@@ -1,12 +1,11 @@
+import numpy as np
+
 from artiq.experiment import *
 from artiq.experiment import delay_mu, delay, parallel
 from artiq.language.core import now_mu, at_mu
-from kexp.util.db.device_db import device_db
-import numpy as np
-
 from artiq.coredevice import adf5356
 
-from kexp.util.artiq.async_print import aprint
+from wax import aprint
 
 dv = -0.1
 

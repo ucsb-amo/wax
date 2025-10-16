@@ -7,9 +7,7 @@ import numpy as np
 from artiq.coredevice import ad9910, ad53xx, ttl
 from artiq.coredevice.urukul import CPLD
 
-from kexp.util.artiq.async_print import aprint
-from kexp.config.dds_calibration import DDS_Amplitude_Calibration as dds_amp_cal
-from kexp.config.dds_calibration import DDS_VVA_Calibration as dds_vva_cal
+from wax.util.artiq.async_print import aprint
 
 DAC_CH_DEFAULT = -1
 di2 = 2
@@ -47,9 +45,6 @@ class DDS():
          self.dac_device = ad53xx.AD53xx
          
       self.dac_control_bool = self.dac_ch != DAC_CH_DEFAULT
-
-      self.dds_amp_calibration = dds_amp_cal()
-      self.dds_vva_calibration = dds_vva_cal()
 
       self._t_att_xfer_mu = np.int64(1592) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.10qxjvv6p35q
       self._t_set_xfer_mu = np.int64(1248) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.e1ucbs8kjf4z

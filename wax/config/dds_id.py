@@ -13,7 +13,7 @@ from wax.config.shuttler_id import shuttler_frame
 # from jax import AD9910Manager, RAMProfile, RAMType
 from artiq.coredevice import ad9910
 
-from kexp.config.expt_params import ExptParams
+from wax.config.expt_params import ExptParams
 
 N_uru = 6
 N_ch = 4

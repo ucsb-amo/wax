@@ -5,7 +5,7 @@ import copy
 import h5py
 
 from wax.util.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
-from wax.base.sub.dealer import Dealer
+
 
 data_dir = os.getenv("data")
 
@@ -16,7 +16,10 @@ imaging_path = os.path.join(code_dir,"k-exp","kexp","base","sub","image.py")
 
 class DataSaver():
 
-    def save_data(self,expt:Dealer,expt_filepath="",data_object=None):
+    def save_data(self,expt,expt_filepath="",data_object=None):
+
+        from wax.base.sub.dealer import Dealer
+        expt: Dealer
 
         if expt.setup_camera:
             

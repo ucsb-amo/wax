@@ -1,7 +1,7 @@
 from artiq.experiment import kernel, rpc, delay
 from artiq.coredevice.zotino import Zotino
 
-from kexp.util.artiq.async_print import aprint
+from wax.util.artiq.async_print import aprint
 
 dv = -10432.
 

@@ -15,7 +15,7 @@ from wax.control.misc.tektronix_tbs1104 import ScopeData
 
 RPC_DELAY = 10.e-3
 
-from wax import img_types as img
+from wax.control.cameras.camera_param_classes import img_types as img
 from wax.base.sub import Dealer, Scanner, Scribe
 
 from wax.util.artiq.async_print import aprint
