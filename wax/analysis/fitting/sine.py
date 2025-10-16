@@ -1,5 +1,5 @@
-from kexp.analysis.fitting import Fit, GaussianFit
-from kexp.analysis.helper import normalize
+from wax.analysis.fitting import Fit, GaussianFit
+from wax.analysis.helper import normalize
 
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit

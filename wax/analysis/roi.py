@@ -3,10 +3,10 @@ import pandas as pd
 import os
 import cv2
 
-import kexp.util.data.server_talk as st
-from kexp.analysis.image_processing.compute_ODs import compute_OD
+import wax.util.data.server_talk as st
+from wax.analysis.image_processing.compute_ODs import compute_OD
 
-from kexp.control.cameras.camera_param_classes import img_types
+from wax.control.cameras.camera_param_classes import img_types
 
 import h5py
 from copy import deepcopy

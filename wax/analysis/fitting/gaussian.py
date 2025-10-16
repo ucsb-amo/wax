@@ -3,7 +3,7 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 import kamo.constants as c
-from kexp.analysis.fitting.fit import Fit
+from wax.analysis.fitting.fit import Fit
 
 class GaussianFit(Fit):
     def __init__(self,xdata,ydata,debug_plotting=False,

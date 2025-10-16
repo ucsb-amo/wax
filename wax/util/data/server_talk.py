@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import glob
 import numpy as np
 import random
-import winsound
 
 DATA_DIR = os.getenv("data")
 DATA_DIR_FILE_DEPTH_IDX = len(DATA_DIR.split('\\')[0:-1]) - 2
@@ -182,13 +181,14 @@ def play_random_sound():
     set_data_dir()
     files = [f for f in os.listdir(SOUNDS_DIR) if os.path.isfile(os.path.join(SOUNDS_DIR, f))]
     file = random.choice(files)
+    import winsound
     winsound.PlaySound(os.path.join(SOUNDS_DIR,file), winsound.SND_FILENAME)
 
 def create_lite_copy(run_idx,roi_id=None,use_saved_roi=True):
-    from kexp.util.data import RunInfo, DataSaver
-    from kexp.analysis.atomdata import unpack_group
+    from wax.util.data import RunInfo, DataSaver
+    from wax.analysis.atomdata import unpack_group
     import h5py
-    from kexp.analysis import ROI
+    from wax.analysis import ROI
 
     original_data_filepath, rid = get_data_file(run_idx)
 

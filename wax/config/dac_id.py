@@ -15,6 +15,8 @@ class dac_frame():
 
         p = expt_params
 
+        ### begin assignments
+
         self._write_dac_keys()
         
     def assign_dac_ch(self,ch,v=0.,max_v=9.99) -> DAC_CH:

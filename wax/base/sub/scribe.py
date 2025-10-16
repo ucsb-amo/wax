@@ -1,9 +1,9 @@
-from kexp.util.data.data_vault import DataSaver
+from wax.util.data.data_vault import DataSaver
 import h5py, time
 import numpy as np
 import os
 from artiq.experiment import TBool, rpc
-from kexp.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
+from wax.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
                                    CHECK_CAMERA_READY_ACK_PERIOD, REMOVE_DATA_POLL_INTERVAL,
                                    CHECK_FOR_DATA_AVAILABLE_PERIOD as CHECK_PERIOD)
 

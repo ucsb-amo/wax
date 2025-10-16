@@ -1,6 +1,6 @@
 import numpy as np
 
-from kexp.config.camera_id import img_types as img
+from wax.config.camera_id import img_types as img
 
 def process_ODs(raw_ODs,roi):
     '''

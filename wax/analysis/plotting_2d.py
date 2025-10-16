@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from kexp.analysis import atomdata
+from wax.analysis import atomdata
 
 def plot_image_grid(ad:atomdata,
                     ndarray = [],

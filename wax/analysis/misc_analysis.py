@@ -2,8 +2,8 @@ import numpy as np
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
-from kexp.analysis import atomdata
-from kexp.analysis.helper.datasmith import normalize, crop_array_by_index, find_n_max_indices
+from wax.analysis import atomdata
+from wax.analysis.helper.datasmith import normalize, crop_array_by_index, find_n_max_indices
 
 def get_best_result_idx(ad:atomdata,
                         figure_of_merit_key='atom_number',

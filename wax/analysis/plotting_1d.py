@@ -1,8 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from kexp.analysis import atomdata
+from wax.analysis import atomdata
 
-from kexp.analysis.helper import xlabels_1d
+from wax.analysis.helper import xlabels_1d
 
 def plot_mixOD(ad:atomdata,
                ndarray=[],

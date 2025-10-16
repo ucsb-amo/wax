@@ -2,8 +2,8 @@ import numpy as np
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
-from kexp.analysis import atomdata
-from kexp.analysis.helper import *
+from wax.analysis import atomdata
+from wax.analysis.helper import *
 
 dv = -1000.
 dv_fit_guess_rabi_frequency = 1.e5
@@ -34,7 +34,7 @@ class TOF():
 
         self.t_tof = ad.params.t_tof
         
-        from kexp.analysis.fitting.gaussian import GaussianTemperatureFit
+        from wax.analysis.fitting.gaussian import GaussianTemperatureFit
         
         self.fit = GaussianTemperatureFit(self.t_tof, self.sigmas,
                                           include_idx = include_idx,

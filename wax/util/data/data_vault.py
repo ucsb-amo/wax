@@ -4,8 +4,8 @@ import os
 import copy
 import h5py
 
-from kexp.util.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
-from kexp.base.sub.dealer import Dealer
+from wax.util.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
+from wax.base.sub.dealer import Dealer
 
 data_dir = os.getenv("data")
 
