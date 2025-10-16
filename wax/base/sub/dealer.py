@@ -1,21 +1,21 @@
 from artiq.experiment import *
 from artiq.experiment import delay, parallel, sequential
 
-from wax.config.expt_params import ExptParams
-from wax.util.data.run_info import RunInfo
-
 import numpy as np
 
 class Dealer():
     def __init__(self):
         self.sort_idx = []
         self.sort_N = []
+        from wax.config.expt_params import ExptParams
         self.params = ExptParams()
         self.xvarnames = []
         self.xvardims = []
         self.N_xvars = 0
         self.images = np.array([])
         self.image_timestamps = np.array([])
+
+        from wax.util.data.run_info import RunInfo
         self.run_info = RunInfo()
 
         self.scan_xvars = []

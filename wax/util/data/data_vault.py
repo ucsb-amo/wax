@@ -18,8 +18,8 @@ class DataSaver():
 
     def save_data(self,expt,expt_filepath="",data_object=None):
 
-        from wax.base.sub.dealer import Dealer
-        expt: Dealer
+        # from wax.base.sub.dealer import Dealer
+        # expt: Dealer
 
         if expt.setup_camera:
             

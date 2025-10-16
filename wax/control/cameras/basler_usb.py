@@ -5,8 +5,7 @@ import numpy as np
 from queue import Queue
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from kexp.config.camera_id import cameras
-from kexp.config.timeouts import (CAMERA_GRAB_TIMEOUT_BASLER_INIT as TIMEOUT_INIT,
+from wax.config.timeouts import (CAMERA_GRAB_TIMEOUT_BASLER_INIT as TIMEOUT_INIT,
                                   CAMERA_GRAB_TIMEOUT_BASLER_RUN as TIMEOUT_RUN)
 
 def nothing():
@@ -23,7 +22,7 @@ class BaslerUSB(pylon.InstantCamera):
         TriggerMode (str): picks whether or not the camera waits for a trigger to capture frames. (default: 'On')
         BaslerSerialNumber (str): identifies which camera should be used via the serial number. (default: ExptParams.basler_serial_no_absorption)
     '''
-    def __init__(self,ExposureTime=0.,Gain=0.,TriggerSource='Line1',TriggerMode='On',BaslerSerialNumber=cameras.xy_basler.serial_no):
+    def __init__(self,ExposureTime=0.,Gain=0.,TriggerSource='Line1',TriggerMode='On',BaslerSerialNumber='40316451'):
 
         super().__init__()
 

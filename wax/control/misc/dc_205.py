@@ -1,11 +1,10 @@
-import serial
-import time
-import math
+import numpy as np
 
 class dc_205():
     def __init__(self):
         self.port = 'COM16'
         self.baud = 115200
+        import serial
         self.ser = serial.Serial(
             port=self.port,
             baudrate=self.baud,
@@ -16,6 +15,7 @@ class dc_205():
             write_timeout=2
         )
         # Confirm the port is open
+        import time
         if self.ser.is_open:
             print(f"Serial port {self.port} opened at {self.baud} baud.")
         else:
@@ -43,7 +43,7 @@ class dc_205():
     #v = 0,10,100
     def set_range(self,v):
         #rangeHigh = 10
-        n = int(math.log10(v))
+        n = int(np.log10(v))
         vSet = f"RNGE {n}; RNGE?\n"
         self.ser.write(vSet.encode('utf-8'))
         print(f"Sent command: {vSet.strip()}")

@@ -5,8 +5,6 @@ from artiq.experiment import delay_mu, delay, parallel
 from artiq.language.core import now_mu, at_mu
 from artiq.coredevice import adf5356
 
-from wax import aprint
-
 dv = -0.1
 
 class Mirny():

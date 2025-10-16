@@ -1,7 +1,6 @@
 import time
-from wax.util.data.server_talk import get_run_id
 
-from wax.config.camera_id import img_types as img
+from wax.util.data.server_talk import get_run_id
 
 class RunInfo():
     def __init__(self,expt_obj=None,save_data=True):
@@ -23,6 +22,7 @@ class RunInfo():
         self.experiment_filepath = []
         self.xvarnames = []
 
+        from wax import img_types as img
         self.imaging_type = img.ABSORPTION
         
         self.save_data = int(save_data)

@@ -1,16 +1,16 @@
-from pylablib.devices import Andor
-from pylablib.devices.interface.camera import trim_frames
 import numpy as np
 import time
 
-from queue import Queue
-from PyQt6.QtCore import QThread, pyqtSignal
-
+from pylablib.devices import Andor
+from pylablib.devices.interface.camera import trim_frames
 from pylablib.devices.Andor.atmcd32d_lib import wlib as lib
 from pylablib.core.utils import general as general_utils
 from pylablib.core.devio import interface
 
-from kexp.config.timeouts import (CAMERA_GRAB_TIMEOUT_ANDOR as TIMEOUT)
+from queue import Queue
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from wax.config.timeouts import (CAMERA_GRAB_TIMEOUT_ANDOR as TIMEOUT)
 
 def nothing():
     return False

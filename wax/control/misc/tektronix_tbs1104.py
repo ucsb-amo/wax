@@ -1,4 +1,3 @@
-from pylablib.devices import Tektronix
 import numpy as np
 from artiq.language import TBool
 
@@ -40,6 +39,7 @@ class TektronixScope_TBS1104():
 
         self.device_id = self.handle_devid_input(device_id)
         print(self.device_id)
+        from pylablib.devices import Tektronix
         self.scope = Tektronix.ITektronixScope(self.device_id)
         self._scope_data.scopes.append(self)
 

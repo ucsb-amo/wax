@@ -1,9 +1,6 @@
 import sys
 import os
 import time
-
-from pylablib.devices import Newport
-
 import numpy as np
 
 CONTROLLER_HOSTNAME = "192.168.1.80"
@@ -13,7 +10,9 @@ AXES_LISTS = [[1,2,3],[4,5,6]]
 AXES_NAME_LIST = [["x","y"],["x","y"]]
 
 class motor_axis():
-    def __init__(self,controller_addr,motor_idx,stage_obj:Newport.Picomotor8742):
+    def __init__(self,controller_addr,motor_idx,stage_obj):
+        from pylablib.devices import Newport
+        stage_obj:Newport.Picomotor8742
         self.addr = controller_addr
         self.motor_idx = motor_idx
         self.stage = stage_obj
@@ -34,6 +33,7 @@ class motor_axis():
 class controller():
 
     def __init__(self):
+        from pylablib.devices import Newport
         self.stage = Newport.Picomotor8742(CONTROLLER_HOSTNAME,multiaddr=True,scan=False)
         self.setup_axes()
 
