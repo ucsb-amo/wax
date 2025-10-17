@@ -3,10 +3,9 @@ import pandas as pd
 import os
 import cv2
 
-import wax.util.data.server_talk as st
-from wax.analysis.image_processing.compute_ODs import compute_OD
-
-from wax.control.cameras.camera_param_classes import img_types
+import waxa.data.server_talk as st
+from waxa.image_processing.compute_ODs import compute_OD
+from waxa import img_types
 
 import h5py
 from copy import deepcopy

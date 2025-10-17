@@ -1,4 +1,4 @@
-from wax.analysis.fitting import Fit
+from waxa.fitting import Fit
 from scipy.optimize import curve_fit
 import numpy as np
 

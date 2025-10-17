@@ -1,4 +1,5 @@
-from wax.analysis.fitting import Fit, GaussianFit
+from waxa.fitting.fit import Fit
+from waxa.fitting import GaussianFit
 
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit

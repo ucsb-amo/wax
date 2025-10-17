@@ -1,5 +1,5 @@
 import numpy as np
-from wax.analysis.fitting import GaussianFit
+from waxa.fitting import GaussianFit
 
 def fit_gaussian_sum_dist(sum_dist: np.ndarray, camera_params) -> list[GaussianFit]:
     '''

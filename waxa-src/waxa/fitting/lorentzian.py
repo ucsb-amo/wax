@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.optimize import curve_fit
 import kamo.constants as c
-from wax.analysis.fitting.fit import Fit
+from waxa.fitting.fit import Fit
 
 class LorentzianFit(Fit):
     def __init__(self,xdata,ydata,

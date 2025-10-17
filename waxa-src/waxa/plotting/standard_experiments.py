@@ -2,8 +2,8 @@ import numpy as np
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
-from wax.analysis import atomdata
-from wax.analysis.helper import *
+from waxa import atomdata
+from waxa.helper import *
 
 dv = -1000.
 dv_fit_guess_rabi_frequency = 1.e5

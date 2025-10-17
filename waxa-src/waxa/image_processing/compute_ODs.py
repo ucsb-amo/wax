@@ -1,6 +1,6 @@
 import numpy as np
 
-from wax.config.camera_id import img_types as img
+from waxa.config import img_types as img
 
 def process_ODs(raw_ODs,roi):
     '''
