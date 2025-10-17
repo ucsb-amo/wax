@@ -2,7 +2,7 @@ import numpy as np
 from scipy.signal import savgol_filter
 import matplotlib.pyplot as plt
 import copy
-from wax.analysis.helper import crop_array_by_index, remove_infnan
+from waxa.helper import crop_array_by_index, remove_infnan
 
 class Fit():
     def __init__(self,xdata,ydata,
