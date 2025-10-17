@@ -5,6 +5,7 @@ import numpy as np
 from waxa import ExptParams
 from waxa.data import DataSaver, RunInfo, counter, server_talk
 from waxa.base import Dealer, Scribe
+from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
 
@@ -67,7 +68,7 @@ class Expt(Dealer, Scanner, Scribe):
         a scan. This must be an RPC -- no kernel decorator.
         """
 
-        if self.run_info.imaging_type == img.ABSORPTION:
+        if self.run_info.imaging_type == img_types.ABSORPTION:
             if self.params.N_pwa_per_shot > 1:
                 print("You indicated more than one PWA per shot, but the analysis is set to absorption imaging. Setting # PWA to 1.")
             self.params.N_pwa_per_shot = 1
@@ -114,6 +115,46 @@ class Expt(Dealer, Scanner, Scribe):
         else:
             self.images = np.array([0])
             self.image_timestamps = np.array([0])
+        
+    def get_N_img(self):
+        """
+        Computes the number of images to be taken during the sequence from the
+        length of the specified xvars, stores in self.params.N_img. For
+        absorption imaging, 3 images per shot. For fluorescence imaging,
+        variable pwa images (ExptParams.N_pwa_per_shot, default = 1), then 1
+        each pwoa and dark images.
+        """                
+        N_img = 1
+        msg = ""
+
+        for xvar in self.scan_xvars:
+            N_img = N_img * xvar.values.shape[0]
+            msg += f" {xvar.values.shape[0]} values of {xvar.key}."
+        self.params.N_shots_with_repeats = N_img
+
+        msg += f" {N_img} total shots."
+
+        ### I have no idea what this is for. ###
+        if isinstance(self.params.N_repeats,list):
+            if len(self.params.N_repeats) == 1:
+                N_repeats = self.params.N_repeats[0]
+            else:
+                N_repeats = np.prod(self.params.N_repeats)
+        else:
+            N_repeats = 1
+        self.params.N_shots = int(N_img / N_repeats)
+        ###
+
+        if self.run_info.imaging_type == img_types.ABSORPTION:
+            images_per_shot = 3
+        else:
+            images_per_shot = self.params.N_pwa_per_shot + 2
+
+        N_img = images_per_shot * N_img # 3 images per value of independent variable (xvar)
+
+        msg += f" {N_img} total images expected."
+        print(msg)
+        return N_img
     
     def end(self, expt_filepath):
 
