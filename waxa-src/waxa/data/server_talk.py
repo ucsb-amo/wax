@@ -185,10 +185,10 @@ def play_random_sound():
     winsound.PlaySound(os.path.join(SOUNDS_DIR,file), winsound.SND_FILENAME)
 
 def create_lite_copy(run_idx,roi_id=None,use_saved_roi=True):
-    from wax.util.data import RunInfo, DataSaver
-    from wax.analysis.atomdata import unpack_group
+    from waxa.data import RunInfo, DataSaver
+    from waxa.atomdata import unpack_group
     import h5py
-    from wax.analysis import ROI
+    from waxa import ROI
 
     original_data_filepath, rid = get_data_file(run_idx)
 

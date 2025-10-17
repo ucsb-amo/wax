@@ -4,7 +4,7 @@ class Dealer():
     def __init__(self):
         self.sort_idx = []
         self.sort_N = []
-        from waxa.config.expt_params import ExptParams
+        from waxa.config.expt_params_waxa import ExptParams
         self.params = ExptParams()
         self.xvarnames = []
         self.xvardims = []

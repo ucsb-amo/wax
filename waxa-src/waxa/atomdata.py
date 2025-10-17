@@ -11,7 +11,7 @@ from waxa.base import Dealer, xvar
 import waxa.data.server_talk as st
 from waxa.helper.datasmith import *
 from waxa.data.run_info import RunInfo
-from waxa.config.expt_params import ExptParams
+from waxa.config.expt_params_waxa import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
 

@@ -1,5 +1,5 @@
 from waxx.control.artiq.TTL import TTL
-from waxx.config.expt_params import ExptParams
+from waxx.config.expt_params_waxx import ExptParams
 from waxx.control.tweezer import tweezer_xmesh as mesh, TweezerMovesLib
 
 from artiq.language.core import now_mu

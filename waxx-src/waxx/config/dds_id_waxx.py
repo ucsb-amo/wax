@@ -6,9 +6,9 @@ from artiq.language.core import delay_mu
 
 from waxx.control.artiq.DDS import DDS
 from waxx.control.artiq.dummy_core import DummyCore
-from waxx.config.dac_id import dac_frame
-from waxx.config.shuttler_id import shuttler_frame
-from waxx.config.expt_params import ExptParams
+from waxx.config.dac_id_waxx import dac_frame
+from waxx.config.shuttler_id_waxx import shuttler_frame
+from waxx.config.expt_params_waxx import ExptParams
 
 # from jax import AD9910Manager, RAMProfile, RAMType
 from artiq.coredevice import ad9910

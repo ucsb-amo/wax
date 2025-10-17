@@ -5,6 +5,7 @@ import numpy as np
 from waxa import ExptParams
 from waxa.data import DataSaver, RunInfo, counter, server_talk
 from waxa.base import Dealer, Scribe
+from waxa.dummy.camera_params import CameraParams
 from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
@@ -34,6 +35,8 @@ class Expt(Dealer, Scanner, Scribe):
         self.scope_data = ScopeData()
         self._ridstr = " Run ID: "+ str(self.run_info.run_id)
         self._counter = counter()
+
+        self.camera_params = CameraParams()
 
         self.params = ExptParams()
         self.p = self.params

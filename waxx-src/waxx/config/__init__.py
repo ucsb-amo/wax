@@ -1,1 +1,1 @@
-from .expt_params import ExptParams
+from .expt_params_waxx import ExptParams
