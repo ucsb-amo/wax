@@ -2,9 +2,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='wax',
+    name='waxa',
     version='0.0.1',
-    url='https://github.com/ucsb-amo/wax-ucsb',
+    url='https://github.com/ucsb-amo/wax-ucsb/waxa',
     author='Jared Pagett',
     author_email='pagett.jared@gmail.com',
     packages=find_packages(), # This will find 'my_package'
