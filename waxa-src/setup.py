@@ -8,4 +8,16 @@ setup(
     author='Jared Pagett',
     author_email='pagett.jared@gmail.com',
     packages=find_packages(), # This will find 'my_package'
+    install_requires=[
+        'numpy',
+        'pandas',
+        'matplotlib',
+        'scipy',
+        'h5py',
+        'datetime',
+        'time',
+        'copy',
+        'subprocess',
+        'glob',
+        'random']
 )

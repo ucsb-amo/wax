@@ -1,5 +1,4 @@
 import numpy as np
-
 from waxa.config.img_types import img_types as img
 
 def process_ODs(raw_ODs,roi):

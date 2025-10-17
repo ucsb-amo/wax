@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.optimize import curve_fit
-import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
+
 from waxa import atomdata
 from waxa.helper import *
 

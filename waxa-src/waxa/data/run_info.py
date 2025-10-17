@@ -1,5 +1,4 @@
 import time
-
 from waxa.data.server_talk import get_run_id
 
 class RunInfo():

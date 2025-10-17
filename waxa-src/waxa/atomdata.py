@@ -15,8 +15,6 @@ from waxa.config.expt_params_waxa import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
 
-from kamo.atom_properties.k39 import Potassium39
-
 def unpack_group(file,group_key,obj):
     """Looks in an open h5 file in the group specified by key, and iterates over
     every dataset in that h5 group, and for each dataset assigns an attribute of
@@ -97,7 +95,6 @@ class atomdata():
 
         ### Helper objects
         self._ds = DataSaver()
-        self.atom = Potassium39()
         self._dealer = self._init_dealer()
         self._analysis_tags = analysis_tags(roi_id,self.run_info.imaging_type)
         self.roi = ROI(run_id = self.run_info.run_id,
@@ -213,7 +210,7 @@ class atomdata():
 
     ### Physics
     def compute_atom_number(self):
-        self.atom_cross_section = self.atom.get_cross_section()
+        self.atom_cross_section = 5.878324268151581e-13 # from kamo.Potassium39.get_cross_section
         dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
         
         self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / self.atom_cross_section
