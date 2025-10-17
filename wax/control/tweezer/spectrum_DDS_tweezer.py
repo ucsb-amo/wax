@@ -16,10 +16,8 @@ import numpy as np
 # di = 666420695318008 #causes failure
 di = 0
 dv = -1000.
-dv_list = np.linspace(0.,1.,5)
 dv_array = np.array([dv])
 db_array = np.array([None])
-T_AWG_RAMP_WRITE_DELAY = 100.e-3
 T_AWG_RPC_DELAY = 25.e-3
 
 VAL_TYPE_FREQ = 0
