@@ -2,23 +2,17 @@ from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
 import numpy as np
 
-from wax.config.expt_params import ExptParams
-
-from wax.util.data.data_vault import DataSaver
-from wax.util.data.run_info import RunInfo
-from wax.util.data.counter import counter
-from wax.util.data import server_talk
+from waxa import ExptParams
+from waxa.data import DataSaver, RunInfo, counter, server_talk
+from waxa.base import Dealer, Scanner, Scribe
 
 from artiq.language.core import kernel_from_string, now_mu
 
-from wax.control.misc.tektronix_tbs1104 import ScopeData
+from waxx.control.misc.tektronix_tbs1104 import ScopeData
 
 RPC_DELAY = 10.e-3
 
-from wax.control.cameras.camera_param_classes import img_types as img
-from wax.base.sub import Dealer, Scanner, Scribe
-
-from wax.util.artiq.async_print import aprint
+from waxx.util.artiq.async_print import aprint
 
 class Expt(Dealer, Scanner, Scribe):
     def __init__(self,

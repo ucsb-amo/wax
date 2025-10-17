@@ -1,20 +1,20 @@
-from wax.analysis.image_processing.compute_ODs import compute_OD
-from wax.analysis.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
-from wax.analysis.roi import ROI
-from wax.util.data.data_vault import DataSaver
+from waxa.image_processing.compute_ODs import compute_OD
+from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
+from waxa.roi import ROI
+from waxa.data.data_vault import DataSaver
 import numpy as np
 from kamo.atom_properties.k39 import Potassium39
 
-from wax.util.data.run_info import RunInfo
-from wax.config.expt_params import ExptParams
-from wax.config.camera_id import CameraParams
-from wax.base.sub.dealer import Dealer
-from wax.base.sub.scanner import xvar
+from waxa.data.run_info import RunInfo
+from waxx.config.expt_params import ExptParams
+from waxx.config.camera_id import CameraParams
+from waxx.base.sub.dealer import Dealer
+from waxx.base.sub.scanner import xvar
 
-import wax.util.data.server_talk as st
+import waxx.util.data.server_talk as st
 import h5py
 
-from wax.analysis.helper.datasmith import *
+from waxx.analysis.helper.datasmith import *
 
 import datetime
 import os

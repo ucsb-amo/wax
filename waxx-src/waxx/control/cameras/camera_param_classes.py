@@ -1,10 +1,4 @@
-class ImagingType():
-    def __init__(self):
-        self.ABSORPTION = 0
-        self.DISPERSIVE = 1
-        self.FLUORESCENCE = 2
-
-img_types = ImagingType()
+from waxa.config.img_types import img_types
 
 class CameraParams():
     # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
