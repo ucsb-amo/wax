@@ -1,7 +1,5 @@
-import time
 import numpy as np
 import os
-import copy
 import h5py
 
 from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
