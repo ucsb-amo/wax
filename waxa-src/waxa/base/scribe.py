@@ -1,10 +1,9 @@
-from wax.util.data.data_vault import DataSaver
-
 import h5py, time
 import numpy as np
 import os
-from artiq.experiment import TBool, rpc
-from wax.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
+
+from waxa.data.data_vault import DataSaver
+from waxa.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
                                    CHECK_CAMERA_READY_ACK_PERIOD, REMOVE_DATA_POLL_INTERVAL,
                                    CHECK_FOR_DATA_AVAILABLE_PERIOD as CHECK_PERIOD)
 
@@ -47,7 +46,7 @@ class Scribe():
                 if time.time() - t0 > timeout:
                     raise ValueError("Timed out waiting for data to be available.")        
                 
-    def wait_for_camera_ready(self,timeout=-1.) -> TBool:
+    def wait_for_camera_ready(self,timeout=-1.) -> bool:
         count = 1
         t0 = time.time()
         waiting = True
@@ -117,7 +116,7 @@ class Scribe():
                 if not self._check_data_file_exists(raise_error=False):
                     break
 
-    def _check_data_file_exists(self, raise_error=True) -> TBool:
+    def _check_data_file_exists(self, raise_error=True) -> bool:
         """
         Checks if the data file exists if saving data is enabled. Raises an
         error if not found.

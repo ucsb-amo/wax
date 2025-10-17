@@ -5,7 +5,7 @@ import numpy as np
 from queue import Queue
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from wax.config.timeouts import (CAMERA_GRAB_TIMEOUT_BASLER_INIT as TIMEOUT_INIT,
+from waxx.config.timeouts import (CAMERA_GRAB_TIMEOUT_BASLER_INIT as TIMEOUT_INIT,
                                   CAMERA_GRAB_TIMEOUT_BASLER_RUN as TIMEOUT_RUN)
 
 def nothing():

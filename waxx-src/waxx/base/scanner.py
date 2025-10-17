@@ -1,6 +1,8 @@
 from artiq.experiment import *
 import numpy as np
 
+from waxa.base import xvar
+
 from artiq.language.core import kernel_from_string, now_mu
 from artiq.experiment import delay
 

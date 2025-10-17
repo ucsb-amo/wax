@@ -1,5 +1,5 @@
 import os
-from wax.analysis.atomdata import atomdata
+from waxa import atomdata
 
 def load_atomdata(idx=0, roi_id=None, path = "",
                   skip_saved_roi = False,

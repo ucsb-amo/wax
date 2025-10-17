@@ -1,8 +1,6 @@
-from wax.control.artiq.DAC_CH import DAC_CH
-from wax.control.artiq.TTL import TTL
-from wax.control.artiq.DDS import DDS
-from wax.config.expt_params import ExptParams
-from wax.control.tweezer import tweezer_xmesh as mesh, TweezerMovesLib
+from waxx.control.artiq.TTL import TTL
+from waxx.config.expt_params import ExptParams
+from waxx.control.tweezer import tweezer_xmesh as mesh, TweezerMovesLib
 
 from artiq.language.core import now_mu
 from artiq.coredevice.core import Core

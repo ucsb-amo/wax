@@ -4,18 +4,16 @@ from artiq.coredevice import ad53xx
 from artiq.experiment import kernel, portable
 from artiq.language.core import delay_mu
 
-from wax.control.artiq.DDS import DDS
-from wax.control.artiq.dummy_core import DummyCore
-
-from wax.config.dac_id import dac_frame
-from wax.config.shuttler_id import shuttler_frame
+from waxx.control.artiq.DDS import DDS
+from waxx.control.artiq.dummy_core import DummyCore
+from waxx.config.dac_id import dac_frame
+from waxx.config.shuttler_id import shuttler_frame
+from waxx.config.expt_params import ExptParams
 
 # from jax import AD9910Manager, RAMProfile, RAMType
 from artiq.coredevice import ad9910
 
-from wax.config.expt_params import ExptParams
-
-N_uru = 6
+N_uru = 1
 N_ch = 4
 shape = (N_uru,N_ch)
 

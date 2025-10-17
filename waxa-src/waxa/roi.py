@@ -5,10 +5,9 @@ import cv2
 
 import waxa.data.server_talk as st
 from waxa.image_processing.compute_ODs import compute_OD
-from waxa import img_types
+from waxa.config.img_types import img_types
 
 import h5py
-from copy import deepcopy
 
 st.check_for_mapped_data_dir()
 ROI_CSV_PATH = os.path.join(st.DATA_DIR,"roi.xlsx")

@@ -7,7 +7,7 @@ import numpy as np
 from artiq.coredevice import ad9910, ad53xx, ttl
 from artiq.coredevice.urukul import CPLD
 
-from wax.util.artiq.async_print import aprint
+from waxx.util.artiq.async_print import aprint
 
 DAC_CH_DEFAULT = -1
 di2 = 2

@@ -4,10 +4,11 @@ import numpy as np
 
 from waxa import ExptParams
 from waxa.data import DataSaver, RunInfo, counter, server_talk
-from waxa.base import Dealer, Scanner, Scribe
+from waxa.base import Dealer, Scribe
 
 from artiq.language.core import kernel_from_string, now_mu
 
+from waxx.base import Scanner
 from waxx.control.misc.tektronix_tbs1104 import ScopeData
 
 RPC_DELAY = 10.e-3

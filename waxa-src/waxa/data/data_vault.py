@@ -4,8 +4,7 @@ import os
 import copy
 import h5py
 
-from wax.util.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
-
+from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
 
 data_dir = os.getenv("data")
 
