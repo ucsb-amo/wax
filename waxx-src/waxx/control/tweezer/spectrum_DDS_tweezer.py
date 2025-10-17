@@ -473,16 +473,12 @@ class TweezerTrap():
 class TweezerController():
 
     def __init__(self,
-                 awg_ip='TCPIP::192.168.1.83::inst0::INSTR',
+                  awg_ip='TCPIP::192.168.1.83::inst0::INSTR',
                   awg_trg_ttl=TTL,
                   tweezer_xmesh=mesh(),
                   expt_params=ExptParams(),
                   core=Core):
         """Controls the tweezers.
-
-        Args:
-            sw_ttl (TTL): TTL
-            awg_trg_ttl (TTL): TTL
         """        
         self.awg_trg_ttl = awg_trg_ttl
         self.params = expt_params
@@ -625,13 +621,13 @@ class TweezerController():
         if (position != dv) and (frequency != dv):
             raise ValueError('You must specify either freuqency or position (not both).')
 
-        tweezer = TweezerTrap(position,
-                              amplitude,
-                              cateye,
-                              frequency,
-                              self.awg_trg_ttl,
-                              self.params,
-                              self.core)
+        tweezer = TweezerTrap(position=position,
+                              amplitude=amplitude,
+                              cateye=cateye,
+                              awg_trigger_ttl=self.awg_trg_ttl,
+                              tweezer_xmesh=self.tweezer_xmesh,
+                              expt_params=self.params,
+                              core=self.core)
         self.traps.append(tweezer)
         return tweezer
 
