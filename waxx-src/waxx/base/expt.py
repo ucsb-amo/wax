@@ -170,4 +170,4 @@ class Expt(Dealer, Scanner, Scribe):
             else:
                 self.remove_incomplete_data()
                 
-        server_talk.play_random_sound()
+        # server_talk.play_random_sound()

@@ -3,9 +3,6 @@ from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
 from kexp.config.expt_params import ExptParams
 import numpy as np
-import threading
-# from kexp.control.slm.PatternApp import Patternapp  # Assuming this file defines the PatternApp class
-import tkinter as tk
 import json
 di = -1
 dv = 1.

@@ -35,7 +35,7 @@ class TOF():
 
         self.t_tof = ad.params.t_tof
         
-        from wax.analysis.fitting.gaussian import GaussianTemperatureFit
+        from waxa.fitting.gaussian import GaussianTemperatureFit
         
         self.fit = GaussianTemperatureFit(self.t_tof, self.sigmas,
                                           include_idx = include_idx,

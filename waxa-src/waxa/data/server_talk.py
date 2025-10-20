@@ -177,12 +177,12 @@ def update_run_id(run_info):
 
     os.chdir(pwd)
 
-def play_random_sound():
-    set_data_dir()
-    files = [f for f in os.listdir(SOUNDS_DIR) if os.path.isfile(os.path.join(SOUNDS_DIR, f))]
-    file = random.choice(files)
-    import winsound
-    winsound.PlaySound(os.path.join(SOUNDS_DIR,file), winsound.SND_FILENAME)
+# def play_random_sound():
+#     set_data_dir()
+#     files = [f for f in os.listdir(SOUNDS_DIR) if os.path.isfile(os.path.join(SOUNDS_DIR, f))]
+#     file = random.choice(files)
+#     import winsound
+#     winsound.PlaySound(os.path.join(SOUNDS_DIR,file), winsound.SND_FILENAME)
 
 def create_lite_copy(run_idx,roi_id=None,use_saved_roi=True):
     from waxa.data import RunInfo, DataSaver
