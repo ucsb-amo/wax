@@ -11,7 +11,7 @@ from waxa import img_types
 from artiq.language.core import kernel_from_string, now_mu
 
 from waxx.base import Scanner
-from waxx.control.misc.tektronix_tbs1104 import ScopeData
+from waxx.control.misc.oscilloscopes import ScopeData
 
 RPC_DELAY = 10.e-3
 
