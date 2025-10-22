@@ -96,7 +96,7 @@ class Expt(Dealer, Scanner, Scribe):
         self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
         self.scope_data.xvardims = self.xvardims
 
-        if self.setup_camera:
+        if self.run_info.save_data:
             self.data_filepath = self.ds.create_data_file(self)
 
         self.generate_assignment_kernels()
@@ -106,7 +106,7 @@ class Expt(Dealer, Scanner, Scribe):
 
     def prepare_image_array(self):
         if self.run_info.save_data:
-            print(self.camera_params.camera_type)
+            # print(self.camera_params.camera_type)
             if self.camera_params.camera_type == 'andor':
                 dtype = np.uint16
             elif self.camera_params.camera_type == 'basler':
@@ -163,11 +163,10 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.scope_data.close()
 
-        if self.setup_camera:
-            if self.run_info.save_data:
-                self.cleanup_scanned()
-                self.write_data(expt_filepath)
-            else:
-                self.remove_incomplete_data()
+        if self.run_info.save_data:
+            self.cleanup_scanned()
+            self.write_data(expt_filepath)
+        else:
+            self.remove_incomplete_data()
                 
         # server_talk.play_random_sound()
