@@ -1,7 +1,8 @@
 import numpy as np
 from pylablib.devices import Tektronix
 from .siglent_sds2000 import SiglentSDS2000X_Base
-from artiq.language import TBool
+from artiq.language import TBool, now_mu
+from artiq.experiment import kernel
 from waxx.util.artiq.async_print import aprint
 
 class ScopeData:
@@ -69,6 +70,7 @@ class GenericWaxxScope():
             self._data = np.array(self._data)
             Npts = np.array(self._data).shape[-1]
             self._data = self._data.reshape(*self._scopedata.xvardims,4,2,Npts)
+            return self._data
 
     def handle_devid_input(self,device_id):
         default = (device_id == "")
@@ -114,7 +116,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id,label,scope_data)
 
-    def read_sweep(self,channels) -> TBool:
+    def read_sweep(self,channels):
         if isinstance(channels,int):
             channels = [channels]
         channels = np.asarray(channels)
@@ -130,9 +132,9 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
                     data[ch][0] = t
                     data[ch][1] = v
                 except Exception as e:
-                    aprint(e)
+                    pass
         self._data.append(data)
-        return True
+        # return True
 
 class TektronixScope_TBS1104(GenericWaxxScope):
     def __init__(self,device_id="",label="",

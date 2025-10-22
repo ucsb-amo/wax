@@ -714,9 +714,11 @@ class atomdata():
             except:
                 self.sort_idx = np.array([])
                 self.sort_N = np.array([])
-
-            d = f['data']['scope_data']
-            self.scope_data = format_scope_data(d)
+            try:
+                d = f['data']['scope_data']
+                self.scope_data = format_scope_data(d)
+            except:
+                None
 
 # class ConcatAtomdata(atomdata):
 #     def __init__(self,rids=[],roi_id=None,lite=False):
