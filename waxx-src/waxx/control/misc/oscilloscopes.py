@@ -1,7 +1,8 @@
 import numpy as np
 from pylablib.devices import Tektronix
-from .siglent_sds2000 import SiglentSDS2000XPlus
+from .siglent_sds2000 import SiglentSDS2000X_Base
 from artiq.language import TBool
+from waxx.util.artiq.async_print import aprint
 
 class ScopeData:
     def __init__(self):
@@ -22,7 +23,8 @@ class ScopeData:
         return scope
     
     def add_siglent_scope(self,device_id="",label=""):
-        scope = SiglentSDS2000XPlus(host=device_id,label=label,
+        scope = SiglentScope_SDS2104X(device_id=device_id,
+                                      label=label,
                                     scope_data=self)
         return scope
     
@@ -42,32 +44,31 @@ class GenericWaxxScope():
             scope_data (ScopeData): Should be the ScopeData object of the
             experiment ("self.scope_data").
         """        
-        self._scope_data = scope_data
+        self._scopedata = scope_data
 
         if label == "":
-            idx = len(self._scope_data.scopes)
+            idx = len(self._scopedata.scopes)
             label = f"scope{idx}"
         self.label = label
-
         self.device_id = self.handle_devid_input(device_id)
-
         self.scope_trace_taken_this_shot = False
+        self._data = []
+        
+        self._scopedata.scopes.append(self)
 
-        self.data = []
-
-    def get_data(self):
-        if self._scope_data.xvardims != []:
+    def data(self):
+        if self._scopedata.xvardims != []:
             self.reshape_data()
-        return np.array(self.data)
+        return np.array(self._data)
 
     def close(self):
         self.scope.close()
 
     def reshape_data(self):
-        if self.data != []:
-            self.data = np.array(self.data)
-            Npts = np.array(self.data).shape[-1]
-            self.data = self.data.reshape(*self._scope_data.xvardims,4,2,Npts)
+        if self._data != []:
+            self._data = np.array(self._data)
+            Npts = np.array(self._data).shape[-1]
+            self._data = self._data.reshape(*self._scopedata.xvardims,4,2,Npts)
 
     def handle_devid_input(self,device_id):
         default = (device_id == "")
@@ -109,26 +110,28 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
             scope_data (ScopeData): Should be the ScopeData object of the
             experiment ("self.scope_data").
         """        
+        
+        self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id,label,scope_data)
-        self.scope = SiglentSDS2000XPlus(device_id)
-        self._scope_data.scopes.append(self)
 
     def read_sweep(self,channels) -> TBool:
         if isinstance(channels,int):
             channels = [channels]
         channels = np.asarray(channels)
-        print(channels)
-        self._scope_data._scope_trace_taken = True
+        self._scopedata._scope_trace_taken = True
 
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
         data = np.zeros((4,2,Npts))
         for ch in range(4):
             if self.scope.is_channel_visible(ch) and (ch in channels):
-                (t,v) = self.scope.read_sweep(ch)
-                data[ch][0] = t
-                data[ch][1] = v
-        self.data.append(data)
+                try:
+                    (t,v) = self.scope.read_sweep(ch)
+                    data[ch][0] = t
+                    data[ch][1] = v
+                except Exception as e:
+                    aprint(e)
+        self._data.append(data)
         return True
 
 class TektronixScope_TBS1104(GenericWaxxScope):
@@ -146,12 +149,9 @@ class TektronixScope_TBS1104(GenericWaxxScope):
             object.
             scope_data (ScopeData): Should be the ScopeData object of the
             experiment ("self.scope_data").
-        """        
+        """  
+        self.scope = Tektronix.ITektronixScope(self.device_id)      
         super().__init__(device_id,label,scope_data)
-        self.scope = Tektronix.ITektronixScope(self.device_id)
-        self._scope_data.scopes.append(self)
-
-        self.data = []
 
     def read_sweep(self,channels) -> TBool:
         """Read out the specified channels and records result to self.data.
@@ -166,7 +166,7 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         if isinstance(channels,int):
             channels = [channels]
         channels = np.asarray(channels)
-        self._scope_data._scope_trace_taken = True
+        self._scopedata._scope_trace_taken = True
         sweeps = self.scope.read_multiple_sweeps(list(np.array(channels) + 1))
         Npts = np.array(sweeps).shape[1]
         data = np.zeros((4,2,Npts))
@@ -174,5 +174,5 @@ class TektronixScope_TBS1104(GenericWaxxScope):
             if idx in channels:
                 data[idx][0] = sweeps[idx][:,0]
                 data[idx][1] = sweeps[idx][:,1]
-        self.data.append(data)
+        self._data.append(data)
         return True
