@@ -2,6 +2,7 @@ import time
 import vxi11
 import struct
 import numpy as np
+from enum import Enum
 
 TIMEBASE_VALUES = (
         200e-12, 500e-12, 1e-9, 2e-9, 5e-9, 10e-9, 20e-9, 50e-9, 100e-9, 200e-9,
@@ -11,14 +12,26 @@ TIMEBASE_VALUES = (
 MEMORY_DEPTH_VALUES = (10000, 100000, 1000000, 10000000, 100000000,
                                     20000, 200000, 2000000, 20000000, 200000000)
 
-class SiglentSDS2000XPlus(vxi11.Instrument):
+class SiglentSDSTriggerStatus(Enum):
+    ARM = "Arm"
+    READY = "Ready"
+    AUTO = "Auto"
+    TRIGD = "Trig'd"
+    STOP = "Stop"
+    ROLL = "Roll"
+
+class SiglentWaveformWidth(Enum):
+    BYTE = "BYTE"
+    WORD = "WORD"
+
+class SiglentSDS2000X_Base(vxi11.Instrument):
     _name = "Siglent SDS2000X Plus"
     center_code = 127
     full_code = 256
     grid = 10
 
     def __init__(self, host, *args, **kwargs) -> None:
-        super(SiglentSDS2000XPlus, self).__init__(host, *args, **kwargs)
+        super(SiglentSDS2000X_Base, self).__init__(host, *args, **kwargs)
         # idn = self.idn.split(',')
         # self.vendor = idn[0]
         # self.product = idn[1]
@@ -30,10 +43,10 @@ class SiglentSDS2000XPlus(vxi11.Instrument):
 
         :param src_channel: The channel to be sampled. Zero-indexed.
         """
-        # while True:
-        #     res = self.get_trigger_status()
-        #     if res == SiglentSDSTriggerStatus.STOP.value:
-        #         break
+        while True:
+            res = self.get_trigger_status()
+            if not res == SiglentSDSTriggerStatus.STOP.value:
+                break
 
         # Send command that specifies the source waveform to be transferred
 
@@ -64,14 +77,15 @@ class SiglentSDS2000XPlus(vxi11.Instrument):
             recv = list(recv_rtn[data_start:-2:2])
             recv_all += recv
 
-        try:
-            v = self.convert_to_voltage(recv_all, preamble)
-            t = self.waveform_time_axis(preamble)
-            self._last_trace = np.array([t,v])
-        except Exception as e:
-            print(e)
-
-        return self._last_trace
+        # try:
+        v = self.convert_to_voltage(recv_all, preamble)
+        t = self.waveform_time_axis(preamble)
+        if len(t) == len(v):
+            return np.array([t,v])
+        else:
+            raise ValueError("Voltage data was not the right length -- was the scope ready?")
+        # except Exception as e:
+        #     print(e)
     
     def get_waveform_preamble(self):
         """The query returns the parameters of the source using by the command 
