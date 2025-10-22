@@ -14,16 +14,13 @@ from waxa.data.run_info import RunInfo
 from waxa.config.expt_params_waxa import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
-
-class ScopeTrace():
+    
+class ScopeTraceArray():
     def __init__(self,scope_key,ch,t,v):
         self.scope_key = scope_key
         self.ch = ch
         self.t = t
         self.v = v
-
-    def data(self):
-        return (self.t, self.v)
 
 def format_scope_data(dataset):
     scope_dict = dict()
@@ -33,16 +30,21 @@ def format_scope_data(dataset):
         this_scope_data = dict()
         for ch in range(4):
             # -3 is the axis that labels the channel, slice there
-            this_ch_data = []
+            # this_ch_data = []
             c = np.take(data_array,ch,-3)
             s = c.shape
             c = c.reshape(np.prod(s[:-2]),2,s[-1])
-            for single_shot_data in c:
-                t = single_shot_data[0]
-                v = single_shot_data[1]
-                this_ch_data.append(ScopeTrace(scope_key,ch,t,v))
-            this_ch_data = np.array(this_ch_data).reshape(*s[:-2])
-            this_scope_data[ch] = this_ch_data
+            # t = c[:][0].reshape(*s[:-2],s[-1])
+            # v = c[:][1].reshape(*s[:-2],s[-1])
+            # for single_shot_data in c:
+            #     t = single_shot_data[0]
+            #     v = single_shot_data[1]
+            #     this_ch_data.append(ScopeTrace(scope_key,ch,t,v))
+            # this_ch_data = np.array(this_ch_data).reshape(*s[:-2])
+            # this_scope_data[ch] = this_ch_data
+            t = np.take(c,0,axis=-2).reshape(*s[:-2],s[-1])
+            v = np.take(c,1,axis=-2).reshape(*s[:-2],s[-1])
+            this_scope_data[ch] = ScopeTraceArray(scope_key,ch,t,v)
         scope_dict[scope_key] = this_scope_data
     return scope_dict
 
