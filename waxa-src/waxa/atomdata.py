@@ -15,6 +15,37 @@ from waxa.config.expt_params_waxa import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
 
+class ScopeTrace():
+    def __init__(self,scope_key,ch,t,v):
+        self.scope_key = scope_key
+        self.ch = ch
+        self.t = t
+        self.v = v
+
+    def data(self):
+        return (self.t, self.v)
+
+def format_scope_data(dataset):
+    scope_dict = dict()
+    for scope_key in dataset.keys():
+
+        data_array = dataset[scope_key][()]
+        this_scope_data = dict()
+        for ch in range(4):
+            # -3 is the axis that labels the channel, slice there
+            this_ch_data = []
+            c = np.take(data_array,ch,-3)
+            s = c.shape
+            c = c.reshape(np.prod(s[:-2]),2,s[-1])
+            for single_shot_data in c:
+                t = single_shot_data[0]
+                v = single_shot_data[1]
+                this_ch_data.append(ScopeTrace(scope_key,ch,t,v))
+            this_ch_data = np.array(this_ch_data).reshape(*s[:-2])
+            this_scope_data[ch] = this_ch_data
+        scope_dict[scope_key] = this_scope_data
+    return scope_dict
+
 def unpack_group(file,group_key,obj):
     """Looks in an open h5 file in the group specified by key, and iterates over
     every dataset in that h5 group, and for each dataset assigns an attribute of
@@ -683,7 +714,9 @@ class atomdata():
             except:
                 self.sort_idx = np.array([])
                 self.sort_N = np.array([])
-                
+
+            d = f['data']['scope_data']
+            self.scope_data = format_scope_data(d)
 
 # class ConcatAtomdata(atomdata):
 #     def __init__(self,rids=[],roi_id=None,lite=False):
