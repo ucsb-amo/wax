@@ -125,7 +125,7 @@ class PolModBeatLock(BeatLockImaging):
         self.dds_polmod_v = dds_polmod_v
         self.dds_polmod_h = dds_polmod_h
 
-        self.polmod_bool = False
+        self.frequency_polmod = 0.
 
         self._frequency_array = np.array([0.,0.])
 
@@ -151,7 +151,7 @@ class PolModBeatLock(BeatLockImaging):
 
         f_shift_resonance = FREQUENCY_GS_HFS / 2
         f_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
-        if self.polmod_bool:
+        if self.frequency_polmod > 0.:
             f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency \
                                 + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency
         else:
@@ -184,8 +184,6 @@ class PolModBeatLock(BeatLockImaging):
         
         The reference frequency is provided by a DDS channel (dds_frame.beatlock_ref).
         '''
-        if frequency_polmod == 0.:
-            self.polmod_bool = False
         self.set_polmod(frequency_polmod=frequency_polmod)
 
         self.dds_sw.set_dds(amplitude=amp)
@@ -210,7 +208,7 @@ class PolModBeatLock(BeatLockImaging):
     @kernel(flags={"fast_math"})
     def polmod_frequency_to_ao_frequency(self, frequency_polmod)  -> TArray(TFloat):
 
-        if self.polmod_bool:
+        if frequency_polmod > 0.:
             order_p = self.dds_polmod_h.aom_order
             order_m = self.dds_polmod_v.aom_order
 
@@ -229,16 +227,6 @@ class PolModBeatLock(BeatLockImaging):
             self._frequency_array[1] = 0
 
         return self._frequency_array
-    
-    @kernel
-    def on(self):
-        self.dds_polmod_v.on()
-        self.dds_polmod_h.on()
-
-    @kernel
-    def off(self):
-        self.dds_polmod_v.off()
-        self.dds_polmod_h.off()
 
     @kernel
     def set_polmod(self,
@@ -321,6 +309,13 @@ class PolModBeatLock(BeatLockImaging):
                                 # self.amplitude,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
+            
+        if self.frequency_polmod > 0.:
+            self.dds_polmod_h.on()
+            self.dds_polmod_v.on()
+        else:
+            self.dds_polmod_h.on()
+            self.dds_polmod_v.off()
             
     @kernel
     def set_phase(self,relative_phase=dv,global_phase=dv,
