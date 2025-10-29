@@ -108,8 +108,8 @@ class BeatLockImaging():
 class PolModBeatLock(BeatLockImaging):
     def __init__(self,
                  dds_sw=DDS,
-                 dds_polmod_s=DDS,
-                 dds_polmod_p=DDS,
+                 dds_polmod_v=DDS,
+                 dds_polmod_h=DDS,
                  dds_beatref=DDS,
                  N_beatref_mult=8,
                  beatref_sign=-1,
@@ -122,8 +122,8 @@ class PolModBeatLock(BeatLockImaging):
             frequency_minimum_beat=frequency_minimum_beat,
             expt_params=expt_params)
     
-        self.dds_polmod_s = dds_polmod_s
-        self.dds_polmod_p = dds_polmod_p
+        self.dds_polmod_v = dds_polmod_v
+        self.dds_polmod_h = dds_polmod_h
 
         self.polmod_bool = False
 
@@ -152,10 +152,10 @@ class PolModBeatLock(BeatLockImaging):
         f_shift_resonance = FREQUENCY_GS_HFS / 2
         f_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
         if self.polmod_bool:
-            f_polmod_ao_shift = self.dds_polmod_s.aom_order * self.dds_polmod_s.frequency \
-                                + self.dds_polmod_p.aom_order * self.dds_polmod_p.frequency
+            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency \
+                                + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency
         else:
-            f_polmod_ao_shift = self.dds_polmod_s.aom_order * self.dds_polmod_s.frequency
+            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency
         f_offset = 1/self._beat_sign * (frequency_detuned - f_ao_shift - f_shift_resonance - f_polmod_ao_shift)
 
         f_beatlock_ref = f_offset / self._N_beatref_mult
@@ -203,16 +203,16 @@ class PolModBeatLock(BeatLockImaging):
         self.dds_beatref.on()
 
     def _init(self):
-        self._frequency_center_dds = (self.dds_polmod_p.frequency + self.dds_polmod_s.frequency)/2
-        if abs(self._frequency_center_dds - self.dds_polmod_p.frequency) != abs(self._frequency_center_dds - self.dds_polmod_s.frequency):
+        self._frequency_center_dds = (self.dds_polmod_h.frequency + self.dds_polmod_v.frequency)/2
+        if abs(self._frequency_center_dds - self.dds_polmod_h.frequency) != abs(self._frequency_center_dds - self.dds_polmod_v.frequency):
             raise ValueError("The - and + DDS frequencies should be equidistant from their mean for optimal efficiency.")
 
     @kernel(flags={"fast_math"})
     def polmod_frequency_to_ao_frequency(self, frequency_polmod)  -> TArray(TFloat):
 
         if self.polmod_bool:
-            order_p = self.dds_polmod_p.aom_order
-            order_m = self.dds_polmod_s.aom_order
+            order_p = self.dds_polmod_h.aom_order
+            order_m = self.dds_polmod_v.aom_order
 
             frequency_polmod = frequency_polmod / 2 # bc the atoms respond same to polarization rotated by pi
 
@@ -232,13 +232,13 @@ class PolModBeatLock(BeatLockImaging):
     
     @kernel
     def on(self):
-        self.dds_polmod_s.on()
-        self.dds_polmod_p.on()
+        self.dds_polmod_v.on()
+        self.dds_polmod_h.on()
 
     @kernel
     def off(self):
-        self.dds_polmod_s.off()
-        self.dds_polmod_p.off()
+        self.dds_polmod_v.off()
+        self.dds_polmod_h.off()
 
     @kernel
     def set_polmod(self,
@@ -305,19 +305,19 @@ class PolModBeatLock(BeatLockImaging):
             relative_phase_changed = True
         
         if phase_mode_changed:
-            self.dds_polmod_p.set_phase_mode(self.phase_mode)
-            self.dds_polmod_s.set_phase_mode(self.phase_mode)
+            self.dds_polmod_h.set_phase_mode(self.phase_mode)
+            self.dds_polmod_v.set_phase_mode(self.phase_mode)
 
         # if freq_changed or amp_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
         if freq_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self._frequency_array = self.polmod_frequency_to_ao_frequency(self.frequency_polmod)
 
-            self.dds_polmod_p.set_dds(self._frequency_array[0],
+            self.dds_polmod_h.set_dds(self._frequency_array[0],
                                 # self.amplitude,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase)
             
-            self.dds_polmod_s.set_dds(self._frequency_array[1],
+            self.dds_polmod_v.set_dds(self._frequency_array[1],
                                 # self.amplitude,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
