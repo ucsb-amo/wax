@@ -2,7 +2,7 @@ import numpy as np
 from pylablib.devices import Tektronix
 from .siglent_sds2000 import SiglentSDS2000X_Base
 from artiq.language import TBool, now_mu
-from artiq.experiment import kernel
+from artiq.experiment import kernel, rpc
 from waxx.util.artiq.async_print import aprint
 
 class ScopeData:
@@ -115,7 +115,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         
         self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id,label,scope_data)
-
+    
     def read_sweep(self,channels):
         if isinstance(channels,int):
             channels = [channels]
