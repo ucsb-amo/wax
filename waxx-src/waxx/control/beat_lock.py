@@ -356,3 +356,16 @@ class PolModBeatLock(BeatLockImaging):
         at_mu(t)
         if not pretrigger:
             delay(5.e-6)
+
+    @kernel
+    def init(self,frequency_polmod=0.,
+            global_phase=0.,relative_phase=0.,
+            t_phase_origin_mu=np.int64(-1),
+            phase_mode=1):
+        if t_phase_origin_mu < 0:
+            t_phase_origin_mu = now_mu()
+        self.set_polmod(frequency_polmod,
+                        global_phase,relative_phase,
+                        t_phase_origin_mu=t_phase_origin_mu,
+                        phase_mode=phase_mode,
+                        init=True)
