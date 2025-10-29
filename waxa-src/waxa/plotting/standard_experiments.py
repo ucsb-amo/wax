@@ -206,6 +206,8 @@ def rabi_oscillation(ad:atomdata,
                             override_normalize_minimum=override_normalize_min,
                             override_normalize_maximum=override_normalize_max)
     
+    print(np.max(populations))
+    
     if avg_repeats:
         mean, err = get_repeat_std_error(populations, Nr)
 
@@ -231,7 +233,7 @@ def rabi_oscillation(ad:atomdata,
                             p0=[fit_guess_frequency, fit_guess_phase,
                                  fit_guess_amp, fit_guess_offset,
                                    fit_guess_decay_tau],
-                            bounds=((0.,0.,0.,0.,0.),(np.inf,2*np.pi,1.,1.,np.inf)))
+                            bounds=((0.,0.,0.,0.,0.),(1.2*fit_guess_frequency, 2*np.pi, 1., 1., np.inf)))
         
         y_fit = _fit_func_rabi_oscillation(times, *popt)
 

@@ -7,3 +7,7 @@ class DummyCore():
     @kernel
     def wait_until_mu(self,t):
         pass
+
+    @kernel
+    def reset(self):
+        pass
