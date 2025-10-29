@@ -8,7 +8,6 @@ from pylablib.core.utils import general as general_utils
 from pylablib.core.devio import interface
 
 from queue import Queue
-from PyQt6.QtCore import QThread, pyqtSignal
 
 from waxx.config.timeouts import (CAMERA_GRAB_TIMEOUT_ANDOR as TIMEOUT)
 
