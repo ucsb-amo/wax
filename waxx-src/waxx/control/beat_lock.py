@@ -31,9 +31,11 @@ class BeatLockImaging():
         # +1 for lock greater frequency than reference (Gain switch "+"), vice versa ("-")
         self._beat_sign = beatref_sign
         self._frequency_minimum_beat = frequency_minimum_beat
+        self.phase_mode = 1
 
     @portable(flags={"fast-math"})
-    def imaging_detuning_to_beat_ref(self, frequency_detuned) -> TFloat:
+    def imaging_detuning_to_beat_ref(self, frequency_detuned,
+                             frequency_polmod=0.) -> TFloat:
         """Converts a desired imaging detuning to the required beat lock reference.
 
         Makes reference to the beat lock sign, which DDS channel drives the AO
@@ -66,7 +68,8 @@ class BeatLockImaging():
         return f_beatlock_ref
     
     @kernel(flags={"fast-math"})
-    def set_imaging_detuning(self, frequency_detuned, amp):
+    def set_imaging_detuning(self, frequency_detuned, amp,
+                             frequency_polmod=0.):
         '''
         Sets the detuning of the beat-locked imaging laser (in Hz).
 
@@ -105,6 +108,21 @@ class BeatLockImaging():
         delay(t)
         self.dds_sw.off()
 
+    @kernel
+    def on(self):
+        self.dds_sw.on()
+    
+    @kernel
+    def off(self):
+        self.dds_sw.off()
+
+    @kernel
+    def init(self,frequency_polmod=0.,
+            global_phase=0.,relative_phase=0.,
+            t_phase_origin_mu=np.int64(-1),
+            phase_mode=1):
+        pass
+
 class PolModBeatLock(BeatLockImaging):
     def __init__(self,
                  dds_sw=DDS,
@@ -126,9 +144,14 @@ class PolModBeatLock(BeatLockImaging):
         self.dds_polmod_h = dds_polmod_h
 
         self.frequency_polmod = 0.
+        self.global_phase = 0.
+        self.relative_phase = 0.
+        self.t_phase_origin_mu = np.int64(0)
 
+        self.phase_mode = 0  # 0: independent, 1: synchronized
+
+        self._frequency_center_dds = 0.
         self._frequency_array = np.array([0.,0.])
-
         self._init()
 
     @portable(flags={"fast-math"})
@@ -170,8 +193,7 @@ class PolModBeatLock(BeatLockImaging):
         return f_beatlock_ref
     
     @kernel(flags={"fast-math"})
-    def set_imaging_detuning(self, frequency_detuned, amp,
-                             frequency_polmod=0.):
+    def set_imaging_detuning(self, frequency_detuned, amp):
         '''
         Sets the detuning of the beat-locked imaging laser (in Hz).
 
@@ -184,7 +206,7 @@ class PolModBeatLock(BeatLockImaging):
         
         The reference frequency is provided by a DDS channel (dds_frame.beatlock_ref).
         '''
-        self.set_polmod(frequency_polmod=frequency_polmod)
+        self.set_polmod(self.frequency_polmod)
 
         self.dds_sw.set_dds(amplitude=amp)
 
@@ -212,7 +234,7 @@ class PolModBeatLock(BeatLockImaging):
             order_p = self.dds_polmod_h.aom_order
             order_m = self.dds_polmod_v.aom_order
 
-            frequency_polmod = frequency_polmod / 2 # bc the atoms respond same to polarization rotated by pi
+            frequency_polmod = frequency_polmod # bc the atoms respond same to polarization rotated by pi
 
             df = frequency_polmod / 4
 
@@ -224,7 +246,7 @@ class PolModBeatLock(BeatLockImaging):
                 self._frequency_array[1] = self._frequency_center_dds - df
         else:
             self._frequency_array[0] = self._frequency_center_dds
-            self._frequency_array[1] = 0
+            self._frequency_array[1] = 0.
 
         return self._frequency_array
 
@@ -298,6 +320,7 @@ class PolModBeatLock(BeatLockImaging):
 
         # if freq_changed or amp_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
         if freq_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
+
             self._frequency_array = self.polmod_frequency_to_ao_frequency(self.frequency_polmod)
 
             self.dds_polmod_h.set_dds(self._frequency_array[0],
@@ -369,3 +392,5 @@ class PolModBeatLock(BeatLockImaging):
                         t_phase_origin_mu=t_phase_origin_mu,
                         phase_mode=phase_mode,
                         init=True)
+        self.dds_polmod_h._stash_defaults()
+        self.dds_polmod_v._stash_defaults()
