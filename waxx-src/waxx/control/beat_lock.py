@@ -175,10 +175,11 @@ class PolModBeatLock(BeatLockImaging):
         f_shift_resonance = FREQUENCY_GS_HFS / 2
         f_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
         if self.frequency_polmod > 0.:
-            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency \
-                                + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency
+            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency * 2 \
+                                + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
         else:
-            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency
+            f_polmod_ao_shift = self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
+
         f_offset = 1/self._beat_sign * (frequency_detuned - f_ao_shift - f_shift_resonance - f_polmod_ao_shift)
 
         f_beatlock_ref = f_offset / self._N_beatref_mult
