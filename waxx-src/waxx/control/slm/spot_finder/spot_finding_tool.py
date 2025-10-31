@@ -22,6 +22,7 @@ class PatternApp:
         self.angle_deg = 34.5
         self.mode = "spot"
         self.keys_pressed = set()
+        self.init = False
 
         # Connect to display server
         self.server_ip = "192.168.1.102"
@@ -78,24 +79,25 @@ class PatternApp:
             return
         try:
             if self.mode == "spot":
-                data = {
+                command = {
                     "mask": "spot",
                     "center": self.spot_center,
                     "dimension": self.spot_radius,
                     "spacing":self.grating_spacing,
                     "angle":self.angle_deg,
-                    "phase": 3.14                    
+                    "phase": 3,
+                    "initialize": self.init
                 }
             else:
-                data = {
+                command = {
                     "mask": "grating",
                     "center": self.grating_center,
                     "dimension": self.grating_size,
                     "spacing":self.grating_spacing,
                     "angle":self.angle_deg,
-                    "phase": 3.14
+                    "phase": 3
                 }
-            message = json.dumps(data).encode() + b'\n'
+            message = json.dumps(command).encode() + b'\n'
             time.sleep(0.02)
             self.sock.sendall(message)
         except Exception as e:
@@ -182,6 +184,7 @@ class PatternApp:
         if key == "Escape":
             self.mode = "spot"
             self.spot_radius = 0
+            self.init = True
             self.quit_program()
         elif key == "1":
             if self.mode != "spot":
