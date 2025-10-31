@@ -1,13 +1,13 @@
 import socket
 from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
-from kexp.config.expt_params import ExptParams
+from waxx.config.expt_params_waxx import ExptParams
 import numpy as np
 import json
 di = -1
 dv = 1.
 dm = 1
-SLM_RPC_DELAY = 1.
+SLM_RPC_DELAY = 0.25
 
 class SLM:
     def __init__(self, expt_params=ExptParams(), core=Core,
@@ -66,7 +66,9 @@ class SLM:
                     "center": [x_center, y_center],
                     "phase": phase/np.pi,
                     "dimension": dimension,
-                    "initialize": initialize
+                    "initialize": initialize,
+                    "spacing": 10,
+                    "angle": 35,
                 }
             # command = f"{int(dimension)} {phase/np.pi} {x_center} {y_center} {mask}"
             self._send_command(command)
