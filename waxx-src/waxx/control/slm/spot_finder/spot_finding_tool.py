@@ -100,7 +100,6 @@ class PatternApp:
             self.sock.sendall(message)
         except Exception as e:
             print("Error sending data:", e)
-# I found some gen AIs are stupid. For example, they cannot read a pdf file and give me the latex form directly. Instead, they just work well when I feed them page by page. How can I make a (python) code, which can read pdf file and sent them to a gen AI to generate latex?   
     def update_title(self):
         center = self.spot_center if self.mode == "spot" else self.grating_center
         self.main_window.title(f"Main - Control Window | Mode: {self.mode} | Center: ({center[0]}, {center[1]}) | Size: {self.spot_radius} | Spacing: {self.grating_spacing} | Angle: {self.angle_deg}")
