@@ -3,7 +3,7 @@ import json
 import time
 import threading
 import queue
-from .slm_server import SLM_server
+from slm_server import SLM_server
 
 SERVER_IP = '192.168.1.102'
 SERVER_PORT = 5000

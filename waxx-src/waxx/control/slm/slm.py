@@ -67,7 +67,11 @@ class SLM:
                     "phase": phase/np.pi,
                     "dimension": dimension,
                     "initialize": initialize,
+<<<<<<< HEAD
                     "spacing": 100,
+=======
+                    "spacing": 10,
+>>>>>>> f70de005d4621a0ae9a3518a9409dc609933a0a5
                     "angle": 45,
                 }
             # command = f"{int(dimension)} {phase/np.pi} {x_center} {y_center} {mask}"
