@@ -68,7 +68,23 @@ class PatternApp:
         self.canvas1.bind("<MouseWheel>", self.resize_pattern)
         self.canvas1.bind("<Button-4>", self.resize_pattern)
         self.canvas1.bind("<Button-5>", self.resize_pattern)
-
+        self.canvas1.create_text(200,170,fill="darkblue",font="Ariel 10 bold",
+                text="=== Keyboard Instructions ===\n"
+                    "General:\n"                    
+                    "   1 ............... Switch to spot mode\n"
+                    "   2 ............... Switch to grating mode\n"
+                    "   0 ............... Mirror mode\n"
+                    "   Esc ............ Initialize SLM and quit program\n"
+                    "   Dragging or using arrow keys to move the pattern\n"
+                    "   Ctrl + arrow keys can move finely\n\n"
+                    "spot mode:\n"
+                    "   +/- ........ Increase/decrease size\n"
+                    "   Ctrl + (+/-) .... Fine adjusting size\n\n"
+                    "grating mode:\n"
+                    "   +/- ........ Increase/decrease size\n"
+                    "   Ctrl + (+/-) .... Fine adjusting size\n"
+                    "   Shift + (+/-) ... Adjust grating spacing\n"
+                    "   Space ........... Rotate grating ±0.5° (hold Shift to reverse)\n\n")
         self.update_image()
 
     def quit_program(self):
