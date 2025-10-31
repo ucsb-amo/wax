@@ -68,7 +68,7 @@ class SLM:
                     "dimension": dimension,
                     "initialize": initialize,
                     "spacing": 10,
-                    "angle": 35,
+                    "angle": 45,
                 }
             # command = f"{int(dimension)} {phase/np.pi} {x_center} {y_center} {mask}"
             self._send_command(command)
