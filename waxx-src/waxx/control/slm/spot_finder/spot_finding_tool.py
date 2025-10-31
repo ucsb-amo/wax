@@ -68,7 +68,7 @@ class PatternApp:
         self.canvas1.bind("<MouseWheel>", self.resize_pattern)
         self.canvas1.bind("<Button-4>", self.resize_pattern)
         self.canvas1.bind("<Button-5>", self.resize_pattern)
-        self.canvas1.create_text(200,170,fill="darkblue",font="Ariel 10 bold",
+        self.canvas1.create_text(200,170,fill="blue",font="Ariel 10 bold",
                 text="=== Keyboard Instructions ===\n"
                     "General:\n"                    
                     "   1 ............... Switch to spot mode\n"
