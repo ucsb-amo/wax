@@ -22,6 +22,7 @@ class PatternApp:
         self.angle_deg = 34.5
         self.mode = "spot"
         self.keys_pressed = set()
+        self.init = False
 
         # Connect to display server
         self.server_ip = "192.168.1.102"
@@ -67,7 +68,23 @@ class PatternApp:
         self.canvas1.bind("<MouseWheel>", self.resize_pattern)
         self.canvas1.bind("<Button-4>", self.resize_pattern)
         self.canvas1.bind("<Button-5>", self.resize_pattern)
-
+        self.canvas1.create_text(200,170,fill="blue",font="Ariel 10 bold",
+                text="=== Keyboard Instructions ===\n"
+                    "General:\n"                    
+                    "   1 ............... Switch to spot mode\n"
+                    "   2 ............... Switch to grating mode\n"
+                    "   0 ............... Mirror mode\n"
+                    "   Esc ............ Initialize SLM and quit program\n"
+                    "   Dragging or using arrow keys to move the pattern\n"
+                    "   Ctrl + arrow keys can move finely\n\n"
+                    "spot mode:\n"
+                    "   +/- ........ Increase/decrease size\n"
+                    "   Ctrl + (+/-) .... Fine adjusting size\n\n"
+                    "grating mode:\n"
+                    "   +/- ........ Increase/decrease size\n"
+                    "   Ctrl + (+/-) .... Fine adjusting size\n"
+                    "   Shift + (+/-) ... Adjust grating spacing\n"
+                    "   Space ........... Rotate grating ±0.5° (hold Shift to reverse)\n\n")
         self.update_image()
 
     def quit_program(self):
@@ -78,29 +95,29 @@ class PatternApp:
             return
         try:
             if self.mode == "spot":
-                data = {
+                command = {
                     "mask": "spot",
                     "center": self.spot_center,
                     "dimension": self.spot_radius,
                     "spacing":self.grating_spacing,
                     "angle":self.angle_deg,
-                    "phase": 3.14                    
+                    "phase": 3,
+                    "initialize": self.init
                 }
             else:
-                data = {
+                command = {
                     "mask": "grating",
                     "center": self.grating_center,
                     "dimension": self.grating_size,
                     "spacing":self.grating_spacing,
                     "angle":self.angle_deg,
-                    "phase": 3.14
+                    "phase": 3
                 }
-            message = json.dumps(data).encode() + b'\n'
+            message = json.dumps(command).encode() + b'\n'
             time.sleep(0.02)
             self.sock.sendall(message)
         except Exception as e:
             print("Error sending data:", e)
-# I found some gen AIs are stupid. For example, they cannot read a pdf file and give me the latex form directly. Instead, they just work well when I feed them page by page. How can I make a (python) code, which can read pdf file and sent them to a gen AI to generate latex?   
     def update_title(self):
         center = self.spot_center if self.mode == "spot" else self.grating_center
         self.main_window.title(f"Main - Control Window | Mode: {self.mode} | Center: ({center[0]}, {center[1]}) | Size: {self.spot_radius} | Spacing: {self.grating_spacing} | Angle: {self.angle_deg}")
@@ -183,6 +200,7 @@ class PatternApp:
         if key == "Escape":
             self.mode = "spot"
             self.spot_radius = 0
+            self.init = True
             self.quit_program()
         elif key == "1":
             if self.mode != "spot":
