@@ -115,6 +115,9 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         
         self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id,label,scope_data)
+
+    def arm(self):
+        self.scope.arm()
     
     def read_sweep(self,channels):
         if isinstance(channels,int):
@@ -154,6 +157,9 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         """  
         self.scope = Tektronix.ITektronixScope(self.device_id)      
         super().__init__(device_id,label,scope_data)
+
+    def arm(self):
+        pass
 
     def read_sweep(self,channels) -> TBool:
         """Read out the specified channels and records result to self.data.

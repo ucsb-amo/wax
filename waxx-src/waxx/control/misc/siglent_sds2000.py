@@ -45,7 +45,7 @@ class SiglentSDS2000X_Base(vxi11.Instrument):
         """
         while True:
             res = self.get_trigger_status()
-            if not res == SiglentSDSTriggerStatus.STOP.value:
+            if res == SiglentSDSTriggerStatus.STOP.value:
                 break
 
         # Send command that specifies the source waveform to be transferred
