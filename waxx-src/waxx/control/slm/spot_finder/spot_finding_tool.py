@@ -18,8 +18,8 @@ class PatternApp:
         self.spot_center = [1148,916]# [self.canvas_width // 2, self.canvas_height // 2]
         self.grating_spacing = 6
         self.grating_size = 300
-        self.grating_center = [1148,916]# [self.canvas_width // 2, self.canvas_height // 2]
-        self.angle_deg = 34.5
+        self.grating_center = self.spot_center# [self.canvas_width // 2, self.canvas_height // 2]
+        self.angle_deg = 0
         self.mode = "spot"
         self.keys_pressed = set()
         self.init = False
