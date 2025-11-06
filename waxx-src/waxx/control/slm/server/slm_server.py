@@ -154,8 +154,8 @@ class SLM_server():
     def initialize_slm(self):
         global slm_lib, width, height, is_eight_bit_image
 
-        if self.slm_initialized:
-            return  # Skip re-initialization if already done
+        # if self.slm_initialized:
+        #     return  # Skip re-initialization if already done
 
         awareness = ctypes.c_int()
         ctypes.windll.shcore.GetProcessDpiAwareness(0, ctypes.byref(awareness))
