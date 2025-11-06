@@ -1,6 +1,5 @@
 import numpy as np
-from pylablib.devices import Tektronix
-from .siglent_sds2000 import SiglentSDS2000X_Base
+from .oscilloscopes_base import Scope_Base, TektronixTBS1104B_Base, SiglentSDS2000X_Base
 from artiq.language import TBool, now_mu
 from artiq.experiment import kernel, rpc
 from waxx.util.artiq.async_print import aprint
@@ -18,19 +17,36 @@ class ScopeData:
             except:
                 pass
 
-    def add_tektronix_scope(self,device_id="",label=""):
-        scope = TektronixScope_TBS1104(device_id=device_id,label=label,
-                               scope_data=self)
-        return scope
-    
-    def add_siglent_scope(self,device_id="",label=""):
-        scope = SiglentScope_SDS2104X(device_id=device_id,
-                                      label=label,
+    def add_tektronix_scope(self,device_id="",label="",arm=True):
+        scope = TektronixScope_TBS1104(device_id=device_id,
+                                    label=label,
+                                    arm=arm,
                                     scope_data=self)
         return scope
     
+    def add_siglent_scope(self,device_id="",label="",arm=True):
+        scope = SiglentScope_SDS2104X(device_id=device_id,
+                                    label=label,
+                                    arm=arm,
+                                    scope_data=self)
+        return scope
+    
+    def arm_rpc(self):
+        for scope in self.scopes:
+            try: 
+                if scope._arm:
+                    scope.scope.arm()
+                else:
+                    scope.scope.set_normal_trigger()
+                    scope.scope.set_trigger_run()
+            except: pass
+        
+    @kernel
+    def arm(self):
+        self.arm_rpc()
+    
 class GenericWaxxScope():
-    def __init__(self,device_id="",label="",
+    def __init__(self,device_id="",label="",arm=True,
                  scope_data=ScopeData()):
         """A scope object.
 
@@ -46,6 +62,7 @@ class GenericWaxxScope():
             experiment ("self.scope_data").
         """        
         self._scopedata = scope_data
+        self._arm = arm
 
         if label == "":
             idx = len(self._scopedata.scopes)
@@ -56,6 +73,9 @@ class GenericWaxxScope():
         self._data = []
         
         self._scopedata.scopes.append(self)
+
+        if not hasattr(self,'scope'):
+            self.scope = Scope_Base()
 
     def data(self):
         if self._scopedata.xvardims != []:
@@ -96,8 +116,11 @@ class GenericWaxxScope():
             device_id = devs[idx]
         return device_id
     
+    def arm(self):
+        self.scope.arm()
+    
 class SiglentScope_SDS2104X(GenericWaxxScope):
-    def __init__(self,device_id="",label="",
+    def __init__(self,device_id="",label="",arm=True,
                  scope_data=ScopeData()):
         """A scope object.
 
@@ -114,10 +137,10 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         """        
         
         self.scope = SiglentSDS2000X_Base(device_id)
-        super().__init__(device_id,label,scope_data)
+        super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
     
     def read_sweep(self,channels):
-        if isinstance(channels,int):
+        if isinstance(channels,int) or isinstance(channels,np.int32):
             channels = [channels]
         channels = np.asarray(channels)
         self._scopedata._scope_trace_taken = True
@@ -125,6 +148,8 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
         data = np.zeros((4,2,Npts))
+        if np.any([ch not in range(4) for ch in channels]):
+            raise ValueError('Invalid channel.')
         for ch in range(4):
             if self.scope.is_channel_visible(ch) and (ch in channels):
                 try:
@@ -132,12 +157,12 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
                     data[ch][0] = t
                     data[ch][1] = v
                 except Exception as e:
+                    # aprint(e)
                     pass
         self._data.append(data)
-        # return True
 
 class TektronixScope_TBS1104(GenericWaxxScope):
-    def __init__(self,device_id="",label="",
+    def __init__(self,device_id="",label="",arm=True,
                  scope_data=ScopeData()):
         """A scope object.
 
@@ -152,8 +177,8 @@ class TektronixScope_TBS1104(GenericWaxxScope):
             scope_data (ScopeData): Should be the ScopeData object of the
             experiment ("self.scope_data").
         """  
-        self.scope = Tektronix.ITektronixScope(self.device_id)      
-        super().__init__(device_id,label,scope_data)
+        self.scope = TektronixTBS1104B_Base(self.device_id)
+        super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
 
     def read_sweep(self,channels) -> TBool:
         """Read out the specified channels and records result to self.data.

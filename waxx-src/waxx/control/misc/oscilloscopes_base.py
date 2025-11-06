@@ -3,6 +3,27 @@ import vxi11
 import struct
 import numpy as np
 from enum import Enum
+from pylablib.devices import Tektronix
+
+class Scope_Base():
+    def __init__(self):
+        pass
+
+    def arm(self):
+        pass
+
+    def close(self):
+        pass
+
+    def set_normal_trigger(self):
+        pass
+
+    def set_trigger_run(self):
+        pass
+
+class TektronixTBS1104B_Base(Tektronix.ITektronixScope, Scope_Base):
+    def __init__(self, device_id):
+        super().__init__(device_id=device_id)
 
 TIMEBASE_VALUES = (
         200e-12, 500e-12, 1e-9, 2e-9, 5e-9, 10e-9, 20e-9, 50e-9, 100e-9, 200e-9,
@@ -24,7 +45,7 @@ class SiglentWaveformWidth(Enum):
     BYTE = "BYTE"
     WORD = "WORD"
 
-class SiglentSDS2000X_Base(vxi11.Instrument):
+class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
     _name = "Siglent SDS2000X Plus"
     center_code = 127
     full_code = 256
@@ -43,10 +64,10 @@ class SiglentSDS2000X_Base(vxi11.Instrument):
 
         :param src_channel: The channel to be sampled. Zero-indexed.
         """
-        while True:
-            res = self.get_trigger_status()
-            if not res == SiglentSDSTriggerStatus.STOP.value:
-                break
+        # while True:
+        #     res = self.get_trigger_status()
+        #     if res == SiglentSDSTriggerStatus.STOP.value:
+        #         break
 
         # Send command that specifies the source waveform to be transferred
 
