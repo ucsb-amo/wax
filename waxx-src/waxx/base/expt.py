@@ -163,10 +163,11 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.scope_data.close()
 
-        if self.run_info.save_data:
-            self.cleanup_scanned()
-            self.write_data(expt_filepath)
-        else:
-            self.remove_incomplete_data()
+        if self.setup_camera:
+            if self.run_info.save_data:
+                self.cleanup_scanned()
+                self.write_data(expt_filepath)
+            else:
+                self.remove_incomplete_data()
                 
         # server_talk.play_random_sound()
