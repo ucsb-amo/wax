@@ -5,20 +5,17 @@ import threading
 import queue
 from slm_server import SLM_server
 
+
 SERVER_IP = '192.168.1.102'
 SERVER_PORT = 5000
 BUFFER_SIZE = 1024
 
 REINIT_INTERVAL_SEC = 3600          # reinitialize period
-MIN_IDLE_BEFORE_REINIT_SEC = 200     # idle time
+MIN_IDLE_BEFORE_REINIT_SEC = 20     # idle time
 CMD_QUEUE_MAXSIZE = 256
 
 slmtest = SLM_server()
 cmd_q = queue.Queue(maxsize=CMD_QUEUE_MAXSIZE)
-
-# Periodic self-reinit enable/disable (default: enabled)
-self_reinit_enabled = threading.Event()
-self_reinit_enabled.set()  # True => periodic reinit allowed
 
 default_pattern = {
     "dimension": 0,
@@ -36,11 +33,11 @@ last_pattern = {
     "center_y": 600,
     "grating_spacing": 10,
     "angle_deg": 0,
-    "mask": 1
+    "mask": 1  # 1=spot, 2=grating
 }
 
 _last_activity_lock = threading.Lock()
-_last_activity_monotonic = time.monotonic()
+_last_activity_monotonic = time.monotonic()  
 
 def _touch_activity():
     global _last_activity_monotonic
@@ -61,16 +58,17 @@ def slm_worker():
         print(f"Error during initial init: {e}")
 
     while True:
-        task = cmd_q.get()
+        task = cmd_q.get() 
         if task is None:
-            break
+            break  
 
         ttype = task.get("type")
         try:
             if ttype == "REINIT":
                 print("Reinitializing SLM...")
                 slmtest.initialize_slm()
-                print("Reinit done.")
+                print("Restoring default pattern after reinitializing...\n")
+                _apply_pattern(default_pattern, fast=True)
 
             elif ttype == "APPLY":
                 last_pattern.update({
@@ -83,7 +81,7 @@ def slm_worker():
                     "mask": task["mask"]
                 })
                 _apply_pattern(last_pattern, fast=True)
-                _touch_activity()
+                _touch_activity()  
 
             else:
                 print(f"Unknown task type: {ttype}")
@@ -92,7 +90,7 @@ def slm_worker():
         finally:
             cmd_q.task_done()
 
-def _apply_pattern(pat, fast=True):
+def _apply_pattern(pat, fast=True): # Generate and upload a pattern
     img = slmtest.generate_mask(
         dimension=pat["dimension"],
         phase=pat["phase"],
@@ -117,12 +115,13 @@ def _apply_pattern(pat, fast=True):
     print('Waiting for next task...\n')
 
 def periodic_reinit_scheduler():
+    """
+    Reinitialize every REINIT_INTERVAL_SEC, but only enqueues REINIT
+    if server is idle long enough and the queue is empty.
+    """
     next_tick = time.monotonic() + REINIT_INTERVAL_SEC
     while True:
         time.sleep(0.5)
-        if not self_reinit_enabled.is_set():
-            continue  
-
         now = time.monotonic()
         if now < next_tick:
             continue
@@ -168,24 +167,34 @@ def handle_client(conn):
                 command = data.decode('utf-8').strip()
                 print(f"Received command: {command}")
 
-                parsed = analyze_command(command)
-                if parsed is None:
+                dims = analyze_command(command)
+                if dims is None:
                     print("Ignoring malformed command.")
                     continue
 
-                (dimension, phase, center_x, center_y,
-                 grating_spacing, angle_deg, mask, init_flag) = parsed
+                dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask = dims
 
-                if init_flag is True:
-                    self_reinit_enabled.clear()
-                    enqueue_reinit_then_apply(
-                        dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask
-                    )
-                else:
-                    self_reinit_enabled.set()
-                    enqueue_apply_only(
-                        dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask
-                    )
+                task = {
+                    "type": "APPLY",
+                    "dimension": dimension,
+                    "phase": phase,
+                    "center_x": center_x,
+                    "center_y": center_y,
+                    "grating_spacing": grating_spacing,
+                    "angle_deg": angle_deg,
+                    "mask": mask
+                }
+
+                try:
+                    cmd_q.put_nowait(task)
+                except queue.Full:
+                    try:
+                        _ = cmd_q.get_nowait()
+                        cmd_q.task_done()
+                        cmd_q.put_nowait(task)
+                        print("Queue full: dropped one stale task to enqueue latest APPLY.")
+                    except Exception as e:
+                        print(f"Failed to enqueue APPLY: {e}")
 
             except ConnectionResetError:
                 print("SLM_find_spot.py disconnected")
@@ -194,70 +203,7 @@ def handle_client(conn):
                 print(f"Error while handling client: {e}")
                 break
 
-def enqueue_apply_only(dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask):
-    task = {
-        "type": "APPLY",
-        "dimension": dimension,
-        "phase": phase,
-        "center_x": center_x,
-        "center_y": center_y,
-        "grating_spacing": grating_spacing,
-        "angle_deg": angle_deg,
-        "mask": mask
-    }
-    try:
-        cmd_q.put_nowait(task)
-    except queue.Full:
-        try:
-            _ = cmd_q.get_nowait()
-            cmd_q.task_done()
-            cmd_q.put_nowait(task)
-            print("Queue full: dropped one stale task to enqueue latest APPLY.")
-        except Exception as e:
-            print(f"Failed to enqueue APPLY: {e}")
-
-def enqueue_reinit_then_apply(dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask):
-    try:
-        cmd_q.put_nowait({"type": "REINIT"})
-        cmd_q.put_nowait({
-            "type": "APPLY",
-            "dimension": dimension,
-            "phase": phase,
-            "center_x": center_x,
-            "center_y": center_y,
-            "grating_spacing": grating_spacing,
-            "angle_deg": angle_deg,
-            "mask": mask
-        })
-    except queue.Full:
-        freed = 0
-        try:
-            _ = cmd_q.get_nowait(); cmd_q.task_done(); freed += 1
-            _ = cmd_q.get_nowait(); cmd_q.task_done(); freed += 1
-        except Exception:
-            pass
-        try:
-            cmd_q.put_nowait({"type": "REINIT"})
-            cmd_q.put_nowait({
-                "type": "APPLY",
-                "dimension": dimension,
-                "phase": phase,
-                "center_x": center_x,
-                "center_y": center_y,
-                "grating_spacing": grating_spacing,
-                "angle_deg": angle_deg,
-                "mask": mask
-            })
-            print(f"Queue full: dropped {freed} task(s) to enqueue REINIT+APPLY.")
-        except Exception as e:
-            print(f"Failed to enqueue REINIT+APPLY: {e}")
-
 def analyze_command(command):
-    """
-    Returns: (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask, init_flag)
-    init_flag is True/False; default False if missing.
-    """
-    # Defaults
     dimension = 0
     phase = 0.0
     center_x = 1920 // 2
@@ -265,24 +211,17 @@ def analyze_command(command):
     mask = 1  # 1=spot, 2=grating
     grating_spacing = 10
     angle_deg = 0
-    init_flag = False  # default if missing
 
     try:
         d = json.loads(command)
-
-        # initialize
-        init_flag = bool(d.get("initialize", False))
-
         m = d.get("mask", "spot")
+
         cx, cy = d.get("center", [center_x, center_y])
         center_x, center_y = int(cx), int(cy)
         dimension = int(d.get("dimension", dimension))
         phase = float(d.get("phase", phase))
         grating_spacing = int(d.get("spacing", grating_spacing))
-        angle_val = d.get("angle", d.get("angle_deg", angle_deg))
-
-        angle_deg = float(angle_val) if isinstance(angle_val, (int, float, str)) else angle_deg
-        angle_deg = float(angle_deg)
+        angle_deg = int(d.get("angle", d.get("angle_deg", angle_deg)))
 
         if m == "spot":
             mask = 1
@@ -294,7 +233,7 @@ def analyze_command(command):
             print("Unknown mask; set to default spot.")
             mask = 1
 
-        return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask, init_flag)
+        return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask)
 
     except json.JSONDecodeError:
         parts = command.split()
@@ -303,7 +242,7 @@ def analyze_command(command):
                 dimension = int(parts[0])
                 phase = float(parts[1])
                 mask = int(parts[2])
-                return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask, init_flag)
+                return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask)
             except ValueError:
                 print("Plaintext 3-arg parse failed.")
                 return None
@@ -315,9 +254,9 @@ def analyze_command(command):
                 center_x = int(parts[2])
                 center_y = int(parts[3])
                 grating_spacing = int(parts[4])
-                angle_deg = float(parts[5])
+                angle_deg = int(parts[5])
                 mask = int(parts[6])
-                return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask, init_flag)
+                return (dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask)
             except ValueError:
                 print("Plaintext 7-arg parse failed.")
                 return None
@@ -328,5 +267,7 @@ def analyze_command(command):
 
 if __name__ == '__main__':
     threading.Thread(target=slm_worker, daemon=True).start()
+
     threading.Thread(target=periodic_reinit_scheduler, daemon=True).start()
+
     start_server()
