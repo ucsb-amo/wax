@@ -33,13 +33,14 @@ class TOF():
             self.xvarname = ad.xvarnames[0]
             self.xvar = ad.xvars[0]
 
-        self.t_tof = ad.params.t_tof
+        
         
         from waxa.fitting.gaussian import GaussianTemperatureFit
         
-        self.fit = GaussianTemperatureFit(self.t_tof, self.sigmas,
+        self.fit = GaussianTemperatureFit(ad.params.t_tof, self.sigmas,
                                           include_idx = include_idx,
                                           exclude_idx = exclude_idx)
+        self.t_tof = self.fit.xdata
         
         self.sigma_r0 = self.fit.y_fitdata[0]
         self.average_atom_number = np.mean(self.atom_numbers)
