@@ -498,7 +498,7 @@ class GaussianTemperatureFit(Fit):
                          include_idx=include_idx,exclude_idx=exclude_idx,
                          savgol_window=4,savgol_degree=2)
 
-        super().__init__(xdata,ydata,savgol_window=4,savgol_degree=2)
+        # super().__init__(xdata,ydata,savgol_window=4,savgol_degree=2)
 
         # scales up small numbers
         self._mult = 1.e6
