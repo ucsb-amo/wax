@@ -16,6 +16,7 @@ class BeatLockImaging():
     def __init__(self,
                  dds_sw=DDS,
                  dds_beatref=DDS,
+                 pid_override_ttl=TTL_OUT,
                  N_beatref_mult=8,
                  beatref_sign=-1,
                  frequency_minimum_beat=250.e6,
@@ -23,6 +24,8 @@ class BeatLockImaging():
         
         self.dds_sw = dds_sw
         self.dds_beatref = dds_beatref
+
+        self.ttl_pid_manual_override = pid_override_ttl
 
         self.params = expt_params
         self.p = self.params
@@ -117,6 +120,7 @@ class BeatLockImaging():
             global_phase=0.,relative_phase=0.,
             t_phase_origin_mu=np.int64(-1),
             phase_mode=1):
+        self.ttl_pid_manual_override.on()
         pass
 
 class PolModBeatLock(BeatLockImaging):
@@ -125,6 +129,7 @@ class PolModBeatLock(BeatLockImaging):
                  dds_polmod_v=DDS,
                  dds_polmod_h=DDS,
                  dds_beatref=DDS,
+                 pid_override_ttl=TTL_OUT,
                  N_beatref_mult=8,
                  beatref_sign=-1,
                  frequency_minimum_beat=250.e6,
@@ -132,6 +137,7 @@ class PolModBeatLock(BeatLockImaging):
         super().__init__(dds_sw=dds_sw,
             dds_beatref=dds_beatref,
             N_beatref_mult=N_beatref_mult,
+            pid_override_ttl=pid_override_ttl,
             beatref_sign=beatref_sign,
             frequency_minimum_beat=frequency_minimum_beat,
             expt_params=expt_params)
@@ -241,6 +247,12 @@ class PolModBeatLock(BeatLockImaging):
                 self._frequency_array[1] = self._frequency_center_dds - df
         else:
             self._frequency_array[0] = self._frequency_center_dds
+            # this is annoying -- gave rise to a bug where when we weren't using
+            # the polmod_v DDS, we changed it's frequency in dds_id to do
+            # something else and then found that the imaging detuning was no
+            # longer right. Probably best just to set each AO in dds_id to its
+            # actual alignment freuqency and then get the default freuqency for
+            # that DDS if polmod=False
             self._frequency_array[1] = 0.
 
         return self._frequency_array
@@ -393,6 +405,7 @@ class BeatLockImagingPID(BeatLockImaging):
                  dds_sw=DDS,
                  dds_pid=DDS,
                  pid_int_clear_ttl=TTL_OUT,
+                 pid_override_ttl=TTL_OUT,
                  dac_pid_setpoint=DAC_CH,
                  vpd_max_power=9.9,
                  dds_beatref=DDS,
@@ -411,12 +424,15 @@ class BeatLockImagingPID(BeatLockImaging):
         super().__init__(dds_sw=dds_sw,
                 dds_beatref=dds_beatref,
                 N_beatref_mult=N_beatref_mult,
+                pid_override_ttl=pid_override_ttl,
                 beatref_sign=beatref_sign,
                 frequency_minimum_beat=frequency_minimum_beat,
                 expt_params=expt_params)
 
     @kernel
-    def init_pid(self, power_fraction_imaging=dv):
+    def init(self, power_fraction_imaging=dv):
+        self.ttl_pid_manual_override.off()
+
         self.set_imaging_detuning(0.)
         vpd_set = power_fraction_imaging * self._vpd_max_power
         self.dds_pid.set_dds(v_pd=vpd_set)
