@@ -12,6 +12,9 @@ dv = -10.e9
 
 FREQUENCY_GS_HFS = 461.7 * 1.e6
 
+POLMOD_H_IDX = 0
+POLMOD_V_IDX = 1
+
 class BeatLockImaging():
     def __init__(self,
                  dds_sw=DDS,
@@ -227,6 +230,7 @@ class PolModBeatLock(BeatLockImaging):
         self._frequency_center_dds = (self.dds_polmod_h.frequency + self.dds_polmod_v.frequency)/2
         if abs(self._frequency_center_dds - self.dds_polmod_h.frequency) != abs(self._frequency_center_dds - self.dds_polmod_v.frequency):
             raise ValueError("The - and + DDS frequencies should be equidistant from their mean for optimal efficiency.")
+        self._frequency_array_defaults = [self.dds_polmod_h.frequency, self.dds_polmod_v.frequency]
 
     @kernel(flags={"fast_math"})
     def polmod_frequency_to_ao_frequency(self, frequency_polmod)  -> TArray(TFloat):
@@ -240,20 +244,21 @@ class PolModBeatLock(BeatLockImaging):
             df = frequency_polmod / 4
 
             if order_p * order_m == -1:
-                self._frequency_array[0] = df
-                self._frequency_array[1] = df
+                self._frequency_array[POLMOD_H_IDX] = df
+                self._frequency_array[POLMOD_V_IDX] = df
             else:
-                self._frequency_array[0] = self._frequency_center_dds + df
-                self._frequency_array[1] = self._frequency_center_dds - df
+                self._frequency_array[POLMOD_H_IDX] = self._frequency_center_dds + df
+                self._frequency_array[POLMOD_V_IDX] = self._frequency_center_dds - df
         else:
-            self._frequency_array[0] = self._frequency_center_dds
+            # self._frequency_array[0] = self._frequency_center_dds
+            self._frequency_array[POLMOD_H_IDX] = self._frequency_array_defaults[0]
             # this is annoying -- gave rise to a bug where when we weren't using
             # the polmod_v DDS, we changed it's frequency in dds_id to do
             # something else and then found that the imaging detuning was no
             # longer right. Probably best just to set each AO in dds_id to its
             # actual alignment freuqency and then get the default freuqency for
             # that DDS if polmod=False
-            self._frequency_array[1] = 0.
+            self._frequency_array[POLMOD_V_IDX] = 0.
 
         return self._frequency_array
 
@@ -330,11 +335,11 @@ class PolModBeatLock(BeatLockImaging):
 
             self._frequency_array = self.polmod_frequency_to_ao_frequency(self.frequency_polmod)
 
-            self.dds_polmod_h.set_dds(self._frequency_array[0],
+            self.dds_polmod_h.set_dds(self._frequency_array[POLMOD_H_IDX],
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase)
             
-            self.dds_polmod_v.set_dds(self._frequency_array[1],
+            self.dds_polmod_v.set_dds(self._frequency_array[POLMOD_V_IDX],
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
             
