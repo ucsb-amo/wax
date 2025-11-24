@@ -392,18 +392,15 @@ class BeatLockImagingPID(BeatLockImaging):
                 expt_params=expt_params)
 
     @kernel
-    def init(self, v_pd_imaging=9.99):
+    def init(self):
         self.dds_pid.dac_ch = -1
         self.dds_pid.set_dds(init=True)
         self.dds_sw.set_dds(init=True)
 
         self.dds_pid.on()
-
-        self.ttl_pid_manual_override.off()
-
+        # self.ttl_pid_manual_override.off()
+        self.ttl_pid_manual_override.on()
         self.set_imaging_detuning(0.)
-        self.dds_pid.set_dds(v_pd=v_pd_imaging)
-
         self.ttl_pid_int_clear.pulse(1.e-6)
 
     @portable(flags={"fast-math"})
@@ -414,4 +411,7 @@ class BeatLockImagingPID(BeatLockImaging):
 
     @kernel
     def set_power(self, power_control_parameter=dv):
-        self.dds_pid.set_dds(v_pd=power_control_parameter)
+        # self.dds_pid.set_dds(amplitude=self.dds_pid._amplitude_default,
+        #                      v_pd=power_control_parameter)
+        self.dds_pid.set_dds(amplitude=power_control_parameter)
+        # self.ttl_pid_int_clear.pulse(1.e-6)
