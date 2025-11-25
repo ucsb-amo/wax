@@ -105,6 +105,9 @@ def guess_unit(name, values):
     if (lname.startswith("amp_") or
             lname.startswith("pfrac_") or "fraction" in lname):
         return "", 1.0
+    
+    if (lname.startswith("phase_")):
+        return "π", 1/np.pi
 
     # Default: unknown / unitless
     return None, 1.0
