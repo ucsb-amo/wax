@@ -9,6 +9,7 @@ from waxx.config.expt_params_waxx import ExptParams
 from waxx.util.artiq.async_print import aprint
 
 dv = -10.e9
+di = -10000
 
 FREQUENCY_GS_HFS = 461.7 * 1.e6
 
@@ -20,10 +21,10 @@ class BeatLockImaging():
                  dds_sw=DDS,
                  dds_beatref=DDS,
                  pid_override_ttl=TTL_OUT,
-                 N_beatref_mult=8,
-                 beatref_sign=-1,
-                 frequency_minimum_beat=250.e6,
-                 expt_params=ExptParams):
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
+                 expt_params=ExptParams()):
         
         self.dds_sw = dds_sw
         self.dds_beatref = dds_beatref
@@ -33,10 +34,14 @@ class BeatLockImaging():
         self.params = expt_params
         self.p = self.params
 
-        self._N_beatref_mult = N_beatref_mult
-        # +1 for lock greater frequency than reference (Gain switch "+"), vice versa ("-")
-        self._beat_sign = beatref_sign
-        self._frequency_minimum_beat = frequency_minimum_beat
+        if N_beatref_mult == di:
+            self._N_beatref_mult = self.p.N_offset_lock_reference_multiplier
+        if beatref_sign == di:
+            # +1 for lock greater frequency than reference (Gain switch "+"), vice versa ("-")
+            self._beat_sign = self.p.beatlock_sign
+        if frequency_minimum_beat == dv:
+            self._frequency_minimum_beat = self.p.frequency_minimum_offset_beatlock
+            
         self.phase_mode = 1
 
     @kernel
@@ -151,9 +156,9 @@ class PolModBeatLock(BeatLockImaging):
                  dds_polmod_h=DDS,
                  dds_beatref=DDS,
                  pid_override_ttl=TTL_OUT,
-                 N_beatref_mult=8,
-                 beatref_sign=-1,
-                 frequency_minimum_beat=250.e6,
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
                  expt_params=ExptParams):
         super().__init__(dds_sw=dds_sw,
             dds_beatref=dds_beatref,
@@ -373,9 +378,9 @@ class BeatLockImagingPID(BeatLockImaging):
                  pid_override_ttl=TTL_OUT,
                  dac_pid_setpoint=DAC_CH,
                  dds_beatref=DDS,
-                 N_beatref_mult=8,
-                 beatref_sign=-1,
-                 frequency_minimum_beat=250.e6,
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
                  expt_params=ExptParams):
         
         self.dds_pid = dds_pid
