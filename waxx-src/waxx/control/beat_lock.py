@@ -41,7 +41,7 @@ class BeatLockImaging():
             self._beat_sign = self.p.beatlock_sign
         if frequency_minimum_beat == dv:
             self._frequency_minimum_beat = self.p.frequency_minimum_offset_beatlock
-            
+
         self.phase_mode = 1
 
     @kernel
@@ -159,7 +159,7 @@ class PolModBeatLock(BeatLockImaging):
                  N_beatref_mult=di,
                  beatref_sign=di,
                  frequency_minimum_beat=dv,
-                 expt_params=ExptParams):
+                 expt_params=ExptParams()):
         super().__init__(dds_sw=dds_sw,
             dds_beatref=dds_beatref,
             N_beatref_mult=N_beatref_mult,
@@ -381,7 +381,7 @@ class BeatLockImagingPID(BeatLockImaging):
                  N_beatref_mult=di,
                  beatref_sign=di,
                  frequency_minimum_beat=dv,
-                 expt_params=ExptParams):
+                 expt_params=ExptParams()):
         
         self.dds_pid = dds_pid
 
