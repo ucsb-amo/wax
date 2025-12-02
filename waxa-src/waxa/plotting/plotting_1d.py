@@ -104,7 +104,7 @@ def guess_unit(name, values):
     # Amplitude / power fraction (dimensionless)
     if (lname.startswith("amp_") or
             lname.startswith("pfrac_") or "fraction" in lname):
-        return "", 1.0
+        return "(amp)", 1.0
     
     if (lname.startswith("phase_")):
         return "π", 1/np.pi
@@ -129,9 +129,9 @@ def detect_unit(ad: atomdata, xvar_idx, xvarunit="", xvarmult=1.0):
 
     final_mult = xvarmult if xvarmult != 1.0 else (mult_from_comment or 1.0)
 
-    print(f"[plot_mixOD] xvar = {xvarname}, source = {source}, "
+    print(f"xvar = {xvarname}, source = {source}, "
           f"detected unit = {unit_from_comment}, multiplier = {mult_from_comment:.1e}")
-    print(f"[plot_mixOD] final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
+    print(f"final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
 
     return final_unit, final_mult, xvarname
 
