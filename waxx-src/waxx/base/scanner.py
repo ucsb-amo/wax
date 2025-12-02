@@ -17,7 +17,7 @@ def nothing():
 class Scanner():
     def __init__(self):
 
-        from waxx.config.expt_params_waxx import ExptParams
+        from waxx.config.expt_params import ExptParams
         self.params = ExptParams()
 
         self.xvarnames = []

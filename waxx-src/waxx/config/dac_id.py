@@ -1,22 +1,26 @@
 import numpy as np
 from artiq.experiment import kernel
 from artiq.coredevice.zotino import Zotino
-from wax.control.artiq.DAC_CH import DAC_CH
-from wax.config.expt_params import ExptParams
+from waxx.control.artiq.DAC_CH import DAC_CH
+from waxx.config.expt_params import ExptParams
 
 FORBIDDEN_CH = []
 
 class dac_frame():
     def __init__(self, expt_params = ExptParams(), dac_device = Zotino):
 
-        self.dac_device = dac_device
-
-        self.dac_ch_list = []
-
-        p = expt_params
+        self.setup(expt_params,dac_device)
 
         ### begin assignments
 
+        self.cleanup()
+
+    def setup(self, expt_params:ExptParams, dac_device:Zotino):
+        self.dac_device = dac_device
+        self.dac_ch_list = []
+        self.p = expt_params
+
+    def cleanup(self):
         self._write_dac_keys()
         
     def assign_dac_ch(self,ch,v=0.,max_v=9.99) -> DAC_CH:

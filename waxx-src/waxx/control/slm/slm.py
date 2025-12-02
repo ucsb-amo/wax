@@ -1,7 +1,7 @@
 import socket
 from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
-from waxx.config.expt_params_waxx import ExptParams
+from waxx.config.expt_params import ExptParams
 import numpy as np
 import json
 di = -1

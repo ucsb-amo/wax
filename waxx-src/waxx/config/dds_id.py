@@ -6,9 +6,9 @@ from artiq.language.core import delay_mu
 
 from waxx.control.artiq.DDS import DDS
 from waxx.control.artiq.dummy_core import DummyCore
-from waxx.config.dac_id_waxx import dac_frame
-from waxx.config.shuttler_id_waxx import shuttler_frame
-from waxx.config.expt_params_waxx import ExptParams
+from waxx.config.dac_id import dac_frame
+from waxx.config.shuttler_id import shuttler_frame
+from waxx.config.expt_params import ExptParams
 
 # from jax import AD9910Manager, RAMProfile, RAMType
 from artiq.coredevice import ad9910
@@ -22,7 +22,6 @@ RAMP_STEP_TIME = 100 * 4.e-9
 # default_dac_dds_amplitude = 0.3
 
 dv = -0.1
-d_exptparams = ExptParams()
 
 def dds_empty_frame(x=None):
     return [[x for _ in range(N_ch)] for _ in range(N_uru)]
@@ -34,11 +33,30 @@ class dds_frame():
     associated transition for detuning calulations, and default
     frequency/amplitudes.
     '''
-    def __init__(self, expt_params:ExptParams=d_exptparams,
-                  dac_frame_obj:dac_frame = [],
-                  shuttler_frame_obj:shuttler_frame = [],
+    def __init__(self, expt_params = ExptParams(),
+                  dac_frame_obj = dac_frame(),
+                  shuttler_frame_obj = shuttler_frame(),
                   core = DummyCore()):
         
+        self._db = None
+        
+        self.setup(expt_params, core, N_uru, N_ch, shape, dac_frame_obj)
+
+        ### begin assignments
+
+        self.cleanup()
+
+    def setup(self, expt_params,
+                    core,
+                    N_uru,
+                    N_ch,
+                    shape,
+                    dac_frame_obj):
+        
+        self.core = core
+        self.ramp_dt = RAMP_STEP_TIME
+        # self.dds_manager = [DDSManager]
+
         self.p = expt_params
 
         self._N_uru = N_uru
@@ -52,12 +70,8 @@ class dds_frame():
 
         self.dds_array = [[DDS(uru,ch,dac_device=self._dac_frame.dac_device) for ch in range(N_ch)] for uru in range(N_uru)]
 
-        ### begin assignments
-
-        self.core = core
-        # self.dds_manager = [DDSManager]
-        self.ramp_dt = RAMP_STEP_TIME
-
+    def cleanup(self):
+    
         self.write_dds_keys()
         self.make_dds_array()
         self.dds_list = np.array(self.dds_array).flatten()
@@ -95,12 +109,14 @@ class dds_frame():
         dds0 = DDS(urukul_idx=uru,ch=ch,
                    frequency=default_freq,
                    amplitude=default_amp,
-                   v_pd=5.0)
+                   v_pd=5.0,
+                   device_db=self._db)
         dds0.aom_order = ao_order
         dds0.transition = transition
         dds0.dac_ch = dac_ch_vpd
         dds0.dac_device = self._dac_frame.dac_device
         dds0.double_pass = double_pass
+        dds0.update_dac_bool()
 
         # set the frequency according to detuning if default_detuning was specified instead of default_freq
         if default_detuning != dv and default_freq == dv:
@@ -138,7 +154,7 @@ class dds_frame():
             uru = idx[0]
             ch = idx[1]
             freq, amp, v_pd = 0., 0., 0.
-            this_dds = DDS(uru,ch,freq,amp,v_pd,dac_device=self._dac_frame.dac_device)
+            this_dds = DDS(uru,ch,freq,amp,v_pd,dac_device=self._dac_frame.dac_device,device_db=self._db)
             self.dds_array[uru][ch] = this_dds
 
     @portable

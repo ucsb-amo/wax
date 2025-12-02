@@ -3,10 +3,17 @@ from waxx.control.cameras.camera_param_classes import CameraParams, BaslerParams
 class camera_frame():
     def __init__(self):
         
+        self.setup()
+
+        self.cleanup()
+
+    def setup(self):
         self.img_types = img_types
-        self.write_keys()
+
+    def cleanup(self):
+        self._write_keys()
     
-    def write_keys(self):
+    def _write_keys(self):
         """Adds the assigned keys to the CameraParams objects so that the
         user-defined names (key) are available with the CameraParams
         objects."""

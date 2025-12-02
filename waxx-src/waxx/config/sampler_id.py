@@ -6,16 +6,23 @@ from waxx.control.artiq.Sampler_CH import Sampler_CH
 class sampler_frame():
     def __init__(self, sampler_device = Sampler):
 
-        self.sampler_device = sampler_device
-        self.samples = np.zeros(8,dtype=float)
-        self.gains = np.zeros(8,dtype=int)
-        
+        self.setup(sampler_device)
+        self.sampler_device:Sampler
+
         ### begin assignments
  
         self.test = self.sampler_assign(0,gain=3)
 
         ### end assignments
+        self.cleanup()
+        
 
+    def setup(self, sampler_device:Sampler):
+        self.sampler_device = sampler_device
+        self.samples = np.zeros(8,dtype=float)
+        self.gains = np.zeros(8,dtype=int)
+
+    def cleanup(self):
         self._write_sampler_keys()
 
     def sampler_assign(self,ch,gain=0) -> Sampler_CH:

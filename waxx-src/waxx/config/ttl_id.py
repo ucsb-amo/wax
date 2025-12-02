@@ -1,18 +1,23 @@
 import numpy as np
 from artiq.experiment import kernel
 from artiq.coredevice.ttl import TTLOut, TTLInOut
-from wax.control.artiq.TTL import TTL, TTL_IN, TTL_OUT
+
+from waxx.control.artiq.TTL import TTL, TTL_IN, TTL_OUT
 
 class ttl_frame():
     def __init__(self):
+        self.setup()
 
-        self.ttl_list = []
-        
         # add TTLs here
 
-        self._write_ttl_keys()
+        self.cleanup()
+        
+    def setup(self):
+        self.ttl_list = []
 
-        self.camera = TTL
+    def cleanup(self):
+        self._write_ttl_keys()
+        self.camera = TTL_OUT
 
     def assign_ttl_out(self,ch) -> TTL_OUT:
         this_ttl = TTL_OUT(ch)
