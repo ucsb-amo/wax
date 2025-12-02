@@ -1,16 +1,23 @@
 import numpy as np
-from artiq.experiment import kernel, portable
+from artiq.experiment import kernel, portable, delay
 
 from artiq.coredevice.zotino import Zotino
 from artiq.coredevice.shuttler import DCBias, DDS, Relay, Trigger, Config, shuttler_volt_to_mu
 
-from wax.control.artiq.Shuttler_CH import Shuttler_CH
+from waxx.control.artiq.Shuttler_CH import Shuttler_CH
 
 class shuttler_frame():
     def __init__(self):
 
-        ### Setup
+        self.setup()
 
+        ### Channel assignment
+
+        ###
+
+        self.cleanup()
+
+    def setup(self):
         self._STATE_BASE = np.array([1<<n for n in range(16)])
 
         self.shuttler_list = []
@@ -20,13 +27,10 @@ class shuttler_frame():
         self._trigger = Trigger
         self._relay = Relay
 
-        ### Channel assignment
+    def cleanup(self):
+        self._write_shuttler_keys()
 
-        ###
-
-        self._write_dds_keys()
-
-    def _write_dds_keys(self):
+    def _write_shuttler_keys(self):
         '''Adds the assigned keys to the DDS objects so that the user-defined
         names (keys) are available with the DDS objects.'''
         for key in self.__dict__.keys():

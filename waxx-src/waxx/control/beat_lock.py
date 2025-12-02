@@ -5,7 +5,7 @@ from artiq.experiment import portable, kernel, rpc, \
 from artiq.language.core import delay, now_mu, at_mu
 
 from waxx.control.artiq import DDS, TTL_OUT, DAC_CH
-from waxx.config.expt_params_waxx import ExptParams
+from waxx.config.expt_params import ExptParams
 from waxx.util.artiq.async_print import aprint
 
 dv = -10.e9
