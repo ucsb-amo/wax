@@ -4,98 +4,58 @@ from artiq.experiment import portable, kernel, rpc, \
                                 TFloat, TArray
 from artiq.language.core import delay, now_mu, at_mu
 
-from waxx.control.artiq import DDS, TTL, DAC_CH
+from waxx.control.artiq import DDS, TTL_OUT, DAC_CH
 from waxx.config.expt_params_waxx import ExptParams
 from waxx.util.artiq.async_print import aprint
 
 dv = -10.e9
+di = -10000
 
 FREQUENCY_GS_HFS = 461.7 * 1.e6
+
+T_PID_RESET_PULSE = 1.e-6
+
+POLMOD_H_IDX = 0
+POLMOD_V_IDX = 1
 
 class BeatLockImaging():
     def __init__(self,
                  dds_sw=DDS,
                  dds_beatref=DDS,
-                 N_beatref_mult=8,
-                 beatref_sign=-1,
-                 frequency_minimum_beat=250.e6,
-                 expt_params=ExptParams):
+                 pid_override_ttl=TTL_OUT,
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
+                 expt_params=ExptParams()):
         
         self.dds_sw = dds_sw
         self.dds_beatref = dds_beatref
 
+        self.ttl_pid_manual_override = pid_override_ttl
+
         self.params = expt_params
         self.p = self.params
 
-        self._N_beatref_mult = N_beatref_mult
-        # +1 for lock greater frequency than reference (Gain switch "+"), vice versa ("-")
-        self._beat_sign = beatref_sign
-        self._frequency_minimum_beat = frequency_minimum_beat
+        if N_beatref_mult == di:
+            self._N_beatref_mult = self.p.N_offset_lock_reference_multiplier
+        if beatref_sign == di:
+            # +1 for lock greater frequency than reference (Gain switch "+"), vice versa ("-")
+            self._beat_sign = self.p.beatlock_sign
+        if frequency_minimum_beat == dv:
+            self._frequency_minimum_beat = self.p.frequency_minimum_offset_beatlock
+
         self.phase_mode = 1
 
-    @portable(flags={"fast-math"})
-    def imaging_detuning_to_beat_ref(self, frequency_detuned,
-                             frequency_polmod=0.) -> TFloat:
-        """Converts a desired imaging detuning to the required beat lock reference.
-
-        Makes reference to the beat lock sign, which DDS channel drives the AO
-        to frequency shift the imaging light, and the reference multiplier
-        setting on the beat lock controller.
-
-        Args:
-            frequency_detuned (float, optional): The desired imaging detuning
-            from the brightest D2 resonance in Hz. Whether the detuning is
-            relative to F=2 -> 4P3/2 or F=1 -> 4P3/2 depends on the parameter
-            ExptParams.imaging_state (if == 1: F=1, if == 2: F=2)
-
-        Returns:
-            TFloat: the required beat lock reference frequency in Hz.
-        """        
-
-        f_shift_resonance = FREQUENCY_GS_HFS / 2
-        f_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
-        f_offset = self._beat_sign * (frequency_detuned - f_ao_shift - f_shift_resonance)
-
-        f_beatlock_ref = f_offset / self._N_beatref_mult
-
-        if f_offset < self._frequency_minimum_beat:
-            aprint("The requested detuning results in an offset less than the minimum beat note frequency for the lock.")
-        if f_beatlock_ref < 0.:
-            aprint("The requested detuning would require a negative reference frequency. You'll need to flip the beat lock sign to reach this detuning.")
-        if f_beatlock_ref > 400.e6:
-            aprint("Invalid beatlock reference frequency for requested detuning (>400 MHz). Must be less than 400 MHz for ARTIQ DDS. Consider changing the beat lock reference multiplier.")
-
-        return f_beatlock_ref
-    
-    @kernel(flags={"fast-math"})
-    def set_imaging_detuning(self, frequency_detuned, amp,
-                             frequency_polmod=0.):
-        '''
-        Sets the detuning of the beat-locked imaging laser (in Hz).
-
-        Imaging detuning is controlled by two things -- the Vescent offset lock
-        and a double pass (-1 order).
-
-        The offset lock has a multiplier, N, that determines the offset lock
-        frequency relative to the lock point of the D2 laser locked at the
-        crossover feature for the D2 transition. Offset = N * reference freqeuency.
-        
-        The reference frequency is provided by a DDS channel (dds_frame.beatlock_ref).
-        '''
-
-        f_beatlock_ref = self.imaging_detuning_to_beat_ref(frequency_detuned=frequency_detuned)
-
-        self.dds_sw.set_dds(amplitude=amp)
-
-        f_offset = f_beatlock_ref * self._N_beatref_mult
-        if f_offset < self._frequency_minimum_beat:
-            raise ValueError("The beat lock is unhappy at a lock point below the minimum offset.")
-        
-        if f_beatlock_ref < 0.:
-            raise ValueError("You tried to set the DDS to a negative frequency!")
-        
-        self.dds_beatref.set_dds(frequency=f_beatlock_ref)
+    @kernel
+    def init(self):
         self.dds_beatref.on()
+        self.dds_sw.dac_ch = -1 # disconnect the logic for dac control of the dds
+        self.dds_sw.update_dac_bool()
+        self.ttl_pid_manual_override.on()
+
+    @kernel
+    def set_power(self, power_control_parameter=dv):
+        self.dds_sw.set_dds(amplitude=power_control_parameter)
 
     @kernel
     def pulse(self,t):
@@ -117,43 +77,42 @@ class BeatLockImaging():
         self.dds_sw.off()
 
     @kernel
-    def init(self,frequency_polmod=0.,
-            global_phase=0.,relative_phase=0.,
-            t_phase_origin_mu=np.int64(-1),
-            phase_mode=1):
+    def pre_set_detuning(self):
         pass
 
-class PolModBeatLock(BeatLockImaging):
-    def __init__(self,
-                 dds_sw=DDS,
-                 dds_polmod_v=DDS,
-                 dds_polmod_h=DDS,
-                 dds_beatref=DDS,
-                 N_beatref_mult=8,
-                 beatref_sign=-1,
-                 frequency_minimum_beat=250.e6,
-                 expt_params=ExptParams):
-        super().__init__(dds_sw=dds_sw,
-            dds_beatref=dds_beatref,
-            N_beatref_mult=N_beatref_mult,
-            beatref_sign=beatref_sign,
-            frequency_minimum_beat=frequency_minimum_beat,
-            expt_params=expt_params)
+    @portable(flags={"fast-math"})
+    def get_ao_shift(self) -> TFloat:
+        ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
+        return ao_shift
     
-        self.dds_polmod_v = dds_polmod_v
-        self.dds_polmod_h = dds_polmod_h
+    @kernel(flags={"fast-math"})
+    def set_imaging_detuning(self, frequency_detuned):
+        '''
+        Sets the detuning of the beat-locked imaging laser (in Hz).
 
-        self.frequency_polmod = 0.
-        self.global_phase = 0.
-        self.relative_phase = 0.
-        self.t_phase_origin_mu = np.int64(0)
+        Imaging detuning is controlled by two things -- the Vescent offset lock
+        and a double pass (-1 order).
 
-        self.phase_mode = 0  # 0: independent, 1: synchronized
+        The offset lock has a multiplier, N, that determines the offset lock
+        frequency relative to the lock point of the D2 laser locked at the
+        crossover feature for the D2 transition. Offset = N * reference freqeuency.
+        
+        The reference frequency is provided by a DDS channel (dds_frame.beatlock_ref).
+        '''
+        self.pre_set_detuning()
 
-        self._frequency_center_dds = 0.
-        self._frequency_array = np.array([0.,0.])
-        self._init()
+        f_beatlock_ref = self.imaging_detuning_to_beat_ref(frequency_detuned=frequency_detuned)
 
+        f_offset = f_beatlock_ref * self._N_beatref_mult
+        if f_offset < self._frequency_minimum_beat:
+            raise ValueError("The beat lock is unhappy at a lock point below the minimum offset.")
+        
+        if f_beatlock_ref < 0.:
+            raise ValueError("You tried to set the DDS to a negative frequency!")
+        
+        self.dds_beatref.set_dds(frequency=f_beatlock_ref)
+        self.dds_beatref.on()
+    
     @portable(flags={"fast-math"})
     def imaging_detuning_to_beat_ref(self, frequency_detuned) -> TFloat:
         """Converts a desired imaging detuning to the required beat lock reference.
@@ -173,14 +132,9 @@ class PolModBeatLock(BeatLockImaging):
         """        
 
         f_shift_resonance = FREQUENCY_GS_HFS / 2
-        f_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
-        if self.frequency_polmod > 0.:
-            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency * 2 \
-                                + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
-        else:
-            f_polmod_ao_shift = self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
+        f_ao_shift = self.get_ao_shift()
 
-        f_offset = 1/self._beat_sign * (frequency_detuned - f_ao_shift - f_shift_resonance - f_polmod_ao_shift)
+        f_offset = 1/self._beat_sign * (frequency_detuned - f_ao_shift - f_shift_resonance)
 
         f_beatlock_ref = f_offset / self._N_beatref_mult
 
@@ -192,41 +146,49 @@ class PolModBeatLock(BeatLockImaging):
             aprint("Invalid beatlock reference frequency for requested detuning (>400 MHz). Must be less than 400 MHz for ARTIQ DDS. Consider changing the beat lock reference multiplier.")
 
         return f_beatlock_ref
+
+class PolModBeatLock(BeatLockImaging):
+    def __init__(self,
+                 dds_sw=DDS,
+                 dds_polmod_v=DDS,
+                 dds_polmod_h=DDS,
+                 dds_beatref=DDS,
+                 pid_override_ttl=TTL_OUT,
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
+                 expt_params=ExptParams()):
+        super().__init__(dds_sw=dds_sw,
+            dds_beatref=dds_beatref,
+            N_beatref_mult=N_beatref_mult,
+            pid_override_ttl=pid_override_ttl,
+            beatref_sign=beatref_sign,
+            frequency_minimum_beat=frequency_minimum_beat,
+            expt_params=expt_params)
     
-    @kernel(flags={"fast-math"})
-    def set_imaging_detuning(self, frequency_detuned, amp):
-        '''
-        Sets the detuning of the beat-locked imaging laser (in Hz).
+        self.dds_polmod_v = dds_polmod_v
+        self.dds_polmod_h = dds_polmod_h
 
-        Imaging detuning is controlled by two things -- the Vescent offset lock
-        and a double pass (-1 order).
+        self.frequency_polmod = 0.
+        self.global_phase = 0.
+        self.relative_phase = 0.
+        self.t_phase_origin_mu = np.int64(0)
 
-        The offset lock has a multiplier, N, that determines the offset lock
-        frequency relative to the lock point of the D2 laser locked at the
-        crossover feature for the D2 transition. Offset = N * reference freqeuency.
-        
-        The reference frequency is provided by a DDS channel (dds_frame.beatlock_ref).
-        '''
+        self.phase_mode = 0  # 0: independent, 1: synchronized
+
+        self._frequency_center_dds = 0.
+        self._frequency_array = np.array([0.,0.])
+        self._init()
+
+    @kernel
+    def pre_set_detuning(self):
         self.set_polmod(self.frequency_polmod)
-
-        self.dds_sw.set_dds(amplitude=amp)
-
-        f_beatlock_ref = self.imaging_detuning_to_beat_ref(frequency_detuned=frequency_detuned)
-
-        f_offset = f_beatlock_ref * self._N_beatref_mult
-        if f_offset < self._frequency_minimum_beat:
-            raise ValueError("The beat lock is unhappy at a lock point below the minimum offset.")
-        
-        if f_beatlock_ref < 0.:
-            raise ValueError("You tried to set the DDS to a negative frequency!")
-        
-        self.dds_beatref.set_dds(frequency=f_beatlock_ref)
-        self.dds_beatref.on()
 
     def _init(self):
         self._frequency_center_dds = (self.dds_polmod_h.frequency + self.dds_polmod_v.frequency)/2
         if abs(self._frequency_center_dds - self.dds_polmod_h.frequency) != abs(self._frequency_center_dds - self.dds_polmod_v.frequency):
             raise ValueError("The - and + DDS frequencies should be equidistant from their mean for optimal efficiency.")
+        self._frequency_array_defaults = [self.dds_polmod_h.frequency, self.dds_polmod_v.frequency]
 
     @kernel(flags={"fast_math"})
     def polmod_frequency_to_ao_frequency(self, frequency_polmod)  -> TArray(TFloat):
@@ -240,14 +202,14 @@ class PolModBeatLock(BeatLockImaging):
             df = frequency_polmod / 4
 
             if order_p * order_m == -1:
-                self._frequency_array[0] = df
-                self._frequency_array[1] = df
+                self._frequency_array[POLMOD_H_IDX] = df
+                self._frequency_array[POLMOD_V_IDX] = df
             else:
-                self._frequency_array[0] = self._frequency_center_dds + df
-                self._frequency_array[1] = self._frequency_center_dds - df
+                self._frequency_array[POLMOD_H_IDX] = self._frequency_center_dds + df
+                self._frequency_array[POLMOD_V_IDX] = self._frequency_center_dds - df
         else:
-            self._frequency_array[0] = self._frequency_center_dds
-            self._frequency_array[1] = 0.
+            self._frequency_array[POLMOD_H_IDX] = self._frequency_array_defaults[0]
+            self._frequency_array[POLMOD_V_IDX] = 0.
 
         return self._frequency_array
 
@@ -324,13 +286,11 @@ class PolModBeatLock(BeatLockImaging):
 
             self._frequency_array = self.polmod_frequency_to_ao_frequency(self.frequency_polmod)
 
-            self.dds_polmod_h.set_dds(self._frequency_array[0],
-                                # self.amplitude,
+            self.dds_polmod_h.set_dds(self._frequency_array[POLMOD_H_IDX],
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase)
             
-            self.dds_polmod_v.set_dds(self._frequency_array[1],
-                                # self.amplitude,
+            self.dds_polmod_v.set_dds(self._frequency_array[POLMOD_V_IDX],
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
             
@@ -381,13 +341,26 @@ class PolModBeatLock(BeatLockImaging):
         if not pretrigger:
             delay(5.e-6)
 
+    @portable(flags={"fast-math"})
+    def get_ao_shift(self) -> TFloat:
+        f_sw_ao_shift = self.dds_sw.frequency * self.dds_sw.aom_order * 2
+        if self.frequency_polmod > 0.:
+            f_polmod_ao_shift = self.dds_polmod_v.aom_order * self.dds_polmod_v.frequency * 2 \
+                                + self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
+        else:
+            f_polmod_ao_shift = self.dds_polmod_h.aom_order * self.dds_polmod_h.frequency * 2
+        f_ao_shift = f_sw_ao_shift + f_polmod_ao_shift
+        return f_ao_shift
+
     @kernel
     def init(self,frequency_polmod=0.,
             global_phase=0.,relative_phase=0.,
             t_phase_origin_mu=np.int64(-1),
-            phase_mode=1):
+            phase_mode=1,
+            v_pd_imaging=0.):
         if t_phase_origin_mu < 0:
             t_phase_origin_mu = now_mu()
+        self.dds_beatref.on()
         self.set_polmod(frequency_polmod,
                         global_phase,relative_phase,
                         t_phase_origin_mu=t_phase_origin_mu,
@@ -395,3 +368,55 @@ class PolModBeatLock(BeatLockImaging):
                         init=True)
         self.dds_polmod_h._stash_defaults()
         self.dds_polmod_v._stash_defaults()
+
+class BeatLockImagingPID(BeatLockImaging):
+    def __init__(self,
+                 dds_sw=DDS,
+                 dds_pid=DDS,
+                 pid_int_clear_ttl=TTL_OUT,
+                 pid_override_ttl=TTL_OUT,
+                 dac_pid_setpoint=DAC_CH,
+                 dds_beatref=DDS,
+                 N_beatref_mult=di,
+                 beatref_sign=di,
+                 frequency_minimum_beat=dv,
+                 expt_params=ExptParams()):
+        
+        self.dds_pid = dds_pid
+
+        self.dac_pid = dac_pid_setpoint
+        self.ttl_pid_int_clear = pid_int_clear_ttl
+        
+        super().__init__(dds_sw=dds_sw,
+                dds_beatref=dds_beatref,
+                N_beatref_mult=N_beatref_mult,
+                pid_override_ttl=pid_override_ttl,
+                beatref_sign=beatref_sign,
+                frequency_minimum_beat=frequency_minimum_beat,
+                expt_params=expt_params)
+
+    @kernel
+    def init(self):
+        self.dds_beatref.on()
+
+        self.dds_pid.set_dds(init=True)
+        self.dds_sw.set_dds(init=True)
+
+        self.dds_pid.on()
+        self.ttl_pid_manual_override.off()
+        self.set_imaging_detuning(0.)
+        self.set_power(0.2, reset_pid=True)
+
+    @portable(flags={"fast-math"})
+    def get_ao_shift(self) -> TFloat:
+        ao_shift = (self.dds_sw.frequency * self.dds_sw.aom_order \
+                    + self.dds_pid.aom_order * self.dds_pid.frequency) * 2
+        return ao_shift
+
+    @kernel
+    def set_power(self, power_control_parameter=dv, reset_pid=False):
+        self.dds_pid.set_dds(amplitude=self.dds_pid._amplitude_default,
+                             v_pd=power_control_parameter)
+        if reset_pid:
+            self.ttl_pid_int_clear.pulse(T_PID_RESET_PULSE)
+            delay(-T_PID_RESET_PULSE)

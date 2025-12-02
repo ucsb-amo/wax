@@ -2,6 +2,138 @@ import matplotlib.pyplot as plt
 import numpy as np
 from waxa import atomdata
 from waxa.helper import xlabels_1d
+import inspect
+import re
+def _normalize_name(name):
+    if isinstance(name, bytes):
+        name = name.decode("utf-8")
+    return name.strip().strip("\x00")
+
+
+UNIT_MAP_FROM_COMMENT = {
+    "ns":        ("ns", 1e9),
+    "us":        ("µs", 1e6),
+    "µs":        ("µs", 1e6),
+    "ms":        ("ms", 1e3),
+    "s":         ("s", 1.0),
+    "MHz":       ("MHz", 1e-6),
+    "kHz":       ("kHz", 1e-3),
+    "Hz":        ("Hz", 1.0),
+    "Gamma":     ("Γ", 1.0),
+    "V":         ("V", 1.0),
+    "A":         ("A", 1.0),
+    "amplitude": ("", 1.0),
+    "fraction":  ("", 1.0),
+    "rad":       ("π", 1 / np.pi),
+    "unitless":  ("", 1.0),
+}
+
+
+def get_param(params_obj, param_name):
+    param_name = _normalize_name(param_name)
+
+    try:
+        src = inspect.getsource(params_obj.__class__)
+    except OSError:
+        return None, 1.0
+    pattern = rf"self\.{re.escape(param_name)}\s*=\s*.*?#\s*([^\n]+)"
+    m = re.search(pattern, src)
+    if not m:
+        return None, 1.0
+
+    raw_unit = m.group(1).strip()
+
+    for key, (unit_label, mult) in UNIT_MAP_FROM_COMMENT.items():
+        if key in raw_unit:
+            return unit_label, mult
+
+    return None, 1.0
+
+
+def guess_unit(name, values):
+
+    name = _normalize_name(name)
+    lname = name.lower()
+
+    try:
+        vals = np.asarray(values, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return None, 1.0
+        vmax = float(np.max(np.abs(vals)))
+    except Exception:
+        return None, 1.0
+
+    # Time 
+    if lname.startswith("t_") or "time" in lname or lname.endswith("_t"):
+        if vmax >= 1:
+            return "s", 1.0
+        elif vmax >= 1e-3:
+            return "ms", 1e3
+        elif vmax >= 1e-6:
+            return "µs", 1e6
+        elif vmax >= 1e-9:
+            return "ns", 1e9
+        else:
+            return "s", 1.0
+
+    # Frequency
+    if ("freq" in lname or "frequency" in lname or "f_" in lname or
+            "raman" in lname or "rf" in lname):
+        if vmax >= 1e9:
+            return "GHz", 1e-9
+        elif vmax >= 1e6:
+            return "MHz", 1e-6
+        elif vmax >= 1e3:
+            return "kHz", 1e-3
+        else:
+            return "Hz", 1.0
+
+    # detuning in units of Gamma Γ
+    if lname.startswith("detune_") or "detun_" in lname:
+        return "Γ", 1.0
+
+    # Voltage
+    if lname.startswith("v_") or "volt" in lname:
+        return "V", 1.0
+
+    # Current
+    if lname.startswith("i_") or "current" in lname:
+        return "A", 1.0
+
+    # Amplitude / power fraction (dimensionless)
+    if (lname.startswith("amp_") or
+            lname.startswith("pfrac_") or "fraction" in lname):
+        return "(amp)", 1.0
+    
+    if (lname.startswith("phase_")):
+        return "π", 1/np.pi
+
+    # Default: unknown / unitless
+    return None, 1.0
+
+
+def detect_unit(ad: atomdata, xvar_idx, xvarunit="", xvarmult=1.0):
+
+    xvarname = _normalize_name(ad.xvarnames[xvar_idx])
+    xvar_vals = ad.xvars[xvar_idx]
+
+    unit_from_comment, mult_from_comment = get_param(ad.params, xvarname)
+
+    source = "comment"
+    if unit_from_comment is None:
+        unit_from_comment, mult_from_comment = guess_unit(xvarname, xvar_vals)
+        source = "guess"
+
+    final_unit = xvarunit if xvarunit != "" else (unit_from_comment or "")
+
+    final_mult = xvarmult if xvarmult != 1.0 else (mult_from_comment or 1.0)
+
+    print(f"xvar = {xvarname}, source = {source}, "
+          f"detected unit = {unit_from_comment}, multiplier = {mult_from_comment:.1e}")
+    print(f"final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
+
+    return final_unit, final_mult, xvarname
 
 def plot_mixOD(ad:atomdata,
                ndarray=[],
@@ -18,6 +150,7 @@ def plot_mixOD(ad:atomdata,
     
     xvarnames = ad.xvarnames
     xvars = ad.xvars
+    xvarunit, xvarmult, xvarname = detect_unit(ad, xvar_idx, xvarunit=xvarunit, xvarmult=xvarmult) ##
 
     if isinstance(ndarray,np.ndarray):
         od = ndarray
@@ -102,6 +235,10 @@ def plot_mixOD(ad:atomdata,
     plt.gca().set_aspect(aspect)
 
     # Set axis labels and title
+    label_name = xvarname
+    axislabel_str = f'{label_name}'
+    if xvarunit != "":
+        axislabel_str += f' ({xvarunit})'    
     ax.set_title(f"Run ID: {ad.run_info.run_id}")
 
     # Set the x-axis limits to show all images

@@ -2,7 +2,9 @@ import numpy as np
 
 class ExptParams():
     def __init__(self):
-        pass
+        self.beatlock_sign = -1
+        self.N_offset_lock_reference_multiplier = 8
+        self.frequency_minimum_offset_beatlock = 250.e6
 
     def compute_derived(self):
         '''loop through methods (except built in ones) and compute all derived quantities'''
