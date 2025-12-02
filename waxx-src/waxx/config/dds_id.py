@@ -155,6 +155,7 @@ class dds_frame():
             ch = idx[1]
             freq, amp, v_pd = 0., 0., 0.
             this_dds = DDS(uru,ch,freq,amp,v_pd,dac_device=self._dac_frame.dac_device,device_db=self._db)
+            this_dds.key = f"urukul{uru}_ch{ch}"
             self.dds_array[uru][ch] = this_dds
 
     @portable

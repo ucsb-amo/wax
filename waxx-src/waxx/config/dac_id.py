@@ -5,30 +5,38 @@ from waxx.control.artiq.DAC_CH import DAC_CH
 from waxx.config.expt_params import ExptParams
 
 FORBIDDEN_CH = []
+N_CH = 8
 
 class dac_frame():
     def __init__(self, expt_params = ExptParams(), dac_device = Zotino):
 
-        self.setup(expt_params,dac_device)
+        self.setup(expt_params,dac_device, N_CH)
 
         ### begin assignments
 
         self.cleanup()
 
-    def setup(self, expt_params:ExptParams, dac_device:Zotino):
+    def setup(self, expt_params:ExptParams, dac_device:Zotino, N_CH=N_CH):
         self.dac_device = dac_device
-        self.dac_ch_list = []
         self.p = expt_params
+        self.populate_dac_list(N_CH)
 
     def cleanup(self):
         self._write_dac_keys()
+
+    def populate_dac_list(self, N_CH):
+        self.dac_ch_list = [DAC_CH(ch) for ch in range(N_CH)]
+        for ch in range(N_CH):
+            dac_ch = DAC_CH(ch)
+            dac_ch.key = f"zotino0_ch{ch}"
+            self.dac_ch_list[ch] = dac_ch
         
     def assign_dac_ch(self,ch,v=0.,max_v=9.99) -> DAC_CH:
         if ch in FORBIDDEN_CH:
             raise ValueError(f"DAC channel {ch} is forbidden.")
         this_dac_ch = DAC_CH(ch,self.dac_device, max_v=max_v)
         this_dac_ch.v = v
-        self.dac_ch_list.append(this_dac_ch)
+        self.dac_ch_list[ch] = (this_dac_ch)
         return this_dac_ch
     
     def _write_dac_keys(self):
