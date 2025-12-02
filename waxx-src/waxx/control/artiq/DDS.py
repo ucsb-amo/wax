@@ -1,7 +1,6 @@
 from artiq.experiment import *
 from artiq.experiment import delay_mu, delay, parallel
 from artiq.language.core import now_mu, at_mu
-from kexp.util.db.device_db import device_db
 import numpy as np
 
 from artiq.coredevice import ad9910, ad53xx, ttl
@@ -14,7 +13,7 @@ di2 = 2
 
 class DDS():
 
-   def __init__(self, urukul_idx, ch, frequency=0., amplitude=0., v_pd=0., dac_device=[]):
+   def __init__(self, urukul_idx, ch, frequency=0., amplitude=0., v_pd=0., dac_device=[], device_db=None):
       self.urukul_idx = urukul_idx
       self.ch = ch
       self.frequency = frequency
@@ -37,7 +36,8 @@ class DDS():
       self.cpld_device = CPLD
       self.bus_channel = []
       self.ftw_per_hz = 0
-      self.read_db(device_db)
+      if device_db is not None:
+         self.read_db(device_db)
       
       if dac_device:
          self.dac_device = dac_device
@@ -256,7 +256,7 @@ class DDS():
 
    def read_db(self,ddb):
       '''read out info from ddb. ftw_per_hz comes from artiq.frontend.moninj, line 206-207'''
-      v = device_db[self.name]
+      v = ddb[self.name]
       self.cpld_name = v["arguments"]["cpld_device"]
       spi_dev = ddb[self.cpld_name]["arguments"]["spi_device"]
       self.bus_channel = ddb[spi_dev]["arguments"]["channel"]
