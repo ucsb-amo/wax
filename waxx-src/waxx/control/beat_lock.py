@@ -13,6 +13,8 @@ di = -10000
 
 FREQUENCY_GS_HFS = 461.7 * 1.e6
 
+T_PID_RESET_PULSE = 1.e-6
+
 POLMOD_H_IDX = 0
 POLMOD_V_IDX = 1
 
@@ -45,12 +47,8 @@ class BeatLockImaging():
         self.phase_mode = 1
 
     @kernel
-    def init(self,
-            frequency_polmod=0.,
-            global_phase=0.,relative_phase=0.,
-            t_phase_origin_mu=np.int64(-1),
-            phase_mode=1,
-            v_pd_imaging=0.):
+    def init(self):
+        self.dds_beatref.on()
         self.dds_sw.dac_ch = -1 # disconnect the logic for dac control of the dds
         self.dds_sw.update_dac_bool()
         self.ttl_pid_manual_override.on()
@@ -362,6 +360,7 @@ class PolModBeatLock(BeatLockImaging):
             v_pd_imaging=0.):
         if t_phase_origin_mu < 0:
             t_phase_origin_mu = now_mu()
+        self.dds_beatref.on()
         self.set_polmod(frequency_polmod,
                         global_phase,relative_phase,
                         t_phase_origin_mu=t_phase_origin_mu,
@@ -398,15 +397,15 @@ class BeatLockImagingPID(BeatLockImaging):
 
     @kernel
     def init(self):
-        self.dds_pid.dac_ch = -1
+        self.dds_beatref.on()
+
         self.dds_pid.set_dds(init=True)
         self.dds_sw.set_dds(init=True)
 
         self.dds_pid.on()
-        # self.ttl_pid_manual_override.off()
-        self.ttl_pid_manual_override.on()
+        self.ttl_pid_manual_override.off()
         self.set_imaging_detuning(0.)
-        self.ttl_pid_int_clear.pulse(1.e-6)
+        self.set_power(0.2, reset_pid=True)
 
     @portable(flags={"fast-math"})
     def get_ao_shift(self) -> TFloat:
@@ -415,8 +414,9 @@ class BeatLockImagingPID(BeatLockImaging):
         return ao_shift
 
     @kernel
-    def set_power(self, power_control_parameter=dv):
-        # self.dds_pid.set_dds(amplitude=self.dds_pid._amplitude_default,
-        #                      v_pd=power_control_parameter)
-        self.dds_pid.set_dds(amplitude=power_control_parameter)
-        # self.ttl_pid_int_clear.pulse(1.e-6)
+    def set_power(self, power_control_parameter=dv, reset_pid=False):
+        self.dds_pid.set_dds(amplitude=self.dds_pid._amplitude_default,
+                             v_pd=power_control_parameter)
+        if reset_pid:
+            self.ttl_pid_int_clear.pulse(T_PID_RESET_PULSE)
+            delay(-T_PID_RESET_PULSE)
