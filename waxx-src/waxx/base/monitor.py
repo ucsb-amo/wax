@@ -256,12 +256,12 @@ class Monitor:
                 self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
 
     @kernel
-    def sync_change_list(self):
+    def sync_change_list(self,verbose=True):
         """
         Synchronize kernel variables with the non-kernel update lists.
         """
         (self.dds_frequency_amplitude_updates, self.dds_vpd_updates, \
-          self.dds_sw_state_updates, self.ttl_updates, self.dac_updates) = self.detect_changes()
+          self.dds_sw_state_updates, self.ttl_updates, self.dac_updates) = self.detect_changes(verbose=verbose)
 
     @kernel
     def apply_updates(self):
