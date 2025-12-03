@@ -30,7 +30,7 @@ except ImportError:
 
 class DeviceWidget(QGroupBox):
     """Base class for device control widgets"""
-    value_changed = pyqtSignal(str, dict)
+    value_changed = pyqtSignal(str, str, dict)
     
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
         super().__init__(device_name)
@@ -170,7 +170,7 @@ class DDSWidget(DeviceWidget):
     def on_update_clicked(self):
         """Handle update button click"""
         updated_config = self.get_updated_config()
-        self.value_changed.emit(self.device_name, updated_config)
+        self.value_changed.emit("dds", self.device_name, updated_config)
         
     def get_updated_config(self) -> Dict[str, Any]:
         """Return the updated configuration for this DDS device"""
@@ -241,7 +241,7 @@ class DACWidget(DeviceWidget):
     def on_update_clicked(self):
         """Handle update button click"""
         updated_config = self.get_updated_config()
-        self.value_changed.emit(self.device_name, updated_config)
+        self.value_changed.emit("dac", self.device_name, updated_config)
         
     def get_updated_config(self) -> Dict[str, Any]:
         """Return the updated configuration for this DAC device"""
@@ -271,38 +271,39 @@ class TTLWidget(DeviceWidget):
         
         self.state_checkbox = QCheckBox("ON")
         self.state_checkbox.setChecked(bool(self.device_config["ttl_state"]))
+        self.state_checkbox.stateChanged.connect(self.on_update_clicked)
         state_layout.addWidget(self.state_checkbox)
         
         layout.addLayout(state_layout)
         
-        # Pulse controls
-        pulse_layout = QHBoxLayout()
-        pulse_layout.addWidget(QLabel("Pulse Time:"))
+        # # Pulse controls
+        # pulse_layout = QHBoxLayout()
+        # pulse_layout.addWidget(QLabel("Pulse Time:"))
         
-        self.pulse_time_edit = QLineEdit()
-        self.pulse_time_edit.setText("1e-6")
-        self.pulse_time_edit.setPlaceholderText("e.g., 1e-6")
-        pulse_layout.addWidget(self.pulse_time_edit)
+        # self.pulse_time_edit = QLineEdit()
+        # self.pulse_time_edit.setText("1e-6")
+        # self.pulse_time_edit.setPlaceholderText("e.g., 1e-6")
+        # pulse_layout.addWidget(self.pulse_time_edit)
         
-        pulse_layout.addWidget(QLabel("s"))
+        # pulse_layout.addWidget(QLabel("s"))
         
-        self.pulse_btn = QPushButton("Pulse")
-        self.pulse_btn.clicked.connect(self.on_pulse_clicked)
-        pulse_layout.addWidget(self.pulse_btn)
+        # self.pulse_btn = QPushButton("Pulse")
+        # self.pulse_btn.clicked.connect(self.on_pulse_clicked)
+        # pulse_layout.addWidget(self.pulse_btn)
         
-        layout.addLayout(pulse_layout)
+        # layout.addLayout(pulse_layout)
         
         # Update button
-        self.update_btn = QPushButton("Update State")
-        self.update_btn.clicked.connect(self.on_update_clicked)
-        layout.addWidget(self.update_btn)
+        # self.update_btn = QPushButton("Update State")
+        # self.update_btn.clicked.connect(self.on_update_clicked)
+        # layout.addWidget(self.update_btn)
         
         self.setLayout(layout)
         
     def on_update_clicked(self):
         """Handle update button click"""
         updated_config = self.get_updated_config()
-        self.value_changed.emit(self.device_name, updated_config)
+        self.value_changed.emit("ttl", self.device_name, updated_config)
         
     def on_pulse_clicked(self):
         """Handle pulse button click"""
@@ -484,14 +485,15 @@ class DeviceStateGUI(QMainWindow):
                 if child.widget():
                     child.widget().deleteLater()
                     
-    def on_device_value_changed(self, device_name: str, updated_config: Dict[str, Any]):
+    def on_device_value_changed(self, device_type: str, device_name: str, updated_config: Dict[str, Any]):
         """Handle device value changes"""
         # Determine device type and update config
-        if device_name in self.config_data.get("dds", {}):
+        if device_name in self.config_data.get("dds", {}) and device_type=="dds":
             self.config_data["dds"][device_name].update(updated_config)
-        elif device_name in self.config_data.get("dac", {}):
+        elif device_name in self.config_data.get("dac", {}) and device_type=="dac":
             self.config_data["dac"][device_name].update(updated_config)
-        elif device_name in self.config_data.get("ttl", {}):
+        elif device_name in self.config_data.get("ttl", {}) and device_type=="ttl":
+            print(updated_config)
             self.config_data["ttl"][device_name].update(updated_config)
             
         # Save updated config to file
