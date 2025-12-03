@@ -13,6 +13,8 @@ from artiq.language.core import kernel_from_string, now_mu
 from waxx.base import Scanner, Monitor
 from waxx.control.misc.oscilloscopes import ScopeData
 
+from waxx.util.device_state.update_state_file import update_device_states
+
 RPC_DELAY = 10.e-3
 
 from waxx.util.artiq.async_print import aprint
@@ -173,5 +175,7 @@ class Expt(Dealer, Scanner, Scribe):
                 self.write_data(expt_filepath)
             else:
                 self.remove_incomplete_data()
+
+        update_device_states(self)
                 
         # server_talk.play_random_sound()
