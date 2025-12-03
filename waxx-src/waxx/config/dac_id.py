@@ -23,18 +23,23 @@ class dac_frame():
 
     def cleanup(self):
         self._write_dac_keys()
+        self.populate_attrs()
+
+    def populate_attrs(self):
+        for dac in self.dac_ch_list:
+            vars(self)[dac.key] = dac
 
     def populate_dac_list(self, N_CH):
-        self.dac_ch_list = [DAC_CH(ch) for ch in range(N_CH)]
+        self.dac_ch_list = [0 for ch in range(N_CH)]
         for ch in range(N_CH):
-            dac_ch = DAC_CH(ch)
+            dac_ch = DAC_CH(ch, self.dac_device)
             dac_ch.key = f"zotino0_ch{ch}"
             self.dac_ch_list[ch] = dac_ch
         
     def assign_dac_ch(self,ch,v=0.,max_v=9.99) -> DAC_CH:
         if ch in FORBIDDEN_CH:
             raise ValueError(f"DAC channel {ch} is forbidden.")
-        this_dac_ch = DAC_CH(ch,self.dac_device, max_v=max_v)
+        this_dac_ch = DAC_CH(ch, self.dac_device, max_v=max_v)
         this_dac_ch.v = v
         self.dac_ch_list[ch] = (this_dac_ch)
         return this_dac_ch
