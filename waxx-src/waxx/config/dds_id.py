@@ -75,6 +75,7 @@ class dds_frame():
         self.write_dds_keys()
         self.make_dds_array()
         self.dds_list = np.array(self.dds_array).flatten()
+        self.populate_attrs()
 
         self.stash_defaults()
 
@@ -128,6 +129,10 @@ class dds_frame():
         self.dds_array[uru][ch] = dds0
 
         return dds0
+    
+    def populate_attrs(self):
+        for dds in self.dds_list:
+            vars(self)[dds.key] = dds
     
     def write_dds_keys(self):
         """Adds the assigned keys to the DDS objects so that the user-defined

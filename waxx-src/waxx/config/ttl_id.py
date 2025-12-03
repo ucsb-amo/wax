@@ -23,6 +23,11 @@ class ttl_frame():
     def cleanup(self):
         self._write_ttl_keys()
         self.camera = TTL_OUT
+        self.populate_attrs()
+
+    def populate_attrs(self):
+        for ttl in self.ttl_list:
+            vars(self)[ttl.key] = ttl
 
     def populate_ttl_list(self, N_TTL):
         self.ttl_list = [TTL(ch) for ch in range(N_TTL)]
