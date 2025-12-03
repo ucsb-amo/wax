@@ -111,6 +111,8 @@ class Monitor:
                         ["expt","state"],
                         f"expt.ttl.{attr_name}.set_state(state)"
                     ))
+                    ttl_idx += 1
+        
 
         dac_idx = 0
         # Build DAC device kernels
