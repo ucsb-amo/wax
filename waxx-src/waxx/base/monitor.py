@@ -11,9 +11,6 @@ from artiq.coredevice.core import Core
 
 # from waxx.control.artiq import DDS, DAC_CH, TTL_OUT, TTL_IN
 
-# from waxx.config.dds_id import dds_frame
-# from waxx.config.dac_id import dac_frame
-# from waxx.config.ttl_id import ttl_frame
 # from waxx.util.artiq.async_print import aprint
 
 DEFAULT_UPDATE_2FLOAT = (-1, 0.0, 0.0)
@@ -55,9 +52,12 @@ class Monitor:
         self.dac = self.expt.dac
         self.ttl = self.expt.ttl
 
-        # self.dds: dds_frame = self.expt.dds
-        # self.dac: dac_frame = self.expt.dac
-        # self.ttl: ttl_frame = self.expt.ttl
+        from waxx.config.dds_id import dds_frame
+        from waxx.config.dac_id import dac_frame
+        from waxx.config.ttl_id import ttl_frame
+        self.dds: dds_frame = self.expt.dds
+        self.dac: dac_frame = self.expt.dac
+        self.ttl: ttl_frame = self.expt.ttl
 
         self.build_device_lookup()
 
