@@ -10,7 +10,7 @@ from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
 
-from waxx.base import Scanner
+from waxx.base import Scanner, Monitor
 from waxx.control.misc.oscilloscopes import ScopeData
 
 RPC_DELAY = 10.e-3
@@ -50,6 +50,8 @@ class Expt(Dealer, Scanner, Scribe):
 
         self._setup_awg = False
 
+        self.monitor = Monitor(self)
+
         self.ds = DataSaver()
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
@@ -70,6 +72,8 @@ class Expt(Dealer, Scanner, Scribe):
         parameters that the user created in the experiment file at each step in
         a scan. This must be an RPC -- no kernel decorator.
         """
+
+        self.monitor.init_monitor()
 
         if self.run_info.imaging_type == img_types.ABSORPTION:
             if self.params.N_pwa_per_shot > 1:
