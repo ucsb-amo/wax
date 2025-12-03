@@ -19,7 +19,7 @@ kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = kexp_root / 'kexp' / 'config'
 sys.path.insert(0, str(kexp_root))
 
-PX_WIDTH_PER_COLUMN = 200
+PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
 
 # Import the DDS frame for detuning calculations
@@ -31,12 +31,12 @@ except ImportError:
     DDS_AVAILABLE = False
     print("Warning: Could not import DDS configuration. Detuning conversions will not be available.")
 
-class DeviceWidget(QGroupBox):
+class DeviceWidget(QWidget):
     """Base class for device control widgets"""
     value_changed = pyqtSignal(str, str, dict)
     
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
-        super().__init__(device_name)
+        super().__init__()
         self.device_name = device_name
         self.device_config = device_config
         self.setFont(QFont("Arial", 9))
@@ -59,6 +59,11 @@ class DDSWidget(DeviceWidget):
         
     def setup_ui(self):
         layout = QVBoxLayout()
+        
+        label = QLineEdit(self.device_name)
+        label.setReadOnly(True)
+        label.setToolTip(self.device_name)
+        layout.addWidget(label)
         
         # Frequency controls
         freq_layout = QHBoxLayout()
@@ -235,15 +240,22 @@ class DDSWidget(DeviceWidget):
 
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
-    
+
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
         super().__init__(device_name, device_config)
         self.setup_ui()
-        
+    
     def setup_ui(self):
         layout = QVBoxLayout()
+
+        label = QLineEdit(self.device_name)
+        label.setReadOnly(True)
+        label.setToolTip(self.device_name)
+        layout.addWidget(label)
         
+        # Voltage control
         voltage_layout = QHBoxLayout()
+        # voltage_layout.addWidget(QLabel("Voltage:"))
         
         self.voltage_spinbox = QDoubleSpinBox()
         self.voltage_spinbox.setRange(-9.999, 9.999)
@@ -276,13 +288,18 @@ class DACWidget(DeviceWidget):
 
 class TTLWidget(DeviceWidget):
     """Widget for controlling TTL devices"""
-    
+
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
         super().__init__(device_name, device_config)
         self.setup_ui()
-        
+    
     def setup_ui(self):
         layout = QVBoxLayout()
+
+        label = QLineEdit(self.device_name)
+        label.setReadOnly(True)
+        label.setToolTip(self.device_name)
+        layout.addWidget(label)
         
         # State control
         state_layout = QHBoxLayout()
@@ -462,38 +479,27 @@ class DeviceStateGUI(QMainWindow):
                     
         # Add TTL widgets grouped into columns of 8 (0-7, 8-15, etc.)
         if "ttl" in self.config_data:
-            ttl_devices = self.config_data["ttl"].items()
-            
-            # Create a dictionary to hold widgets for each channel
-            ttl_widgets_by_ch = {}
-            for device_name, device_config in ttl_devices:
+            for device_name, device_config in self.config_data["ttl"].items():
+                widget = TTLWidget(device_name, device_config)
+                widget.value_changed.connect(self.on_device_value_changed)
+                
+                # Extract channel number from device config or name
                 ch = device_config.get("ch", 0)
                 if ch == 0 and device_name.startswith("ttl"):
                     try:
+                        # Handle names like "ttl6", "ttl7", etc.
                         ch_str = device_name.replace("ttl", "")
                         if ch_str.isdigit():
                             ch = int(ch_str)
                     except (ValueError, IndexError):
                         ch = 0
                 
-                widget = TTLWidget(device_name, device_config)
-                widget.value_changed.connect(self.on_device_value_changed)
-                ttl_widgets_by_ch[ch] = widget
+                # Position: column groups of 8, row within group
+                col = ch // 8
+                row = ch % 8
+                
+                self.ttl_layout.addWidget(widget, row, col)
                 self.device_widgets[f"ttl.{device_name}"] = widget
-
-            if ttl_widgets_by_ch:
-                max_ch = max(ttl_widgets_by_ch.keys())
-                num_columns = (max_ch // 8) + 1
-
-                for col in range(num_columns):
-                    for row in range(8):
-                        ch = col * 8 + row
-                        if ch in ttl_widgets_by_ch:
-                            self.ttl_layout.addWidget(ttl_widgets_by_ch[ch], row, col)
-                        else:
-                            # Add a placeholder
-                            placeholder = QWidget()
-                            self.ttl_layout.addWidget(placeholder, row, col)
         
         self.adjust_window_width()
                     
