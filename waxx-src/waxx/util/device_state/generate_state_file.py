@@ -84,7 +84,6 @@ def extract_ttl_devices(frame_obj) -> Dict[str, Dict[str, Any]]:
             #     ttl_type = 'out'
             
             # Get actual state from the TTL object
-            print(ttl_device)
             ttl_state = getattr(ttl_device, 'state', 0)
             
             devices[ttl_device.key] = {

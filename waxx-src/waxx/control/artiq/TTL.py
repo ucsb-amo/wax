@@ -21,6 +21,7 @@ class TTL_OUT(TTL):
     def __init__(self,ch):
         super().__init__(ch)
         self.ttl_device = TTLOut
+        self.state = 0
     
     @kernel
     def on(self):
@@ -35,6 +36,14 @@ class TTL_OUT(TTL):
         self.ttl_device.on()
         delay(t)
         self.ttl_device.off()
+    
+    @kernel
+    def set_state(self,state=-1):
+        self.state = state if state != -1 else self.state
+        if self.state == 1:
+            self.on()
+        else:
+            self.off()
 
 class TTL_IN(TTL):
     def __init__(self,ch):
