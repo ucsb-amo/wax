@@ -8,7 +8,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
-    QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox
+    QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget
 )
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -18,6 +18,9 @@ from waxx.util.device_state.generate_state_file import load_module_from_file
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = kexp_root / 'kexp' / 'config'
 sys.path.insert(0, str(kexp_root))
+
+PX_WIDTH_PER_COLUMN = 200
+STATE_BUTTON_ON_COLOR = "green"
 
 # Import the DDS frame for detuning calculations
 try:
@@ -59,7 +62,7 @@ class DDSWidget(DeviceWidget):
         
         # Frequency controls
         freq_layout = QHBoxLayout()
-        freq_layout.addWidget(QLabel("Frequency:"))
+        # freq_layout.addWidget(QLabel("Frequency:"))
         
         self.freq_spinbox = QDoubleSpinBox()
         self.freq_spinbox.setSingleStep(0.1)
@@ -67,11 +70,14 @@ class DDSWidget(DeviceWidget):
         self.freq_spinbox.setValue(self.device_config["frequency"] / 1e6)  # Convert Hz to MHz
         self.freq_spinbox.setMinimum(0.)
         self.freq_spinbox.setMaximum(400.)
+        self.freq_spinbox.editingFinished.connect(self.on_update_clicked)
         freq_layout.addWidget(self.freq_spinbox)
         
         # Frequency unit selector (MHz/Γ) if transition is not None
         self.freq_unit_combo = QComboBox()
-        self.freq_unit_combo.addItems(["MHz", "Γ"])
+        self.freq_unit_combo.addItem("MHz")
+        if self.device_config.get("transition", "None") != "None":
+            self.freq_unit_combo.addItem("Γ")
         self.freq_unit_combo.currentTextChanged.connect(self.on_freq_unit_changed)
         
         freq_layout.addWidget(self.freq_unit_combo)
@@ -80,47 +86,64 @@ class DDSWidget(DeviceWidget):
         
         # Amplitude controls
         amp_layout = QHBoxLayout()
-        amp_layout.addWidget(QLabel("Amplitude:"))
         
         self.amp_spinbox = QDoubleSpinBox()
         self.amp_spinbox.setRange(0, 1)
         self.amp_spinbox.setDecimals(3)
-        self.amp_spinbox.setSingleStep(0.05)  # Increment of 0.05
+        self.amp_spinbox.setSingleStep(0.05)
         self.amp_spinbox.setValue(self.device_config["amplitude"])
-        amp_layout.addWidget(self.amp_spinbox)
-        
-        # Amplitude unit selector (Amp/V) if dac_ch is not -1
-        self.amp_unit_combo = QComboBox()
-        self.amp_unit_combo.addItems(["Amp"])
-        if self.device_config.get("transition", "None") != "None" and DDS_AVAILABLE:
-            self.amp_unit_combo.addItems(["V"])
-        self.amp_unit_combo.currentTextChanged.connect(self.on_amp_unit_changed)
-        
-        amp_layout.addWidget(self.amp_unit_combo)
-            
-        layout.addLayout(amp_layout)
-        
-        # V_PD control (shown when amplitude unit is V)
-        self.vpd_layout = QHBoxLayout()
-        self.vpd_layout.addWidget(QLabel("V_PD:"))
+        self.amp_spinbox.editingFinished.connect(self.on_update_clicked)
+
         self.vpd_spinbox = QDoubleSpinBox()
         self.vpd_spinbox.setRange(0, 10)
         self.vpd_spinbox.setDecimals(2)
-        self.vpd_spinbox.setSingleStep(0.05)  # Increment of 0.05
+        self.vpd_spinbox.setSingleStep(0.05)
         self.vpd_spinbox.setValue(self.device_config.get("v_pd", 5.0))
-        self.vpd_layout.addWidget(self.vpd_spinbox)
+        self.vpd_spinbox.editingFinished.connect(self.on_update_clicked)
+
+        self.power_control_widget = QHBoxLayout()
+        self.power_control_widget.addWidget(self.amp_spinbox)
+        self.power_control_widget.addWidget(self.vpd_spinbox)
         
-        self.vpd_widget = QWidget()
-        self.vpd_widget.setLayout(self.vpd_layout)
-        self.vpd_widget.setVisible(False)  # Hidden by default
-        layout.addWidget(self.vpd_widget)
+        amp_layout.addLayout(self.power_control_widget)
+        
+        # Amplitude unit selector (Amp/V)
+        self.amp_unit_combo = QComboBox()
+        self.amp_unit_combo.addItems(["Amp"])
+        start_unit = "amp"
+        if self.device_config.get("dac_ch", -1) != -1 and DDS_AVAILABLE:
+            self.amp_unit_combo.addItem("V")
+            start_unit = "V"
+            self.amp_unit_combo.setCurrentIndex(1)
+        self.amp_unit_combo.currentTextChanged.connect(self.on_amp_unit_changed)
+        amp_layout.addWidget(self.amp_unit_combo)
+        layout.addLayout(amp_layout)
         
         # Update button
-        self.update_btn = QPushButton("Update")
-        self.update_btn.clicked.connect(self.on_update_clicked)
-        layout.addWidget(self.update_btn)
+
+        self.state_button = QPushButton("Off")
+        self.state_button.setCheckable(True)
+        self.state_button.toggled.connect(self.on_state_button_toggled)
+        state_button_row = QHBoxLayout()
+        # state_button_row.addWidget(QLabel("sw state:"))
+        state_button_row.addWidget(self.state_button)
+
+        layout.addLayout(state_button_row)
         
         self.setLayout(layout)
+        self.update_from_config(self.device_config)
+        self.update_from_config(self.device_config)
+
+        self.on_amp_unit_changed(start_unit)
+        
+    def on_state_button_toggled(self, checked):
+        if checked:
+            self.state_button.setText("On")
+            self.state_button.setStyleSheet(f"background-color: {STATE_BUTTON_ON_COLOR}")
+        else:
+            self.state_button.setText("Off")
+            self.state_button.setStyleSheet("")
+        self.on_update_clicked()
         
     def on_freq_unit_changed(self, unit):
         """Handle frequency unit change between MHz and Γ"""
@@ -157,15 +180,14 @@ class DDSWidget(DeviceWidget):
     def on_amp_unit_changed(self, unit):
         """Handle amplitude unit change between Amp and V"""
         if self.device_config.get("dac_ch", -1) == -1:
+            self.vpd_spinbox.setVisible(False)
             return
         if unit == "V":
-            self.vpd_widget.setVisible(True)
-            self.amp_spinbox.setSuffix("")
-            self.amp_spinbox.setRange(0, 10)
+            self.amp_spinbox.setVisible(False)
+            self.vpd_spinbox.setVisible(True)
         else:
-            self.vpd_widget.setVisible(False)
-            self.amp_spinbox.setSuffix("")
-            self.amp_spinbox.setRange(0, 1)
+            self.amp_spinbox.setVisible(True)
+            self.vpd_spinbox.setVisible(False)
             
     def on_update_clicked(self):
         """Handle update button click"""
@@ -192,10 +214,13 @@ class DDSWidget(DeviceWidget):
             config["frequency"] = freq_value * 1e6  # Convert MHz to Hz
             
         # Update amplitude
-        if self.amp_unit_combo.currentText() == "V":
-            config["v_pd"] = self.vpd_spinbox.value()
-        else:
-            config["amplitude"] = self.amp_spinbox.value()
+        # if self.amp_unit_combo.currentText() == "V":
+        config["v_pd"] = self.vpd_spinbox.value()
+        # else:
+        config["amplitude"] = self.amp_spinbox.value()
+
+        # Update sw state
+        config["sw_state"] = int(self.state_button.isChecked())
             
         return config
         
@@ -206,7 +231,7 @@ class DDSWidget(DeviceWidget):
         self.amp_spinbox.setValue(config["amplitude"])
         if "v_pd" in config:
             self.vpd_spinbox.setValue(config["v_pd"])
-
+        self.state_button.setChecked(bool(config["sw_state"]))
 
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
@@ -218,23 +243,17 @@ class DACWidget(DeviceWidget):
     def setup_ui(self):
         layout = QVBoxLayout()
         
-        # Voltage control
         voltage_layout = QHBoxLayout()
-        voltage_layout.addWidget(QLabel("Voltage:"))
         
         self.voltage_spinbox = QDoubleSpinBox()
-        self.voltage_spinbox.setRange(-10, 10)
+        self.voltage_spinbox.setRange(-9.999, 9.999)
         self.voltage_spinbox.setDecimals(3)
         self.voltage_spinbox.setSuffix(" V")
         self.voltage_spinbox.setValue(self.device_config["voltage"])
+        self.voltage_spinbox.editingFinished.connect(self.on_update_clicked)
         voltage_layout.addWidget(self.voltage_spinbox)
         
         layout.addLayout(voltage_layout)
-        
-        # Update button
-        self.update_btn = QPushButton("Update")
-        self.update_btn.clicked.connect(self.on_update_clicked)
-        layout.addWidget(self.update_btn)
         
         self.setLayout(layout)
         
@@ -267,38 +286,26 @@ class TTLWidget(DeviceWidget):
         
         # State control
         state_layout = QHBoxLayout()
-        state_layout.addWidget(QLabel("State:"))
+        # state_layout.addWidget(QLabel("State:"))
         
-        self.state_checkbox = QCheckBox("ON")
-        self.state_checkbox.setChecked(bool(self.device_config["ttl_state"]))
-        self.state_checkbox.stateChanged.connect(self.on_update_clicked)
-        state_layout.addWidget(self.state_checkbox)
+        self.state_button = QPushButton("Off")
+        self.state_button.setCheckable(True)
+        self.state_button.toggled.connect(self.on_state_button_toggled)
+        state_layout.addWidget(self.state_button)
         
         layout.addLayout(state_layout)
         
-        # # Pulse controls
-        # pulse_layout = QHBoxLayout()
-        # pulse_layout.addWidget(QLabel("Pulse Time:"))
-        
-        # self.pulse_time_edit = QLineEdit()
-        # self.pulse_time_edit.setText("1e-6")
-        # self.pulse_time_edit.setPlaceholderText("e.g., 1e-6")
-        # pulse_layout.addWidget(self.pulse_time_edit)
-        
-        # pulse_layout.addWidget(QLabel("s"))
-        
-        # self.pulse_btn = QPushButton("Pulse")
-        # self.pulse_btn.clicked.connect(self.on_pulse_clicked)
-        # pulse_layout.addWidget(self.pulse_btn)
-        
-        # layout.addLayout(pulse_layout)
-        
-        # Update button
-        # self.update_btn = QPushButton("Update State")
-        # self.update_btn.clicked.connect(self.on_update_clicked)
-        # layout.addWidget(self.update_btn)
-        
         self.setLayout(layout)
+        self.update_from_config(self.device_config)
+
+    def on_state_button_toggled(self, checked):
+        if checked:
+            self.state_button.setText("On")
+            self.state_button.setStyleSheet("background-color: lightgreen")
+        else:
+            self.state_button.setText("Off")
+            self.state_button.setStyleSheet("")
+        self.on_update_clicked()
         
     def on_update_clicked(self):
         """Handle update button click"""
@@ -318,13 +325,13 @@ class TTLWidget(DeviceWidget):
     def get_updated_config(self) -> Dict[str, Any]:
         """Return the updated configuration for this TTL device"""
         config = self.device_config.copy()
-        config["ttl_state"] = int(self.state_checkbox.isChecked())
+        config["ttl_state"] = int(self.state_button.isChecked())
         return config
         
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         self.device_config = config
-        self.state_checkbox.setChecked(bool(config["ttl_state"]))
+        self.state_button.setChecked(bool(config["ttl_state"]))
 
 
 class DeviceStateGUI(QMainWindow):
@@ -455,28 +462,55 @@ class DeviceStateGUI(QMainWindow):
                     
         # Add TTL widgets grouped into columns of 8 (0-7, 8-15, etc.)
         if "ttl" in self.config_data:
-            for device_name, device_config in self.config_data["ttl"].items():
-                widget = TTLWidget(device_name, device_config)
-                widget.value_changed.connect(self.on_device_value_changed)
-                
-                # Extract channel number from device config or name
+            ttl_devices = self.config_data["ttl"].items()
+            
+            # Create a dictionary to hold widgets for each channel
+            ttl_widgets_by_ch = {}
+            for device_name, device_config in ttl_devices:
                 ch = device_config.get("ch", 0)
                 if ch == 0 and device_name.startswith("ttl"):
                     try:
-                        # Handle names like "ttl6", "ttl7", etc.
                         ch_str = device_name.replace("ttl", "")
                         if ch_str.isdigit():
                             ch = int(ch_str)
                     except (ValueError, IndexError):
                         ch = 0
                 
-                # Position: column groups of 8, row within group
-                col = ch // 8
-                row = ch % 8
-                
-                self.ttl_layout.addWidget(widget, row, col)
+                widget = TTLWidget(device_name, device_config)
+                widget.value_changed.connect(self.on_device_value_changed)
+                ttl_widgets_by_ch[ch] = widget
                 self.device_widgets[f"ttl.{device_name}"] = widget
+
+            if ttl_widgets_by_ch:
+                max_ch = max(ttl_widgets_by_ch.keys())
+                num_columns = (max_ch // 8) + 1
+
+                for col in range(num_columns):
+                    for row in range(8):
+                        ch = col * 8 + row
+                        if ch in ttl_widgets_by_ch:
+                            self.ttl_layout.addWidget(ttl_widgets_by_ch[ch], row, col)
+                        else:
+                            # Add a placeholder
+                            placeholder = QWidget()
+                            self.ttl_layout.addWidget(placeholder, row, col)
+        
+        self.adjust_window_width()
                     
+        # Adjust window width based on the number of columns
+        self.adjust_window_width()
+        
+    def adjust_window_width(self):
+        """Adjust the window width based on the tab with the most columns."""
+        max_columns = 0
+        for layout in [self.dds_layout, self.dac_layout, self.ttl_layout]:
+            max_columns = max(max_columns, layout.columnCount())
+        
+        if max_columns > 0:
+            # Add a buffer column for aesthetics
+            new_width = (max_columns + 1) * PX_WIDTH_PER_COLUMN
+            self.resize(new_width, self.height())
+        
     def clear_layouts(self):
         """Clear all device widgets from layouts"""
         for layout in [self.dds_layout, self.dac_layout, self.ttl_layout]:
