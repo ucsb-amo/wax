@@ -28,18 +28,8 @@ import numpy as np
 # Add the k-exp package to the path
 # script_dir = Path(__file__).parent
 kexp_root = Path(os.getenv('code')) / 'k-exp'
-config_file_path_dir = kexp_root / 'kexp' / 'kexp' / 'config'
+config_file_path_dir = kexp_root / 'kexp' / 'config'
 sys.path.insert(0, str(kexp_root))
-
-# Import device classes for isinstance checks
-try:
-    from waxx.control.artiq.DDS import DDS
-    from waxx.control.artiq.DAC_CH import DAC_CH
-    from waxx.control.artiq.TTL import TTL, TTL_OUT, TTL_IN
-except ImportError as e:
-    print(f"Error importing device classes: {e}")
-    print("Make sure the kexp package is available in the Python path")
-    sys.exit(1)
 
 def ensure_json_serializable(value):
     """Convert numpy types to native Python types for JSON serialization."""
@@ -67,6 +57,7 @@ def extract_live_dds_states(dds_frame) -> Dict[str, Dict[str, Any]]:
             
         attr_value = getattr(dds_frame, attr_name)
         
+        from waxx.control.artiq.DDS import DDS
         # Check if it's a DDS object using isinstance
         if isinstance(attr_value, DDS):
             # Get current live values and ensure JSON serializable
@@ -93,15 +84,16 @@ def extract_live_ttl_states(ttl_frame) -> Dict[str, Dict[str, Any]]:
             continue
             
         attr_value = getattr(ttl_frame, attr_name)
+        from waxx.control.artiq.TTL import TTL, TTL_OUT, TTL_IN
         
         # Check if it's a TTL object using isinstance
-        if isinstance(attr_value, TTL):
+        if isinstance(attr_value, TTL_OUT):
             # Determine the specific TTL type
+            # ttl_type = 'out'
+            # if isinstance(attr_value, TTL_IN):
+            #     ttl_type = 'in'
+            # elif isinstance(attr_value, TTL_OUT):
             ttl_type = 'out'
-            if isinstance(attr_value, TTL_IN):
-                ttl_type = 'in'
-            elif isinstance(attr_value, TTL_OUT):
-                ttl_type = 'out'
             
             # Get actual state from the TTL object and ensure JSON serializable
             devices[attr_name] = {
@@ -123,6 +115,7 @@ def extract_live_dac_states(dac_frame) -> Dict[str, Dict[str, Any]]:
             
         attr_value = getattr(dac_frame, attr_name)
         
+        from waxx.control.artiq.DAC_CH import DAC_CH
         # Check if it's a DAC_CH object using isinstance
         if isinstance(attr_value, DAC_CH):
             devices[attr_name] = {
