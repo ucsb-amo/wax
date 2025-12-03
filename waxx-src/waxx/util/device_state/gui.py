@@ -479,27 +479,37 @@ class DeviceStateGUI(QMainWindow):
                     
         # Add TTL widgets grouped into columns of 8 (0-7, 8-15, etc.)
         if "ttl" in self.config_data:
-            for device_name, device_config in self.config_data["ttl"].items():
-                widget = TTLWidget(device_name, device_config)
-                widget.value_changed.connect(self.on_device_value_changed)
-                
-                # Extract channel number from device config or name
+            ttl_devices = self.config_data["ttl"].items()
+            
+            # Pre-process to get channel numbers and find max channel
+            processed_ttls = []
+            max_ch = -1
+            for device_name, device_config in ttl_devices:
                 ch = device_config.get("ch", 0)
-                if ch == 0 and device_name.startswith("ttl"):
-                    try:
-                        # Handle names like "ttl6", "ttl7", etc.
-                        ch_str = device_name.replace("ttl", "")
-                        if ch_str.isdigit():
-                            ch = int(ch_str)
-                    except (ValueError, IndexError):
-                        ch = 0
-                
-                # Position: column groups of 8, row within group
+                if ch > max_ch:
+                    max_ch = ch
+                processed_ttls.append((device_name, device_config))
+
+            num_cols = (max_ch // 8) + 1 if max_ch != -1 else 0
+
+            # Create a grid of widgets to place, initialized with placeholders
+            widget_grid = [[QWidget() for _ in range(8)] for _ in range(num_cols)]
+
+            for device_name, device_config in processed_ttls:
+                ch = device_config["ch"]
                 col = ch // 8
                 row = ch % 8
                 
-                self.ttl_layout.addWidget(widget, row, col)
-                self.device_widgets[f"ttl.{device_name}"] = widget
+                if 0 <= col < num_cols:
+                    widget = TTLWidget(device_name, device_config)
+                    widget.value_changed.connect(self.on_device_value_changed)
+                    widget_grid[col][row] = widget
+                    self.device_widgets[f"ttl.{device_name}"] = widget
+
+            # Add widgets to layout
+            for col_idx, col_widgets in enumerate(widget_grid):
+                for row_idx, widget in enumerate(col_widgets):
+                    self.ttl_layout.addWidget(widget, row_idx, col_idx)
         
         self.adjust_window_width()
                     
