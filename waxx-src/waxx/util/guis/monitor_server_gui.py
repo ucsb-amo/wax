@@ -21,8 +21,8 @@ MONITOR_SERVER_IP_PATH = Path(os.getenv('code')) / 'k-exp' / 'kexp' / \
 class MonitorServerGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Monitor Control Server")
-        self.setGeometry(100, 100, 300, 100)
+        self.setWindowTitle("Monitor Server")
+        self.setGeometry(100, 100, 200, 80)
 
         self.monitor_manager = MonitorManager()
         self.monitor_manager.msg.connect(print) # For debugging
