@@ -28,7 +28,7 @@ import numpy as np
 # Add the k-exp package to the path
 # script_dir = Path(__file__).parent
 kexp_root = Path(os.getenv('code')) / 'k-exp'
-config_file_path_dir = kexp_root / 'kexp' / 'config'
+config_file_path_dir = Path(os.getenv('data'))
 sys.path.insert(0, str(kexp_root))
 
 def ensure_json_serializable(value):

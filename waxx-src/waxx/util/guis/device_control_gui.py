@@ -16,7 +16,7 @@ from PyQt6.QtGui import QFont
 from waxx.util.import_module_from_file import load_module_from_file
 
 kexp_root = Path(os.getenv('code')) / 'k-exp'
-config_file_path_dir = kexp_root / 'kexp' / 'config'
+config_file_path_dir = Path(os.getenv('data'))
 sys.path.insert(0, str(kexp_root))
 
 PX_WIDTH_PER_COLUMN = 100
@@ -25,7 +25,7 @@ STATE_BUTTON_ON_COLOR = "green"
 # Import the DDS frame for detuning calculations
 try:
     # from kexp.config.dds_id import dds_frame
-    DDS_FRAME = load_module_from_file(config_file_path_dir / 'dds_id.py').dds_frame()
+    DDS_FRAME = load_module_from_file(kexp_root / 'kexp' / 'config' / 'dds_id.py').dds_frame()
     DDS_AVAILABLE = True
 except ImportError:
     DDS_AVAILABLE = False

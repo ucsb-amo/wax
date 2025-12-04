@@ -41,7 +41,7 @@ class Monitor:
         Args:
             config_file: Path to device state config file. If None, uses default location.
         """
-        self.config_file = Path(os.getenv('code')) / 'k-exp' / 'kexp' / 'config' / 'device_state_config.json'
+        self.config_file = Path(os.getenv('data')) / 'device_state_config.json'
         
         self.last_config_data = None
 
