@@ -1,6 +1,9 @@
+import numpy as np
+from pathlib import Path
+import os
+
 from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
-import numpy as np
 
 from waxa import ExptParams
 from waxa.data import DataSaver, RunInfo, counter, server_talk
@@ -12,8 +15,6 @@ from artiq.language.core import kernel_from_string, now_mu
 
 from waxx.base import Scanner, Monitor
 from waxx.control.misc.oscilloscopes import ScopeData
-
-from waxx.util.device_state.update_state_file import update_device_states
 
 RPC_DELAY = 10.e-3
 
@@ -176,6 +177,7 @@ class Expt(Dealer, Scanner, Scribe):
             else:
                 self.remove_incomplete_data()
 
-        update_device_states(self)
+        self.monitor.update_device_states()
+        self.monitor.signal_end()
                 
         # server_talk.play_random_sound()

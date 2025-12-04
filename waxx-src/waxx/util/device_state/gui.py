@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
-from waxx.util.device_state.generate_state_file import load_module_from_file
+from waxx.util.import_module_from_file import load_module_from_file
 
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = kexp_root / 'kexp' / 'config'

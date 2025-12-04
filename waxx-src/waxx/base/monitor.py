@@ -18,6 +18,17 @@ DEFAULT_UPDATE_FLOAT = (-1, 0.0)
 DEFAULT_UPDATE_BOOL = (-1, False)
 DEFAULT_UPDATE_INT = (-1, 0)
 
+from waxx.util.comms_server.comm_client import MonitorClient
+from waxx.util.device_state.update_state_file import update_device_states
+from waxx.util.import_module_from_file import load_module_from_file
+
+MONITOR_SERVER_IP_PATH = Path(os.getenv('code')) / 'k-exp' / 'kexp' / \
+      'config' / 'server.py'
+try:
+    MONITOR_SERVER_IP = load_module_from_file(MONITOR_SERVER_IP_PATH).MONITOR_SERVER_IP
+except:
+    raise ValueError(f'The monitor server IP config file in kexp cannot be found -- expected at {MONITOR_SERVER_IP_PATH}')
+
 class Monitor:
     """
     Detects changes in device state configuration and updates hardware devices.
@@ -42,6 +53,17 @@ class Monitor:
         self.dac_kernels = []
 
         self.expt = expt
+
+        self._monitor_client = MonitorClient(MONITOR_SERVER_IP)
+
+    def update_device_states(self):
+        update_device_states(self.expt)
+
+    def signal_end(self):
+        self._monitor_client.send_end()
+
+    def signal_ready(self):
+        self._monitor_client.send_ready()
 
     def init_monitor(self):
 

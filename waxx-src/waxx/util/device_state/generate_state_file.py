@@ -14,7 +14,7 @@ For DAC devices: voltage
 
 import os
 import sys
-import importlib.util
+
 import json
 import numpy as np
 from pathlib import Path
@@ -25,6 +25,8 @@ kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = kexp_root / 'kexp' / 'config'
 sys.path.insert(0, str(kexp_root))
 
+from waxx.util.import_module_from_file import load_module_from_file
+
 # Import device classes for isinstance checks
 try:
     from waxx.control.artiq.DDS import DDS
@@ -33,17 +35,6 @@ try:
 except ImportError as e:
     print(f"Error importing device classes: {e}")
     sys.exit(1)
-
-def load_module_from_file(file_path: Path):
-    """Load a Python module from a file path."""
-    spec = importlib.util.spec_from_file_location("module", file_path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-        return module
-    except Exception as e:
-        print(f"Error loading {file_path}: {e}")
-        return None
 
 def extract_dds_devices(frame_obj) -> Dict[str, Dict[str, Any]]:
     """Extract DDS device states from a dds_frame object."""
