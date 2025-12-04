@@ -1,6 +1,6 @@
 import sys
 import socket
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont
 import os
@@ -22,7 +22,7 @@ class MonitorServerGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Monitor Server")
-        self.setGeometry(100, 100, 200, 80)
+        self.setGeometry(100, 100, 250, 80)
 
         self.monitor_manager = MonitorManager()
         self.monitor_manager.msg.connect(print) # For debugging
@@ -41,7 +41,7 @@ class MonitorServerGUI(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout()
         self.status_indicator = QPushButton("NOT READY")
-        self.status_indicator.clicked.connect(self.on_status_button_clicked)
+        self.status_indicator.clicked.connect(self.on_status_clicked)
         font = QFont()
         font.setPointSize(24)
         font.setBold(True)
@@ -63,13 +63,17 @@ class MonitorServerGUI(QWidget):
         
         self.server_thread.start()
 
-    def on_status_button_clicked(self):
-        if not self.is_ready:
-            print("Manual start of monitor triggered.")
-            self.monitor_manager.start()
-
     def on_status_clicked(self):
-        if self.status_indicator.text() == "NOT READY":
+        if self.status_indicator.text() == "READY":
+            reply = QMessageBox.question(self, 'Restart Monitor',
+                                         "Are you sure you'd like to restart the monitor experiment?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                print("Manual monitor restart triggered.")
+                self.monitor_manager.start()
+                self.set_status(STATES.LOADING)
+        elif self.status_indicator.text() == "NOT READY":
             print("Manual monitor start triggered.")
             self.monitor_manager.start()
 
@@ -87,11 +91,11 @@ class MonitorServerGUI(QWidget):
         if status == STATES.READY:
             self.status_indicator.setText("READY")
             self.status_indicator.setStyleSheet("background-color: green; color: white;")
-            self.status_indicator.setEnabled(False)
+            # self.status_indicator.setEnabled(False)
         elif status == STATES.NOT_READY:
             self.status_indicator.setText("NOT READY")
             self.status_indicator.setStyleSheet("background-color: red; color: white;")
-            self.status_indicator.setEnabled(True)
+            # self.status_indicator.setEnabled(True)
         else:
             self.status_indicator.setText("Loading...")
             self.status_indicator.setStyleSheet("background-color: orange; color: white;")
