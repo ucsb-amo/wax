@@ -22,26 +22,19 @@ from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.device_state.update_state_file import update_device_states
 from waxx.util.import_module_from_file import load_module_from_file
 
-MONITOR_SERVER_IP_PATH = Path(os.getenv('code')) / 'k-exp' / 'kexp' / \
-      'config' / 'server.py'
-try:
-    MONITOR_SERVER_IP = load_module_from_file(MONITOR_SERVER_IP_PATH).MONITOR_SERVER_IP
-except:
-    raise ValueError(f'The monitor server IP config file in kexp cannot be found -- expected at {MONITOR_SERVER_IP_PATH}')
-
 class Monitor:
     """
     Detects changes in device state configuration and updates hardware devices.
     """
      
-    def __init__(self, expt):
+    def __init__(self, expt, monitor_server_ip, device_state_json_path):
         """
         Initialize the device state updater.
         
         Args:
             config_file: Path to device state config file. If None, uses default location.
         """
-        self.config_file = Path(os.getenv('data')) / 'device_state_config.json'
+        self.config_file = device_state_json_path
         
         self.last_config_data = None
 
@@ -54,7 +47,7 @@ class Monitor:
 
         self.expt = expt
 
-        self._monitor_client = MonitorClient(MONITOR_SERVER_IP)
+        self._monitor_client = MonitorClient(monitor_server_ip)
 
     def update_device_states(self):
         update_device_states(self.expt)
@@ -157,7 +150,7 @@ class Monitor:
 
         while attempts < max_attempts:
             try:
-                if not self.config_file.exists():
+                if not os.path.isfile(self.config_file):
                     print(f"Config file {self.config_file} does not exist")
                     return None
 

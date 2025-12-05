@@ -9,22 +9,21 @@ from pathlib import Path
 from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.comms_server.comm_server import UdpServer, STATES, ReadyBit
 
-# Assuming monitor_manager is in a reachable path.
-# We might need to adjust the path.
-k_exp_path = Path(os.getenv('code')) / 'k-exp'
-sys.path.insert(0, str(k_exp_path))
-
 from waxx.util.import_module_from_file import load_module_from_file
-MONITOR_SERVER_IP_PATH = Path(os.getenv('code')) / 'k-exp' / 'kexp' / \
-      'config' / 'server.py'
+
+# class MonitorUDPServer(UdpServer):
+#     def __init__(self, )
 
 class MonitorServerGUI(QWidget):
-    def __init__(self):
+    def __init__(self, monitor_server_ip, monitor_expt_path):
         super().__init__()
+
+        self.server_ip = monitor_server_ip
+
         self.setWindowTitle("Monitor Server")
         self.setGeometry(100, 100, 250, 80)
 
-        self.monitor_manager = MonitorManager()
+        self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(print) # For debugging
 
         self.is_ready = False
@@ -51,11 +50,8 @@ class MonitorServerGUI(QWidget):
 
     def setup_udp_server(self):
         self.server_thread = QThread()
-        try:
-            MONITOR_SERVER_IP = load_module_from_file(MONITOR_SERVER_IP_PATH).MONITOR_SERVER_IP
-        except:
-            raise ValueError(f'The monitor server IP config file in kexp cannot be found -- expected at {MONITOR_SERVER_IP_PATH}')
-        self.udp_server = UdpServer(MONITOR_SERVER_IP, 6789)
+        
+        self.udp_server = UdpServer(self.server_ip, 6789)
         self.udp_server.moveToThread(self.server_thread)
 
         self.server_thread.started.connect(self.udp_server.run)
@@ -116,9 +112,3 @@ class MonitorServerGUI(QWidget):
         self.monitor_manager.terminate()
         self.monitor_manager.wait()
         event.accept()
-
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    gui = MonitorServerGUI()
-    gui.show()
-    sys.exit(app.exec())

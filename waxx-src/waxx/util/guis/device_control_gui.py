@@ -13,23 +13,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
+# from waxx.config.dds_id import dds_frame
 from waxx.util.import_module_from_file import load_module_from_file
-
-kexp_root = Path(os.getenv('code')) / 'k-exp'
-config_file_path_dir = Path(os.getenv('data'))
-sys.path.insert(0, str(kexp_root))
 
 PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
-
-# Import the DDS frame for detuning calculations
-try:
-    # from kexp.config.dds_id import dds_frame
-    DDS_FRAME = load_module_from_file(kexp_root / 'kexp' / 'config' / 'dds_id.py').dds_frame()
-    DDS_AVAILABLE = True
-except ImportError:
-    DDS_AVAILABLE = False
-    print("Warning: Could not import DDS configuration. Detuning conversions will not be available.")
 
 class DeviceWidget(QWidget):
     """Base class for device control widgets"""
@@ -119,7 +107,7 @@ class DDSWidget(DeviceWidget):
         self.amp_unit_combo = QComboBox()
         self.amp_unit_combo.addItems(["Amp"])
         start_unit = "amp"
-        if self.device_config.get("dac_ch", -1) != -1 and DDS_AVAILABLE:
+        if self.device_config.get("dac_ch", -1) != -1:
             self.amp_unit_combo.addItem("V")
             start_unit = "V"
             self.amp_unit_combo.setCurrentIndex(1)
@@ -159,7 +147,7 @@ class DDSWidget(DeviceWidget):
 
         if unit == "Γ":
             # Convert MHz to Γ
-            if DDS_AVAILABLE and self.dds_frame_obj:
+            if self.dds_frame_obj:
                 try:
                     uru_idx = self.device_config["urukul_idx"]
                     ch = self.device_config["ch"]
@@ -173,7 +161,7 @@ class DDSWidget(DeviceWidget):
                     print(e)
         elif unit == "MHz":
             # Convert Γ to MHz
-            if DDS_AVAILABLE and self.dds_frame_obj:
+            if self.dds_frame_obj:
                 try:
                     uru_idx = self.device_config["urukul_idx"]
                     ch = self.device_config["ch"]
@@ -208,7 +196,7 @@ class DDSWidget(DeviceWidget):
         
         # Update frequency
         freq_value = self.freq_spinbox.value()
-        if self.freq_unit_combo.currentText() == "Γ" and DDS_AVAILABLE and self.dds_frame_obj:
+        if self.freq_unit_combo.currentText() == "Γ":
             try:
                 uru_idx = self.device_config["urukul_idx"]
                 ch = self.device_config["ch"]
@@ -358,20 +346,17 @@ class TTLWidget(DeviceWidget):
 class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management"""
     
-    def __init__(self):
+    def __init__(self,
+                  monitor_server_ip,
+                  device_state_json_path,
+                  dds_frame):
         super().__init__()
-        self.config_file = config_file_path_dir / "device_state_config.json"
+        self.config_file = device_state_json_path
         self.config_data = {}
         self.device_widgets = {}
         
-        # Initialize DDS frame if available
-        self.dds_frame_obj = None
-        if DDS_AVAILABLE:
-            try:
-                self.dds_frame_obj = DDS_FRAME
-            except Exception as e:
-                print(f"Warning: Could not initialize DDS frame: {e}")
-        
+        self.dds_frame_obj = dds_frame
+
         self.setup_ui()
         self.load_config()
         self.setup_timer()
@@ -560,21 +545,3 @@ class DeviceStateGUI(QMainWindow):
                 json.dump(self.config_data, f, indent=2)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
-
-
-def main():
-    """Main application entry point"""
-    app = QApplication(sys.argv)
-    
-    # Set application style
-    app.setStyle('Fusion')
-    
-    # Create and show main window
-    window = DeviceStateGUI()
-    window.show()
-    
-    # Run application
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()

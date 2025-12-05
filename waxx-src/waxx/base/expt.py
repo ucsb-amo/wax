@@ -13,12 +13,11 @@ from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
 
-from waxx.base import Scanner, Monitor
+from waxx.base import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
+from waxx.util.artiq.async_print import aprint
 
 RPC_DELAY = 10.e-3
-
-from waxx.util.artiq.async_print import aprint
 
 class Expt(Dealer, Scanner, Scribe):
     def __init__(self,
@@ -53,8 +52,6 @@ class Expt(Dealer, Scanner, Scribe):
 
         self._setup_awg = False
 
-        self.monitor = Monitor(self)
-
         self.ds = DataSaver()
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
@@ -76,7 +73,8 @@ class Expt(Dealer, Scanner, Scribe):
         a scan. This must be an RPC -- no kernel decorator.
         """
 
-        self.monitor.init_monitor()
+        if hasattr(self,'monitor'):
+            self.monitor.init_monitor()
 
         if self.run_info.imaging_type == img_types.ABSORPTION:
             if self.params.N_pwa_per_shot > 1:
@@ -177,7 +175,8 @@ class Expt(Dealer, Scanner, Scribe):
             else:
                 self.remove_incomplete_data()
 
-        self.monitor.update_device_states()
-        self.monitor.signal_end()
+        if hasattr(self,'monitor'):
+            self.monitor.update_device_states()
+            self.monitor.signal_end()
                 
         # server_talk.play_random_sound()
