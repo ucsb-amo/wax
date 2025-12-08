@@ -37,10 +37,15 @@ except ImportError as e:
     sys.exit(1)
     
 class Generator():
-    def __init__(self,dds_frame,ttl_frame,dac_frame):
+    def __init__(self,dds_frame,ttl_frame,dac_frame,
+                 state_file_path,
+                 verbose = True):
         self.dds = dds_frame
         self.ttl = ttl_frame
         self.dac = dac_frame
+
+        self._state_file = state_file_path
+        self._verbose = verbose
 
         self.config_data: Dict = None
 
@@ -51,18 +56,22 @@ class Generator():
             print("Failed to generate configuration data.")
             return 1
         
-        self.print_summary()
+        if self._verbose:
+            self.print_summary()
 
         output_file = self.save_config_file()
 
-        if output_file:
-            print(f"\nTotal devices found:")
-            print(f"  DDS: {len(self.config_data['dds'])}")
-            print(f"  TTL: {len(self.config_data['ttl'])}")
-            print(f"  DAC: {len(self.config_data['dac'])}")
-            return 0
+        if self._verbose:
+            if output_file:
+                print(f"\nTotal devices found:")
+                print(f"  DDS: {len(self.config_data['dds'])}")
+                print(f"  TTL: {len(self.config_data['ttl'])}")
+                print(f"  DAC: {len(self.config_data['dac'])}")
+                return 0
+            else:
+                return 1
         else:
-            return 1
+            print("Device states updated.")
 
     def extract_dds_devices(self) -> Dict[str, Dict[str, Any]]:
         """Extract DDS device states from a dds_frame object."""
@@ -72,14 +81,13 @@ class Generator():
         dds_list = getattr(self.dds, 'dds_list', [])
         for dds_device in dds_list:
             if isinstance(dds_device, DDS):
-                sw_state = getattr(dds_device, 'sw_state', 0)
                 devices[dds_device.key] = {
                     'frequency': getattr(dds_device, 'frequency', 0.0),
                     'amplitude': getattr(dds_device, 'amplitude', 0.0),
                     'v_pd': getattr(dds_device, 'v_pd', 0.0),  # voltage photodiode setpoint
                     'urukul_idx': getattr(dds_device, 'urukul_idx', 0),
                     'ch': getattr(dds_device, 'ch', 0),
-                    'sw_state': sw_state,  # Hardware switch state (0/1)
+                    'sw_state': getattr(dds_device, 'sw_state', 0),  # Hardware switch state (0/1)
                     'transition': getattr(dds_device, 'transition', 'None'),
                     'aom_order': getattr(dds_device, 'aom_order', 0),
                     'dac_ch': getattr(dds_device, 'dac_ch', -1)
@@ -97,10 +105,6 @@ class Generator():
             if isinstance(ttl_device, TTL_OUT):
                 # Determine the specific TTL type
                 ttl_type = 'out'
-                # if isinstance(ttl_device, TTL_IN):
-                #     ttl_type = 'in'
-                # elif isinstance(ttl_device, TTL_OUT):
-                #     ttl_type = 'out'
                 
                 # Get actual state from the TTL object
                 ttl_state = getattr(ttl_device, 'state', 0)
@@ -159,13 +163,9 @@ class Generator():
 
         self.config_data = device_config
 
-    def save_config_file(self,
-                         output_file: str = None):
+    def save_config_file(self):
         """Save the configuration data to a JSON file."""
-        if output_file is None:
-            output_file = config_file_path_dir / 'device_state_config.json'
-        else:
-            output_file = Path(output_file)
+        output_file = self._state_file
         
         # Helper function to convert numpy types to native Python types
         def convert_numpy_types(obj):
@@ -208,32 +208,3 @@ class Generator():
                 elif device_type == 'dac':
                     print(f"  {name:25} | Ch: {props['ch']:2d} | "
                         f"Voltage: {props['voltage']:6.3f} V | Max: {props['max_voltage']:6.3f} V")
-
-def main():
-
-    """Main function to generate device state configuration."""
-    
-    # Generate configuration
-    config_data = generate_device_config()
-    
-    if config_data is None:
-        print("Failed to generate configuration data.")
-        return 1
-    
-    # Print summary
-    print_summary(config_data)
-    
-    # Save to file
-    output_file = save_config_file(config_data)
-    
-    if output_file:
-        print(f"\nTotal devices found:")
-        print(f"  DDS: {len(config_data['dds'])}")
-        print(f"  TTL: {len(config_data['ttl'])}")
-        print(f"  DAC: {len(config_data['dac'])}")
-        return 0
-    else:
-        return 1
-
-if __name__ == "__main__":
-    sys.exit(main())

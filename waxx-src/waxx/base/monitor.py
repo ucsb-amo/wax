@@ -19,8 +19,7 @@ DEFAULT_UPDATE_BOOL = (-1, False)
 DEFAULT_UPDATE_INT = (-1, 0)
 
 from waxx.util.comms_server.comm_client import MonitorClient
-from waxx.util.device_state.update_state_file import update_device_states
-from waxx.util.import_module_from_file import load_module_from_file
+from waxx.util.device_state.generate_state_file import Generator
 
 class Monitor:
     """
@@ -50,7 +49,7 @@ class Monitor:
         self._monitor_client = MonitorClient(monitor_server_ip)
 
     def update_device_states(self):
-        update_device_states(self.expt)
+        self.generator.generate()
 
     def signal_end(self):
         self._monitor_client.send_end()
@@ -73,6 +72,10 @@ class Monitor:
         self.dds: dds_frame = self.expt.dds
         self.dac: dac_frame = self.expt.dac
         self.ttl: ttl_frame = self.expt.ttl
+
+        self.generator = Generator(self.dds,self.ttl,self.dac,
+                                   self.config_file,
+                                   verbose = False)
 
         self.build_device_lookup()
 
@@ -327,4 +330,3 @@ class Monitor:
                 break
             self.dac_kernels[index](self.expt,v)
             delay(t0)
-            
