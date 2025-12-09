@@ -1,18 +1,46 @@
-import sys
 import socket
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont
-import os
-from pathlib import Path
+import time
 
 from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.comms_server.comm_server import UdpServer, STATES, ReadyBit
 
-from waxx.util.import_module_from_file import load_module_from_file
+class Status:
+    def __init__(self,state=False):
+        self.state = state
 
-# class MonitorUDPServer(UdpServer):
-#     def __init__(self, )
+class MonitorUDPServer(UdpServer):
+
+    reset_signal = pyqtSignal()
+
+    def __init__(self, host, port):
+        super().__init__(host,port)
+
+        self.status = Status()
+        
+    def run(self):
+        self.sock.bind((self.host, self.port))
+        self.running = True
+        print(f"Listening on {self.host}:{self.port}")
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(1024)
+                message = data.decode('utf-8')
+                self.parse_message(message)
+                self.message_received.emit(message)
+            except socket.error as e:
+                if self.running:
+                    print(f"Socket error: {e}")
+                break
+        print("UDP Server stopped.")
+    
+    def parse_message(self,message):
+        if message == 'status':
+            self.sock.sendall(self.status.state)
+        elif message == 'reset':
+            self.reset_signal.emit()
 
 class MonitorServerGUI(QWidget):
     def __init__(self, monitor_server_ip, monitor_expt_path):
@@ -26,7 +54,8 @@ class MonitorServerGUI(QWidget):
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(print) # For debugging
 
-        self.is_ready = False
+        self.status = Status()
+
         self.setup_ui()
         self.setup_udp_server()
 
@@ -40,7 +69,7 @@ class MonitorServerGUI(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout()
         self.status_indicator = QPushButton("NOT READY")
-        self.status_indicator.clicked.connect(self.on_status_clicked)
+        self.status_indicator.clicked.connect(self.on_button_clicked)
         font = QFont()
         font.setPointSize(24)
         font.setBold(True)
@@ -51,27 +80,54 @@ class MonitorServerGUI(QWidget):
     def setup_udp_server(self):
         self.server_thread = QThread()
         
-        self.udp_server = UdpServer(self.server_ip, 6789)
+        self.udp_server = MonitorUDPServer(self.server_ip, 6789)
         self.udp_server.moveToThread(self.server_thread)
 
+        self.udp_server.reset_signal.connect(self.restart_monitor)
         self.server_thread.started.connect(self.udp_server.run)
         self.udp_server.message_received.connect(self.handle_message)
         
         self.server_thread.start()
 
-    def on_status_clicked(self):
-        if self.status_indicator.text() == "READY":
+    def on_button_clicked(self):
+        if self.status.state == STATES.READY:
             reply = QMessageBox.question(self, 'Restart Monitor',
                                          "Are you sure you'd like to restart the monitor experiment?",
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 print("Manual monitor restart triggered.")
-                self.monitor_manager.start()
-                self.set_status(STATES.LOADING)
-        elif self.status_indicator.text() == "NOT READY":
+                self.restart_monitor()
+        elif self.status.state == STATES.NOT_READY:
             print("Manual monitor start triggered.")
             self.monitor_manager.start()
+
+    def restart_monitor(self):
+        if self.monitor_manager.isRunning():
+            self.monitor_manager.terminate()
+            time.sleep(0.125)
+        self.monitor_manager.start()
+        self.set_status(STATES.LOADING)
+
+    def set_status(self, status):
+        if status == STATES.READY:
+            self.status_indicator.setText("READY")
+            self.status_indicator.setStyleSheet("background-color: green; color: white;")
+        elif status == STATES.NOT_READY:
+            self.status_indicator.setText("NOT READY")
+            self.status_indicator.setStyleSheet("background-color: red; color: white;")
+        else:
+            self.status_indicator.setText("Loading...")
+            self.status_indicator.setStyleSheet("background-color: orange; color: white;")
+        self.status.state = status
+
+    def check_monitor_status(self):
+        if self.monitor_manager.isRunning() and self.status_indicator.text() != "READY":
+            self.set_status(STATES.LOADING)
+        elif not self.monitor_manager.isRunning():
+            self.set_status(STATES.NOT_READY)
+        else:
+            self.set_status(STATES.READY)
 
     def handle_message(self, message):
         print(f"Message received: {message}")
@@ -81,27 +137,6 @@ class MonitorServerGUI(QWidget):
             self.set_status(STATES.LOADING)
         elif "monitor ready" in message:
             print("Monitor ready message received.")
-            self.set_status(STATES.READY)
-
-    def set_status(self, status: ReadyBit):
-        if status == STATES.READY:
-            self.status_indicator.setText("READY")
-            self.status_indicator.setStyleSheet("background-color: green; color: white;")
-            # self.status_indicator.setEnabled(False)
-        elif status == STATES.NOT_READY:
-            self.status_indicator.setText("NOT READY")
-            self.status_indicator.setStyleSheet("background-color: red; color: white;")
-            # self.status_indicator.setEnabled(True)
-        else:
-            self.status_indicator.setText("Loading...")
-            self.status_indicator.setStyleSheet("background-color: orange; color: white;")
-
-    def check_monitor_status(self):
-        if self.monitor_manager.isRunning() and self.status_indicator.text() != "READY":
-            self.set_status(STATES.LOADING)
-        elif not self.monitor_manager.isRunning():
-            self.set_status(STATES.NOT_READY)
-        else:
             self.set_status(STATES.READY)
         
     def closeEvent(self, event):
