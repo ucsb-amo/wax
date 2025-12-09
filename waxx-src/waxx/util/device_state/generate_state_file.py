@@ -24,17 +24,6 @@ from typing import Dict, Any, List
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = Path(os.getenv('data'))
 sys.path.insert(0, str(kexp_root))
-
-from waxx.util.import_module_from_file import load_module_from_file
-
-# Import device classes for isinstance checks
-try:
-    from waxx.control.artiq.DDS import DDS
-    from waxx.control.artiq.DAC_CH import DAC_CH
-    from waxx.control.artiq.TTL import TTL, TTL_OUT, TTL_IN
-except ImportError as e:
-    print(f"Error importing device classes: {e}")
-    sys.exit(1)
     
 class Generator():
     def __init__(self,dds_frame,ttl_frame,dac_frame,
@@ -76,6 +65,8 @@ class Generator():
     def extract_dds_devices(self) -> Dict[str, Dict[str, Any]]:
         """Extract DDS device states from a dds_frame object."""
         devices = {}
+
+        from waxx.control.artiq.DDS import DDS
         
         # Iterate over _dds_list to extract DDS devices
         dds_list = getattr(self.dds, 'dds_list', [])
@@ -98,6 +89,8 @@ class Generator():
     def extract_ttl_devices(self) -> Dict[str, Dict[str, Any]]:
         """Extract TTL device states from a ttl_frame object."""
         devices = {}
+
+        from waxx.control.artiq.TTL import TTL_OUT
         
         # Iterate over _ttl_list to extract TTL devices
         ttl_list = getattr(self.ttl, 'ttl_list', [])
@@ -120,6 +113,8 @@ class Generator():
     def extract_dac_devices(self) -> Dict[str, Dict[str, Any]]:
         """Extract DAC device states from a dac_frame object."""
         devices = {}
+
+        from waxx.control.artiq.DAC_CH import DAC_CH
 
         # Iterate over _dac_ch_list to extract DAC devices
         dac_ch_list = getattr(self.dac, 'dac_ch_list', [])
