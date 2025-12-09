@@ -220,6 +220,7 @@ class DDS():
          self.dac_device.write_dac(channel=self.dac_ch,voltage=0.)
          if dac_load:
             self.dac_device.load()
+      self.sw_state = 0
 
    @kernel
    def on(self, dac_update = True, dac_load=True):
@@ -229,6 +230,16 @@ class DDS():
          if dac_load:
             self.dac_device.load()
       self.dds_device.sw.on()
+      self.sw_state = 1
+
+   @kernel
+   def set_sw(self, state=-1):
+      self.sw_state = state if state != -1 else self.sw_state
+
+      if self.sw_state == 1:
+         self.dds_device.sw.on()
+      else:
+         self.dds_device.sw.off()
 
    @kernel
    def set_sw(self, state=-1):

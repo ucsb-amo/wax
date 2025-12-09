@@ -1,6 +1,9 @@
+import numpy as np
+from pathlib import Path
+import os
+
 from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
-import numpy as np
 
 from waxa import ExptParams
 from waxa.data import DataSaver, RunInfo, counter, server_talk
@@ -12,10 +15,9 @@ from artiq.language.core import kernel_from_string, now_mu
 
 from waxx.base import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
+from waxx.util.artiq.async_print import aprint
 
 RPC_DELAY = 10.e-3
-
-from waxx.util.artiq.async_print import aprint
 
 class Expt(Dealer, Scanner, Scribe):
     def __init__(self,
@@ -70,6 +72,9 @@ class Expt(Dealer, Scanner, Scribe):
         parameters that the user created in the experiment file at each step in
         a scan. This must be an RPC -- no kernel decorator.
         """
+
+        if hasattr(self,'monitor'):
+            self.monitor.init_monitor()
 
         if self.run_info.imaging_type == img_types.ABSORPTION:
             if self.params.N_pwa_per_shot > 1:
@@ -169,5 +174,9 @@ class Expt(Dealer, Scanner, Scribe):
                 self.write_data(expt_filepath)
             else:
                 self.remove_incomplete_data()
+
+        if hasattr(self,'monitor'):
+            self.monitor.update_device_states()
+            self.monitor.signal_end()
                 
         # server_talk.play_random_sound()

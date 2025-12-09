@@ -75,7 +75,7 @@ def check_for_mapped_data_dir():
         cmd = MAP_BAT_PATH         
         result = subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
         if not os.path.exists(DATA_DIR):
-            raise ValueError(f"Data dir still not found. Are you connected to the physics network?") 
+            print(f"Data dir still not found. Are you connected to the physics network?") 
         else:
             print("Network drives successfully mapped.")
 

@@ -26,10 +26,12 @@ class TTL_OUT(TTL):
     @kernel
     def on(self):
         self.ttl_device.on()
+        self.state = 1
 
     @kernel
     def off(self):
         self.ttl_device.off()
+        self.state = 0
 
     @kernel
     def pulse(self,t):
