@@ -142,15 +142,19 @@ class Generator():
         
         dds_devices = self.extract_dds_devices()
         device_config['dds'].update(dds_devices)
-        print(f"  Found {len(dds_devices)} DDS devices")
+        
 
         ttl_devices = self.extract_ttl_devices()
         device_config['ttl'].update(ttl_devices)
-        print(f"  Found {len(ttl_devices)} TTL devices")
+        
                 
         dac_devices = self.extract_dac_devices()
         device_config['dac'].update(dac_devices)
-        print(f"  Found {len(dac_devices)} DAC devices")
+
+        if self._verbose:
+            print(f"  Found {len(ttl_devices)} TTL devices")
+            print(f"  Found {len(dds_devices)} DDS devices")
+            print(f"  Found {len(dac_devices)} DAC devices")
         
         # Add timestamp
         from datetime import datetime
@@ -175,7 +179,8 @@ class Generator():
         try:
             with open(output_file, 'w') as f:
                 json.dump(self.config_data, f, indent=2, sort_keys=True, default=convert_numpy_types)
-            print(f"\nConfiguration saved to: {output_file}")
+            if self._verbose:
+                print(f"\nConfiguration saved to: {output_file}")
             return output_file
         except Exception as e:
             print(f"Error saving configuration file: {e}")
