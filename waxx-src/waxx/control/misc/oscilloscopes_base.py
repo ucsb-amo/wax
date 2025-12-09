@@ -95,7 +95,11 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
             block_start = recv_rtn.find(b'#')
             data_digit = int(recv_rtn[block_start + 1:block_start + 2])
             data_start = block_start + 2 + data_digit + 1
-            recv = list(recv_rtn[data_start:-2:2])
+
+            if adc_bit == 8:
+                recv = list(recv_rtn[data_start:-2:2])
+            elif adc_bit == 16:
+                recv = list(recv_rtn[data_start:-1])
             recv_all += recv
 
         # try:
