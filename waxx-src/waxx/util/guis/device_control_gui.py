@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont
 
+from PyQt6.QtCore import Qt
+
 import time
 
 from waxx.util.comms_server.comm_client import MonitorClient
@@ -417,10 +419,11 @@ class DeviceStateGUI(QMainWindow):
         self.status_button = QPushButton("Connecting...")
         self.status_button.clicked.connect(self.on_status_button_clicked)
         font = QFont()
-        font.setPointSize(16)
-        font.setBold(True)
+        font.setPointSize(14)
+        font.setBold(False)
         self.status_button.setFont(font)
-        self.status_button.setMinimumHeight(50)
+        self.status_button.setMinimumHeight(25)
+        # self.status_button.setFixedWidth(1000)
         central_widget_layout.addWidget(self.status_button)
         
         # Create tab widget
@@ -486,13 +489,13 @@ class DeviceStateGUI(QMainWindow):
         """Update the status button based on the server status"""
         self.connection_failed = False
         if status == STATES.READY:
-            self.status_button.setText("READY")
+            self.status_button.setText("monitor ready")
             self.status_button.setStyleSheet("background-color: green; color: white;")
         elif status == STATES.LOADING:
-            self.status_button.setText("LOADING...")
+            self.status_button.setText("monitor getting ready...")
             self.status_button.setStyleSheet("background-color: orange; color: white;")
         else:  # STATES.NOT_READY
-            self.status_button.setText("NOT READY")
+            self.status_button.setText("monitor not ready - click to restart")
             self.status_button.setStyleSheet("background-color: red; color: white;")
             
     def on_connection_failed(self):
