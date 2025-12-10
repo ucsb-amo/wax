@@ -24,7 +24,7 @@ class CommClient:
             self.sock.connect(self.server_address)
             self.sock.sendall(message.encode())
             reply = self.sock.recv(1024)
-            print(f'reply: {reply.decode()}')
+            return reply
         except Exception as e:
             print(e)
         finally:
@@ -47,7 +47,11 @@ class MonitorClient(CommClient):
         self.send_message("monitor ready")
 
     def check_status(self):
-        self.send_message("status")
+        status = self.send_message("status")
+        return status
+    
+    def send_reset(self):
+        self.send_message("reset")
 
 # if __name__ == '__main__':
 #     # Example usage:

@@ -13,8 +13,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
-# from waxx.config.dds_id import dds_frame
-from waxx.util.import_module_from_file import load_module_from_file
+from waxx.util.comms_server.comm_client import MonitorClient
+from waxx.util.comms_server.comm_server import STATES
 
 PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
@@ -348,6 +348,7 @@ class DeviceStateGUI(QMainWindow):
     
     def __init__(self,
                   monitor_server_ip,
+                  monitor_server_port,
                   device_state_json_path,
                   dds_frame):
         super().__init__()
@@ -356,6 +357,8 @@ class DeviceStateGUI(QMainWindow):
         self.device_widgets = {}
         
         self.dds_frame_obj = dds_frame
+
+        self.server_addr = (monitor_server_ip, monitor_server_port)
 
         self.setup_ui()
         self.load_config()
