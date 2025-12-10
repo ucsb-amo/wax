@@ -12,20 +12,24 @@ class CommClient:
         :param server_port: The port of the server. Defaults to 6789.
         """
         self.server_address = (server_ip, server_port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
+        
     def send_message(self, message):
         """
         Sends a message to the server.
 
         :param message: The message to send (string).
         """
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self.sock.sendto(message.encode('utf-8'), self.server_address)
-            print(f"Sent message: '{message}' to {self.server_address[0]}:{self.server_address[1]}")
+            self.sock.connect(self.server_address)
+            self.sock.sendall(message.encode())
+            reply = self.sock.recv(1024)
+            return reply.decode()
         except Exception as e:
-            print(f"Error sending message: {e}")
-
+            print(e)
+        finally:
+            self.sock.close()
+        
     def close(self):
         """
         Closes the socket.
@@ -41,6 +45,13 @@ class MonitorClient(CommClient):
 
     def send_ready(self):
         self.send_message("monitor ready")
+
+    def check_status(self):
+        status = self.send_message("status")
+        return status
+    
+    def send_reset(self):
+        self.send_message("reset")
 
 # if __name__ == '__main__':
 #     # Example usage:
