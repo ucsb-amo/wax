@@ -53,6 +53,7 @@ class DDSWidget(DeviceWidget):
         layout = QVBoxLayout()
         
         label = QLineEdit(self.device_name)
+        label.setCursorPosition(0)
         label.setReadOnly(True)
         label.setToolTip(self.device_name)
         layout.addWidget(label)
@@ -244,6 +245,7 @@ class DACWidget(DeviceWidget):
         layout = QVBoxLayout()
 
         label = QLineEdit(self.device_name)
+        label.setCursorPosition(0)
         label.setReadOnly(True)
         label.setToolTip(self.device_name)
         layout.addWidget(label)
@@ -293,6 +295,7 @@ class TTLWidget(DeviceWidget):
         layout = QVBoxLayout()
 
         label = QLineEdit(self.device_name)
+        label.setCursorPosition(0)
         label.setReadOnly(True)
         label.setToolTip(self.device_name)
         layout.addWidget(label)
