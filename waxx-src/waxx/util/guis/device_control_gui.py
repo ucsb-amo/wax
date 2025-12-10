@@ -414,7 +414,7 @@ class DeviceStateGUI(QMainWindow):
         central_widget_layout = QVBoxLayout()
         
         # Create status button at the top
-        self.status_button = QPushButton("CHECKING...")
+        self.status_button = QPushButton("Connecting...")
         self.status_button.clicked.connect(self.on_status_button_clicked)
         font = QFont()
         font.setPointSize(16)
@@ -462,7 +462,7 @@ class DeviceStateGUI(QMainWindow):
         """Handle status button click"""
         if self.connection_failed:
             # Retry connection
-            self.status_button.setText("RETRYING...")
+            self.status_button.setText("Connecting...")
             self.status_button.setStyleSheet("background-color: gray; color: white;")
             self.connection_failed = False
             self.status_checker.retry()
