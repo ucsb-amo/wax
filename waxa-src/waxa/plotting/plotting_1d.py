@@ -78,8 +78,7 @@ def guess_unit(name, values):
             return "s", 1.0
 
     # Frequency
-    if ("freq" in lname or "frequency" in lname or "f_" in lname or
-            "raman" in lname or "rf" in lname):
+    if ("freq" in lname or "frequency" in lname or lname.startswith("f_")):
         if vmax >= 1e9:
             return "GHz", 1e-9
         elif vmax >= 1e6:
@@ -92,7 +91,7 @@ def guess_unit(name, values):
     # detuning in units of Gamma Γ
     if lname.startswith("detune_") or "detun_" in lname:
         return "Γ", 1.0
-
+    
     # Voltage
     if lname.startswith("v_") or "volt" in lname:
         return "V", 1.0
@@ -108,6 +107,19 @@ def guess_unit(name, values):
     
     if (lname.startswith("phase_")):
         return "π", 1/np.pi
+    
+    if (lname.startswith("dimension_")):
+        if vmax >= 1:
+            return "m", 1.0
+        elif vmax >= 1e-3:
+            return "mm", 1e3
+        elif vmax >= 1e-6:
+            return "µm", 1e6
+        elif vmax >= 1e-9:
+            return "nm", 1e9
+        else:
+            return "m", 1.0     
+
 
     # Default: unknown / unitless
     return None, 1.0

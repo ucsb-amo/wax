@@ -120,6 +120,7 @@ def mixOD_grid(ad,
         plt.figure(figsize=(10, 8))
     plt.imshow(full_image,vmin=0.,vmax=max_od)
     plt.title(f"Run ID: {ad.run_info.run_id}")
+
     xv0str = ''
     xv1str = ''
     if xvar1unit != '':
