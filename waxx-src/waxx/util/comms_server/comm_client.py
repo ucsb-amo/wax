@@ -24,7 +24,7 @@ class CommClient:
             self.sock.connect(self.server_address)
             self.sock.sendall(message.encode())
             reply = self.sock.recv(1024)
-            return reply
+            return reply.decode()
         except Exception as e:
             print(e)
         finally:

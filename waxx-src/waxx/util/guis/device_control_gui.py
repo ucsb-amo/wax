@@ -10,8 +10,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget
 )
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont
+
+import time
 
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
@@ -343,6 +345,40 @@ class TTLWidget(DeviceWidget):
         self.state_button.setChecked(bool(config["ttl_state"]))
 
 
+class MonitorStatusChecker(QThread):
+    """Thread that periodically checks the monitor server status"""
+    status_updated = pyqtSignal(int)
+    connection_failed = pyqtSignal()
+
+    def __init__(self,server_addr):
+        super().__init__()
+        
+        # Setup monitor client
+        self.monitor_client = MonitorClient(*server_addr)
+        self.status_checker = None
+        self.running = True
+        self.retry_connection = False
+
+    def run(self):
+        while self.running:
+            try:
+                status = self.monitor_client.check_status()
+                self.status_updated.emit(int(status))
+            except Exception as e:
+                print(f"Connection error: {e}")
+                self.connection_failed.emit()
+                # Wait for retry signal
+                while self.running and not self.retry_connection:
+                    time.sleep(0.1)
+                self.retry_connection = False
+            time.sleep(1.)
+            
+    def stop(self):
+        self.running = False
+        
+    def retry(self):
+        self.retry_connection = True
+
 class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management"""
     
@@ -359,10 +395,13 @@ class DeviceStateGUI(QMainWindow):
         self.dds_frame_obj = dds_frame
 
         self.server_addr = (monitor_server_ip, monitor_server_port)
+        self.connection_failed = False
 
         self.setup_ui()
         self.load_config()
         self.setup_timer()
+        self.setup_status_checker()
+        self.running = False
         
     def setup_ui(self):
         """Setup the main UI"""
@@ -372,10 +411,20 @@ class DeviceStateGUI(QMainWindow):
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        central_widget_layout = QVBoxLayout()
+        
+        # Create status button at the top
+        self.status_button = QPushButton("CHECKING...")
+        self.status_button.clicked.connect(self.on_status_button_clicked)
+        font = QFont()
+        font.setPointSize(16)
+        font.setBold(True)
+        self.status_button.setFont(font)
+        self.status_button.setMinimumHeight(50)
+        central_widget_layout.addWidget(self.status_button)
         
         # Create tab widget
         self.tab_widget = QTabWidget()
-        central_widget_layout = QVBoxLayout()
         central_widget_layout.addWidget(self.tab_widget)
         central_widget.setLayout(central_widget_layout)
         
@@ -387,16 +436,71 @@ class DeviceStateGUI(QMainWindow):
         self.tab_widget.addTab(self.dds_tab, "DDS")
         self.tab_widget.addTab(self.dac_tab, "DAC")
         self.tab_widget.addTab(self.ttl_tab, "TTL")
-        
-        # Setup tab layouts
+
         self.dds_layout = QGridLayout()
         self.dac_layout = QGridLayout()
         self.ttl_layout = QGridLayout()
-        
+
         self.dds_tab.setLayout(self.dds_layout)
         self.dac_tab.setLayout(self.dac_layout)
         self.ttl_tab.setLayout(self.ttl_layout)
+
+    def setup_timer(self):
+        """Setup timer for periodic config file checking"""
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_config_changes)
+        self.timer.start(1000)  # Check every 1 second
         
+    def setup_status_checker(self):
+        """Setup the status checker thread"""
+        self.status_checker = MonitorStatusChecker(self.server_addr)
+        self.status_checker.status_updated.connect(self.update_status_button)
+        self.status_checker.connection_failed.connect(self.on_connection_failed)
+        self.status_checker.start()
+        
+    def on_status_button_clicked(self):
+        """Handle status button click"""
+        if self.connection_failed:
+            # Retry connection
+            self.status_button.setText("RETRYING...")
+            self.status_button.setStyleSheet("background-color: gray; color: white;")
+            self.connection_failed = False
+            self.status_checker.retry()
+        else:
+            # Normal reset operation
+            reply = QMessageBox.question(
+                self, 
+                'Reset Server',
+                "Are you sure you want to send a reset message to the server?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    self.status_checker.monitor_client.send_reset()
+                    QMessageBox.information(self, "Reset Sent", "Reset message sent to server.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to send reset message: {e}")
+                
+    def update_status_button(self, status):
+        """Update the status button based on the server status"""
+        self.connection_failed = False
+        if status == STATES.READY:
+            self.status_button.setText("READY")
+            self.status_button.setStyleSheet("background-color: green; color: white;")
+        elif status == STATES.LOADING:
+            self.status_button.setText("LOADING...")
+            self.status_button.setStyleSheet("background-color: orange; color: white;")
+        else:  # STATES.NOT_READY
+            self.status_button.setText("NOT READY")
+            self.status_button.setStyleSheet("background-color: red; color: white;")
+            
+    def on_connection_failed(self):
+        """Handle connection failure"""
+        self.connection_failed = True
+        self.status_button.setText("Server connection failed")
+        self.status_button.setStyleSheet("background-color: gray; color: white;")
+
     def setup_timer(self):
         """Setup timer for periodic config file checking"""
         self.timer = QTimer()
@@ -498,12 +602,28 @@ class DeviceStateGUI(QMainWindow):
                     widget_grid[col][row] = widget
                     self.device_widgets[f"ttl.{device_name}"] = widget
 
+                
             # Add widgets to layout
             for col_idx, col_widgets in enumerate(widget_grid):
                 for row_idx, widget in enumerate(col_widgets):
                     self.ttl_layout.addWidget(widget, row_idx, col_idx)
         
         self.adjust_window_width()
+
+    def save_config(self):
+        """Save current configuration to JSON file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config_data, f, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
+            
+    def closeEvent(self, event):
+        """Handle window close event"""
+        if self.status_checker:
+            self.status_checker.stop()
+            self.status_checker.wait()
+        event.accept()
                     
         # Adjust window width based on the number of columns
         self.adjust_window_width()
@@ -535,7 +655,6 @@ class DeviceStateGUI(QMainWindow):
         elif device_name in self.config_data.get("dac", {}) and device_type=="dac":
             self.config_data["dac"][device_name].update(updated_config)
         elif device_name in self.config_data.get("ttl", {}) and device_type=="ttl":
-            print(updated_config)
             self.config_data["ttl"][device_name].update(updated_config)
             
         # Save updated config to file
