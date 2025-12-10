@@ -23,21 +23,34 @@ class UdpServer(QObject):
         self.host = host
         self.port = port
         self.running = False
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def run(self):
+
         self.sock.bind((self.host, self.port))
         self.running = True
-        print(f"Listening on {self.host}:{self.port}")
+
+        self.sock.listen(5)
+        print(f"Server listening on {self.host}:{self.port}")
         while self.running:
+            conn, addr = self.sock.accept()
+            print(f"Connected by {addr}")
             try:
-                data, addr = self.sock.recvfrom(1024)
-                message = data.decode('utf-8')
-                self.message_received.emit(message)
+                while True:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                    message = data.decode()
+                    self.on_message_received(message)
+                    reply = self.generate_reply(message)
+                    conn.sendall(reply.encode())
             except socket.error as e:
                 if self.running:
                     print(f"Socket error: {e}")
                 break
+            finally:
+                conn.close()
         print("UDP Server stopped.")
 
     def stop(self):
@@ -45,8 +58,14 @@ class UdpServer(QObject):
         # Unblock the socket by sending a dummy message to it
         try:
             # Create a temporary socket to send a message to the listening socket
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(b'stop', (self.host, self.port))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.sendall(b'stop')
         except Exception as e:
             print(f"Error sending stop signal to UDP server: {e}")
         self.sock.close()
+
+    def on_message_received(self, message):
+        pass
+
+    def generate_reply(self, message):
+        return f'Server received {message}'
