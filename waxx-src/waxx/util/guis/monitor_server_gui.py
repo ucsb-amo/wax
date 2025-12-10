@@ -19,34 +19,25 @@ class MonitorUDPServer(UdpServer):
         super().__init__(host,port)
 
         self.status = Status()
-        
-    def run(self):
-        self.sock.bind((self.host, self.port))
-        self.running = True
-        print(f"Listening on {self.host}:{self.port}")
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(1024)
-                message = data.decode('utf-8')
-                self.parse_message(message)
-                self.message_received.emit(message)
-            except socket.error as e:
-                if self.running:
-                    print(f"Socket error: {e}")
-                break
-        print("UDP Server stopped.")
-    
-    def parse_message(self,message):
-        if message == 'status':
-            self.sock.sendall(self.status.state)
-        elif message == 'reset':
+
+    def on_message_received(self,message):
+        if message == 'reset':
             self.reset_signal.emit()
+        self.message_received.emit(message)
+
+    def generate_reply(self, message):
+        reply = str(int(self.status.state))
+        return reply
 
 class MonitorServerGUI(QWidget):
-    def __init__(self, monitor_server_ip, monitor_expt_path):
+    def __init__(self,
+                monitor_server_ip, 
+                monitor_server_port,
+                monitor_expt_path):
         super().__init__()
 
         self.server_ip = monitor_server_ip
+        self.server_port = monitor_server_port
 
         self.setWindowTitle("Monitor Server")
         self.setGeometry(100, 100, 250, 80)
@@ -80,7 +71,7 @@ class MonitorServerGUI(QWidget):
     def setup_udp_server(self):
         self.server_thread = QThread()
         
-        self.udp_server = MonitorUDPServer(self.server_ip, 6789)
+        self.udp_server = MonitorUDPServer(self.server_ip, self.server_port)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
@@ -119,7 +110,9 @@ class MonitorServerGUI(QWidget):
         else:
             self.status_indicator.setText("Loading...")
             self.status_indicator.setStyleSheet("background-color: orange; color: white;")
+
         self.status.state = status
+        self.udp_server.status.state = status
 
     def check_monitor_status(self):
         if self.monitor_manager.isRunning() and self.status_indicator.text() != "READY":
