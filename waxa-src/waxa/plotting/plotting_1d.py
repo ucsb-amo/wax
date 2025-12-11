@@ -78,7 +78,7 @@ def guess_unit(name, values):
             return "s", 1.0
 
     # Frequency
-    if ("freq" in lname or "frequency" in lname or lname.startswith("f_")):
+    if ("freq" in lname or "frequency" in lname or "_detuning" in lname or lname.startswith("f_")):
         if vmax >= 1e9:
             return "GHz", 1e-9
         elif vmax >= 1e6:
