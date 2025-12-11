@@ -54,6 +54,9 @@ class SDG6000X_CH():
                                       amplitude_vpp=amplitude_vpp,
                                       state=default_state,
                                       max_amplitude_vpp=max_amplitude_vpp)
+        
+        self._frequency_default = 0.
+        self._amplitude_vpp_default = 0.
 
         self.core = core
 
