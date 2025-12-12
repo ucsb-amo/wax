@@ -506,12 +506,6 @@ class DeviceStateGUI(QMainWindow):
         self.connection_failed = True
         self.status_button.setText("Server connection failed")
         self.status_button.setStyleSheet("background-color: gray; color: white;")
-
-    def setup_timer(self):
-        """Setup timer for periodic config file checking"""
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.check_config_changes)
-        self.timer.start(1000)  # Check every 1 second
         
     def load_config(self):
         """Load configuration from JSON file"""
@@ -615,14 +609,6 @@ class DeviceStateGUI(QMainWindow):
                     self.ttl_layout.addWidget(widget, row_idx, col_idx)
         
         self.adjust_window_width()
-
-    def save_config(self):
-        """Save current configuration to JSON file"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config_data, f, indent=2)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
             
     def closeEvent(self, event):
         """Handle window close event"""

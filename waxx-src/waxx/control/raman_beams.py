@@ -169,16 +169,22 @@ class RamanBeamPair():
         Args:
             frequency_transition (float, optional): The two-photon transition frequency (Hz).
                 If negative or unchanged, the frequency is not updated.
+            
             fraction_power_raman (float, optional): The fractional power for the Raman beams.
                 If negative or unchanged, the power is not updated.
+            
             global_phase (float, optional): The global phase of the Raman beams (radians).
                 If negative or unchanged, the global phase is not updated.
+            
             relative_phase (float, optional): The relative phase between the Raman beams (radians).
                 If negative or unchanged, the relative phase is not updated.
+            
             t_phase_origin_mu (int, optional): The phase origin timestamp in machine units.
                 If zero or unchanged, the phase origin is not updated.
+            
             phase_mode (int, optional): Phase mode (0: independent, 1: synchronized).
                 If unchanged, the phase mode is not updated.
+            
             init (bool, optional): If True, force all parameters to update regardless of their values.
 
         Side Effects:

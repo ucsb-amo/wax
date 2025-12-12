@@ -59,7 +59,7 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                     missing_frame="skip",
                     return_info=True, buff_size=None,
                     check_interrupt_method=nothing):
-        """
+        '''
         Snap `nframes` images (with preset image read mode parameters)
         Modified from pylablib.devices.interface.camera.
         
@@ -70,7 +70,7 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         or ``"skip"`` (skipping them, while still keeping total returned frames number to `n`).
         If ``return_info==True``, return tuple ``(frames, infos)``, where ``infos`` is a list of frame info tuples (camera-dependent);
         if some frames are missing and ``missing_frame!="skip"``, the corresponding frame info is ``None``.
-        """
+        '''
         if output_queue == None:
             output_queue = self._internal_output_queue
 
@@ -130,7 +130,7 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
     @interface.use_parameters(since="frame_wait_mode")
     def wait_for_frame(self, since="lastread", nframes=1, timeout=20., error_on_stopped=False,
                        check_interrupt_method=nothing):
-        """
+        '''
         Wait for one or several new camera frames. (overloaded to accept interrupt)
 
         `since` specifies the reference point for waiting to acquire `nframes` frames;
@@ -141,7 +141,7 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         If the call times out, raise ``TimeoutError``.
         If ``error_on_stopped==True`` and the acquisition is not running, raise ``Error``;
         otherwise, simply return ``False`` without waiting.
-        """
+        '''
         wait_started=False
         if isinstance(timeout,tuple):
             timeout,frame_timeout=timeout
@@ -182,29 +182,29 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         return True
     
     def activate_cameralink(self,state=1):
-        """This function allows the user to enable or disable the Camera Link
+        '''This function allows the user to enable or disable the Camera Link
         functionality for the camera. Enabling this functionality will start to
         stream all acquired data through the camera link interface.
 
         Args:
             state (int, optional): Enables/Disables Camera Link mode. 1 - Enable
             Camera Link 0 - Disable Camera Link. Defaults to 1.
-        """        
+        '''        
         lib.SetCameraLinkMode(state)
 
     def set_emccd_advanced(self):
-        """
+        '''
         This function turns on and off access to higher EM gain levels within
         the SDK. Typically, optimal signal to noise ratio and dynamic range is
         achieved between x1 to x300 EM Gain. Higher gains of > x300 are
         recommended for single photon counting only. Before using higher levels,
         you should ensure that light levels do not exceed the regime of tens of
         photons per pixel, otherwise accelerated ageing of the sensor can occur.
-        """        
+        '''        
         lib.SetEMAdvanced(1)
 
     def set_fast_trigger_mode(self, mode:int = 1):
-        """
+        '''
         This function will enable fast external triggering. When fast external
         triggering is enabled the system will NOT wait until a “Keep Clean”
         cycle has been completed before accepting the next trigger. This setting
@@ -213,29 +213,29 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
 
         Args:
             mode (int, optional): 0 disabled. 1 enabled. Defaults to 1.
-        """        
+        '''        
         lib.SetFastExtTrigger(mode)
 
     def set_cooler_mode(self, mode:int = 1):
-        """This function determines whether the cooler is switched off when the
+        '''This function determines whether the cooler is switched off when the
         camera is shut down.
 
         Args:
             mode (int, optional): 1 – Temperature is maintained on ShutDown. 0 –
             Returns to ambient temperature on ShutDown. Defaults to 1.
-        """        
+        '''        
         lib.SetCoolerMode(mode)
 
     def set_vsamplitude(self, vs_amp:int = 0):
-        """
+        '''
         If you choose a high readout speed (a low readout time), then you should
         also consider increasing the amplitude of the Vertical Clock Voltage.
         There are five levels of amplitude available for you to choose from:
-            • Normal
-            • +1
-            • +2
-            • +3
-            • +4
+            * Normal
+            * +1
+            * +2
+            * +3
+            * +4
         Exercise caution when increasing the amplitude of the vertical clock voltage,
         since higher clocking voltages may result in increased clock-induced charge
         (noise) in your signal. In general, only the very highest vertical clocking
@@ -244,11 +244,11 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         Args:
             vs_amp (int, optional): See docstring for amplitude settings.
             Defaults to 0.
-        """        
+        '''        
         lib.SetVSAmplitude(vs_amp)
 
     def set_hsspeed(self, typ:int=0, hs_speed:int = 0):
-        """
+        '''
         This function will set the speed at which the pixels are shifted into
         the output node during the readout phase of an acquisition. Typically
         your camera will be capable of operating at several horizontal shift
@@ -259,13 +259,13 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
             hs_speed (int, optional): the horizontal speed to be used Valid
             values 0 to GetNumberHSSpeeds()-1. Defaults to 0. 
             int type: the type of output amplifier on an EMCCD.
-                0 – Standard EMCCD gain register (default).
-                1 – Conventional CCD register.
-        """        
+                * 0: Standard EMCCD gain register (default).
+                * 1: Conventional CCD register.
+        '''        
         lib.SetHSSpeed(typ, hs_speed)
 
     def set_isolated_crop_mode_type(self, mode:int=1):
-        """This function determines the method by which data is transferred in
+        '''This function determines the method by which data is transferred in
         isolated crop mode. The default method is High Speed where multiple
         frames may be stored in the storage area of the sensor before they
         are read out. In Low Latency mode, each cropped frame is read out as
@@ -273,5 +273,5 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
 
         Args:
             mode (int): 0 – High Speed. 1 – Low Latency. Defaults to 1.
-        """        
+        '''        
         lib.SetIsolatedCropModeType(mode)

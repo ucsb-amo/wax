@@ -76,7 +76,7 @@ class DDS():
       linewidths_detuned * Gamma from the resonant D1, D2 transitions. Gamma = 2
       * pi * 6 MHz.
 
-      D1 AOMs give detuning relative to |g> -> |F'=2>.
+      D1 AOMs give detuning relative to |g> -> |F=2>.
       D2 AOMs give detuning relative to |g> -> unresolved D2 peak.
 
       Parameters
@@ -124,7 +124,6 @@ class DDS():
          stored self.frequency)
 
       amplitude: float
-         
       '''
       self.update_dac_bool()
       delta = float(delta)
@@ -140,27 +139,33 @@ class DDS():
    def set_dds(self, frequency=-0.1, amplitude=-0.1, v_pd=-0.1, phase=0.,
                t_phase_origin_mu=np.int64(-1),
                init=False):
-      """
+      '''
       Set the DDS (Direct Digital Synthesizer) frequency, amplitude, phase, and optionally DAC voltage.
 
       This method updates the DDS device with new frequency, amplitude, and phase values,
       and, if applicable, sets the associated DAC voltage. Only parameters with non-negative
-      values different from the current state are updated. If `init` is True, all parameters
+      values different from the current state are updated. If init is True, all parameters
       are forced to update regardless of their values.
 
       Args:
-         frequency (float, optional): Frequency in Hz. If negative or unchanged, frequency is not updated.
-         amplitude (float, optional): Amplitude in V. If negative or unchanged, amplitude is not updated.
-         v_pd (float, optional): Voltage for the DAC. If negative or unchanged, voltage is not updated.
-               Only used if the DDS is controlled by a DAC.
-         phase (float, optional): Phase offset in radians (0 to 2π). If negative or unchanged, phase is not updated.
-         t_phase_origin_mu (int, optional): Phase origin timestamp in machine units. If zero or unchanged, not updated.
-         init (bool, optional): If True, force all parameters to update regardless of their values.
+         frequency (float, optional): 
+            Frequency in Hz. If negative or unchanged, frequency is not updated.
+         amplitude (float, optional): 
+            Amplitude in V. If negative or unchanged, amplitude is not updated.
+         v_pd (float, optional): 
+            Voltage for the DAC. If negative or unchanged, voltage is not updated. 
+            Only used if the DDS is controlled by a DAC.
+         phase (float, optional): 
+            Phase offset in radians (0 to 2π). If negative or unchanged, phase is not updated.
+         t_phase_origin_mu (int, optional): 
+            Phase origin timestamp in machine units. If zero or unchanged, not updated.
+         init (bool, optional): 
+            If True, force all parameters to update regardless of their values.
 
       Side Effects:
          Updates the internal state of the DDS object and applies the new settings to the hardware.
          If the DDS is associated with a DAC, also updates the DAC voltage.
-      """
+      '''
 
       self.update_dac_bool()
       
@@ -242,24 +247,15 @@ class DDS():
          self.dds_device.sw.off()
 
    @kernel
-   def set_sw(self, state=-1):
-      self.sw_state = state if state != -1 else self.sw_state
-
-      if self.sw_state == 1:
-         self.dds_device.sw.on()
-      else:
-         self.dds_device.sw.off()
-
-   @kernel
    def set_phase_mode(self, mode=0):
-      """
+      '''
       Sets the phase mode of the DDS. See ad9910.AD9910.set_phase_mode for
       details.
 
       Args:
           mode (int, optional): Phase mode to set. 0 for continuous phase mode,
           1 for tracking phase mode. Defaults to 0 (continuous phase mode).
-      """      
+      '''    
       if mode == 0:
          self.dds_device.set_phase_mode(ad9910.PHASE_MODE_CONTINUOUS)
          self.phase_mode = mode

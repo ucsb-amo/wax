@@ -71,26 +71,26 @@ class SLM_server():
 
         return image
     
-    def generate_grating_mask(self, dimension, phase, center_x, center_y, grating_spacing=10):
-        period = grating_spacing
-        filling_factor = 0.5
+    # def generate_grating_mask(self, dimension, phase, center_x, center_y, grating_spacing=10):
+    #     period = grating_spacing
+    #     filling_factor = 0.5
 
-        mapped_gray_value = self.phase2gray(phase)
+    #     mapped_gray_value = self.phase2gray(phase)
 
-        image = np.full((height, width), 0, dtype=np.uint8)
+    #     image = np.full((height, width), 0, dtype=np.uint8)
 
-        half_length = dimension // 2
-        x_start = max(center_x - half_length, 0)
-        x_end = min(center_x + half_length, width)
-        y_start = max(center_y - half_length, 0)
-        y_end = min(center_y + half_length, height)
+    #     half_length = dimension // 2
+    #     x_start = max(center_x - half_length, 0)
+    #     x_end = min(center_x + half_length, width)
+    #     y_start = max(center_y - half_length, 0)
+    #     y_end = min(center_y + half_length, height)
 
-        for x in range(x_start, x_end):
-            position_in_period = (x - x_start) % period
-            if position_in_period < period * filling_factor:
-                image[y_start:y_end, x] = mapped_gray_value
+    #     for x in range(x_start, x_end):
+    #         position_in_period = (x - x_start) % period
+    #         if position_in_period < period * filling_factor:
+    #             image[y_start:y_end, x] = mapped_gray_value
 
-        return image
+    #     return image
 
     def generate_grating_mask(self, dimension, phase, center_x, center_y,
                             grating_spacing=10, angle_deg=0):
