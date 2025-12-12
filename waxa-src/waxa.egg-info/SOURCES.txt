@@ -39,6 +39,7 @@ waxa/helper/plotting_helper.py
 waxa/image_processing/__init__.py
 waxa/image_processing/compute_ODs.py
 waxa/image_processing/compute_gaussian_cloud_params.py
+waxa/plotting/__init__.py
 waxa/plotting/misc_analysis.py
 waxa/plotting/plotting_1d.py
 waxa/plotting/plotting_2d.py
