@@ -6,3 +6,4 @@
 *.mdb-lock
 *.gif
 *.DS_Store
+_build
