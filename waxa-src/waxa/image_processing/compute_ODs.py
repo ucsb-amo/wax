@@ -16,7 +16,7 @@ def process_ODs(raw_ODs,roi):
 
     roi: kexp.analysis.ROI
         The ROI object to use for the crop.
-
+    
     Returns
     -------
     ODs: ArrayLike
