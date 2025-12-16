@@ -143,7 +143,7 @@ class SDG6000X_CH():
         self._stash_defaults()
         self.set_rpc(init=True)
         self.set_output_rpc(init=True)
-        delay(2*T_RPC_DELAY)
+        delay(10*T_RPC_DELAY)
         
     @kernel
     def set(self,frequency=dv,amplitude=dv,init=False):
