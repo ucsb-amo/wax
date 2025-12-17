@@ -5,6 +5,8 @@ from artiq.language import now_mu, kernel, delay, portable
 
 import vxi11
 
+from waxx.util.artiq.async_print import aprint
+
 T_RPC_DELAY = 10.e-3
 
 dv = -0.1
@@ -14,11 +16,15 @@ class SDG6000X_Params():
                  frequency=0.,
                  amplitude_vpp=0.,
                  state=0,
-                 max_amplitude_vpp=0.):
+                 max_amplitude_vpp=0.,
+                 max_frequency=0.,
+                 min_frequency=0.):
         self.frequency = frequency
         self.amplitude_vpp = amplitude_vpp
         self.max_amplitude_vpp = max_amplitude_vpp
         self.state = state
+        self.max_frequency = max_frequency
+        self.min_frequency = min_frequency
 
 class SDG6000X(vxi11.Instrument):
     def __init__(self,ip):
@@ -43,18 +49,22 @@ class SDG6000X_CH():
                  ch,ip,
                  frequency,
                  amplitude_vpp,
-                 default_state = 1,
+                 default_state=1,
                  max_amplitude_vpp=1.,
+                 min_frequency=0.,
+                 max_frequency=500.e6,
                  core=Core):
 
         self._instr = SDG6000X(ip)
         self.ch = ch
         
         self._p = SDG6000X_Params(frequency=frequency,
-                                      amplitude_vpp=amplitude_vpp,
-                                      state=default_state,
-                                      max_amplitude_vpp=max_amplitude_vpp)
-        
+                                amplitude_vpp=amplitude_vpp,
+                                state=default_state,
+                                max_amplitude_vpp=max_amplitude_vpp,
+                                min_frequency=min_frequency,
+                                max_frequency=max_frequency)
+    
         self._frequency_default = 0.
         self._amplitude_vpp_default = 0.
 
@@ -130,6 +140,12 @@ class SDG6000X_CH():
             amp_changed = (amplitude >= 0.) and (amplitude != self._p.amplitude_vpp)
         if freq_changed:
             self._p.frequency = frequency if frequency!=dv else self._p.frequency
+            if self._p.frequency > self._p.max_frequency:
+                self._p.frequency = self._p.max_frequency
+                aprint("Requested siglent freuqency exceeds configured maximum, setting to max.")
+            elif self._p.frequency < self._p.min_frequency:
+                self._p.frequency = self._p.min_frequency
+                aprint("Requested siglent freuqency exceeds configured minimum, setting to min.")
             self._instr._set_freq_command(self.ch,self._p.frequency)
         if amp_changed:
             if self._p.amplitude_vpp > self._p.max_amplitude_vpp:
