@@ -31,8 +31,8 @@ class GaussianFit(Fit):
         except Exception as e:
             if print_errors:
                 print(e)
-            popt = [np.NaN] * 4
-            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.NaN)
+            popt = [np.nan] * 4
+            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.nan)
 
         amplitude, sigma, x_center, y_offset = popt
         self.popt = popt
@@ -451,8 +451,8 @@ class BECFit(Fit):
             popt = self._fit(self.xdata,self.ydata)
         except Exception as e:
             print(e)
-            popt = [np.NaN] * 6
-            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.NaN)
+            popt = [np.nan] * 6
+            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.nan)
 
         self.popt = popt
         g_amp, g_sigma, g_center, tf_trap_coeff, tf_center, tf_offset = popt

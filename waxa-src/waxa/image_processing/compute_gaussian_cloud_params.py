@@ -34,7 +34,7 @@ def fit_gaussian_sum_dist(sum_dist: np.ndarray, camera_params) -> list[GaussianF
         this_sum_dist = sum_dist_list[i]
         try:
             fits[i] = GaussianFit(xaxis, this_sum_dist, print_errors=False)
-        except Exception:
+        except Exception as e:
             error_count += 1
             fits[i] = None
     # reshape back to the n-dim'nal sumOD shape
