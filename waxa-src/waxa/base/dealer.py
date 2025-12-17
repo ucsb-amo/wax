@@ -1,10 +1,11 @@
 import numpy as np
+from waxa.base.xvar import xvar
 
 class Dealer():
     def __init__(self):
         self.sort_idx = []
         self.sort_N = []
-        from waxa.config.expt_params_waxa import ExptParams
+        from waxa.config.expt_params import ExptParams
         self.params = ExptParams()
         self.xvarnames = []
         self.xvardims = []
@@ -17,6 +18,14 @@ class Dealer():
 
         self.scan_xvars = []
         self.Nvars = 0
+
+    def plug_in_xvars(self):
+        """Plugs in the first value of the xvar list in for the params before
+        compilation, to avoid variable type clashes when scanning.
+        """        
+        for this_xvar in self.scan_xvars:
+            this_xvar: xvar
+            vars(self.params)[this_xvar.key] = this_xvar.values[0]
 
     def repeat_xvars(self,N_repeats=[]):
         """

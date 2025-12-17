@@ -11,9 +11,7 @@ class xvar():
             by "key" should be scanned.
         """
         self.key = key
-        if type(values) == float or type(values) == int:
-            raise ValueError("xvar must be a list or ndarray")
-        self.values = np.asarray(values)
+        self.values = np.atleast_1d(values)
         self.position = position
         self.counter = 0
         self.sort_idx = []
