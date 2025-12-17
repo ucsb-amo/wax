@@ -38,6 +38,7 @@ class Expt(Dealer, Scanner, Scribe):
         self._ridstr = " Run ID: "+ str(self.run_info.run_id)
         self._counter = counter()
 
+        # Placeholders, overwritten in kexp.Base init
         self.camera_params = CameraParams()
 
         self.params = ExptParams()
@@ -45,7 +46,7 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.images = []
         self.image_timestamps = []
-
+        
         self.xvarnames = []
         self.sort_idx = []
         self.sort_N = []
@@ -106,6 +107,11 @@ class Expt(Dealer, Scanner, Scribe):
             self.data_filepath = self.ds.create_data_file(self)
 
         self.generate_assignment_kernels()
+
+        if hasattr(self,'dds'):
+            self.dds.stash_defaults()   
+        if hasattr(self,'dac'):
+            self.dac.stash_defaults()
     
     def compute_new_derived(self):
         pass

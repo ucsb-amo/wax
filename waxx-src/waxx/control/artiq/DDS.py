@@ -6,28 +6,31 @@ import numpy as np
 from artiq.coredevice import ad9910, ad53xx, ttl
 from artiq.coredevice.urukul import CPLD
 
+from waxx.control.artiq.DAC_CH import DAC_CH, DAC_CH_DEFAULT, DV_DAC
 from waxx.util.artiq.async_print import aprint
 
-DAC_CH_DEFAULT = -1
+dv = DV_DAC
 di2 = 2
 
 class DDS():
 
-   def __init__(self, urukul_idx, ch, frequency=0., amplitude=0., v_pd=0., dac_device=[], device_db=None):
+   def __init__(self, urukul_idx, ch,
+                  frequency=0., amplitude=0.,
+                  dac_ch=DAC_CH(),
+                  device_db=None):
       self.urukul_idx = urukul_idx
       self.ch = ch
       self.frequency = frequency
       self.amplitude = amplitude
       self.phase = 0.
+      self.v_pd = 0.
       self.t_phase_origin_mu = np.int64(0)
 
       self.sw_state = 0
       self.aom_order = 0
       self.transition = 'None'
       self.double_pass = True
-      self.v_pd = v_pd
       self.phase_mode = 0
-      self.dac_ch = DAC_CH_DEFAULT
       self.key = ""
 
       self.dds_device = ad9910.AD9910
@@ -39,12 +42,9 @@ class DDS():
       if device_db is not None:
          self.read_db(device_db)
       
-      if dac_device:
-         self.dac_device = dac_device
-      else:
-         self.dac_device = ad53xx.AD53xx
+      self.dac_ch = dac_ch
          
-      self.dac_control_bool = self.dac_ch != DAC_CH_DEFAULT
+      self.update_dac_bool()
 
       self._t_att_xfer_mu = np.int64(1592) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.10qxjvv6p35q
       self._t_set_xfer_mu = np.int64(1248) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.e1ucbs8kjf4z
@@ -67,7 +67,7 @@ class DDS():
 
    @portable
    def update_dac_bool(self):
-      self.dac_control_bool = (self.dac_ch != DAC_CH_DEFAULT)
+      self.dac_control_bool = self.dac_ch.ch != DAC_CH_DEFAULT
 
    @portable(flags={"fast-math"})
    def detuning_to_frequency(self,linewidths_detuned) -> TFloat:
@@ -111,7 +111,7 @@ class DDS():
       return detuning
    
    @kernel(flags={"fast-math"})
-   def set_dds_gamma(self, delta=-1000., amplitude=-0.1, v_pd=-0.1, phase=0.,
+   def set_dds_gamma(self, delta=dv, amplitude=dv, v_pd=dv, phase=0.,
                t_phase_origin_mu=np.int64(0)):
       '''
       Sets the DDS frequency and attenuation. Uses delta (detuning) in units of
@@ -127,8 +127,8 @@ class DDS():
       '''
       self.update_dac_bool()
       delta = float(delta)
-      if delta == -1000.:
-         frequency = -0.1
+      if delta == dv:
+         frequency = dv
       else:
          frequency = self.detuning_to_frequency(linewidths_detuned=delta)
 
@@ -136,8 +136,8 @@ class DDS():
                    t_phase_origin_mu=t_phase_origin_mu, phase=phase)
 
    @kernel(flags={"fast-math"})
-   def set_dds(self, frequency=-0.1, amplitude=-0.1, v_pd=-0.1, phase=0.,
-               t_phase_origin_mu=np.int64(-1),
+   def set_dds(self, frequency=dv, amplitude=dv, v_pd=dv,
+               phase=0., t_phase_origin_mu=np.int64(-1),
                init=False):
       '''
       Set the DDS (Direct Digital Synthesizer) frequency, amplitude, phase, and optionally DAC voltage.
@@ -170,19 +170,19 @@ class DDS():
       self.update_dac_bool()
       
       # Determine if frequency, amplitude, or v_pd should be updated
-      freq_changed = (frequency >= 0.) and (frequency != self.frequency)
-      amp_changed = (amplitude >= 0.) and (amplitude != self.amplitude)
-      vpd_changed = (v_pd >= 0.) and (v_pd != self.v_pd)
+      freq_changed = (frequency != dv) and (frequency != self.frequency)
+      amp_changed = (amplitude != dv) and (amplitude != self.amplitude)
+      vpd_changed = (v_pd != dv) and (v_pd != self.dac_ch.v)
       phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
       phase_changed = phase >= 0. and (phase != self.phase)
 
       # Update stored values
       if freq_changed:
-         self.frequency = frequency if frequency >= 0. else self.frequency
+         self.frequency = frequency if frequency != dv else self.frequency
       if amp_changed:
-         self.amplitude = amplitude if amplitude >= 0. else self.amplitude
+         self.amplitude = amplitude if amplitude != dv else self.amplitude
       if self.dac_control_bool and vpd_changed:
-         self.v_pd = v_pd if v_pd >= 0. else self.v_pd
+         self.dac_ch.v = v_pd if v_pd != dv else self.dac_ch.v
       if phase_origin_changed:
          self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
@@ -198,20 +198,17 @@ class DDS():
 
       # Set DDS and DAC as needed
       if self.dac_control_bool and (vpd_changed or init):
-         self.update_dac_setpoint(self.v_pd)
+         self.update_dac_setpoint()
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
          self.dds_device.set(frequency=self.frequency, amplitude=self.amplitude, 
                              phase=self.phase/(2*np.pi), ref_time_mu=self.t_phase_origin_mu)
    
    @kernel
-   def update_dac_setpoint(self, v_pd=-0.1, dac_load = True):
+   def update_dac_setpoint(self, v_pd=dv, dac_load = True):
 
-      self.v_pd = v_pd if v_pd >= 0. else self.v_pd
-      v_pd = self.v_pd
-
-      self.dac_device.write_dac(channel=self.dac_ch, voltage=v_pd)
-      if dac_load:
-         self.dac_device.load()
+      self.dac_ch.v = v_pd if v_pd != dv else self.dac_ch.v
+      self.dac_ch.set(load_dac=dac_load)
+      self.v_pd = self.dac_ch.v
 
    def get_devices(self,expt):
       self.dds_device = expt.get_device(self.name)
@@ -222,18 +219,16 @@ class DDS():
       self.update_dac_bool()
       self.dds_device.sw.off()
       if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=0.)
-         if dac_load:
-            self.dac_device.load()
+         self.dac_ch._stash_defaults()
+         self.dac_ch.set(0.,load_dac=dac_load)
       self.sw_state = 0
 
    @kernel
    def on(self, dac_update = True, dac_load=True):
       self.update_dac_bool()
       if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=self.v_pd)
-         if dac_load:
-            self.dac_device.load()
+         self.dac_ch._restore_defaults()
+         self.dac_ch.set(load_dac=dac_load)
       self.dds_device.sw.on()
       self.sw_state = 1
 

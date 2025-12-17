@@ -5,6 +5,7 @@ from artiq.experiment import kernel, portable
 from artiq.language.core import delay_mu
 
 from waxx.control.artiq.DDS import DDS
+from waxx.control.artiq.DAC_CH import DAC_CH, DAC_CH_DEFAULT
 from waxx.control.artiq.dummy_core import DummyCore
 from waxx.config.dac_id import dac_frame
 from waxx.config.shuttler_id import shuttler_frame
@@ -68,7 +69,8 @@ class dds_frame():
         else:
             self._dac_frame = dac_frame()
 
-        self.dds_array = [[DDS(uru,ch,dac_device=self._dac_frame.dac_device) for ch in range(N_ch)] for uru in range(N_uru)]
+        dac_device = self._dac_frame.dac_device
+        self.dds_array = [[DDS(uru,ch,dac_ch=DAC_CH(dac_device=dac_device)) for ch in range(N_ch)] for uru in range(N_uru)]
 
     def cleanup(self):
     
@@ -81,7 +83,8 @@ class dds_frame():
 
     def dds_assign(self, uru, ch, 
                    default_freq=dv, default_detuning=dv, default_amp=dv, 
-                   ao_order=0, double_pass = True, transition='None', dac_ch_vpd=-1) -> DDS:
+                   ao_order=0, double_pass = True, transition='None',
+                   dac_ch_vpd=None) -> DDS:
         """Instantiates and returns a DDS object for the given urukul and channel.
 
         Args:
@@ -100,8 +103,8 @@ class dds_frame():
             transition (str, optional): If the AO controls near-resonant light,
             specify the transition ('D1' or 'D2'). Defaults to 'None'.
             dac_ch_vpd (int, optional): If controlling an AO with a VVA in line
-            with the DDS, this should specify the DAC channel number which
-            controls that VVA. For no DAC control, leave as -1.
+            with the DDS, this should specify the DAC channel object which
+            controls that VVA. For no DAC control, leave as default.
 
         Returns:
             DDS
@@ -110,13 +113,15 @@ class dds_frame():
         dds0 = DDS(urukul_idx=uru,ch=ch,
                    frequency=default_freq,
                    amplitude=default_amp,
-                   v_pd=5.0,
                    device_db=self._db)
         dds0.aom_order = ao_order
         dds0.transition = transition
-        dds0.dac_ch = dac_ch_vpd
-        dds0.dac_device = self._dac_frame.dac_device
         dds0.double_pass = double_pass
+
+        if dac_ch_vpd == None:
+            dac_ch_vpd = DAC_CH(dac_device=self._dac_frame.dac_device)
+        dds0.dac_ch = dac_ch_vpd
+        
         dds0.update_dac_bool()
 
         # set the frequency according to detuning if default_detuning was specified instead of default_freq
@@ -140,6 +145,8 @@ class dds_frame():
         for key in self.__dict__.keys():
             if isinstance(self.__dict__[key],DDS):
                 self.__dict__[key].key = key
+                if self.__dict__[key].dac_ch.ch != DAC_CH_DEFAULT:
+                    self.__dict__[key].dac_ch._dds_control_key = key
     
     def make_dds_array(self):
         """Creates an array of shape (N_uru,N_ch) containing DDS objects for
@@ -158,8 +165,11 @@ class dds_frame():
         for idx in non_key_idx:
             uru = idx[0]
             ch = idx[1]
-            freq, amp, v_pd = 0., 0., 0.
-            this_dds = DDS(uru,ch,freq,amp,v_pd,dac_device=self._dac_frame.dac_device,device_db=self._db)
+            freq, amp = 0., 0.
+            this_dds = DDS(uru,ch,
+                           freq,amp,
+                           device_db=self._db,
+                           dac_ch=DAC_CH(dac_device=self._dac_frame.dac_device))
             this_dds.key = f"urukul{uru}_ch{ch}"
             self.dds_array[uru][ch] = this_dds
 

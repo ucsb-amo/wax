@@ -25,6 +25,14 @@ class dac_frame():
         self._write_dac_keys()
         self.populate_attrs()
 
+    def stash_defaults(self):
+        for dac in self.dac_ch_list:
+            dac._stash_defaults()
+
+    def restore_defaults(self):
+        for dac in self.dac_ch_list:
+            dac._restore_defaults()
+
     def populate_attrs(self):
         for dac in self.dac_ch_list:
             vars(self)[dac.key] = dac

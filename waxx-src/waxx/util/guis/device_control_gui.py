@@ -237,8 +237,12 @@ class DDSWidget(DeviceWidget):
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
 
-    def __init__(self, device_name: str, device_config: Dict[str, Any]):
+    def __init__(self,
+                  device_name: str,
+                  device_config: Dict[str, Any],
+                  dac_frame):
         super().__init__(device_name, device_config)
+        self.dac_frame = dac_frame
         self.setup_ui()
     
     def setup_ui(self):
@@ -262,6 +266,18 @@ class DACWidget(DeviceWidget):
         self.voltage_spinbox.editingFinished.connect(self.on_update_clicked)
         self.voltage_spinbox.valueChanged.connect(self.on_update_clicked)
         voltage_layout.addWidget(self.voltage_spinbox)
+
+        ch = self.device_config["ch"]
+        dac_dds_key = self.dac_frame.dac_ch_list[ch]._dds_control_key
+        if dac_dds_key != "":
+            # print(ch,dac_dds_key)
+            self.voltage_spinbox.setEnabled(False)
+            self._dds_label = QLineEdit()
+            self._dds_label.setText(f"controlling DDS {dac_dds_key}")
+            self._dds_label.setReadOnly(True)
+            self._dds_label.setStyleSheet("color: orange;")
+            self.voltage_spinbox.setHidden(True)
+            voltage_layout.addWidget(self._dds_label)
         
         layout.addLayout(voltage_layout)
         
@@ -349,7 +365,6 @@ class TTLWidget(DeviceWidget):
         self.device_config = config
         self.state_button.setChecked(bool(config["ttl_state"]))
 
-
 class MonitorStatusChecker(QThread):
     """Thread that periodically checks the monitor server status"""
     status_updated = pyqtSignal(int)
@@ -391,13 +406,15 @@ class DeviceStateGUI(QMainWindow):
                   monitor_server_ip,
                   monitor_server_port,
                   device_state_json_path,
-                  dds_frame):
+                  dds_frame,
+                  dac_frame):
         super().__init__()
         self.config_file = device_state_json_path
         self.config_data = {}
         self.device_widgets = {}
         
         self.dds_frame_obj = dds_frame
+        self.dac_frame_obj = dac_frame
 
         self.server_addr = (monitor_server_ip, monitor_server_port)
         self.connection_failed = False
@@ -555,7 +572,7 @@ class DeviceStateGUI(QMainWindow):
         # Add DAC widgets grouped into columns of 8
         if "dac" in self.config_data:
             for device_name, device_config in self.config_data["dac"].items():
-                widget = DACWidget(device_name, device_config)
+                widget = DACWidget(device_name, device_config, self.dac_frame_obj)
                 widget.value_changed.connect(self.on_device_value_changed)
                 
                 # Extract channel number from device config or name

@@ -1,36 +1,56 @@
-from artiq.experiment import kernel, rpc, delay
+from artiq.language.core import kernel, rpc, delay, portable
 from artiq.coredevice.zotino import Zotino
 
 from waxx.util.artiq.async_print import aprint
 
-dv = -10432.
+DV_DAC = -104.
+
+dv = DV_DAC
+DAC_CH_DEFAULT = -1
 
 class DAC_CH():
-    def __init__(self,ch,dac_device=Zotino,max_v=dv):
+    def __init__(self,
+                ch=DAC_CH_DEFAULT,
+                dac_device=Zotino,
+                max_v=dv):
         self.ch = ch
         self.dac_device = dac_device
         self.v = 0.
+        self.key = ""
+        self._default_v = 0.
+        self._dds_control_key = ""
+
         if max_v == dv:
             self.max_v = 9.99
         else:
             self.max_v = max_v
-        self.key = ""
 
     def set_errmessage(self):
         self.errmessage = f"Attempted to set dac ch {self.key} to a voltage > specified maximum voltage ({self.max_v:1.3f}) for that channel. DAC voltage was replaced by zero for these instances."
 
+    @portable
+    def _stash_defaults(self):
+        self._default_v = self.v
+
+    @portable
+    def _restore_defaults(self):
+        self.v = self._default_v
+
     @kernel
     def set(self,v=dv,load_dac=True):
-        if v != dv:
-            if v > self.max_v:
-                self.v = 0.
-                self.max_voltage_error()
-            else:
-                self.v = v
-                
-        self.dac_device.write_dac(self.ch,self.v)
-        if load_dac:
-            self.dac_device.load()
+        if self.ch > 0:
+            self.v = v if v != dv else self.v
+
+            if v != dv:
+                if v > self.max_v:
+                    self.v = 0.
+                    self.max_voltage_error()
+                else:
+                    self.v = v
+                    
+            self.dac_device.write_dac(self.ch,self.v)
+            if load_dac:
+                self.dac_device.load()
 
     @rpc(flags={'async'})
     def max_voltage_error(self):

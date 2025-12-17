@@ -49,8 +49,8 @@ class BeatLockImaging():
     @kernel
     def init(self):
         self.dds_beatref.on()
-        self.dds_sw.dac_ch = -1 # disconnect the logic for dac control of the dds
-        self.dds_sw.update_dac_bool()
+        # self.dds_sw.dac_ch = -1 # disconnect the logic for dac control of the dds
+        # self.dds_sw.update_dac_bool()
         self.ttl_pid_manual_override.on()
 
     @kernel
