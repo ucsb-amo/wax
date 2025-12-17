@@ -188,7 +188,7 @@ class Scanner():
 
         Must have run generate_assignment_kernels() in build first.
         """
-        int32val = 1
+        int32val = np.int32(1)
         int64val = np.int64(1)
         floatval = 0.1
         # self._dummy_array[:] = 0.
