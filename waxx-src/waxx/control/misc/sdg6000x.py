@@ -32,7 +32,6 @@ class SDG6000X(vxi11.Instrument):
         self.ip = ip
 
     def _set_amp_command(self,ch,amp):
-        print(amp)
         self.write(f"C{ch}:BSWV AMP,{amp}")
 
     def _set_freq_command(self,ch,freq):
@@ -65,8 +64,6 @@ class SDG6000X_CH():
                                 max_amplitude_vpp=max_amplitude_vpp,
                                 min_frequency=min_frequency,
                                 max_frequency=max_frequency)
-        
-        print(self._p.frequency)
     
         self._frequency_default = 0.
         self._amplitude_vpp_default = 0.
