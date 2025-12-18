@@ -85,10 +85,15 @@ class SDG6000X_CH():
 
     @portable
     def set_output_rpc(self,state=1,init=False):
-        if init:
-            sw_changed = True
-        else:
-            sw_changed = bool(state) != (self._p.state == 1)
+        # Turns out it's better just to poll the state of the device, then only
+        # turn it on if the device was off before. Otherwise, sending the "ON"
+        # command again causes a brief interruption of output.
+
+        # Thus the `init` option has been removed.
+
+        # if init:
+        #   sw_changed = True else:
+        sw_changed = bool(state) != (self._p.state == 1)
 
         if sw_changed:
             self._p.state = state if state >= 0. else self._p.state
@@ -158,8 +163,9 @@ class SDG6000X_CH():
 
     def init_rpc(self):
         self._stash_defaults()
-        self.set_rpc(init=True)
-        self.set_output_rpc(init=True)
+        self.fetch_state()
+        self.set_rpc()
+        self.set_output_rpc(state=1)
 
     @kernel
     def init(self):
