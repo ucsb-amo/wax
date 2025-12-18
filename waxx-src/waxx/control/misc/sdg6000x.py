@@ -32,6 +32,7 @@ class SDG6000X(vxi11.Instrument):
         self.ip = ip
 
     def _set_amp_command(self,ch,amp):
+        print(amp)
         self.write(f"C{ch}:BSWV AMP,{amp}")
 
     def _set_freq_command(self,ch,freq):
@@ -64,6 +65,8 @@ class SDG6000X_CH():
                                 max_amplitude_vpp=max_amplitude_vpp,
                                 min_frequency=min_frequency,
                                 max_frequency=max_frequency)
+        
+        print(self._p.frequency)
     
         self._frequency_default = 0.
         self._amplitude_vpp_default = 0.
@@ -100,7 +103,7 @@ class SDG6000X_CH():
             frq_end = response.find('HZ', frq_start)
             if frq_start > 3 and frq_end != -1:
                 freq = float(response[frq_start:frq_end])
-            
+
             amp_start = response.find('AMP,') + 4
             amp_end = response.find('V', amp_start)
             if amp_start > 3 and amp_end != -1:
@@ -114,14 +117,14 @@ class SDG6000X_CH():
             outp_end = response.find(',', outp_start)
             if outp_start > 4 and outp_end != -1:
                 string = response[outp_start:outp_end]
-                if string == 'ON':
+                if string == 'ON' :
                     state = 1
                 elif string == 'OFF':
                     state = 0
                 return state
             return None
         state = parse_output_state(reply)
-
+        
         self._p.frequency = freq
         self._p.amplitude_vpp = amp
         self._p.state = state
@@ -153,12 +156,15 @@ class SDG6000X_CH():
             self._p.amplitude_vpp = amplitude if amplitude!=dv else self._p.amplitude_vpp
             self._instr._set_amp_command(self.ch,self._p.amplitude_vpp)
 
-    @kernel
-    def init(self):
-        self.core.wait_until_mu(now_mu())
+    def init_rpc(self):
         self._stash_defaults()
         self.set_rpc(init=True)
         self.set_output_rpc(init=True)
+
+    @kernel
+    def init(self):
+        self.core.wait_until_mu(now_mu())
+        self.init_rpc()
         self.core.break_realtime()
         
     @kernel
