@@ -65,8 +65,9 @@ class SDG6000X_CH():
                                 min_frequency=min_frequency,
                                 max_frequency=max_frequency)
     
-        self._frequency_default = 0.
-        self._amplitude_vpp_default = 0.
+        # self._frequency_default = 0.
+        # self._amplitude_vpp_default = 0.
+        self._stash_defaults()
 
         self.core = core
 
