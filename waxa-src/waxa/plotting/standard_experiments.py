@@ -234,7 +234,7 @@ def rabi_oscillation(ad:atomdata,
                             p0=[fit_guess_frequency, fit_guess_phase,
                                  fit_guess_amp, fit_guess_offset,
                                    fit_guess_decay_tau],
-                            bounds=((0.,0.,0.,0.,0.),(1.2*fit_guess_frequency, 2*np.pi, 1., 1., np.inf)))
+                            bounds=((0.,0.,0.,0.,5.e-6),(1.2*fit_guess_frequency, 2*np.pi, 0.51, 1.1, np.inf)))
         
         y_fit = _fit_func_rabi_oscillation(times, *popt)
 

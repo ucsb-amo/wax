@@ -14,7 +14,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton,
                              QDialog, QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QFormLayout,
                              QMenuBar, QMenu)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
 from PyQt6.QtCore import QTimer, Qt, QRect, QPoint
 from pypylon import pylon
 import pyqtgraph as pg
@@ -632,7 +632,10 @@ class BaslerCameraViewer(QMainWindow):
                     painter = QPainter(qt_image)
                     painter.setPen(QPen(QColor(255, 0, 0), 10))
                     painter.setFont(painter.font())
-                    painter.drawText(10, 30, "⚠ SATURATION WARNING ⚠")
+                    font_large = QFont("Times", 100)
+                    # Apply the new font to the painter
+                    painter.setFont(font_large)
+                    painter.drawText(10, 170, "⚠ SATURATION WARNING ⚠")
                     painter.end()
                 
                 # Scale to fit label
