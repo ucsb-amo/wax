@@ -22,5 +22,6 @@ class MonitorManager(QThread):
             run_expt_command = r"%kpy% & ar " + str(expt_path)
             self.msg.emit("Starting monitor...")
             result = run(run_expt_command, stdout=PIPE, stderr=PIPE, universal_newlines=True, shell=True)
+            print(result)
         except Exception as e:
             print(e)
