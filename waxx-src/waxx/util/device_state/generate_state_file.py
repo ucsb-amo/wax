@@ -39,7 +39,7 @@ class Generator():
         self.config_data: Dict = None
 
     def generate(self):
-        self.generate_device_config()
+        self._generate_device_config()
         
         if self.config_data is None:
             print("Failed to generate configuration data.")
@@ -128,7 +128,7 @@ class Generator():
         
         return devices
 
-    def generate_device_config(self):
+    def _generate_device_config(self):
         """Generate device configuration from all _id files."""
         
         device_config = {

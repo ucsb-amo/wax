@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Set
 import os
 import json
 import time
@@ -145,6 +145,46 @@ class Monitor:
                         f"expt.dac.{attr_name}.set(v)"
                     ))
                     dac_idx += 1
+
+    def check_config_key_alignment(self, verbose: bool = True) -> Tuple[bool, Dict[str, Dict[str, List[str]]]]:
+        """Validate that lookup keys for DDS/TTL/DAC match what is stored in the JSON."""
+        config_data = self.load_config_file()
+        if config_data is None:
+            if verbose:
+                print("Unable to validate config keys because the config file could not be loaded.")
+            empty_report = {k: [] for k in ["dds", "ttl", "dac"]}
+            return False, {"missing_in_config": empty_report, "missing_in_lookup": empty_report}
+
+        lookup_sets: Dict[str, Set[str]] = {
+            "dds": set(self.dds_dict.keys()),
+            "ttl": set(self.ttl_dict.keys()),
+            "dac": set(self.dac_dict.keys()),
+        }
+
+        config_sets: Dict[str, Set[str]] = {
+            "dds": set(config_data.get("dds", {}).keys()),
+            "ttl": set(config_data.get("ttl", {}).keys()),
+            "dac": set(config_data.get("dac", {}).keys()),
+        }
+
+        missing_in_config = {k: sorted(lookup_sets[k] - config_sets[k]) for k in lookup_sets}
+        missing_in_lookup = {k: sorted(config_sets[k] - lookup_sets[k]) for k in lookup_sets}
+
+        matches_bool = all(len(missing_in_config[k]) == 0 and len(missing_in_lookup[k]) == 0 for k in lookup_sets)
+
+        if verbose:
+            if matches_bool:
+                print("Device keys in lookup dictionaries match the configuration file.")
+            else:
+                print("Device key mismatch detected between lookup dictionaries and configuration file.")
+                for dev_type in ["dds", "ttl", "dac"]:
+                    if missing_in_config[dev_type]:
+                        print(f"  {dev_type.upper()} missing in config: {missing_in_config[dev_type]}")
+                    if missing_in_lookup[dev_type]:
+                        print(f"  {dev_type.upper()} missing in lookup: {missing_in_lookup[dev_type]}")
+
+        # return matches, {"missing_in_config": missing_in_config, "missing_in_lookup": missing_in_lookup}
+        return matches_bool
 
     def load_config_file(self) -> Optional[dict]:
         """Load configuration file and return data, retrying if file is in use."""
@@ -336,7 +376,13 @@ class Monitor:
         self.signal_ready()
         while True:
             self.core.wait_until_mu(now_mu())
+            if self.check_config_key_alignment():
+                self.generator.generate()
+                break
             self.sync_change_list(verbose=verbose)
             self.core.break_realtime()
             self.apply_updates()
             delay(T_MONITOR_UPDATE_INTERVAL)
+        delay(1.)
+        self.core.wait_until_mu(now_mu())
+        self.signal_end()
