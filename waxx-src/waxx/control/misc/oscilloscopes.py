@@ -140,22 +140,22 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
     
     def read_sweep(self,channels):
-        if isinstance(channels,int) or isinstance(channels,np.int32):
-            channels = [channels]
-        channels = np.asarray(channels)
+        channels = np.atleast_1d(channels)
+        if len(channels) > 1:
+            raise ValueError('Taking traces from multiple channels is not supported.')
         self._scopedata._scope_trace_taken = True
 
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
-        data = np.zeros((4,2,Npts))
+        data = np.zeros((1,2,Npts)) # data = np.zeros((4,2,Npts))
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
         for ch in range(4):
             if self.scope.is_channel_visible(ch) and (ch in channels):
                 try:
                     (t,v) = self.scope.read_sweep(ch)
-                    data[ch][0] = t
-                    data[ch][1] = v
+                    data[0][0] = t # data[ch][0] = t
+                    data[0][1] = v # data[ch][1] = v
                 except Exception as e:
                     # aprint(e)
                     pass
@@ -190,16 +190,18 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         Returns:
             TBool: Returns true when read is complete.
         """        
-        if isinstance(channels,int):
-            channels = [channels]
-        channels = np.asarray(channels)
+        channels = np.atleast_1d(channels)
+        if len(channels) > 1:
+            raise ValueError('Taking traces from multiple channels is not supported.')
         self._scopedata._scope_trace_taken = True
         sweeps = self.scope.read_multiple_sweeps(list(np.array(channels) + 1))
         Npts = np.array(sweeps).shape[1]
-        data = np.zeros((4,2,Npts))
+        data = np.zeros((1,2,Npts)) # data = np.zeros((4,2,Npts))
+        j = 0
         for idx in range(4):
             if idx in channels:
-                data[idx][0] = sweeps[idx][:,0]
-                data[idx][1] = sweeps[idx][:,1]
+                data[0][0] = sweeps[j][:,0] # data[idx][0] = sweeps[j][:,0]
+                data[0][1] = sweeps[j][:,1] # data[idx][1] = sweeps[j][:,1]
+                j += 1
         self._data.append(data)
         return True
