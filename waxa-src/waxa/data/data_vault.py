@@ -36,8 +36,13 @@ class DataSaver():
                     data = scope.reshape_data()
                     if expt.sort_idx:
                         data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
-                    scope_data.create_dataset(scope.label,data=data)
-
+                    # scope_data.create_dataset(scope.label,data=data)
+                    this_scope_data = scope_data.create_group(scope.label)
+                    t = data[:, 0, 0, :]
+                    v = data[:, :, 1, :]
+                    this_scope_data.create_dataset('t',data=t)
+                    this_scope_data.create_dataset('v',data=v)
+                    
             if expt.sort_idx:
                 expt.images = np.array(f['data']['images'])
                 expt.image_timestamps = np.array(f['data']['image_timestamps'])
