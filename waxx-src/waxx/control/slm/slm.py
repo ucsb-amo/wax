@@ -1,4 +1,5 @@
 import socket
+import time
 from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
 from waxx.config.expt_params import ExptParams
@@ -9,6 +10,8 @@ dv = 1.
 dm = 1
 SLM_RPC_DELAY = 0.25
 
+T_RESEND_SLM_COMMAND_S = 450.
+
 class SLM:
     def __init__(self, expt_params=ExptParams(), core=Core,
                  server_ip='192.168.1.102', server_port=5000):
@@ -16,6 +19,21 @@ class SLM:
         self.server_port = server_port
         self.params = expt_params
         self.core = core
+
+        self.dimension = dv
+        self.phase = dv
+        self.x_center = di
+        self.y_center = di
+
+        self._time_last_command = 0
+
+    @kernel
+    def check_for_old_setting(self):
+        if time.time() - self._time_last_command > T_RESEND_SLM_COMMAND_S:
+            self.write_phase_mask_kernel(self.dimension,
+                                        self.phase,
+                                        self.x_center,
+                                        self.y_center)
 
     def write_phase_mask(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot', initialize=False):
         """Writes a phase spot of given dimension and phase to the specified
@@ -50,6 +68,11 @@ class SLM:
         x_center = int(x_center)
         y_center = int(y_center)
 
+        self.dimension = dimension
+        self.phase = phase
+        self.x_center = x_center
+        self.y_center = y_center
+
         if mask_type == 'spot':
             mask = 'spot'
         elif mask_type == 'grating':
@@ -74,6 +97,9 @@ class SLM:
             self._send_command(command)
             print(f"\nSent: {command}")
             print(f"-> mask: {mask_type}, dimension = {dimension} um, phase = {phase/np.pi} pi, x-center = {x_center}, y-center = {y_center}\n")
+
+            self._time_last_command = time.time()
+
         except Exception as e:
             print(f"Error sending phase spot: {e}")
 
