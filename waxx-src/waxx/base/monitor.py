@@ -5,8 +5,7 @@ import json
 import time
 import numpy as np
 
-from artiq.language.core import kernel, kernel_from_string
-from artiq.experiment import delay, EnvExperiment
+from artiq.language.core import kernel, kernel_from_string, delay, now_mu
 from artiq.coredevice.core import Core
 
 # from waxx.control.artiq import DDS, DAC_CH, TTL_OUT, TTL_IN
@@ -17,6 +16,8 @@ DEFAULT_UPDATE_2FLOAT = (-1, 0.0, 0.0)
 DEFAULT_UPDATE_FLOAT = (-1, 0.0)
 DEFAULT_UPDATE_BOOL = (-1, False)
 DEFAULT_UPDATE_INT = (-1, 0)
+
+T_MONITOR_UPDATE_INTERVAL = 0.1
 
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.device_state.generate_state_file import Generator
@@ -330,3 +331,12 @@ class Monitor:
                 break
             self.dac_kernels[index](self.expt,v)
             delay(t0)
+        
+    def monitor_loop(self, verbose=False):
+        self.signal_ready()
+        while True:
+            self.core.wait_until_mu(now_mu())
+            self.sync_change_list(verbose=verbose)
+            self.core.break_realtime()
+            self.apply_updates()
+            delay(T_MONITOR_UPDATE_INTERVAL)
