@@ -147,7 +147,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
         data = []
-        d = np.zeros(2,Npts) # data = np.zeros((4,2,Npts))
+        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
         for ch in range(4):
@@ -196,7 +196,7 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         sweeps = self.scope.read_multiple_sweeps(list(np.array(channels) + 1))
         Npts = np.array(sweeps).shape[1]
         data = []
-        d = np.zeros(2,Npts) # data = np.zeros((4,2,Npts))
+        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
         j = 0
         for idx in range(4):
             if idx in channels:
