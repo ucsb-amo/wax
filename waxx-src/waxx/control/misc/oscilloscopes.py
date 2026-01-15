@@ -90,7 +90,7 @@ class GenericWaxxScope():
         if self._data != []:
             self._data = np.array(self._data)
             Npts = np.array(self._data).shape[-1]
-            self._data = self._data.reshape(*self._scopedata.xvardims,4,2,Npts)
+            self._data = self._data.reshape(*self._scopedata.xvardims,self._data.shape[1],2,Npts)
             return self._data
 
     def handle_devid_input(self,device_id):
