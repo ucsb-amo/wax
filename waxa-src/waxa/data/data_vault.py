@@ -35,7 +35,7 @@ class DataSaver():
                 for scope in expt.scope_data.scopes:
                     data = scope.reshape_data()
                     if expt.sort_idx:
-                        data = expt._unshuffle_ndarray(data,exclude_dims=3)
+                        data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
                     scope_data.create_dataset(scope.label,data=data)
 
             if expt.sort_idx:

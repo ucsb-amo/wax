@@ -27,8 +27,9 @@ def format_scope_data(dataset):
     for scope_key in dataset.keys():
 
         data_array = dataset[scope_key][()]
+        data_array: np.ndarray
         this_scope_data = dict()
-        for ch in range(4):
+        for ch in range(data_array.shape[1]):
             # -3 is the axis that labels the channel, slice there
             # this_ch_data = []
             c = np.take(data_array,ch,-3)
@@ -719,8 +720,8 @@ class atomdata():
             try:
                 d = f['data']['scope_data']
                 self.scope_data = format_scope_data(d)
-            except:
-                None
+            except Exception as e:
+                print(e)
 
 # class ConcatAtomdata(atomdata):
 #     def __init__(self,rids=[],roi_id=None,lite=False):
