@@ -332,6 +332,7 @@ class Monitor:
             self.dac_kernels[index](self.expt,v)
             delay(t0)
         
+    @kernel
     def monitor_loop(self, verbose=False):
         self.signal_ready()
         while True:
