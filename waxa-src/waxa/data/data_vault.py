@@ -57,7 +57,7 @@ class DataSaver():
         if expt.setup_camera:
             
             pwd = os.getcwd()
-            os.chdir(data_dir)
+            os.chdir(self._data_dir)
             
             fpath, _ = self._data_path(expt.run_info)
 

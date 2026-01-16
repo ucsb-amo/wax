@@ -12,7 +12,7 @@ waxa/base/dealer.py
 waxa/base/scribe.py
 waxa/base/xvar.py
 waxa/config/__init__.py
-waxa/config/expt_params_waxa.py
+waxa/config/expt_params.py
 waxa/config/img_types.py
 waxa/config/timeouts.py
 waxa/data/__init__.py
