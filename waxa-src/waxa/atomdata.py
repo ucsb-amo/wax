@@ -6,7 +6,7 @@ import h5py
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
 from waxa.roi import ROI
-from waxa.data.data_vault import DataSaver
+from waxa.data.data_vault import DataSaver, DataVault
 from waxa.base import Dealer, xvar
 import waxa.data.server_talk as st
 from waxa.helper.datasmith import *
@@ -697,6 +697,13 @@ class atomdata():
             self.image_timestamps = f['data']['image_timestamps'][()]
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
+
+            self.data = DataVault()
+            for k in f['data'].keys():
+                if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx']:
+                    vars(self.data)[k] = f['data'][k][()]
+                    self.data._keys.append(k)
+
             try:
                 experiment_text = f.attrs['expt_file']
                 params_text = f.attrs['params_file']

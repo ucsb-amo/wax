@@ -11,6 +11,25 @@ params_path = os.path.join(code_dir,"k-exp","kexp","config","expt_params.py")
 cooling_path = os.path.join(code_dir,"k-exp","kexp","base","cooling.py")
 imaging_path = os.path.join(code_dir,"k-exp","kexp","base","image.py")
 
+class DataVault():
+    def __init__(self):
+        self._keys = []
+
+    def add_data_container(self,
+                            key:str,
+                            per_shot_data_shape=(1,),
+                            dtype=np.float64):
+        data_container_seed = np.zeros(per_shot_data_shape,dtype=dtype)
+        vars(self)[key] = data_container_seed
+        self._keys.append(key)
+
+    def set_container_sizes(self, xvardims):
+        for key in self._keys:
+            y = vars(self)[key]
+            for d in xvardims:
+                y = [y]*d
+            vars(self)[key] = np.asarray(y)
+
 class DataSaver():
 
     def save_data(self,expt,expt_filepath="",data_object=None):
@@ -29,6 +48,14 @@ class DataSaver():
                 f = data_object
             else:
                 f = h5py.File(fpath,'r+')
+
+            if len(expt.data._keys) > 0:
+                for key in expt.data._keys:
+                    this_data = vars(expt.data)[key]
+                    ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
+                    if expt.sort_idx:
+                        expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+                    f['data'].create_dataset(key, data=this_data)
 
             if expt.scope_data._scope_trace_taken:
                 scope_data = f['data'].create_group('scope_data')
