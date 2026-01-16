@@ -22,31 +22,26 @@ class ScopeTraceArray():
         self.t = t
         self.v = v
 
-def format_scope_data(dataset):
+def format_scope_data(dataset, old_method=False):
     scope_dict = dict()
     for scope_key in dataset.keys():
-
-        data_array = dataset[scope_key][()]
-        data_array: np.ndarray
         this_scope_data = dict()
-        for ch in range(data_array.shape[1]):
-            # -3 is the axis that labels the channel, slice there
-            # this_ch_data = []
-            c = np.take(data_array,ch,-3)
-            s = c.shape
-            c = c.reshape(np.prod(s[:-2]),2,s[-1])
-            # t = c[:][0].reshape(*s[:-2],s[-1])
-            # v = c[:][1].reshape(*s[:-2],s[-1])
-            # for single_shot_data in c:
-            #     t = single_shot_data[0]
-            #     v = single_shot_data[1]
-            #     this_ch_data.append(ScopeTrace(scope_key,ch,t,v))
-            # this_ch_data = np.array(this_ch_data).reshape(*s[:-2])
-            # this_scope_data[ch] = this_ch_data
-            t = np.take(c,0,axis=-2).reshape(*s[:-2],s[-1])
-            v = np.take(c,1,axis=-2).reshape(*s[:-2],s[-1])
-            this_scope_data[ch] = ScopeTraceArray(scope_key,ch,t,v)
-        scope_dict[scope_key] = this_scope_data
+        if old_method:
+            data_array = dataset[scope_key][()]
+            data_array: np.ndarray
+            for ch in range(data_array.shape[-3]):
+                ch_data = np.take(data_array,ch,-3)
+                t = np.take(ch_data,0,axis=-2)
+                v = np.take(ch_data,1,axis=-2)
+                this_scope_data[ch] = ScopeTraceArray(scope_key,ch,t,v)
+            scope_dict[scope_key] = this_scope_data
+        if not old_method:
+            v_data = dataset[scope_key]['v']
+            t = dataset[scope_key]['t'][()]
+            for ch in range(v_data.shape[-2]):
+                v = np.take(v_data,ch,axis=-2)
+                this_scope_data[ch] = ScopeTraceArray(scope_key,ch,t,v)
+            scope_dict[scope_key] = this_scope_data
     return scope_dict
 
 def unpack_group(file,group_key,obj):
@@ -725,8 +720,11 @@ class atomdata():
                 self.sort_idx = np.array([])
                 self.sort_N = np.array([])
             try:
-                d = f['data']['scope_data']
-                self.scope_data = format_scope_data(d)
+                if 'scope_data' in f['data'].keys():
+                    d = f['data']['scope_data']
+                    SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,0)
+                    old_method_bool = datetime.datetime(*self.run_info.run_datetime[:4]) < SCOPE_DATA_CHANGE_EPOCH
+                    self.scope_data = format_scope_data(d,old_method=old_method_bool)
             except Exception as e:
                 print(e)
 
