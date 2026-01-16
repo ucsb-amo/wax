@@ -4,13 +4,6 @@ import h5py
 
 from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
 
-data_dir = os.getenv("data")
-
-code_dir = os.getenv("code")
-params_path = os.path.join(code_dir,"k-exp","kexp","config","expt_params.py")
-cooling_path = os.path.join(code_dir,"k-exp","kexp","base","cooling.py")
-imaging_path = os.path.join(code_dir,"k-exp","kexp","base","image.py")
-
 class DataVault():
     def __init__(self):
         self._keys = []
@@ -31,6 +24,30 @@ class DataVault():
             vars(self)[key] = np.asarray(y)
 
 class DataSaver():
+    def __init__(self,
+                 data_dir="",
+                 expt_repo_src_directory="",
+                 expt_params_relative_filepath="",
+                 cooling_relative_filepath="",
+                 imaging_relative_filepath=""):
+        self._data_dir = data_dir
+        self._expt_repo_path = expt_repo_src_directory
+        self._expt_params_path = os.path.join(expt_repo_src_directory,
+                                              expt_params_relative_filepath)
+        self._cooling_path = os.path.join(expt_repo_src_directory,
+                                          cooling_relative_filepath)
+        self._imaging_path = os.path.join(expt_repo_src_directory,
+                                          imaging_relative_filepath)
+        
+        if not os.path.isfile(self._expt_params_path):
+            print(f'expt_params file not found at {self._expt_params_path}, saving contents skipped')
+            self._expt_params_path = ""
+        if not os.path.isfile(self._cooling_path):
+            print(f'cooling file not found at {self._cooling_path}, saving contents skipped')
+            self._cooling_path = ""
+        if not os.path.isfile(self._imaging_path):
+            print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
+            self._imaging_path = ""
 
     def save_data(self,expt,expt_filepath="",data_object=None):
 
@@ -86,15 +103,16 @@ class DataSaver():
             else:
                 f.attrs["expt_file"] = ""
 
-            with open(params_path) as params_file:
-                params_file = params_file.read()
-            f.attrs["params_file"] = params_file
+            if self._expt_params_path:
+                with open(self._expt_params_path) as params_file:
+                    params_file = params_file.read()
+                f.attrs["params_file"] = params_file
+            
+            if self._cooling_path:
+                    cooling_file = cooling_file.read()
+                f.attrs["cooling_file"] = cooling_file
 
-            with open(cooling_path) as cooling_file:
-                cooling_file = cooling_file.read()
-            f.attrs["cooling_file"] = cooling_file
-
-            with open(imaging_path) as imaging_file:
+            with open(self._imaging_path) as imaging_file:
                 imaging_file = imaging_file.read()
             f.attrs["imaging_file"] = imaging_file
 
@@ -117,7 +135,7 @@ class DataSaver():
         pwd = os.getcwd()
 
         check_for_mapped_data_dir()
-        os.chdir(data_dir)
+        os.chdir(self._data_dir)
 
         fpath, folder = self._data_path(expt.run_info)
 
@@ -183,13 +201,13 @@ class DataSaver():
             print(e)
 
     def _data_path(self,run_info,lite=False):
-        this_data_dir = data_dir
+        this_data_dir = self._data_dir
         run_id_str = f"{str(run_info.run_id).zfill(7)}"
         expt_class = self._bytes_to_str(run_info.expt_class)
         datetime_str = self._bytes_to_str(run_info.run_datetime_str)
         if lite:
             run_id_str += "_lite"
-            this_data_dir = os.path.join(data_dir,"_lite")
+            this_data_dir = os.path.join(self._data_dir,"_lite")
         filename = run_id_str + "_" + datetime_str + "_" + expt_class + ".hdf5"
         filepath_folder = os.path.join(this_data_dir,
                                        self._bytes_to_str(run_info.run_date_str))
