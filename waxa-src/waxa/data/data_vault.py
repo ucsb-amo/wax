@@ -4,24 +4,52 @@ import h5py
 
 from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
 
+class DataContainer():
+    def __init__(self, key, per_shot_data_shape, dtype, external_data_bool, expt):
+        self.key = key
+        self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
+        self._dtype = dtype
+        self._external_data_bool = external_data_bool
+        self._expt = expt
+
+        self.array = np.zeros(per_shot_data_shape,dtype=dtype)
+
+    def put_data(self,value):
+        value = np.asarray(value).astype(self._dtype)
+        if value.shape != self._per_shot_data_shape:
+            raise ValueError(f"Value is not correct shape for this data container (expected {self._per_shot_data_shape} but value is {value.shape})")
+        idx = [x.counter for x in self._expt.scan_xvars]
+        idx = tuple(idx)
+        self.array[idx] = value
+
+    def set_container_size(self):
+        y = self.array
+        for d in self._expt.xvardims:
+            y = [y]*d
+        self.array = np.asarray(y).squeeze()
+
 class DataVault():
-    def __init__(self):
-        self._keys = []
+    def __init__(self, expt):
+        self.keys = []
+        self._expt = expt
 
     def add_data_container(self,
                             key:str,
                             per_shot_data_shape=(1,),
-                            dtype=np.float64):
-        data_container_seed = np.zeros(per_shot_data_shape,dtype=dtype)
-        vars(self)[key] = data_container_seed
-        self._keys.append(key)
+                            dtype=np.float64,
+                            external_data_bool=False):
+        vars(self)[key] = DataContainer(key,
+                                        per_shot_data_shape,
+                                        dtype,
+                                        external_data_bool,
+                                        self._expt)
+        self.keys.append(key)
 
-    def set_container_sizes(self, xvardims):
-        for key in self._keys:
-            y = vars(self)[key]
-            for d in xvardims:
-                y = [y]*d
-            vars(self)[key] = np.asarray(y)
+    def set_container_sizes(self):
+        for key in self.keys:
+            dc = vars(self)[key]
+            if isinstance(dc,DataContainer):
+                dc.set_container_size()
 
 class DataSaver():
     def __init__(self,
@@ -66,13 +94,16 @@ class DataSaver():
             else:
                 f = h5py.File(fpath,'r+')
 
-            if len(expt.data._keys) > 0:
-                for key in expt.data._keys:
-                    this_data = vars(expt.data)[key]
+            for key in expt.data.keys:
+                this_data_container = vars(expt.data)[key]
+                if this_data_container._external_data_bool:
+                    this_data = f['data'][key][...]
+                else:
+                    this_data = this_data_container.array
+                if expt.sort_idx:
                     ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
-                    if expt.sort_idx:
-                        expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
-                    f['data'].create_dataset(key, data=this_data)
+                    expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+                f['data'][key][...] = this_data
 
             if expt.scope_data._scope_trace_taken:
                 scope_data = f['data'].create_group('scope_data')
@@ -113,6 +144,7 @@ class DataSaver():
                 f.attrs["params_file"] = params_file
             
             if self._cooling_path:
+                with open(self._cooling_path) as cooling_file:
                     cooling_file = cooling_file.read()
                 f.attrs["cooling_file"] = cooling_file
 
@@ -158,6 +190,9 @@ class DataSaver():
         f.attrs['xvarnames'] = expt.xvarnames
         data.create_dataset('images',data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
+        for key in expt.data.keys:
+            data.create_dataset(key, data=vars(expt.data)[key])
+
         if expt.sort_idx:
             # pad with [-1]s to allow saving in hdf5 (avoid staggered array)
             self.pad_sort_idx(expt)
