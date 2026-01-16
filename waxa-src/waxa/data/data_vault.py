@@ -7,20 +7,28 @@ from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_
 class DataVault():
     def __init__(self):
         self._keys = []
+        self._flatten_keys = []
 
     def add_data_container(self,
                             key:str,
                             per_shot_data_shape=(1,),
-                            dtype=np.float64):
+                            dtype=np.float64,
+                            flatten_xvardims=False):
         data_container_seed = np.zeros(per_shot_data_shape,dtype=dtype)
         vars(self)[key] = data_container_seed
-        self._keys.append(key)
+        if key not in self._keys:
+            self._keys.append(key)
+        if flatten_xvardims and key not in self._flatten_keys:
+            self._flatten_keys.append(key)
 
     def set_container_sizes(self, xvardims):
         for key in self._keys:
             y = vars(self)[key]
-            for d in xvardims:
-                y = [y]*d
+            if key in self._flatten_keys:
+                y = [y]*np.prod(xvardims)
+            else:
+                for d in xvardims:
+                    y = [y]*d
             vars(self)[key] = np.asarray(y)
 
 class DataSaver():
@@ -57,7 +65,7 @@ class DataSaver():
         if expt.setup_camera:
             
             pwd = os.getcwd()
-            os.chdir(data_dir)
+            os.chdir(self._data_dir)
             
             fpath, _ = self._data_path(expt.run_info)
 
@@ -66,13 +74,25 @@ class DataSaver():
             else:
                 f = h5py.File(fpath,'r+')
 
-            if len(expt.data._keys) > 0:
-                for key in expt.data._keys:
-                    this_data = vars(expt.data)[key]
-                    ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
-                    if expt.sort_idx:
-                        expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
-                    f['data'].create_dataset(key, data=this_data)
+            if expt.sort_idx:
+                expt.xvardims = self.get_xvardims(expt)
+                expt.N_xvars = len(expt.xvardims)
+                expt._unshuffle_struct(expt)
+
+            for key in expt.data._keys:
+                this_data = vars(expt.data)[key]
+                if expt.sort_idx:
+                    if key in ['images','image_timestamps']:
+                        vars(expt.data)[key] = np.array(f['data'][key])
+                        match key:
+                            case 'images':
+                                this_data = expt.unscramble_images()
+                            case 'image_timestamps':
+                                this_data = expt._unscramble_timestamps()
+                    else:
+                        ndims_per_shot = len(this_data.shape) - expt.N_xvars
+                        this_data = expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+                f['data'][key][...] = this_data
 
             if expt.scope_data._scope_trace_taken:
                 scope_data = f['data'].create_group('scope_data')
@@ -85,16 +105,6 @@ class DataSaver():
                     v = np.take(data,1,-2)
                     this_scope_data.create_dataset('t',data=t)
                     this_scope_data.create_dataset('v',data=v)
-                    
-            if expt.sort_idx:
-                expt.images = np.array(f['data']['images'])
-                expt.image_timestamps = np.array(f['data']['image_timestamps'])
-                expt.xvardims = [len(xvar.values) for xvar in expt.scan_xvars]
-                expt.N_xvars = len(expt.xvardims)
-                expt._unshuffle_struct(expt)
-                f['data']['images'][...] = expt.unscramble_images()
-                f['data']['image_timestamps'][...] = expt._unscramble_timestamps()
-                expt._unshuffle_struct(expt.params)
 
             del f['params']
             params_dset = f.create_group('params')
@@ -113,6 +123,7 @@ class DataSaver():
                 f.attrs["params_file"] = params_file
             
             if self._cooling_path:
+                with open(self._cooling_path) as cooling_file:
                     cooling_file = cooling_file.read()
                 f.attrs["cooling_file"] = cooling_file
 
@@ -156,8 +167,10 @@ class DataSaver():
         f.attrs['camera_ready_ack'] = 0
         
         f.attrs['xvarnames'] = expt.xvarnames
-        data.create_dataset('images',data=expt.images)
-        data.create_dataset('image_timestamps',data=expt.image_timestamps)
+        if len(expt.data._keys) > 0:
+            for key in expt.data._keys:
+                this_data = vars(expt.data)[key]
+                data.create_dataset(key, data=this_data)
         if expt.sort_idx:
             # pad with [-1]s to allow saving in hdf5 (avoid staggered array)
             self.pad_sort_idx(expt)
