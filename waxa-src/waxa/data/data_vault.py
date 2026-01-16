@@ -36,10 +36,9 @@ class DataSaver():
                     data = scope.reshape_data()
                     if expt.sort_idx:
                         data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
-                    # scope_data.create_dataset(scope.label,data=data)
                     this_scope_data = scope_data.create_group(scope.label)
-                    t = data[:, 0, 0, :]
-                    v = data[:, :, 1, :]
+                    t = np.take(np.take(data,0,-2),0,-2)
+                    v = np.take(data,1,-2)
                     this_scope_data.create_dataset('t',data=t)
                     this_scope_data.create_dataset('v',data=v)
                     
