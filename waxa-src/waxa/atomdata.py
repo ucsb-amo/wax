@@ -713,10 +713,11 @@ class atomdata():
                 self.sort_idx = np.array([])
                 self.sort_N = np.array([])
             try:
-                d = f['data']['scope_data']
-                SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,0)
-                old_method_bool = datetime.datetime(*self.run_info.run_datetime[:4]) < SCOPE_DATA_CHANGE_EPOCH
-                self.scope_data = format_scope_data(d,old_method=old_method_bool)
+                if 'scope_data' in f['data'].keys():
+                    d = f['data']['scope_data']
+                    SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,0)
+                    old_method_bool = datetime.datetime(*self.run_info.run_datetime[:4]) < SCOPE_DATA_CHANGE_EPOCH
+                    self.scope_data = format_scope_data(d,old_method=old_method_bool)
             except Exception as e:
                 print(e)
 
