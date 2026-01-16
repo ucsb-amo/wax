@@ -37,7 +37,7 @@ def format_scope_data(dataset, old_method=False):
             scope_dict[scope_key] = this_scope_data
         if not old_method:
             v_data = dataset[scope_key]['v']
-            t = dataset[scope_key]['t']
+            t = dataset[scope_key]['t'][()]
             for ch in range(v_data.shape[-2]):
                 v = np.take(v_data,ch,axis=-2)
                 this_scope_data[ch] = ScopeTraceArray(scope_key,ch,t,v)
@@ -714,10 +714,9 @@ class atomdata():
                 self.sort_N = np.array([])
             try:
                 d = f['data']['scope_data']
-                SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,14)
-                old_method_bool = datetime.datetime(*self.run_info.run_datetime[:3]) < SCOPE_DATA_CHANGE_EPOCH
+                SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,0)
+                old_method_bool = datetime.datetime(*self.run_info.run_datetime[:4]) < SCOPE_DATA_CHANGE_EPOCH
                 self.scope_data = format_scope_data(d,old_method=old_method_bool)
-                
             except Exception as e:
                 print(e)
 

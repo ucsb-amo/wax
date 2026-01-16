@@ -81,14 +81,14 @@ class GenericWaxxScope():
     def data(self):
         if self._scopedata.xvardims != []:
             self.reshape_data()
-        return np.array(self._data)
+        return np.asarray(self._data)
 
     def close(self):
         self.scope.close()
 
     def reshape_data(self):
         if self._data != []:
-            self._data = np.array(self._data)
+            self._data = np.asarray(self._data)
             Npts = np.array(self._data).shape[-1]
             self._data = self._data.reshape(*self._scopedata.xvardims,self._data.shape[-3],2,Npts)
             return self._data
