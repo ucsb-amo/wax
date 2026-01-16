@@ -71,6 +71,7 @@ class GenericWaxxScope():
         self.device_id = self.handle_devid_input(device_id)
         self.scope_trace_taken_this_shot = False
         self._data = []
+        self._channels = []
         
         self._scopedata.scopes.append(self)
 
@@ -80,16 +81,16 @@ class GenericWaxxScope():
     def data(self):
         if self._scopedata.xvardims != []:
             self.reshape_data()
-        return np.array(self._data)
+        return np.asarray(self._data)
 
     def close(self):
         self.scope.close()
 
     def reshape_data(self):
         if self._data != []:
-            self._data = np.array(self._data)
+            self._data = np.asarray(self._data)
             Npts = np.array(self._data).shape[-1]
-            self._data = self._data.reshape(*self._scopedata.xvardims,4,2,Npts)
+            self._data = self._data.reshape(*self._scopedata.xvardims,self._data.shape[-3],2,Npts)
             return self._data
 
     def handle_devid_input(self,device_id):
@@ -140,26 +141,26 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
     
     def read_sweep(self,channels):
-        if isinstance(channels,int) or isinstance(channels,np.int32):
-            channels = [channels]
-        channels = np.asarray(channels)
+        channels = np.atleast_1d(channels)
         self._scopedata._scope_trace_taken = True
 
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
-        data = np.zeros((4,2,Npts))
+        data = []
+        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
         for ch in range(4):
             if self.scope.is_channel_visible(ch) and (ch in channels):
                 try:
                     (t,v) = self.scope.read_sweep(ch)
-                    data[ch][0] = t
-                    data[ch][1] = v
+                    d[0] = t # data[ch][0] = t
+                    d[1] = v # data[ch][1] = v
+                    data.append(d)
                 except Exception as e:
                     # aprint(e)
                     pass
-        self._data.append(data)
+        self._data.append(np.array(data))
 
 class TektronixScope_TBS1104(GenericWaxxScope):
     def __init__(self,device_id="",label="",arm=True,
@@ -190,16 +191,18 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         Returns:
             TBool: Returns true when read is complete.
         """        
-        if isinstance(channels,int):
-            channels = [channels]
-        channels = np.asarray(channels)
+        channels = np.atleast_1d(channels)
         self._scopedata._scope_trace_taken = True
         sweeps = self.scope.read_multiple_sweeps(list(np.array(channels) + 1))
         Npts = np.array(sweeps).shape[1]
-        data = np.zeros((4,2,Npts))
+        data = []
+        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
+        j = 0
         for idx in range(4):
             if idx in channels:
-                data[idx][0] = sweeps[idx][:,0]
-                data[idx][1] = sweeps[idx][:,1]
-        self._data.append(data)
+                d[0] = sweeps[j][:,0] # data[idx][0] = sweeps[j][:,0]
+                d[1] = sweeps[j][:,1] # data[idx][1] = sweeps[j][:,1]
+                data.append(d)
+                j += 1
+        self._data.append(np.array(data))
         return True

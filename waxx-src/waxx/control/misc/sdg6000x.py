@@ -7,7 +7,7 @@ import vxi11
 
 from waxx.util.artiq.async_print import aprint
 
-T_RPC_DELAY = 10.e-3
+T_RPC_DELAY = 20.e-3
 
 dv = -0.1
 

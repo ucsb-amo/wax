@@ -54,7 +54,7 @@ class BeatLockImaging():
         self.ttl_pid_manual_override.on()
 
     @kernel
-    def set_power(self, power_control_parameter=dv):
+    def set_power(self, power_control_parameter=dv, reset_pid=False):
         self.dds_sw.set_dds(amplitude=power_control_parameter)
 
     @kernel

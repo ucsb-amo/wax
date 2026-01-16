@@ -17,11 +17,13 @@ class RamanBeamPair():
     def __init__(self,
                  dds0:DDS,
                  dds1:DDS,
+                 dds_sw:DDS,
                  params=ExptParams(),
                  frequency_transition=0.,
                  fraction_power=0.):
         self.dds0 = dds0
         self.dds1 = dds1
+        self.dds_sw = dds_sw
         self.params = params
         self.p = self.params
 
@@ -66,6 +68,27 @@ class RamanBeamPair():
         fc1 = self._frequency_center_1
 
         self._frequency_diff_sign = np.sign(fc0 - fc1)
+
+    @kernel
+    def init(self,
+            frequency_transition,
+            fraction_power,
+            global_phase=0.,relative_phase=0.,
+            t_phase_origin_mu=np.int64(-1),
+            phase_mode=1):
+        if t_phase_origin_mu < 0:
+            t_phase_origin_mu = now_mu()
+        self.set(frequency_transition=frequency_transition,
+                 fraction_power_raman=fraction_power,
+                 global_phase=global_phase,
+                 relative_phase=relative_phase,
+                 t_phase_origin_mu=t_phase_origin_mu,
+                 phase_mode=phase_mode,
+                 init=True)
+        self.dds_sw._restore_defaults()
+        self.dds_sw.set_dds(init=True)
+        self.dds0.on()
+        self.dds1.on()
 
     @portable(flags={"fast-math"})
     def state_splitting_to_ao_frequency(self,frequency_state_splitting) -> TArray(TFloat):
@@ -142,13 +165,11 @@ class RamanBeamPair():
 
     @kernel
     def on(self):
-        self.dds0.on()
-        self.dds1.on()
+        self.dds_sw.on()
 
     @kernel
     def off(self):
-        self.dds0.off()
-        self.dds1.off()
+        self.dds_sw.off()
 
     @kernel
     def set(self,
@@ -240,6 +261,8 @@ class RamanBeamPair():
                                 amp1,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
+        self.dds0.on()
+        self.dds1.on()
 
     @kernel
     def pulse(self,t):
