@@ -6,7 +6,7 @@ import h5py
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
 from waxa.roi import ROI
-from waxa.data.data_vault import DataSaver, DataVault
+from waxa.data.data_vault import DataSaver
 from waxa.base import Dealer, xvar
 import waxa.data.server_talk as st
 from waxa.helper.datasmith import *
@@ -607,6 +607,7 @@ class atomdata():
             self.images = self._dealer.unscramble_images(reshuffle=True)
             self._dealer._unshuffle_struct(self, reshuffle=True)
             self._dealer._unshuffle_struct(self.params, reshuffle=True)
+            self._dealer._unshuffle_struct(self.data, reshuffle=True)
             self.xvars = self._unpack_xvars()
             self._sort_images()
             self.analyze()
@@ -619,6 +620,7 @@ class atomdata():
             self.images = self._dealer.unscramble_images(reshuffle=False)
             self._dealer._unshuffle_struct(self, reshuffle=False)
             self._dealer._unshuffle_struct(self.params, reshuffle=False)
+            self._dealer._unshuffle_struct(self.data, reshuffle=False)
             self.xvars = self._unpack_xvars()
             if reanalyze:
                 self._sort_images()
@@ -693,11 +695,16 @@ class atomdata():
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
 
+            class DataVault():
+                pass
+
             self.data = DataVault()
             for k in f['data'].keys():
                 if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx']:
-                    vars(self.data)[k] = f['data'][k][()]
-                    self.data._keys.append(k)
+                    data_k = f['data'][k][()]
+                    data_k: np.ndarray
+                    vars(self.data)[k] = data_k
+                    self.data.keys.append(k)
 
             try:
                 experiment_text = f.attrs['expt_file']
