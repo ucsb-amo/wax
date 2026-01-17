@@ -18,8 +18,7 @@ class DataContainer():
         value = np.asarray(value).astype(self._dtype)
         if value.shape != self._per_shot_data_shape:
             raise ValueError(f"Value is not correct shape for this data container (expected {self._per_shot_data_shape} but value is {value.shape})")
-        idx = [x.counter for x in self._expt.scan_xvars]
-        idx = tuple(idx)
+        idx = tuple([x.counter for x in self._expt.scan_xvars])
         self.array[idx] = value
 
     def set_container_size(self):
@@ -191,7 +190,8 @@ class DataSaver():
         data.create_dataset('images',data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
-            data.create_dataset(key, data=vars(expt.data)[key])
+            this_data = vars(expt.data)[key]
+            data.create_dataset(key, data=this_data)
 
         if expt.sort_idx:
             # pad with [-1]s to allow saving in hdf5 (avoid staggered array)
