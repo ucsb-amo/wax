@@ -28,7 +28,7 @@ class DataContainer():
         self.array = np.asarray(y).squeeze()
 
 class DataVault():
-    def __init__(self, expt):
+    def __init__(self, expt=None):
         self.keys = []
         self._expt = expt
 
@@ -37,12 +37,13 @@ class DataVault():
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
                             external_data_bool=False):
-        vars(self)[key] = DataContainer(key,
-                                        per_shot_data_shape,
-                                        dtype,
-                                        external_data_bool,
-                                        self._expt)
+        
         self.keys.append(key)
+        return DataContainer(key,
+                            per_shot_data_shape,
+                            dtype,
+                            external_data_bool,
+                            self._expt)
 
     def set_container_sizes(self):
         for key in self.keys:
@@ -65,16 +66,6 @@ class DataSaver():
                                           cooling_relative_filepath)
         self._imaging_path = os.path.join(expt_repo_src_directory,
                                           imaging_relative_filepath)
-        
-        if not os.path.isfile(self._expt_params_path):
-            print(f'expt_params file not found at {self._expt_params_path}, saving contents skipped')
-            self._expt_params_path = ""
-        if not os.path.isfile(self._cooling_path):
-            print(f'cooling file not found at {self._cooling_path}, saving contents skipped')
-            self._cooling_path = ""
-        if not os.path.isfile(self._imaging_path):
-            print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
-            self._imaging_path = ""
 
     def save_data(self,expt,expt_filepath="",data_object=None):
 
@@ -92,7 +83,6 @@ class DataSaver():
                 f = data_object
             else:
                 f = h5py.File(fpath,'r+')
-
             
                     
             if expt.sort_idx:
@@ -105,6 +95,7 @@ class DataSaver():
                 expt.N_xvars = len(expt.xvardims)
 
                 expt._unshuffle_struct(expt) # this usually does nothing
+                # now replace the data from the h5 with the unscrambled data
                 f['data']['images'][...] = expt.unscramble_images()
                 f['data']['image_timestamps'][...] = expt._unscramble_timestamps()
                 expt._unshuffle_struct(expt.params)
@@ -116,7 +107,7 @@ class DataSaver():
             params_dset = f.create_group('params')
             self._class_attr_to_dataset(params_dset,expt.params)
 
-            self._save_expt_files_text()
+            self._save_expt_files_text(f,expt_filepath)
 
             f.close()
             print("Parameters saved, data closed.")
@@ -157,7 +148,7 @@ class DataSaver():
         data.create_dataset('images',data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
-            this_data = vars(expt.data)[key]
+            this_data = vars(expt.data)[key].array
             data.create_dataset(key, data=this_data)
 
         if expt.sort_idx:
@@ -227,8 +218,11 @@ class DataSaver():
                 this_scope_data.create_dataset('v',data=v)
 
     def _save_expt_files_text(self,
-                              expt_filepath,
-                              h5File:h5py.File):
+                              h5File:h5py.File,
+                              expt_filepath):
+        
+        self._check_for_expt_files()
+
         f = h5File
         if expt_filepath:
                 with open(expt_filepath) as expt_file:
@@ -250,6 +244,17 @@ class DataSaver():
         with open(self._imaging_path) as imaging_file:
             imaging_file = imaging_file.read()
         f.attrs["imaging_file"] = imaging_file
+
+    def _check_for_expt_files(self):
+        if not os.path.isfile(self._expt_params_path):
+            print(f'expt_params file not found at {self._expt_params_path}, saving contents skipped')
+            self._expt_params_path = ""
+        if not os.path.isfile(self._cooling_path):
+            print(f'cooling file not found at {self._cooling_path}, saving contents skipped')
+            self._cooling_path = ""
+        if not os.path.isfile(self._imaging_path):
+            print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
+            self._imaging_path = ""
 
     def _class_attr_to_dataset(self,dset,obj):
         try:
