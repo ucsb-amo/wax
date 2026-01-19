@@ -384,6 +384,12 @@ class atomdata():
                 'img_timestamp_atoms','img_timestamp_light','img_timestamp_dark']
         for k in nd_keys:
             vars(ad)[k] = slice_ndarray(vars(ad)[k])
+        for k in self.data.keys:
+            vars(self.data)[k] = slice_ndarray(vars(self.data)[k])
+        if hasattr(self,'scope_data'):
+            for k in self.scope_data.keys():
+                for ch in self.scope_data[k].keys():
+                    self.scope_data[k][ch] = slice_ndarray(self.scope_data[k][ch])
 
         ad.params.N_img = np.prod(ad.xvardims)
         ad.params.N_shots = int(ad.params.N_shots / sliced_xvardim)
@@ -698,8 +704,8 @@ class atomdata():
             self.xvars = self._unpack_xvars()
 
             class DataVault():
-                pass
-
+                def __init__(self):
+                    self.keys = []
             self.data = DataVault()
             for k in f['data'].keys():
                 if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx']:
