@@ -530,6 +530,9 @@ class atomdata():
             new_var_idx can also be set to True in the case of one or two xvars,
             for convenience.
         """        
+        if self._analysis_tags.averaged:
+            raise ValueError("This function was written poorly and doesn't work on repeat averaged data. You can revert_repeats, transpose, then re-average.")
+
         Nvars = len(self.xvars)
 
         if new_xvar_idx == [] or new_xvar_idx == True:
