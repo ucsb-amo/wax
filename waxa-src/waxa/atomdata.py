@@ -607,7 +607,8 @@ class atomdata():
             self.images = self._dealer.unscramble_images(reshuffle=True)
             self._dealer._unshuffle_struct(self, reshuffle=True)
             self._dealer._unshuffle_struct(self.params, reshuffle=True)
-            self._dealer._unshuffle_struct(self.data, reshuffle=True)
+            for k in self.data.keys:
+                 vars(self.data)[k].array = self._dealer._unshuffle_ndarray(vars(self.data)[k].array)
             self.xvars = self._unpack_xvars()
             self._sort_images()
             self.analyze()
@@ -620,7 +621,8 @@ class atomdata():
             self.images = self._dealer.unscramble_images(reshuffle=False)
             self._dealer._unshuffle_struct(self, reshuffle=False)
             self._dealer._unshuffle_struct(self.params, reshuffle=False)
-            self._dealer._unshuffle_struct(self.data, reshuffle=False)
+            for k in self.data.keys:
+                 vars(self.data)[k].array = self._dealer._unshuffle_ndarray(vars(self.data)[k].array)
             self.xvars = self._unpack_xvars()
             if reanalyze:
                 self._sort_images()
@@ -705,7 +707,6 @@ class atomdata():
                     data_k: np.ndarray
                     vars(self.data)[k] = data_k
                     self.data.keys.append(k)
-
             try:
                 experiment_text = f.attrs['expt_file']
                 params_text = f.attrs['params_file']

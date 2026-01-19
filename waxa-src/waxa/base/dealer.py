@@ -216,7 +216,7 @@ class Dealer():
                               'image_timestamps','sort_N','sort_idx',
                               'xvars','N_repeats','N_shots',
                               'N_shots_with_repeats','scan_xvars',
-                              'xvardims']
+                              'xvardims','data']
             ks = struct.__dict__.keys()
             sort_ks = [k for k in ks if k not in protected_keys]
             for k in sort_ks:
