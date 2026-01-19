@@ -93,63 +93,30 @@ class DataSaver():
             else:
                 f = h5py.File(fpath,'r+')
 
-            for key in expt.data.keys:
-                this_data_container = vars(expt.data)[key]
-                if this_data_container._external_data_bool:
-                    this_data = f['data'][key][...]
-                else:
-                    this_data = this_data_container.array
-                if expt.sort_idx:
-                    ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
-                    expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
-                f['data'][key][...] = this_data
-
-            if expt.scope_data._scope_trace_taken:
-                scope_data = f['data'].create_group('scope_data')
-                for scope in expt.scope_data.scopes:
-                    data = scope.reshape_data()
-                    if expt.sort_idx:
-                        data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
-                    this_scope_data = scope_data.create_group(scope.label)
-                    t = np.take(np.take(data,0,-2),0,-2)
-                    v = np.take(data,1,-2)
-                    this_scope_data.create_dataset('t',data=t)
-                    this_scope_data.create_dataset('v',data=v)
+            
                     
             if expt.sort_idx:
+                # these were read in by liveOD, so we replace the expt empty arrays
                 expt.images = np.array(f['data']['images'])
                 expt.image_timestamps = np.array(f['data']['image_timestamps'])
+
+                # I think these two lines are redundant, should already happen in prepare
                 expt.xvardims = [len(xvar.values) for xvar in expt.scan_xvars]
                 expt.N_xvars = len(expt.xvardims)
-                expt._unshuffle_struct(expt)
+
+                expt._unshuffle_struct(expt) # this usually does nothing
                 f['data']['images'][...] = expt.unscramble_images()
                 f['data']['image_timestamps'][...] = expt._unscramble_timestamps()
                 expt._unshuffle_struct(expt.params)
+
+            self._save_data_vault(f,expt)
+            self._save_scope_data(f,expt)
 
             del f['params']
             params_dset = f.create_group('params')
             self._class_attr_to_dataset(params_dset,expt.params)
 
-            if expt_filepath:
-                with open(expt_filepath) as expt_file:
-                    expt_text = expt_file.read()
-                f.attrs["expt_file"] = expt_text
-            else:
-                f.attrs["expt_file"] = ""
-
-            if self._expt_params_path:
-                with open(self._expt_params_path) as params_file:
-                    params_file = params_file.read()
-                f.attrs["params_file"] = params_file
-            
-            if self._cooling_path:
-                with open(self._cooling_path) as cooling_file:
-                    cooling_file = cooling_file.read()
-                f.attrs["cooling_file"] = cooling_file
-
-            with open(self._imaging_path) as imaging_file:
-                imaging_file = imaging_file.read()
-            f.attrs["imaging_file"] = imaging_file
+            self._save_expt_files_text()
 
             f.close()
             print("Parameters saved, data closed.")
@@ -215,6 +182,74 @@ class DataSaver():
 
         return fpath
         
+    def _save_data_vault(self,
+                         h5File:h5py.File,
+                         expt):
+        f = h5File
+        for key in expt.data.keys:
+            this_data_container = vars(expt.data)[key]
+            if this_data_container._external_data_bool:
+                # overwrite with data from hdf5 in case populated by a process outside expt
+                this_data = f['data'][key][...]
+            else:
+                # otherwise, take the data that was stuck into the array during the expt
+                this_data = this_data_container.array
+            if expt.sort_idx:
+                # unshuffle if shuffled
+                ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
+                expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+            f['data'][key][...] = this_data
+
+    def _save_scope_data(self,
+                         h5File:h5py.File,
+                         expt):
+        f = h5File
+        if expt.scope_data._scope_trace_taken:
+            scope_data = f['data'].create_group('scope_data')
+            for scope in expt.scope_data.scopes:
+                data = scope.reshape_data()
+                # data comes out as shape (n0,...,nN,Nch,2,Npts)
+                # ni = values for ith xvar
+                # Nch = # scope channels the user captured from
+                # 2 = axis for picking time or voltage axis
+                # Npts = points per scan
+                if expt.sort_idx:
+                    data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
+                this_scope_data = scope_data.create_group(scope.label)
+                # time/voltage axis always -2, take the first one for each capture
+                # only take one time axis for all the channels on a given shot
+                # resulting shape: (n0,...,nN,Npts)
+                t = np.take(np.take(data,0,axis=-2),0,axis=-2)
+                # take the voltage values
+                # resulting shape: (n0,...,nN,Nch,Npts)
+                v = np.take(data,1,-2)
+                this_scope_data.create_dataset('t',data=t)
+                this_scope_data.create_dataset('v',data=v)
+
+    def _save_expt_files_text(self,
+                              expt_filepath,
+                              h5File:h5py.File):
+        f = h5File
+        if expt_filepath:
+                with open(expt_filepath) as expt_file:
+                    expt_text = expt_file.read()
+                f.attrs["expt_file"] = expt_text
+        else:
+            f.attrs["expt_file"] = ""
+
+        if self._expt_params_path:
+            with open(self._expt_params_path) as params_file:
+                params_file = params_file.read()
+            f.attrs["params_file"] = params_file
+        
+        if self._cooling_path:
+            with open(self._cooling_path) as cooling_file:
+                cooling_file = cooling_file.read()
+            f.attrs["cooling_file"] = cooling_file
+
+        with open(self._imaging_path) as imaging_file:
+            imaging_file = imaging_file.read()
+        f.attrs["imaging_file"] = imaging_file
 
     def _class_attr_to_dataset(self,dset,obj):
         try:
