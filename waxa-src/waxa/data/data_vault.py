@@ -79,6 +79,39 @@ class DataVault():
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
                             external_data_bool=False) -> DataContainer:
+        """Returns a data container object. This should be assigned to an
+        attribute of the `DataVault` object, which will then write to the data
+        container the key used for the assignment during `finish_prepare` of
+        an experiment.
+
+        Example in `prepare`: for an experiment with DataVault object `self.data`:
+            self.data.my_data = self.data.add_data_container()
+
+        Example in `kexp.config.data_vault`: add to `__init__`
+            self.my_data = self.add_data_container()
+
+        Both cases will result in the data being saved to hdf5 and loaded in
+        atomdata with key 'my_data':
+            in hdf5: f['data']['my_data']
+            in atomdata: ad.data.my_data
+
+        Args:
+            per_shot_data_shape (tuple or array or int): Shape of the data per
+                shot. Defaults to (1,).
+            dtype (_type_, optional): Data type for each value in the data
+                array. Defaults to np.float64.
+            external_data_bool (bool, optional): Set to True if the data for
+                this container will be populated directly into the hdf5 data file by
+                a process external to the ARTIQ process. An example would be image
+                data being stuck into the hdf5 file by LiveOD. Setting to True
+                will cause the unshuffle code to load in the data from the hdf5
+                at the end of the experiment for unshuffling (instead of
+                overwriting the hdf5 contents with the placeholder arrays of
+                zeros.) Defaults to False.
+
+        Returns:
+            DataContainer: _description_
+        """        
         return DataContainer(per_shot_data_shape,
                             dtype,
                             external_data_bool,
@@ -97,6 +130,8 @@ class DataVault():
             if isinstance(dc,DataContainer):
                 dc.set_container_size()
 
+from waxa.dummy.expt import Expt as DummyExpt
+
 class DataSaver():
     def __init__(self,
                  data_dir="",
@@ -113,7 +148,7 @@ class DataSaver():
         self._imaging_path = os.path.join(expt_repo_src_directory,
                                           imaging_relative_filepath)
 
-    def save_data(self,expt,expt_filepath="",data_object=None):
+    def save_data(self,expt:DummyExpt,expt_filepath="",data_object=None):
 
         # from wax.base.sub.dealer import Dealer
         # expt: Dealer
@@ -160,16 +195,16 @@ class DataSaver():
             # self._update_run_id(expt.run_info)
             os.chdir(pwd)
 
-    def get_xvardims(self,expt):
+    def get_xvardims(self,expt:DummyExpt):
         return [len(xvar.values) for xvar in expt.scan_xvars]
     
-    def pad_sort_idx(self,expt):
+    def pad_sort_idx(self,expt:DummyExpt):
         maxN = np.max(expt.sort_N)
         for i in range(len(expt.sort_idx)):
             N_to_pad = maxN - len(expt.sort_idx[i])
             expt.sort_idx[i] = np.append(expt.sort_idx[i], [-1]*N_to_pad).astype(int)
 
-    def create_data_file(self,expt):
+    def create_data_file(self,expt:DummyExpt):
 
         pwd = os.getcwd()
 
@@ -221,10 +256,10 @@ class DataSaver():
         
     def _save_data_vault(self,
                          h5File:h5py.File,
-                         expt):
+                         expt:DummyExpt):
         f = h5File
         for key in expt.data.keys:
-            this_data_container = vars(expt.data)[key]
+            this_data_container:DataContainer = vars(expt.data)[key]
             if this_data_container._external_data_bool:
                 # overwrite with data from hdf5 in case populated by a process outside expt
                 this_data = f['data'][key][...]
@@ -239,7 +274,7 @@ class DataSaver():
 
     def _save_scope_data(self,
                          h5File:h5py.File,
-                         expt):
+                         expt:DummyExpt):
         f = h5File
         if expt.scope_data._scope_trace_taken:
             scope_data = f['data'].create_group('scope_data')
