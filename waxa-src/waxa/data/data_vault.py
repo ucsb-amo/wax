@@ -23,7 +23,7 @@ class DataContainer():
 
     def set_container_size(self):
         y = self.array
-        for d in self._expt.xvardims:
+        for d in np.flip(self._expt.xvardims):
             y = [y]*d
         self.array = np.asarray(y).squeeze()
 
