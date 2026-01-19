@@ -401,6 +401,9 @@ class atomdata():
 
     ### Averaging and transpose
 
+    def _storage_key(self,key):
+        return "_" + key + "_stored"
+
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
         """
         Averages the images along the axes specified in xvars_to_avg. Uses
@@ -432,17 +435,37 @@ class atomdata():
             self._store_param_keys = ['N_repeats',*self.xvarnames]
             store_values(self.params,self._store_param_keys)
 
-            avg_keys = ['od_raw']
+            self._store_data_keys = self.data.keys
+            store_values(self.data,self._store_data_keys)
+
+            if hasattr(self,'scope_data'):
+                for k in self.scope_data.keys():
+                    newkey = self._storage_key(k)
+                    self.scope_data[newkey] = deepcopy(self.scope_data[k])
+
+            def avg_attrs(struct,key_list):
+                for key in key_list:
+                    arr = vars(struct)[key]
+                    arr = self._avg_repeated_ndarray(arr, xvar_idx)
+                    vars(struct)[key] = arr
+
+            def avg_scope_dict():
+                if hasattr(self,'scope_data'):
+                    for k in self.scope_data.keys():
+                        sta:dict = self.scope_data[k]
+                        for ch in sta.keys():
+                            for ax in ['t','v']:
+                                x = self._avg_repeated_ndarray(vars(sta[ch])[ax])
+                                vars(self.scope_data[k][ch])[ax] = x
+
             for xvar_idx in xvars_to_avg:
-                for key in avg_keys:
-                    array = vars(self)[key]
-                    array = self._avg_repeated_ndarray( array, xvar_idx )
-                    vars(self)[key] = array
+                avg_attrs(self, ['od_raw'])
+                avg_attrs(self.data, self.data.keys)
+                avg_scope_dict()
                 # write in the unaveraged xvars
                 self.xvars[xvar_idx] = np.unique(self.xvars[xvar_idx])
                 vars(self.params)[self.xvarnames[xvar_idx]] = self.xvars[xvar_idx]
                 self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
-
             self.params.N_repeats = np.ones(len(self.xvars),dtype=int)
         
             if reanalyze:
@@ -472,10 +495,17 @@ class atomdata():
         if self._analysis_tags.averaged:
             def retrieve_values(struct,keylist):
                 for key in keylist:
-                    newkey = "_" + key + "_stored"
+                    newkey = self._storage_key(key)
                     vars(struct)[key] = vars(struct)[newkey]
+            def retrieve_scope_dict():
+                if hasattr('scope_data',self):
+                    for k in self.scope_data.keys():
+                        newkey = self._storage_key(k)
+                        self.scope_data[k] = self.scope_data[newkey]
             retrieve_values(self,self._store_keys)
             retrieve_values(self.params,self._store_param_keys)
+            retrieve_values(self.data,self._store_data_keys)
+            retrieve_scope_dict()
 
             self.analyze_ods()
             self._analysis_tags.averaged = False
