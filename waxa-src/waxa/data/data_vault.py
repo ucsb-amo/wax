@@ -16,16 +16,19 @@ class DataContainer():
 
     def put_data(self,value):
         value = np.asarray(value).astype(self._dtype)
-        if value.shape != self._per_shot_data_shape:
-            raise ValueError(f"Value is not correct shape for this data container (expected {self._per_shot_data_shape} but value is {value.shape})")
+        # if value.shape != self._per_shot_data_shape:
+        #     raise ValueError(f"Value is not correct shape for this data container (expected {self._per_shot_data_shape} but value is {value.shape})")
         idx = tuple([x.counter for x in self._expt.scan_xvars])
         self.array[idx] = value
 
     def set_container_size(self):
+        xvd = self._expt.xvardims
         y = self.array
-        for d in np.flip(self._expt.xvardims):
+        for d in np.flip(xvd):
             y = [y]*d
-        self.array = np.asarray(y).squeeze()
+        self.array = np.asarray(y)
+        if len(xvd) == 1:
+            self.array = self.array.squeeze()
 
 class DataVault():
     def __init__(self, expt=None):
