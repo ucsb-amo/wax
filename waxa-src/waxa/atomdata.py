@@ -562,17 +562,31 @@ class atomdata():
 
         # for things of an ndarraylike nature which have one axis per xvar, and
         # so should have the order of their axes switched.
-        ndarraylike_keys = ['img_atoms','img_light','img_dark']
-        for key in ndarraylike_keys:
-            attr = vars(self)[key]
+        def transpose_ndattr(attr):
+            ndim = np.ndim(attr)
             # figure out how many extra indices each has. add them to the new
             # axis index list without changing their order.
-            ndim = np.ndim(attr)
             dims_to_add = ndim - Nvars
             axes_idx_to_add = [Nvars+i for i in range(dims_to_add)]
             new_idx = np.concatenate( (new_xvar_idx, axes_idx_to_add) ).astype(int)
             attr = np.transpose(attr,new_idx)
-            vars(self)[key] = attr
+            return attr
+
+        def reorder_ndarraylike(struct,keylist):
+            for key in keylist:
+                attr = vars(struct)[key]
+                vars(struct)[key] = transpose_ndattr(attr)
+
+        def transpose_scopedata():
+            if hasattr(self, 'scope_data'):
+                for k in self.scope_data.keys():
+                    for ch in self.scope_data[k]:
+                        reorder_ndarraylike(self.scope_data[k][ch],['t','v'])
+
+        ndarraylike_keys = ['img_atoms','img_light','img_dark']
+        reorder_ndarraylike(self,ndarraylike_keys)
+        reorder_ndarraylike(self.data,self.data.keys)
+        transpose_scopedata()
 
         self._dealer = self._init_dealer()
 
