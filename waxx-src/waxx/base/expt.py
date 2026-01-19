@@ -52,7 +52,7 @@ class Expt(Dealer, Scanner, Scribe):
 
         self._setup_awg = False
 
-        self.data = DataVault()
+        self.data = DataVault(expt=self)
         self.ds = DataSaver()
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
@@ -103,7 +103,7 @@ class Expt(Dealer, Scanner, Scribe):
         self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
         self.scope_data.xvardims = self.xvardims
 
-        self.data.set_container_sizes(xvardims=self.xvardims)
+        self.data.set_container_sizes()
 
         if self.setup_camera:
             self.data_filepath = self.ds.create_data_file(self)
