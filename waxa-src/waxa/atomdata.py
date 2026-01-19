@@ -534,8 +534,8 @@ class atomdata():
 
         if new_xvar_idx == [] or new_xvar_idx == True:
             if Nvars == 1:
-                print('There is only one variable -- no dimensions to permute.')
-                pass
+                raise ValueError('There is only one variable -- no dimensions to permute.')
+                
             elif Nvars == 2:
                 new_xvar_idx = [1,0] # by default, flip for just two vars
             else:
@@ -580,7 +580,8 @@ class atomdata():
 
         def transpose_scopedata():
             if hasattr(self, 'scope_data'):
-                for k in self.scope_data.keys():
+                key_list = list(self.scope_data.keys())
+                for k in key_list:
                     for ch in self.scope_data[k]:
                         reorder_ndarraylike(self.scope_data[k][ch],['t','v'])
 
