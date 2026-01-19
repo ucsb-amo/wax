@@ -651,15 +651,19 @@ class atomdata():
         return xvars
     
     ## Unshuffling
-    
+
+    def _shuff(self, reshuffle_bool):
+        self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self, reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self.params, reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_datavault(self.data, reshuffle=reshuffle_bool)
+        if hasattr(self,'scope_data'):
+            self._dealer._unshuffle_scopedata_dict(self.scope_data)
+        self.xvars = self._unpack_xvars()
+
     def reshuffle(self):
         if self._analysis_tags.xvars_shuffled == False:
-            self.images = self._dealer.unscramble_images(reshuffle=True)
-            self._dealer._unshuffle_struct(self, reshuffle=True)
-            self._dealer._unshuffle_struct(self.params, reshuffle=True)
-            for k in self.data.keys:
-                 vars(self.data)[k].array = self._dealer._unshuffle_ndarray(vars(self.data)[k].array)
-            self.xvars = self._unpack_xvars()
+            self._shuff(reshuffle_bool=True)
             self._sort_images()
             self.analyze()
             self._analysis_tags.xvars_shuffled = True
@@ -668,12 +672,7 @@ class atomdata():
 
     def unshuffle(self,reanalyze=True):
         if self._analysis_tags.xvars_shuffled == True:
-            self.images = self._dealer.unscramble_images(reshuffle=False)
-            self._dealer._unshuffle_struct(self, reshuffle=False)
-            self._dealer._unshuffle_struct(self.params, reshuffle=False)
-            for k in self.data.keys:
-                 vars(self.data)[k].array = self._dealer._unshuffle_ndarray(vars(self.data)[k].array)
-            self.xvars = self._unpack_xvars()
+            self._shuff(reshuffle_bool=False)
             if reanalyze:
                 self._sort_images()
                 self.analyze()

@@ -1,5 +1,6 @@
 import numpy as np
 from waxa.base.xvar import xvar
+from waxa.data.data_vault import DataVault, DataContainer
 
 class Dealer():
     def __init__(self):
@@ -12,6 +13,8 @@ class Dealer():
         self.N_xvars = 0
         self.images = np.array([])
         self.image_timestamps = np.array([])
+
+        self.data = DataVault()
 
         from waxa.data.run_info import RunInfo
         self.run_info = RunInfo()
@@ -207,7 +210,8 @@ class Dealer():
                                   *ndarray.shape[2:])
         return ndarray
 
-    def _unshuffle_struct(self,struct,
+    def _unshuffle_struct(self,
+                          struct,
                           reshuffle=False):
 
         # only unshuffle if list has been shuffled
@@ -245,6 +249,35 @@ class Dealer():
                         unshuf_idx = shuf_idx
                     var = var.take(unshuf_idx,dim)
         return var
+    
+    def _unshuffle_datavault(self,
+                             reshuffle=False,
+                             atomdata_bool=True):
+        for key in self.data.keys:
+            dc = vars(self.data)[key]
+            if not atomdata_bool:
+                arr = dc.array
+            exclude_dims = np.ndim(arr) - len(self.scan_xvars)
+            arr = self._unshuffle_ndarray(arr,
+                                          exclude_dims=exclude_dims,
+                                          reshuffle=reshuffle)
+            if atomdata_bool:
+                vars(self.data)[key] = arr
+            else:
+                vars(self.data)[key].array = arr
+
+    def _unshuffle_scopedata_dict(self,
+                                  scope_data,
+                                  reshuffle=False):
+            for k in scope_data.keys():
+                for ch in scope_data[k].keys():
+                    for s in ['t','v']:
+                        y = vars(scope_data[k][ch])[s]
+                        exclude_dims = np.ndim(y) - len(self.scan_xvars)
+                        y = self._unshuffle_ndarray(y,
+                                                    exclude_dims=exclude_dims,
+                                                    reshuffle=reshuffle)
+                        vars(scope_data[k][ch])[s] = y
 
     def _dims_to_sort(self,var,exclude_dims=0):
         """For a given ndarray (var), determine which axes should be unshuffled.
