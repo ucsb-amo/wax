@@ -4,9 +4,10 @@ import h5py
 
 from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
 
+# __DEFAULT_KEY = "no_one_will_ever_use_this_key000111"
 class DataContainer():
-    def __init__(self, key, per_shot_data_shape, dtype, external_data_bool, expt):
-        self.key = key
+    def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt):
+        self.key = ""
         self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
         self._dtype = dtype
         self._external_data_bool = external_data_bool
@@ -31,22 +32,27 @@ class DataContainer():
             self.array = self.array.squeeze()
 
 class DataVault():
+    
     def __init__(self, expt=None):
         self.keys = []
         self._expt = expt
 
     def add_data_container(self,
-                            key:str,
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
                             external_data_bool=False):
-        
-        self.keys.append(key)
-        return DataContainer(key,
-                            per_shot_data_shape,
+        obj = DataContainer(per_shot_data_shape,
                             dtype,
                             external_data_bool,
                             self._expt)
+        return obj
+
+    def write_keys(self):
+        for k in self.__dict__.keys():
+            obj = vars(self)[k]
+            if isinstance(obj,DataContainer):
+                vars(self)[k].key = k
+                self.keys.append(k)
 
     def set_container_sizes(self):
         for key in self.keys:

@@ -104,6 +104,7 @@ class Expt(Dealer, Scanner, Scribe):
         self.scope_data.xvardims = self.xvardims
 
         self.data.set_container_sizes()
+        self.data.write_keys()
 
         if self.setup_camera:
             self.data_filepath = self.ds.create_data_file(self)
