@@ -212,6 +212,7 @@ class Dealer():
 
     def _unshuffle_struct(self,
                           struct,
+                          only_treat_first_Nvar_axes=False,
                           reshuffle=False):
 
         # only unshuffle if list has been shuffled
@@ -225,7 +226,11 @@ class Dealer():
             sort_ks = [k for k in ks if k not in protected_keys]
             for k in sort_ks:
                 var = vars(struct)[k]
+                if only_treat_first_Nvar_axes:
+                    exclude_dims = np.ndim(var) - len(self.scan_xvars)
+                else: exclude_dims = 0
                 var = self._unshuffle_ndarray(var,
+                                              exclude_dims=exclude_dims,
                                               reshuffle=reshuffle)
                 vars(struct)[k] = var
     
@@ -249,22 +254,6 @@ class Dealer():
                         unshuf_idx = shuf_idx
                     var = var.take(unshuf_idx,dim)
         return var
-    
-    def _unshuffle_datavault(self,
-                             reshuffle=False,
-                             atomdata_bool=True):
-        for key in self.data.keys:
-            dc = vars(self.data)[key]
-            if not atomdata_bool:
-                arr = dc.array
-            exclude_dims = np.ndim(arr) - len(self.scan_xvars)
-            arr = self._unshuffle_ndarray(arr,
-                                          exclude_dims=exclude_dims,
-                                          reshuffle=reshuffle)
-            if atomdata_bool:
-                vars(self.data)[key] = arr
-            else:
-                vars(self.data)[key].array = arr
 
     def _unshuffle_scopedata_dict(self,
                                   scope_data,
