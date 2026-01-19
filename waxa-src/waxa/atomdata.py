@@ -439,7 +439,8 @@ class atomdata():
             store_values(self.data,self._store_data_keys)
 
             if hasattr(self,'scope_data'):
-                for k in self.scope_data.keys():
+                self._store_scope_keys = list(self.scope_data.keys())
+                for k in self._store_scope_keys:
                     newkey = self._storage_key(k)
                     self.scope_data[newkey] = deepcopy(self.scope_data[k])
 
@@ -451,11 +452,11 @@ class atomdata():
 
             def avg_scope_dict():
                 if hasattr(self,'scope_data'):
-                    for k in self.scope_data.keys():
+                    for k in self._store_scope_keys:
                         sta:dict = self.scope_data[k]
                         for ch in sta.keys():
                             for ax in ['t','v']:
-                                x = self._avg_repeated_ndarray(vars(sta[ch])[ax])
+                                x = self._avg_repeated_ndarray(vars(sta[ch])[ax], xvar_idx)
                                 vars(self.scope_data[k][ch])[ax] = x
 
             for xvar_idx in xvars_to_avg:
@@ -498,8 +499,8 @@ class atomdata():
                     newkey = self._storage_key(key)
                     vars(struct)[key] = vars(struct)[newkey]
             def retrieve_scope_dict():
-                if hasattr('scope_data',self):
-                    for k in self.scope_data.keys():
+                if hasattr(self,'scope_data'):
+                    for k in self._store_scope_keys:
                         newkey = self._storage_key(k)
                         self.scope_data[k] = self.scope_data[newkey]
             retrieve_values(self,self._store_keys)
@@ -753,7 +754,7 @@ class atomdata():
                     self.keys = []
             self.data = DataVault()
             for k in f['data'].keys():
-                if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx']:
+                if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data']:
                     data_k = f['data'][k][()]
                     data_k: np.ndarray
                     vars(self.data)[k] = data_k
