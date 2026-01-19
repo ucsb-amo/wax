@@ -426,7 +426,7 @@ class atomdata():
                 for key in keylist:
                     array = vars(struct)[key]
                     # save the old information
-                    newkey = "_" + key + "_stored"
+                    newkey = self._storage_key(key)
                     vars(struct)[newkey] = deepcopy(array)
 
             self._store_keys = ['xvars','xvardims','od_raw']
