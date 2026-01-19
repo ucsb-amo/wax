@@ -16,20 +16,58 @@ class DataContainer():
         self.array = np.zeros(per_shot_data_shape,dtype=dtype)
 
     def put_data(self,value):
-        value = np.asarray(value).astype(self._dtype)
-        # if value.shape != self._per_shot_data_shape:
-        #     raise ValueError(f"Value is not correct shape for this data container (expected {self._per_shot_data_shape} but value is {value.shape})")
-        idx = tuple([x.counter for x in self._expt.scan_xvars])
-        self.array[idx] = value
+        """Insert data into the array for the current shot.
+
+        Args:
+            value (_type_): _description_
+        """        
+        try:
+            value = np.asarray(value).astype(self._dtype)
+            idx = tuple([x.counter for x in self._expt.scan_xvars])
+            self.array[idx] = value
+        except Exception as e:
+            if value.shape != self._per_shot_data_shape:
+                print(f"Value is not correct shape for data container '{self.key}':\n"+
+                f"  expected shape {self._per_shot_data_shape} but value has shape {value.shape}. Skipping.")
+            else:
+                print(f"An error occurred with 'put_data' for data container '{self.key}':")
+                print(e)
 
     def set_container_size(self):
+        """Takes the per-shot data array and patterns it to the appropriate shape.
+        For xvardims = [n0,...,nN] and per-shot data of shape (p0,...,pM) (arb
+        dimension), data array takes shape (n0,...,nN,p0,...,pM).
+        """        
         xvd = self._expt.xvardims
         y = self.array
         for d in np.flip(xvd):
             y = [y]*d
         self.array = np.asarray(y)
-        if len(xvd) == 1:
-            self.array = self.array.squeeze()
+        # squeeze the data shape axes if they have length == 1
+        self.squeeze_axes(xvd)
+
+    def squeeze_axes(self, xvardims):
+        """Identifies if the per-shot data has any axes with dimension 1. If so,
+        squeezes them to avoid unnecessary indexing.
+
+        Example: per-shot data is a single float (not a list of floats), with a
+        2D scan with xvardims = [4,3]. set_container_size produces a data array
+        of shape (4,3,1), but this is annoying -- to get the value corresponding
+        to the (i,j)th shot, you'd need to do array[i,j,0]. By squeezing out the
+        axis of size 1, we can index the (i,j)th value as array[i,j]. 
+
+        Args:
+            xvardims (list): The xvardims for the experiment.
+        """        
+        n_axes_to_squeeze = self.array.ndim - len(xvardims) # how many axes are for the per-shot data
+        sh_axes_to_squeeze = np.asarray(self.array.shape[-n_axes_to_squeeze:]) # their shape
+        squeeze_mask = sh_axes_to_squeeze == 1 # check which dims have size == 1
+        # make a mask to index these axes starting from the end (-1,-2,...),
+        # since xvar axes come first
+        ax_idx_to_squeeze = -(np.arange(0,n_axes_to_squeeze,dtype=int) + 1)[squeeze_mask]
+        # do the squeeze (convert axis index list to tuple to make it work with np.ndarray.squeeze)
+        self.array = self.array.squeeze(axis=tuple(ax_idx_to_squeeze))
+        self._per_shot_data_shape = self.array.shape[len(xvardims):]
 
 class DataVault():
     
@@ -41,11 +79,10 @@ class DataVault():
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
                             external_data_bool=False) -> DataContainer:
-        obj = DataContainer(per_shot_data_shape,
+        return DataContainer(per_shot_data_shape,
                             dtype,
                             external_data_bool,
                             self._expt)
-        return obj
 
     def write_keys(self):
         for k in self.__dict__.keys():
