@@ -40,7 +40,7 @@ class DataVault():
     def add_data_container(self,
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
-                            external_data_bool=False):
+                            external_data_bool=False) -> DataContainer:
         obj = DataContainer(per_shot_data_shape,
                             dtype,
                             external_data_bool,
