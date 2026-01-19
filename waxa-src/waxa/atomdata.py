@@ -384,6 +384,12 @@ class atomdata():
                 'img_timestamp_atoms','img_timestamp_light','img_timestamp_dark']
         for k in nd_keys:
             vars(ad)[k] = slice_ndarray(vars(ad)[k])
+        for k in self.data.keys:
+            vars(self.data)[k] = slice_ndarray(vars(self.data)[k])
+        if hasattr(self,'scope_data'):
+            for k in self.scope_data.keys():
+                for ch in self.scope_data[k].keys():
+                    self.scope_data[k][ch] = slice_ndarray(self.scope_data[k][ch])
 
         ad.params.N_img = np.prod(ad.xvardims)
         ad.params.N_shots = int(ad.params.N_shots / sliced_xvardim)
@@ -394,6 +400,9 @@ class atomdata():
         return ad
 
     ### Averaging and transpose
+
+    def _storage_key(self,key):
+        return "_" + key + "_stored"
 
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
         """
@@ -417,7 +426,7 @@ class atomdata():
                 for key in keylist:
                     array = vars(struct)[key]
                     # save the old information
-                    newkey = "_" + key + "_stored"
+                    newkey = self._storage_key(key)
                     vars(struct)[newkey] = deepcopy(array)
 
             self._store_keys = ['xvars','xvardims','od_raw']
@@ -426,17 +435,38 @@ class atomdata():
             self._store_param_keys = ['N_repeats',*self.xvarnames]
             store_values(self.params,self._store_param_keys)
 
-            avg_keys = ['od_raw']
+            self._store_data_keys = self.data.keys
+            store_values(self.data,self._store_data_keys)
+
+            if hasattr(self,'scope_data'):
+                self._store_scope_keys = list(self.scope_data.keys())
+                for k in self._store_scope_keys:
+                    newkey = self._storage_key(k)
+                    self.scope_data[newkey] = deepcopy(self.scope_data[k])
+
+            def avg_attrs(struct,key_list):
+                for key in key_list:
+                    arr = vars(struct)[key]
+                    arr = self._avg_repeated_ndarray(arr, xvar_idx)
+                    vars(struct)[key] = arr
+
+            def avg_scope_dict():
+                if hasattr(self,'scope_data'):
+                    for k in self._store_scope_keys:
+                        sta:dict = self.scope_data[k]
+                        for ch in sta.keys():
+                            for ax in ['t','v']:
+                                x = self._avg_repeated_ndarray(vars(sta[ch])[ax], xvar_idx)
+                                vars(self.scope_data[k][ch])[ax] = x
+
             for xvar_idx in xvars_to_avg:
-                for key in avg_keys:
-                    array = vars(self)[key]
-                    array = self._avg_repeated_ndarray( array, xvar_idx )
-                    vars(self)[key] = array
+                avg_attrs(self, ['od_raw'])
+                avg_attrs(self.data, self.data.keys)
+                avg_scope_dict()
                 # write in the unaveraged xvars
                 self.xvars[xvar_idx] = np.unique(self.xvars[xvar_idx])
                 vars(self.params)[self.xvarnames[xvar_idx]] = self.xvars[xvar_idx]
                 self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
-
             self.params.N_repeats = np.ones(len(self.xvars),dtype=int)
         
             if reanalyze:
@@ -466,10 +496,17 @@ class atomdata():
         if self._analysis_tags.averaged:
             def retrieve_values(struct,keylist):
                 for key in keylist:
-                    newkey = "_" + key + "_stored"
+                    newkey = self._storage_key(key)
                     vars(struct)[key] = vars(struct)[newkey]
+            def retrieve_scope_dict():
+                if hasattr(self,'scope_data'):
+                    for k in self._store_scope_keys:
+                        newkey = self._storage_key(k)
+                        self.scope_data[k] = self.scope_data[newkey]
             retrieve_values(self,self._store_keys)
             retrieve_values(self.params,self._store_param_keys)
+            retrieve_values(self.data,self._store_data_keys)
+            retrieve_scope_dict()
 
             self.analyze_ods()
             self._analysis_tags.averaged = False
@@ -493,12 +530,15 @@ class atomdata():
             new_var_idx can also be set to True in the case of one or two xvars,
             for convenience.
         """        
+        if self._analysis_tags.averaged:
+            raise ValueError("This function was written poorly and doesn't work on repeat averaged data. You can revert_repeats, transpose, then re-average.")
+
         Nvars = len(self.xvars)
 
         if new_xvar_idx == [] or new_xvar_idx == True:
             if Nvars == 1:
-                print('There is only one variable -- no dimensions to permute.')
-                pass
+                raise ValueError('There is only one variable -- no dimensions to permute.')
+                
             elif Nvars == 2:
                 new_xvar_idx = [1,0] # by default, flip for just two vars
             else:
@@ -526,17 +566,32 @@ class atomdata():
 
         # for things of an ndarraylike nature which have one axis per xvar, and
         # so should have the order of their axes switched.
-        ndarraylike_keys = ['img_atoms','img_light','img_dark']
-        for key in ndarraylike_keys:
-            attr = vars(self)[key]
+        def transpose_ndattr(attr):
+            ndim = np.ndim(attr)
             # figure out how many extra indices each has. add them to the new
             # axis index list without changing their order.
-            ndim = np.ndim(attr)
             dims_to_add = ndim - Nvars
             axes_idx_to_add = [Nvars+i for i in range(dims_to_add)]
             new_idx = np.concatenate( (new_xvar_idx, axes_idx_to_add) ).astype(int)
             attr = np.transpose(attr,new_idx)
-            vars(self)[key] = attr
+            return attr
+
+        def reorder_ndarraylike(struct,keylist):
+            for key in keylist:
+                attr = vars(struct)[key]
+                vars(struct)[key] = transpose_ndattr(attr)
+
+        def transpose_scopedata():
+            if hasattr(self, 'scope_data'):
+                key_list = list(self.scope_data.keys())
+                for k in key_list:
+                    for ch in self.scope_data[k]:
+                        reorder_ndarraylike(self.scope_data[k][ch],['t','v'])
+
+        ndarraylike_keys = ['img_atoms','img_light','img_dark']
+        reorder_ndarraylike(self,ndarraylike_keys)
+        reorder_ndarraylike(self.data,self.data.keys)
+        transpose_scopedata()
 
         self._dealer = self._init_dealer()
 
@@ -601,13 +656,21 @@ class atomdata():
         return xvars
     
     ## Unshuffling
-    
+
+    def _shuff(self, reshuffle_bool):
+        self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self, reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self.params, reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self.data,
+                                       only_treat_first_Nvar_axes=True,
+                                       reshuffle=reshuffle_bool)
+        if hasattr(self,'scope_data'):
+            self._dealer._unshuffle_scopedata_dict(self.scope_data)
+        self.xvars = self._unpack_xvars()
+
     def reshuffle(self):
         if self._analysis_tags.xvars_shuffled == False:
-            self.images = self._dealer.unscramble_images(reshuffle=True)
-            self._dealer._unshuffle_struct(self, reshuffle=True)
-            self._dealer._unshuffle_struct(self.params, reshuffle=True)
-            self.xvars = self._unpack_xvars()
+            self._shuff(reshuffle_bool=True)
             self._sort_images()
             self.analyze()
             self._analysis_tags.xvars_shuffled = True
@@ -616,10 +679,7 @@ class atomdata():
 
     def unshuffle(self,reanalyze=True):
         if self._analysis_tags.xvars_shuffled == True:
-            self.images = self._dealer.unscramble_images(reshuffle=False)
-            self._dealer._unshuffle_struct(self, reshuffle=False)
-            self._dealer._unshuffle_struct(self.params, reshuffle=False)
-            self.xvars = self._unpack_xvars()
+            self._shuff(reshuffle_bool=False)
             if reanalyze:
                 self._sort_images()
                 self.analyze()
@@ -692,6 +752,17 @@ class atomdata():
             self.image_timestamps = f['data']['image_timestamps'][()]
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
+
+            class DataVault():
+                def __init__(self):
+                    self.keys = []
+            self.data = DataVault()
+            for k in f['data'].keys():
+                if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data']:
+                    data_k = f['data'][k][()]
+                    data_k: np.ndarray
+                    vars(self.data)[k] = data_k
+                    self.data.keys.append(k)
             try:
                 experiment_text = f.attrs['expt_file']
                 params_text = f.attrs['params_file']

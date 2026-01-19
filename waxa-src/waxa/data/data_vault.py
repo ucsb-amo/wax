@@ -4,16 +4,151 @@ import h5py
 
 from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
 
-data_dir = os.getenv("data")
+# __DEFAULT_KEY = "no_one_will_ever_use_this_key000111"
+class DataContainer():
+    def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt):
+        self.key = ""
+        self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
+        self._dtype = dtype
+        self._external_data_bool = external_data_bool
+        self._expt = expt
 
-code_dir = os.getenv("code")
-params_path = os.path.join(code_dir,"k-exp","kexp","config","expt_params.py")
-cooling_path = os.path.join(code_dir,"k-exp","kexp","base","cooling.py")
-imaging_path = os.path.join(code_dir,"k-exp","kexp","base","image.py")
+        self.array = np.zeros(per_shot_data_shape,dtype=dtype)
+
+    def put_data(self,value):
+        """Insert data into the array for the current shot.
+
+        Args:
+            value (_type_): _description_
+        """        
+        try:
+            value = np.asarray(value).astype(self._dtype)
+            idx = tuple([x.counter for x in self._expt.scan_xvars])
+            self.array[idx] = value
+        except Exception as e:
+            if value.shape != self._per_shot_data_shape:
+                print(f"Value is not correct shape for data container '{self.key}':\n"+
+                f"  expected shape {self._per_shot_data_shape} but value has shape {value.shape}. Skipping.")
+            else:
+                print(f"An error occurred with 'put_data' for data container '{self.key}':")
+                print(e)
+
+    def set_container_size(self):
+        """Takes the per-shot data array and patterns it to the appropriate shape.
+        For xvardims = [n0,...,nN] and per-shot data of shape (p0,...,pM) (arb
+        dimension), data array takes shape (n0,...,nN,p0,...,pM).
+        """        
+        xvd = self._expt.xvardims
+        y = self.array
+        for d in np.flip(xvd):
+            y = [y]*d
+        self.array = np.asarray(y)
+        # squeeze the data shape axes if they have length == 1
+        self.squeeze_axes(xvd)
+
+    def squeeze_axes(self, xvardims):
+        """Identifies if the per-shot data has any axes with dimension 1. If so,
+        squeezes them to avoid unnecessary indexing.
+
+        Example: per-shot data is a single float (not a list of floats), with a
+        2D scan with xvardims = [4,3]. set_container_size produces a data array
+        of shape (4,3,1), but this is annoying -- to get the value corresponding
+        to the (i,j)th shot, you'd need to do array[i,j,0]. By squeezing out the
+        axis of size 1, we can index the (i,j)th value as array[i,j]. 
+
+        Args:
+            xvardims (list): The xvardims for the experiment.
+        """        
+        n_axes_to_squeeze = self.array.ndim - len(xvardims) # how many axes are for the per-shot data
+        sh_axes_to_squeeze = np.asarray(self.array.shape[-n_axes_to_squeeze:]) # their shape
+        squeeze_mask = sh_axes_to_squeeze == 1 # check which dims have size == 1
+        # make a mask to index these axes starting from the end (-1,-2,...),
+        # since xvar axes come first
+        ax_idx_to_squeeze = -(np.arange(0,n_axes_to_squeeze,dtype=int) + 1)[squeeze_mask]
+        # do the squeeze (convert axis index list to tuple to make it work with np.ndarray.squeeze)
+        self.array = self.array.squeeze(axis=tuple(ax_idx_to_squeeze))
+        self._per_shot_data_shape = self.array.shape[len(xvardims):]
+
+class DataVault():
+    
+    def __init__(self, expt=None):
+        self.keys = []
+        self._expt = expt
+
+    def add_data_container(self,
+                            per_shot_data_shape=(1,),
+                            dtype=np.float64,
+                            external_data_bool=False) -> DataContainer:
+        """Returns a data container object. This should be assigned to an
+        attribute of the `DataVault` object, which will then write to the data
+        container the key used for the assignment during `finish_prepare` of
+        an experiment.
+
+        Example in `prepare`: for an experiment with DataVault object `self.data`:
+            self.data.my_data = self.data.add_data_container()
+
+        Example in `kexp.config.data_vault`: add to `__init__`
+            self.my_data = self.add_data_container()
+
+        Both cases will result in the data being saved to hdf5 and loaded in
+        atomdata with key 'my_data':
+            in hdf5: f['data']['my_data']
+            in atomdata: ad.data.my_data
+
+        Args:
+            per_shot_data_shape (tuple or array or int): Shape of the data per
+                shot. Defaults to (1,).
+            dtype (_type_, optional): Data type for each value in the data
+                array. Defaults to np.float64.
+            external_data_bool (bool, optional): Set to True if the data for
+                this container will be populated directly into the hdf5 data file by
+                a process external to the ARTIQ process. An example would be image
+                data being stuck into the hdf5 file by LiveOD. Setting to True
+                will cause the unshuffle code to load in the data from the hdf5
+                at the end of the experiment for unshuffling (instead of
+                overwriting the hdf5 contents with the placeholder arrays of
+                zeros.) Defaults to False.
+
+        Returns:
+            DataContainer: _description_
+        """        
+        return DataContainer(per_shot_data_shape,
+                            dtype,
+                            external_data_bool,
+                            self._expt)
+
+    def write_keys(self):
+        for k in self.__dict__.keys():
+            obj = vars(self)[k]
+            if isinstance(obj,DataContainer):
+                vars(self)[k].key = k
+                self.keys.append(k)
+
+    def set_container_sizes(self):
+        for key in self.keys:
+            dc = vars(self)[key]
+            if isinstance(dc,DataContainer):
+                dc.set_container_size()
+
+from waxa.dummy.expt import Expt as DummyExpt
 
 class DataSaver():
+    def __init__(self,
+                 data_dir="",
+                 expt_repo_src_directory="",
+                 expt_params_relative_filepath="",
+                 cooling_relative_filepath="",
+                 imaging_relative_filepath=""):
+        self._data_dir = data_dir
+        self._expt_repo_path = expt_repo_src_directory
+        self._expt_params_path = os.path.join(expt_repo_src_directory,
+                                              expt_params_relative_filepath)
+        self._cooling_path = os.path.join(expt_repo_src_directory,
+                                          cooling_relative_filepath)
+        self._imaging_path = os.path.join(expt_repo_src_directory,
+                                          imaging_relative_filepath)
 
-    def save_data(self,expt,expt_filepath="",data_object=None):
+    def save_data(self,expt:DummyExpt,expt_filepath="",data_object=None):
 
         # from wax.base.sub.dealer import Dealer
         # expt: Dealer
@@ -21,7 +156,7 @@ class DataSaver():
         if expt.setup_camera:
             
             pwd = os.getcwd()
-            os.chdir(data_dir)
+            os.chdir(self._data_dir)
             
             fpath, _ = self._data_path(expt.run_info)
 
@@ -29,72 +164,52 @@ class DataSaver():
                 f = data_object
             else:
                 f = h5py.File(fpath,'r+')
-
-            if expt.scope_data._scope_trace_taken:
-                scope_data = f['data'].create_group('scope_data')
-                for scope in expt.scope_data.scopes:
-                    data = scope.reshape_data()
-                    if expt.sort_idx:
-                        data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
-                    this_scope_data = scope_data.create_group(scope.label)
-                    t = np.take(np.take(data,0,-2),0,-2)
-                    v = np.take(data,1,-2)
-                    this_scope_data.create_dataset('t',data=t)
-                    this_scope_data.create_dataset('v',data=v)
+            
                     
             if expt.sort_idx:
+                # these were read in by liveOD, so we replace the expt empty arrays
                 expt.images = np.array(f['data']['images'])
                 expt.image_timestamps = np.array(f['data']['image_timestamps'])
+
+                # I think these two lines are redundant, should already happen in prepare
                 expt.xvardims = [len(xvar.values) for xvar in expt.scan_xvars]
                 expt.N_xvars = len(expt.xvardims)
-                expt._unshuffle_struct(expt)
+
+                expt._unshuffle_struct(expt) # this usually does nothing
+                # now replace the data from the h5 with the unscrambled data
                 f['data']['images'][...] = expt.unscramble_images()
                 f['data']['image_timestamps'][...] = expt._unscramble_timestamps()
                 expt._unshuffle_struct(expt.params)
+
+            self._save_data_vault(f,expt)
+            self._save_scope_data(f,expt)
 
             del f['params']
             params_dset = f.create_group('params')
             self._class_attr_to_dataset(params_dset,expt.params)
 
-            if expt_filepath:
-                with open(expt_filepath) as expt_file:
-                    expt_text = expt_file.read()
-                f.attrs["expt_file"] = expt_text
-            else:
-                f.attrs["expt_file"] = ""
-
-            with open(params_path) as params_file:
-                params_file = params_file.read()
-            f.attrs["params_file"] = params_file
-
-            with open(cooling_path) as cooling_file:
-                cooling_file = cooling_file.read()
-            f.attrs["cooling_file"] = cooling_file
-
-            with open(imaging_path) as imaging_file:
-                imaging_file = imaging_file.read()
-            f.attrs["imaging_file"] = imaging_file
+            self._save_expt_files_text(f,expt_filepath)
 
             f.close()
             print("Parameters saved, data closed.")
             # self._update_run_id(expt.run_info)
             os.chdir(pwd)
 
-    def get_xvardims(self,expt):
+    def get_xvardims(self,expt:DummyExpt):
         return [len(xvar.values) for xvar in expt.scan_xvars]
     
-    def pad_sort_idx(self,expt):
+    def pad_sort_idx(self,expt:DummyExpt):
         maxN = np.max(expt.sort_N)
         for i in range(len(expt.sort_idx)):
             N_to_pad = maxN - len(expt.sort_idx[i])
             expt.sort_idx[i] = np.append(expt.sort_idx[i], [-1]*N_to_pad).astype(int)
 
-    def create_data_file(self,expt):
+    def create_data_file(self,expt:DummyExpt):
 
         pwd = os.getcwd()
 
         check_for_mapped_data_dir()
-        os.chdir(data_dir)
+        os.chdir(self._data_dir)
 
         fpath, folder = self._data_path(expt.run_info)
 
@@ -113,6 +228,10 @@ class DataSaver():
         f.attrs['xvarnames'] = expt.xvarnames
         data.create_dataset('images',data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
+        for key in expt.data.keys:
+            this_data = vars(expt.data)[key].array
+            data.create_dataset(key, data=this_data)
+
         if expt.sort_idx:
             # pad with [-1]s to allow saving in hdf5 (avoid staggered array)
             self.pad_sort_idx(expt)
@@ -135,6 +254,88 @@ class DataSaver():
 
         return fpath
         
+    def _save_data_vault(self,
+                         h5File:h5py.File,
+                         expt:DummyExpt):
+        f = h5File
+        for key in expt.data.keys:
+            this_data_container:DataContainer = vars(expt.data)[key]
+            if this_data_container._external_data_bool:
+                # overwrite with data from hdf5 in case populated by a process outside expt
+                this_data = f['data'][key][...]
+            else:
+                # otherwise, take the data that was stuck into the array during the expt
+                this_data = this_data_container.array
+            if expt.sort_idx:
+                # unshuffle if shuffled
+                ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
+                expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+            f['data'][key][...] = this_data
+
+    def _save_scope_data(self,
+                         h5File:h5py.File,
+                         expt:DummyExpt):
+        f = h5File
+        if expt.scope_data._scope_trace_taken:
+            scope_data = f['data'].create_group('scope_data')
+            for scope in expt.scope_data.scopes:
+                data = scope.reshape_data()
+                # data comes out as shape (n0,...,nN,Nch,2,Npts)
+                # ni = values for ith xvar
+                # Nch = # scope channels the user captured from
+                # 2 = axis for picking time or voltage axis
+                # Npts = points per scan
+                if expt.sort_idx:
+                    data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
+                this_scope_data = scope_data.create_group(scope.label)
+                # time/voltage axis always -2, take the first one for each capture
+                # only take one time axis for all the channels on a given shot
+                # resulting shape: (n0,...,nN,Npts)
+                t = np.take(np.take(data,0,axis=-2),0,axis=-2)
+                # take the voltage values
+                # resulting shape: (n0,...,nN,Nch,Npts)
+                v = np.take(data,1,-2)
+                this_scope_data.create_dataset('t',data=t)
+                this_scope_data.create_dataset('v',data=v)
+
+    def _save_expt_files_text(self,
+                              h5File:h5py.File,
+                              expt_filepath):
+        
+        self._check_for_expt_files()
+
+        f = h5File
+        if expt_filepath:
+                with open(expt_filepath) as expt_file:
+                    expt_text = expt_file.read()
+                f.attrs["expt_file"] = expt_text
+        else:
+            f.attrs["expt_file"] = ""
+
+        if self._expt_params_path:
+            with open(self._expt_params_path) as params_file:
+                params_file = params_file.read()
+            f.attrs["params_file"] = params_file
+        
+        if self._cooling_path:
+            with open(self._cooling_path) as cooling_file:
+                cooling_file = cooling_file.read()
+            f.attrs["cooling_file"] = cooling_file
+
+        with open(self._imaging_path) as imaging_file:
+            imaging_file = imaging_file.read()
+        f.attrs["imaging_file"] = imaging_file
+
+    def _check_for_expt_files(self):
+        if not os.path.isfile(self._expt_params_path):
+            print(f'expt_params file not found at {self._expt_params_path}, saving contents skipped')
+            self._expt_params_path = ""
+        if not os.path.isfile(self._cooling_path):
+            print(f'cooling file not found at {self._cooling_path}, saving contents skipped')
+            self._cooling_path = ""
+        if not os.path.isfile(self._imaging_path):
+            print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
+            self._imaging_path = ""
 
     def _class_attr_to_dataset(self,dset,obj):
         try:
@@ -160,13 +361,13 @@ class DataSaver():
             print(e)
 
     def _data_path(self,run_info,lite=False):
-        this_data_dir = data_dir
+        this_data_dir = self._data_dir
         run_id_str = f"{str(run_info.run_id).zfill(7)}"
         expt_class = self._bytes_to_str(run_info.expt_class)
         datetime_str = self._bytes_to_str(run_info.run_datetime_str)
         if lite:
             run_id_str += "_lite"
-            this_data_dir = os.path.join(data_dir,"_lite")
+            this_data_dir = os.path.join(self._data_dir,"_lite")
         filename = run_id_str + "_" + datetime_str + "_" + expt_class + ".hdf5"
         filepath_folder = os.path.join(this_data_dir,
                                        self._bytes_to_str(run_info.run_date_str))

@@ -54,6 +54,8 @@ class Scanner():
             values (ndarray): Values to scan over. Can be n-dimensional, scan will step over first index.
         """
         this_xvar = xvar(key,values,position=len(self.scan_xvars))
+        if this_xvar.key in [x.key for x in self.scan_xvars]:
+            raise ValueError(f"xvar of key {this_xvar.key} is assigned more than once.")
         self.scan_xvars.append(this_xvar)
         self.xvarnames.append(this_xvar.key)
         # check if params has this xvar key already -- if not, add it

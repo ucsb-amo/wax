@@ -6,14 +6,14 @@ from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
 
 from waxa import ExptParams
-from waxa.data import DataSaver, RunInfo, counter, server_talk
+from waxa.data import DataSaver, RunInfo, counter, server_talk, DataVault
 from waxa.base import Dealer, Scribe
 from waxa.dummy.camera_params import CameraParams
 from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
 
-from waxx.base import Scanner
+from waxx.base.scanner import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
 
@@ -52,6 +52,7 @@ class Expt(Dealer, Scanner, Scribe):
 
         self._setup_awg = False
 
+        self.data = DataVault(expt=self)
         self.ds = DataSaver()
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
@@ -101,6 +102,9 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
         self.scope_data.xvardims = self.xvardims
+
+        self.data.write_keys()
+        self.data.set_container_sizes()
 
         if self.setup_camera:
             self.data_filepath = self.ds.create_data_file(self)
