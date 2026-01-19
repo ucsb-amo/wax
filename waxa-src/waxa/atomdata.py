@@ -656,7 +656,9 @@ class atomdata():
         self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self, reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self.params, reshuffle=reshuffle_bool)
-        self._dealer._unshuffle_datavault(self.data, reshuffle=reshuffle_bool)
+        self._dealer._unshuffle_struct(self.data,
+                                       only_treat_first_Nvar_axes=True,
+                                       reshuffle=reshuffle_bool)
         if hasattr(self,'scope_data'):
             self._dealer._unshuffle_scopedata_dict(self.scope_data)
         self.xvars = self._unpack_xvars()
