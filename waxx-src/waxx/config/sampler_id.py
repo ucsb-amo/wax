@@ -19,14 +19,14 @@ class sampler_frame():
 
     def setup(self, sampler_device:Sampler):
         self.sampler_device = sampler_device
-        self.samples = np.zeros(8,dtype=float)
+        self.data = np.zeros(8,dtype=float)
         self.gains = np.zeros(8,dtype=int)
 
     def cleanup(self):
         self._write_sampler_keys()
 
     def sampler_assign(self,ch,gain=0) -> Sampler_CH:
-        this_ch = Sampler_CH(ch,gain=gain,sample_array=self.samples)
+        this_ch = Sampler_CH(ch,gain=gain,sample_array=self.data)
         this_ch.sampler_device = self.sampler_device
         self.gains[ch] = gain
         return this_ch
@@ -40,7 +40,7 @@ class sampler_frame():
                 
     @kernel
     def sample(self):
-        self.sampler_device.sample(self.samples)
+        self.sampler_device.sample(self.data)
     
     @kernel
     def init(self):
