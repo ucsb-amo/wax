@@ -47,6 +47,9 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
 
         self._internal_output_queue = Queue()
 
+    def set_EM_gain_mode(self,mode):
+        lib.SetEMGainMode(mode)
+
     def Close(self):
         self.setup_shutter(mode="closed")
         self.close()
