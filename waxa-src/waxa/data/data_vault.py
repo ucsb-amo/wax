@@ -14,6 +14,7 @@ class DataContainer():
         self._expt = expt
 
         self.array = np.zeros(per_shot_data_shape,dtype=dtype)
+        self.temp_array = np.zeros(per_shot_data_shape,dtype=dtype)
 
     def put_data(self,value):
         """Insert data into the array for the current shot.
