@@ -29,7 +29,8 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         # run startup setting methods
         # self.activate_cameralink()
         # self.enable_frame_transfer_mode(enable=True)
-        self.set_emccd_advanced()
+        # self.set_emccd_advanced()
+        self.set_EM_gain_mode(3)
         self.set_EMCCD_gain(gain=gain)
         self.set_exposure(ExposureTime)
         self.set_trigger_mode("ext")
@@ -275,3 +276,6 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
             mode (int): 0 – High Speed. 1 – Low Latency. Defaults to 1.
         '''        
         lib.SetIsolatedCropModeType(mode)
+
+    def set_EM_gain_mode(self, mode:int=3):
+        lib.SetEMGainMode(mode)
