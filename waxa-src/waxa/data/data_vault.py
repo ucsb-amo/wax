@@ -252,8 +252,6 @@ class DataSaver():
         f.close()
 
         os.chdir(pwd)
-
-        return fpath
         
     def _save_data_vault(self,
                          h5File:h5py.File,

@@ -2,6 +2,7 @@ from artiq.experiment import *
 import numpy as np
 
 from waxa.base import xvar
+from waxx.util.live_od import CameraClient
 
 from artiq.language.core import kernel_from_string, now_mu
 from artiq.experiment import delay
@@ -19,6 +20,8 @@ class Scanner():
 
         from waxx.config.expt_params import ExptParams
         self.params = ExptParams()
+
+        self.live_od_client = CameraClient(None, None)
 
         self.xvarnames = []
         self.scan_xvars = []
@@ -141,16 +144,14 @@ class Scanner():
             
             self.core.wait_until_mu(now_mu())
             self.update_params_from_xvars()
-            delay(RPC_DELAY)
 
-            self.core.wait_until_mu(now_mu())
             self.write_host_params_to_kernel()
-            delay(RPC_DELAY)
+            
+            self.live_od_client.send_xvars(self.scan_xvars)
             self.core.break_realtime()
 
             # overloaded in kexp.Base
             self.init_scan_kernel()
-
             self.core.break_realtime()
 
             # overloaded by user per experiment

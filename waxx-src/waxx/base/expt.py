@@ -17,6 +17,8 @@ from waxx.base.scanner import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
 
+from waxx.util.live_od.camera_client import CameraClient
+
 RPC_DELAY = 10.e-3
 
 class Expt(Dealer, Scanner, Scribe):
@@ -40,6 +42,8 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.camera_params = CameraParams()
 
+        self.live_od_client = CameraClient(None, None)
+
         self.params = ExptParams()
         self.p = self.params
 
@@ -54,6 +58,17 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.data = DataVault(expt=self)
         self.ds = DataSaver()
+
+    def send_new_run(self):
+        self.live_od_client.connect()
+        ready = self.live_od_client.send_new_run(camera_params=self.camera_params,
+                                            data_filepath=self.run_info.filepath,
+                                            save_data = self.run_info.save_data,
+                                            N_img = self.params.N_img,
+                                            N_shots = self.params.N_shots,
+                                            N_pwa_per_shot=self.p.N_pwa_per_shot,
+                                            imaging_type=self.run_info.imaging_type,
+                                            run_id=self.run_info.run_id)
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
         """
@@ -105,9 +120,6 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.data.write_keys()
         self.data.set_container_sizes()
-
-        if self.setup_camera:
-            self.data_filepath = self.ds.create_data_file(self)
 
         self.generate_assignment_kernels()
     

@@ -14,7 +14,7 @@ class Scribe():
     def __init__(self, data_filepath=""):
         self.ds = DataSaver()
         if data_filepath != "":
-            self.data_filepath = data_filepath
+            self.run_info.filepath = data_filepath
 
     def wait_for_data_available(self,openmode='r+',
                                 check_period=CHECK_PERIOD,
@@ -29,7 +29,7 @@ class Scribe():
             try:
                 if check_interrupt_method():
                     break
-                f = h5py.File(self.data_filepath,openmode)
+                f = h5py.File(self.run_info.filepath,openmode)
                 return f
             except Exception as e:
                 if "Unable to" in str(e) or "Invalid file name" in str(e) or "cannot access" in str(e):
@@ -101,7 +101,7 @@ class Scribe():
                 try:
                     with self.wait_for_data_available(check_period=REMOVE_DATA_POLL_INTERVAL) as f:
                         pass
-                    os.remove(self.data_filepath)
+                    os.remove(self.run_info.filepath)
                     print(msg)
                 except Exception as e:
                     if "Unable to" in str(e) or "Invalid file name" in str(e) or "cannot access" in str(e):
