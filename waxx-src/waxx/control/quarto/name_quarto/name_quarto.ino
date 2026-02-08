@@ -5,12 +5,13 @@ struct Cal {
     uint16_t cal_a;
     double cal_b;
     uint16_t cal_c;
-    char cal_d[16] = "imaging_pid"; // label the quarto here
+    char cal_d[16] = "phase-lock"; // label the quarto here
 };
 struct Cal cal1; // Properly declare the cal1 variable
 
 void setup() {
   Serial.begin(115200); // Initialize serial communication
+  qC.addCommand("ping",ping);
   
   cal1.cal_a = 56;//various numbers to test storage is working
   cal1.cal_b = 1.2345678;
@@ -18,5 +19,11 @@ void setup() {
 
   writeNVMpages(&cal1, sizeof(cal1), 500); //Store struct cal1 in NVM starting at page 500
   Serial.printf("Checking cal_a in NVM is: %u\n", readNVM(500*128));
+}
 
+void ping(qCommand& qC, Stream& S)
+{
+  struct Cal cal2;
+  readNVMblock(&cal2, sizeof(cal2), 0xFA00);  
+  Serial.println(cal2.cal_d); 
 }
