@@ -23,6 +23,8 @@ from PyQt6.QtCore import Qt, QTimer
 
 from waxx.util.live_od.camera_server import CameraServer
 from waxx.util.live_od.camera_nanny import CameraNanny
+from waxx.util.live_od.viewer_client import ViewerClient
+from waxx.util.live_od.gui.viewer_window import XVarDisplay
 from waxa.data.increment_run_id import RUN_ID_PATH
 
 
@@ -93,7 +95,6 @@ class CameraServerWindow(QWidget):
 
         # ---- Server instance ----
         self.camera_nanny = camera_nanny or CameraNanny()
-        print(self.camera_nanny)
         self.server = CameraServer(
             host=self._host,
             port=self._port,
@@ -111,23 +112,24 @@ class CameraServerWindow(QWidget):
         self.run_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self.run_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        self.xvar_display = XVarDisplay()
+
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setFont(QFont("Consolas", 9))
         self.log_box.setMaximumBlockCount(2000)
 
-        self.start_button = QPushButton("Start Server")
-        self.start_button.setStyleSheet(
+        self.toggle_server_button = QPushButton("Start Server")
+        self.toggle_server_button.setStyleSheet(
             "background-color: #ccffcc; font-size: 14px; font-weight: bold;"
         )
-        self.start_button.clicked.connect(self._start_server)
+        self.toggle_server_button.clicked.connect(self._toggle_server)
 
-        self.stop_button = QPushButton("Stop Server")
-        self.stop_button.setStyleSheet(
-            "background-color: #ffcccc; font-size: 14px; font-weight: bold;"
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setStyleSheet(
+            "background-color: #cc6666; font-size: 14px; font-weight: bold;"
         )
-        self.stop_button.clicked.connect(self._stop_server)
-        self.stop_button.setEnabled(False)
+        self.reset_button.clicked.connect(self._send_reset)
 
         # ---- Layout ----
         lights = QHBoxLayout()
@@ -136,13 +138,19 @@ class CameraServerWindow(QWidget):
         lights.addWidget(self.grab_light)
         lights.addWidget(self.viewer_light)
 
+        xvar_row = QHBoxLayout()
+        xvar_row.addWidget(self.run_label)
+        xvar_row.addStretch()
+        xvar_row.addWidget(self.xvar_display)
+        xvar_row.addStretch()
+
         button_row = QHBoxLayout()
-        button_row.addWidget(self.start_button)
-        button_row.addWidget(self.stop_button)
+        button_row.addWidget(self.toggle_server_button)
+        button_row.addWidget(self.reset_button)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.run_label)
         layout.addLayout(lights)
+        layout.addLayout(xvar_row)
         layout.addWidget(self.log_box, stretch=1)
         layout.addLayout(button_row)
         self.setLayout(layout)
@@ -154,6 +162,7 @@ class CameraServerWindow(QWidget):
         self._viewer_timer = QTimer(self)
         self._viewer_timer.timeout.connect(self._update_viewer_count)
         self._viewer_timer.timeout.connect(self._update_run_id_label)
+        self._viewer_timer.setSingleShot(False)
         self._viewer_timer.start(1000)
 
         self._server_thread = None
@@ -162,7 +171,7 @@ class CameraServerWindow(QWidget):
         self._active_run = False   # True while a run is in progress
 
         self._update_run_id_label()
-        self._start_server()
+        self._toggle_server()
 
     # ------------------------------------------------------------------
     #  Helpers
@@ -174,6 +183,7 @@ class CameraServerWindow(QWidget):
         self.server.run_started_signal.connect(self._on_run_started)
         self.server.run_completed_signal.connect(self._on_run_completed)
         self.server.image_grabbed_signal.connect(self._on_image_grabbed)
+        self.server.xvars_signal.connect(self._on_xvars)
 
     # ------------------------------------------------------------------
     #  Signal handlers
@@ -247,34 +257,55 @@ class CameraServerWindow(QWidget):
         except Exception:
             pass
 
+    def _on_xvars(self, xvars: dict):
+        """Update the xvar display when xvars are forwarded."""
+        self.xvar_display.update_xvars(xvars)
+
+    def _send_reset(self):
+        """Send a reset command to the camera server from the server window."""
+        self._on_log("Sending reset to camera server...")
+        try:
+            ViewerClient.send_reset(self._host, self._port)
+        except Exception as e:
+            self._on_log(f"Reset error: {e}")
+
     # ------------------------------------------------------------------
     #  Start / Stop
     # ------------------------------------------------------------------
 
-    def _start_server(self):
+    def _toggle_server(self):
+        """Toggle server state: start if stopped, stop if running."""
         if self._server_thread is not None and self._server_thread.is_alive():
-            return
-        # Re-create server so sockets are fresh after a stop
-        self.server = CameraServer(
-            host=self._host,
-            port=self._port,
-            camera_nanny=self.camera_nanny,
-        )
-        self._connect_server_signals()
+            # Server is running -> stop it
+            self.server.stop()
+            self.server_light.set_state("error")
+            self.toggle_server_button.setText("Start Server")
+            self.toggle_server_button.setStyleSheet(
+                "background-color: #ccffcc; font-size: 14px; font-weight: bold;"
+            )
+            self._on_log("Server stopped by user.")
+        else:
+            # Server is not running -> start it
+            # Re-create server so sockets are fresh after a stop
+            self.server = CameraServer(
+                host=self._host,
+                port=self._port,
+                camera_nanny=self.camera_nanny,
+            )
+            self._connect_server_signals()
 
-        self._server_thread = threading.Thread(target=self.server.run, daemon=True)
-        self._server_thread.start()
-        self.server_light.set_state("ok")
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self._on_log("Server started.")
-
-    def _stop_server(self):
-        self.server.stop()
-        self.server_light.set_state("error")
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self._on_log("Server stopped by user.")
+            self._server_thread = threading.Thread(target=self.server.run, daemon=True)
+            self._server_thread.start()
+            self.server_light.set_state("ok")
+            self.toggle_server_button.setText("Stop Server")
+            self.toggle_server_button.setStyleSheet(
+                "background-color: #ffcccc; font-size: 14px; font-weight: bold;"
+            )
+            self._on_log("Server started.")
+        
+        # Ensure timer is always running
+        if not self._viewer_timer.isActive():
+            self._viewer_timer.start(1000)
 
     def closeEvent(self, event):
         self.server.stop()

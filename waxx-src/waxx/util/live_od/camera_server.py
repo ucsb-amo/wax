@@ -61,6 +61,7 @@ class CameraServer(UdpServer):
     run_completed_signal = pyqtSignal()
     image_grabbed_signal = pyqtSignal(object, int)  # (np.ndarray, index)
     log_signal = pyqtSignal(str)  # human-readable status messages
+    xvars_signal = pyqtSignal(dict)  # forwarded xvar values
 
     def __init__(self, host, port, camera_nanny=None):
         super().__init__(host, port)
@@ -70,6 +71,7 @@ class CameraServer(UdpServer):
 
         # ---- state ----
         self._run_info = {}
+        self._run_start_info = None  # Store run_start info for late-connecting viewers
         self._camera = None
         self._camera_ready = False
         self._grab_active = False
@@ -134,18 +136,30 @@ class CameraServer(UdpServer):
 
     def _viewer_listener(self):
         """Accept viewer connections on ``self.viewer_port``."""
-        self._viewer_sock.bind((self.host, self.viewer_port))
-        self._viewer_sock.listen(10)
-        while self.running:
-            try:
-                conn, addr = self._viewer_sock.accept()
-                self._log(f"Viewer client connected: {addr}")
-                with self._viewer_lock:
-                    self._viewer_connections.append(conn)
-            except socket.error:
-                if self.running:
-                    continue
-                break
+        try:
+            self._viewer_sock.bind((self.host, self.viewer_port))
+            self._viewer_sock.listen(10)
+            self._log(f"Viewer listener started on {self.host}:{self.viewer_port}")
+            while self.running:
+                try:
+                    conn, addr = self._viewer_sock.accept()
+                    self._log(f"Viewer client connected: {addr}")
+                    with self._viewer_lock:
+                        self._viewer_connections.append(conn)
+                    
+                    # If a run is currently active, send the run_start info to the new viewer
+                    if self._run_start_info is not None:
+                        try:
+                            send_msg(conn, self._run_start_info)
+                            self._log(f"Sent run_start info to {addr}")
+                        except Exception as e:
+                            self._log(f"Error sending run_start info to {addr}: {e}")
+                except socket.error:
+                    if self.running:
+                        continue
+                    break
+        except Exception as e:
+            self._log(f"Viewer listener error: {e}")
 
     # ------------------------------------------------------------------
     #  Experiment command handler  (one persistent connection per run)
@@ -190,6 +204,30 @@ class CameraServer(UdpServer):
         finally:
             conn.close()
             self._log("Experiment client disconnected.")
+            # If grab loop is still active, terminate it and clean up
+            if self._grab_active:
+                import os
+                self._log("Terminating grab loop due to client disconnect.")
+                self._interrupted = True
+
+                # Close the HDF5 data file
+                with self._data_file_lock:
+                    if self._data_file is not None:
+                        try:
+                            self._data_file.close()
+                            self._log("Data file closed.")
+                        except Exception as e:
+                            self._log(f"Error closing data file: {e}")
+                    self._data_file = None
+
+                # Delete the data file from disk
+                if self._data_filepath:
+                    try:
+                        if os.path.exists(self._data_filepath):
+                            os.remove(self._data_filepath)
+                            self._log(f"Data file deleted: {self._data_filepath}")
+                    except Exception as e:
+                        self._log(f"Error deleting data file: {e}")
 
     # ---- command handlers --------------------------------------------------
 
@@ -238,7 +276,11 @@ class CameraServer(UdpServer):
                 "imaging_type": msg.get("imaging_type", False),
                 "run_id": run_id,
                 "save_data": save_data,
+                "pixel_size_m": getattr(camera_params, "pixel_size_m", 0.0),
+                "magnification": getattr(camera_params, "magnification", 1.0),
             }
+            # Store for late-connecting viewers
+            self._run_start_info = run_start_info
             self._broadcast_to_viewers(run_start_info)
             self.run_started_signal.emit(run_start_info)
 
@@ -267,11 +309,16 @@ class CameraServer(UdpServer):
         parts = ", ".join(f"{k}={v}" for k, v in xvars.items())
         self._log(f"xvars received: {parts}")
         self._broadcast_to_viewers({"cmd": "xvars", "xvars": xvars})
+        try:
+            self.xvars_signal.emit(xvars)
+        except RuntimeError:
+            pass
         return {"cmd": "ack"}
 
     def _handle_run_complete(self):
         """Experiment signalled run complete."""
         self._log("Experiment signalled run complete.")
+        self._run_start_info = None  # Clear run info since run is complete
         self.camera_status_signal.emit(-1)
         try:
             update_run_id()
@@ -290,6 +337,7 @@ class CameraServer(UdpServer):
 
         self._log("RESET requested — stopping grab loop.")
         self._interrupted = True
+        self._run_start_info = None  # Clear run info since run is being reset
 
         # Close the HDF5 data file
         with self._data_file_lock:
@@ -350,6 +398,8 @@ class CameraServer(UdpServer):
         save_data = self._run_info.get("save_data", True)
 
         self._data_filepath = data_filepath
+        self._save_data = save_data
+
         if save_data and data_filepath:
             try:
                 with self._data_file_lock:
@@ -357,6 +407,8 @@ class CameraServer(UdpServer):
                 self._log(f"Data file opened: {data_filepath}")
             except Exception as e:
                 self._log(f"Error opening data file: {e}")
+        elif not save_data:
+            self._log("save_data=False — images will be broadcast but NOT saved.")
 
         count = 0
         while count < N_img and not self._interrupted:
@@ -364,17 +416,18 @@ class CameraServer(UdpServer):
                 img, _, idx = self._image_queue.get(timeout=1.0)
                 img_t = time.time()
 
-                # Save to HDF5
-                with self._data_file_lock:
-                    if save_data and self._data_file is not None:
-                        try:
-                            self._data_file["data"]["images"][idx] = img
-                            self._data_file["data"]["image_timestamps"][idx] = img_t
-                            self._log(f"Image saved {idx + 1}/{N_img}")
-                        except Exception as e:
-                            self._log(f"Error saving image {idx + 1}: {e}")
+                # Save to HDF5 (only when save_data is True)
+                if save_data:
+                    with self._data_file_lock:
+                        if self._data_file is not None:
+                            try:
+                                self._data_file["data"]["images"][idx] = img
+                                self._data_file["data"]["image_timestamps"][idx] = img_t
+                                self._log(f"Image saved {idx + 1}/{N_img}")
+                            except Exception as e:
+                                self._log(f"Error saving image {idx + 1}: {e}")
 
-                # Broadcast to viewers
+                # Broadcast to viewers (always, regardless of save_data)
                 self._broadcast_to_viewers(
                     {"cmd": "image", "image": np.asarray(img), "index": idx}
                 )
@@ -394,6 +447,16 @@ class CameraServer(UdpServer):
                 except Exception:
                     pass
                 self._data_file = None
+
+        # If save_data was False, delete the data file from disk
+        if not save_data and data_filepath:
+            import os
+            try:
+                if os.path.exists(data_filepath):
+                    os.remove(data_filepath)
+                    self._log(f"save_data=False — data file deleted: {data_filepath}")
+            except Exception as e:
+                self._log(f"Error deleting unsaved data file: {e}")
 
         # Notify viewers
         if count >= N_img:

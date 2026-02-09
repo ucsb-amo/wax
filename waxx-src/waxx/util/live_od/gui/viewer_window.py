@@ -17,10 +17,11 @@ Usage::
 import sys
 import numpy as np
 from queue import Queue
+from types import SimpleNamespace
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame,
+    QPushButton, QLabel, QFrame, QGridLayout,
 )
 from PyQt6.QtGui import QFont, QGuiApplication, QIcon
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
@@ -32,6 +33,7 @@ from waxa import ROI
 from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.analyzer import Analyzer
 from waxx.util.live_od.gui.plotter import LiveODPlotter
+from waxx.util.live_od.gui.shot_plot_window import ShotPlotWindow
 
 
 class ConnectionIndicator(QWidget):
@@ -60,24 +62,86 @@ class ConnectionIndicator(QWidget):
         self._set_color(connected)
 
 
-class XVarDisplay(QWidget):
-    """Small panel that shows the current xvar names and values."""
+class XVarDisplay(QFrame):
+    """Prominent styled panel showing the current xvar names and values."""
 
     def __init__(self):
         super().__init__()
-        self._label = QLabel("xvars: –")
-        font = QFont()
-        font.setPointSize(10)
-        self._label.setFont(font)
-        self._label.setWordWrap(True)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "XVarDisplay {"
+            "  background-color: #1e1e2e;"
+            "  border: 2px solid #555;"
+            "  border-radius: 8px;"
+            "}"
+        )
+
+        self._header = QLabel("Scan Variables")
+        hfont = QFont()
+        hfont.setPointSize(10)
+        hfont.setBold(True)
+        self._header.setFont(hfont)
+        self._header.setStyleSheet("color: #aaa; border: none;")
+        self._header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._grid = QGridLayout()
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(12)
+        self._grid.setVerticalSpacing(2)
+        self._grid_widget = QWidget()
+        self._grid_widget.setLayout(self._grid)
+
+        self._placeholder = QLabel("–")
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pf = QFont(); pf.setPointSize(13)
+        self._placeholder.setFont(pf)
+        self._placeholder.setStyleSheet("color: #777; border: none;")
+
         layout = QVBoxLayout()
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(self._label)
+        layout.setContentsMargins(14, 6, 14, 8)
+        layout.addWidget(self._header)
+        layout.addWidget(self._placeholder)
+        layout.addWidget(self._grid_widget)
+        self._grid_widget.hide()
         self.setLayout(layout)
 
     def update_xvars(self, xvars: dict):
-        parts = [f"{k} = {v}" for k, v in xvars.items()]
-        self._label.setText("xvars: " + ", ".join(parts) if parts else "xvars: –")
+        # clear old grid entries
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not xvars:
+            self._placeholder.setText("–")
+            self._placeholder.show()
+            self._grid_widget.hide()
+            return
+
+        self._placeholder.hide()
+        self._grid_widget.show()
+
+        name_font = QFont(); name_font.setPointSize(11); name_font.setBold(True)
+        val_font = QFont(); val_font.setPointSize(14); val_font.setBold(True)
+
+        for row, (k, v) in enumerate(xvars.items()):
+            name_lbl = QLabel(f"{k}")
+            name_lbl.setFont(name_font)
+            name_lbl.setStyleSheet("color: #8888cc; border: none;")
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            eq_lbl = QLabel("=")
+            eq_lbl.setStyleSheet("color: #999; border: none;")
+            eq_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            val_lbl = QLabel(f"{v}")
+            val_lbl.setFont(val_font)
+            val_lbl.setStyleSheet("color: #e0e0e0; border: none;")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+            self._grid.addWidget(name_lbl, row, 0)
+            self._grid.addWidget(eq_lbl, row, 1)
+            self._grid.addWidget(val_lbl, row, 2)
 
 
 class LiveODClientWindow(QWidget):
@@ -125,10 +189,23 @@ class LiveODClientWindow(QWidget):
         )
         self.reset_button.clicked.connect(self._send_reset)
 
+        self.new_plot_button = QPushButton("📊 New Plot")
+        self.new_plot_button.setMinimumHeight(40)
+        self.new_plot_button.setStyleSheet(
+            "background-color: #2e7d32; font-size: 16px; color: #f2f2f2; font-weight: bold;"
+            " border-radius: 6px;"
+        )
+        self.new_plot_button.clicked.connect(self._open_new_plot)
+
         self.run_id_label = QLabel("Run ID: –")
         self.run_id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         font = QFont(); font.setPointSize(12); font.setBold(True)
         self.run_id_label.setFont(font)
+
+        # ---- pop-out plot windows ----
+        self._plot_windows: list[ShotPlotWindow] = []
+        self._plot_counter = 0
+        self._xvar_names: list[str] = []
 
         # ---- state ----
         self._img_count = 0
@@ -142,7 +219,7 @@ class LiveODClientWindow(QWidget):
         self.viewer_client.connection_status.connect(self.conn_indicator.set_connected)
         self.viewer_client.run_started.connect(self._on_run_started)
         self.viewer_client.image_received.connect(self._on_image_received)
-        self.viewer_client.xvars_received.connect(self.xvar_display.update_xvars)
+        self.viewer_client.xvars_received.connect(self._on_xvars_received)
         self.viewer_client.run_completed.connect(self._on_run_completed)
         self.viewer_client.reset_received.connect(self._on_reset_received)
 
@@ -155,17 +232,35 @@ class LiveODClientWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _setup_layout(self):
+        # ---- top row: left info | centre xvars | right buttons ----
         top_bar = QHBoxLayout()
-        top_bar.addWidget(self.run_id_label)
-        top_bar.addWidget(self.conn_indicator)
+        top_bar.setSpacing(12)
+
+        # Left group: run ID + connection
+        left_group = QVBoxLayout()
+        left_group.setSpacing(2)
+        left_group.addWidget(self.run_id_label)
+        left_group.addWidget(self.conn_indicator)
+        top_bar.addLayout(left_group)
+
         top_bar.addStretch()
+
+        # Centre: xvar display
         top_bar.addWidget(self.xvar_display)
-        top_bar.addWidget(self.screenshot_button)
-        top_bar.addWidget(self.reset_button)
+
+        top_bar.addStretch()
+
+        # Right group: action buttons
+        btn_group = QHBoxLayout()
+        btn_group.setSpacing(8)
+        btn_group.addWidget(self.new_plot_button)
+        btn_group.addWidget(self.screenshot_button)
+        btn_group.addWidget(self.reset_button)
+        top_bar.addLayout(btn_group)
 
         layout = QVBoxLayout()
         layout.addLayout(top_bar)
-        layout.addWidget(self.viewer_window)
+        layout.addWidget(self.viewer_window, stretch=1)
         self.setLayout(layout)
 
     # ------------------------------------------------------------------
@@ -184,14 +279,32 @@ class LiveODClientWindow(QWidget):
         self._N_pwa_per_shot = N_pwa_per_shot
         self._img_count = 0
 
+        # Clear plots for new run (especially important for late-connecting viewers)
+        self.viewer_window.clear_plots()
+
         self.analyzer.get_img_number(N_img, N_shots, N_pwa_per_shot)
         self.analyzer.get_analysis_type(imaging_type)
+
+        # Give the analyzer camera pixel info for Gaussian fitting
+        px_size = info.get("pixel_size_m", 0.0)
+        mag = info.get("magnification", 1.0)
+        if px_size > 0:
+            self.analyzer.camera_params = SimpleNamespace(
+                pixel_size_m=px_size, magnification=mag
+            )
+        else:
+            self.analyzer.camera_params = None
+
         self.viewer_window.get_img_number(N_img, N_shots, N_pwa_per_shot, run_id)
         self.viewer_window.clear_plots()
         self.run_id_label.setText(f"Run ID: {run_id}")
 
         # Set a sensible default ROI for the camera
         self._set_default_roi(camera_key)
+
+        # Notify pop-out plot windows
+        for w in self._plot_windows:
+            w.on_run_started()
 
         self.viewer_window.output_window.appendPlainText(
             f"Run {run_id} started — camera: {camera_key}, "
@@ -218,6 +331,42 @@ class LiveODClientWindow(QWidget):
         self.viewer_window.output_window.appendPlainText(
             "Server reset: grab stopped, data file deleted."
         )
+
+    def _on_xvars_received(self, xvars: dict):
+        """Update the xvar display, analyzer state, and pop-out windows."""
+        self.xvar_display.update_xvars(xvars)
+        self.analyzer.set_xvars(xvars)
+
+        new_names = list(xvars.keys())
+        if new_names != self._xvar_names:
+            self._xvar_names = new_names
+            for w in self._plot_windows:
+                w.update_xvar_names(new_names)
+
+    # ------------------------------------------------------------------
+    #  Pop-out plot windows
+    # ------------------------------------------------------------------
+
+    def _open_new_plot(self):
+        """Create a new pop-out ShotPlotWindow."""
+        self._plot_counter += 1
+        win = ShotPlotWindow(
+            window_id=self._plot_counter,
+            xvar_names=list(self._xvar_names),
+        )
+        win.closed.connect(self._on_plot_closed)
+        self.analyzer.shot_result.connect(win.on_new_shot)
+        self._plot_windows.append(win)
+        win.show()
+
+    def _on_plot_closed(self, win: ShotPlotWindow):
+        """De-register a closed pop-out window."""
+        try:
+            self.analyzer.shot_result.disconnect(win.on_new_shot)
+        except (TypeError, RuntimeError):
+            pass
+        if win in self._plot_windows:
+            self._plot_windows.remove(win)
 
     # ------------------------------------------------------------------
     #  Helpers
@@ -248,5 +397,9 @@ class LiveODClientWindow(QWidget):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        # Close any open pop-out plot windows
+        for w in list(self._plot_windows):
+            w.close()
+        self._plot_windows.clear()
         self.viewer_client.stop()
         super().closeEvent(event)
