@@ -195,5 +195,7 @@ class Expt(Dealer, Scanner, Scribe):
         if hasattr(self,'monitor'):
             self.monitor.update_device_states()
             self.monitor.signal_end()
+
+        self.live_od_client.send_run_complete()
                 
         # server_talk.play_random_sound()
