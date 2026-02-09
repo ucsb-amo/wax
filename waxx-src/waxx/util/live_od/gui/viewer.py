@@ -360,13 +360,13 @@ class LiveODViewer(QWidget):
         light_min, light_max = self._first_image_minmax.get('light', (None, None))
         dark_min, dark_max = self._first_image_minmax.get('dark', (None, None))
         if self._autoscale_ready:
-            self.img_atoms_view.setImage(atoms.T, autoLevels=False, levels=(atoms_min, atoms_max))
-            self.img_light_view.setImage(light.T, autoLevels=False, levels=(atoms_min, atoms_max))
-            self.img_dark_view.setImage(dark.T, autoLevels=False, levels=(dark_min, dark_max))
+            self.img_atoms_view.setImage(atoms.T, autoRange=False, autoLevels=False, levels=(atoms_min, atoms_max))
+            self.img_light_view.setImage(light.T, autoRange=False, autoLevels=False, levels=(atoms_min, atoms_max))
+            self.img_dark_view.setImage(dark.T, autoRange=False, autoLevels=False, levels=(dark_min, dark_max))
         else:
-            self.img_atoms_view.setImage(atoms.T, autoLevels=True)
-            self.img_light_view.setImage(light.T, autoLevels=True)
-            self.img_dark_view.setImage(dark.T, autoLevels=True)
+            self.img_atoms_view.setImage(atoms.T, autoRange=False, autoLevels=True)
+            self.img_light_view.setImage(light.T, autoRange=False, autoLevels=True)
+            self.img_dark_view.setImage(dark.T, autoRange=False, autoLevels=True)
         self._last_atoms = atoms
         self._last_light = light
         self._last_dark = dark
@@ -506,7 +506,7 @@ class LiveODViewer(QWidget):
 
     def handle_plot_data(self, to_plot):
         img_atoms, img_light, img_dark, od, sum_od_x, sum_od_y = to_plot
-        self._syncing_image_views = True
+        self._syncing_image_views = True # workaround for not having image sizes reset on replotting new images
         self.plot_images(img_atoms, img_light, img_dark)
         self._syncing_image_views = False
         self.plot_od(od, sum_od_x, sum_od_y)

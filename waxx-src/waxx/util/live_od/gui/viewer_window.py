@@ -84,10 +84,9 @@ class XVarDisplay(QFrame):
         self._header.setStyleSheet("color: #aaa; border: none;")
         self._header.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._grid = QGridLayout()
+        self._grid = QHBoxLayout()
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(12)
-        self._grid.setVerticalSpacing(2)
+        self._grid.setSpacing(16)
         self._grid_widget = QWidget()
         self._grid_widget.setLayout(self._grid)
 
@@ -124,24 +123,30 @@ class XVarDisplay(QFrame):
         name_font = QFont(); name_font.setPointSize(11); name_font.setBold(True)
         val_font = QFont(); val_font.setPointSize(14); val_font.setBold(True)
 
-        for row, (k, v) in enumerate(xvars.items()):
+        first = True
+        for k, v in xvars.items():
+            if not first:
+                sep = QLabel("  │  ")
+                sep.setStyleSheet("color: #555; border: none;")
+                self._grid.addWidget(sep)
+            first = False
+            
             name_lbl = QLabel(f"{k}")
             name_lbl.setFont(name_font)
             name_lbl.setStyleSheet("color: #8888cc; border: none;")
-            name_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             eq_lbl = QLabel("=")
             eq_lbl.setStyleSheet("color: #999; border: none;")
-            eq_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             val_lbl = QLabel(f"{v}")
             val_lbl.setFont(val_font)
             val_lbl.setStyleSheet("color: #e0e0e0; border: none;")
-            val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-            self._grid.addWidget(name_lbl, row, 0)
-            self._grid.addWidget(eq_lbl, row, 1)
-            self._grid.addWidget(val_lbl, row, 2)
+            self._grid.addWidget(name_lbl)
+            self._grid.addWidget(eq_lbl)
+            self._grid.addWidget(val_lbl)
+        
+        self._grid.addStretch()
 
 
 class LiveODClientWindow(QWidget):
@@ -278,9 +283,6 @@ class LiveODClientWindow(QWidget):
         self._N_img = N_img
         self._N_pwa_per_shot = N_pwa_per_shot
         self._img_count = 0
-
-        # Clear plots for new run (especially important for late-connecting viewers)
-        self.viewer_window.clear_plots()
 
         self.analyzer.get_img_number(N_img, N_shots, N_pwa_per_shot)
         self.analyzer.get_analysis_type(imaging_type)
