@@ -235,7 +235,7 @@ class DC205_Server:
     def __init__(self, port='COM10',
                 baudrate=115200,
                 server_ip='0.0.0.0',
-                server_port=5555):
+                server_port=5556):
         self.device = DC205(port=port, baudrate=baudrate)
         self.server_ip = server_ip
         self.server_port = server_port
@@ -291,7 +291,6 @@ class DC205_Server:
     def stop(self):
         self.running = False
 
-
 # ---------------------------------------------------------------------------
 # DC205 Client
 # ---------------------------------------------------------------------------
@@ -301,7 +300,7 @@ class DC205_Client:
     Remote client that mirrors the DC205 API over TCP.
     """
 
-    def __init__(self, server_ip='localhost', server_port=5555, timeout=5.0):
+    def __init__(self, server_ip='localhost', server_port=5556, timeout=5.0):
         self.server_ip = server_ip
         self.server_port = server_port
         self.timeout = timeout

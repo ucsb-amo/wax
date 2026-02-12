@@ -580,6 +580,7 @@ class SRS560_Server:
         self.server_socket.listen(5)
         
         print(f"SRS560 Server started on {self.server_ip}:{self.server_port}")
+        print("Press Ctrl+C to stop the server")
         
         try:
             while self.running:
@@ -597,7 +598,7 @@ class SRS560_Server:
                         print(f"Error accepting client connection: {e}")
         
         except KeyboardInterrupt:
-            print("\nServer interrupted by user")
+            print("\n\nServer interrupted by user (Ctrl+C)")
         
         finally:
             self.stop()
