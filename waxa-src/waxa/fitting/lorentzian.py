@@ -20,8 +20,8 @@ class LorentzianFit(Fit):
             popt = self._fit(self.xdata,self.ydata)
         except Exception as e:
             print(e)
-            popt = [np.NaN]*4
-            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.NaN)
+            popt = [np.nan]*4
+            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.nan)
 
         self.popt = popt
         amplitude, gamma, x_center, y_offset = popt

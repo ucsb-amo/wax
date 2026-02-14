@@ -47,6 +47,7 @@ class DDSWidget(DeviceWidget):
     def __init__(self, device_name: str, device_config: Dict[str, Any], dds_frame_obj=None):
         super().__init__(device_name, device_config)
         self.dds_frame_obj = dds_frame_obj
+        self.has_unsaved_changes = False
         self.setup_ui()
         
     def setup_ui(self):
@@ -68,8 +69,8 @@ class DDSWidget(DeviceWidget):
         self.freq_spinbox.setValue(self.device_config["frequency"] / 1e6)  # Convert Hz to MHz
         self.freq_spinbox.setMinimum(0.)
         self.freq_spinbox.setMaximum(400.)
-        self.freq_spinbox.editingFinished.connect(self.on_update_clicked)
-        self.freq_spinbox.valueChanged.connect(self.on_update_clicked)
+        self.freq_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
+        self.freq_spinbox.valueChanged.connect(self.on_value_changed)
         freq_layout.addWidget(self.freq_spinbox)
         
         # Frequency unit selector (MHz/Γ) if transition is not None
@@ -91,16 +92,16 @@ class DDSWidget(DeviceWidget):
         self.amp_spinbox.setDecimals(3)
         self.amp_spinbox.setSingleStep(0.005)
         self.amp_spinbox.setValue(self.device_config["amplitude"])
-        self.amp_spinbox.editingFinished.connect(self.on_update_clicked)
-        self.amp_spinbox.valueChanged.connect(self.on_update_clicked)
+        self.amp_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
+        self.amp_spinbox.valueChanged.connect(self.on_value_changed)
 
         self.vpd_spinbox = QDoubleSpinBox()
         self.vpd_spinbox.setRange(0, 10)
         self.vpd_spinbox.setDecimals(2)
         self.vpd_spinbox.setSingleStep(0.05)
         self.vpd_spinbox.setValue(self.device_config.get("v_pd", 5.0))
-        self.vpd_spinbox.editingFinished.connect(self.on_update_clicked)
-        self.vpd_spinbox.valueChanged.connect(self.on_update_clicked)
+        self.vpd_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
+        self.vpd_spinbox.valueChanged.connect(self.on_value_changed)
 
         self.power_control_widget = QHBoxLayout()
         self.power_control_widget.addWidget(self.amp_spinbox)
@@ -189,9 +190,27 @@ class DDSWidget(DeviceWidget):
         else:
             self.amp_spinbox.setVisible(True)
             self.vpd_spinbox.setVisible(False)
+
+    def on_value_changed(self):
+        """Mark that values have changed but not yet submitted"""
+        self.has_unsaved_changes = True
+        self.highlight_unsaved()
+
+    def highlight_unsaved(self):
+        """Highlight spinboxes orange when they have unsaved changes"""
+        if self.has_unsaved_changes:
+            self.freq_spinbox.setStyleSheet("QDoubleSpinBox { background-color: orange; }")
+            self.amp_spinbox.setStyleSheet("QDoubleSpinBox { background-color: orange; }")
+            self.vpd_spinbox.setStyleSheet("QDoubleSpinBox { background-color: orange; }")
+        else:
+            self.freq_spinbox.setStyleSheet("")
+            self.amp_spinbox.setStyleSheet("")
+            self.vpd_spinbox.setStyleSheet("")
             
     def on_update_clicked(self):
-        """Handle update button click"""
+        """Handle update button click (triggered by editingFinished)"""
+        self.has_unsaved_changes = False
+        self.highlight_unsaved()
         updated_config = self.get_updated_config()
         self.value_changed.emit("dds", self.device_name, updated_config)
         
@@ -239,6 +258,7 @@ class DACWidget(DeviceWidget):
 
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
         super().__init__(device_name, device_config)
+        self.has_unsaved_changes = False
         self.setup_ui()
     
     def setup_ui(self):
@@ -259,16 +279,30 @@ class DACWidget(DeviceWidget):
         self.voltage_spinbox.setDecimals(3)
         self.voltage_spinbox.setSuffix(" V")
         self.voltage_spinbox.setValue(self.device_config["voltage"])
-        self.voltage_spinbox.editingFinished.connect(self.on_update_clicked)
-        self.voltage_spinbox.valueChanged.connect(self.on_update_clicked)
+        self.voltage_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
+        self.voltage_spinbox.valueChanged.connect(self.on_value_changed)
         voltage_layout.addWidget(self.voltage_spinbox)
         
         layout.addLayout(voltage_layout)
         
         self.setLayout(layout)
+
+    def on_value_changed(self):
+        """Mark that values have changed but not yet submitted"""
+        self.has_unsaved_changes = True
+        self.highlight_unsaved()
+
+    def highlight_unsaved(self):
+        """Highlight spinbox orange when it has unsaved changes"""
+        if self.has_unsaved_changes:
+            self.voltage_spinbox.setStyleSheet("QDoubleSpinBox { background-color: orange; }")
+        else:
+            self.voltage_spinbox.setStyleSheet("")
         
     def on_update_clicked(self):
-        """Handle update button click"""
+        """Handle update button click (triggered by editingFinished)"""
+        self.has_unsaved_changes = False
+        self.highlight_unsaved()
         updated_config = self.get_updated_config()
         self.value_changed.emit("dac", self.device_name, updated_config)
         
