@@ -59,6 +59,11 @@ class Fit():
     def _fit(self,x,y):
         pass
 
+    def get_fitplot_arrays(self, Ninterp=10000):
+        xplt = np.linspace(self.xdata[0],self.xdata[-1],Ninterp)
+        yplt = self._fit_func(xplt, *self.popt)
+        return xplt, yplt
+
     def plot_fit(self,N_interp=10000,legend=True):
         # plt.figure()
         plt.plot(self.xdata,self.ydata,'.',markersize=4)
