@@ -12,6 +12,7 @@ from pylablib.devices.Thorlabs import KinesisMotor
 from artiq.coredevice.core import Core
 from artiq.language import TBool, TFloat, TInt32, now_mu, delay, kernel
 from waxx.control.artiq import Sampler_CH
+from waxx.util.artiq.async_print import aprint
 
 POSITION_180 = -345535
 POSITION_90 = POSITION_180 / 2
@@ -168,6 +169,7 @@ class WaveplateRotatorPhotodiodePID():
             if err < V_PD_THRESHOLD:
                 break
             steps = np.int32(err * P_GAIN)
+            aprint(v_pd, v_set, err, steps)
             self.move_by(steps)
             n_iter = n_iter + 1
             if n_iter > N_MAX_ITER:
