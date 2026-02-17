@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget
 )
-from PyQt6.QtCore import QTimer, pyqtSignal, QThread
+from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker
 from PyQt6.QtGui import QFont
 
 from PyQt6.QtCore import Qt
@@ -134,7 +134,6 @@ class DDSWidget(DeviceWidget):
         
         self.setLayout(layout)
         self.update_from_config(self.device_config)
-        self.update_from_config(self.device_config)
 
         self.on_amp_unit_changed(start_unit)
         
@@ -247,11 +246,21 @@ class DDSWidget(DeviceWidget):
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         self.device_config = config
-        self.freq_spinbox.setValue(config["frequency"] / 1e6)
-        self.amp_spinbox.setValue(config["amplitude"])
-        if "v_pd" in config:
-            self.vpd_spinbox.setValue(config["v_pd"])
-        self.state_button.setChecked(bool(config["sw_state"]))
+        self.has_unsaved_changes = False
+        self.highlight_unsaved()
+        with QSignalBlocker(self.freq_spinbox), QSignalBlocker(self.amp_spinbox), QSignalBlocker(self.vpd_spinbox):
+            self.freq_spinbox.setValue(config["frequency"] / 1e6)
+            self.amp_spinbox.setValue(config["amplitude"])
+            if "v_pd" in config:
+                self.vpd_spinbox.setValue(config["v_pd"])
+        with QSignalBlocker(self.state_button):
+            self.state_button.setChecked(bool(config["sw_state"]))
+        if config["sw_state"]:
+            self.state_button.setText("On")
+            self.state_button.setStyleSheet(f"background-color: {STATE_BUTTON_ON_COLOR}")
+        else:
+            self.state_button.setText("Off")
+            self.state_button.setStyleSheet("")
 
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
@@ -315,7 +324,10 @@ class DACWidget(DeviceWidget):
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         self.device_config = config
-        self.voltage_spinbox.setValue(config["voltage"])
+        self.has_unsaved_changes = False
+        self.highlight_unsaved()
+        with QSignalBlocker(self.voltage_spinbox):
+            self.voltage_spinbox.setValue(config["voltage"])
 
 
 class TTLWidget(DeviceWidget):
@@ -381,7 +393,14 @@ class TTLWidget(DeviceWidget):
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         self.device_config = config
-        self.state_button.setChecked(bool(config["ttl_state"]))
+        with QSignalBlocker(self.state_button):
+            self.state_button.setChecked(bool(config["ttl_state"]))
+        if config["ttl_state"]:
+            self.state_button.setText("On")
+            self.state_button.setStyleSheet("background-color: lightgreen")
+        else:
+            self.state_button.setText("Off")
+            self.state_button.setStyleSheet("")
 
 
 class MonitorStatusChecker(QThread):
