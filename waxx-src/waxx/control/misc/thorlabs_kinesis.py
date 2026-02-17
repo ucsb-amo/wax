@@ -13,6 +13,8 @@ from artiq.coredevice.core import Core
 from artiq.language import TBool, TFloat, TInt32, now_mu, delay, kernel
 from waxx.control.artiq import Sampler_CH
 
+from waxx.util.artiq.async_print import aprint
+
 POSITION_180 = -345535
 POSITION_90 = POSITION_180 / 2
 P_GAIN = 50
@@ -21,9 +23,15 @@ class ThorlabsKinesisMotor():
     def __init__(self, device_id = 27500961):
         self._device_id = device_id
 
-    def init(self):
+    def init(self, force_home=True) -> TBool:
         self.motor = KinesisMotor(self._device_id)
         self.setup_velocity()
+        self.motor._home(force=force_home)
+        self.motor.move_to(0)
+        while self.is_moving():
+            time.sleep(0.01)
+        self.motor._set_position_reference()
+        return True
 
     def move_by(self,steps):
         self.motor._move_by(steps)
@@ -43,10 +51,10 @@ class ThorlabsKinesisMotor():
         return self.motor._get_position()
 
     def home(self) -> TBool:
-        self.motor._home()
-        while self.is_moving():
-            time.sleep(0.1)
-        self.motor._set_position_reference()
+        if not self.motor._is_homed():
+            self.motor._home()
+            while self.is_moving():
+                time.sleep(0.1)
         return True
 
 class WaveplateRotatorPhotodiodePID():
@@ -58,13 +66,18 @@ class WaveplateRotatorPhotodiodePID():
         self.sampler_ch = sampler_ch
         self.core = core
 
+        self.motor = ThorlabsKinesisMotor(self._kinesis_devid)
+
         self._v_temp = np.zeros(1000)
-        self._p_temp = np.zeros(1000)
+        self._p_temp = np.zeros(1000, dtype=np.int32)
         self.idx = 0
 
-    def init(self) -> TBool:
-        self.motor = ThorlabsKinesisMotor(self._kinesis_devid)
-        self.motor.home()
+    @kernel
+    def init(self, force_home=True) -> TBool:
+        self.core.wait_until_mu(now_mu())
+        self.motor.init(force_home=force_home)
+        self.core.break_realtime()
+        self.wait_until_stopped()
         return True
     
     @kernel
@@ -75,7 +88,7 @@ class WaveplateRotatorPhotodiodePID():
         return pos
     
     @kernel
-    def move_to(self, pos=0, fraction_power=-1) -> TInt32:
+    def move_to(self, pos=0, fraction_power=-1):
         self.core.wait_until_mu(now_mu())
         if fraction_power != -1:
             pos = self.position_from_pfrac_calibration(fraction_power)
@@ -83,7 +96,7 @@ class WaveplateRotatorPhotodiodePID():
         self.core.break_realtime()
 
     @kernel
-    def move_by(self, steps=0) -> TInt32:
+    def move_by(self, steps=0):
         self.core.wait_until_mu(now_mu())
         self.motor.move_by(steps)
         self.core.break_realtime()
@@ -94,22 +107,31 @@ class WaveplateRotatorPhotodiodePID():
         b = self.motor.is_moving()
         self.core.break_realtime()
         return b
-
+    
     @kernel
-    def find_pd_range(self, n_calibration_steps=100):
-        self.move_to(0)
+    def wait_until_stopped(self):
         while self.is_moving():
             pass
 
+    @kernel
+    def find_pd_range(self, n_calibration_steps=10):
+        self.move_to(0)
+        self.wait_until_stopped()
+
         self.idx = 0
-        step_size = POSITION_90 / n_calibration_steps
+        step_size = np.int32( POSITION_90 / n_calibration_steps )
         
         for _ in range(n_calibration_steps):
             self.move_by(step_size)
-            while self.is_moving():
-                pass
-            self._p_temp[self.idx] = self.get_position()
-            self._v_temp[self.idx] = self.sampler_ch.sample()
+            self.wait_until_stopped()
+
+            p = self.get_position()
+            v = self.sampler_ch.sample()
+
+            self._p_temp[self.idx] = p
+            self._v_temp[self.idx] = v
+
+            aprint(p,v)
             self.idx += 1
 
         self.build_lookup_table()
