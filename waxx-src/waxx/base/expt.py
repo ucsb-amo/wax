@@ -169,7 +169,7 @@ class Expt(Dealer, Scanner, Scribe):
         print(msg)
         return N_img
     
-    def end(self, expt_filepath):
+    def end_wax(self, expt_filepath):
 
         self.scope_data.close()
 
