@@ -44,10 +44,12 @@ class DeviceWidget(QWidget):
 class DDSWidget(DeviceWidget):
     """Widget for controlling DDS devices"""
     
-    def __init__(self, device_name: str, device_config: Dict[str, Any], dds_frame_obj=None):
+    def __init__(self, device_name: str, device_config: Dict[str, Any], dds_frame_obj=None, step_size_controller=None):
         super().__init__(device_name, device_config)
         self.dds_frame_obj = dds_frame_obj
+        self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
+        self.instant_apply = False
         self.setup_ui()
         
     def setup_ui(self):
@@ -70,7 +72,7 @@ class DDSWidget(DeviceWidget):
         self.freq_spinbox.setMinimum(0.)
         self.freq_spinbox.setMaximum(400.)
         self.freq_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
-        self.freq_spinbox.valueChanged.connect(self.on_value_changed)
+        self.freq_spinbox.valueChanged.connect(self.on_freq_spinbox_value_changed)
         freq_layout.addWidget(self.freq_spinbox)
         
         # Frequency unit selector (MHz/Γ) if transition is not None
@@ -93,7 +95,7 @@ class DDSWidget(DeviceWidget):
         self.amp_spinbox.setSingleStep(0.005)
         self.amp_spinbox.setValue(self.device_config["amplitude"])
         self.amp_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
-        self.amp_spinbox.valueChanged.connect(self.on_value_changed)
+        self.amp_spinbox.valueChanged.connect(self.on_amp_spinbox_value_changed)
 
         self.vpd_spinbox = QDoubleSpinBox()
         self.vpd_spinbox.setRange(0, 10)
@@ -101,7 +103,7 @@ class DDSWidget(DeviceWidget):
         self.vpd_spinbox.setSingleStep(0.05)
         self.vpd_spinbox.setValue(self.device_config.get("v_pd", 5.0))
         self.vpd_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
-        self.vpd_spinbox.valueChanged.connect(self.on_value_changed)
+        self.vpd_spinbox.valueChanged.connect(self.on_vpd_spinbox_value_changed)
 
         self.power_control_widget = QHBoxLayout()
         self.power_control_widget.addWidget(self.amp_spinbox)
@@ -145,6 +147,36 @@ class DDSWidget(DeviceWidget):
             self.state_button.setText("Off")
             self.state_button.setStyleSheet("")
         self.on_update_clicked()
+        
+    def on_instant_apply_toggled(self, checked):
+        """Handle instant apply checkbox toggle"""
+        self.instant_apply = checked
+        
+    def setup_step_sizes(self):
+        """Setup step sizes from the shared step size controller"""
+        if self.step_size_controller:
+            self.freq_spinbox.setSingleStep(self.step_size_controller.freq_step_spinbox.value())
+            self.amp_spinbox.setSingleStep(self.step_size_controller.amp_step_spinbox.value())
+            self.vpd_spinbox.setSingleStep(self.step_size_controller.vpd_step_spinbox.value())
+            self.instant_apply = self.step_size_controller.instant_apply_checkbox.isChecked()
+        
+    def on_freq_spinbox_value_changed(self):
+        """Handle frequency spinbox value change"""
+        self.on_value_changed()
+        if self.instant_apply:
+            self.on_update_clicked()
+            
+    def on_amp_spinbox_value_changed(self):
+        """Handle amplitude spinbox value change"""
+        self.on_value_changed()
+        if self.instant_apply:
+            self.on_update_clicked()
+            
+    def on_vpd_spinbox_value_changed(self):
+        """Handle VPD spinbox value change"""
+        self.on_value_changed()
+        if self.instant_apply:
+            self.on_update_clicked()
         
     def on_freq_unit_changed(self, unit):
         """Handle frequency unit change between MHz and Γ"""
@@ -249,10 +281,15 @@ class DDSWidget(DeviceWidget):
         self.has_unsaved_changes = False
         self.highlight_unsaved()
         with QSignalBlocker(self.freq_spinbox), QSignalBlocker(self.amp_spinbox), QSignalBlocker(self.vpd_spinbox):
+            # Update main spinbox values
             self.freq_spinbox.setValue(config["frequency"] / 1e6)
             self.amp_spinbox.setValue(config["amplitude"])
             if "v_pd" in config:
                 self.vpd_spinbox.setValue(config["v_pd"])
+            
+            # Update step sizes from shared controller
+            self.setup_step_sizes()
+            
         with QSignalBlocker(self.state_button):
             self.state_button.setChecked(bool(config["sw_state"]))
         if config["sw_state"]:
@@ -279,6 +316,22 @@ class DACWidget(DeviceWidget):
         label.setToolTip(self.device_name)
         layout.addWidget(label)
         
+        # Step size controls panel
+        step_layout = QHBoxLayout()
+        step_layout.addWidget(QLabel("Step:"))
+        
+        self.voltage_step_spinbox = QDoubleSpinBox()
+        self.voltage_step_spinbox.setRange(0.001, 9.999)
+        self.voltage_step_spinbox.setDecimals(3)
+        self.voltage_step_spinbox.setSingleStep(0.001)
+        self.voltage_step_spinbox.setValue(0.01)
+        self.voltage_step_spinbox.setSuffix(" V")
+        step_layout.addWidget(QLabel("Voltage:"))
+        step_layout.addWidget(self.voltage_step_spinbox)
+        
+        step_layout.addStretch()
+        layout.addLayout(step_layout)
+        
         # Voltage control
         voltage_layout = QHBoxLayout()
         # voltage_layout.addWidget(QLabel("Voltage:"))
@@ -293,6 +346,9 @@ class DACWidget(DeviceWidget):
         voltage_layout.addWidget(self.voltage_spinbox)
         
         layout.addLayout(voltage_layout)
+        
+        # Connect step size spinbox change to update main spinbox step
+        self.voltage_step_spinbox.valueChanged.connect(lambda val: self.voltage_spinbox.setSingleStep(val))
         
         self.setLayout(layout)
 
@@ -328,6 +384,8 @@ class DACWidget(DeviceWidget):
         self.highlight_unsaved()
         with QSignalBlocker(self.voltage_spinbox):
             self.voltage_spinbox.setValue(config["voltage"])
+            # Update step size spinbox from current value (it persists across configs)
+            self.voltage_spinbox.setSingleStep(self.voltage_step_spinbox.value())
 
 
 class TTLWidget(DeviceWidget):
@@ -496,12 +554,63 @@ class DeviceStateGUI(QMainWindow):
         self.tab_widget.addTab(self.dac_tab, "DAC")
         self.tab_widget.addTab(self.ttl_tab, "TTL")
 
+        # Setup DDS tab with step size controls at top
+        dds_tab_layout = QVBoxLayout()
+        
+        # Step size controls panel for DDS
+        dds_step_layout = QHBoxLayout()
+        dds_step_layout.addWidget(QLabel("Step:"))
+        
+        self.freq_step_spinbox = QDoubleSpinBox()
+        self.freq_step_spinbox.setRange(0.001, 100)
+        self.freq_step_spinbox.setDecimals(3)
+        self.freq_step_spinbox.setSingleStep(0.01)
+        self.freq_step_spinbox.setValue(0.1)
+        self.freq_step_spinbox.setSuffix(" MHz")
+        dds_step_layout.addWidget(QLabel("Freq:"))
+        dds_step_layout.addWidget(self.freq_step_spinbox)
+        
+        self.amp_step_spinbox = QDoubleSpinBox()
+        self.amp_step_spinbox.setRange(0.001, 1)
+        self.amp_step_spinbox.setDecimals(3)
+        self.amp_step_spinbox.setSingleStep(0.001)
+        self.amp_step_spinbox.setValue(0.005)
+        dds_step_layout.addWidget(QLabel("Amp:"))
+        dds_step_layout.addWidget(self.amp_step_spinbox)
+        
+        self.vpd_step_spinbox = QDoubleSpinBox()
+        self.vpd_step_spinbox.setRange(0.01, 10)
+        self.vpd_step_spinbox.setDecimals(2)
+        self.vpd_step_spinbox.setSingleStep(0.01)
+        self.vpd_step_spinbox.setValue(0.05)
+        self.vpd_step_spinbox.setSuffix(" V")
+        dds_step_layout.addWidget(QLabel("V:"))
+        dds_step_layout.addWidget(self.vpd_step_spinbox)
+        
+        self.instant_apply_checkbox = QCheckBox("Instant Apply")
+        self.instant_apply_checkbox.setChecked(False)
+        dds_step_layout.addWidget(self.instant_apply_checkbox)
+        
+        dds_step_layout.addStretch()
+        dds_tab_layout.addLayout(dds_step_layout)
+        
+        # DDS devices grid layout
         self.dds_layout = QGridLayout()
+        dds_tab_layout.addLayout(self.dds_layout)
+        self.dds_tab.setLayout(dds_tab_layout)
+        
+        # Connect DDS step size controls to update all DDS widgets
+        self.freq_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
+        self.amp_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
+        self.vpd_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
+        self.instant_apply_checkbox.toggled.connect(self.on_dds_step_size_changed)
+        
+        # Setup DAC tab
         self.dac_layout = QGridLayout()
-        self.ttl_layout = QGridLayout()
-
-        self.dds_tab.setLayout(self.dds_layout)
         self.dac_tab.setLayout(self.dac_layout)
+        
+        # Setup TTL tab
+        self.ttl_layout = QGridLayout()
         self.ttl_tab.setLayout(self.ttl_layout)
 
     def setup_timer(self):
@@ -560,6 +669,12 @@ class DeviceStateGUI(QMainWindow):
         self.status_button.setText("Server connection failed")
         self.status_button.setStyleSheet("background-color: gray; color: white;")
         
+    def on_dds_step_size_changed(self):
+        """Update all DDS widgets when step size or instant apply changes"""
+        for widget_key, widget in self.device_widgets.items():
+            if widget_key.startswith("dds."):
+                widget.setup_step_sizes()
+        
     def load_config(self):
         """Load configuration from JSON file"""
         try:
@@ -595,8 +710,9 @@ class DeviceStateGUI(QMainWindow):
                 if "ch" not in device_config:
                     device_config["ch"] = device_config.get("ch", 0)
                     
-                widget = DDSWidget(device_name, device_config, self.dds_frame_obj)
+                widget = DDSWidget(device_name, device_config, self.dds_frame_obj, self)
                 widget.value_changed.connect(self.on_device_value_changed)
+                widget.setup_step_sizes()
                 
                 # Position by urukul_idx (column) and ch (row)
                 row = device_config["ch"]
