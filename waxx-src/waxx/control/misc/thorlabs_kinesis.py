@@ -32,7 +32,7 @@ class ThorlabsKinesisMotor():
         aprint('start homing...')
         self.motor._home(force=force_home)
         aprint('moving...')
-        if move_to_zero:j
+        if move_to_zero:
             self.move_to(0)
         while self.is_moving():
             time.sleep(0.01)
