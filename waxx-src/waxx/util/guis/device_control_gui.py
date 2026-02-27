@@ -22,6 +22,8 @@ from waxx.util.comms_server.comm_server import STATES
 
 PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
+DEFAULT_BUTTON_COLOR = "#363636FF"  # Dark gray
+UNDO_BUTTON_COLOR = "orange"
 
 class DeviceWidget(QWidget):
     """Base class for device control widgets"""
@@ -50,16 +52,22 @@ class DDSWidget(DeviceWidget):
         self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
         self.instant_apply = False
+        self.device_label = None  # Will store reference to label for tooltip update
+        # Store previous values for undo functionality
+        self.prev_freq = None
+        self.prev_amp = None
+        self.prev_vpd = None
+        self.prev_sw_state = None
         self.setup_ui()
         
     def setup_ui(self):
         layout = QVBoxLayout()
         
-        label = QLineEdit(self.device_name)
-        label.setCursorPosition(0)
-        label.setReadOnly(True)
-        label.setToolTip(self.device_name)
-        layout.addWidget(label)
+        self.device_label = QLineEdit(self.device_name)
+        self.device_label.setCursorPosition(0)
+        self.device_label.setReadOnly(True)
+        self.device_label.setToolTip(self.device_name)
+        layout.addWidget(self.device_label)
         
         # Frequency controls
         freq_layout = QHBoxLayout()
@@ -131,6 +139,11 @@ class DDSWidget(DeviceWidget):
         state_button_row = QHBoxLayout()
         # state_button_row.addWidget(QLabel("sw state:"))
         state_button_row.addWidget(self.state_button)
+        
+        self.default_button = QPushButton("default")
+        self.default_button.clicked.connect(self.on_default_undo_clicked)
+        self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
+        state_button_row.addWidget(self.default_button)
 
         layout.addLayout(state_button_row)
         
@@ -138,6 +151,36 @@ class DDSWidget(DeviceWidget):
         self.update_from_config(self.device_config)
 
         self.on_amp_unit_changed(start_unit)
+    
+    def on_default_undo_clicked(self):
+        """Handle default/undo button click"""
+        if self.has_unsaved_changes:
+            # Undo: restore previous values
+            with QSignalBlocker(self.freq_spinbox):
+                self.freq_spinbox.setValue(self.prev_freq)
+            with QSignalBlocker(self.amp_spinbox):
+                self.amp_spinbox.setValue(self.prev_amp)
+            with QSignalBlocker(self.vpd_spinbox):
+                self.vpd_spinbox.setValue(self.prev_vpd)
+            with QSignalBlocker(self.state_button):
+                self.state_button.setChecked(self.prev_sw_state)
+                # Manually update state button style since signal is blocked
+                if self.prev_sw_state:
+                    self.state_button.setText("On")
+                    self.state_button.setStyleSheet(f"background-color: {STATE_BUTTON_ON_COLOR}")
+                else:
+                    self.state_button.setText("Off")
+                    self.state_button.setStyleSheet("")
+            self.has_unsaved_changes = False
+            self.update_default_button_state()
+        else:
+            # Reset to default values
+            if hasattr(self.dds_frame_obj, self.device_name):
+                dds = vars(self.dds_frame_obj)[self.device_name]
+                self.freq_spinbox.setValue(dds.frequency/1.e6)
+                self.amp_spinbox.setValue(dds.amplitude)
+                self.state_button.setChecked(dds.sw_state)
+                self.on_update_clicked()
         
     def on_state_button_toggled(self, checked):
         if checked:
@@ -158,7 +201,12 @@ class DDSWidget(DeviceWidget):
             self.freq_spinbox.setSingleStep(self.step_size_controller.freq_step_spinbox.value())
             self.amp_spinbox.setSingleStep(self.step_size_controller.amp_step_spinbox.value())
             self.vpd_spinbox.setSingleStep(self.step_size_controller.vpd_step_spinbox.value())
-            self.instant_apply = self.step_size_controller.instant_apply_checkbox.isChecked()
+            self.instant_apply = self.step_size_controller.instant_apply_button.isChecked()
+    
+    def set_tooltip(self, urukul_idx: int, ch: int):
+        """Set tooltip to show urukul and channel"""
+        if self.device_label:
+            self.device_label.setToolTip(f"urukul{urukul_idx}_ch{ch}")
         
     def on_freq_spinbox_value_changed(self):
         """Handle frequency spinbox value change"""
@@ -225,7 +273,7 @@ class DDSWidget(DeviceWidget):
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
         self.has_unsaved_changes = True
-        self.highlight_unsaved()
+        self.update_default_button_state()
 
     def highlight_unsaved(self):
         """Highlight spinboxes orange when they have unsaved changes"""
@@ -237,11 +285,26 @@ class DDSWidget(DeviceWidget):
             self.freq_spinbox.setStyleSheet("")
             self.amp_spinbox.setStyleSheet("")
             self.vpd_spinbox.setStyleSheet("")
+    
+    def update_default_button_state(self):
+        """Update button text and style based on unsaved changes"""
+        if self.has_unsaved_changes:
+            self.default_button.setText("undo")
+            self.default_button.setStyleSheet(f"background-color: {UNDO_BUTTON_COLOR}")
+        else:
+            self.default_button.setText("default")
+            self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
+        self.highlight_unsaved()
             
     def on_update_clicked(self):
         """Handle update button click (triggered by editingFinished)"""
+        # Store current values as previous for next undo
+        self.prev_freq = self.freq_spinbox.value()
+        self.prev_amp = self.amp_spinbox.value()
+        self.prev_vpd = self.vpd_spinbox.value()
+        self.prev_sw_state = self.state_button.isChecked()
         self.has_unsaved_changes = False
-        self.highlight_unsaved()
+        self.update_default_button_state()
         updated_config = self.get_updated_config()
         self.value_changed.emit("dds", self.device_name, updated_config)
         
@@ -287,11 +350,17 @@ class DDSWidget(DeviceWidget):
             if "v_pd" in config:
                 self.vpd_spinbox.setValue(config["v_pd"])
             
+            # Store as previous values for undo
+            self.prev_freq = self.freq_spinbox.value()
+            self.prev_amp = self.amp_spinbox.value()
+            self.prev_vpd = self.vpd_spinbox.value()
+            
             # Update step sizes from shared controller
             self.setup_step_sizes()
             
         with QSignalBlocker(self.state_button):
             self.state_button.setChecked(bool(config["sw_state"]))
+            self.prev_sw_state = self.state_button.isChecked()
         if config["sw_state"]:
             self.state_button.setText("On")
             self.state_button.setStyleSheet(f"background-color: {STATE_BUTTON_ON_COLOR}")
@@ -302,9 +371,12 @@ class DDSWidget(DeviceWidget):
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
 
-    def __init__(self, device_name: str, device_config: Dict[str, Any]):
+    def __init__(self, device_name: str, device_config: Dict[str, Any], step_size_controller=None):
         super().__init__(device_name, device_config)
+        self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
+        # Store previous value for undo functionality
+        self.prev_voltage = None
         self.setup_ui()
     
     def setup_ui(self):
@@ -315,22 +387,6 @@ class DACWidget(DeviceWidget):
         label.setReadOnly(True)
         label.setToolTip(self.device_name)
         layout.addWidget(label)
-        
-        # Step size controls panel
-        step_layout = QHBoxLayout()
-        step_layout.addWidget(QLabel("Step:"))
-        
-        self.voltage_step_spinbox = QDoubleSpinBox()
-        self.voltage_step_spinbox.setRange(0.001, 9.999)
-        self.voltage_step_spinbox.setDecimals(3)
-        self.voltage_step_spinbox.setSingleStep(0.001)
-        self.voltage_step_spinbox.setValue(0.01)
-        self.voltage_step_spinbox.setSuffix(" V")
-        step_layout.addWidget(QLabel("Voltage:"))
-        step_layout.addWidget(self.voltage_step_spinbox)
-        
-        step_layout.addStretch()
-        layout.addLayout(step_layout)
         
         # Voltage control
         voltage_layout = QHBoxLayout()
@@ -345,17 +401,42 @@ class DACWidget(DeviceWidget):
         self.voltage_spinbox.valueChanged.connect(self.on_value_changed)
         voltage_layout.addWidget(self.voltage_spinbox)
         
+        self.default_button = QPushButton("default")
+        self.default_button.clicked.connect(self.on_default_undo_clicked)
+        self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
+        voltage_layout.addWidget(self.default_button)
+        
         layout.addLayout(voltage_layout)
         
-        # Connect step size spinbox change to update main spinbox step
-        self.voltage_step_spinbox.valueChanged.connect(lambda val: self.voltage_spinbox.setSingleStep(val))
-        
         self.setLayout(layout)
+
+    def on_default_undo_clicked(self):
+        """Handle default/undo button click"""
+        if self.has_unsaved_changes:
+            # Undo: restore previous value
+            with QSignalBlocker(self.voltage_spinbox):
+                self.voltage_spinbox.setValue(self.prev_voltage)
+            self.has_unsaved_changes = False
+            self.update_default_button_state()
+        else:
+            # Reset to default value
+            if "dac_id" in self.device_config:
+                # Use dac_id to load defaults - for now just reset voltage to 0
+                dac_id = self.device_config["dac_id"]
+                # TODO: Implement loading defaults from dac_id
+                # For now, use reasonable default
+                self.voltage_spinbox.setValue(0.0)
+                self.on_update_clicked()
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
         self.has_unsaved_changes = True
-        self.highlight_unsaved()
+        self.update_default_button_state()
+
+    def setup_step_sizes(self):
+        """Setup step sizes from the shared step size controller"""
+        if self.step_size_controller:
+            self.voltage_spinbox.setSingleStep(self.step_size_controller.dac_voltage_step_spinbox.value())
 
     def highlight_unsaved(self):
         """Highlight spinbox orange when it has unsaved changes"""
@@ -363,11 +444,23 @@ class DACWidget(DeviceWidget):
             self.voltage_spinbox.setStyleSheet("QDoubleSpinBox { background-color: orange; }")
         else:
             self.voltage_spinbox.setStyleSheet("")
+    
+    def update_default_button_state(self):
+        """Update button text and style based on unsaved changes"""
+        if self.has_unsaved_changes:
+            self.default_button.setText("undo")
+            self.default_button.setStyleSheet(f"background-color: {UNDO_BUTTON_COLOR}")
+        else:
+            self.default_button.setText("default")
+            self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
+        self.highlight_unsaved()
         
     def on_update_clicked(self):
         """Handle update button click (triggered by editingFinished)"""
+        # Store current value as previous for next undo
+        self.prev_voltage = self.voltage_spinbox.value()
         self.has_unsaved_changes = False
-        self.highlight_unsaved()
+        self.update_default_button_state()
         updated_config = self.get_updated_config()
         self.value_changed.emit("dac", self.device_name, updated_config)
         
@@ -384,8 +477,10 @@ class DACWidget(DeviceWidget):
         self.highlight_unsaved()
         with QSignalBlocker(self.voltage_spinbox):
             self.voltage_spinbox.setValue(config["voltage"])
-            # Update step size spinbox from current value (it persists across configs)
-            self.voltage_spinbox.setSingleStep(self.voltage_step_spinbox.value())
+            # Store as previous value for undo
+            self.prev_voltage = self.voltage_spinbox.value()
+            # Update step size from shared controller
+            self.setup_step_sizes()
 
 
 class TTLWidget(DeviceWidget):
@@ -393,16 +488,17 @@ class TTLWidget(DeviceWidget):
 
     def __init__(self, device_name: str, device_config: Dict[str, Any]):
         super().__init__(device_name, device_config)
+        self.device_label = None  # Will store reference to label for tooltip update
         self.setup_ui()
     
     def setup_ui(self):
         layout = QVBoxLayout()
 
-        label = QLineEdit(self.device_name)
-        label.setCursorPosition(0)
-        label.setReadOnly(True)
-        label.setToolTip(self.device_name)
-        layout.addWidget(label)
+        self.device_label = QLineEdit(self.device_name)
+        self.device_label.setCursorPosition(0)
+        self.device_label.setReadOnly(True)
+        self.device_label.setToolTip(self.device_name)
+        layout.addWidget(self.device_label)
         
         # State control
         state_layout = QHBoxLayout()
@@ -426,6 +522,11 @@ class TTLWidget(DeviceWidget):
             self.state_button.setText("Off")
             self.state_button.setStyleSheet("")
         self.on_update_clicked()
+        
+    def set_tooltip(self, ch: int):
+        """Set tooltip to show channel"""
+        if self.device_label:
+            self.device_label.setToolTip(f"ttl{ch}")
         
     def on_update_clicked(self):
         """Handle update button click"""
@@ -559,7 +660,19 @@ class DeviceStateGUI(QMainWindow):
         
         # Step size controls panel for DDS
         dds_step_layout = QHBoxLayout()
-        dds_step_layout.addWidget(QLabel("Step:"))
+        dds_step_layout.setContentsMargins(0, 0, 0, 0)
+        dds_step_layout.setSpacing(5)
+        
+        # Bolded title
+        title_label = QLabel("Step Settings")
+        title_font = title_label.font()
+        title_font.setBold(True)
+        title_font.setPointSize(9)
+        title_label.setFont(title_font)
+        dds_step_layout.addWidget(title_label)
+        
+        dds_step_layout.addSpacing(10)
+        dds_step_layout.addWidget(QLabel("Freq:"))
         
         self.freq_step_spinbox = QDoubleSpinBox()
         self.freq_step_spinbox.setRange(0.001, 100)
@@ -567,31 +680,42 @@ class DeviceStateGUI(QMainWindow):
         self.freq_step_spinbox.setSingleStep(0.01)
         self.freq_step_spinbox.setValue(0.1)
         self.freq_step_spinbox.setSuffix(" MHz")
-        dds_step_layout.addWidget(QLabel("Freq:"))
+        self.freq_step_spinbox.setMaximumHeight(20)
         dds_step_layout.addWidget(self.freq_step_spinbox)
+        
+        dds_step_layout.addSpacing(10)
+        dds_step_layout.addWidget(QLabel("Amp:"))
         
         self.amp_step_spinbox = QDoubleSpinBox()
         self.amp_step_spinbox.setRange(0.001, 1)
         self.amp_step_spinbox.setDecimals(3)
         self.amp_step_spinbox.setSingleStep(0.001)
         self.amp_step_spinbox.setValue(0.005)
-        dds_step_layout.addWidget(QLabel("Amp:"))
+        self.amp_step_spinbox.setMaximumHeight(20)
         dds_step_layout.addWidget(self.amp_step_spinbox)
         
+        dds_step_layout.addSpacing(10)
+        dds_step_layout.addWidget(QLabel("V:"))
+        
         self.vpd_step_spinbox = QDoubleSpinBox()
-        self.vpd_step_spinbox.setRange(0.01, 10)
-        self.vpd_step_spinbox.setDecimals(2)
+        self.vpd_step_spinbox.setRange(0.001, 10)
+        self.vpd_step_spinbox.setDecimals(3)
         self.vpd_step_spinbox.setSingleStep(0.01)
         self.vpd_step_spinbox.setValue(0.05)
         self.vpd_step_spinbox.setSuffix(" V")
-        dds_step_layout.addWidget(QLabel("V:"))
+        self.vpd_step_spinbox.setMaximumHeight(20)
         dds_step_layout.addWidget(self.vpd_step_spinbox)
         
-        self.instant_apply_checkbox = QCheckBox("Instant Apply")
-        self.instant_apply_checkbox.setChecked(False)
-        dds_step_layout.addWidget(self.instant_apply_checkbox)
-        
         dds_step_layout.addStretch()
+        
+        self.instant_apply_button = QPushButton("turn on instant apply")
+        self.instant_apply_button.setCheckable(True)
+        self.instant_apply_button.setChecked(False)
+        self.instant_apply_button.setStyleSheet("background-color: orange; color: black; font-weight: bold;")
+        self.instant_apply_button.setMaximumHeight(20)
+        self.instant_apply_button.toggled.connect(self.on_instant_apply_toggled)
+        dds_step_layout.addWidget(self.instant_apply_button)
+        
         dds_tab_layout.addLayout(dds_step_layout)
         
         # DDS devices grid layout
@@ -603,11 +727,45 @@ class DeviceStateGUI(QMainWindow):
         self.freq_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
         self.amp_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
         self.vpd_step_spinbox.valueChanged.connect(self.on_dds_step_size_changed)
-        self.instant_apply_checkbox.toggled.connect(self.on_dds_step_size_changed)
         
-        # Setup DAC tab
+        # Setup DAC tab with step size controls at top
+        dac_tab_layout = QVBoxLayout()
+        
+        # Step size controls panel for DAC
+        dac_step_layout = QHBoxLayout()
+        dac_step_layout.setContentsMargins(0, 0, 0, 0)
+        dac_step_layout.setSpacing(5)
+        
+        # Bolded title
+        dac_title_label = QLabel("Step Settings")
+        dac_title_font = dac_title_label.font()
+        dac_title_font.setBold(True)
+        dac_title_font.setPointSize(9)
+        dac_title_label.setFont(dac_title_font)
+        dac_step_layout.addWidget(dac_title_label)
+        
+        dac_step_layout.addSpacing(10)
+        dac_step_layout.addWidget(QLabel("Voltage:"))
+        
+        self.dac_voltage_step_spinbox = QDoubleSpinBox()
+        self.dac_voltage_step_spinbox.setRange(0.001, 9.999)
+        self.dac_voltage_step_spinbox.setDecimals(3)
+        self.dac_voltage_step_spinbox.setSingleStep(0.001)
+        self.dac_voltage_step_spinbox.setValue(0.01)
+        self.dac_voltage_step_spinbox.setSuffix(" V")
+        self.dac_voltage_step_spinbox.setMaximumHeight(20)
+        dac_step_layout.addWidget(self.dac_voltage_step_spinbox)
+        
+        dac_step_layout.addStretch()
+        dac_tab_layout.addLayout(dac_step_layout)
+        
+        # DAC devices grid layout
         self.dac_layout = QGridLayout()
-        self.dac_tab.setLayout(self.dac_layout)
+        dac_tab_layout.addLayout(self.dac_layout)
+        self.dac_tab.setLayout(dac_tab_layout)
+        
+        # Connect DAC step size controls to update all DAC widgets
+        self.dac_voltage_step_spinbox.valueChanged.connect(self.on_dac_step_size_changed)
         
         # Setup TTL tab
         self.ttl_layout = QGridLayout()
@@ -669,6 +827,26 @@ class DeviceStateGUI(QMainWindow):
         self.status_button.setText("Server connection failed")
         self.status_button.setStyleSheet("background-color: gray; color: white;")
         
+    def on_instant_apply_toggled(self, checked):
+        """Handle instant apply button toggle and update color and text"""
+        if checked:
+            self.instant_apply_button.setStyleSheet("background-color: red; color: white; font-weight: bold;")
+            self.instant_apply_button.setText("turn off instant apply")
+        else:
+            self.instant_apply_button.setStyleSheet("background-color: orange; color: black; font-weight: bold;")
+            self.instant_apply_button.setText("turn on instant apply")
+        self.on_dds_step_size_changed()
+        
+    def on_instant_apply_toggled_dac(self, checked):
+        """Handle DAC instant apply (placeholder for future use)"""
+        pass
+    
+    def on_dac_step_size_changed(self):
+        """Update all DAC widgets when step size changes"""
+        for widget_key, widget in self.device_widgets.items():
+            if widget_key.startswith("dac."):
+                widget.setup_step_sizes()
+    
     def on_dds_step_size_changed(self):
         """Update all DDS widgets when step size or instant apply changes"""
         for widget_key, widget in self.device_widgets.items():
@@ -703,29 +881,32 @@ class DeviceStateGUI(QMainWindow):
         
         # Add DDS widgets organized by urukul_idx (columns) and ch (rows)
         if "dds" in self.config_data:
+            # Collect all DDS devices
             for device_name, device_config in self.config_data["dds"].items():
                 # Add urukul_idx and ch to config for DDS widgets
                 if "urukul_idx" not in device_config:
                     device_config["urukul_idx"] = device_config.get("urukul_idx", 0)
                 if "ch" not in device_config:
                     device_config["ch"] = device_config.get("ch", 0)
-                    
+                
+                urukul_idx = device_config["urukul_idx"]
+                ch = device_config["ch"]
+                
                 widget = DDSWidget(device_name, device_config, self.dds_frame_obj, self)
                 widget.value_changed.connect(self.on_device_value_changed)
                 widget.setup_step_sizes()
+                widget.set_tooltip(urukul_idx, ch)
                 
                 # Position by urukul_idx (column) and ch (row)
-                row = device_config["ch"]
-                col = device_config["urukul_idx"]
-                
-                self.dds_layout.addWidget(widget, row, col)
+                self.dds_layout.addWidget(widget, ch, urukul_idx)
                 self.device_widgets[f"dds.{device_name}"] = widget
                     
         # Add DAC widgets grouped into columns of 8
         if "dac" in self.config_data:
             for device_name, device_config in self.config_data["dac"].items():
-                widget = DACWidget(device_name, device_config)
+                widget = DACWidget(device_name, device_config, self)
                 widget.value_changed.connect(self.on_device_value_changed)
+                widget.setup_step_sizes()
                 
                 # Extract channel number from device config or name
                 ch = device_config.get("ch", 0)
@@ -768,6 +949,7 @@ class DeviceStateGUI(QMainWindow):
                 if 0 <= col < num_cols:
                     widget = TTLWidget(device_name, device_config)
                     widget.value_changed.connect(self.on_device_value_changed)
+                    widget.set_tooltip(ch)
                     widget_grid[col][row] = widget
                     self.device_widgets[f"ttl.{device_name}"] = widget
 
