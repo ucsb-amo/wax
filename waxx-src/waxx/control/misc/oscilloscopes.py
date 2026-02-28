@@ -78,6 +78,9 @@ class GenericWaxxScope():
         if not hasattr(self,'scope'):
             self.scope = Scope_Base()
 
+    def clear_data(self):
+        self._data = []
+
     def data(self):
         if self._scopedata.xvardims != []:
             self.reshape_data()
