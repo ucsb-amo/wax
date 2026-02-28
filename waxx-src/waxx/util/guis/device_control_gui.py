@@ -46,7 +46,9 @@ class DeviceWidget(QWidget):
 class DDSWidget(DeviceWidget):
     """Widget for controlling DDS devices"""
     
-    def __init__(self, device_name: str, device_config: Dict[str, Any], dds_frame_obj=None, step_size_controller=None):
+    def __init__(self, device_name: str, device_config: Dict[str, Any],
+                dds_frame_obj=None,
+                step_size_controller=None):
         super().__init__(device_name, device_config)
         self.dds_frame_obj = dds_frame_obj
         self.step_size_controller = step_size_controller  # Reference to shared step size controls
@@ -180,6 +182,7 @@ class DDSWidget(DeviceWidget):
                 self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
                 self.state_button.setChecked(dds.sw_state)
+                self.vpd_spinbox.setValue(dds.v_pd)
                 self.on_update_clicked()
         
     def on_state_button_toggled(self, checked):
@@ -371,8 +374,11 @@ class DDSWidget(DeviceWidget):
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
 
-    def __init__(self, device_name: str, device_config: Dict[str, Any], step_size_controller=None):
+    def __init__(self, device_name: str, device_config: Dict[str, Any],
+                  step_size_controller=None,
+                  dac_frame_obj=None):
         super().__init__(device_name, device_config)
+        self.dac_frame_obj = dac_frame_obj
         self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
         # Store previous value for undo functionality
@@ -419,13 +425,9 @@ class DACWidget(DeviceWidget):
             self.has_unsaved_changes = False
             self.update_default_button_state()
         else:
-            # Reset to default value
-            if "dac_id" in self.device_config:
-                # Use dac_id to load defaults - for now just reset voltage to 0
-                dac_id = self.device_config["dac_id"]
-                # TODO: Implement loading defaults from dac_id
-                # For now, use reasonable default
-                self.voltage_spinbox.setValue(0.0)
+            if hasattr(self.dac_frame_obj, self.device_name):
+                dac = vars(self.dac_frame_obj)[self.device_name]
+                self.voltage_spinbox.setValue(dac.v)
                 self.on_update_clicked()
 
     def on_value_changed(self):
@@ -603,13 +605,15 @@ class DeviceStateGUI(QMainWindow):
                   monitor_server_ip,
                   monitor_server_port,
                   device_state_json_path,
-                  dds_frame):
+                  dds_frame,
+                  dac_frame):
         super().__init__()
         self.config_file = device_state_json_path
         self.config_data = {}
         self.device_widgets = {}
         
         self.dds_frame_obj = dds_frame
+        self.dac_frame_obj = dac_frame
 
         self.server_addr = (monitor_server_ip, monitor_server_port)
         self.connection_failed = False
@@ -904,7 +908,7 @@ class DeviceStateGUI(QMainWindow):
         # Add DAC widgets grouped into columns of 8
         if "dac" in self.config_data:
             for device_name, device_config in self.config_data["dac"].items():
-                widget = DACWidget(device_name, device_config, self)
+                widget = DACWidget(device_name, device_config, step_size_controller=self, dac_frame_obj=self.dac_frame_obj)
                 widget.value_changed.connect(self.on_device_value_changed)
                 widget.setup_step_sizes()
                 
