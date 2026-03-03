@@ -8,7 +8,7 @@ from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum
 from waxa.roi import ROI
 from waxa.data.data_vault import DataSaver
 from waxa.base import Dealer, xvar
-from waxa.data.server_talk import server_talk
+from waxa.data.server_talk import server_talk as st
 from waxa.helper.datasmith import *
 from waxa.data.run_info import RunInfo
 from waxa.config.expt_params import ExptParams
@@ -95,7 +95,7 @@ class atomdata():
                 skip_saved_roi = False,
                 transpose_idx = [],
                 avg_repeats = False,
-                server_talk = server_talk()):
+                server_talk = st()):
         '''
         Returns the atomdata stored in the `idx`th newest file at `path`.
 
@@ -136,7 +136,8 @@ class atomdata():
         self.roi = ROI(run_id = self.run_info.run_id,
                        roi_id = roi_id,
                        use_saved_roi = not skip_saved_roi,
-                       lite = self._lite)
+                       lite = self._lite,
+                       server_talk=self.server_talk)
 
         self._unshuffle_old_data()
         self._initial_analysis(transpose_idx,avg_repeats)
