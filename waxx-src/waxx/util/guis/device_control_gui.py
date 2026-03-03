@@ -181,7 +181,7 @@ class DDSWidget(DeviceWidget):
                 dds = vars(self.dds_frame_obj)[self.device_name]
                 self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
-                self.state_button.setChecked(dds.sw_state)
+                # self.state_button.setChecked(dds.sw_state)
                 self.vpd_spinbox.setValue(dds.v_pd)
                 self.on_update_clicked()
         
@@ -582,14 +582,14 @@ class MonitorStatusChecker(QThread):
         while self.running:
             try:
                 status = self.monitor_client.check_status()
-                self.status_updated.emit(int(status))
+                if status is not None:
+                    self.status_updated.emit(int(status))
             except Exception as e:
                 print(f"Connection error: {e}")
                 self.connection_failed.emit()
-                # Wait for retry signal
-                while self.running and not self.retry_connection:
-                    time.sleep(0.1)
-                self.retry_connection = False
+                # Automatically retry after 0.25 seconds
+                time.sleep(0.25)
+                continue  # Skip the normal sleep and retry immediately
             time.sleep(1.)
             
     def stop(self):
@@ -635,7 +635,7 @@ class DeviceStateGUI(QMainWindow):
         central_widget_layout = QVBoxLayout()
         
         # Create status button at the top
-        self.status_button = QPushButton("Connecting...")
+        self.status_button = QPushButton("Trying to connect to monitor server...")
         self.status_button.clicked.connect(self.on_status_button_clicked)
         font = QFont()
         font.setPointSize(14)

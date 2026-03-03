@@ -19,10 +19,13 @@ class MonitorUDPServer(UdpServer):
         super().__init__(host,port)
 
         self.status = Status()
+        self._print_connections_bool = False
 
     def on_message_received(self,message):
         if message == 'reset':
             self.reset_signal.emit()
+        if message == 'status':
+            return
         self.message_received.emit(message)
 
     def generate_reply(self, message):
