@@ -26,6 +26,8 @@ class UdpServer(QObject):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+        self._print_connections_bool = True
+
     def run(self):
 
         self.sock.bind((self.host, self.port))
@@ -35,7 +37,8 @@ class UdpServer(QObject):
         print(f"Server listening on {self.host}:{self.port}")
         while self.running:
             conn, addr = self.sock.accept()
-            print(f"Connected by {addr}")
+            if self._print_connections_bool:
+                print(f"Connected by {addr}")
             try:
                 while True:
                     data = conn.recv(1024)

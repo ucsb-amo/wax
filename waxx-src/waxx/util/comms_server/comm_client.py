@@ -26,7 +26,10 @@ class CommClient:
             reply = self.sock.recv(1024)
             return reply.decode()
         except Exception as e:
-            print(e)
+            if "[WinError 10061]" in str(e):
+                print("Connection refused [WinError 10061]: Unable to reach the server")
+            else:
+                print(e)
         finally:
             self.sock.close()
         
