@@ -2,7 +2,7 @@ import numpy as np
 import os
 import h5py
 
-from waxa.data.server_talk import check_for_mapped_data_dir, get_run_id, update_run_id
+from waxa.data.server_talk import server_talk as st
 
 # __DEFAULT_KEY = "no_one_will_ever_use_this_key000111"
 class DataContainer():
@@ -139,7 +139,9 @@ class DataSaver():
                  expt_repo_src_directory="",
                  expt_params_relative_filepath="",
                  cooling_relative_filepath="",
-                 imaging_relative_filepath=""):
+                 imaging_relative_filepath="",
+                 server_talk=None):
+        
         self._data_dir = data_dir
         self._expt_repo_path = expt_repo_src_directory
         self._expt_params_path = os.path.join(expt_repo_src_directory,
@@ -148,6 +150,12 @@ class DataSaver():
                                           cooling_relative_filepath)
         self._imaging_path = os.path.join(expt_repo_src_directory,
                                           imaging_relative_filepath)
+
+        if server_talk == None:
+            server_talk = st(data_dir=data_dir)
+        else:
+            server_talk = server_talk
+        self.server_talk = server_talk
 
     def save_data(self,expt:DummyExpt,expt_filepath="",data_object=None):
 
@@ -193,7 +201,6 @@ class DataSaver():
 
             f.close()
             print("Parameters saved, data closed.")
-            # self._update_run_id(expt.run_info)
             os.chdir(pwd)
 
     def get_xvardims(self,expt:DummyExpt):
@@ -209,7 +216,7 @@ class DataSaver():
 
         pwd = os.getcwd()
 
-        check_for_mapped_data_dir()
+        self.server_talk.check_for_mapped_data_dir()
         os.chdir(self._data_dir)
 
         fpath, folder = self._data_path(expt.run_info)
@@ -376,10 +383,10 @@ class DataSaver():
         return filepath, filepath_folder
 
     def _update_run_id(self,run_info):
-        update_run_id(run_info)
+        self.server_talk.update_run_id(run_info)
 
     def _get_rid(self):
-        return get_run_id()
+        return self.server_talk.get_run_id()
     
     def _bytes_to_str(self,attr):
         if isinstance(attr,bytes):

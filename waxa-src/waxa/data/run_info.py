@@ -1,10 +1,18 @@
 import time
-from waxa.data.server_talk import get_run_id
+from waxa.data.server_talk import server_talk as st
 
 class RunInfo():
-    def __init__(self,expt_obj=None,save_data=True):
+    def __init__(self,
+                 expt_obj=None,
+                 save_data=True,
+                 server_talk=None):
+        if server_talk == None:
+            server_talk = st()
+        else:
+            server_talk = server_talk
+
         if expt_obj != None:
-            self.run_id = get_run_id()
+            self.run_id = server_talk.get_run_id()
             print(f'Run id: {self.run_id}')
         else:
             self.run_id = 0

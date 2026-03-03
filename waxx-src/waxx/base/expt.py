@@ -23,7 +23,8 @@ class Expt(Dealer, Scanner, Scribe):
     def __init__(self,
                  setup_camera=True,
                  save_data=True,
-                 absorption_image=None):
+                 absorption_image=None,
+                 server_talk=None):
         
         if absorption_image != None:
             print("Warning: The argument 'absorption_image' is depreciated -- change it out for 'imaging_type'")
@@ -33,7 +34,7 @@ class Expt(Dealer, Scanner, Scribe):
         super().__init__()
 
         self.setup_camera = setup_camera
-        self.run_info = RunInfo(self,save_data)
+        self.run_info = RunInfo(self,save_data,server_talk=server_talk)
         self.scope_data = ScopeData()
         self._ridstr = " Run ID: "+ str(self.run_info.run_id)
         self._counter = counter()

@@ -3,14 +3,11 @@ import pandas as pd
 import os
 import cv2
 
-import waxa.data.server_talk as st
+from waxa.data.server_talk import server_talk as st
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.config.img_types import img_types
 
 import h5py
-
-st.check_for_mapped_data_dir()
-ROI_CSV_PATH = os.path.join(st.DATA_DIR,"roi.xlsx")
 
 class ROI():
     def __init__(self,
@@ -19,7 +16,14 @@ class ROI():
                  key="",
                  use_saved_roi=True,
                  lite=False,
-                 printouts=True):
+                 printouts=True,
+                 server_talk=None):
+        
+        if server_talk == None:
+            self.server_talk = st()
+        else:
+            self.server_talk = server_talk
+
         self.roix = [-1,-1]
         self.roiy = [-1,-1]
         self.key = key
@@ -30,7 +34,7 @@ class ROI():
                       printouts=printouts)
 
     def crop(self,OD):
-        """Crops the given ndarray according to the ROI.
+        """Crops the given ndarray according the ROI.
 
         Args:
             OD (np.ndarray): The ndarray to be cropped.
@@ -105,7 +109,7 @@ class ROI():
             self.roiy = [0,py]
 
     def save_roi_h5(self, lite=False):
-        fpath, _ = st.get_data_file(self.run_id,lite=lite)
+        fpath, _ = self.server_talk.get_data_file(self.run_id,lite=lite)
         with h5py.File(fpath,'r+') as f:
             f.attrs['roix'] = self.roix
             f.attrs['roiy'] = self.roiy
@@ -174,7 +178,7 @@ class ROI():
         self.key = key
         if key == "":
             raise ValueError("ROI key must be a non-empty string.")
-        roicsv = pd.read_excel(ROI_CSV_PATH)
+        roicsv = pd.read_excel(self.server_talk.roi_csv_path)
         keymatch = roicsv.loc[ roicsv['key'] == self.key ]
         if np.any(keymatch):
             if printouts: print(f"ROI {key} found.")
@@ -208,7 +212,7 @@ class ROI():
         """        
         if run_id == []:
             run_id = self.run_id
-        update_bool, roix, roiy = roi_creator(run_id, self.key).get_roi_rectangle()
+        update_bool, roix, roiy = roi_creator(run_id, self.key, self.server_talk).get_roi_rectangle()
         if update_bool:
             self.roix, self.roiy = roix, roiy
         else:
@@ -224,7 +228,7 @@ class ROI():
             raise ValueError("The key must be nonempty in order to save the ROI.")
 
         # Read the excel file
-        df = pd.read_excel(ROI_CSV_PATH)
+        df = pd.read_excel(self.server_talk.roi_csv_path)
         new_values = [*self.roix, *self.roiy]
 
         # Check if the label exists
@@ -239,16 +243,16 @@ class ROI():
             df = pd.concat([df, new_row], ignore_index=True)
 
         # Save the updated dataframe back to the excel file
-        df.to_excel(ROI_CSV_PATH, index=False)
+        df.to_excel(self.server_talk.roi_csv_path, index=False)
         print(f"Updated the spreadsheet ROI with key {key}.")
 
 class roi_creator():
-    def __init__(self,run_id,key):
+    def __init__(self,run_id,key,server_talk):
 
         self.key = key
         self.run_id = run_id
 
-        filepath, _ = st.get_data_file(run_id)
+        filepath, _ = server_talk.get_data_file(run_id)
         self.h5_file = h5py.File(filepath)
         self.N_img = self.h5_file['data']['images'].shape[0]//3
         # try:

@@ -8,7 +8,7 @@ from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum
 from waxa.roi import ROI
 from waxa.data.data_vault import DataSaver
 from waxa.base import Dealer, xvar
-import waxa.data.server_talk as st
+from waxa.data.server_talk import server_talk
 from waxa.helper.datasmith import *
 from waxa.data.run_info import RunInfo
 from waxa.config.expt_params import ExptParams
@@ -87,10 +87,15 @@ class atomdata():
     '''
     Use to store and do basic analysis on data for every experiment.
     '''
-    def __init__(self, idx=0, roi_id=None, path = "",
-                 lite = False,
-                 skip_saved_roi = False,
-                 transpose_idx = [], avg_repeats = False):
+    def __init__(self,
+                idx=0,
+                roi_id=None,
+                path = "",
+                lite = False,
+                skip_saved_roi = False,
+                transpose_idx = [],
+                avg_repeats = False,
+                server_talk = server_talk()):
         '''
         Returns the atomdata stored in the `idx`th newest file at `path`.
 
@@ -119,6 +124,8 @@ class atomdata():
         '''
 
         self._lite = lite
+
+        self.server_talk = server_talk
 
         self._load_data(idx,path,lite)
 
@@ -651,6 +658,8 @@ class atomdata():
         # figure out dimensions of each xvar
         self.xvardims = np.zeros(self.Nvars,dtype=int)
         for i in range(self.Nvars):
+            if type(xvars[i]) == np.int64:
+                raise ValueError(f'Run {self.run_info.run_id} did not have a scanned parameter.')
             self.xvardims[i] = np.int32(len(xvars[i]))
 
         return xvars
@@ -722,7 +731,7 @@ class atomdata():
 
     def _load_data(self, idx=0, path = "", lite=False):
 
-        file, rid = st.get_data_file(idx, path, lite)
+        file, rid = self.server_talk.get_data_file(idx, path, lite)
 
         # If idx==0, check if the file is locked and try previous files if so
         if idx <= 0 and path == "" and lite == False:
@@ -736,7 +745,7 @@ class atomdata():
             while is_file_locked(file):
                 # print(f"File {file} is locked, trying previous file...")
                 idx -= 1
-                file, rid = st.get_data_file(idx)
+                file, rid = self.server_talk.get_data_file(idx)
                 # Optionally, add a small delay to avoid hammering the disk
                 time.sleep(0.05)
             
