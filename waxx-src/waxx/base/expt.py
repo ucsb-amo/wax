@@ -109,6 +109,7 @@ class Expt(Dealer, Scanner, Scribe):
 
         if self.setup_camera:
             self.data_filepath = self.ds.create_data_file(self)
+            print(self.data_filepath)
 
         self.generate_assignment_kernels()
     
