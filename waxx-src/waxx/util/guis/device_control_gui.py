@@ -584,13 +584,12 @@ class MonitorStatusChecker(QThread):
                 status = self.monitor_client.check_status()
                 if status is not None:
                     self.status_updated.emit(int(status))
+                time.sleep(0.5)
             except Exception as e:
                 print(f"Connection error: {e}")
                 self.connection_failed.emit()
                 # Automatically retry after 0.25 seconds
                 time.sleep(0.25)
-                continue  # Skip the normal sleep and retry immediately
-            time.sleep(1.)
             
     def stop(self):
         self.running = False
