@@ -157,9 +157,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
             if self.scope.is_channel_visible(ch) and (ch in channels):
                 try:
                     (t,v) = self.scope.read_sweep(ch)
-                    d[0] = t # data[ch][0] = t
-                    d[1] = v # data[ch][1] = v
-                    data.append(d)
+                    data.append([t,v])
                 except Exception as e:
                     # aprint(e)
                     pass
