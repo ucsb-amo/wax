@@ -4,14 +4,14 @@ from artiq.experiment import kernel, portable, TArray, TFloat, parallel
 from artiq.language.core import now_mu, at_mu, delay, delay_mu
 
 from waxx.control.artiq.TTL import TTL_OUT
-from waxx.control.artiq.Sampler_CH import Sampler_CH
+from waxx.control.artiq.Sampler_CH import Sampler_CH, Sampler_Last_CH
 from waxx.util.artiq.async_print import aprint
 from waxx.config.expt_params import ExptParams
 
 dv = -0.1
 di = 0
 
-T_RESET_RESPONSE_MU = 100
+T_RESET_RESPONSE_MU = 300
 T_RESET_MU = 1500
 T_INTEGRATOR_BEGIN_MU = 300
 T_SETTLE_MU = 1000
@@ -22,12 +22,12 @@ class Integrator():
     def __init__(self,
                  ttl_integrate:TTL_OUT,
                  ttl_reset:TTL_OUT,
-                 sampler_ch:Sampler_CH):
+                 sampler_ch:Sampler_Last_CH):
         self.ttl_integrate = ttl_integrate # logic inverted -- on=not integrating, off=integrating
         self.ttl_reset = ttl_reset # on=clearing integrator, off=not clearing integrator
+        if not isinstance(sampler_ch, Sampler_Last_CH):
+            raise ValueError('For fast readout, use channel 6 or 7 of the sampler and assign as Sampler_Last_CH in sampler_id.py')
         self.sampler_ch = sampler_ch
-
-        self._cleared = True
 
     @kernel
     def init(self):
@@ -44,12 +44,14 @@ class Integrator():
         if reset:
             at_mu(t_gate_open - T_INTEGRATOR_BEGIN_MU - T_RESET_RESPONSE_MU - T_RESET_MU)
             self.ttl_reset.off()
+
         at_mu(t_gate_open - T_INTEGRATOR_BEGIN_MU - T_RESET_RESPONSE_MU)
         self.ttl_reset.on()
+
         at_mu(t_gate_open - T_INTEGRATOR_BEGIN_MU)
         self.ttl_integrate.off()
+
         at_mu(t_gate_open)
-        self._cleared = False
 
     @kernel
     def stop_and_sample(self) -> TFloat:
@@ -60,11 +62,17 @@ class Integrator():
         """        
         self.ttl_integrate.on()
         delay_mu(T_SETTLE_MU)
-        v = self.sampler_ch.sample()
-        delay(11.e-6)
-        self.ttl_reset.off()
+        
+        v = self.sampler_ch.sample_single()
+        delay(3.e-6)
         return v
-    
+
+    @kernel
+    def clear(self, t=2*T_RESET_MU):
+        self.ttl_integrate.on()
+        self.ttl_reset.off()
+        delay_mu(t)
+
     @kernel
     def reset(self):
         self.ttl_reset.on()

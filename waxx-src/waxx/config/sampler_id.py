@@ -1,7 +1,7 @@
 import numpy as np
 from artiq.experiment import kernel, TFloat, TArray
 from artiq.coredevice.sampler import Sampler
-from waxx.control.artiq.Sampler_CH import Sampler_CH
+from waxx.control.artiq.Sampler_CH import Sampler_CH, Sampler_Last_CH
 
 class sampler_frame():
     def __init__(self, sampler_device = Sampler):
@@ -27,6 +27,12 @@ class sampler_frame():
 
     def sampler_assign(self,ch,gain=0) -> Sampler_CH:
         this_ch = Sampler_CH(ch,gain=gain,sample_array=self.data)
+        this_ch.sampler_device = self.sampler_device
+        self.gains[ch] = gain
+        return this_ch
+    
+    def sampler_assign_lastch(self,ch,gain=0) -> Sampler_Last_CH:
+        this_ch = Sampler_Last_CH(ch,gain=gain,sample_array=self.data)
         this_ch.sampler_device = self.sampler_device
         self.gains[ch] = gain
         return this_ch
