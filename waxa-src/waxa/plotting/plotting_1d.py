@@ -1,4 +1,6 @@
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+
 import numpy as np
 from waxa import atomdata
 from waxa.helper import xlabels_1d
@@ -324,13 +326,14 @@ def plot_sum_od_fits(ad:atomdata,axis=0,
         fig, ax = plt.subplots(Nr,Ns,
                            layout='tight')
 
-    
+    if isinstance(ax, Axes):
+        ax = [ax]
 
     xvar = ad.xvars[0]
     xvarlabels = xlabels_1d(xvar, xvarmult, xvarformat)
 
-    if ad.params.N_repeats == 1 or Ns == 1:
-        for i in range(Ns):
+    if Nr == 1 or Ns == 1:
+        for i in range(max(Nr,Ns)):
 
             yfit = fits[i].y_fitdata
             ydata = fits[i].ydata
