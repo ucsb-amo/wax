@@ -277,7 +277,7 @@ class DataSaver():
             if expt.sort_idx:
                 # unshuffle if shuffled
                 ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
-                expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+                this_data = expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
             f['data'][key][...] = this_data
 
     def _save_scope_data(self,
