@@ -150,7 +150,6 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
         data = []
-        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
         for ch in range(4):
