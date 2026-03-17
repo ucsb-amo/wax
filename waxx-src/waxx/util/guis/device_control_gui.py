@@ -207,9 +207,9 @@ class DDSWidget(DeviceWidget):
             self.instant_apply = self.step_size_controller.instant_apply_button.isChecked()
     
     def set_tooltip(self, urukul_idx: int, ch: int):
-        """Set tooltip to show urukul and channel"""
+        """Set tooltip to show device name and urukul/channel"""
         if self.device_label:
-            self.device_label.setToolTip(f"urukul{urukul_idx}_ch{ch}")
+            self.device_label.setToolTip(f"{self.device_name}\nurukul{urukul_idx}_ch{ch}")
         
     def on_freq_spinbox_value_changed(self):
         """Handle frequency spinbox value change"""
@@ -526,9 +526,9 @@ class TTLWidget(DeviceWidget):
         self.on_update_clicked()
         
     def set_tooltip(self, ch: int):
-        """Set tooltip to show channel"""
+        """Set tooltip to show device name and channel"""
         if self.device_label:
-            self.device_label.setToolTip(f"ttl{ch}")
+            self.device_label.setToolTip(f"{self.device_name}\nttl{ch}")
         
     def on_update_clicked(self):
         """Handle update button click"""
