@@ -165,8 +165,8 @@ class atomdata():
     def save_roi_excel(self,key=""):
         self.roi.save_roi_excel(key)
 
-    def save_roi_h5(self):
-        self.roi.save_roi_h5(lite=self._lite)
+    def save_roi_h5(self,printouts=False):
+        self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
             
     ### Analysis
 
