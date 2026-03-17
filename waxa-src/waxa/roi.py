@@ -108,11 +108,12 @@ class ROI():
             self.roix = [0,px]
             self.roiy = [0,py]
 
-    def save_roi_h5(self, lite=False):
+    def save_roi_h5(self, lite=False, printouts=False):
         fpath, _ = self.server_talk.get_data_file(self.run_id,lite=lite)
         with h5py.File(fpath,'r+') as f:
             f.attrs['roix'] = self.roix
             f.attrs['roiy'] = self.roiy
+        if printouts: print(f"ROI saved to h5 file at {fpath}")
 
     def save_roi_excel(self,key=""):
         if self.key == "" and key == "":
@@ -133,7 +134,7 @@ class ROI():
         Returns:
             px, py: The image dimensions (rows, columns).
         """        
-        fpath, _ = st.get_data_file(self.run_id)
+        fpath, _ = self.server_talk.get_data_file(self.run_id)
         with h5py.File(fpath) as f:
             py, px = f['data']['images'].shape[-2:]
         return px, py
@@ -152,7 +153,7 @@ class ROI():
         if run_id == []:
             run_id = self.run_id
         try:
-            fpath, run_id = st.get_data_file(run_id,lite=lite)
+            fpath, run_id = self.server_talk.get_data_file(run_id,lite=lite)
             with h5py.File(fpath) as f:
                 roix = f.attrs['roix']
                 roiy = f.attrs['roiy']
@@ -160,7 +161,8 @@ class ROI():
             self.roiy = roiy
             if printouts: print(f"ROI loaded from run {run_id}.")
             return True
-        except:
+        except Exception as e:
+            print(e)
             if printouts: print(f"No ROI saved in run {run_id}.")
             return False
         
