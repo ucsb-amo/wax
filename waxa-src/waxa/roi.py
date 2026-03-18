@@ -162,7 +162,6 @@ class ROI():
             if printouts: print(f"ROI loaded from run {run_id}.")
             return True
         except Exception as e:
-            print(e)
             if printouts: print(f"No ROI saved in run {run_id}.")
             return False
         
