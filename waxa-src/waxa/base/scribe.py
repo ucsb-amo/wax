@@ -136,6 +136,9 @@ class Scribe():
             for path in paths:
                 if path and not os.path.exists(path):
                     if raise_error:
+                        if hasattr(self,'monitor'):
+                            self.monitor.update_device_states()
+                            self.monitor.signal_end()
                         raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
                     else:
                         return False
