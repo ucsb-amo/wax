@@ -93,8 +93,12 @@ class server_talk():
             result = subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
             if not os.path.exists(self.data_dir):
                 print(f"Data dir still not found. Are you connected to the physics network?") 
+                return False
             else:
                 print("Network drives successfully mapped.")
+                return True
+        else:
+            return True
 
     def get_latest_date_folder(self,lite=False,days_ago=0):
         self.set_data_dir(lite)
