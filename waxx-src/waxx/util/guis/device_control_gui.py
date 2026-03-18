@@ -19,6 +19,7 @@ import time
 
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
+from waxa.data.server_talk import server_talk
 
 PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
@@ -604,6 +605,7 @@ class DeviceStateGUI(QMainWindow):
                   monitor_server_ip,
                   monitor_server_port,
                   device_state_json_path,
+                  server_talk: server_talk,
                   dds_frame,
                   dac_frame):
         super().__init__()
@@ -616,6 +618,8 @@ class DeviceStateGUI(QMainWindow):
 
         self.server_addr = (monitor_server_ip, monitor_server_port)
         self.connection_failed = False
+
+        self.server_talk = server_talk
 
         self.setup_ui()
         self.load_config()
@@ -858,19 +862,20 @@ class DeviceStateGUI(QMainWindow):
         
     def load_config(self):
         """Load configuration from JSON file"""
-        try:
-            with open(self.config_file, 'r') as f:
-                new_config = json.load(f)
-                
-            # Check if config has changed
-            if new_config != self.config_data:
-                self.config_data = new_config
-                self.update_device_widgets()
-                
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Error", f"Configuration file not found: {self.config_file}")
-        except json.JSONDecodeError as e:
-            QMessageBox.critical(self, "Error", f"Invalid JSON in configuration file: {e}")
+        for attempt in range(3):
+            try:
+                with open(self.config_file, 'r') as f:
+                    new_config = json.load(f)
+                if new_config != self.config_data:
+                    self.config_data = new_config
+                    self.update_device_widgets()
+                return
+            except FileNotFoundError:
+                self.server_talk.check_for_mapped_data_dir()
+            except json.JSONDecodeError as e:
+                QMessageBox.critical(self, "Error", f"Invalid JSON in configuration file: {e}")
+                return
+        QMessageBox.critical(self, "Error", f"Configuration file not found: {self.config_file}")
             
     def check_config_changes(self):
         """Check for changes in the config file"""

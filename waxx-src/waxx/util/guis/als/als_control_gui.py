@@ -7,6 +7,7 @@ import sys
 import threading
 import socket
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, Any
@@ -107,6 +108,7 @@ class StepIndicator(QWidget):
         
         layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(8)
         
         # Color indicator (light)
         self.indicator = QPushButton()
@@ -115,15 +117,33 @@ class StepIndicator(QWidget):
         self._update_color()
         layout.addWidget(self.indicator)
         
-        # Label
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+
+        # Primary label
         self.label = QLabel(label)
         self.label.setMinimumWidth(150)
-        layout.addWidget(self.label)
+        text_layout.addWidget(self.label)
+
+        # Secondary status line (completed/already done timestamps)
+        self.note_label = QLabel("")
+        self.note_label.setStyleSheet("color: #5b6670; font-size: 11px;")
+        self.note_label.setVisible(False)
+        text_layout.addWidget(self.note_label)
+
+        layout.addLayout(text_layout)
+        layout.addStretch()
         
     def set_state(self, state: str):
         """Set state: 'not_done', 'doing', or 'done'"""
         self.state = state
         self._update_color()
+
+    def set_note(self, note: str) -> None:
+        text = note.strip()
+        self.note_label.setText(text)
+        self.note_label.setVisible(bool(text))
     
     def _update_color(self):
         if self.state == "not_done":
@@ -522,6 +542,16 @@ class ALSControlGUI(QMainWindow):
         self._last_remote_error: Optional[str] = None
         self._remote_sequence_state = SequenceState.IDLE
         self._remote_sequence_type: Optional[str] = None
+        self._remote_serial_port = serial_port
+        self._startup_step_base_labels = [
+            "1. Turn Power On",
+            "2. Turn Interlock On",
+            "3. Wait for IMON-PA > 3A",
+            "4. Turn On Second Stage",
+            "5. Ramp to 80%",
+            "6. Warm Up at 80%",
+            "7. Turn to 100%",
+        ]
         
         # UI Setup
         self.setWindowTitle("ALS Fiber Amplifier Control")
@@ -731,7 +761,7 @@ class ALSControlGUI(QMainWindow):
         connection_header_layout = QHBoxLayout()
         connection_header_layout.setSpacing(8)
 
-        connection_title = QLabel("Server")
+        connection_title = QLabel("TCP")
         connection_title.setObjectName("CardEyebrow")
         connection_header_layout.addWidget(connection_title)
         connection_header_layout.addStretch()
@@ -742,9 +772,9 @@ class ALSControlGUI(QMainWindow):
 
         connection_layout.addLayout(connection_header_layout)
 
-        self.connect_button = QPushButton("Disconnected")
-        self.connect_button.setMinimumWidth(120)
-        self.connect_button.setMaximumWidth(120)
+        self.connect_button = QPushButton(f"{self._remote_serial_port} Disconnected")
+        self.connect_button.setMinimumWidth(180)
+        self.connect_button.setMaximumWidth(220)
         self.connect_button.setStyleSheet(
             "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
         )
@@ -888,11 +918,6 @@ class ALSControlGUI(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        server_label = QLabel(f"TCP\n{self.ip}:{self.port}")
-        server_label.setStyleSheet("color: #6f777e; font-size: 12px; font-weight: 600;")
-        server_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(server_label)
-        
         self.startup_button = QPushButton("Startup")
         self.startup_button.clicked.connect(self._start_startup)
         layout.addWidget(self.startup_button)
@@ -901,12 +926,6 @@ class ALSControlGUI(QMainWindow):
         self.shutdown_button.clicked.connect(self._start_shutdown)
         layout.addWidget(self.shutdown_button)
         
-        self.interrupt_button = QPushButton("Interrupt")
-        self.interrupt_button.clicked.connect(self._interrupt_sequence)
-        self.interrupt_button.setEnabled(False)
-        self.interrupt_button.setVisible(False)
-        layout.addWidget(self.interrupt_button)
-
         layout.addStretch()
         
         return group
@@ -917,17 +936,22 @@ class ALSControlGUI(QMainWindow):
         layout = QVBoxLayout(group)
         
         self.startup_steps = [
-            StepIndicator("1. Turn Power On"),
-            StepIndicator("2. Turn Interlock On"),
-            StepIndicator("3. Wait for IMON-PA > 3A"),
-            StepIndicator("4. Turn On Second Stage"),
-            StepIndicator("5. Ramp to 80%"),
-            StepIndicator("6. Warm Up at 80%"),
-            StepIndicator("7. Turn to 100%"),
+            StepIndicator(self._startup_step_base_labels[0]),
+            StepIndicator(self._startup_step_base_labels[1]),
+            StepIndicator(self._startup_step_base_labels[2]),
+            StepIndicator(self._startup_step_base_labels[3]),
+            StepIndicator(self._startup_step_base_labels[4]),
+            StepIndicator(self._startup_step_base_labels[5]),
+            StepIndicator(self._startup_step_base_labels[6]),
         ]
         
         for step in self.startup_steps:
             layout.addWidget(step)
+
+        self.startup_interrupt_button = QPushButton("Interrupt Startup")
+        self.startup_interrupt_button.clicked.connect(self._interrupt_sequence)
+        self.startup_interrupt_button.setEnabled(False)
+        layout.addWidget(self.startup_interrupt_button)
         
         return group
     
@@ -945,6 +969,11 @@ class ALSControlGUI(QMainWindow):
         
         for step in self.shutdown_steps:
             layout.addWidget(step)
+
+        self.shutdown_interrupt_button = QPushButton("Interrupt Shutdown")
+        self.shutdown_interrupt_button.clicked.connect(self._interrupt_sequence)
+        self.shutdown_interrupt_button.setEnabled(False)
+        layout.addWidget(self.shutdown_interrupt_button)
         
         return group
     
@@ -1058,6 +1087,9 @@ class ALSControlGUI(QMainWindow):
 
     def _apply_remote_snapshot(self, snapshot: Dict[str, Any]) -> None:
         status_data = snapshot.get("status", {})
+        serial_port = snapshot.get("serial_port")
+        if isinstance(serial_port, str) and serial_port.strip():
+            self._remote_serial_port = serial_port.strip()
         connection_state_value = status_data.get("connection_state", ConnectionState.DISCONNECTED.value)
         try:
             connection_state = ConnectionState(connection_state_value)
@@ -1092,19 +1124,26 @@ class ALSControlGUI(QMainWindow):
         sequence_type = sequence_data.get("type")
         self._remote_sequence_state = sequence_state
         self._remote_sequence_type = sequence_type
+        sequence_started_epoch = sequence_data.get("started_epoch")
 
         startup_steps = sequence_data.get("startup_steps", [])
         shutdown_steps = sequence_data.get("shutdown_steps", [])
+        startup_step_notes = sequence_data.get("startup_step_notes", [])
+        shutdown_step_notes = sequence_data.get("shutdown_step_notes", [])
         for index, state in enumerate(startup_steps[:len(self.startup_steps)]):
             self.startup_steps[index].set_state(state)
+            note = startup_step_notes[index] if index < len(startup_step_notes) else ""
+            self.startup_steps[index].set_note(note)
         for index, state in enumerate(shutdown_steps[:len(self.shutdown_steps)]):
             self.shutdown_steps[index].set_state(state)
+            note = shutdown_step_notes[index] if index < len(shutdown_step_notes) else ""
+            self.shutdown_steps[index].set_note(note)
 
         if sequence_state == SequenceState.RUNNING:
             self.startup_button.setEnabled(False)
             self.shutdown_button.setEnabled(False)
-            self.interrupt_button.setEnabled(True)
-            self.interrupt_button.setVisible(True)
+            self.startup_interrupt_button.setEnabled(sequence_type == "STARTUP")
+            self.shutdown_interrupt_button.setEnabled(sequence_type == "SHUTDOWN")
             self.connect_button.setEnabled(False)
             self.power_status_dot.setEnabled(False)
             self.interlock_status_dot.setEnabled(False)
@@ -1112,6 +1151,7 @@ class ALSControlGUI(QMainWindow):
             if sequence_type == "STARTUP":
                 self.startup_sequence_panel.show()
                 self.shutdown_sequence_panel.hide()
+                self._update_startup_wait_step_labels(startup_steps, sequence_started_epoch)
             elif sequence_type == "SHUTDOWN":
                 self.startup_sequence_panel.hide()
                 self.shutdown_sequence_panel.show()
@@ -1120,8 +1160,8 @@ class ALSControlGUI(QMainWindow):
             is_connected = self.status.connection_state == ConnectionState.CONNECTED
             self.startup_button.setEnabled(is_connected)
             self.shutdown_button.setEnabled(is_connected)
-            self.interrupt_button.setEnabled(False)
-            self.interrupt_button.setVisible(False)
+            self.startup_interrupt_button.setEnabled(False)
+            self.shutdown_interrupt_button.setEnabled(False)
             self.connect_button.setEnabled(True)
             self.power_status_dot.setEnabled(is_connected)
             self.interlock_status_dot.setEnabled(is_connected)
@@ -1129,10 +1169,31 @@ class ALSControlGUI(QMainWindow):
             self.startup_sequence_panel.hide()
             self.shutdown_sequence_panel.hide()
             self.sequence_progress_window.hide()
+            self._reset_startup_step_labels()
             if previous_state == SequenceState.RUNNING and sequence_state == SequenceState.COMPLETED:
                 self.statusBar().showMessage(f"{(previous_type or sequence_type or 'Sequence').title()} completed")
             elif previous_state == SequenceState.RUNNING and sequence_state == SequenceState.INTERRUPTED:
                 self.statusBar().showMessage(f"{(previous_type or sequence_type or 'Sequence').title()} interrupted")
+
+    def _reset_startup_step_labels(self) -> None:
+        for index, base_label in enumerate(self._startup_step_base_labels):
+            self.startup_steps[index].label.setText(base_label)
+
+    def _update_startup_wait_step_labels(self, startup_steps: list, sequence_started_epoch: Any) -> None:
+        self._reset_startup_step_labels()
+        if len(startup_steps) > 2 and startup_steps[2] == "doing":
+            self.startup_steps[2].label.setText(
+                f"3. Wait for IMON-PA: {self.status.imon_pa:.2f} / 3.00 A"
+            )
+
+        if len(startup_steps) > 5 and startup_steps[5] == "doing":
+            elapsed_s = 0
+            if isinstance(sequence_started_epoch, (int, float)):
+                elapsed_s = max(0, int(time.time() - sequence_started_epoch))
+            minutes, seconds = divmod(elapsed_s, 60)
+            self.startup_steps[5].label.setText(
+                f"6. Warm Up at 80% (since turn-on: {minutes:02d}:{seconds:02d})"
+            )
 
     def _sync_remote_logs(self, log_count: int) -> None:
         if self.remote_client is None or log_count <= self._next_log_index:
@@ -1164,8 +1225,8 @@ class ALSControlGUI(QMainWindow):
         self._cleanup_sequence_thread()
         self.startup_button.setEnabled(True)
         self.shutdown_button.setEnabled(True)
-        self.interrupt_button.setEnabled(False)
-        self.interrupt_button.setVisible(False)
+        self.startup_interrupt_button.setEnabled(False)
+        self.shutdown_interrupt_button.setEnabled(False)
         self.connect_button.setEnabled(True)
         is_connected = self.status.connection_state == ConnectionState.CONNECTED
         self.power_status_dot.setEnabled(is_connected)
@@ -1188,8 +1249,8 @@ class ALSControlGUI(QMainWindow):
         self._cleanup_sequence_thread()
         self.startup_button.setEnabled(True)
         self.shutdown_button.setEnabled(True)
-        self.interrupt_button.setEnabled(False)
-        self.interrupt_button.setVisible(False)
+        self.startup_interrupt_button.setEnabled(False)
+        self.shutdown_interrupt_button.setEnabled(False)
         self.connect_button.setEnabled(True)
         is_connected = self.status.connection_state == ConnectionState.CONNECTED
         self.power_status_dot.setEnabled(is_connected)
@@ -1204,8 +1265,8 @@ class ALSControlGUI(QMainWindow):
         self._cleanup_sequence_thread()
         self.startup_button.setEnabled(True)
         self.shutdown_button.setEnabled(True)
-        self.interrupt_button.setEnabled(False)
-        self.interrupt_button.setVisible(False)
+        self.startup_interrupt_button.setEnabled(False)
+        self.shutdown_interrupt_button.setEnabled(False)
         self.connect_button.setEnabled(True)
         is_connected = self.status.connection_state == ConnectionState.CONNECTED
         self.power_status_dot.setEnabled(is_connected)
@@ -1226,7 +1287,7 @@ class ALSControlGUI(QMainWindow):
         is_sequence_running = self._sequence_thread_is_running()
         if state == ConnectionState.CONNECTED:
             self.status.connected = True
-            self.connect_button.setText("Connected")
+            self.connect_button.setText(f"{self._remote_serial_port} Connected")
             self.connect_button.setStyleSheet(
                 "background-color: #2ba363; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
             )
@@ -1239,7 +1300,7 @@ class ALSControlGUI(QMainWindow):
                 self.second_stage_status_dot.setEnabled(True)
         elif state == ConnectionState.ERROR:
             self.status.connected = False
-            self.connect_button.setText("Disconnected")
+            self.connect_button.setText(f"{self._remote_serial_port} Disconnected")
             self.connect_button.setStyleSheet(
                 "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
             )
@@ -1251,7 +1312,7 @@ class ALSControlGUI(QMainWindow):
             self.second_stage_status_dot.setEnabled(False)
         else:
             self.status.connected = False
-            self.connect_button.setText("Disconnected")
+            self.connect_button.setText(f"{self._remote_serial_port} Disconnected")
             self.connect_button.setStyleSheet(
                 "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
             )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import signal
 import socket
 import threading
 import time
@@ -96,8 +98,14 @@ class ALSLaserServer:
         self.status = LaserStatus()
         self.sequence_state = SequenceState.IDLE
         self.sequence_type: Optional[str] = None
+        self.sequence_started_epoch: Optional[float] = None
+        self.current_step_number: Optional[int] = None
+        self.current_step_started_epoch: Optional[float] = None
         self.startup_step_states = ["not_done"] * len(self.STARTUP_STEPS)
         self.shutdown_step_states = ["not_done"] * len(self.SHUTDOWN_STEPS)
+        self.startup_step_notes = [""] * len(self.STARTUP_STEPS)
+        self.shutdown_step_notes = [""] * len(self.SHUTDOWN_STEPS)
+        self._current_step_already_done = False
         self._interrupt_requested = False
 
         self._state_lock = threading.Lock()
@@ -105,10 +113,11 @@ class ALSLaserServer:
         self._log_lock = threading.Lock()
         self._log_entries: list[str] = []
         self._log_offset = 0
+        self._cleanup_registered = False
 
         self.log_handler = LogBufferHandler(self)
         self.log_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
         )
 
     def start(self) -> None:
@@ -120,6 +129,9 @@ class ALSLaserServer:
         self.accept_thread.start()
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
+        if not self._cleanup_registered:
+            atexit.register(self._cleanup_on_exit)
+            self._cleanup_registered = True
         if self.auto_connect:
             try:
                 self.connect_laser()
@@ -144,6 +156,16 @@ class ALSLaserServer:
         self.disconnect_laser()
         LOGGER.removeHandler(self.log_handler)
         self.log_handler.close()
+
+    def _cleanup_on_exit(self) -> None:
+        """Best-effort process-exit cleanup that releases the serial port."""
+        try:
+            if self.running:
+                self.stop()
+            else:
+                self.disconnect_laser()
+        except Exception:
+            pass
 
     def append_log_entry(self, message: str) -> None:
         with self._log_lock:
@@ -170,11 +192,17 @@ class ALSLaserServer:
             status_dict["connection_state"] = self.status.connection_state.value
             return {
                 "status": status_dict,
+                "serial_port": self.serial_port,
                 "sequence": {
                     "state": self.sequence_state.value,
                     "type": self.sequence_type,
+                    "started_epoch": self.sequence_started_epoch,
+                    "current_step_number": self.current_step_number,
+                    "current_step_started_epoch": self.current_step_started_epoch,
                     "startup_steps": list(self.startup_step_states),
                     "shutdown_steps": list(self.shutdown_step_states),
+                    "startup_step_notes": list(self.startup_step_notes),
+                    "shutdown_step_notes": list(self.shutdown_step_notes),
                 },
                 "log_count": self._log_offset + len(self._log_entries),
             }
@@ -456,9 +484,14 @@ class ALSLaserServer:
                 return False
             self.sequence_state = SequenceState.RUNNING
             self.sequence_type = sequence_type
+            self.sequence_started_epoch = time.time()
+            self.current_step_number = None
+            self.current_step_started_epoch = None
             self._interrupt_requested = False
             self.startup_step_states = ["not_done"] * len(self.STARTUP_STEPS)
             self.shutdown_step_states = ["not_done"] * len(self.SHUTDOWN_STEPS)
+            self.startup_step_notes = [""] * len(self.STARTUP_STEPS)
+            self.shutdown_step_notes = [""] * len(self.SHUTDOWN_STEPS)
 
         target = self._run_startup_sequence if sequence_type == "STARTUP" else self._run_shutdown_sequence
         self.sequence_thread = threading.Thread(target=target, daemon=True)
@@ -481,13 +514,21 @@ class ALSLaserServer:
         try:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
-            startup_controller = ALSLaserStartupController(self.laser)
+            startup_controller = ALSLaserStartupController(
+                self.laser,
+                interrogate_callback=self._on_sequence_interrogated_state,
+            )
             for step_num, step_name, method_name in steps:
                 with self._state_lock:
                     if self._interrupt_requested:
                         LOGGER.warning("%s sequence interrupted", sequence_type.title())
                         self.sequence_state = SequenceState.INTERRUPTED
+                        self.current_step_number = None
+                        self.current_step_started_epoch = None
                         return
+                    self.current_step_number = step_num
+                    self.current_step_started_epoch = time.time()
+                    self._current_step_already_done = False
                     self._set_step_state(sequence_type, step_num - 1, "doing")
                 LOGGER.info("%s step %s: %s", sequence_type.title(), step_num, step_name)
                 with self._laser_lock:
@@ -495,16 +536,47 @@ class ALSLaserServer:
                     self._poll_status_locked()
                 with self._state_lock:
                     self._set_step_state(sequence_type, step_num - 1, "done")
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    if self._current_step_already_done:
+                        self._set_step_note(sequence_type, step_num - 1, f"already done at {timestamp}")
+                    else:
+                        self._set_step_note(sequence_type, step_num - 1, f"completed at {timestamp}")
+                    self._current_step_already_done = False
             with self._state_lock:
                 self.sequence_state = SequenceState.COMPLETED
+                self.current_step_number = None
+                self.current_step_started_epoch = None
             LOGGER.info("%s sequence completed", sequence_type.title())
         except Exception as exc:
             LOGGER.exception("%s sequence failed: %s", sequence_type.title(), exc)
             with self._state_lock:
                 self.sequence_state = SequenceState.INTERRUPTED
+                self.current_step_number = None
+                self.current_step_started_epoch = None
         finally:
             if self.sequence_state != SequenceState.RUNNING:
                 pass
+
+    def _on_sequence_interrogated_state(self, state: dict) -> None:
+        """Receive controller interrogation snapshots and publish them to GUI clients."""
+        updated_status = LaserStatus(
+            power_enabled=bool(state.get("power_enabled", False)),
+            interlock_enabled=bool(state.get("interlock_enabled", False)),
+            second_stage_enabled=bool(state.get("second_stage_enabled", False)),
+            power_setpoint_percent=float(state.get("power_setpoint_percent", 0.0)),
+            temperature_act_p=float(state.get("temperature_act_p", 0.0)),
+            temperature_set_p=float(state.get("temperature_set_p", 0.0)),
+            imon_pa=float(state.get("imon_pa", 0.0)),
+            lmon=float(state.get("lmon", 0.0)),
+            pmon_w=float(state.get("pmon_w", 0.0)),
+            connected=bool(state.get("connected", True)),
+            connection_state=ConnectionState.CONNECTED,
+        )
+        context = str(state.get("context", "")).lower()
+        with self._state_lock:
+            self.status = updated_status
+            if "skipped" in context or "already" in context:
+                self._current_step_already_done = True
 
     def _set_step_state(self, sequence_type: str, index: int, state: str) -> None:
         if sequence_type == "STARTUP":
@@ -512,16 +584,34 @@ class ALSLaserServer:
         else:
             self.shutdown_step_states[index] = state
 
+    def _set_step_note(self, sequence_type: str, index: int, note: str) -> None:
+        if sequence_type == "STARTUP":
+            self.startup_step_notes[index] = note
+        else:
+            self.shutdown_step_notes[index] = note
+
 
 def main(host: str = "0.0.0.0", port: int = 5557, serial_port: str = "COM6") -> None:
     logging.basicConfig(level=logging.INFO)
     server = ALSLaserServer(host=host, port=port, serial_port=serial_port)
     server.start()
+
+    def _handle_termination_signal(signum, _frame) -> None:
+        LOGGER.warning("Received signal %s; stopping ALS server", signum)
+        server.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _handle_termination_signal)
+    signal.signal(signal.SIGTERM, _handle_termination_signal)
+
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
         LOGGER.info("Stopping ALS server")
+    except BaseException:
+        LOGGER.exception("ALS server exiting due to unexpected error")
+        raise
     finally:
         server.stop()
 

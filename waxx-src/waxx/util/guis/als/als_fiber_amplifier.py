@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import math
 import struct
@@ -154,9 +154,20 @@ class ALSLaserController:
         self._ser.reset_output_buffer()
 
     def close(self) -> None:
-        if self._ser is not None:
-            self._ser.close()
-            self._ser = None
+        ser = self._ser
+        self._ser = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        """Best-effort cleanup so the serial port is released on abnormal teardown."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> "ALSLaserController":
         self.connect()
@@ -540,7 +551,7 @@ class ALSLaserController:
         count = 0
         while max_frames is None or count < max_frames:
             frame = self.read_all_once(require_no_error_status=require_no_error_status)
-            stamp = time.strftime("%H:%M:%S")
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{stamp}] {self.format_converted(self.convert_frame(frame), precision=precision)}")
             count += 1
 
@@ -556,6 +567,7 @@ class ALSLaserStartupController:
         warmup_seconds: float = 30.0 * 60.0,
         poll_interval_seconds: float = 1.0,
         sleep_fn=None,
+        interrogate_callback: Optional[Callable[[dict], None]] = None,
     ):
         if imon_pa_threshold_amps <= 0:
             raise ValueError("imon_pa_threshold_amps must be > 0")
@@ -575,9 +587,10 @@ class ALSLaserStartupController:
         self.warmup_seconds = float(warmup_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+        self.interrogate_callback = interrogate_callback
 
     def _log(self, message: str) -> None:
-        stamp = time.strftime("%H:%M:%S")
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{stamp}] {message}")
 
     def _sleep_with_log(self, seconds: float, reason: str) -> None:
@@ -596,6 +609,45 @@ class ALSLaserStartupController:
         )
         return converted
 
+    def _interrogate_laser_state(self, context: str) -> ConvertedFrame:
+        """Query and optionally publish current laser state for external UIs."""
+        frame = self.laser.stop_and_read()
+        converted = self.laser.convert_frame(frame)
+        power_enabled = bool(frame.statuses.get("STS_RACK_PSU", 0)) or bool(
+            frame.statuses.get("STS_RELAY_PSU", 0)
+        )
+        interlock_enabled = bool(self.laser.cmd_ask_interlock_sts())
+        second_stage_enabled = bool(self.laser.cmd_ask_secondstage_sts())
+        power_setpoint_percent = self.laser.cmd_ask_power_consign() / 65535.0 * 100.0
+
+        self._log(
+            f"Interrogate ({context}): "
+            f"power={'ON' if power_enabled else 'OFF'}, "
+            f"interlock={'ON' if interlock_enabled else 'OFF'}, "
+            f"2nd_stage={'ON' if second_stage_enabled else 'OFF'}, "
+            f"setpoint={power_setpoint_percent:.1f}%, "
+            f"IMON-PA={converted.IMON_PA:.3f} A, PMON={converted.PMON_W:.3f} W"
+        )
+
+        if self.interrogate_callback is not None:
+            self.interrogate_callback(
+                {
+                    "context": context,
+                    "power_enabled": power_enabled,
+                    "interlock_enabled": interlock_enabled,
+                    "second_stage_enabled": second_stage_enabled,
+                    "power_setpoint_percent": power_setpoint_percent,
+                    "temperature_act_p": converted.TACT_P,
+                    "temperature_set_p": converted.TSET_P,
+                    "imon_pa": converted.IMON_PA,
+                    "lmon": converted.LMON,
+                    "pmon_w": converted.PMON_W,
+                    "connected": True,
+                }
+            )
+
+        return converted
+
     def _is_power_enabled(self) -> bool:
         frame = self.laser.stop_and_read()
         rack_or_relay = bool(frame.statuses.get("STS_RACK_PSU", 0)) or bool(
@@ -612,16 +664,20 @@ class ALSLaserStartupController:
     def step_1_turn_laser_power_on(self) -> None:
         if self._is_power_enabled():
             self._log("Step 1: laser power supply already on; skipping.")
+            self._interrogate_laser_state("after step 1 (skipped)")
             return
         self._log("Step 1: turning laser power supply on.")
         self.laser.cmd_set_power_supply_on()
+        self._interrogate_laser_state("after step 1")
 
     def step_2_turn_interlock_on(self) -> None:
         if self._is_interlock_enabled():
             self._log("Step 2: interlock already enabled; skipping.")
+            self._interrogate_laser_state("after step 2 (skipped)")
             return
         self._log("Step 2: enabling interlock.")
         self.laser.cmd_set_interlock_on()
+        self._interrogate_laser_state("after step 2")
 
     def step_3_wait_for_imon_pa(self) -> ConvertedFrame:
         self._log(
@@ -632,6 +688,7 @@ class ALSLaserStartupController:
             self._log(
                 f"Step 3: IMON-PA already above threshold ({converted.IMON_PA:.3f} A); skipping wait."
             )
+            self._interrogate_laser_state("after step 3 (already above threshold)")
             return converted
         while True:
             converted = self._read_converted_snapshot()
@@ -640,15 +697,18 @@ class ALSLaserStartupController:
                     f"IMON-PA threshold reached: {converted.IMON_PA:.3f} A > "
                     f"{self.imon_pa_threshold_amps:.3f} A."
                 )
+                self._interrogate_laser_state("after step 3 (threshold reached)")
                 return converted
             self.sleep_fn(self.poll_interval_seconds)
 
     def step_4_turn_on_second_stage(self) -> None:
         if self._is_second_stage_enabled():
             self._log("Step 4: second stage already enabled; skipping.")
+            self._interrogate_laser_state("after step 4 (skipped)")
             return
         self._log("Step 4: enabling second stage.")
         self.laser.cmd_set_second_stage_on()
+        self._interrogate_laser_state("after step 4")
 
     def step_5_ramp_to_80_percent(self) -> list[float]:
         current_percent = self._get_current_power_percent()
@@ -659,6 +719,7 @@ class ALSLaserStartupController:
         applied_steps: list[float] = []
         if current_percent >= 80.0 - 1e-9:
             self._log("Step 5: power already at or above 80%; skipping ramp.")
+            self._interrogate_laser_state("after step 5 (skipped)")
             return applied_steps
 
         step = self.ramp_step_percent
@@ -671,6 +732,7 @@ class ALSLaserStartupController:
                 self._log(f"Set power to {target_percent:.0f}%.")
             else:
                 self._log(f"Set power to {target_percent:.0f}% (echoed raw consign={echoed}).")
+            self._interrogate_laser_state(f"step 5 ramp point {target_percent:.0f}%")
             if target_percent < 80.0:
                 self._sleep_with_log(self.ramp_wait_seconds, f"power-settle at {target_percent:.0f}%")
             percent += step
@@ -679,13 +741,16 @@ class ALSLaserStartupController:
     def step_6_warm_up_at_80_percent(self) -> None:
         if self._get_current_power_percent() >= 100.0 - 1e-9:
             self._log("Step 6: power already at 100%; skipping warm-up hold.")
+            self._interrogate_laser_state("after step 6 (skipped)")
             return
         self._log("Step 6: warm-up hold at 80 percent.")
         self._sleep_with_log(self.warmup_seconds, "laser warm-up at 80%")
+        self._interrogate_laser_state("after step 6")
 
     def step_7_turn_to_100_percent(self) -> Optional[int]:
         if self._get_current_power_percent() >= 100.0 - 1e-9:
             self._log("Step 7: laser power already at 100%; skipping.")
+            self._interrogate_laser_state("after step 7 (skipped)")
             return None
         self._log("Step 7: setting laser power to 100 percent.")
         echoed = self.laser.set_power_percent(100.0)
@@ -693,6 +758,7 @@ class ALSLaserStartupController:
             self._log("Laser power set to 100%.")
         else:
             self._log(f"Laser power set to 100% (echoed raw consign={echoed}).")
+        self._interrogate_laser_state("after step 7")
         return echoed
 
     def _get_current_power_percent(self) -> float:
@@ -714,6 +780,7 @@ class ALSLaserStartupController:
                 self._log(f"Set power to {target_percent:.1f}%.")
             else:
                 self._log(f"Set power to {target_percent:.1f}% (echoed raw consign={echoed}).")
+            self._interrogate_laser_state(f"turn-off ramp point {target_percent:.1f}%")
             if target_percent <= 0.0:
                 break
             self._sleep_with_log(self.ramp_wait_seconds, f"power-settle at {target_percent:.1f}%")
@@ -723,25 +790,31 @@ class ALSLaserStartupController:
     def step_2_turn_off_second_stage(self) -> None:
         if not self._is_second_stage_enabled():
             self._log("Turn-off Step 2: second stage already disabled; skipping.")
+            self._interrogate_laser_state("after turn-off step 2 (skipped)")
             return
         self._log("Turn-off Step 2: disabling second stage.")
         self.laser.cmd_set_second_stage_off()
         self._sleep_with_log(self.ramp_wait_seconds, "second stage shutdown")
+        self._interrogate_laser_state("after turn-off step 2")
 
     def step_3_turn_off_interlock(self) -> None:
         if not self._is_interlock_enabled():
             self._log("Turn-off Step 3: interlock already disabled; skipping.")
+            self._interrogate_laser_state("after turn-off step 3 (skipped)")
             return
         self._log("Turn-off Step 3: disabling interlock.")
         self.laser.cmd_set_interlock_off()
         self._sleep_with_log(self.ramp_wait_seconds, "interlock shutdown")
+        self._interrogate_laser_state("after turn-off step 3")
 
     def step_4_turn_off_laser_power(self) -> None:
         if not self._is_power_enabled():
             self._log("Turn-off Step 4: laser power supply already off; skipping.")
+            self._interrogate_laser_state("after turn-off step 4 (skipped)")
             return
         self._log("Turn-off Step 4: turning laser power supply off.")
         self.laser.cmd_set_power_supply_off()
+        self._interrogate_laser_state("after turn-off step 4")
 
     def run_turn_on_procedure(self) -> dict[str, object]:
         self.step_1_turn_laser_power_on()
