@@ -393,11 +393,11 @@ class atomdata():
         for k in nd_keys:
             vars(ad)[k] = slice_ndarray(vars(ad)[k])
         for k in self.data.keys:
-            vars(self.data)[k] = slice_ndarray(vars(self.data)[k])
+            vars(self.data)[k] = slice_ndarray(vars(ad.data)[k])
         if hasattr(self,'scope_data'):
             for k in self.scope_data.keys():
                 for ch in self.scope_data[k].keys():
-                    self.scope_data[k][ch] = slice_ndarray(self.scope_data[k][ch])
+                    self.scope_data[k][ch] = slice_ndarray(ad.scope_data[k][ch])
 
         ad.params.N_img = np.prod(ad.xvardims)
         ad.params.N_shots = int(ad.params.N_shots / sliced_xvardim)
