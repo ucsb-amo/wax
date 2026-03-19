@@ -862,7 +862,10 @@ class DeviceStateGUI(QMainWindow):
         
     def load_config(self):
         """Load configuration from JSON file"""
-        for attempt in range(3):
+        map_attempts = 0
+        decode_attempts = 0
+
+        while True:
             try:
                 with open(self.config_file, 'r') as f:
                     new_config = json.load(f)
@@ -871,11 +874,17 @@ class DeviceStateGUI(QMainWindow):
                     self.update_device_widgets()
                 return
             except FileNotFoundError:
-                self.server_talk.check_for_mapped_data_dir()
-            except json.JSONDecodeError as e:
-                QMessageBox.critical(self, "Error", f"Invalid JSON in configuration file: {e}")
+                if map_attempts < 3:
+                    map_attempts += 1
+                    self.server_talk.check_for_mapped_data_dir()
+                    continue
+                QMessageBox.critical(self, "Error", f"Configuration file not found: {self.config_file}")
                 return
-        QMessageBox.critical(self, "Error", f"Configuration file not found: {self.config_file}")
+            except json.JSONDecodeError as e:
+                decode_attempts += 1
+                if decode_attempts >= 10:
+                    QMessageBox.critical(self, "Error", f"Invalid JSON in configuration file: {e}")
+                    return
             
     def check_config_changes(self):
         """Check for changes in the config file"""
