@@ -6,6 +6,7 @@ from artiq.language.core import now_mu
 from artiq.coredevice.core import Core
 from artiq.experiment import rpc, kernel, delay, parallel, TFloat, portable, TArray, TInt32
 
+import time
 import spcm
 from spcm import units
 
@@ -670,54 +671,70 @@ class TweezerController():
     def awg_init(self,two_d = False):
         """Connects to spectrum AWG, sets full-scale voltage amplitude, initializes trigger mode.
         """        
-        self.card = spcm.Card(self._awg_ip)
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                self.card = spcm.Card(self._awg_ip)
 
-        self.card.open(self._awg_ip)
+                self.card.open(self._awg_ip)
 
-        # self.card.reset()
+                # self.card.reset()
 
-        # setup card for DDS
-        self.card.card_mode(spcm.SPC_REP_STD_DDS)
+                # setup card for DDS
+                self.card.card_mode(spcm.SPC_REP_STD_DDS)
 
-        # Setup the channels
-        channels = spcm.Channels(self.card)
-        channels.enable(True)
-        channels.output_load(50 * units.ohm)
-        channels.amp(0.428 * units.V)
-        # channels.amp(1. * units.V)
-        self.card.write_setup()
+                # Setup the channels
+                channels = spcm.Channels(self.card)
+                channels.enable(True)
+                channels.output_load(50 * units.ohm)
+                channels.amp(0.428 * units.V)
+                # channels.amp(1. * units.V)
+                self.card.write_setup()
 
-        # trigger mode
-        trigger = spcm.Trigger(self.card)
-        trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
-        trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
-        trigger.ext0_level0(1.5 * units.V) # Trigger level is 1.5 V (1500 mV)
-        trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
-        self.card.write_setup()
+                # trigger mode
+                trigger = spcm.Trigger(self.card)
+                trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
+                trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
+                trigger.ext0_level0(1.5 * units.V) # Trigger level is 1.5 V (1500 mV)
+                trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
+                self.card.write_setup()
 
-        # Setup DDS functionality
-        self.dds = spcm.DDSCommandList(self.card)
-        self.dds.reset()
+                # Setup DDS functionality
+                self.dds = spcm.DDSCommandList(self.card)
+                self.dds.reset()
 
-        for trap in self.traps:
-            trap.dds = self.dds
+                for trap in self.traps:
+                    trap.dds = self.dds
 
-        self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
-        self.dds.mode = self.dds.WRITE_MODE.WAIT_IF_FULL
+                self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
+                self.dds.mode = self.dds.WRITE_MODE.WAIT_IF_FULL
 
-        self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+                self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
 
-        # thanks jp
-        self.core_list = [hex(2**n) for n in range(20)]
+                # thanks jp
+                self.core_list = [hex(2**n) for n in range(20)]
 
-        # assign dds cores to channel
-        if two_d:
-            self.dds.cores_on_channel(1, spcm.SPCM_DDS_CORE8,spcm.SPCM_DDS_CORE9,spcm.SPCM_DDS_CORE10,spcm.SPCM_DDS_CORE11)
+                # assign dds cores to channel
+                if two_d:
+                    self.dds.cores_on_channel(1, spcm.SPCM_DDS_CORE8,spcm.SPCM_DDS_CORE9,spcm.SPCM_DDS_CORE10,spcm.SPCM_DDS_CORE11)
 
-        self.dds.write_to_card()
+                self.dds.write_to_card()
 
-        # Start command including enable of trigger engine
-        self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
+                # Start command including enable of trigger engine
+                self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
+                break
+                
+            except spcm.classes_error_exception.SpcmException as e:
+                if e.args[0] == 285:
+                    if attempt < max_retries - 1:
+                        print('error with tweezer awg, trying again')
+                        time.sleep(retry_delay)
+                    else:
+                        raise
+                else:
+                    raise
 
     def set_static_tweezers(self, freq_list=[0.], amp_list=[0.], phase_list=[0.]):
         """Sets a static tweezer array. If no arguments are provided,
