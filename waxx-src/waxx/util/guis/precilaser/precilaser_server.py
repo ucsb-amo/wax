@@ -82,6 +82,7 @@ class PrecilaserLaserServer:
         self.status = LaserStatus()
         self.sequence_state = SequenceState.IDLE
         self.sequence_type: Optional[str] = None
+        self.startup_target_current_a = 10.0
         self._interrupt_requested = False
 
         self._state_lock = threading.Lock()
@@ -157,6 +158,7 @@ class PrecilaserLaserServer:
                 "sequence": {
                     "state": self.sequence_state.value,
                     "type": self.sequence_type,
+                    "startup_target_current_a": self.startup_target_current_a,
                 },
                 "log_count": self._log_offset + len(self._log_entries),
             }
@@ -241,6 +243,9 @@ class PrecilaserLaserServer:
             if command == "SET_STABILITY_MODE":
                 self.set_stability_mode(argument.lower() in {"1", "true", "on"})
                 return "OK"
+            if command == "SET_STARTUP_TARGET_CURRENT":
+                self.set_startup_target_current(float(argument))
+                return "OK"
         except Exception as exc:
             LOGGER.exception("Command failed: %s", exc)
             return f"ERROR: {exc}"
@@ -279,6 +284,9 @@ class PrecilaserLaserServer:
             )
             with self._state_lock:
                 self.status = updated_status
+        except TimeoutError as exc:
+            # Keep connection alive across intermittent missed status frames.
+            LOGGER.warning("Status query timeout (keeping serial open): %s", exc)
         except Exception as exc:
             self._handle_serial_error(exc)
 
@@ -347,6 +355,13 @@ class PrecilaserLaserServer:
             LOGGER.info("Power stability mode set to %s", enabled)
             self._poll_status_locked()
 
+    def set_startup_target_current(self, target_current_a: float) -> None:
+        if target_current_a < 0:
+            raise ValueError("target_current_a must be >= 0")
+        with self._state_lock:
+            self.startup_target_current_a = float(target_current_a)
+        LOGGER.info("Startup target current set to %.2f A", target_current_a)
+
     def start_startup_sequence(self) -> bool:
         return self._start_sequence("STARTUP")
 
@@ -390,7 +405,12 @@ class PrecilaserLaserServer:
         try:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
-            startup_controller = PrecilaserStartupController(self.laser)
+            with self._state_lock:
+                startup_target_current_a = self.startup_target_current_a
+            startup_controller = PrecilaserStartupController(
+                self.laser,
+                target_working_current_a=startup_target_current_a,
+            )
             if sequence_type == "STARTUP":
                 with self._laser_lock:
                     startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)

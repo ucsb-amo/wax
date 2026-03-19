@@ -43,6 +43,7 @@ class PrecilaserController:
     FRAME_TAIL = b"\r\n"
     DEFAULT_HOST = 0x00
     DEFAULT_ADDR = 0x00
+    DEFAULT_SLAVE_ADDR = 0x00
 
     CMD_QUERY_WORKING_STATUS = 0x04
     CMD_QUERY_TEC_TEMPS = 0x05
@@ -57,12 +58,14 @@ class PrecilaserController:
         timeout_s: float = 1.0,
         host: int = DEFAULT_HOST,
         address: int = DEFAULT_ADDR,
+        slave_address: int = DEFAULT_SLAVE_ADDR,
     ):
         self.port = port
         self.baudrate = int(baudrate)
         self.timeout_s = float(timeout_s)
         self.host = host & 0xFF
         self.address = address & 0xFF
+        self.slave_address = slave_address & 0xFF
         self._ser: Optional[serial.Serial] = None
         self._io_lock = threading.Lock()
         self._last_command_time = 0.0
@@ -107,6 +110,7 @@ class PrecilaserController:
         body = bytes([
             self.host,
             self.address,
+            self.slave_address,
             command & 0xFF,
             len(payload) & 0xFF,
         ]) + payload
@@ -126,17 +130,24 @@ class PrecilaserController:
             head = self._read_exact(1)[0]
             if head == self.FRAME_HEAD:
                 break
-        header = self._read_exact(4)
+
+        header = self._read_exact(5)
         host = header[0]
         address = header[1]
-        command = header[2]
-        payload_len = header[3]
+        slave_address = header[2]
+        command = header[3]
+        payload_len = header[4]
+
+        if payload_len > 220:
+            raise ValueError(f"Invalid payload length: {payload_len}")
+
         payload = self._read_exact(payload_len)
         sum_check = self._read_exact(1)[0]
         xor_check = self._read_exact(1)[0]
         tail = self._read_exact(2)
         if tail != self.FRAME_TAIL:
             raise ValueError(f"Invalid frame tail: {tail!r}")
+
         check_data = header + payload
         expected_sum = self._sum_checksum(check_data)
         expected_xor = self._xor_checksum(check_data)
@@ -148,6 +159,8 @@ class PrecilaserController:
             raise ValueError(
                 f"XOR checksum mismatch: expected 0x{expected_xor:02X}, got 0x{xor_check:02X}"
             )
+
+        _ = slave_address
         return host, address, command, payload
 
     @staticmethod
@@ -183,7 +196,11 @@ class PrecilaserController:
             self._last_command_time = time.monotonic()
             expected = self._expected_response_commands(command) if expected_commands is None else expected_commands
             for _ in range(max_frames):
-                _, _, response_cmd, response_payload = self._read_frame()
+                try:
+                    _, _, response_cmd, response_payload = self._read_frame()
+                except ValueError as exc:
+                    LOGGER.debug("Skipping malformed frame: %s", exc)
+                    continue
                 if not expected or response_cmd in expected:
                     return response_payload
             expected_text = "any" if not expected else ", ".join(f"0x{x:02X}" for x in sorted(expected))
