@@ -58,9 +58,9 @@ class LogBufferHandler(logging.Handler):
 class PrecilaserLaserServer:
     def __init__(
         self,
-        host: str = "192.168.1.76",
+        host: str = "0.0.0.0",
         port: int = 5560,
-        serial_port: str = "COM20",
+        serial_port: str = "COM6",
         poll_interval_s: float = 1.0,
         max_log_entries: int = 2000,
         auto_connect: bool = True,
@@ -71,6 +71,7 @@ class PrecilaserLaserServer:
         self.poll_interval_s = float(poll_interval_s)
         self.max_log_entries = int(max_log_entries)
         self.auto_connect = auto_connect
+        self.reconnect_delay_s = 0.25
 
         self.running = False
         self.server_socket: Optional[socket.socket] = None
@@ -82,7 +83,6 @@ class PrecilaserLaserServer:
         self.status = LaserStatus()
         self.sequence_state = SequenceState.IDLE
         self.sequence_type: Optional[str] = None
-        self.startup_target_current_a = 10.0
         self._interrupt_requested = False
 
         self._state_lock = threading.Lock()
@@ -158,7 +158,6 @@ class PrecilaserLaserServer:
                 "sequence": {
                     "state": self.sequence_state.value,
                     "type": self.sequence_type,
-                    "startup_target_current_a": self.startup_target_current_a,
                 },
                 "log_count": self._log_offset + len(self._log_entries),
             }
@@ -243,9 +242,6 @@ class PrecilaserLaserServer:
             if command == "SET_STABILITY_MODE":
                 self.set_stability_mode(argument.lower() in {"1", "true", "on"})
                 return "OK"
-            if command == "SET_STARTUP_TARGET_CURRENT":
-                self.set_startup_target_current(float(argument))
-                return "OK"
         except Exception as exc:
             LOGGER.exception("Command failed: %s", exc)
             return f"ERROR: {exc}"
@@ -284,11 +280,30 @@ class PrecilaserLaserServer:
             )
             with self._state_lock:
                 self.status = updated_status
-        except TimeoutError as exc:
-            # Keep connection alive across intermittent missed status frames.
-            LOGGER.warning("Status query timeout (keeping serial open): %s", exc)
         except Exception as exc:
+            if isinstance(exc, ValueError) and "Invalid frame tail" in str(exc):
+                self._recover_serial_after_invalid_tail_locked(exc)
+                return
             self._handle_serial_error(exc)
+
+    def _recover_serial_after_invalid_tail_locked(self, exc: Exception) -> None:
+        LOGGER.warning("Invalid frame tail detected (%s); reconnecting serial", exc)
+        try:
+            if self.laser is not None:
+                try:
+                    self.laser.close()
+                except Exception:
+                    pass
+            time.sleep(self.reconnect_delay_s)
+            self.laser = PrecilaserController(port=self.serial_port)
+            self.laser.connect()
+            LOGGER.info("Serial reconnected on %s after invalid frame tail", self.serial_port)
+            with self._state_lock:
+                self.status.connected = True
+                self.status.connection_state = ConnectionState.CONNECTED
+        except Exception as reconnect_exc:
+            LOGGER.exception("Serial reconnect after invalid tail failed: %s", reconnect_exc)
+            self._handle_serial_error(reconnect_exc)
 
     def _handle_serial_error(self, exc: Exception) -> None:
         LOGGER.exception("Serial communication failed: %s", exc)
@@ -311,7 +326,11 @@ class PrecilaserLaserServer:
                     self.laser = PrecilaserController(port=self.serial_port)
                 self.laser.connect()
                 LOGGER.info("Serial connection opened on %s", self.serial_port)
-                self._poll_status_locked()
+                # Do not block CONNECT_SERIAL on an immediate status query.
+                # Background polling will populate telemetry on the next cycle.
+                with self._state_lock:
+                    self.status.connected = True
+                    self.status.connection_state = ConnectionState.CONNECTED
             except Exception as exc:
                 self._handle_serial_error(exc)
                 raise
@@ -354,13 +373,6 @@ class PrecilaserLaserServer:
             self.laser.set_power_stability_mode(enabled)
             LOGGER.info("Power stability mode set to %s", enabled)
             self._poll_status_locked()
-
-    def set_startup_target_current(self, target_current_a: float) -> None:
-        if target_current_a < 0:
-            raise ValueError("target_current_a must be >= 0")
-        with self._state_lock:
-            self.startup_target_current_a = float(target_current_a)
-        LOGGER.info("Startup target current set to %.2f A", target_current_a)
 
     def start_startup_sequence(self) -> bool:
         return self._start_sequence("STARTUP")
@@ -405,12 +417,7 @@ class PrecilaserLaserServer:
         try:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
-            with self._state_lock:
-                startup_target_current_a = self.startup_target_current_a
-            startup_controller = PrecilaserStartupController(
-                self.laser,
-                target_working_current_a=startup_target_current_a,
-            )
+            startup_controller = PrecilaserStartupController(self.laser)
             if sequence_type == "STARTUP":
                 with self._laser_lock:
                     startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
@@ -434,7 +441,7 @@ class PrecilaserLaserServer:
 
 
 
-def main(host: str = "192.168.1.76", port: int = 5560, serial_port: str = "COM20") -> None:
+def main(host: str = "0.0.0.0", port: int = 5560, serial_port: str = "COM6") -> None:
     logging.basicConfig(level=logging.INFO)
     server = PrecilaserLaserServer(host=host, port=port, serial_port=serial_port)
     server.start()

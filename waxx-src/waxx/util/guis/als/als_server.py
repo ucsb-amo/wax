@@ -55,6 +55,31 @@ class LogBufferHandler(logging.Handler):
         self.server.append_log_entry(self.format(record))
 
 
+class _LockedLaserProxy:
+    """Thread-safe proxy that serializes each laser command with the server lock."""
+
+    def __init__(self, server: "ALSLaserServer"):
+        self._server = server
+
+    def _get_laser(self) -> ALSLaserController:
+        laser = self._server.laser
+        if laser is None:
+            raise RuntimeError("Laser not connected")
+        return laser
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._get_laser(), name)
+        if not callable(attr):
+            return attr
+
+        def _locked_call(*args, **kwargs):
+            with self._server._laser_lock:
+                live_attr = getattr(self._get_laser(), name)
+                return live_attr(*args, **kwargs)
+
+        return _locked_call
+
+
 class ALSLaserServer:
     STARTUP_STEPS = [
         (1, "Turn Power On", "step_1_turn_laser_power_on"),
@@ -110,6 +135,7 @@ class ALSLaserServer:
 
         self._state_lock = threading.Lock()
         self._laser_lock = threading.Lock()
+        self._sequence_laser = _LockedLaserProxy(self)
         self._log_lock = threading.Lock()
         self._log_entries: list[str] = []
         self._log_offset = 0
@@ -304,8 +330,7 @@ class ALSLaserServer:
     def _poll_loop(self) -> None:
         while self.running:
             try:
-                if self.sequence_state != SequenceState.RUNNING:
-                    self.poll_status()
+                self.poll_status()
             except Exception as exc:
                 LOGGER.exception("Background polling failed: %s", exc)
             time.sleep(self.poll_interval_s)
@@ -323,9 +348,12 @@ class ALSLaserServer:
                 return
             converted = self.laser.convert_frame(frame)
             power_raw = self.laser.cmd_ask_power_consign()
-            power_enabled = bool(frame.statuses.get("STS_RELAY_PSU", 0)) or bool(
-                frame.statuses.get("STS_RACK_PSU", 0)
-            )
+            power_enabled = bool(frame.statuses.get("STS_RELAY_PSU", 0))
+            if not power_enabled:
+                power_raw = 0
+                pmon_w = 0.0
+            else:
+                pmon_w = converted.PMON_W
             updated_status = LaserStatus(
                 power_enabled=power_enabled,
                 interlock_enabled=bool(self.laser.cmd_ask_interlock_sts()),
@@ -335,7 +363,7 @@ class ALSLaserServer:
                 temperature_set_p=converted.TSET_P,
                 imon_pa=converted.IMON_PA,
                 lmon=converted.LMON,
-                pmon_w=converted.PMON_W,
+                pmon_w=pmon_w,
                 connected=True,
                 connection_state=ConnectionState.CONNECTED,
             )
@@ -504,6 +532,10 @@ class ALSLaserServer:
             self._interrupt_requested = True
         LOGGER.warning("Sequence interrupt requested")
 
+    def _is_interrupt_requested(self) -> bool:
+        with self._state_lock:
+            return self._interrupt_requested
+
     def _run_startup_sequence(self) -> None:
         self._run_sequence(sequence_type="STARTUP", steps=self.STARTUP_STEPS)
 
@@ -515,8 +547,9 @@ class ALSLaserServer:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
             startup_controller = ALSLaserStartupController(
-                self.laser,
+                self._sequence_laser,
                 interrogate_callback=self._on_sequence_interrogated_state,
+                should_interrupt=self._is_interrupt_requested,
             )
             for step_num, step_name, method_name in steps:
                 with self._state_lock:
@@ -531,9 +564,8 @@ class ALSLaserServer:
                     self._current_step_already_done = False
                     self._set_step_state(sequence_type, step_num - 1, "doing")
                 LOGGER.info("%s step %s: %s", sequence_type.title(), step_num, step_name)
-                with self._laser_lock:
-                    getattr(startup_controller, method_name)()
-                    self._poll_status_locked()
+                getattr(startup_controller, method_name)()
+                self.poll_status()
                 with self._state_lock:
                     self._set_step_state(sequence_type, step_num - 1, "done")
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -547,6 +579,12 @@ class ALSLaserServer:
                 self.current_step_number = None
                 self.current_step_started_epoch = None
             LOGGER.info("%s sequence completed", sequence_type.title())
+        except InterruptedError:
+            LOGGER.warning("%s sequence interrupted", sequence_type.title())
+            with self._state_lock:
+                self.sequence_state = SequenceState.INTERRUPTED
+                self.current_step_number = None
+                self.current_step_started_epoch = None
         except Exception as exc:
             LOGGER.exception("%s sequence failed: %s", sequence_type.title(), exc)
             with self._state_lock:
@@ -559,16 +597,23 @@ class ALSLaserServer:
 
     def _on_sequence_interrogated_state(self, state: dict) -> None:
         """Receive controller interrogation snapshots and publish them to GUI clients."""
+        power_enabled = bool(state.get("power_enabled", False))
+        power_setpoint_percent = float(state.get("power_setpoint_percent", 0.0))
+        pmon_w = float(state.get("pmon_w", 0.0))
+        if not power_enabled:
+            power_setpoint_percent = 0.0
+            pmon_w = 0.0
+
         updated_status = LaserStatus(
-            power_enabled=bool(state.get("power_enabled", False)),
+            power_enabled=power_enabled,
             interlock_enabled=bool(state.get("interlock_enabled", False)),
             second_stage_enabled=bool(state.get("second_stage_enabled", False)),
-            power_setpoint_percent=float(state.get("power_setpoint_percent", 0.0)),
+            power_setpoint_percent=power_setpoint_percent,
             temperature_act_p=float(state.get("temperature_act_p", 0.0)),
             temperature_set_p=float(state.get("temperature_set_p", 0.0)),
             imon_pa=float(state.get("imon_pa", 0.0)),
             lmon=float(state.get("lmon", 0.0)),
-            pmon_w=float(state.get("pmon_w", 0.0)),
+            pmon_w=pmon_w,
             connected=bool(state.get("connected", True)),
             connection_state=ConnectionState.CONNECTED,
         )

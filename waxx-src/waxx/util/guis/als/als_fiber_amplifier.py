@@ -568,6 +568,7 @@ class ALSLaserStartupController:
         poll_interval_seconds: float = 1.0,
         sleep_fn=None,
         interrogate_callback: Optional[Callable[[dict], None]] = None,
+        should_interrupt: Optional[Callable[[], bool]] = None,
     ):
         if imon_pa_threshold_amps <= 0:
             raise ValueError("imon_pa_threshold_amps must be > 0")
@@ -588,6 +589,7 @@ class ALSLaserStartupController:
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.sleep_fn = time.sleep if sleep_fn is None else sleep_fn
         self.interrogate_callback = interrogate_callback
+        self.should_interrupt = should_interrupt
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -597,7 +599,24 @@ class ALSLaserStartupController:
         if seconds <= 0:
             return
         self._log(f"Waiting {seconds:.1f} s for {reason}.")
-        self.sleep_fn(seconds)
+        self._sleep_interruptibly(seconds)
+
+    def _interrupt_requested(self) -> bool:
+        return bool(self.should_interrupt is not None and self.should_interrupt())
+
+    def _raise_if_interrupted(self) -> None:
+        if self._interrupt_requested():
+            self._log("Interrupt requested; aborting current wait.")
+            raise InterruptedError("Sequence interrupted")
+
+    def _sleep_interruptibly(self, seconds: float) -> None:
+        remaining = float(seconds)
+        while remaining > 0:
+            self._raise_if_interrupted()
+            chunk = min(remaining, 1.0)
+            self.sleep_fn(chunk)
+            remaining -= chunk
+        self._raise_if_interrupted()
 
     def _read_converted_snapshot(self) -> ConvertedFrame:
         frame = self.laser.stop_and_read()
@@ -691,6 +710,7 @@ class ALSLaserStartupController:
             self._interrogate_laser_state("after step 3 (already above threshold)")
             return converted
         while True:
+            self._raise_if_interrupted()
             converted = self._read_converted_snapshot()
             if converted.IMON_PA > self.imon_pa_threshold_amps:
                 self._log(
@@ -699,7 +719,7 @@ class ALSLaserStartupController:
                 )
                 self._interrogate_laser_state("after step 3 (threshold reached)")
                 return converted
-            self.sleep_fn(self.poll_interval_seconds)
+            self._sleep_interruptibly(self.poll_interval_seconds)
 
     def step_4_turn_on_second_stage(self) -> None:
         if self._is_second_stage_enabled():

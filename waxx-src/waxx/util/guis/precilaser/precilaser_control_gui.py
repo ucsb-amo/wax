@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import atexit
 import logging
 import math
 import sys
-import traceback
 from typing import Any
 
 from PyQt6.QtCore import Qt, QTimer
@@ -16,7 +14,6 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -82,13 +79,6 @@ class PrecilaserControlGUI(QMainWindow):
         self._last_remote_error: str | None = None
         self._laser_enabled = False
         self._stability_enabled = False
-        self._startup_target_current_a = 3.0
-        self._shutdown_cleanup_done = False
-
-        app = QApplication.instance()
-        if app is not None:
-            app.aboutToQuit.connect(self._shutdown_cleanup)
-        atexit.register(self._shutdown_cleanup)
 
         self.setWindowTitle("Precilaser Control")
         self.resize(1080, 760)
@@ -210,12 +200,6 @@ class PrecilaserControlGUI(QMainWindow):
         layout.addLayout(current_row)
 
         seq_row = QHBoxLayout()
-        self.startup_config_button = QPushButton("⚙")
-        self.startup_config_button.setToolTip("Set startup ramp target current")
-        self.startup_config_button.setFixedWidth(34)
-        self.startup_config_button.clicked.connect(self._configure_startup_target_current)
-        seq_row.addWidget(self.startup_config_button)
-
         self.startup_button = QPushButton("Start Turn On")
         self.startup_button.clicked.connect(self._start_startup)
         seq_row.addWidget(self.startup_button)
@@ -433,30 +417,6 @@ class PrecilaserControlGUI(QMainWindow):
         except Exception as exc:
             self._append_log(f"ERROR startup sequence: {exc}")
 
-    def _configure_startup_target_current(self) -> None:
-        value, ok_pressed = QInputDialog.getDouble(
-            self,
-            "Startup Ramp Target",
-            "Target working current for startup (A):",
-            value=float(self._startup_target_current_a),
-            min=0.0,
-            max=655.35,
-            decimals=2,
-        )
-        if not ok_pressed:
-            return
-        try:
-            if self.client.set_startup_target_current(value):
-                self._startup_target_current_a = float(value)
-                self.startup_config_button.setToolTip(
-                    f"Startup target current: {self._startup_target_current_a:.2f} A"
-                )
-                self._set_status_message(
-                    f"Startup target current set to {self._startup_target_current_a:.2f} A"
-                )
-        except Exception as exc:
-            self._append_log(f"ERROR set startup target current: {exc}")
-
     def _start_shutdown(self):
         try:
             if self.client.run_shutdown_sequence():
@@ -470,16 +430,6 @@ class PrecilaserControlGUI(QMainWindow):
                 self._set_status_message("Interrupt requested")
         except Exception as exc:
             self._append_log(f"ERROR interrupt sequence: {exc}")
-
-    def _shutdown_cleanup(self) -> None:
-        if self._shutdown_cleanup_done:
-            return
-        self._shutdown_cleanup_done = True
-        try:
-            self.client.disconnect_serial()
-        except Exception:
-            # Ignore cleanup failures during app teardown.
-            pass
 
     def _sync_remote_state(self) -> None:
         try:
@@ -548,41 +498,20 @@ class PrecilaserControlGUI(QMainWindow):
 
         seq_state = str(sequence.get("state", "IDLE"))
         seq_type = str(sequence.get("type") or "-")
-        if "startup_target_current_a" in sequence:
-            self._startup_target_current_a = float(sequence.get("startup_target_current_a", 3.0))
-            self.startup_config_button.setToolTip(
-                f"Startup target current: {self._startup_target_current_a:.2f} A"
-            )
         self.sequence_state_value.setText(f"Sequence: {seq_state} ({seq_type})")
         self.interrupt_button.setVisible(seq_state == "RUNNING")
 
     def closeEvent(self, event):
         self.status_timer.stop()
-        self._shutdown_cleanup()
         return super().closeEvent(event)
 
 
 
 def main(ip: str = "192.168.1.76", port: int = 5560):
-    previous_excepthook = sys.excepthook
-
-    def _crash_hook(exc_type, exc_value, exc_tb):
-        try:
-            window._shutdown_cleanup()
-        except Exception:
-            pass
-        traceback.print_exception(exc_type, exc_value, exc_tb)
-        previous_excepthook(exc_type, exc_value, exc_tb)
-
     app = QApplication(sys.argv)
     window = PrecilaserControlGUI(ip=ip, port=port)
-    sys.excepthook = _crash_hook
     window.show()
-    try:
-        exit_code = app.exec()
-    finally:
-        window._shutdown_cleanup()
-    sys.exit(exit_code)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -62,6 +62,3 @@ class PrecilaserGuiClient:
 
     def set_stability_mode(self, enabled: bool) -> bool:
         return self._send_ok_command(f"SET_STABILITY_MODE {1 if enabled else 0}")
-
-    def set_startup_target_current(self, current_amps: float) -> bool:
-        return self._send_ok_command(f"SET_STARTUP_TARGET_CURRENT {float(current_amps):.6f}")

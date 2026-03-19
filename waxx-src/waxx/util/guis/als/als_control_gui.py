@@ -1422,21 +1422,35 @@ class ALSControlGUI(QMainWindow):
         
         # Second stage status dot
         self.second_stage_status_dot.set_status(self.status.second_stage_enabled)
+
+        all_indicators_off = (
+            not self.status.power_enabled
+            and not self.status.interlock_enabled
+            and not self.status.second_stage_enabled
+        )
+        displayed_setpoint_percent = 0.0 if not self.status.power_enabled else self.status.power_setpoint_percent
+        displayed_optical_power_w = 0.0 if not self.status.power_enabled else self.status.pmon_w
         
         # Power setpoint (only update label if not editing)
         if not self.power_edit_checkbox.isChecked():
-            self.power_setpoint_label.setText(f"{self.status.power_setpoint_percent:.1f}%")
+            self.power_setpoint_label.setText(f"{displayed_setpoint_percent:.1f}%")
         
         # Temperature
-        self.temp_label.setText(
-            f"{self.status.temperature_act_p:.1f} / {self.status.temperature_set_p:.1f} °C"
-        )
+        if all_indicators_off:
+            self.temp_label.setText("-- / -- °C")
+        else:
+            self.temp_label.setText(
+                f"{self.status.temperature_act_p:.1f} / {self.status.temperature_set_p:.1f} °C"
+            )
         
         # Current
-        self.current_label.setText(f"{self.status.imon_pa:.2f} / {self.status.lmon:.2f} A")
+        if all_indicators_off:
+            self.current_label.setText("-- / -- A")
+        else:
+            self.current_label.setText(f"{self.status.imon_pa:.2f} / {self.status.lmon:.2f} A")
         
         # Optical power
-        self.optical_power_label.setText(f"{self.status.pmon_w:.2f} W")
+        self.optical_power_label.setText(f"{displayed_optical_power_w:.2f} W")
     
     def closeEvent(self, event):
         """Handle window close"""
