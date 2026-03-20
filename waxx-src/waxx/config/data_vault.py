@@ -142,6 +142,10 @@ class DataVault():
                             dtype,
                             external_data_bool,
                             self._expt)
+    
+    def init(self):
+        self.write_keys()
+        self.set_container_sizes()
 
     def write_keys(self):
         for k in self.__dict__.keys():
@@ -164,7 +168,3 @@ class DataVault():
         for dc in self._container_list:
             dc._put_shot_data()
         self._expt.core.break_realtime()
-
-    def prime_data_containers(self):
-        for dc in self._container_list:
-            dc._data_put_this_shot = False
