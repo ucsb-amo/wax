@@ -71,7 +71,7 @@ class PrecilaserLaserServer:
         self.poll_interval_s = float(poll_interval_s)
         self.max_log_entries = int(max_log_entries)
         self.auto_connect = auto_connect
-        self.reconnect_delay_s = 0.25
+        self.reconnect_delay_s = 0.3
 
         self.running = False
         self.server_socket: Optional[socket.socket] = None
@@ -287,7 +287,7 @@ class PrecilaserLaserServer:
             self._handle_serial_error(exc)
 
     def _recover_serial_after_invalid_tail_locked(self, exc: Exception) -> None:
-        LOGGER.warning("Invalid frame tail detected (%s); reconnecting serial", exc)
+        LOGGER.debug("Invalid frame tail detected (%s); reconnecting serial", exc)
         try:
             if self.laser is not None:
                 try:
@@ -297,7 +297,7 @@ class PrecilaserLaserServer:
             time.sleep(self.reconnect_delay_s)
             self.laser = PrecilaserController(port=self.serial_port)
             self.laser.connect()
-            LOGGER.info("Serial reconnected on %s after invalid frame tail", self.serial_port)
+            LOGGER.debug("Serial reconnected on %s after invalid frame tail", self.serial_port)
             with self._state_lock:
                 self.status.connected = True
                 self.status.connection_state = ConnectionState.CONNECTED
