@@ -133,6 +133,8 @@ class MagnetometerServer:
         self.stop_event = threading.Event()
         self.history_lock = threading.Lock()
         self.reference_lock = threading.Lock()
+        self.serial_lock = threading.Lock()
+        self.serial_should_be_connected = True
         self.history = deque(maxlen=MAX_HISTORY)
 
     # ------------------------------------------------------------------
@@ -182,8 +184,17 @@ class MagnetometerServer:
         bad_reads = 0
 
         while not self.stop_event.is_set():
+            if not self.serial_should_be_connected:
+                if self.stop_event.wait(self.poll_interval):
+                    break
+                continue
+
             try:
-                x_counts, y_counts, z_counts = self.reader.read_one()
+                if not self._is_serial_connected():
+                    self._reconnect()
+
+                with self.serial_lock:
+                    x_counts, y_counts, z_counts = self.reader.read_one()
                 values = (x_counts, y_counts, z_counts)
 
                 if values == last_values:
@@ -193,9 +204,8 @@ class MagnetometerServer:
                     last_values = values
 
                 if same_count == MAX_STUCK_SAME_VALUES:
-                    print(
-                        f"[WARN] Readings unchanged for {same_count} polls — "
-                        "field appears stable (not an error)."
+                    raise RuntimeError(
+                        f"Sensor readings stuck for {same_count} consecutive polls"
                     )
 
                 bad_reads = 0
@@ -211,8 +221,11 @@ class MagnetometerServer:
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
+                if not self.serial_should_be_connected:
+                    continue
                 bad_reads += 1
-                print(f"[ERROR] Read error ({bad_reads}): {exc!r} — reconnecting…")
+                print(f"[ERROR] Read error ({bad_reads}): {exc!r}")
+                print("[INFO] Starting serial disconnect/reconnect cycle.")
                 try:
                     self._reconnect()
                     last_values = None
@@ -232,21 +245,47 @@ class MagnetometerServer:
     def _reconnect(self):
         if self.stop_event.is_set():
             raise RuntimeError("Server stopping")
-        if self.reader is not None:
-            try:
-                self.reader.close()
-            except Exception:
-                pass
-        time.sleep(0.2)
-        if self.stop_event.is_set():
-            raise RuntimeError("Server stopping")
-        self.reader = HMR2300Reader(
-            port=self.serial_port,
-            baud=self.baud,
-            device_id=self.device_id,
-        )
-        self.reader.open()
-        self.reader.setup()
+        with self.serial_lock:
+            if self.reader is not None:
+                try:
+                    print(f"[INFO] Disconnecting serial device on {self.serial_port}.")
+                    self.reader.close()
+                    print("[INFO] Serial device disconnected.")
+                except Exception:
+                    pass
+                self.reader = None
+
+            print(f"[INFO] Reconnecting serial device on {self.serial_port}.")
+            time.sleep(0.2)
+            if self.stop_event.is_set():
+                raise RuntimeError("Server stopping")
+            self.reader = HMR2300Reader(
+                port=self.serial_port,
+                baud=self.baud,
+                device_id=self.device_id,
+            )
+            self.reader.open()
+            self.reader.setup()
+            print("[INFO] Serial device reconnected and configured.")
+
+    def _disconnect_serial(self):
+        with self.serial_lock:
+            if self.reader is not None:
+                try:
+                    print(f"[INFO] Manually disconnecting serial device on {self.serial_port}.")
+                    self.reader.close()
+                    print("[INFO] Serial device disconnected by operator.")
+                except Exception:
+                    pass
+                self.reader = None
+
+    def _is_serial_connected(self):
+        with self.serial_lock:
+            return (
+                self.reader is not None
+                and self.reader.ser is not None
+                and self.reader.ser.is_open
+            )
 
     # ------------------------------------------------------------------
     # TCP server loop (main thread)
@@ -288,6 +327,26 @@ class MagnetometerServer:
     def _dispatch(self, command: str) -> dict:
         if command == "PING":
             return {"ok": True, "message": "pong"}
+
+        if command == "GET_SERIAL_STATUS":
+            return {
+                "ok": True,
+                "connected": self._is_serial_connected(),
+                "target_connected": bool(self.serial_should_be_connected),
+            }
+
+        if command == "SERIAL_DISCONNECT":
+            self.serial_should_be_connected = False
+            self._disconnect_serial()
+            return {"ok": True, "connected": False}
+
+        if command == "SERIAL_RECONNECT":
+            self.serial_should_be_connected = True
+            try:
+                self._reconnect()
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "connected": self._is_serial_connected()}
 
         if command == "GET_FIELD":
             with self.history_lock:

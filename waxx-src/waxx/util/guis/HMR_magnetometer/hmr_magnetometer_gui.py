@@ -103,6 +103,9 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         # Reference summary label
         self.reference_info_label = None
+        self.latest_log_preview_label = None
+        self.serial_button = None
+        self.serial_connected = None
 
         self._build_ui()
         self._auto_load_latest_reference()
@@ -111,7 +114,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.queue_timer.timeout.connect(self._process_queue)
         self.queue_timer.start(100)
 
+        self.serial_status_timer = QtCore.QTimer(self)
+        self.serial_status_timer.timeout.connect(self._refresh_serial_status)
+        self.serial_status_timer.start(2500)
+
         QtCore.QTimer.singleShot(200, self.start_monitor)
+        QtCore.QTimer.singleShot(300, self._refresh_serial_status)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -155,6 +163,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.window_spin.setDecimals(2)
         self.window_spin.setValue(self.window_s)
         self.window_spin.setSingleStep(5.0)
+        self.window_spin.setMaximumWidth(92)
         self.window_spin.valueChanged.connect(self._on_window_changed)
         time_layout.addWidget(self.window_spin, 0, 1)
 
@@ -164,6 +173,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.stats_spin.setDecimals(2)
         self.stats_spin.setValue(self.stats_window_s)
         self.stats_spin.setSingleStep(5.0)
+        self.stats_spin.setMaximumWidth(92)
         self.stats_spin.valueChanged.connect(self._on_stats_window_changed)
         time_layout.addWidget(self.stats_spin, 1, 1)
         top.addWidget(time_group, 1)
@@ -173,8 +183,11 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             "QGroupBox { border: 1px solid #cfd6df; border-radius: 8px; margin-top: 8px; font-weight: 700; }"
             "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; color: #506070; }"
         )
-        action_layout = QtWidgets.QHBoxLayout(action_group)
-        action_layout.setContentsMargins(10, 10, 10, 8)
+        action_col = QtWidgets.QVBoxLayout(action_group)
+        action_col.setContentsMargins(10, 10, 10, 8)
+        action_col.setSpacing(4)
+
+        action_layout = QtWidgets.QHBoxLayout()
         action_layout.setSpacing(6)
 
         self.toggle_button = QtWidgets.QPushButton("Start")
@@ -192,6 +205,14 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         log_btn = QtWidgets.QPushButton("Open Log")
         log_btn.clicked.connect(self._open_log_dialog)
         action_layout.addWidget(log_btn)
+
+        self.latest_log_preview_label = QtWidgets.QLabel("last log: --")
+        self.latest_log_preview_label.setStyleSheet("color: #6f7a87; font-size: 11px;")
+        self.latest_log_preview_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        action_col.addLayout(action_layout)
+        action_col.addWidget(self.latest_log_preview_label)
         top.addWidget(action_group, 1)
 
         ref_group = QtWidgets.QGroupBox("Reference")
@@ -232,20 +253,30 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         top.addWidget(ref_group, 1)
 
-        settings_btn = QtWidgets.QPushButton("⚙ Settings")
+        right_controls = QtWidgets.QVBoxLayout()
+        right_controls.setContentsMargins(0, 0, 0, 0)
+        right_controls.setSpacing(6)
+
+        settings_btn = QtWidgets.QPushButton("⚙")
         settings_btn.clicked.connect(self.open_settings_window)
-        settings_btn.setFixedHeight(
-            max(
-                time_group.sizeHint().height(),
-                action_group.sizeHint().height(),
-                ref_group.sizeHint().height(),
-            )
-        )
+        settings_btn.setFixedSize(34, 30)
         settings_btn.setStyleSheet(
-            "QPushButton { background: #ffffff; border: 1px solid #bcc7d6; border-radius: 7px; padding: 5px 12px; font-weight: 600; }"
+            "QPushButton { background: #ffffff; border: 1px solid #bcc7d6; border-radius: 7px; padding: 0; font-weight: 700; }"
             "QPushButton:hover { background: #eef3ff; border-color: #8aa2ff; }"
         )
-        top.addWidget(settings_btn, 0, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        right_controls.addWidget(settings_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        self.serial_button = QtWidgets.QPushButton("Serial: ?")
+        self.serial_button.setFixedHeight(28)
+        self.serial_button.setStyleSheet(
+            "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; border-radius: 7px; padding: 2px 10px; }"
+            "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+        )
+        self.serial_button.clicked.connect(self._toggle_serial_connection)
+        right_controls.addWidget(self.serial_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        right_controls.addStretch(1)
+
+        top.addLayout(right_controls)
 
         # --- plots + left readout cards (one row per channel) ---
         rows = QtWidgets.QVBoxLayout()
@@ -1128,9 +1159,57 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.log_dialog = None
         self.log_text = None
 
+    def _refresh_serial_status(self):
+        if self.serial_button is None:
+            return
+        try:
+            result = self.client._get_serial_status(timeout=1.5)
+            connected = bool(result.get("connected", False))
+        except Exception:
+            self.serial_connected = None
+            self.serial_button.setText("Serial: ?")
+            self.serial_button.setStyleSheet(
+                "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+            )
+            return
+
+        self.serial_connected = connected
+        if connected:
+            self.serial_button.setText("Serial: Connected")
+            self.serial_button.setStyleSheet(
+                "QPushButton { background: #e9f7ef; border: 1px solid #95d3ab; color: #2f6a45; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #dcf0e5; border-color: #77c594; }"
+            )
+        else:
+            self.serial_button.setText("Serial: Disconnected")
+            self.serial_button.setStyleSheet(
+                "QPushButton { background: #fbeeee; border: 1px solid #e6abab; color: #8b4040; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #f7dfdf; border-color: #d88f8f; }"
+            )
+
+    def _toggle_serial_connection(self):
+        try:
+            if self.serial_connected is False:
+                result = self.client._serial_reconnect(timeout=4.0)
+                action_name = "reconnect"
+            else:
+                result = self.client._serial_disconnect(timeout=2.5)
+                action_name = "disconnect"
+            if not result.get("ok", False):
+                raise RuntimeError(result.get("error", f"Serial {action_name} failed"))
+            self._set_status(result.get("message", f"Serial {action_name} command sent"))
+        except Exception as exc:
+            self._set_status(f"Serial control error: {exc}")
+        finally:
+            self._refresh_serial_status()
+
     def _set_status(self, text: str):
         stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
         self.log_lines.append(stamped)
+        if self.latest_log_preview_label is not None:
+            preview = text if len(text) <= 100 else (text[:97] + "...")
+            self.latest_log_preview_label.setText(f"{preview}")
         if self.log_text is not None:
             self.log_text.appendPlainText(stamped)
             sb = self.log_text.verticalScrollBar()

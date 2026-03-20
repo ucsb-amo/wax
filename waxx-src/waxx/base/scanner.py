@@ -118,6 +118,12 @@ class Scanner():
         pass
 
     @kernel
+    def post_scan(self):
+        """This method is run just after the whole scan completes.
+        Usually overloaded in kexp.Base.
+        """
+
+    @kernel
     def scan(self):
         """
         Runs the scan_kernel function for each value of the xvars specified.
@@ -166,6 +172,8 @@ class Scanner():
             scanning = self.step_scan()
 
             self.core.break_realtime()
+
+        self.post_scan()
 
     def update_params_from_xvars(self):
         """Updates the host ExptParams attributes and recomputes derived

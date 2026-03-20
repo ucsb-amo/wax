@@ -107,15 +107,35 @@ class HMRClient:
         """Fetch the latest reference with timestamp <= *timestamp_s*."""
         return self._request(f"GET_REFERENCE_BEFORE {timestamp_s:.6f}", timeout)
 
-    def get_field_magnitude(self, timeout: float = 2.0) -> float:
+    def _get_serial_status(self, timeout: float = 2.0) -> dict:
+        """Return server-side serial connection status."""
+        return self._request("GET_SERIAL_STATUS", timeout)
+
+    def _serial_disconnect(self, timeout: float = 2.0) -> dict:
+        """Manually disconnect serial device on server."""
+        return self._request("SERIAL_DISCONNECT", timeout)
+
+    def _serial_reconnect(self, timeout: float = 3.0) -> dict:
+        """Manually reconnect serial device on server."""
+        return self._request("SERIAL_RECONNECT", timeout)
+
+    def get_field_magnitude(self, timeout: float = 5.) -> float:
         """Return the latest total field magnitude in Gauss.
 
         Raises ``RuntimeError`` if the server returns an error or has no data yet.
         """
-        result = self._get_field(timeout=timeout)
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error", "Server returned error"))
-        return float(result["Btot"])
+        max_attempts = 5
+        per_try_timeout = min(1.5, timeout / max_attempts)
+        
+        for attempt in range(max_attempts):
+            try:
+                result = self._get_field(timeout=per_try_timeout)
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error", "Server returned error"))
+                return float(result["Btot"])
+            except (socket.timeout, socket.error) as e:
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(f"Failed after {max_attempts} attempts: {e}")
 
     def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
         """Return [Bx, By, Bz, Btot] from the newest reference at or before *date*.

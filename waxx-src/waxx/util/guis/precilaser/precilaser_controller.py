@@ -323,7 +323,11 @@ class PrecilaserStartupController:
         self.log_fn = LOGGER.info if log_fn is None else log_fn
 
     def _log(self, message: str) -> None:
-        self.log_fn(message)
+        now = time.time()
+        local = time.localtime(now)
+        millis = int((now - int(now)) * 1000)
+        stamp = time.strftime("%H:%M:%S", local)
+        self.log_fn(f"[{stamp}.{millis:03d}] {message}")
 
     def _sleep_with_interrupt_check(self, seconds: float, should_continue: Callable[[], bool]) -> None:
         if seconds <= 0:
@@ -349,7 +353,13 @@ class PrecilaserStartupController:
 
         step = abs(self.ramp_step_a)
         direction = 1.0 if target_current_a > current else -1.0
+        direction_text = "up" if direction > 0 else "down"
+        self._log(
+            f"Ramping {direction_text} from {current:.2f} A to {target_current_a:.2f} A "
+            f"in {step:.2f} A steps with {self.ramp_wait_s:.2f} s wait."
+        )
         next_value = current
+        step_index = 0
         while True:
             if not should_continue():
                 raise RuntimeError("Startup/shutdown interrupted")
@@ -360,10 +370,12 @@ class PrecilaserStartupController:
 
             self.laser.set_working_current(next_value)
             applied.append(next_value)
-            self._log(f"Working current set to {next_value:.2f} A")
+            step_index += 1
+            self._log(f"Ramp step {step_index}: working current set to {next_value:.2f} A")
 
             if abs(next_value - target_current_a) <= 1e-9:
                 break
+            self._log(f"Waiting {self.ramp_wait_s:.2f} s before next ramp step")
             self._sleep_with_interrupt_check(self.ramp_wait_s, should_continue)
 
         return applied
@@ -403,6 +415,11 @@ class PrecilaserStartupController:
 
         self._log("Turn-off: ramping working current to 0 A.")
         ramp_steps = self._ramp_to_current(0.0, should_continue)
+        if ramp_steps:
+            self._log(
+                f"Turn-off: hold at 0 A for {self.ramp_wait_s:.2f} s before disabling drivers."
+            )
+            self._sleep_with_interrupt_check(self.ramp_wait_s, should_continue)
 
         self._log("Turn-off: disabling laser drivers.")
         self.laser.set_laser_enable(False)

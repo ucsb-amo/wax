@@ -20,9 +20,9 @@ T_ADC_CONV_MU = 450
 
 class Integrator():
     def __init__(self,
-                 ttl_integrate:TTL_OUT,
-                 ttl_reset:TTL_OUT,
-                 sampler_ch:Sampler_Last_CH):
+                 ttl_integrate=TTL_OUT,
+                 ttl_reset=TTL_OUT,
+                 sampler_ch=Sampler_Last_CH):
         self.ttl_integrate = ttl_integrate # logic inverted -- on=not integrating, off=integrating
         self.ttl_reset = ttl_reset # on=clearing integrator, off=not clearing integrator
         if not isinstance(sampler_ch, Sampler_Last_CH):

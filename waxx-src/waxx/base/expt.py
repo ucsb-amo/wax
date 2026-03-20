@@ -5,14 +5,16 @@ import os
 from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
 
-from waxa import ExptParams
-from waxa.data import DataSaver, RunInfo, counter, server_talk, DataVault
-from waxa.base import Dealer, Scribe
+from waxa.config.expt_params import ExptParams
+from waxa.data import DataSaver, RunInfo, counter, server_talk
+from waxa.base.dealer import Dealer
+from waxa.base.scribe import Scribe
 from waxa.dummy.camera_params import CameraParams
 from waxa import img_types
 
 from artiq.language.core import kernel_from_string, now_mu
 
+from waxx.config.data_vault import DataVault
 from waxx.base.scanner import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
