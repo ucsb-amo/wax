@@ -15,7 +15,6 @@ class DataContainer():
         self._run_data = np.zeros(per_shot_data_shape,dtype=dtype)
         self.shot_data = np.zeros(per_shot_data_shape,dtype=dtype)
         self._reference_data = copy.deepcopy(self.shot_data)
-        self.temp_array = self.shot_data
 
     def _put_shot_data_to_run_data(self):
         """Insert data into the array for the current shot.
