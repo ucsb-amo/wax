@@ -135,7 +135,8 @@ class HMRClient:
                 return float(result["Btot"])
             except (socket.timeout, socket.error) as e:
                 if attempt == max_attempts - 1:
-                    raise RuntimeError(f"Failed after {max_attempts} attempts: {e}")
+                    print(f"Reading magnetometer failed after {max_attempts} attempts: {e}")
+                    return float(0.)
 
     def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
         """Return [Bx, By, Bz, Btot] from the newest reference at or before *date*.
