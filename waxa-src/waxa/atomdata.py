@@ -70,6 +70,18 @@ class analysis_tags():
         self.transposed = False
         self.averaged = False
 
+class atom_number_apd():
+    def __init__(self, n_up, n_down):
+        self.n_up = n_up
+        self.n_down = n_down
+        self.n_total = n_up + n_down
+        self.frac_up = n_up / (self.n_total)
+        self.frac_down = n_up / (self.n_total)
+
+    def calibration(self):
+        # for later
+        pass
+
 class expt_code():
     """A simple container to organize experiment text.
     """    
@@ -77,11 +89,13 @@ class expt_code():
                  experiment,
                  params,
                  cooling,
-                 imaging):
+                 imaging,
+                 control):
         self.experiment = experiment
         self.params = params
         self.cooling = cooling
         self.imaging = imaging
+        self.control = control
 
 class atomdata():
     '''
@@ -211,11 +225,39 @@ class atomdata():
         self.cloudfit_y = fit_gaussian_sum_dist(self.sum_od_y,self.camera_params)
         
         self._remap_fit_results()
+
+        self.compute_apd_atom_number()
         
         if self._analysis_tags.imaging_type == img.ABSORPTION:
             self.compute_atom_number()
 
         self.integrated_od = np.sum(np.sum(self.od,-2),-1)
+
+    def compute_apd_atom_number(self):
+        if 'post_shot_absorption' in self.data.keys:
+            v = self.data.post_shot_absorption
+            if np.all(v == 0.):
+                return
+            
+            v_up = v[:,0]
+            v_down = v[:,1]
+            v_light = v[:,2]
+            v_dark = v[:,3]
+
+            light_only = v_light - v_dark
+            up_only = v_up - v_dark
+            down_only = v_down - v_dark
+
+            # Only keep physically valid points for log argument > 0
+            ratio_up = np.where((up_only > 0) & (light_only > 0), up_only / light_only, np.nan)
+            ratio_down = np.where((down_only > 0) & (light_only > 0), down_only / light_only, np.nan)
+
+            number_up = -np.log(ratio_up)
+            number_down = -np.log(ratio_down)
+
+            # calibrate later
+
+            self.atom_number_apd = atom_number_apd(number_up, number_down)
 
     def _sort_images(self):
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
@@ -778,15 +820,18 @@ class atomdata():
                 params_text = f.attrs['params_file']
                 cooling_text = f.attrs['cooling_file']
                 imaging_text = f.attrs['imaging_file']
+                control_text = f.attrs['control_file']
             except:
                 experiment_text = ""
                 params_text = ""
                 cooling_text = ""
                 imaging_text = ""
+                control_text = ""
             self.experiment_code = expt_code(experiment_text,
                                                 params_text,
                                                 cooling_text,
-                                                imaging_text)
+                                                imaging_text,
+                                                control_text)
             try:
                 self.sort_idx = f['data']['sort_idx'][()]
                 self.sort_N = f['data']['sort_N'][()]

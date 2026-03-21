@@ -15,6 +15,7 @@ class DataSaver():
                  expt_params_relative_filepath="",
                  cooling_relative_filepath="",
                  imaging_relative_filepath="",
+                 control_relative_filepath="",
                  server_talk=None):
         
         self._data_dir = data_dir
@@ -25,6 +26,8 @@ class DataSaver():
                                           cooling_relative_filepath)
         self._imaging_path = os.path.join(expt_repo_src_directory,
                                           imaging_relative_filepath)
+        self._control_path = os.path.join(expt_repo_src_directory,
+                                          control_relative_filepath)
 
         if server_talk == None:
             server_talk = st(data_dir=data_dir)
@@ -206,9 +209,15 @@ class DataSaver():
                 cooling_file = cooling_file.read()
             f.attrs["cooling_file"] = cooling_file
 
-        with open(self._imaging_path) as imaging_file:
-            imaging_file = imaging_file.read()
-        f.attrs["imaging_file"] = imaging_file
+        if self._imaging_path:
+            with open(self._imaging_path) as imaging_file:
+                imaging_file = imaging_file.read()
+            f.attrs["imaging_file"] = imaging_file
+
+        if self._control_path:
+            with open(self._control_path) as file:
+                file = file.read()
+            f.attrs["control_file"] = file
 
     def _check_for_expt_files(self):
         if not os.path.isfile(self._expt_params_path):
@@ -220,6 +229,9 @@ class DataSaver():
         if not os.path.isfile(self._imaging_path):
             print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
             self._imaging_path = ""
+        if not os.path.isfile(self._control_path):
+            print(f'control file not found at {self._control_path}, saving contents skipped')
+            self._control_path = ""
 
     def _class_attr_to_dataset(self,dset,obj):
         try:
