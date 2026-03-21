@@ -405,7 +405,7 @@ class BeatLockImagingPID(BeatLockImaging):
         self.dds_pid.on()
         self.ttl_pid_manual_override.off()
         self.set_imaging_detuning(0.)
-        self.set_power(0.2, reset_pid=True)
+        self.set_power(0.25, reset_pid=True)
 
     @portable(flags={"fast-math"})
     def get_ao_shift(self) -> TFloat:

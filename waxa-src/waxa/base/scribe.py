@@ -2,7 +2,8 @@ import h5py, time
 import numpy as np
 import os
 
-from waxa.data.data_vault import DataSaver
+from waxa.data import DataSaver
+from waxa.data.server_talk import server_talk as st
 from waxa.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
                                    CHECK_CAMERA_READY_ACK_PERIOD, REMOVE_DATA_POLL_INTERVAL,
                                    CHECK_FOR_DATA_AVAILABLE_PERIOD as CHECK_PERIOD)
@@ -11,8 +12,12 @@ def nothing():
     pass
 
 class Scribe():
-    def __init__(self, data_filepath=""):
-        self.ds = DataSaver()
+    def __init__(self, data_filepath="", server_talk=None):
+        if server_talk == None:
+            self.server_talk = st()
+        else:
+            self.server_talk = server_talk
+        self.ds = DataSaver(server_talk=server_talk)
         if data_filepath != "":
             self.run_info.filepath = data_filepath
 
@@ -131,6 +136,9 @@ class Scribe():
             for path in paths:
                 if path and not os.path.exists(path):
                     if raise_error:
+                        if hasattr(self,'monitor'):
+                            self.monitor.update_device_states()
+                            self.monitor.signal_end()
                         raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
                     else:
                         return False

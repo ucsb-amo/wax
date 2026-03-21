@@ -2,6 +2,8 @@ from artiq.experiment import *
 import numpy as np
 
 from waxa.base import xvar
+from waxa.data import RunInfo
+from waxa.dummy.camera_params import CameraParams
 from waxx.util.live_od import CameraClient
 
 from artiq.language.core import kernel_from_string, now_mu
@@ -20,6 +22,8 @@ class Scanner():
 
         from waxx.config.expt_params import ExptParams
         self.params = ExptParams()
+        self.run_info = RunInfo()
+        self.camera_params = CameraParams()
 
         self.live_od_client = CameraClient(None, None)
 
@@ -121,6 +125,12 @@ class Scanner():
         pass
 
     @kernel
+    def post_scan(self):
+        """This method is run just after the whole scan completes.
+        Usually overloaded in kexp.Base.
+        """
+
+    @kernel
     def scan(self):
         """
         Runs the scan_kernel function for each value of the xvars specified.
@@ -167,6 +177,8 @@ class Scanner():
             scanning = self.step_scan()
 
             self.core.break_realtime()
+
+        self.post_scan()
 
     def update_params_from_xvars(self):
         """Updates the host ExptParams attributes and recomputes derived
@@ -339,3 +351,90 @@ class Scanner():
     def cleanup_image_count(self):
         # dummy, overloaded by kexp.image.cleanup_image_count
         pass
+
+    def init_xvars(self, shuffle=True, N_repeats=[]):
+        from waxa import img_types
+        if self.run_info.imaging_type == img_types.ABSORPTION:
+            if self.params.N_pwa_per_shot > 1:
+                print("You indicated more than one PWA per shot, but the analysis is set to absorption imaging. Setting # PWA to 1.")
+            self.params.N_pwa_per_shot = 1
+
+        if not self.xvarnames:
+            self.xvar("dummy",[0])
+        if self.xvarnames and not self.scan_xvars:
+            for key in self.xvarnames:
+                self.xvar(key,vars(self.params)[key])
+        self.plug_in_xvars()
+
+        self.repeat_xvars(N_repeats=N_repeats)
+        
+        if shuffle:
+            self.shuffle_xvars()
+        
+        self.params.N_img = self.get_N_img()
+        self.prepare_image_array()
+
+        self.params.compute_derived()
+        self.compute_new_derived()
+
+        self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
+        if hasattr(self,'scope_data'):
+            self.scope_data.xvardims = self.xvardims
+
+        self.generate_assignment_kernels()
+
+    def prepare_image_array(self):
+        if self.run_info.save_data:
+            # print(self.camera_params.camera_type)
+            if self.camera_params.camera_type == 'andor':
+                dtype = np.uint16
+            elif self.camera_params.camera_type == 'basler':
+                dtype = np.uint8
+            else:
+                dtype = np.uint8
+            self.images = np.zeros((self.params.N_img,)+self.camera_params.resolution,dtype=dtype)
+            self.image_timestamps = np.zeros((self.params.N_img,))
+        else:
+            self.images = np.array([0])
+            self.image_timestamps = np.array([0])
+
+    def get_N_img(self):
+        """
+        Computes the number of images to be taken during the sequence from the
+        length of the specified xvars, stores in self.params.N_img. For
+        absorption imaging, 3 images per shot. For fluorescence imaging,
+        variable pwa images (ExptParams.N_pwa_per_shot, default = 1), then 1
+        each pwoa and dark images.
+        """                
+        N_img = 1
+        msg = ""
+
+        for xvar in self.scan_xvars:
+            N_img = N_img * xvar.values.shape[0]
+            msg += f" {xvar.values.shape[0]} values of {xvar.key}."
+        self.params.N_shots_with_repeats = N_img
+
+        msg += f" {N_img} total shots."
+
+        ### I have no idea what this is for. ###
+        if isinstance(self.params.N_repeats,list):
+            if len(self.params.N_repeats) == 1:
+                N_repeats = self.params.N_repeats[0]
+            else:
+                N_repeats = np.prod(self.params.N_repeats)
+        else:
+            N_repeats = 1
+        self.params.N_shots = int(N_img / N_repeats)
+        ###
+
+        from waxa import img_types
+        if self.run_info.imaging_type == img_types.ABSORPTION:
+            images_per_shot = 3
+        else:
+            images_per_shot = self.params.N_pwa_per_shot + 2
+
+        N_img = images_per_shot * N_img # 3 images per value of independent variable (xvar)
+
+        msg += f" {N_img} total images expected."
+        print(msg)
+        return N_img

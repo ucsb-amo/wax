@@ -75,39 +75,38 @@ def rm_outliers(array,
 def rms(x):
     return np.sqrt(np.sum(x**2)/len(x))
 
-def crop_array_by_index(array,include_idx=[0,-1],exclude_idx=[]):
-    """Crops an array to include data between bounding indices in `include_idx`,
-    and excludes data at the indices specified as a list in `exclude_idx`.
+def crop_array_by_index(array, include_idx=[0, -1], exclude_idx=None):
+    """
+    Crops a numpy array to include elements between the indices in `include_idx`,
+    and excludes elements at indices specified in `exclude_idx` (relative to the original array).
 
     Args:
-        array (_type_): The array to be cropped.
-        include_idx (list, optional): The bounding indices of the data to be
-        returned. Defaults to [0,-1], where -1 specifies including the last
-        element in the list.
-        exclude_idx (list, optional): Indices of the data to be removed,
-        specified as indices in the original data array (not within the
-        sub-array specified by `include_idx`). Defaults to [], meaning no
-        indices will be excluded (other than those omitted in the range
-        speficied as `include_idx`.)
+        array (array-like): The array to be cropped.
+        include_idx (tuple or list, optional): Start and end indices (inclusive start, exclusive end).
+            Defaults to (0, -1). -1 as end includes the last element.
+        exclude_idx (list or None, optional): Indices to exclude from the result, relative to the original array.
 
     Returns:
-        array: the array with the specified elements removed.
+        np.ndarray: Cropped array with specified elements removed.
     """
     array = np.asarray(array)
-    idx0 = int(include_idx[0])
-    if include_idx[1] == -1:
-        idxf = len(array)
-        array = array[idx0:]
+    n = len(array)
+    start = include_idx[0]
+    end = include_idx[1]
+    if end == -1:
+        end = n
+    elif end < 0:
+        end = n + end + 1
     else:
-        idxf = int(include_idx[1])
-        array = array[idx0:idxf]
-    
+        end = int(end)
+    # Get indices to keep
+    indices = np.arange(start, end)
     if exclude_idx:
-        exclude_idx = np.array(exclude_idx) - idx0
-        exclude_idx = np.intersect1d(exclude_idx,range(idxf-idx0)).astype(int)
-        array = np.delete(array,exclude_idx)
-
-    return array
+        exclude_idx = np.array(exclude_idx)
+        # Only exclude indices that are within the selected range
+        mask = ~np.isin(indices + start, exclude_idx)
+        indices = indices[mask]
+    return array[indices]
 
 def find_n_max_indices(arr, N):
     """Find the indices of the N maximum values in a numpy ndarray."""

@@ -78,6 +78,9 @@ class GenericWaxxScope():
         if not hasattr(self,'scope'):
             self.scope = Scope_Base()
 
+    def clear_data(self):
+        self._data = []
+
     def data(self):
         if self._scopedata.xvardims != []:
             self.reshape_data()
@@ -147,16 +150,13 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         preamble = self.scope.get_waveform_preamble()
         Npts = preamble[0]
         data = []
-        d = np.zeros((2,Npts)) # data = np.zeros((4,2,Npts))
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
         for ch in range(4):
             if self.scope.is_channel_visible(ch) and (ch in channels):
                 try:
                     (t,v) = self.scope.read_sweep(ch)
-                    d[0] = t # data[ch][0] = t
-                    d[1] = v # data[ch][1] = v
-                    data.append(d)
+                    data.append([t,v])
                 except Exception as e:
                     # aprint(e)
                     pass

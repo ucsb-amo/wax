@@ -31,7 +31,7 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         # self.enable_frame_transfer_mode(enable=True)
         # self.set_emccd_advanced()
         self.set_EM_gain_mode(3)
-        self.set_EMCCD_gain(gain=gain)
+        self.set_EMCCD_gain(gain=gain,advanced=True)
         self.set_exposure(ExposureTime)
         self.set_trigger_mode("ext")
         self.setup_shutter(mode="open")

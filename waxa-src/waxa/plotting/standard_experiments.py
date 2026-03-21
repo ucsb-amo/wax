@@ -93,6 +93,7 @@ def rabi_oscillation(ad:atomdata,
                      avg_repeats=True,
                      plot_bool=True,
                      plot_raw_data=True,
+                     print_results=True,
                      fit_params_on_plot=True,
                      fit_params_on_left=True,
                      fit_guess_frequency=dv_fit_guess_rabi_frequency,
@@ -207,8 +208,6 @@ def rabi_oscillation(ad:atomdata,
                             override_normalize_minimum=override_normalize_min,
                             override_normalize_maximum=override_normalize_max)
     
-    print(np.max(populations))
-    
     if avg_repeats:
         mean, err = get_repeat_std_error(populations, Nr)
 
@@ -239,11 +238,12 @@ def rabi_oscillation(ad:atomdata,
         y_fit = _fit_func_rabi_oscillation(times, *popt)
 
         # Print the fit parameters
-        print(r"Fit function: f(t) = A * exp(-t/tau) * (cos(Omega t / 2 + phi))**2 + B")
-        print(f"Omega = 2*pi*{popt[0]/(2*np.pi)/1.e3:1.2f} kHz"
-              +f"\n phi = {popt[1]},\n A = {popt[3]},"
-              +f"\n B = {popt[2]},"
-              +f"\n tau = {popt[4]}")
+        if print_results:
+            print(r"Fit function: f(t) = A * exp(-t/tau) * (cos(Omega t / 2 + phi))**2 + B")
+            print(f"Omega = 2*pi*{popt[0]/(2*np.pi)/1.e3:1.2f} kHz"
+                +f"\n phi = {popt[1]},\n A = {popt[3]},"
+                +f"\n B = {popt[2]},"
+                +f"\n tau = {popt[4]}")
 
         rabi_frequency_hz = popt[0] / (2*np.pi)
     except Exception as e:
@@ -314,7 +314,8 @@ def rabi_oscillation(ad:atomdata,
 
     try:
         t_pi = np.pi / popt[0]
-        print(f'pi time = {t_pi:1.4e} s')
+        if print_results:
+            print(f'pi time = {t_pi:1.4e} s')
     except:
         t_pi = None
 

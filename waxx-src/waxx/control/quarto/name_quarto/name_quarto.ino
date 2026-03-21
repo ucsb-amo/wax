@@ -11,7 +11,7 @@ struct Cal cal1; // Properly declare the cal1 variable
 
 void setup() {
   Serial.begin(115200); // Initialize serial communication
-  qC.addCommand("ping",ping);
+  // qC.addCommand("ping",ping);
   
   cal1.cal_a = 56;//various numbers to test storage is working
   cal1.cal_b = 1.2345678;
@@ -21,9 +21,9 @@ void setup() {
   Serial.printf("Checking cal_a in NVM is: %u\n", readNVM(500*128));
 }
 
-void ping(qCommand& qC, Stream& S)
-{
-  struct Cal cal2;
-  readNVMblock(&cal2, sizeof(cal2), 0xFA00);  
-  Serial.println(cal2.cal_d); 
-}
+// void ping(qCommand& qC, Stream& S)
+// {
+//   struct Cal cal2;
+//   readNVMblock(&cal2, sizeof(cal2), 0xFA00);  
+//   Serial.println(cal2.cal_d); 
+// }

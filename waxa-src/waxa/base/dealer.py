@@ -1,6 +1,6 @@
 import numpy as np
 from waxa.base.xvar import xvar
-from waxa.data.data_vault import DataVault, DataContainer
+from waxx.config.data_vault import DataContainer, DataVault
 
 class Dealer():
     def __init__(self):
