@@ -101,6 +101,10 @@ class Expt(Dealer, Scanner, Scribe):
 
         if self.setup_camera:
             self.data_filepath = self.ds.create_data_file(self)
+
+    @kernel
+    def cleanup_scan_kernel_wax(self):
+        self.data.put_shot_data()
     
     def compute_new_derived(self):
         pass
