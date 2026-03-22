@@ -12,7 +12,7 @@ from waxa.base.scribe import Scribe
 from waxa.dummy.camera_params import CameraParams
 from waxa import img_types
 
-from artiq.language.core import kernel_from_string, now_mu
+from artiq.language import kernel_from_string, now_mu, TBool
 
 from waxx.config.data_vault import DataVault
 from waxx.base.scanner import Scanner
@@ -50,8 +50,8 @@ class Expt(Dealer, Scanner, Scribe):
         self.params = ExptParams()
         self.p = self.params
 
-        self.images = []
-        self.image_timestamps = []
+        # self.images = []
+        # self.image_timestamps = []
 
         self.xvarnames = []
         self.sort_idx = []
@@ -64,14 +64,22 @@ class Expt(Dealer, Scanner, Scribe):
 
     def send_new_run(self):
         self.live_od_client.connect()
-        ready = self.live_od_client.send_new_run(camera_params=self.camera_params,
+        self.live_od_client.send_new_run(camera_params=self.camera_params,
                                             data_filepath=self.run_info.filepath,
                                             save_data = self.run_info.save_data,
+                                            setup_camera=self.setup_camera,
                                             N_img = self.params.N_img,
                                             N_shots = self.params.N_shots,
                                             N_pwa_per_shot=self.p.N_pwa_per_shot,
                                             imaging_type=self.run_info.imaging_type,
                                             run_id=self.run_info.run_id)
+    
+    @kernel
+    def init_kernel_wax(self):
+        # if self.run_info.save_data:
+        #     self.ds.create_data_file(self)
+        self.send_new_run()
+        # pass
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
         """
@@ -97,14 +105,41 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.init_xvars(shuffle,N_repeats)
 
+        self.set_up_imaging_containers()
         self.data.init()
 
+        if self.run_info.save_data:
+            self.ds.create_data_file(self)
+
+    def set_up_imaging_containers(self):
+        # Image arrays are represented as data-vault containers and populated
+        # by the camera server. Size the per-shot payload from camera params.
         if self.setup_camera:
-            self.data_filepath = self.ds.create_data_file(self)
+            N_img_per_shot = self.p.N_pwa_per_shot+2
+            image_shape = self.camera_params.resolution
+            if self.camera_params.camera_type == 'andor':
+                image_dtype = np.uint16
+            elif self.camera_params.camera_type == 'basler':
+                image_dtype = np.uint8
+            else:
+                image_dtype = np.uint8
+
+            # the old code for image processing relied on the image data being 3*N
+            # by px by py -- a totally linear array of images of length 3*number of
+            # shots. the data container code would add an extra axis for those 3
+            # images per shot, but for backward compatability with old analysis code
+            # I've added the "flat" argument and allowed the user to specify the
+            # number of values per shot -- this flattens the image data and
+            # timestamp containers to be the same shape as the old ones.
+            self.data.images = self.data.add_data_container(image_shape,dtype=image_dtype,flat=True,
+                                                            flat_points_per_shot=N_img_per_shot)
+            self.data.image_timestamps = self.data.add_data_container(1,dtype=float,flat=True,
+                                                                    flat_points_per_shot=N_img_per_shot)
 
     @kernel
     def cleanup_scan_kernel_wax(self):
         self.data.put_shot_data()
+        # print(self.data._expt)
     
     def compute_new_derived(self):
         pass
@@ -113,17 +148,19 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.scope_data.close()
 
-        if self.setup_camera:
-            if self.run_info.save_data:
-                self.cleanup_scanned()
-                self.write_data(expt_filepath)
-            else:
-                self.remove_incomplete_data()
+        if self.run_info.save_data:
+            self.cleanup_scanned()
+            self.write_data(expt_filepath)
+        # else:
+        #     self.remove_incomplete_data()
 
         if hasattr(self,'monitor'):
             self.monitor.update_device_states()
             self.monitor.signal_end()
 
-        self.live_od_client.send_run_complete()
+        try:
+            self.live_od_client.send_run_complete()
+        except Exception as e:
+            print(e)
                 
         # server_talk.play_random_sound()

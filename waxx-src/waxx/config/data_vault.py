@@ -1,13 +1,20 @@
 import numpy as np
 import copy
-from artiq.language import delay, now_mu, kernel, TTuple, TBool
+from artiq.language import delay, now_mu, kernel, TTuple, TBool, kernel_from_string
+from artiq.experiment import rpc
 
 class DataContainer():
-    def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt):
+    def __init__(self, per_shot_data_shape, dtype,
+                external_data_bool=False,
+                flat=False,
+                flat_points_per_shot=1,
+                expt=None):
         self.key = ""
         self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
         self._dtype = dtype
         self._external_data_bool = external_data_bool
+        self._flat = flat
+        self._flat_points_per_shot = flat_points_per_shot
         self._expt = expt
 
         self._data_gotten = False
@@ -16,32 +23,39 @@ class DataContainer():
         self.shot_data = np.zeros(per_shot_data_shape,dtype=dtype)
         self._reference_data = copy.deepcopy(self.shot_data)
 
-    def _put_shot_data_to_run_data(self):
+    def _put_shot_data_to_run_data(self, data):
         """Insert data into the array for the current shot.
 
         Args:
             value (_type_): _description_
         """
-        if self._data_gotten:
-            try:
-                idx = tuple([x.counter for x in self._expt.scan_xvars])
-                self._run_data[idx] = self.shot_data
-            except Exception as e:
-                if self.shot_data.shape != self._per_shot_data_shape:
-                    print(f"Value is not correct shape for data container '{self.key}':\n"+
-                    f"  expected shape {self._per_shot_data_shape} but value has shape {value.shape}. Skipping.")
-                else:
-                    print(f"An error occurred with 'put_data' for data container '{self.key}':")
-                    print(e)
+        self.shot_data = data
+        if not self._data_gotten:
+            self._data_gotten = not np.all(self.shot_data == self._reference_data)
 
-    @kernel
-    def put_data(self,value,idx=0):
+        if not self._data_gotten:
+            return
+
+        try:
+            idx = tuple([x.counter for x in self._expt.scan_xvars])
+            self._run_data[idx] = self.shot_data
+        except Exception:
+            # Ignore bad writes during acquisition; data saver/unshuffle handles
+            # partial datasets more gracefully than a stalled experiment.
+            pass
+
+    @rpc(flags={"async"})
+    def put_data_idx(self, value, idx=0):
         self.shot_data[idx] = value
 
-    @kernel
+    @rpc(flags={"async"})
+    def put_data(self, value):
+        self.shot_data = value
+
     def _put_shot_data(self):
-        self.update_to_host()
-        self._put_shot_data_to_run_data()
+        # Single RPC per container: copy kernel shot_data to host and write it
+        # into run_data. Do not call kernel methods from this RPC path.
+        self._put_shot_data_to_run_data(self.shot_data)
 
     def set_container_size(self):
         """Takes the per-shot data array and patterns it to the appropriate shape.
@@ -50,11 +64,17 @@ class DataContainer():
         """        
         xvd = self._expt.xvardims
         y = self._run_data
+        if self._flat:
+            y = [y]*self._flat_points_per_shot
         for d in np.flip(xvd):
             y = [y]*d
         self._run_data = np.asarray(y)
         # squeeze the data shape axes if they have length == 1
         self.squeeze_axes(xvd)
+        if self._flat:
+            d = np.prod(xvd) * self._flat_points_per_shot
+            flat_shape = (d,) + self._per_shot_data_shape
+            self._run_data = self._run_data.reshape(flat_shape)
 
     def squeeze_axes(self, xvardims):
         """Identifies if the per-shot data has any axes with dimension 1. If so,
@@ -69,8 +89,10 @@ class DataContainer():
         Args:
             xvardims (list): The xvardims for the experiment.
         """        
-        n_axes_to_squeeze = self._run_data.ndim - len(xvardims) # how many axes are for the per-shot data
+        f = int(self._flat) # extra axis if the data is flat
+        n_axes_to_squeeze = self._run_data.ndim - f - len(xvardims) # how many axes are for the per-shot data
         sh_axes_to_squeeze = np.asarray(self._run_data.shape[-n_axes_to_squeeze:]) # their shape
+
         squeeze_mask = sh_axes_to_squeeze == 1 # check which dims have size == 1
         # make a mask to index these axes starting from the end (-1,-2,...),
         # since xvar axes come first
@@ -78,32 +100,26 @@ class DataContainer():
         # do the squeeze (convert axis index list to tuple to make it work with np.ndarray.squeeze)
         self._run_data = self._run_data.squeeze(axis=tuple(ax_idx_to_squeeze))
 
-        self._per_shot_data_shape = self._run_data.shape[len(xvardims):]
-
-    def update_from_kernel(self, data):
-        """Necessary to sync up host and kernel.
-        """      
-        self.shot_data = data
-        if not self._data_gotten:
-            self._data_gotten = not np.all(self.shot_data == self._reference_data)  
-
-    @kernel
-    def update_to_host(self):
-        """Necessary to sync up host and kernel.
-        """   
-        self.update_from_kernel(self.shot_data)
+        self._per_shot_data_shape = self._run_data.shape[len(xvardims)+f:]
 
 class DataVault():
     
     def __init__(self, expt=None):
         self.keys = []
-        self._container_list = []
+        self._keys_nonext= []
         self._expt = expt
+
+        # Camera-server populated datasets. These are placeholders in the
+        # experiment process and are filled externally by LiveOD.
+        self.images = self.add_data_container((1, 1), np.uint8, external_data_bool=True)
+        self.image_timestamps = self.add_data_container((1,), np.float64, external_data_bool=True)
 
     def add_data_container(self,
                             per_shot_data_shape=(1,),
                             dtype=np.float64,
-                            external_data_bool=False) -> DataContainer:
+                            external_data_bool=False,
+                            flat = False,
+                            flat_points_per_shot = 1) -> DataContainer:
         """Returns a data container object. This should be assigned to an
         attribute of the `DataVault` object, which will then write to the data
         container the key used for the assignment during `finish_prepare` of
@@ -137,10 +153,12 @@ class DataVault():
         Returns:
             DataContainer: _description_
         """        
-        return DataContainer(per_shot_data_shape,
-                            dtype,
-                            external_data_bool,
-                            self._expt)
+        return DataContainer(per_shot_data_shape=per_shot_data_shape,
+                             dtype=dtype,
+                             external_data_bool=external_data_bool,
+                             flat=flat,
+                             flat_points_per_shot=flat_points_per_shot,
+                             expt=self._expt)
     
     def init(self):
         self.write_keys()
@@ -152,7 +170,8 @@ class DataVault():
             if isinstance(obj,DataContainer):
                 vars(self)[k].key = k
                 self.keys.append(k)
-                self._container_list.append(obj)
+                if not obj._external_data_bool:
+                    self._keys_nonext.append(k)
 
     def set_container_sizes(self):
         for key in self.keys:
@@ -160,10 +179,12 @@ class DataVault():
             if isinstance(dc,DataContainer):
                 dc.set_container_size()
 
-    @kernel
     def put_shot_data(self):
-        # self._put_shot_data_rpc()
-        self._expt.core.wait_until_mu(now_mu())
-        for dc in self._container_list:
-            dc._put_shot_data()
-        self._expt.core.break_realtime()
+        """Write all non-external containers' shot_data into run_data.
+        Called as an implicit host RPC from cleanup_scan_kernel_wax at the
+        end of every shot. Containers must have been updated via put_data()
+        or put_data_idx() (RPC calls) during the shot kernel.
+        """
+        for k in self._keys_nonext:
+            dc = vars(self)[k]
+            dc._put_shot_data_to_run_data(dc.shot_data)

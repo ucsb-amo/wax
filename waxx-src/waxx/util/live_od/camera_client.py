@@ -40,6 +40,7 @@ import socket
 from waxx.util.comms_server.comm_client import CommClient
 from waxx.util.live_od.protocol import send_msg, recv_msg
 
+from artiq.language import TBool
 
 class CameraClient(CommClient):
     """
@@ -73,9 +74,13 @@ class CameraClient(CommClient):
         """Close the persistent connection."""
         if self._persistent_sock is not None:
             try:
-                self._persistent_sock.close()
+                self._persistent_sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass
+            try:
+                self._persistent_sock.close()
+            except Exception as e:
+                print(e)
             self._persistent_sock = None
 
     # ------------------------------------------------------------------
@@ -83,9 +88,13 @@ class CameraClient(CommClient):
     # ------------------------------------------------------------------
 
     def _send(self, msg):
+        if self._persistent_sock is None:
+            raise RuntimeError("CameraClient is not connected. Call connect() first.")
         send_msg(self._persistent_sock, msg)
 
     def _recv(self):
+        if self._persistent_sock is None:
+            raise RuntimeError("CameraClient is not connected. Call connect() first.")
         return recv_msg(self._persistent_sock)
 
     def _send_recv(self, msg):
@@ -98,7 +107,7 @@ class CameraClient(CommClient):
     # ------------------------------------------------------------------
 
     def send_new_run(self, camera_params, data_filepath, save_data,
-                     N_img, N_shots, N_pwa_per_shot, imaging_type, run_id):
+                     setup_camera, N_img, N_shots, N_pwa_per_shot, imaging_type, run_id):
         """
         Send camera params and run metadata to the server.
 
@@ -116,6 +125,7 @@ class CameraClient(CommClient):
             "camera_params": camera_params,
             "data_filepath": data_filepath,
             "save_data": save_data,
+            "setup_camera": setup_camera,
             "N_img": N_img,
             "N_shots": N_shots,
             "N_pwa_per_shot": N_pwa_per_shot,
@@ -124,7 +134,7 @@ class CameraClient(CommClient):
         }
         return self._send_recv(msg)
 
-    def send_xvars(self, scan_xvars: list):
+    def send_xvars(self, scan_xvars: list, data_fields: dict | None = None):
         """
         Send the current experiment xvar keys and values for a shot.
 
@@ -142,8 +152,23 @@ class CameraClient(CommClient):
             Server reply (``{"cmd": "ack"}``).
         """
         xvars = {xv.key: xv.values[xv.counter] for xv in scan_xvars}
-        self._send({"cmd": "xvars", "xvars": xvars})
+        self._send({"cmd": "xvars", "xvars": xvars, "data_fields": data_fields or {}})
         # return self._send_recv({"cmd": "xvars", "xvars": xvars})
+
+    def send_shot_done(self):
+        """
+        Signal that a shot is complete (independent of image acquisition).
+
+        This allows the server to count shots independently from when images
+        are actually grabbed, which may have variable delays due to camera
+        timing or processing.
+
+        Returns
+        -------
+        dict
+            Server reply (``{"cmd": "ack"}``).
+        """
+        return self._send_recv({"cmd": "shot_done"})
 
     def send_run_complete(self):
         """

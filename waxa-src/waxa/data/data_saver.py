@@ -40,46 +40,32 @@ class DataSaver():
         # from wax.base.sub.dealer import Dealer
         # expt: Dealer
 
-        if expt.setup_camera:
-            
-            pwd = os.getcwd()
-            os.chdir(self._data_dir)
-            
-            fpath, _ = self._data_path(expt.run_info)
+        pwd = os.getcwd()
+        os.chdir(self._data_dir)
 
-            if data_object:
-                f = data_object
-            else:
-                f = h5py.File(fpath,'r+')
-            
-                    
-            if expt.sort_idx:
-                # these were read in by liveOD, so we replace the expt empty arrays
-                expt.images = np.array(f['data']['images'])
-                expt.image_timestamps = np.array(f['data']['image_timestamps'])
+        fpath, _ = self._data_path(expt.run_info)
 
-                # I think these two lines are redundant, should already happen in prepare
-                expt.xvardims = [len(xvar.values) for xvar in expt.scan_xvars]
-                expt.N_xvars = len(expt.xvardims)
+        if data_object:
+            f = data_object
+        else:
+            f = h5py.File(fpath,'r+')
 
-                expt._unshuffle_struct(expt) # this usually does nothing
-                # now replace the data from the h5 with the unscrambled data
-                f['data']['images'][...] = expt.unscramble_images()
-                f['data']['image_timestamps'][...] = expt._unscramble_timestamps()
-                expt._unshuffle_struct(expt.params)
+        if expt.sort_idx:
+            expt._unshuffle_struct(expt) # this usually does nothing
+            expt._unshuffle_struct(expt.params)
 
-            self._save_data_vault(f,expt)
-            self._save_scope_data(f,expt)
+        self._save_data_vault(f,expt)
+        self._save_scope_data(f,expt)
 
-            del f['params']
-            params_dset = f.create_group('params')
-            self._class_attr_to_dataset(params_dset,expt.params)
+        del f['params']
+        params_dset = f.create_group('params')
+        self._class_attr_to_dataset(params_dset,expt.params)
 
-            self._save_expt_files_text(f,expt_filepath)
+        self._save_expt_files_text(f,expt_filepath)
 
-            f.close()
-            print("Parameters saved, data closed.")
-            os.chdir(pwd)
+        f.close()
+        print("Parameters saved, data closed.")
+        os.chdir(pwd)
 
     def get_xvardims(self,expt:DummyExpt):
         return [len(xvar.values) for xvar in expt.scan_xvars]
@@ -103,17 +89,16 @@ class DataSaver():
             os.mkdir(folder)
 
         expt.run_info.filepath = fpath
+        expt.data_filepath = fpath
         expt.run_info.xvarnames = expt.xvarnames
 
         f = h5py.File(fpath,'w')
         data = f.create_group('data')
 
-        f.attrs['camera_ready'] = 0
-        f.attrs['camera_ready_ack'] = 0
+        # f.attrs['camera_ready'] = 0
+        # f.attrs['camera_ready_ack'] = 0
         
         f.attrs['xvarnames'] = expt.xvarnames
-        data.create_dataset('images',data=expt.images)
-        data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
             this_data = vars(expt.data)[key]._run_data
             data.create_dataset(key, data=this_data)
@@ -147,14 +132,21 @@ class DataSaver():
             if this_dc._external_data_bool:
                 # overwrite with data from hdf5 in case populated by a process outside expt
                 this_data = f['data'][key][...]
+                if np.all(this_data == this_dc._run_data):
+                    this_dc._data_gotten = False
             else:
                 # otherwise, take the data that was stuck into the array during the expt
                 this_data = this_dc._run_data
-            if this_dc._external_data_bool or this_dc._data_gotten:
+            if this_dc._data_gotten:
                 if expt.sort_idx:
                     # unshuffle if shuffled
                     ndims_per_shot = len(this_data.shape) - len(expt.scan_xvars)
-                    this_data = expt._unshuffle_ndarray(this_data,exclude_dims=ndims_per_shot)
+                    if key == 'images':
+                        this_data = expt.unscramble_images()
+                    if key == 'image_timestamps':
+                        this_data = expt._unscramble_timestamps()
+                    else:
+                        this_data = expt._unshuffle_ndarray(this_data, exclude_dims=ndims_per_shot)
                 f['data'][key][...] = this_data
 
     def _save_scope_data(self,

@@ -44,6 +44,23 @@ class Analyzer(QThread):
         """Store the latest xvar values (called each scan iteration)."""
         self._xvars = dict(xvars)
 
+    def emit_xvar_only_shot_result(self):
+        """Emit one shot result when no images are expected for this run."""
+        result = self._build_base_result()
+        self._append_xvar_fields(result)
+        self._append_apd_fields(result)
+        for key in [
+            "integrated_od", "sum_od_peak_x", "sum_od_peak_y",
+            "fit_sigma_x", "fit_sigma_y", "fit_center_x", "fit_center_y",
+            "fit_amplitude_x", "fit_amplitude_y", "fit_offset_x", "fit_offset_y",
+            "fit_area_x", "fit_area_y", "atom_number", "atom_number_fit_x", "atom_number_fit_y",
+        ]:
+            result[key] = np.nan
+        try:
+            self.shot_result.emit(result)
+        except RuntimeError:
+            pass
+
     def got_img(self, img):
         # Skip until we have run parameters
         if self.N_pwa_per_shot == 0 and not self.imgs:
@@ -95,12 +112,7 @@ class Analyzer(QThread):
 
     def _emit_shot_result(self):
         """Compute derived quantities from the current shot and emit."""
-        result: dict = {
-            "shot_index": self._shot_index,
-            "timestamp": time.time(),
-            "xvars": dict(self._xvars),
-        }
-        self._shot_index += 1
+        result = self._build_base_result()
 
         od = self.od  # 2-D array for this shot
 
@@ -163,10 +175,62 @@ class Analyzer(QThread):
             result["atom_number_fit_x"] = np.nan
             result["atom_number_fit_y"] = np.nan
 
+        self._append_xvar_fields(result)
+        self._append_apd_fields(result)
+
         try:
             self.shot_result.emit(result)
         except RuntimeError:
             pass
+
+    def _build_base_result(self) -> dict:
+        result: dict = {
+            "shot_index": self._shot_index,
+            "timestamp": time.time(),
+            "xvars": dict(self._xvars),
+        }
+        self._shot_index += 1
+        return result
+
+    def _append_xvar_fields(self, result: dict):
+        for key, value in self._xvars.items():
+            result[f"xvar.{key}"] = self._to_plot_scalar(value)
+
+    def _to_plot_scalar(self, value):
+        """Map any payload value to a scalar suitable for per-shot plotting."""
+        try:
+            if np.isscalar(value):
+                return float(value)
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.size == 0:
+                return np.nan
+            if arr.size == 1:
+                return float(arr[0])
+            return float(np.nanmean(arr))
+        except Exception:
+            return np.nan
+
+    def _append_apd_fields(self, result: dict):
+        raw = self._xvars.get("post_shot_absorption", None)
+        if raw is None:
+            return
+        try:
+            v = np.asarray(raw, dtype=float).reshape(-1)
+            if v.size < 4:
+                return
+            v_up, v_down, v_light, v_dark = v[:4]
+            up_only = v_up - v_dark
+            down_only = v_down - v_dark
+            light_only = v_light - v_dark
+            if up_only <= 0 or down_only <= 0 or light_only <= 0:
+                return
+            n_up = -np.log(up_only / light_only)
+            n_down = -np.log(down_only / light_only)
+            result["atom_number_apd_up"] = float(n_up)
+            result["atom_number_apd_down"] = float(n_down)
+            result["atom_number_apd_total"] = float(n_up + n_down)
+        except Exception:
+            return
         
     def crop_od_to_view_range(self, od):
         """

@@ -13,12 +13,21 @@ import time
 import numpy as np
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QComboBox, QSpinBox, QCheckBox, QLabel, QGroupBox,
-    QListWidget, QListWidgetItem, QPushButton, QMenu,
-    QWidgetAction, QSizePolicy,
+    QWidget,
+    QDialog,
+    QFormLayout,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QComboBox,
+    QSpinBox,
+    QCheckBox,
+    QLabel,
+    QFrame,
+    QPushButton,
+    QSizePolicy,
 )
-from PyQt6.QtGui import QFont, QColor, QAction, QStandardItem, QStandardItemModel
+from PyQt6.QtGui import QFont, QStandardItem, QStandardItemModel
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 
 import pyqtgraph as pg
@@ -46,6 +55,28 @@ DERIVED_QUANTITIES = {
     "fit_area_y":          "Fit area y",
     "sum_od_peak_x":       "Sum OD peak x",
     "sum_od_peak_y":       "Sum OD peak y",
+    "atom_number_apd_up":  "Atom number (APD up)",
+    "atom_number_apd_down":"Atom number (APD down)",
+    "atom_number_apd_total":"Atom number (APD total)",
+}
+
+CAMERA_DERIVED_QUANTITY_KEYS = {
+    "integrated_od",
+    "atom_number",
+    "atom_number_fit_x",
+    "atom_number_fit_y",
+    "fit_sigma_x",
+    "fit_sigma_y",
+    "fit_center_x",
+    "fit_center_y",
+    "fit_amplitude_x",
+    "fit_amplitude_y",
+    "fit_offset_x",
+    "fit_offset_y",
+    "fit_area_x",
+    "fit_area_y",
+    "sum_od_peak_x",
+    "sum_od_peak_y",
 }
 
 INDEPENDENT_VARIABLES = {
@@ -58,6 +89,16 @@ _COLORS = [
     (50, 100, 220),   # blue  – left axis
     (220, 80, 50),    # red   – right axis
 ]
+
+_COLOR_PRESETS = {
+    "Blue": (50, 100, 220),
+    "Red": (220, 80, 50),
+    "Green": (60, 160, 90),
+    "Amber": (225, 145, 40),
+    "Purple": (155, 90, 210),
+    "Teal": (55, 150, 165),
+    "Slate": (95, 110, 135),
+}
 
 
 # ======================================================================
@@ -111,6 +152,26 @@ class _CheckableCombo(QComboBox):
                 out.append(item.text())
         return out
 
+    def has_key(self, key: str) -> bool:
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == key:
+                return True
+        return False
+
+    def remove_key(self, key: str):
+        for row in range(self._model.rowCount() - 1, -1, -1):
+            item = self._model.item(row)
+            if item is None or item.data(Qt.ItemDataRole.UserRole) != key:
+                continue
+            if row in self._order:
+                self._order.remove(row)
+            self._model.removeRow(row)
+            self._order = [idx - 1 if idx > row else idx for idx in self._order]
+            self._update_display_text()
+            self.selectionChanged.emit()
+            return
+
     # ---- internals --------------------------------------------------
 
     def _handle_press(self, index):
@@ -154,7 +215,10 @@ class _CheckableCombo(QComboBox):
             # Put summary in the line-edit area
             self.setEditable(True)
             self.lineEdit().setReadOnly(True)
-            self.lineEdit().setText(" · ".join(labels))
+            summary = " · ".join(labels)
+            if len(summary) > 36:
+                summary = summary[:33] + "..."
+            self.lineEdit().setText(summary)
 
     def hidePopup(self):
         # Allow normal hide
@@ -187,23 +251,57 @@ class ShotPlotWindow(QWidget):
 
     closed = pyqtSignal(object)  # emitted on close so parent can de-register
 
-    def __init__(self, window_id: int = 0, xvar_names: list | None = None):
+    def __init__(self,
+                 window_id: int = 0,
+                 xvar_names: list | None = None,
+                 data_field_names: list | None = None,
+                 camera_enabled: bool = True,
+                 embedded: bool = False):
         super().__init__()
         self._id = window_id
-        self.setWindowTitle(f"Plot #{window_id}")
-        self.resize(580, 440)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._camera_enabled = camera_enabled
+        self._embedded = embedded
+        if not self._embedded:
+            self.setWindowTitle(f"Plot #{window_id}")
+            self.resize(580, 440)
+            self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setStyleSheet(
+            "QWidget { background: #0c131b; color: #e8f1fb; }"
+            "QFrame#controlsPanel {"
+            "  background: #111c28;"
+            "  border: 1px solid #2e4256;"
+            "  border-radius: 10px;"
+            "}"
+            "QComboBox, QSpinBox {"
+            "  background: #162434; border: 1px solid #35516c; border-radius: 7px;"
+            "  padding: 2px 6px; min-height: 12px;"
+            "}"
+            "QLabel#sectionLabel { color: #9fb8d1; font-size: 11px; font-weight: 700; }"
+            "QCheckBox { color: #d8e7f8; }"
+            "QPushButton {"
+            "  background: #1d3550; border: 1px solid #4f7ca8; border-radius: 8px;"
+            "  color: #edf6ff; padding: 5px 10px; font-weight: 700;"
+            "}"
+            "QPushButton:hover { background: #26476a; }"
+            "QLabel { color: #d8e7f8; }"
+        )
 
         # ---- accumulated data ----
         self._shot_data: list[dict] = []
+        self._dynamic_qty_labels: dict[str, str] = {}
+        self._data_field_names: list[str] = []
 
         # ---- autorange state ----
         self._autorange_left = True
         self._autorange_right = True
+        self._series_colors = [tuple(_COLORS[0]), tuple(_COLORS[1])]
 
         # ---- widgets ----
         self._build_controls(xvar_names or [])
         self._build_plot()
+        self._build_options_dialog()
+        self.update_data_field_names(data_field_names or [])
+        self.set_camera_enabled(camera_enabled)
         self._build_layout()
 
     # ------------------------------------------------------------------
@@ -213,12 +311,15 @@ class ShotPlotWindow(QWidget):
     def _build_controls(self, xvar_names: list[str]):
         # Derived quantity selector (checkable, max 2)
         self.qty_combo = _CheckableCombo(max_checked=2)
+        self.qty_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.qty_combo.setMinimumWidth(100)
         for key, label in DERIVED_QUANTITIES.items():
             self.qty_combo.add_item(label, data=key)
         self.qty_combo.selectionChanged.connect(self._replot)
 
         # Independent variable selector
         self.indep_combo = QComboBox()
+        self.indep_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.indep_combo.addItem("Shot index", userData="shot_index")
         self.indep_combo.addItem("Timestamp (s)", userData="timestamp")
         for name in xvar_names:
@@ -235,11 +336,43 @@ class ShotPlotWindow(QWidget):
         self.plot_last_spin.setRange(1, 100000)
         self.plot_last_spin.setValue(50)
         self.plot_last_spin.setSuffix(" shots")
+        self.plot_last_spin.setMaximumWidth(130)
         self.plot_last_spin.valueChanged.connect(self._replot)
 
+        # Plot style controls (hosted in options dialog)
+        self.connect_points_check = QCheckBox("Connect points")
+        self.connect_points_check.setChecked(False)
+        self.connect_points_check.stateChanged.connect(self._on_style_options_changed)
+
+        self.symbol_size_spin = QSpinBox()
+        self.symbol_size_spin.setRange(3, 20)
+        self.symbol_size_spin.setValue(7)
+        self.symbol_size_spin.setSuffix(" px")
+        self.symbol_size_spin.valueChanged.connect(self._on_style_options_changed)
+
+        self.show_grid_check = QCheckBox("Show grid")
+        self.show_grid_check.setChecked(True)
+        self.show_grid_check.stateChanged.connect(self._on_style_options_changed)
+
+        self.left_color_combo = QComboBox()
+        self.right_color_combo = QComboBox()
+        for name, rgb in _COLOR_PRESETS.items():
+            self.left_color_combo.addItem(name, userData=rgb)
+            self.right_color_combo.addItem(name, userData=rgb)
+        self.left_color_combo.setCurrentText("Blue")
+        self.right_color_combo.setCurrentText("Red")
+        self.left_color_combo.currentIndexChanged.connect(self._on_style_options_changed)
+        self.right_color_combo.currentIndexChanged.connect(self._on_style_options_changed)
+
+        self.options_button = QPushButton("⚙")
+        self.options_button.setToolTip("Plot options")
+        self.options_button.setFixedWidth(32)
+        self.options_button.clicked.connect(self._toggle_options_dialog)
+
         # Auto-range button
-        self.autorange_button = QPushButton("⟳ Auto Range")
-        self.autorange_button.setMaximumWidth(120)
+        self.autorange_button = QPushButton("⟳")
+        self.autorange_button.setToolTip("Auto range")
+        self.autorange_button.setFixedWidth(32)
         self.autorange_button.setStyleSheet(
             "font-size: 11px; font-weight: bold;"
         )
@@ -254,6 +387,25 @@ class ShotPlotWindow(QWidget):
         self._legend_label_2.setStyleSheet(
             f"color: rgb{_COLORS[1]}; font-weight: bold; border: none;"
         )
+        self._update_legend_styles()
+
+    def _build_options_dialog(self):
+        self._options_dialog = QDialog(self)
+        self._options_dialog.setWindowTitle("Plot options")
+        self._options_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self._options_dialog.setMinimumWidth(280)
+
+        form = QFormLayout(self._options_dialog)
+        form.setContentsMargins(10, 10, 10, 10)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+        form.addRow("Window", self.plot_last_check)
+        form.addRow("Shots", self.plot_last_spin)
+        form.addRow("Style", self.connect_points_check)
+        form.addRow("Marker size", self.symbol_size_spin)
+        form.addRow("Left color", self.left_color_combo)
+        form.addRow("Right color", self.right_color_combo)
+        form.addRow("Grid", self.show_grid_check)
 
     def _build_plot(self):
         self.plot_widget = pg.PlotWidget()
@@ -276,10 +428,12 @@ class ShotPlotWindow(QWidget):
         self._vb_right.setXLink(self.plot_widget)
         self.plot_widget.getAxis("right").show()
 
-        self._curve_right = pg.ScatterPlotItem(
-            size=7,
-            brush=pg.mkBrush(*_COLORS[1], 200),
-            pen=pg.mkPen("k", width=0.5),
+        self._curve_right = pg.PlotDataItem(
+            pen=None,
+            symbol="o",
+            symbolSize=7,
+            symbolBrush=pg.mkBrush(*_COLORS[1], 200),
+            symbolPen=pg.mkPen("k", width=0.5),
         )
         self._vb_right.addItem(self._curve_right)
 
@@ -293,35 +447,52 @@ class ShotPlotWindow(QWidget):
         self._vb_right.sigRangeChangedManually.connect(
             self._on_right_range_manual
         )
+        self._apply_plot_style()
 
     def _sync_right_viewbox(self):
         self._vb_right.setGeometry(self.plot_widget.getViewBox().sceneBoundingRect())
         self._vb_right.linkedViewChanged(self.plot_widget.getViewBox(), self._vb_right.XAxis)
 
     def _build_layout(self):
-        form = QFormLayout()
-        form.addRow("Quantities (≤ 2):", self.qty_combo)
-        form.addRow("vs:", self.indep_combo)
+        self._controls_panel = QFrame()
+        self._controls_panel.setObjectName("controlsPanel")
 
-        last_row = QHBoxLayout()
-        last_row.addWidget(self.plot_last_check)
-        last_row.addWidget(self.plot_last_spin)
-        last_row.addStretch()
-        form.addRow("", last_row)
+        self._controls_grid = QGridLayout()
+        self._controls_grid.setContentsMargins(3, 3, 3, 3)
+        self._controls_grid.setHorizontalSpacing(6)
+        self._controls_grid.setVerticalSpacing(4)
 
+        self._y_label = QLabel("Y")
+        self._y_label.setObjectName("sectionLabel")
+        self._x_label = QLabel("X")
+        self._x_label.setObjectName("sectionLabel")
+
+        self._legend_widget = QWidget()
         legend_row = QHBoxLayout()
+        legend_row.setContentsMargins(0, 0, 0, 0)
+        legend_row.setSpacing(14)
         legend_row.addWidget(self._legend_label_1)
         legend_row.addWidget(self._legend_label_2)
         legend_row.addStretch()
-        legend_row.addWidget(self.autorange_button)
-        form.addRow("", legend_row)
+        self._legend_widget.setLayout(legend_row)
 
-        controls = QGroupBox("Settings")
-        controls.setLayout(form)
-        controls.setMaximumHeight(160)
+        self._controls_panel.setLayout(self._controls_grid)
+
+        # Single persistent layout row; compact mode intentionally removed.
+        self._controls_grid.addWidget(self._y_label, 0, 0)
+        self._controls_grid.addWidget(self.qty_combo, 0, 1)
+        self._controls_grid.addWidget(self._x_label, 0, 2)
+        self._controls_grid.addWidget(self.indep_combo, 0, 3)
+        self._controls_grid.addWidget(self.options_button, 0, 4)
+        self._controls_grid.addWidget(self.autorange_button, 0, 5)
+        self._controls_grid.addWidget(self._legend_widget, 1, 0, 1, 6)
+        self._controls_grid.setColumnStretch(1, 1)
+        self._controls_grid.setColumnStretch(3, 1)
 
         layout = QVBoxLayout()
-        layout.addWidget(controls)
+        layout.setContentsMargins(3,3,3,3)
+        layout.setSpacing(4)
+        layout.addWidget(self._controls_panel)
         layout.addWidget(self.plot_widget, stretch=1)
         self.setLayout(layout)
 
@@ -332,6 +503,7 @@ class ShotPlotWindow(QWidget):
     @pyqtSlot(dict)
     def on_new_shot(self, shot: dict):
         """Append one shot result dict and refresh the plot."""
+        self._register_dynamic_quantities(shot)
         self._shot_data.append(shot)
         self._replot()
 
@@ -344,6 +516,18 @@ class ShotPlotWindow(QWidget):
         self._autorange_left = True
         self._autorange_right = True
 
+    def set_camera_enabled(self, enabled: bool):
+        self._camera_enabled = bool(enabled)
+        if self._camera_enabled:
+            for key, label in DERIVED_QUANTITIES.items():
+                if key not in CAMERA_DERIVED_QUANTITY_KEYS:
+                    continue
+                if not self.qty_combo.has_key(key):
+                    self.qty_combo.add_item(label, data=key)
+        else:
+            for key in CAMERA_DERIVED_QUANTITY_KEYS:
+                self.qty_combo.remove_key(key)
+
     def update_xvar_names(self, names: list[str]):
         """Replace xvar entries in the independent combo."""
         to_remove = []
@@ -355,6 +539,16 @@ class ShotPlotWindow(QWidget):
         for name in names:
             self.indep_combo.addItem(f"xvar: {name}", userData=f"xvar:{name}")
 
+    def update_data_field_names(self, names: list[str]):
+        """Register data fields as selectable y-quantities while running."""
+        self._data_field_names = [str(name) for name in names]
+        for name in names:
+            key = f"xvar.{name}"
+            if self.qty_combo.has_key(key):
+                continue
+            self._dynamic_qty_labels[key] = f"data: {name}"
+            self.qty_combo.add_item(f"data: {name}", data=key)
+
     # ------------------------------------------------------------------
     #  Internal
     # ------------------------------------------------------------------
@@ -362,8 +556,82 @@ class ShotPlotWindow(QWidget):
     def _on_indep_changed(self):
         key = self.indep_combo.currentData()
         is_sequential = key in ("shot_index", "timestamp")
-        self.plot_last_check.setVisible(is_sequential)
-        self.plot_last_spin.setVisible(is_sequential)
+        self.plot_last_check.setEnabled(is_sequential)
+        self.plot_last_spin.setEnabled(is_sequential)
+        self.plot_last_check.setToolTip(
+            "Available for shot-index or timestamp x-axis"
+            if not is_sequential
+            else "Only plot the last N points"
+        )
+
+    def _toggle_options_dialog(self):
+        if self._options_dialog.isVisible():
+            self._options_dialog.hide()
+            return
+        anchor = self.options_button.mapToGlobal(self.options_button.rect().bottomLeft())
+        self._options_dialog.move(anchor)
+        self._options_dialog.show()
+        self._options_dialog.raise_()
+        self._options_dialog.activateWindow()
+
+    def _on_style_options_changed(self):
+        left_rgb = self.left_color_combo.currentData()
+        right_rgb = self.right_color_combo.currentData()
+        if isinstance(left_rgb, tuple) and len(left_rgb) == 3:
+            self._series_colors[0] = left_rgb
+        if isinstance(right_rgb, tuple) and len(right_rgb) == 3:
+            self._series_colors[1] = right_rgb
+        self._apply_plot_style()
+        self._replot()
+
+    def _apply_plot_style(self):
+        marker_size = self.symbol_size_spin.value()
+        left_color = self._series_colors[0]
+        right_color = self._series_colors[1]
+        connect_lines = self.connect_points_check.isChecked()
+
+        self._curve_left.setSymbolSize(marker_size)
+        self._curve_right.setSymbolSize(marker_size)
+        self._curve_left.setSymbolBrush(pg.mkBrush(*left_color, 200))
+        self._curve_right.setSymbolBrush(pg.mkBrush(*right_color, 200))
+        self._curve_left.setPen(pg.mkPen(*left_color, width=2) if connect_lines else None)
+        self._curve_right.setPen(pg.mkPen(*right_color, width=2) if connect_lines else None)
+        self.plot_widget.showGrid(x=self.show_grid_check.isChecked(), y=self.show_grid_check.isChecked(), alpha=0.3)
+        self._update_legend_styles()
+
+    def _update_legend_styles(self):
+        c1 = self._series_colors[0]
+        c2 = self._series_colors[1]
+        self._legend_label_1.setStyleSheet(
+            f"color: rgb{c1}; font-weight: bold; border: none;"
+        )
+        self._legend_label_2.setStyleSheet(
+            f"color: rgb{c2}; font-weight: bold; border: none;"
+        )
+
+    def _register_dynamic_quantities(self, shot: dict):
+        for key, value in shot.items():
+            if key in DERIVED_QUANTITIES or key in ("shot_index", "timestamp", "xvars", "data_fields"):
+                continue
+            if isinstance(value, (dict, list, tuple)):
+                continue
+            try:
+                arr = np.asarray(value, dtype=float)
+            except Exception:
+                continue
+            if arr.ndim > 1:
+                continue
+            if self.qty_combo.has_key(key):
+                continue
+            if key.startswith("xvar.") and key.split(".", 1)[1] in self._data_field_names:
+                label = f"data: {key.split('.', 1)[1]}"
+            else:
+                label = key.replace("_", " ")
+            self._dynamic_qty_labels[key] = label
+            self.qty_combo.add_item(label, data=key)
+
+    def _quantity_label(self, key: str) -> str:
+        return DERIVED_QUANTITIES.get(key, self._dynamic_qty_labels.get(key, key))
 
     def _build_x(self, data: list[dict], indep_key: str):
         """Return (x_vals, x_label) for the given independent variable."""
@@ -421,12 +689,12 @@ class ShotPlotWindow(QWidget):
 
         # ---- quantity 1 → left axis -----------------------------------
         key1 = qty_keys[0]
-        label1 = DERIVED_QUANTITIES.get(key1, key1)
+        label1 = self._quantity_label(key1)
         y1 = np.array([d.get(key1, np.nan) for d in data], dtype=float)
         mask1 = np.isfinite(x_vals) & np.isfinite(y1)
         self._curve_left.setData(x_vals[mask1], y1[mask1])
-        self.plot_widget.setLabel("left", label1, color=pg.mkColor(*_COLORS[0]))
-        self.plot_widget.getAxis("left").setPen(pg.mkPen(*_COLORS[0]))
+        self.plot_widget.setLabel("left", label1, color=pg.mkColor(*self._series_colors[0]))
+        self.plot_widget.getAxis("left").setPen(pg.mkPen(*self._series_colors[0]))
         self._legend_label_1.setText(f"● {label1}")
 
         if self._autorange_left:
@@ -435,12 +703,12 @@ class ShotPlotWindow(QWidget):
         # ---- quantity 2 → right axis (if selected) --------------------
         if len(qty_keys) >= 2:
             key2 = qty_keys[1]
-            label2 = DERIVED_QUANTITIES.get(key2, key2)
+            label2 = self._quantity_label(key2)
             y2 = np.array([d.get(key2, np.nan) for d in data], dtype=float)
             mask2 = np.isfinite(x_vals) & np.isfinite(y2)
             self._curve_right.setData(x=x_vals[mask2], y=y2[mask2])
-            self.plot_widget.setLabel("right", label2, color=pg.mkColor(*_COLORS[1]))
-            self.plot_widget.getAxis("right").setPen(pg.mkPen(*_COLORS[1]))
+            self.plot_widget.setLabel("right", label2, color=pg.mkColor(*self._series_colors[1]))
+            self.plot_widget.getAxis("right").setPen(pg.mkPen(*self._series_colors[1]))
             self.plot_widget.getAxis("right").show()
             self._legend_label_2.setText(f"● {label2}")
             # auto-range the right ViewBox only if not manually overridden
@@ -459,12 +727,14 @@ class ShotPlotWindow(QWidget):
         # ---- window title ---------------------------------------------
         labels = self.qty_combo.checked_labels()
         title_qty = " & ".join(labels) if labels else "–"
-        self.setWindowTitle(f"Plot #{self._id}  —  {title_qty}  vs  {x_label}")
+        if not self._embedded:
+            self.setWindowTitle(f"Plot #{self._id}  —  {title_qty}  vs  {x_label}")
 
     # ------------------------------------------------------------------
     #  Cleanup
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        self.closed.emit(self)
+        if not self._embedded:
+            self.closed.emit(self)
         super().closeEvent(event)

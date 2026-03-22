@@ -76,7 +76,7 @@ class atom_number_apd():
         self.n_down = n_down
         self.n_total = n_up + n_down
         self.frac_up = n_up / (self.n_total)
-        self.frac_down = n_up / (self.n_total)
+        self.frac_down = n_down / (self.n_total)
 
     def calibration(self):
         # for later
@@ -185,6 +185,15 @@ class atomdata():
     ### Analysis
 
     def _initial_analysis(self,transpose_idx,avg_repeats):
+        self.compute_apd_atom_number()
+        if not self._has_captured_images():
+            self.od_raw = np.array([])
+            self.od = np.array([])
+            self.sum_od_x = np.array([])
+            self.sum_od_y = np.array([])
+            self.integrated_od = np.array([])
+            return
+
         self._sort_images()
         if transpose_idx:
             self._analysis_tags.transposed = True
@@ -195,8 +204,18 @@ class atomdata():
         self.analyze_ods()
 
     def analyze(self):
+        if not self._has_captured_images():
+            self.compute_apd_atom_number()
+            return
         self.compute_raw_ods()
         self.analyze_ods()
+
+    def _has_captured_images(self) -> bool:
+        try:
+            ts = np.asarray(self.image_timestamps)
+            return ts.size > 0 and np.any(ts > 0)
+        except Exception:
+            return False
 
     def compute_raw_ods(self):
         """Computes the ODs. If not absorption analysis, OD = (pwa - dark)/(pwoa - dark).
@@ -227,7 +246,7 @@ class atomdata():
         self._remap_fit_results()
 
         self.compute_apd_atom_number()
-        
+
         if self._analysis_tags.imaging_type == img.ABSORPTION:
             self.compute_atom_number()
 
@@ -235,14 +254,14 @@ class atomdata():
 
     def compute_apd_atom_number(self):
         if 'post_shot_absorption' in self.data.keys:
-            v = self.data.post_shot_absorption
-            if np.all(v == 0.):
+            v = np.asarray(self.data.post_shot_absorption)
+            if v.size == 0 or v.shape[-1] < 4 or np.all(v == 0.):
                 return
-            
-            v_up = v[:,0]
-            v_down = v[:,1]
-            v_light = v[:,2]
-            v_dark = v[:,3]
+
+            v_up = np.take(v, 0, axis=-1)
+            v_down = np.take(v, 1, axis=-1)
+            v_light = np.take(v, 2, axis=-1)
+            v_dark = np.take(v, 3, axis=-1)
 
             light_only = v_light - v_dark
             up_only = v_up - v_dark
@@ -269,15 +288,18 @@ class atomdata():
         self.img_timestamp_atoms = img_timestamp_tuple[0]
         self.img_timestamp_light = img_timestamp_tuple[1]
         self.img_timestamp_dark = img_timestamp_tuple[2]
-        
-        if self.params.N_pwa_per_shot > 1:
+
+        actual_pwa_per_shot = self.img_atoms.shape[self.Nvars]
+        self.params.N_pwa_per_shot = actual_pwa_per_shot
+
+        if actual_pwa_per_shot > 1:
             self.xvarnames = np.append(self.xvarnames,'idx_pwa')
-            self.xvars.append(np.arange(self.params.N_pwa_per_shot))
-            self.xvardims = np.append(self.xvardims,self.params.N_pwa_per_shot)
+            self.xvars.append(np.arange(actual_pwa_per_shot))
+            self.xvardims = np.append(self.xvardims,actual_pwa_per_shot)
             self.Nvars += 1
-            np.append(self.sort_idx,np.arange(self.params.N_pwa_per_shot))
-            if not self.params.N_pwa_per_shot in self.sort_N:
-                np.append(self.sort_N,self.params.N_pwa_per_shot)
+            np.append(self.sort_idx,np.arange(actual_pwa_per_shot))
+            if not actual_pwa_per_shot in self.sort_N:
+                np.append(self.sort_N,actual_pwa_per_shot)
         else:
             self.img_atoms = self._dealer.strip_shot_idx_axis(self.img_atoms)[0]
             self.img_light = self._dealer.strip_shot_idx_axis(self.img_light)[0]

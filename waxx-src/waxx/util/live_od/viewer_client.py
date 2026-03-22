@@ -54,6 +54,9 @@ class ViewerClient(QThread):
     xvars_received = pyqtSignal(dict)
     """Emitted when xvar dict is forwarded from the experiment."""
 
+    available_data_fields_received = pyqtSignal(list)
+    """Emitted with the latest list of available live data-field names."""
+
     run_completed = pyqtSignal()
     """Emitted when the server reports all images captured."""
 
@@ -119,11 +122,19 @@ class ViewerClient(QThread):
     def _handle_message(self, msg):
         cmd = msg.get("cmd", "")
         if cmd == "run_start":
+            self.available_data_fields_received.emit(
+                list(msg.get("available_data_fields", []))
+            )
             self.run_started.emit(msg)
         elif cmd == "image":
             self.image_received.emit(np.asarray(msg["image"]), msg["index"])
         elif cmd == "xvars":
-            self.xvars_received.emit(msg.get("xvars", {}))
+            self.available_data_fields_received.emit(
+                list(msg.get("available_data_fields", []))
+            )
+            payload = dict(msg.get("xvars", {}))
+            payload.update(msg.get("data_fields", {}))
+            self.xvars_received.emit(payload)
         elif cmd in ("run_complete", "run_incomplete"):
             self.run_completed.emit()
         elif cmd == "reset":
@@ -156,8 +167,8 @@ class ViewerClient(QThread):
         and send a ``reset`` command.
 
         This tells the server to stop the grab loop, close the data
-        file, and delete it from disk.  The experiment's scan loop will
-        detect the missing file and terminate.
+        file, and (for in-progress runs) delete it from disk.  If the
+        run has already completed, the file is preserved.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -167,5 +178,41 @@ class ViewerClient(QThread):
             print(f"[ViewerClient] reset reply: {reply}")
         except Exception as e:
             print(f"[ViewerClient] Error sending reset: {e}")
+        finally:
+            sock.close()
+
+    @staticmethod
+    def get_status(server_ip: str, command_port: int) -> dict | None:
+        """Query the camera server command port for current status."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((server_ip, command_port))
+            send_msg(sock, {"cmd": "status"})
+            reply = recv_msg(sock)
+            return reply if isinstance(reply, dict) else None
+        except Exception as e:
+            print(f"[ViewerClient] Error getting status: {e}")
+            return None
+        finally:
+            sock.close()
+
+    @staticmethod
+    def get_logs(server_ip: str, command_port: int, since: int = 0, limit: int = 10000) -> dict | None:
+        """Fetch timestamped server logs from the command port.
+
+        Returns a dict with keys: ``entries`` (list), ``next_index`` and
+        ``total_count``. Returns ``None`` on communication failure.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((server_ip, command_port))
+            send_msg(sock, {"cmd": "get_logs", "since": int(since), "limit": int(limit)})
+            reply = recv_msg(sock)
+            if isinstance(reply, dict) and reply.get("cmd") == "logs":
+                return reply
+            return None
+        except Exception as e:
+            print(f"[ViewerClient] Error getting logs: {e}")
+            return None
         finally:
             sock.close()

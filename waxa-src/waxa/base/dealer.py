@@ -21,6 +21,7 @@ class Dealer():
 
         self.scan_xvars = []
         self.Nvars = 0
+        self._actual_N_pwa_per_shot = None
 
     def plug_in_xvars(self):
         """Plugs in the first value of the xvar list in for the params before
@@ -205,8 +206,25 @@ class Dealer():
         the lengths of all the xvars (= the number of shots), and px and py are
         the size of the image axes in pixels.
         """
+        expected_shots = int(np.prod(self.xvardims)) if len(self.xvardims) else 1
+        configured_pwa = int(self.params.N_pwa_per_shot)
+        actual_images = int(ndarray.shape[0])
+
+        actual_pwa = configured_pwa
+        if expected_shots > 0 and actual_images != expected_shots * configured_pwa:
+            if actual_images % expected_shots == 0:
+                actual_pwa = int(actual_images / expected_shots)
+            else:
+                raise ValueError(
+                    "Image stack shape is inconsistent with saved xvars: "
+                    f"{actual_images} images cannot be reshaped into "
+                    f"xvardims={tuple(self.xvardims)} with "
+                    f"N_pwa_per_shot={configured_pwa}."
+                )
+
+        self._actual_N_pwa_per_shot = actual_pwa
         ndarray = ndarray.reshape(*self.xvardims,
-                                  self.params.N_pwa_per_shot,
+                                  actual_pwa,
                                   *ndarray.shape[2:])
         return ndarray
 

@@ -4,6 +4,7 @@ import numpy as np
 from waxa.base import xvar
 from waxa.data import RunInfo
 from waxa.dummy.camera_params import CameraParams
+from waxx.config.data_vault import DataVault, DataContainer
 from waxx.util.live_od import CameraClient
 
 from artiq.language.core import kernel_from_string, now_mu
@@ -25,7 +26,8 @@ class Scanner():
         self.run_info = RunInfo()
         self.camera_params = CameraParams()
 
-        self.live_od_client = CameraClient(None, None)
+        self.data = DataVault()
+        self.live_od_client = CameraClient(None,None)
 
         self.xvarnames = []
         self.scan_xvars = []
@@ -156,8 +158,6 @@ class Scanner():
             self.update_params_from_xvars()
 
             self.write_host_params_to_kernel()
-            
-            self.live_od_client.send_xvars(self.scan_xvars)
             self.core.break_realtime()
 
             # overloaded in kexp.Base
@@ -170,8 +170,11 @@ class Scanner():
             # overloaded in kexp.Base
             self.cleanup_scan_kernel()
 
-            delay(self.params.t_recover)
+            self.core.wait_until_mu(now_mu())
+            self.send_xvars()
             self.core.break_realtime()
+
+            delay(self.params.t_recover)
 
             self.core.wait_until_mu(now_mu())
             scanning = self.step_scan()
@@ -179,6 +182,41 @@ class Scanner():
             self.core.break_realtime()
 
         self.post_scan()
+
+    def send_xvars(self):
+        self.live_od_client.send_shot_done()
+        self.live_od_client.send_xvars(
+                self.scan_xvars,
+                data_fields=self._get_live_data_fields())
+
+    def _get_live_data_fields(self):
+        data_fields = {}
+
+        for dc in getattr(self.data, "_container_list", []):
+            if not getattr(dc, "_data_gotten", False):
+                continue
+
+            key = getattr(dc, "key", "")
+            if not key:
+                continue
+            try:
+                value = dc.shot_data
+            except Exception:
+                continue
+
+            # Keep payload pickle-safe and compact for live transport.
+            try:
+                arr = np.asarray(value)
+                if arr.ndim == 0:
+                    data_fields[key] = arr.item()
+                elif arr.ndim == 1:
+                    data_fields[key] = arr.tolist()
+                else:
+                    continue
+            except Exception:
+                data_fields[key] = value
+
+        return data_fields
 
     def update_params_from_xvars(self):
         """Updates the host ExptParams attributes and recomputes derived
@@ -378,6 +416,7 @@ class Scanner():
         self.compute_new_derived()
 
         self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
+        self.N_xvars = len(self.xvardims)
         if hasattr(self,'scope_data'):
             self.scope_data.xvardims = self.xvardims
 

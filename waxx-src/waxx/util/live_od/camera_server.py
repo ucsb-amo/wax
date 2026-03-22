@@ -29,15 +29,23 @@ Server → Viewer broadcasts:
 import socket
 import threading
 import time
+import random
 import numpy as np
 from queue import Queue, Empty
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from waxa.data.server_talk import server_talk as st
+
 from waxx.util.comms_server.comm_server import UdpServer
 from waxx.util.live_od.protocol import send_msg, recv_msg
-from waxa.data.increment_run_id import update_run_id
 
+
+_CAMERA_BABY_NAMES = [
+    "Mochi", "Pip", "Noodle", "Sprout", "Pickle", "Biscuit", "Pebble", "Miso",
+    "Comet", "Pixel", "Nova", "Jellybean", "Clover", "Poppy", "Tofu", "Bean",
+    "Luna", "Cosmo", "Dumpling", "Sunny", "Kiwi", "Maple", "Muffin", "Blue",
+]
 
 class CameraServer(UdpServer):
     """
@@ -63,18 +71,35 @@ class CameraServer(UdpServer):
     log_signal = pyqtSignal(str)  # human-readable status messages
     xvars_signal = pyqtSignal(dict)  # forwarded xvar values
 
-    def __init__(self, host, port, camera_nanny=None):
+    def __init__(self, host, port,
+                camera_nanny=None,
+                server_talk = None):
         super().__init__(host, port)
         self.viewer_port = port + 1
+
+        if server_talk == None:
+            server_talk = st()
+        else:
+            server_talk = server_talk
+        self.server_talk = server_talk
+
 
         self.camera_nanny = camera_nanny
 
         # ---- state ----
         self._run_info = {}
         self._run_start_info = None  # Store run_start info for late-connecting viewers
+        self._run_complete_notified = False
+        self._available_data_fields: list[str] = []
+        self._last_data_fields: dict = {}
+        self._run_shot_count = 0  # Track shots received from experiment (reset each run)
+        self._run_shot_history: list[dict] = []
+        self._run_image_history: list[dict] = []
+        self._camera_baby_name: str = ""
         self._camera = None
         self._camera_ready = False
         self._grab_active = False
+        self._image_processing_complete = False  # Tracks when all images are processed
         self._interrupted = False
         self._data_file = None
         self._data_filepath = ""
@@ -86,6 +111,13 @@ class CameraServer(UdpServer):
         # ---- viewer connections (protected by lock) ----
         self._viewer_lock = threading.Lock()
         self._viewer_connections: list[socket.socket] = []
+        self._experiment_lock = threading.Lock()
+        self._experiment_connections: list[socket.socket] = []
+        self._experiment_threads: list[threading.Thread] = []
+
+        # ---- log history ----
+        self._log_lock = threading.Lock()
+        self._log_history: list[dict] = []
 
         # ---- viewer listener socket ----
         self._viewer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -113,7 +145,6 @@ class CameraServer(UdpServer):
         while self.running:
             try:
                 conn, addr = self.sock.accept()
-                self._log(f"Client connected: {addr}")
                 # Handle each connection in its own thread so that a
                 # reset from a viewer can be processed even while an
                 # experiment connection is active.
@@ -122,6 +153,8 @@ class CameraServer(UdpServer):
                     args=(conn,),
                     daemon=True,
                 )
+                with self._experiment_lock:
+                    self._experiment_threads.append(t)
                 t.start()
             except socket.error as e:
                 if self.running:
@@ -143,7 +176,6 @@ class CameraServer(UdpServer):
             while self.running:
                 try:
                     conn, addr = self._viewer_sock.accept()
-                    self._log(f"Viewer client connected: {addr}")
                     with self._viewer_lock:
                         self._viewer_connections.append(conn)
                     
@@ -168,31 +200,62 @@ class CameraServer(UdpServer):
     def _handle_experiment_connection(self, conn):
         """Handle a full experiment run on *conn*."""
         try:
+            peer = conn.getpeername()
+        except Exception:
+            peer = ("?", "?")
+        with self._experiment_lock:
+            self._experiment_connections.append(conn)
+        try:
             while self.running:
                 msg = recv_msg(conn)
                 if msg is None:
                     break
 
                 cmd = msg.get("cmd", "")
-                self._log(f"<< command: {cmd}")
+                if cmd != "status":
+                    self._log(f"<< command from {peer}: {cmd}")
 
                 if cmd == "new_run":
-                    reply = self._handle_new_run(msg)
+                    reply = self._handle_new_run(msg, peer=peer)
                 elif cmd == "xvars":
                     reply = self._handle_xvars(msg)
+                elif cmd == "shot_done":
+                    reply = self._handle_shot_done()
                 elif cmd == "run_complete":
                     reply = self._handle_run_complete()
-                    send_msg(conn, reply)
-                    break  # end of run → close connection
+                    self._send_reply_and_disconnect(conn, reply)
+                    return
                 elif cmd == "reset":
                     reply = self._handle_reset()
-                    send_msg(conn, reply)
-                    break  # connection ends after reset
+                    self._send_reply_and_disconnect(conn, reply)
+                    return
                 elif cmd == "status":
+                    try:
+                        next_run_id = self.server_talk.get_run_id()
+                    except Exception:
+                        next_run_id = self._run_info.get("run_id", 0)
+                    active_run_id = self._run_info.get("run_id", next_run_id)
                     reply = {
                         "cmd": "status",
                         "camera_ready": self._camera_ready,
                         "grab_active": self._grab_active,
+                        "run_id": active_run_id if self._run_start_info is not None else next_run_id,
+                        "active_run_id": active_run_id,
+                        "next_run_id": next_run_id,
+                    }
+                elif cmd in ("get_logs", "logs"):
+                    since = int(msg.get("since", 0))
+                    limit = int(msg.get("limit", 10000))
+                    with self._log_lock:
+                        total = len(self._log_history)
+                        start = max(0, min(since, total))
+                        end = min(total, start + max(1, limit))
+                        entries = [dict(entry) for entry in self._log_history[start:end]]
+                    reply = {
+                        "cmd": "logs",
+                        "entries": entries,
+                        "next_index": end,
+                        "total_count": total,
                     }
                 else:
                     reply = {"cmd": "error", "message": f"Unknown command: {cmd}"}
@@ -202,46 +265,84 @@ class CameraServer(UdpServer):
         except Exception as e:
             self._log(f"Error in experiment handler: {e}")
         finally:
-            conn.close()
-            self._log("Experiment client disconnected.")
-            # If grab loop is still active, terminate it and clean up
-            if self._grab_active:
-                import os
-                self._log("Terminating grab loop due to client disconnect.")
-                self._interrupted = True
-
-                # Close the HDF5 data file
-                with self._data_file_lock:
-                    if self._data_file is not None:
-                        try:
-                            self._data_file.close()
-                            self._log("Data file closed.")
-                        except Exception as e:
-                            self._log(f"Error closing data file: {e}")
-                    self._data_file = None
-
-                # Delete the data file from disk
-                if self._data_filepath:
-                    try:
-                        if os.path.exists(self._data_filepath):
-                            os.remove(self._data_filepath)
-                            self._log(f"Data file deleted: {self._data_filepath}")
-                    except Exception as e:
-                        self._log(f"Error deleting data file: {e}")
+            with self._experiment_lock:
+                if conn in self._experiment_connections:
+                    self._experiment_connections.remove(conn)
+                current = threading.current_thread()
+                if current in self._experiment_threads:
+                    self._experiment_threads.remove(current)
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ---- command handlers --------------------------------------------------
 
-    def _handle_new_run(self, msg):
+    def _handle_new_run(self, msg, peer=None):
         """Connect camera, start grab loop, reply ``camera_ready``.
 
         The experiment blocks on ``send_new_run()`` until this reply is
         sent, so by the time the experiment proceeds the camera is
         connected and actively waiting for triggers.
         """
+        run_id = msg.get("run_id", 0)
+
+        current_run_id = self._run_info.get("run_id", None)
+        if current_run_id == run_id:
+            self._log(
+                f"Ignoring duplicate new_run for run_id={run_id} from {peer}; "
+                "current run data is still retained in memory."
+            )
+            return {"cmd": "camera_ready", "duplicate": True}
+
         self._run_info = msg
+        self._run_complete_notified = False
+        self._image_processing_complete = False  # Reset for new run
+        self._run_shot_count = 0  # Reset shot counter for new run
+        self._available_data_fields = []
+        self._last_data_fields = {}
+        self._run_shot_history = []
+        self._run_image_history = []
+        self._camera_baby_name = random.choice(_CAMERA_BABY_NAMES)
+        setup_camera = bool(msg.get("setup_camera", True))
         camera_params = msg["camera_params"]
 
         self.camera_status_signal.emit(0)  # baby born
+        self._log(f"Camera baby {self._camera_baby_name} is born for run {run_id}.")
+
+        save_data = msg.get("save_data", True)
+        N_img = int(msg["N_img"])
+        N_shots = int(msg["N_shots"])
+
+        if not setup_camera:
+            self._camera = None
+            self._camera_ready = True
+            self._grab_active = False
+            self._image_processing_complete = True  # No grab loop, so mark as complete
+            self._log(
+                f"Run ID: {run_id} | setup_camera=False | save_data: {save_data}"
+            )
+
+            run_start_info = {
+                "cmd": "run_start",
+                "N_img": 0,
+                "N_shots": N_shots,
+                "N_pwa_per_shot": msg["N_pwa_per_shot"],
+                "camera_key": "",
+                "setup_camera": False,
+                "imaging_type": msg.get("imaging_type", False),
+                "run_id": run_id,
+                "save_data": save_data,
+                "available_data_fields": [],
+                "pixel_size_m": getattr(camera_params, "pixel_size_m", 0.0),
+                "magnification": getattr(camera_params, "magnification", 1.0),
+            }
+            self._run_start_info = run_start_info
+            self._broadcast_to_viewers(run_start_info)
+            self.run_started_signal.emit(run_start_info)
+
+            return {"cmd": "camera_ready"}
+
         self._log("New run requested — connecting camera...")
 
         self._camera = self.camera_nanny.persistent_get_camera(camera_params)
@@ -256,9 +357,6 @@ class CameraServer(UdpServer):
             if isinstance(camera_key, bytes):
                 camera_key = camera_key.decode()
 
-            run_id = msg.get("run_id", 0)
-            N_img = msg["N_img"]
-            save_data = msg.get("save_data", True)
             self._log(
                 f"Camera connected: {camera_key}  |  "
                 f"Run ID: {run_id}  |  "
@@ -273,9 +371,11 @@ class CameraServer(UdpServer):
                 "N_shots": msg["N_shots"],
                 "N_pwa_per_shot": msg["N_pwa_per_shot"],
                 "camera_key": camera_key,
+                "setup_camera": True,
                 "imaging_type": msg.get("imaging_type", False),
                 "run_id": run_id,
                 "save_data": save_data,
+                "available_data_fields": [],
                 "pixel_size_m": getattr(camera_params, "pixel_size_m", 0.0),
                 "magnification": getattr(camera_params, "magnification", 1.0),
             }
@@ -306,22 +406,65 @@ class CameraServer(UdpServer):
     def _handle_xvars(self, msg):
         """Forward xvars to all connected viewers."""
         xvars = msg.get("xvars", {})
+        data_fields = msg.get("data_fields", {})
+        self._last_data_fields = dict(data_fields)
+        if data_fields:
+            field_names = list(data_fields.keys())
+            if field_names != self._available_data_fields:
+                self._available_data_fields = field_names
+                if self._run_start_info is not None:
+                    self._run_start_info["available_data_fields"] = list(self._available_data_fields)
         parts = ", ".join(f"{k}={v}" for k, v in xvars.items())
         self._log(f"xvars received: {parts}")
-        self._broadcast_to_viewers({"cmd": "xvars", "xvars": xvars})
+        shot = {
+            "shot_index": len(self._run_shot_history),
+            "timestamp": time.time(),
+            "xvars": dict(xvars),
+            "data_fields": dict(data_fields),
+        }
+        for key, value in xvars.items():
+            shot[f"xvar.{key}"] = value
+        for key, value in data_fields.items():
+            shot[f"xvar.{key}"] = value
+        self._run_shot_history.append(shot)
+        self._broadcast_to_viewers(
+            {
+                "cmd": "xvars",
+                "xvars": xvars,
+                "data_fields": data_fields,
+                "available_data_fields": list(self._available_data_fields),
+            }
+        )
         try:
-            self.xvars_signal.emit(xvars)
+            self.xvars_signal.emit(dict(xvars))
         except RuntimeError:
             pass
         return {"cmd": "ack"}
 
+    def _handle_shot_done(self):
+        """Experiment signalled a shot is complete (independent shot counter)."""
+        self._run_shot_count += 1
+        N_shots = int(self._run_info.get("N_shots", 0))
+        if N_shots > 0:
+            self._log(f"Shot {self._run_shot_count}/{N_shots} complete.")
+        return {"cmd": "ack"}
+
     def _handle_run_complete(self):
-        """Experiment signalled run complete."""
-        self._log("Experiment signalled run complete.")
+        """Experiment signalled run complete -- wait for grab and image processing."""
+        self._log("Experiment signalled run complete — waiting for grab loop and image processing...")
+        self._wait_for_grab_complete()
+        self._log("Grab loop and image processing complete.")
+        if self._camera_baby_name:
+            self._log(f"Run complete. {self._camera_baby_name} has retired honorably.")
+        
         self._run_start_info = None  # Clear run info since run is complete
         self.camera_status_signal.emit(-1)
+        if not self._run_complete_notified:
+            self._broadcast_to_viewers({"cmd": "run_complete"})
+            self.run_completed_signal.emit()
+            self._run_complete_notified = True
         try:
-            update_run_id()
+            self.server_talk.update_run_id()
             self._log("Run ID advanced.")
         except Exception as e:
             self._log(f"Error advancing run ID: {e}")
@@ -335,7 +478,10 @@ class CameraServer(UdpServer):
         """
         import os
 
+        run_was_active = self._run_start_info is not None
         self._log("RESET requested — stopping grab loop.")
+        if self._camera_baby_name:
+            self._log(f"Reset received. {self._camera_baby_name} had a rough day.")
         self._interrupted = True
         self._run_start_info = None  # Clear run info since run is being reset
 
@@ -349,23 +495,27 @@ class CameraServer(UdpServer):
                     self._log(f"Error closing data file: {e}")
                 self._data_file = None
 
-        # Delete the data file from disk
-        if self._data_filepath:
-            try:
-                if os.path.exists(self._data_filepath):
-                    os.remove(self._data_filepath)
-                    self._log(f"Data file deleted: {self._data_filepath}")
-                else:
-                    self._log(f"Data file already absent: {self._data_filepath}")
-            except Exception as e:
-                self._log(f"Error deleting data file: {e}")
+        # Delete the data file only for in-progress runs.
+        # If the run already completed, keep the finished dataset on reset.
+        if run_was_active:
+            if self._data_filepath:
+                try:
+                    if os.path.exists(self._data_filepath):
+                        os.remove(self._data_filepath)
+                        self._log(f"Data file deleted: {self._data_filepath}")
+                    else:
+                        self._log(f"Data file already absent: {self._data_filepath}")
+                except Exception as e:
+                    self._log(f"Error deleting data file: {e}")
+        else:
+            self._log("Run already complete; data file preserved on reset.")
 
         self._camera_ready = False
         self._grab_active = False
         self.camera_status_signal.emit(-1)
         self._broadcast_to_viewers({"cmd": "reset"})
         try:
-            update_run_id()
+            self.server_talk.update_run_id()
             self._log("Run ID advanced.")
         except Exception as e:
             self._log(f"Error advancing run ID: {e}")
@@ -431,6 +581,9 @@ class CameraServer(UdpServer):
                 self._broadcast_to_viewers(
                     {"cmd": "image", "image": np.asarray(img), "index": idx}
                 )
+                self._run_image_history.append(
+                    {"image": np.asarray(img), "index": idx, "timestamp": img_t}
+                )
                 self.image_grabbed_signal.emit(np.asarray(img), idx)
                 count += 1
 
@@ -448,21 +601,15 @@ class CameraServer(UdpServer):
                     pass
                 self._data_file = None
 
-        # If save_data was False, delete the data file from disk
-        if not save_data and data_filepath:
-            import os
-            try:
-                if os.path.exists(data_filepath):
-                    os.remove(data_filepath)
-                    self._log(f"save_data=False — data file deleted: {data_filepath}")
-            except Exception as e:
-                self._log(f"Error deleting unsaved data file: {e}")
+        # Mark image processing as complete
+        self._image_processing_complete = True
 
         # Notify viewers
         if count >= N_img:
             self._log(f"All {N_img} images captured — run complete.")
             self._broadcast_to_viewers({"cmd": "run_complete"})
             self.run_completed_signal.emit()
+            self._run_complete_notified = True
             self.camera_status_signal.emit(-1)
         else:
             self._log(f"Grab incomplete: {count}/{N_img} images.")
@@ -502,12 +649,44 @@ class CameraServer(UdpServer):
                     pass
                 self._viewer_connections.remove(conn)
 
+    def _wait_for_grab_complete(self, timeout=300):
+        """Wait for grab loop and image processing to complete."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._image_processing_complete:
+                return
+            time.sleep(0.1)
+        self._log(f"WARNING: Image processing did not complete within {timeout}s timeout")
+
+    def _send_reply_and_disconnect(self, conn, reply):
+        """Send a final reply, then half-close the socket so the client sees EOF."""
+        try:
+            send_msg(conn, reply)
+        except Exception as e:
+            self._log(f"Error sending final reply before disconnect: {e}")
+        self._terminate_experiment_connection(conn)
+
+    def _terminate_experiment_connection(self, conn):
+        """Gracefully terminate the per-run command connection so its handler thread exits."""
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     #  Logging helper
     # ------------------------------------------------------------------
 
     def _log(self, msg):
         """Print and emit a human-readable log message."""
+        now = time.time()
+        with self._log_lock:
+            entry = {
+                "index": len(self._log_history),
+                "timestamp": now,
+                "message": str(msg),
+            }
+            self._log_history.append(entry)
         print(f"[CameraServer] {msg}")
         try:
             self.log_signal.emit(msg)
@@ -537,8 +716,27 @@ class CameraServer(UdpServer):
                 except Exception:
                     pass
             self._viewer_connections.clear()
+        with self._experiment_lock:
+            for conn in self._experiment_connections:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._experiment_connections.clear()
         if self.camera_nanny is not None:
             try:
                 self.camera_nanny.close_all()
             except Exception:
                 pass
+
+    def get_run_shot_history(self):
+        """Return a shallow copy of the accumulated shot history for this run."""
+        return list(self._run_shot_history)
+
+    def get_run_image_history(self):
+        """Return a shallow copy of the accumulated image history for this run."""
+        return list(self._run_image_history)
