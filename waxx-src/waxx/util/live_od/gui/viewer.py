@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
 )
 from PyQt6.QtGui import QShortcut, QKeySequence
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
 
 class SuppressPrints:
@@ -42,6 +42,8 @@ class SuppressPrints:
 
 
 class LiveODViewer(QWidget):
+    frame_changed = pyqtSignal(int)
+
     def __init__(self):
         super().__init__()
         self.Nimg = 0
@@ -825,6 +827,7 @@ class LiveODViewer(QWidget):
             self.frame_index_label.setText(f"Frame {self._frame_index + 1}/{n_frames}")
         else:
             self.frame_index_label.setText("Frame 0/0")
+        self.frame_changed.emit(self._frame_index)
 
     def get_od_view_range(self):
         try:

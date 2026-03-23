@@ -537,17 +537,52 @@ class ShotPlotWindow(QWidget):
         for i in reversed(to_remove):
             self.indep_combo.removeItem(i)
         for name in names:
-            self.indep_combo.addItem(f"xvar: {name}", userData=f"xvar:{name}")
+            label_prefix = "data" if str(name) in self._data_field_names else "xvar"
+            self.indep_combo.addItem(f"{label_prefix}: {name}", userData=f"xvar:{name}")
 
     def update_data_field_names(self, names: list[str]):
         """Register data fields as selectable y-quantities while running."""
-        self._data_field_names = [str(name) for name in names]
-        for name in names:
-            key = f"xvar.{name}"
-            if self.qty_combo.has_key(key):
+        normalized = [str(name) for name in names]
+        self._data_field_names = normalized
+
+        # If data-field metadata arrives after selector items were created,
+        # relabel those existing entries from xvar:* to data:*.
+        for i in range(self.indep_combo.count()):
+            item_data = self.indep_combo.itemData(i)
+            if not isinstance(item_data, str) or not item_data.startswith("xvar:"):
                 continue
-            self._dynamic_qty_labels[key] = f"data: {name}"
-            self.qty_combo.add_item(f"data: {name}", data=key)
+            name = item_data.split(":", 1)[1]
+            if name in self._data_field_names:
+                self.indep_combo.setItemText(i, f"data: {name}")
+
+        # Remove stale data-field quantities so selector options match the run.
+        current_data_keys = {
+            f"xvar.{name}" for name in self._data_field_names
+        }
+        to_remove = []
+        for row in range(self.qty_combo.model().rowCount()):
+            item = self.qty_combo.model().item(row)
+            if item is None:
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(key, str) and key.startswith("xvar.") and key not in current_data_keys:
+                to_remove.append(key)
+        for key in to_remove:
+            self.qty_combo.remove_key(key)
+            self._dynamic_qty_labels.pop(key, None)
+
+        for name in self._data_field_names:
+            key = f"xvar.{name}"
+            label = f"data: {name}"
+            self._dynamic_qty_labels[key] = label
+            if self.qty_combo.has_key(key):
+                for row in range(self.qty_combo.model().rowCount()):
+                    item = self.qty_combo.model().item(row)
+                    if item is not None and item.data(Qt.ItemDataRole.UserRole) == key:
+                        item.setText(label)
+                        break
+            else:
+                self.qty_combo.add_item(label, data=key)
 
     # ------------------------------------------------------------------
     #  Internal

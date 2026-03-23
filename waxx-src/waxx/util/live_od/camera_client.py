@@ -107,13 +107,19 @@ class CameraClient(CommClient):
     # ------------------------------------------------------------------
 
     def send_new_run(self, camera_params, data_filepath, save_data,
-                     setup_camera, N_img, N_shots, N_pwa_per_shot, imaging_type, run_id):
+                     setup_camera, N_img, N_shots, N_pwa_per_shot, imaging_type, run_id,
+                     data_spec=None, run_info_attrs=None,
+                     params_attrs=None, camera_params_attrs=None):
         """
         Send camera params and run metadata to the server.
 
         Blocks until the server has connected the camera and started the
         grab loop. Returns ``{"cmd": "camera_ready"}`` on success —
         at that point the experiment can proceed to trigger the camera.
+
+        If ``data_spec`` is provided the server will create the HDF5 data
+        file itself, so the experiment process never needs to mount the
+        data network drive.
 
         Returns
         -------
@@ -131,6 +137,10 @@ class CameraClient(CommClient):
             "N_pwa_per_shot": N_pwa_per_shot,
             "imaging_type": imaging_type,
             "run_id": run_id,
+            "data_spec": data_spec or {},
+            "run_info_attrs": run_info_attrs or {},
+            "params_attrs": params_attrs or {},
+            "camera_params_attrs": camera_params_attrs or {},
         }
         return self._send_recv(msg)
 
@@ -180,6 +190,55 @@ class CameraClient(CommClient):
             Server reply (``{"cmd": "ack"}``).
         """
         return self._send_recv({"cmd": "run_complete"})
+
+    def send_write_data(self, data, params_attrs, sort_info,
+                        scope_data_list, texts):
+        """
+        Send final run data to the server for writing into the HDF5 file.
+
+        Must be called before ``send_run_complete`` while the persistent
+        connection is still open.  The server waits for the grab loop to
+        finish before writing, so this call blocks until the file write is
+        acknowledged.
+
+        Parameters
+        ----------
+        data : dict
+            ``{key: np.ndarray}`` for each non-external DataContainer
+            (already unshuffled on the experiment side).
+        params_attrs : dict
+            Serialized ExptParams key→value dict (post cleanup_scanned).
+        sort_info : dict
+            Sort/shuffle metadata so the server can unshuffle external
+            datasets (images/timestamps) in-place.
+        scope_data_list : list of dict
+            ``[{"label": str, "t": ndarray, "v": ndarray}, ...]``.
+        texts : dict
+            Source-file text content keyed by
+            ``expt / params / cooling / imaging / control``.
+        """
+        return self._send_recv({
+            "cmd": "write_data",
+            "data": data,
+            "params_attrs": params_attrs,
+            "sort_info": sort_info,
+            "scope_data_list": scope_data_list,
+            "texts": texts,
+        })
+
+    def check_interrupted(self) -> bool:
+        """
+        Ask the server whether a reset has been triggered for the current run.
+
+        Used by the experiment scan loop instead of checking for the data
+        file's physical existence on disk.
+
+        Returns
+        -------
+        bool
+        """
+        reply = self._send_recv({"cmd": "check_interrupted"})
+        return bool(reply.get("interrupted", False))
 
     def check_status(self):
         """

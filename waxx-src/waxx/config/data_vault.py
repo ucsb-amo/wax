@@ -106,8 +106,19 @@ class DataVault():
     
     def __init__(self, expt=None):
         self.keys = []
+        self._container_list = []
         self._keys_nonext= []
         self._expt = expt
+
+        # self._xvar_writer_floats = []
+        # self._xvar_writer_int32s = []
+        # self._xvar_writer_int64s = []
+        # self._xvar_writer_arrays = []
+
+        # self._keylist_floats = []
+        # self._keylist_int32s = []
+        # self._keylist_int64s = []
+        # self._keylist_arrays = []
 
         # Camera-server populated datasets. These are placeholders in the
         # experiment process and are filled externally by LiveOD.
@@ -170,6 +181,7 @@ class DataVault():
             if isinstance(obj,DataContainer):
                 vars(self)[k].key = k
                 self.keys.append(k)
+                self._container_list.append(obj)
                 if not obj._external_data_bool:
                     self._keys_nonext.append(k)
 
@@ -188,3 +200,30 @@ class DataVault():
         for k in self._keys_nonext:
             dc = vars(self)[k]
             dc._put_shot_data_to_run_data(dc.shot_data)
+
+    # def generate_assignment_kernels(self):
+    #     """Generates a list of kernel functions for each param datatype (int32,
+    #     int64, ndarray, and float ) -- one for each ExptParam attribute. These
+    #     can be called in the kernel to update the kernel experiment params with
+    #     values from the host ExptParams returned by an RPC (the "fetch" functions).
+    #     """
+
+    #     for key in self._keys_nonext:
+    #         bodycode = f"self.data.{key}._run_data = value"
+    #         dtype = str(type(vars(self.data)[key]._run_data))
+
+    #         if 'int' in dtype:
+    #             if 'numpy.int64' in dtype:
+    #                 self._keylist_int64s.append(key)
+    #                 self._xvar_writer_int64s.append( kernel_from_string(["self","value"],bodycode) )
+    #             else:
+    #                 self._keylist_int32s.append(key)
+    #                 self._xvar_writer_int32s.append( kernel_from_string(["self","value"],bodycode) )
+    #         elif 'float' in dtype:
+    #             self._keylist_floats.append(key)
+    #             self._xvar_writer_floats.append( kernel_from_string(["self","value"],bodycode) )
+    #         elif 'ndarray' in dtype:
+    #             self._keylist_arrays.append(key)
+    #             self._xvar_writer_arrays.append( kernel_from_string(["self","value"],bodycode) )
+
+    

@@ -36,16 +36,16 @@ from queue import Queue, Empty
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from waxa.data.server_talk import server_talk as st
+from waxa.base.dealer import Dealer
 
 from waxx.util.comms_server.comm_server import UdpServer
+from waxx.util.live_od.camera_baby import (
+    BIRTH_EUPHEMISMS,
+    CAMERA_BABY_NAMES,
+    DISHONORABLE_DEATH_EUPHEMISMS,
+    HONORABLE_DEATH_EUPHEMISMS,
+)
 from waxx.util.live_od.protocol import send_msg, recv_msg
-
-
-_CAMERA_BABY_NAMES = [
-    "Mochi", "Pip", "Noodle", "Sprout", "Pickle", "Biscuit", "Pebble", "Miso",
-    "Comet", "Pixel", "Nova", "Jellybean", "Clover", "Poppy", "Tofu", "Bean",
-    "Luna", "Cosmo", "Dumpling", "Sunny", "Kiwi", "Maple", "Muffin", "Blue",
-]
 
 class CameraServer(UdpServer):
     """
@@ -104,6 +104,7 @@ class CameraServer(UdpServer):
         self._data_file = None
         self._data_filepath = ""
         self._data_file_lock = threading.Lock()
+        self._dealer = None
 
         # ---- queues ----
         self._image_queue = Queue()
@@ -212,7 +213,7 @@ class CameraServer(UdpServer):
                     break
 
                 cmd = msg.get("cmd", "")
-                if cmd != "status":
+                if cmd not in ("status", "check_interrupted"):
                     self._log(f"<< command from {peer}: {cmd}")
 
                 if cmd == "new_run":
@@ -257,6 +258,10 @@ class CameraServer(UdpServer):
                         "next_index": end,
                         "total_count": total,
                     }
+                elif cmd == "write_data":
+                    reply = self._handle_write_data(msg)
+                elif cmd == "check_interrupted":
+                    reply = {"cmd": "ack", "interrupted": self._interrupted}
                 else:
                     reply = {"cmd": "error", "message": f"Unknown command: {cmd}"}
 
@@ -296,6 +301,7 @@ class CameraServer(UdpServer):
             return {"cmd": "camera_ready", "duplicate": True}
 
         self._run_info = msg
+        self._init_dealer_from_new_run(msg)
         self._run_complete_notified = False
         self._image_processing_complete = False  # Reset for new run
         self._run_shot_count = 0  # Reset shot counter for new run
@@ -303,14 +309,29 @@ class CameraServer(UdpServer):
         self._last_data_fields = {}
         self._run_shot_history = []
         self._run_image_history = []
-        self._camera_baby_name = random.choice(_CAMERA_BABY_NAMES)
+        self._camera_baby_name = random.choice(CAMERA_BABY_NAMES)
         setup_camera = bool(msg.get("setup_camera", True))
         camera_params = msg["camera_params"]
 
         self.camera_status_signal.emit(0)  # baby born
-        self._log(f"Camera baby {self._camera_baby_name} is born for run {run_id}.")
+        self._log(
+            f"Camera baby {self._camera_baby_name} {random.choice(BIRTH_EUPHEMISMS)} for run {run_id}."
+        )
 
         save_data = msg.get("save_data", True)
+
+        # Create the HDF5 data file on the server side from the spec sent
+        # with new_run. This replaces the experiment-side
+        # DataSaver.create_data_file() call, keeping all file I/O on the
+        # server machine (which has a fast connection to the data store).
+        data_filepath = msg.get("data_filepath", "")
+        if save_data and data_filepath and msg.get("data_spec"):
+            try:
+                self._create_data_file_from_spec(data_filepath, msg)
+                self._log(f"Data file created: {data_filepath}")
+            except Exception as e:
+                self._log(f"Warning: could not create data file: {e}")
+
         N_img = int(msg["N_img"])
         N_shots = int(msg["N_shots"])
 
@@ -455,8 +476,10 @@ class CameraServer(UdpServer):
         self._wait_for_grab_complete()
         self._log("Grab loop and image processing complete.")
         if self._camera_baby_name:
-            self._log(f"Run complete. {self._camera_baby_name} has retired honorably.")
-        
+            self._log(
+                f"Run complete. {self._camera_baby_name} {random.choice(HONORABLE_DEATH_EUPHEMISMS)}."
+            )
+
         self._run_start_info = None  # Clear run info since run is complete
         self.camera_status_signal.emit(-1)
         if not self._run_complete_notified:
@@ -479,9 +502,14 @@ class CameraServer(UdpServer):
         import os
 
         run_was_active = self._run_start_info is not None
-        self._log("RESET requested — stopping grab loop.")
-        if self._camera_baby_name:
-            self._log(f"Reset received. {self._camera_baby_name} had a rough day.")
+        if run_was_active:
+            self._log("RESET requested — stopping grab loop.")
+            if self._camera_baby_name:
+                self._log(
+                    f"Reset received. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                )
+        else:
+            self._log("No active run; advancing run ID.")
         self._interrupted = True
         self._run_start_info = None  # Clear run info since run is being reset
 
@@ -507,8 +535,6 @@ class CameraServer(UdpServer):
                         self._log(f"Data file already absent: {self._data_filepath}")
                 except Exception as e:
                     self._log(f"Error deleting data file: {e}")
-        else:
-            self._log("Run already complete; data file preserved on reset.")
 
         self._camera_ready = False
         self._grab_active = False
@@ -522,9 +548,244 @@ class CameraServer(UdpServer):
         self._log("Reset complete.")
         return {"cmd": "ack"}
 
-    # ------------------------------------------------------------------
-    #  Grab loop & image processing
-    # ------------------------------------------------------------------
+    # ---- server-side data file helpers ------------------------------------
+
+    def _init_dealer_from_new_run(self, run_msg):
+        """Initialize a Dealer context for server-side unscrambling.
+
+        The experiment sends shuffle metadata in ``new_run``. We recreate
+        the minimal Dealer state needed for ``_unshuffle_ndarray``,
+        ``unscramble_images`` and ``_unscramble_timestamps``.
+        """
+        try:
+            data_spec = run_msg.get("data_spec", {})
+            d = Dealer()
+
+            d.sort_idx = [np.asarray(s, dtype=int) for s in data_spec.get("sort_idx", [])]
+            d.sort_N = [int(n) for n in data_spec.get("sort_N", [])]
+            d.xvarnames = list(data_spec.get("xvarnames", []))
+            d.xvardims = [int(v) for v in data_spec.get("xvardims", [])]
+            d.N_xvars = len(d.xvardims)
+
+            d.params.N_pwa_per_shot = int(run_msg.get("N_pwa_per_shot", 1))
+            d.params.N_shots_with_repeats = int(
+                run_msg.get("N_shots", int(np.prod(d.xvardims) if d.xvardims else 1))
+            )
+
+            self._dealer = d
+        except Exception as e:
+            self._dealer = None
+            self._log(f"Warning: failed to initialize Dealer context: {e}")
+
+    def _unshuffle_with_dealer(self, arr, exclude_dims=0):
+        """Unshuffle ndarray using current Dealer context when available."""
+        if self._dealer is None or not getattr(self._dealer, "sort_idx", []):
+            return arr
+        return self._dealer._unshuffle_ndarray(np.asarray(arr), exclude_dims=exclude_dims)
+
+    def _unshuffle_params_attrs(self, params_attrs):
+        """Return params dict with xvar-ordered arrays unshuffled via Dealer."""
+        out = {}
+        for k, v in params_attrs.items():
+            try:
+                out[k] = self._unshuffle_with_dealer(v, exclude_dims=0)
+            except Exception:
+                out[k] = v
+        return out
+
+    def _unshuffle_external_data_in_file(self, f):
+        """Unshuffle images and timestamps in-place using Dealer helpers."""
+        if self._dealer is None or not getattr(self._dealer, "sort_idx", []):
+            return
+        try:
+            if "images" in f["data"]:
+                self._dealer.images = f["data"]["images"][...]
+                f["data"]["images"][...] = self._dealer.unscramble_images()
+            if "image_timestamps" in f["data"]:
+                self._dealer.image_timestamps = f["data"]["image_timestamps"][...]
+                f["data"]["image_timestamps"][...] = self._dealer._unscramble_timestamps()
+        except Exception as e:
+            self._log(f"Warning: failed to unshuffle external datasets: {e}")
+
+    def _create_data_file_from_spec(self, filepath, run_msg):
+        """Create an HDF5 data file from the spec sent with the new_run message.
+
+        Mirrors the structure produced by ``DataSaver.create_data_file()``
+        but runs entirely on the server so the experiment process never
+        opens the data directory directly.
+        """
+        import h5py
+        import os
+
+        data_spec       = run_msg.get("data_spec", {})
+        run_info_attrs  = run_msg.get("run_info_attrs", {})
+        params_attrs    = run_msg.get("params_attrs", {})
+        cam_attrs       = run_msg.get("camera_params_attrs", {})
+
+        folder = os.path.dirname(filepath)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
+        with h5py.File(filepath, "w") as f:
+            data_grp = f.create_group("data")
+
+            xvarnames = data_spec.get("xvarnames", [])
+            try:
+                f.attrs["xvarnames"] = xvarnames
+            except Exception:
+                pass
+
+            # Pre-allocate one dataset per DataContainer
+            for container in data_spec.get("containers", []):
+                key   = container["key"]
+                shape = tuple(container["shape"])
+                dtype = container["dtype"]
+                if 0 in shape:
+                    continue
+                try:
+                    data_grp.create_dataset(key, shape=shape, dtype=dtype)
+                except Exception as e:
+                    self._log(f"Warning: could not create dataset '{key}': {e}")
+
+            # Sort indices (present when scan was shuffled)
+            sort_idx = data_spec.get("sort_idx", [])
+            sort_N   = data_spec.get("sort_N", [])
+            if sort_idx:
+                try:
+                    max_len = max(len(s) for s in sort_idx)
+                    padded  = np.array(
+                        [s + [-1] * (max_len - len(s)) for s in sort_idx]
+                    )
+                    data_grp.create_dataset("sort_idx", data=padded)
+                    data_grp.create_dataset("sort_N",   data=np.array(sort_N))
+                except Exception as e:
+                    self._log(f"Warning: could not save sort_idx: {e}")
+
+            # Run-info: root-level attrs + dedicated group
+            for k, v in run_info_attrs.items():
+                try:
+                    f.attrs[k] = v
+                except Exception:
+                    pass
+            ri_grp = f.create_group("run_info")
+            self._write_dict_to_h5group(ri_grp, run_info_attrs)
+
+            p_grp = f.create_group("params")
+            self._write_dict_to_h5group(p_grp, params_attrs)
+
+            cp_grp = f.create_group("camera_params")
+            self._write_dict_to_h5group(cp_grp, cam_attrs)
+
+        # Record path so _handle_write_data and reset can find the file.
+        self._data_filepath = filepath
+
+    def _write_dict_to_h5group(self, grp, d):
+        """Write each entry of *d* as a dataset in HDF5 group *grp*."""
+        for k, v in d.items():
+            try:
+                grp.create_dataset(k, data=v)
+            except Exception:
+                try:
+                    grp.create_dataset(k, data=str(v))
+                except Exception:
+                    pass
+
+    def _handle_write_data(self, msg):
+        """Write final experiment data into the already-created HDF5 file.
+
+        Called by the experiment just before ``run_complete``.  Waits for
+        the camera grab loop to finish (so images are fully on disk and the
+        file handle is closed), then reopens the file to:
+
+        * write non-external DataContainer arrays (sampler data, OD values, …)
+        * update the params group (post ``cleanup_scanned``)
+        * append scope-trace datasets
+        * store source-file text as HDF5 attrs
+
+        The server applies shuffle inversion using a Dealer context initialized
+        from ``new_run`` metadata. This includes images/timestamps,
+        non-external DataContainer arrays, params arrays, and scope traces.
+        """
+        import h5py
+        import os
+
+        filepath = self._data_filepath
+        if not filepath:
+            self._log("write_data: no data filepath recorded — skipping.")
+            return {"cmd": "ack"}
+
+        # Wait for the grab loop and image-save thread to finish so the file
+        # is properly closed before we reopen it.
+        self._wait_for_grab_complete()
+
+        if not os.path.exists(filepath):
+            self._log(f"write_data: data file not found at {filepath}")
+            return {"cmd": "error", "message": "Data file not found"}
+
+        self._log("Writing final data to HDF5 file…")
+        try:
+            with self._data_file_lock:
+                with h5py.File(filepath, "r+") as f:
+
+                    # External datasets written by grab loop (images/timestamps)
+                    # are in acquisition order; unshuffle in-place on server.
+                    self._unshuffle_external_data_in_file(f)
+
+                    # Non-external DataContainer arrays (raw order from experiment)
+                    for key, arr in msg.get("data", {}).items():
+                        try:
+                            arr = np.asarray(arr)
+                            # Preserve per-shot trailing axes (pixels, channels, etc.)
+                            # by excluding non-xvar dimensions from unshuffle.
+                            exclude_dims = max(0, arr.ndim - len(getattr(self._dealer, "xvardims", [])))
+                            arr = self._unshuffle_with_dealer(arr, exclude_dims=exclude_dims)
+                            if key in f["data"]:
+                                if f["data"][key].shape == arr.shape:
+                                    f["data"][key][...] = arr
+                                else:
+                                    del f["data"][key]
+                                    f["data"].create_dataset(key, data=arr)
+                            else:
+                                f["data"].create_dataset(key, data=arr)
+                        except Exception as e:
+                            self._log(f"Warning: could not write dataset '{key}': {e}")
+
+                    # Updated params (post cleanup_scanned)
+                    if "params" in f:
+                        del f["params"]
+                    p_grp = f.create_group("params")
+                    params_attrs = self._unshuffle_params_attrs(msg.get("params_attrs", {}))
+                    self._write_dict_to_h5group(p_grp, params_attrs)
+
+                    # Scope traces
+                    scope_list = msg.get("scope_data_list", [])
+                    if scope_list:
+                        sd_grp = (
+                            f["data"]["scope_data"]
+                            if "scope_data" in f["data"]
+                            else f["data"].create_group("scope_data")
+                        )
+                        for entry in scope_list:
+                            sg = sd_grp.create_group(entry["label"])
+                            t = self._unshuffle_with_dealer(np.asarray(entry["t"]), exclude_dims=1)
+                            v = self._unshuffle_with_dealer(np.asarray(entry["v"]), exclude_dims=2)
+                            sg.create_dataset("t", data=t)
+                            sg.create_dataset("v", data=v)
+
+                    # Source-file text attrs
+                    texts = msg.get("texts", {})
+                    f.attrs["expt_file"]    = texts.get("expt",    "")
+                    f.attrs["params_file"]  = texts.get("params",  "")
+                    f.attrs["cooling_file"] = texts.get("cooling", "")
+                    f.attrs["imaging_file"] = texts.get("imaging", "")
+                    f.attrs["control_file"] = texts.get("control", "")
+
+            self._log("Data file write complete.")
+            return {"cmd": "ack"}
+
+        except Exception as e:
+            self._log(f"Error in _handle_write_data: {e}")
+            return {"cmd": "error", "message": str(e)}
 
     def _run_grab(self):
         """Block while camera acquires images, putting them in the queue."""
@@ -537,6 +798,10 @@ class CameraServer(UdpServer):
             )
         except Exception as e:
             self._log(f"Grab error: {e}")
+            if self._camera_baby_name and not self._interrupted:
+                self._log(
+                    f"Camera baby {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                )
         finally:
             self._grab_active = False
             self._log("Grab loop finished.")
@@ -613,6 +878,10 @@ class CameraServer(UdpServer):
             self.camera_status_signal.emit(-1)
         else:
             self._log(f"Grab incomplete: {count}/{N_img} images.")
+            if self._camera_baby_name and not self._interrupted:
+                self._log(
+                    f"Run incomplete. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                )
             self._broadcast_to_viewers(
                 {"cmd": "run_incomplete", "count": count, "total": N_img}
             )

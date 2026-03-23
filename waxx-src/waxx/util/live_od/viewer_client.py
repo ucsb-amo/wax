@@ -72,6 +72,14 @@ class ViewerClient(QThread):
         self.reconnect_interval = reconnect_interval
         self._running = False
         self._sock: socket.socket | None = None
+        self._connected = None
+
+    def _set_connection_status(self, connected: bool):
+        connected = bool(connected)
+        if self._connected is connected:
+            return
+        self._connected = connected
+        self.connection_status.emit(connected)
 
     # ------------------------------------------------------------------
     #  Thread entry point
@@ -86,27 +94,33 @@ class ViewerClient(QThread):
         while self._running:
             try:
                 self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(1.0)
                 self._sock.connect(self.server_address)
-                self.connection_status.emit(True)
+                self._set_connection_status(True)
                 print(f"[ViewerClient] Connected to {self.server_address}")
 
                 while self._running:
-                    msg = recv_msg(self._sock)
+                    try:
+                        msg = recv_msg(self._sock)
+                    except socket.timeout:
+                        continue
                     if msg is None:
                         # Server closed the connection
                         break
                     self._handle_message(msg)
 
             except ConnectionRefusedError:
-                self.connection_status.emit(False)
+                self._set_connection_status(False)
+            except socket.timeout:
+                self._set_connection_status(False)
             except OSError:
                 # Socket was closed externally (e.g. stop() called)
                 if not self._running:
                     break
-                self.connection_status.emit(False)
+                self._set_connection_status(False)
             except Exception as e:
                 print(f"[ViewerClient] Error: {e}")
-                self.connection_status.emit(False)
+                self._set_connection_status(False)
             finally:
                 self._close_socket()
 
@@ -156,6 +170,8 @@ class ViewerClient(QThread):
             except Exception:
                 pass
             self._sock = None
+        if self._running:
+            self._set_connection_status(False)
 
     # ------------------------------------------------------------------
     #  One-shot commands (sent via command port)

@@ -64,15 +64,30 @@ class Expt(Dealer, Scanner, Scribe):
 
     def send_new_run(self):
         self.live_od_client.connect()
-        self.live_od_client.send_new_run(camera_params=self.camera_params,
-                                            data_filepath=self.run_info.filepath,
-                                            save_data = self.run_info.save_data,
-                                            setup_camera=self.setup_camera,
-                                            N_img = self.params.N_img,
-                                            N_shots = self.params.N_shots,
-                                            N_pwa_per_shot=self.p.N_pwa_per_shot,
-                                            imaging_type=self.run_info.imaging_type,
-                                            run_id=self.run_info.run_id)
+        data_spec = {}
+        run_info_attrs = {}
+        params_attrs = {}
+        camera_params_attrs = {}
+        if self.run_info.save_data:
+            data_spec          = self._build_data_spec()
+            run_info_attrs     = self._obj_to_pickle_dict(self.run_info)
+            params_attrs       = self._obj_to_pickle_dict(self.params)
+            camera_params_attrs = self._obj_to_pickle_dict(self.camera_params)
+        self.live_od_client.send_new_run(
+            camera_params=self.camera_params,
+            data_filepath=getattr(self.run_info, 'filepath', ''),
+            save_data=self.run_info.save_data,
+            setup_camera=self.setup_camera,
+            N_img=self.params.N_img,
+            N_shots=self.params.N_shots,
+            N_pwa_per_shot=self.p.N_pwa_per_shot,
+            imaging_type=self.run_info.imaging_type,
+            run_id=self.run_info.run_id,
+            data_spec=data_spec,
+            run_info_attrs=run_info_attrs,
+            params_attrs=params_attrs,
+            camera_params_attrs=camera_params_attrs,
+        )
     
     @kernel
     def init_kernel_wax(self):
@@ -109,7 +124,13 @@ class Expt(Dealer, Scanner, Scribe):
         self.data.init()
 
         if self.run_info.save_data:
-            self.ds.create_data_file(self)
+            # Compute the data filepath; the camera server creates the HDF5
+            # file on the server side (via the data_spec sent in new_run), so
+            # the experiment process never opens the data directory directly.
+            fpath, _ = self.ds._data_path(self.run_info)
+            self.run_info.filepath = fpath
+            self.data_filepath     = fpath
+            self.run_info.xvarnames = self.xvarnames
 
     def set_up_imaging_containers(self):
         # Image arrays are represented as data-vault containers and populated
@@ -150,7 +171,7 @@ class Expt(Dealer, Scanner, Scribe):
 
         if self.run_info.save_data:
             self.cleanup_scanned()
-            self.write_data(expt_filepath)
+            self._send_write_data_to_server(expt_filepath)
         # else:
         #     self.remove_incomplete_data()
 
@@ -164,3 +185,145 @@ class Expt(Dealer, Scanner, Scribe):
             print(e)
                 
         # server_talk.play_random_sound()
+
+    # ------------------------------------------------------------------
+    #  Server-side data file helpers
+    # ------------------------------------------------------------------
+
+    def _build_data_spec(self):
+        """Build the file-creation spec dict to send to the camera server."""
+        containers = []
+        for key in self.data.keys:
+            dc = vars(self.data)[key]
+            containers.append({
+                "key":   key,
+                "shape": list(dc._run_data.shape),
+                "dtype": dc._run_data.dtype.str,   # e.g. "<f8"
+                "external": dc._external_data_bool,
+            })
+        sort_idx = [s.tolist() for s in self.sort_idx] if self.sort_idx else []
+        sort_N   = [int(n) for n in self.sort_N]       if self.sort_N   else []
+        return {
+            "xvarnames": list(self.xvarnames),
+            "xvardims": list(self.xvardims),
+            "containers": containers,
+            "sort_idx": sort_idx,
+            "sort_N":   sort_N,
+        }
+
+    def _obj_to_pickle_dict(self, obj):
+        """Serialize non-private object attributes to a pickle-safe dict."""
+        import pickle
+        result = {}
+        for k, v in vars(obj).items():
+            if k.startswith("_"):
+                continue
+            try:
+                pickle.dumps(v)
+                result[k] = v
+            except Exception:
+                try:
+                    result[k] = str(v)
+                except Exception:
+                    pass
+        return result
+
+    def _read_text_file(self, path):
+        """Return the text content of *path*; empty string on any failure."""
+        if path and os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    return f.read()
+            except Exception:
+                pass
+        return ""
+
+    def _send_write_data_to_server(self, expt_filepath):
+        """Collect all run data and send it to the camera server for writing.
+
+        The camera server writes the data to the HDF5 file it created at
+        the start of the run, keeping all NAS I/O on the server machine.
+        This must be called BEFORE send_run_complete so the persistent
+        connection is still open.
+        """
+        # Non-external DataContainer arrays (raw acquisition order).
+        # Server applies unshuffle using Dealer context initialized at new_run.
+        data = {}
+        for key in self.data.keys:
+            dc = vars(self.data)[key]
+            if dc._external_data_bool:
+                continue  # images already on server from grab loop
+            if dc._data_gotten:
+                data[key] = dc._run_data
+
+        # Sort context so the server can unshuffle external data in-place
+        sort_info = {
+            "has_sort":           bool(self.sort_idx),
+            "sort_idx":          [s.tolist() for s in self.sort_idx] if self.sort_idx else [],
+            "sort_N":            [int(n) for n in self.sort_N]       if self.sort_N   else [],
+            "xvardims":          list(getattr(self, 'xvardims', [])),
+            "N_pwa_per_shot":     int(self.params.N_pwa_per_shot),
+            "N_shots_with_repeats": int(getattr(self.params, 'N_shots_with_repeats',
+                                               int(np.prod(self.xvardims) if self.xvardims else 1))),
+        }
+
+        # Scope data (raw acquisition order); server unshuffles.
+        scope_data_list = []
+        if self.scope_data._scope_trace_taken:
+            for scope in self.scope_data.scopes:
+                try:
+                    data_arr = scope.reshape_data()
+                    data_arr = np.asarray(data_arr).astype(np.float32)
+                    t = np.take(np.take(data_arr, 0, axis=-2), 0, axis=-2)
+                    v = np.take(data_arr, 1, -2)
+                    scope_data_list.append({"label": scope.label, "t": t, "v": v})
+                except Exception as e:
+                    print(f"Warning: could not serialize scope {getattr(scope, 'label', '?')}: {e}")
+
+        # Source-file texts (all local to the experiment machine)
+        texts = {
+            "expt":    self._read_text_file(expt_filepath),
+            "params":  self._read_text_file(getattr(self.ds, '_expt_params_path', '')),
+            "cooling": self._read_text_file(getattr(self.ds, '_cooling_path', '')),
+            "imaging": self._read_text_file(getattr(self.ds, '_imaging_path', '')),
+            "control": self._read_text_file(getattr(self.ds, '_control_path', '')),
+        }
+
+        try:
+            self.live_od_client.send_write_data(
+                data=data,
+                params_attrs=self._obj_to_pickle_dict(self.params),
+                sort_info=sort_info,
+                scope_data_list=scope_data_list,
+                texts=texts,
+            )
+            print("Data write acknowledged by server.")
+        except Exception as e:
+            print(f"Error sending write_data to server: {e}")
+
+    def _check_data_file_exists(self, raise_error=True) -> bool:
+        """Override Scribe._check_data_file_exists to query the server.
+
+        With server-managed files the experiment process can't check the
+        HDF5 file's existence on disk (it may not be mounted locally).
+        Instead, ask the server whether a reset has been triggered.
+        """
+        if not self.run_info.save_data:
+            return True
+        try:
+            interrupted = self.live_od_client.check_interrupted()
+            if interrupted:
+                if raise_error:
+                    if hasattr(self, 'monitor'):
+                        self.monitor.update_device_states()
+                        self.monitor.signal_end()
+                    raise RuntimeError(
+                        f"Data file for run ID {self.run_info.run_id} not found."
+                    )
+                return False
+            return True
+        except RuntimeError:
+            raise
+        except Exception:
+            # Server unreachable — don't interrupt the scan
+            return True
