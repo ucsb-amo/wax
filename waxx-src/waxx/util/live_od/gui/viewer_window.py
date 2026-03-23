@@ -340,23 +340,23 @@ class LiveODClientWindow(QWidget):
         status_layout.setSpacing(1)
 
         self.status_run_value = QLabel("Run --")
-        self.status_run_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_run_value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         run_font = QFont(); run_font.setPointSize(8); run_font.setBold(True)
         self.status_run_value.setFont(run_font)
         self.status_run_value.setStyleSheet("color: #cde3f9;")
 
         self.status_shot_value = QLabel("Shots 0/0")
-        self.status_shot_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_shot_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         shot_font = QFont(); shot_font.setPointSize(8); shot_font.setBold(True)
         self.status_shot_value.setFont(shot_font)
         self.status_shot_value.setStyleSheet("color: #f5f9ff;")
 
         self.connection_indicator = ConnectionIndicator()
 
-        status_layout.addWidget(self.status_run_value)
-        status_layout.addWidget(self.status_shot_value)
+        # New: status bar with left/right alignment
+        status_layout.addWidget(self.status_run_value, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         status_layout.addStretch(1)
-        status_layout.addWidget(self.connection_indicator, alignment=Qt.AlignmentFlag.AlignVCenter)
+        status_layout.addWidget(self.status_shot_value, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.status_panel.setLayout(status_layout)
 
         self.plot_controls_panel = QFrame()
@@ -501,7 +501,7 @@ class LiveODClientWindow(QWidget):
         button_column.setSpacing(6)
         self.reset_button.setFixedHeight(24)
         self.reset_button.setMinimumWidth(68)
-        self.reset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.reset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Make reset button stretch vertically
         self.reset_button.setStyleSheet(
             "QPushButton {"
             "  background: #a5222f; color: #fff5f6;"
@@ -512,8 +512,17 @@ class LiveODClientWindow(QWidget):
         )
         self.viewer_window.log_button.setFixedHeight(24)
         self.viewer_window.log_button.setMinimumWidth(68)
-        button_column.addWidget(self.reset_button)
+        button_column.addWidget(self.reset_button, stretch=1)
         button_column.addWidget(self.viewer_window.log_button)
+        # Add server connection indicator below log button with label
+        server_row = QHBoxLayout()
+        server_row.setContentsMargins(0, 0, 0, 0)
+        server_row.setSpacing(4)
+        server_label = QLabel("server")
+        server_label.setStyleSheet("color: #b0c4de; font-size: 10px; font-weight: 600;")
+        server_row.addWidget(server_label)
+        server_row.addWidget(self.connection_indicator)
+        button_column.addLayout(server_row)
         button_column.addStretch(1)
         inline_log_layout.addLayout(button_column)
         self.inline_log_frame.setLayout(inline_log_layout)
