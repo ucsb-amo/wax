@@ -551,6 +551,7 @@ class LiveODClientWindow(QWidget):
         self._main_display_mode = "images"
         self._current_run_id = None
         self._server_connected = False
+        self._pending_run_visual_reset = None
 
         # ---- layout ----
         self._setup_layout()
@@ -652,7 +653,6 @@ class LiveODClientWindow(QWidget):
         self._shot_history = []
         self._xvar_history_by_shot = []
         self._last_viewed_frame_idx = -1
-        self.main_plot_panel.on_run_started()
         self.main_plot_panel.update_xvar_names([])
         self.main_plot_panel.update_data_field_names(self._data_field_names)
         self.main_plot_panel.set_camera_enabled(self._setup_camera)
@@ -671,7 +671,6 @@ class LiveODClientWindow(QWidget):
             self.analyzer.camera_params = None
 
         self.viewer_window.get_img_number(N_img, N_shots, N_pwa_per_shot, run_id)
-        self.viewer_window.clear_plots()
         self.viewer_window.update_image_count(0, N_img)
         self.viewer_window.update_shot_count(0, N_shots)
         self._current_run_id = run_id
@@ -683,12 +682,18 @@ class LiveODClientWindow(QWidget):
 
         # Notify pop-out plot windows
         for w in self._plot_windows:
-            w.on_run_started()
             w.update_xvar_names([])
             w.update_data_field_names(self._data_field_names)
             w.set_camera_enabled(self._setup_camera)
 
         self._refresh_plot_selector_options()
+        self._pending_run_visual_reset = {
+            "camera_key": camera_key,
+            "run_id": run_id,
+            "N_img": N_img,
+        }
+        if self._data_field_names:
+            self._apply_pending_run_visual_reset()
 
         self._append_inline_log(
             f"Run {run_id} started — camera: {camera_key if self._setup_camera else 'disabled'}, "
@@ -765,12 +770,14 @@ class LiveODClientWindow(QWidget):
     def _on_available_data_fields_received(self, field_names: list):
         names = [str(name) for name in field_names]
         if names == self._data_field_names:
+            self._apply_pending_run_visual_reset()
             return
         self._data_field_names = names
         self.main_plot_panel.update_data_field_names(self._data_field_names)
         for w in self._plot_windows:
             w.update_data_field_names(self._data_field_names)
         self._refresh_plot_selector_options()
+        self._apply_pending_run_visual_reset()
 
     def _cache_shot_result(self, shot: dict):
         self._shot_history.append(dict(shot))
@@ -822,6 +829,17 @@ class LiveODClientWindow(QWidget):
             self.analyzer.roi = ROI(roi_id=key, use_saved_roi=False, printouts=False)
         except Exception:
             pass
+
+    def _apply_pending_run_visual_reset(self):
+        if self._pending_run_visual_reset is None:
+            return
+        camera_key = self._pending_run_visual_reset.get("camera_key", "")
+        self.main_plot_panel.on_run_started()
+        for w in self._plot_windows:
+            w.on_run_started()
+        self.viewer_window.clear_plots()
+        self._set_default_roi(camera_key)
+        self._pending_run_visual_reset = None
 
     def _on_frame_navigation_changed(self, *_args):
         self._sync_xvars_to_current_frame()

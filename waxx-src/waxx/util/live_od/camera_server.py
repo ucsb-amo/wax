@@ -305,7 +305,16 @@ class CameraServer(UdpServer):
         self._run_complete_notified = False
         self._image_processing_complete = False  # Reset for new run
         self._run_shot_count = 0  # Reset shot counter for new run
-        self._available_data_fields = []
+        self._available_data_fields = [
+            str(name) for name in msg.get("available_data_fields", [])
+        ]
+        if not self._available_data_fields:
+            containers = msg.get("data_spec", {}).get("containers", [])
+            self._available_data_fields = [
+                str(container.get("key", ""))
+                for container in containers
+                if container.get("key") and not container.get("external", False)
+            ]
         self._last_data_fields = {}
         self._run_shot_history = []
         self._run_image_history = []
@@ -325,6 +334,9 @@ class CameraServer(UdpServer):
         # DataSaver.create_data_file() call, keeping all file I/O on the
         # server machine (which has a fast connection to the data store).
         data_filepath = msg.get("data_filepath", "")
+        self._data_filepath = data_filepath
+        if save_data and not data_filepath:
+            self._log("Warning: new_run arrived without a data filepath.")
         if save_data and data_filepath and msg.get("data_spec"):
             try:
                 self._create_data_file_from_spec(data_filepath, msg)
@@ -354,7 +366,7 @@ class CameraServer(UdpServer):
                 "imaging_type": msg.get("imaging_type", False),
                 "run_id": run_id,
                 "save_data": save_data,
-                "available_data_fields": [],
+                "available_data_fields": list(self._available_data_fields),
                 "pixel_size_m": getattr(camera_params, "pixel_size_m", 0.0),
                 "magnification": getattr(camera_params, "magnification", 1.0),
             }
@@ -396,7 +408,7 @@ class CameraServer(UdpServer):
                 "imaging_type": msg.get("imaging_type", False),
                 "run_id": run_id,
                 "save_data": save_data,
-                "available_data_fields": [],
+                "available_data_fields": list(self._available_data_fields),
                 "pixel_size_m": getattr(camera_params, "pixel_size_m", 0.0),
                 "magnification": getattr(camera_params, "magnification", 1.0),
             }
@@ -646,6 +658,25 @@ class CameraServer(UdpServer):
                     data_grp.create_dataset(key, shape=shape, dtype=dtype)
                 except Exception as e:
                     self._log(f"Warning: could not create dataset '{key}': {e}")
+
+            # Camera image datasets are server-owned and may no longer be
+            # described by experiment-side DataContainers.
+            setup_camera = bool(run_msg.get("setup_camera", True))
+            if setup_camera:
+                cam = run_msg.get("camera_params", None)
+                cam_type = str(getattr(cam, "camera_type", "")).lower()
+                if cam_type == "andor":
+                    image_dtype = np.uint16
+                else:
+                    image_dtype = np.uint8
+                image_shape = tuple(int(v) for v in getattr(cam, "resolution", (0, 0)))
+                n_img = int(run_msg.get("N_img", 0))
+                full_shape = (n_img,) + image_shape
+                if n_img > 0 and all(dim > 0 for dim in image_shape):
+                    if "images" not in data_grp:
+                        data_grp.create_dataset("images", shape=full_shape, dtype=image_dtype)
+                    if "image_timestamps" not in data_grp:
+                        data_grp.create_dataset("image_timestamps", shape=(n_img,), dtype=np.float64)
 
             # Sort indices (present when scan was shuffled)
             sort_idx = data_spec.get("sort_idx", [])

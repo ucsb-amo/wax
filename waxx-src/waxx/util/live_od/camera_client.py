@@ -109,7 +109,8 @@ class CameraClient(CommClient):
     def send_new_run(self, camera_params, data_filepath, save_data,
                      setup_camera, N_img, N_shots, N_pwa_per_shot, imaging_type, run_id,
                      data_spec=None, run_info_attrs=None,
-                     params_attrs=None, camera_params_attrs=None):
+                     params_attrs=None, camera_params_attrs=None,
+                     available_data_fields=None):
         """
         Send camera params and run metadata to the server.
 
@@ -141,6 +142,7 @@ class CameraClient(CommClient):
             "run_info_attrs": run_info_attrs or {},
             "params_attrs": params_attrs or {},
             "camera_params_attrs": camera_params_attrs or {},
+            "available_data_fields": available_data_fields or [],
         }
         return self._send_recv(msg)
 

@@ -184,10 +184,20 @@ class Scanner():
         self.post_scan()
 
     def send_xvars(self):
+        if self.scan_xvars:
+            print(self._current_xvars_line())
         self.live_od_client.send_shot_done()
         self.live_od_client.send_xvars(
                 self.scan_xvars,
                 data_fields=self._get_live_data_fields())
+
+    def _current_xvars_line(self):
+        parts = []
+        for scan_var in self.scan_xvars:
+            value = vars(self.params).get(scan_var.key)
+            parts.append(f"{scan_var.key}={value}")
+        return " | ".join(parts)
+        
 
     def _get_live_data_fields(self):
         data_fields = {}
@@ -209,8 +219,8 @@ class Scanner():
                 arr = np.asarray(value)
                 if arr.ndim == 0:
                     data_fields[key] = arr.item()
-                elif arr.ndim == 1:
-                    data_fields[key] = arr.tolist()
+                elif arr.ndim >= 1:
+                    data_fields[key] = arr.reshape(-1).tolist()
                 else:
                     continue
             except Exception:

@@ -1,28 +1,27 @@
 import numpy as np
 import copy
-from artiq.language import delay, now_mu, kernel, TTuple, TBool, kernel_from_string
-from artiq.experiment import rpc
+from artiq.language import delay, now_mu, kernel, TTuple, TBool, kernel_from_string, rpc
 
 class DataContainer():
-    def __init__(self, per_shot_data_shape, dtype,
+    def __init__(self, 
+                 per_shot_data_shape,
                 external_data_bool=False,
-                flat=False,
-                flat_points_per_shot=1,
                 expt=None):
         self.key = ""
         self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
-        self._dtype = dtype
+        if len(self._per_shot_data_shape) != 1:
+            raise ValueError('per-shot data must be a 1D array')
+        self._dtype = float
         self._external_data_bool = external_data_bool
-        self._flat = flat
-        self._flat_points_per_shot = flat_points_per_shot
         self._expt = expt
 
         self._data_gotten = False
 
-        self._run_data = np.zeros(per_shot_data_shape,dtype=dtype)
-        self.shot_data = np.zeros(per_shot_data_shape,dtype=dtype)
+        self._run_data = np.zeros(self._per_shot_data_shape,self._dtype)
+        self.shot_data = np.zeros(self._per_shot_data_shape,self._dtype)
         self._reference_data = copy.deepcopy(self.shot_data)
 
+    @rpc(flags={"async"})
     def _put_shot_data_to_run_data(self, data):
         """Insert data into the array for the current shot.
 
@@ -44,17 +43,14 @@ class DataContainer():
             # partial datasets more gracefully than a stalled experiment.
             pass
 
-    @rpc(flags={"async"})
+    @kernel
     def put_data_idx(self, value, idx=0):
         self.shot_data[idx] = value
 
-    @rpc(flags={"async"})
-    def put_data(self, value):
-        self.shot_data = value
-
+    @kernel
     def _put_shot_data(self):
         # Single RPC per container: copy kernel shot_data to host and write it
-        # into run_data. Do not call kernel methods from this RPC path.
+        # into run_data.
         self._put_shot_data_to_run_data(self.shot_data)
 
     def set_container_size(self):
@@ -64,17 +60,11 @@ class DataContainer():
         """        
         xvd = self._expt.xvardims
         y = self._run_data
-        if self._flat:
-            y = [y]*self._flat_points_per_shot
         for d in np.flip(xvd):
             y = [y]*d
         self._run_data = np.asarray(y)
         # squeeze the data shape axes if they have length == 1
         self.squeeze_axes(xvd)
-        if self._flat:
-            d = np.prod(xvd) * self._flat_points_per_shot
-            flat_shape = (d,) + self._per_shot_data_shape
-            self._run_data = self._run_data.reshape(flat_shape)
 
     def squeeze_axes(self, xvardims):
         """Identifies if the per-shot data has any axes with dimension 1. If so,
@@ -88,9 +78,8 @@ class DataContainer():
 
         Args:
             xvardims (list): The xvardims for the experiment.
-        """        
-        f = int(self._flat) # extra axis if the data is flat
-        n_axes_to_squeeze = self._run_data.ndim - f - len(xvardims) # how many axes are for the per-shot data
+        """  
+        n_axes_to_squeeze = self._run_data.ndim - len(xvardims) # how many axes are for the per-shot data
         sh_axes_to_squeeze = np.asarray(self._run_data.shape[-n_axes_to_squeeze:]) # their shape
 
         squeeze_mask = sh_axes_to_squeeze == 1 # check which dims have size == 1
@@ -100,13 +89,14 @@ class DataContainer():
         # do the squeeze (convert axis index list to tuple to make it work with np.ndarray.squeeze)
         self._run_data = self._run_data.squeeze(axis=tuple(ax_idx_to_squeeze))
 
-        self._per_shot_data_shape = self._run_data.shape[len(xvardims)+f:]
+        self._per_shot_data_shape = self._run_data.shape[len(xvardims):]
 
 class DataVault():
     
     def __init__(self, expt=None):
         self.keys = []
         self._container_list = []
+        self._container_list_nonext = []
         self._keys_nonext= []
         self._expt = expt
 
@@ -122,15 +112,12 @@ class DataVault():
 
         # Camera-server populated datasets. These are placeholders in the
         # experiment process and are filled externally by LiveOD.
-        self.images = self.add_data_container((1, 1), np.uint8, external_data_bool=True)
-        self.image_timestamps = self.add_data_container((1,), np.float64, external_data_bool=True)
+        # Images/timestamps now live only on the server-side HDF5 path,
+        # so no experiment-side DataContainer placeholders are created.
 
     def add_data_container(self,
                             per_shot_data_shape=(1,),
-                            dtype=np.float64,
-                            external_data_bool=False,
-                            flat = False,
-                            flat_points_per_shot = 1) -> DataContainer:
+                            external_data_bool=False) -> DataContainer:
         """Returns a data container object. This should be assigned to an
         attribute of the `DataVault` object, which will then write to the data
         container the key used for the assignment during `finish_prepare` of
@@ -150,8 +137,6 @@ class DataVault():
         Args:
             per_shot_data_shape (tuple or array or int): Shape of the data per
                 shot. Defaults to (1,).
-            dtype (_type_, optional): Data type for each value in the data
-                array. Defaults to np.float64.
             external_data_bool (bool, optional): Set to True if the data for
                 this container will be populated directly into the hdf5 data file by
                 a process external to the ARTIQ process. An example would be image
@@ -165,10 +150,7 @@ class DataVault():
             DataContainer: _description_
         """        
         return DataContainer(per_shot_data_shape=per_shot_data_shape,
-                             dtype=dtype,
                              external_data_bool=external_data_bool,
-                             flat=flat,
-                             flat_points_per_shot=flat_points_per_shot,
                              expt=self._expt)
     
     def init(self):
@@ -184,6 +166,7 @@ class DataVault():
                 self._container_list.append(obj)
                 if not obj._external_data_bool:
                     self._keys_nonext.append(k)
+                    self._container_list_nonext.append(obj)
 
     def set_container_sizes(self):
         for key in self.keys:
@@ -191,15 +174,15 @@ class DataVault():
             if isinstance(dc,DataContainer):
                 dc.set_container_size()
 
+    @kernel
     def put_shot_data(self):
         """Write all non-external containers' shot_data into run_data.
         Called as an implicit host RPC from cleanup_scan_kernel_wax at the
         end of every shot. Containers must have been updated via put_data()
-        or put_data_idx() (RPC calls) during the shot kernel.
+        or put_data_idx() during the shot kernel.
         """
-        for k in self._keys_nonext:
-            dc = vars(self)[k]
-            dc._put_shot_data_to_run_data(dc.shot_data)
+        for dc in self._container_list_nonext:
+            dc._put_shot_data()
 
     # def generate_assignment_kernels(self):
     #     """Generates a list of kernel functions for each param datatype (int32,
