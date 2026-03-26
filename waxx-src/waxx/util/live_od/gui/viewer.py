@@ -43,6 +43,7 @@ class SuppressPrints:
 
 class LiveODViewer(QWidget):
     frame_changed = pyqtSignal(int)
+    recompute_derived_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -421,6 +422,10 @@ class LiveODViewer(QWidget):
 
         self._toggle_fov_action = menu.addAction("")
         self._toggle_fov_action.triggered.connect(self._toggle_fov_from_menu)
+
+        menu.addSeparator()
+        recompute_action = menu.addAction("Recompute derived from ROI/view")
+        recompute_action.triggered.connect(self.recompute_derived_requested.emit)
 
         menu.addSeparator()
         reset_action = menu.addAction("Reset colormap to viridis")

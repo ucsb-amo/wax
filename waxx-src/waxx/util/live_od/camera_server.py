@@ -95,6 +95,7 @@ class CameraServer(UdpServer):
         self._run_shot_count = 0  # Track shots received from experiment (reset each run)
         self._run_shot_history: list[dict] = []
         self._run_image_history: list[dict] = []
+        self._run_history_lock = threading.Lock()
         self._camera_baby_name: str = ""
         self._camera = None
         self._camera_ready = False
@@ -130,6 +131,8 @@ class CameraServer(UdpServer):
 
     def run(self):
         """Start listening on command and viewer ports (blocking)."""
+        self.running = True
+
         # Viewer listener runs in its own thread
         self._viewer_thread = threading.Thread(
             target=self._viewer_listener, daemon=True
@@ -139,7 +142,6 @@ class CameraServer(UdpServer):
         # Command listener (blocks in accept loop)
         self.sock.bind((self.host, self.port))
         self.sock.listen(5)
-        self.running = True
         self._log(f"Listening — command port: {self.host}:{self.port}")
         self._log(f"Listening — viewer  port: {self.host}:{self.viewer_port}")
 
@@ -179,14 +181,11 @@ class CameraServer(UdpServer):
                     conn, addr = self._viewer_sock.accept()
                     with self._viewer_lock:
                         self._viewer_connections.append(conn)
-                    
-                    # If a run is currently active, send the run_start info to the new viewer
-                    if self._run_start_info is not None:
-                        try:
-                            send_msg(conn, self._run_start_info)
-                            self._log(f"Sent run_start info to {addr}")
-                        except Exception as e:
-                            self._log(f"Error sending run_start info to {addr}: {e}")
+
+                    # If a run is currently active, replay all known run state to
+                    # this late-connecting viewer so it can immediately browse prior
+                    # frames while continuing to receive live updates.
+                    self._replay_active_run_to_viewer(conn, addr)
                 except socket.error:
                     if self.running:
                         continue
@@ -267,6 +266,14 @@ class CameraServer(UdpServer):
 
                 send_msg(conn, reply)
 
+        except (ConnectionResetError, BrokenPipeError) as e:
+            self._log(f"Experiment connection closed by peer {peer}: {e}")
+        except OSError as e:
+            # Windows reports forced socket close as WinError 10054.
+            if getattr(e, "winerror", None) == 10054:
+                self._log(f"Experiment connection closed by peer {peer}: {e}")
+            else:
+                self._log(f"Error in experiment handler: {e}")
         except Exception as e:
             self._log(f"Error in experiment handler: {e}")
         finally:
@@ -316,8 +323,9 @@ class CameraServer(UdpServer):
                 if container.get("key") and not container.get("external", False)
             ]
         self._last_data_fields = {}
-        self._run_shot_history = []
-        self._run_image_history = []
+        with self._run_history_lock:
+            self._run_shot_history = []
+            self._run_image_history = []
         self._camera_baby_name = random.choice(CAMERA_BABY_NAMES)
         setup_camera = bool(msg.get("setup_camera", True))
         camera_params = msg["camera_params"]
@@ -459,7 +467,8 @@ class CameraServer(UdpServer):
             shot[f"xvar.{key}"] = value
         for key, value in data_fields.items():
             shot[f"xvar.{key}"] = value
-        self._run_shot_history.append(shot)
+        with self._run_history_lock:
+            self._run_shot_history.append(shot)
         self._broadcast_to_viewers(
             {
                 "cmd": "xvars",
@@ -877,9 +886,10 @@ class CameraServer(UdpServer):
                 self._broadcast_to_viewers(
                     {"cmd": "image", "image": np.asarray(img), "index": idx}
                 )
-                self._run_image_history.append(
-                    {"image": np.asarray(img), "index": idx, "timestamp": img_t}
-                )
+                with self._run_history_lock:
+                    self._run_image_history.append(
+                        {"image": np.asarray(img), "index": idx, "timestamp": img_t}
+                    )
                 self.image_grabbed_signal.emit(np.asarray(img), idx)
                 count += 1
 
@@ -928,6 +938,100 @@ class CameraServer(UdpServer):
             except Exception:
                 time.sleep(check_period)
         raise TimeoutError(f"Could not open data file: {filepath}")
+
+    def _snapshot_active_run_histories(self):
+        """Return copies of active run metadata and histories for late viewers."""
+        with self._run_history_lock:
+            run_start = dict(self._run_start_info) if self._run_start_info is not None else None
+            shot_history = [dict(shot) for shot in self._run_shot_history]
+            image_history = [
+                {
+                    "image": np.asarray(entry.get("image")),
+                    "index": int(entry.get("index", -1)),
+                    "timestamp": float(entry.get("timestamp", 0.0)),
+                }
+                for entry in self._run_image_history
+            ]
+        return run_start, shot_history, image_history
+
+    def _replay_active_run_to_viewer(self, conn, addr=None):
+        """Replay in-progress run metadata/images to one newly connected viewer."""
+        run_start, shot_history, image_history = self._snapshot_active_run_histories()
+        if run_start is None:
+            return
+
+        addr_txt = str(addr) if addr is not None else "viewer"
+        try:
+            send_msg(conn, run_start)
+
+            # Group saved images by shot index so xvars precede each shot's images.
+            n_per_shot = int(run_start.get("N_pwa_per_shot", 0)) + 2
+            images_by_shot: dict[int, list[dict]] = {}
+            trailing_images: list[dict] = []
+            if n_per_shot > 0:
+                for entry in image_history:
+                    idx = int(entry.get("index", -1))
+                    if idx < 0:
+                        continue
+                    shot_idx = idx // n_per_shot
+                    images_by_shot.setdefault(shot_idx, []).append(entry)
+                for shot_images in images_by_shot.values():
+                    shot_images.sort(key=lambda e: int(e.get("index", -1)))
+            else:
+                trailing_images = sorted(image_history, key=lambda e: int(e.get("index", -1)))
+
+            for shot in shot_history:
+                shot_idx = int(shot.get("shot_index", 0))
+                send_msg(
+                    conn,
+                    {
+                        "cmd": "xvars",
+                        "xvars": dict(shot.get("xvars", {})),
+                        "data_fields": dict(shot.get("data_fields", {})),
+                        "available_data_fields": list(self._available_data_fields),
+                    },
+                )
+                for entry in images_by_shot.get(shot_idx, []):
+                    send_msg(
+                        conn,
+                        {
+                            "cmd": "image",
+                            "image": np.asarray(entry.get("image")),
+                            "index": int(entry.get("index", -1)),
+                        },
+                    )
+
+            # If images were captured before xvars arrived (or if n_per_shot is unknown),
+            # still replay them so frame navigation can traverse all prior images.
+            consumed = {id(e) for lst in images_by_shot.values() for e in lst}
+            if n_per_shot > 0:
+                trailing_images = [
+                    e for e in sorted(image_history, key=lambda z: int(z.get("index", -1)))
+                    if id(e) not in consumed
+                ]
+            for entry in trailing_images:
+                send_msg(
+                    conn,
+                    {
+                        "cmd": "image",
+                        "image": np.asarray(entry.get("image")),
+                        "index": int(entry.get("index", -1)),
+                    },
+                )
+
+            self._log(
+                f"Replayed active run to {addr_txt}: "
+                f"{len(shot_history)} xvar payloads, {len(image_history)} images."
+            )
+        except Exception as e:
+            self._log(f"Error replaying active run to {addr_txt}: {e}")
+            with self._viewer_lock:
+                if conn in self._viewer_connections:
+                    self._viewer_connections.remove(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     #  Viewer broadcast

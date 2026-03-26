@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTreeView,
 )
 from PyQt6.QtGui import QFont, QStandardItem, QStandardItemModel, QIntValidator, QDoubleValidator
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal, pyqtSlot, QTimer
 
 import pyqtgraph as pg
 
@@ -61,6 +61,12 @@ DERIVED_QUANTITIES = {
     "atom_number_apd_up":  "Atom number (APD up)",
     "atom_number_apd_down":"Atom number (APD down)",
     "atom_number_apd_total":"Atom number (APD total)",
+}
+
+APD_DERIVED_QUANTITY_KEYS = {
+    "atom_number_apd_up",
+    "atom_number_apd_down",
+    "atom_number_apd_total",
 }
 
 CAMERA_DERIVED_QUANTITY_KEYS = {
@@ -105,7 +111,7 @@ _COLOR_PRESETS = {
 
 _QUANTITY_GROUP_LABELS = {
     "image": "Image-derived",
-    "data": "Data containers",
+    "data": "Data parameters",
 }
 
 _GROUP_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -140,10 +146,47 @@ class _CheckableCombo(QComboBox):
         tree.setUniformRowHeights(True)
         self.setView(tree)
         self._model.itemChanged.connect(self._on_item_changed)
-        self.view().pressed.connect(self._handle_press)
+        self.view().viewport().installEventFilter(self)
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
+        self.lineEdit().installEventFilter(self)
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._update_display_text()
+
+    def eventFilter(self, obj, event):
+        if obj is self.view().viewport():
+            if (
+                event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                index = self.view().indexAt(event.pos())
+                if index.isValid():
+                    item = self._model.itemFromIndex(index)
+                    if item is not None and not item.hasChildren():
+                        new_state = (
+                            Qt.CheckState.Unchecked
+                            if item.checkState() == Qt.CheckState.Checked
+                            else Qt.CheckState.Checked
+                        )
+                        item.setCheckState(new_state)
+                # Consume release to prevent default combo behavior from
+                # closing the popup after each click.
+                return True
+        if (
+            obj is self.lineEdit()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.showPopup()
+            return True
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.view().isVisible():
+            self.showPopup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     # ---- public API -------------------------------------------------
 
@@ -155,12 +198,14 @@ class _CheckableCombo(QComboBox):
         item.setData(data, Qt.ItemDataRole.UserRole)
         item.setData(group, _GROUP_ROLE)
         parent.appendRow(item)
+        self._update_minimum_width_from_items()
 
     def set_item_text(self, key: str, text: str, group: str | None = None):
         item = self._item_for_key(key)
         if item is None:
             return
         item.setText(text)
+        self._update_minimum_width_from_items()
 
     def checked_keys(self) -> list[str]:
         """Return data (keys) of currently checked items, in check order."""
@@ -187,6 +232,7 @@ class _CheckableCombo(QComboBox):
         parent.removeRow(item.row())
         self._remove_empty_group_items()
         self._update_display_text()
+        self._update_minimum_width_from_items()
         self.selectionChanged.emit()
 
     def _ensure_group_item(self, group: str):
@@ -270,6 +316,26 @@ class _CheckableCombo(QComboBox):
                 summary = summary[:33] + "..."
             self.lineEdit().setText(summary)
 
+    def _update_minimum_width_from_items(self):
+        fm = self.fontMetrics()
+        max_text_width = 0
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item is None:
+                continue
+            max_text_width = max(max_text_width, fm.horizontalAdvance(item.text()))
+            for child_row in range(item.rowCount()):
+                child = item.child(child_row)
+                if child is None:
+                    continue
+                max_text_width = max(max_text_width, fm.horizontalAdvance(child.text()))
+
+        # Padding includes tree indentation, checkbox indicator and frame.
+        min_width = max(120, max_text_width + 68)
+        self.setMinimumWidth(min_width)
+        if self.view() is not None:
+            self.view().setMinimumWidth(min_width)
+
     def hidePopup(self):
         # Allow normal hide
         super().hidePopup()
@@ -302,6 +368,7 @@ class ShotPlotWindow(QWidget):
     """
 
     closed = pyqtSignal(object)  # emitted on close so parent can de-register
+    recomputeRequested = pyqtSignal()
 
     def __init__(self,
                  window_id: int = 0,
@@ -356,6 +423,7 @@ class ShotPlotWindow(QWidget):
         self._override_controls_updating = False
         self._replot_queued = False
         self._queued_autorange = False
+        self._prev_qty_keys: list[str] = []
 
         # ---- widgets ----
         self._build_controls(xvar_names or [])
@@ -376,18 +444,21 @@ class ShotPlotWindow(QWidget):
         self.qty_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.qty_combo.setMinimumWidth(100)
         for key, label in DERIVED_QUANTITIES.items():
-            self.qty_combo.add_item(label, data=key, group="image")
+            group = "data" if key in APD_DERIVED_QUANTITY_KEYS else "image"
+            self.qty_combo.add_item(label, data=key, group=group)
         self.qty_combo.selectionChanged.connect(self._on_quantity_selection_changed)
 
         # Independent variable selector
         self.indep_combo = QComboBox()
         self.indep_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.indep_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.indep_combo.addItem("Shot index", userData="shot_index")
         self.indep_combo.addItem("Timestamp (s)", userData="timestamp")
         for name in xvar_names:
             self.indep_combo.addItem(f"xvar: {name}", userData=f"xvar:{name}")
         self.indep_combo.currentIndexChanged.connect(self._on_indep_changed)
         self.indep_combo.currentIndexChanged.connect(self._request_replot_no_autorange)
+        self._update_selector_minimum_widths()
 
         # "Plot last N" controls (only for shot_index / timestamp)
         self.plot_last_check = QCheckBox("Plot last")
@@ -473,6 +544,10 @@ class ShotPlotWindow(QWidget):
 
         self.options_autoscale_button = QPushButton("Autoscale")
         self.options_autoscale_button.clicked.connect(self._autoscale_now_from_dialog)
+
+        self.options_recompute_button = QPushButton("Recompute")
+        self.options_recompute_button.setToolTip("Recompute derived quantities from ROI/view")
+        self.options_recompute_button.clicked.connect(self._emit_recompute_requested)
 
         self.options_button = QPushButton("⚙")
         self.options_button.setToolTip("Plot options")
@@ -575,6 +650,10 @@ class ShotPlotWindow(QWidget):
         right_ylim_widget.setLayout(right_ylim_row)
         form.addRow("Right Y", right_ylim_widget)
         form.addRow("Axes", self.options_autoscale_button)
+        form.addRow("Derived", self.options_recompute_button)
+
+    def _emit_recompute_requested(self):
+        self.recomputeRequested.emit()
 
     def _build_plot(self):
         self.plot_widget = pg.PlotWidget()
@@ -678,6 +757,7 @@ class ShotPlotWindow(QWidget):
         self._update_value_index_controls(reset_range=True)
         self._update_array_series_legend([])
         self._sync_axis_override_control_states()
+        self._prev_qty_keys = list(self.qty_combo.checked_keys())
 
     def set_camera_enabled(self, enabled: bool):
         self._camera_enabled = bool(enabled)
@@ -702,6 +782,7 @@ class ShotPlotWindow(QWidget):
         for name in names:
             label_prefix = "data" if str(name) in self._data_field_names else "xvar"
             self.indep_combo.addItem(f"{label_prefix}: {name}", userData=f"xvar:{name}")
+        self._update_selector_minimum_widths()
 
     def update_data_field_names(self, names: list[str]):
         """Register data fields as selectable y-quantities while running."""
@@ -738,6 +819,16 @@ class ShotPlotWindow(QWidget):
                 self.qty_combo.set_item_text(key, label, group="data")
             else:
                 self.qty_combo.add_item(label, data=key, group="data")
+        self._update_selector_minimum_widths()
+
+    def _update_selector_minimum_widths(self):
+        fm = self.indep_combo.fontMetrics()
+        widest = 0
+        for i in range(self.indep_combo.count()):
+            widest = max(widest, fm.horizontalAdvance(self.indep_combo.itemText(i)))
+        self.indep_combo.setMinimumWidth(max(120, widest + 48))
+        if self.indep_combo.view() is not None:
+            self.indep_combo.view().setMinimumWidth(max(140, widest + 68))
 
     # ------------------------------------------------------------------
     #  Internal
@@ -777,9 +868,21 @@ class ShotPlotWindow(QWidget):
         self._request_replot(trigger_autorange=False)
 
     def _on_quantity_selection_changed(self):
+        current_keys = list(self.qty_combo.checked_keys())
+        old_left = self._prev_qty_keys[0] if len(self._prev_qty_keys) >= 1 else None
+        old_right = self._prev_qty_keys[1] if len(self._prev_qty_keys) >= 2 else None
+        new_left = current_keys[0] if len(current_keys) >= 1 else None
+        new_right = current_keys[1] if len(current_keys) >= 2 else None
+
+        if old_left != new_left:
+            self._autorange_left = True
+        if old_right != new_right:
+            self._autorange_right = True
+
+        self._prev_qty_keys = current_keys
         self._update_value_index_controls(reset_range=True)
         self._sync_axis_override_control_states()
-        self._request_replot(trigger_autorange=False)
+        self._request_replot(trigger_autorange=True)
 
     def _on_index_slider_changed(self):
         if self._index_controls_updating:
@@ -956,6 +1059,9 @@ class ShotPlotWindow(QWidget):
                 continue
             if key.startswith("xvar.") and key.split(".", 1)[1] in self._data_field_names:
                 label = f"data: {key.split('.', 1)[1]}"
+                group = "data"
+            elif key in APD_DERIVED_QUANTITY_KEYS:
+                label = DERIVED_QUANTITIES.get(key, key.replace("_", " "))
                 group = "data"
             else:
                 label = key.replace("_", " ")

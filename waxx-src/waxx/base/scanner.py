@@ -152,11 +152,9 @@ class Scanner():
 
         while scanning:
 
-            self._check_data_file_exists()
-            
             self.core.wait_until_mu(now_mu())
+            self._check_data_file_exists()
             self.update_params_from_xvars()
-
             self.write_host_params_to_kernel()
             self.core.break_realtime()
 
@@ -195,7 +193,10 @@ class Scanner():
         parts = []
         for scan_var in self.scan_xvars:
             value = vars(self.params).get(scan_var.key)
-            parts.append(f"{scan_var.key}={value}")
+            if isinstance(value, (float, np.floating, int, np.integer)):
+                parts.append(f"{scan_var.key}={float(value):1.3g}")
+            else:
+                parts.append(f"{scan_var.key}={value}")
         return " | ".join(parts)
         
 

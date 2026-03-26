@@ -76,22 +76,11 @@ class Analyzer(QThread):
             self.img_atoms = self.imgs[0]
             self.img_light = self.imgs[self.N_pwa_per_shot]
             self.img_dark = self.imgs[self.N_pwa_per_shot + 1]
-            self.od_raw = compute_OD(self.img_atoms, self.img_light, self.img_dark, imaging_type=self.imaging_type)
-            self.od_raw = np.array([self.od_raw])
-            self.od, self.sum_od_x, self.sum_od_y = process_ODs(self.od_raw, self.roi)
-            self.od_raw = self.od_raw[0]
-            self.od = self.od[0]
-            
-            # Crop the OD to the current view range for sum calculations
-            cropped_od, x_slice, y_slice = self.crop_od_to_view_range(self.od)
-            
-            # Compute sums from the cropped OD
-            cropped_sum_od_x = np.sum(cropped_od, axis=0)  # Sum along y-axis (rows)
-            cropped_sum_od_y = np.sum(cropped_od, axis=1)  # Sum along x-axis (columns)
-            
-            # Use cropped sums instead of the original ones
-            self.sum_od_x = cropped_sum_od_x
-            self.sum_od_y = cropped_sum_od_y
+            self.od_raw, self.od, self.sum_od_x, self.sum_od_y = self._compute_od_and_sums(
+                self.img_atoms,
+                self.img_light,
+                self.img_dark,
+            )
             
         except Exception as e:
             print(f"[Analyzer] Error during OD computation: {e}")
@@ -106,15 +95,62 @@ class Analyzer(QThread):
         # ---- compute & emit derived quantities for pop-out plots ----
         self._emit_shot_result()
 
+    def _compute_od_and_sums(self, img_atoms, img_light, img_dark):
+        od_raw = compute_OD(img_atoms, img_light, img_dark, imaging_type=self.imaging_type)
+        od_stack = np.array([od_raw])
+        od_processed, _, _ = process_ODs(od_stack, self.roi)
+        od = od_processed[0]
+
+        # Crop to current OD viewport before recomputing derived traces.
+        cropped_od, _, _ = self.crop_od_to_view_range(od)
+        sum_od_x = np.sum(cropped_od, axis=0)
+        sum_od_y = np.sum(cropped_od, axis=1)
+        return od_raw, od, sum_od_x, sum_od_y
+
+    def compute_shot_result_from_images(self, img_atoms, img_light, img_dark, shot_index: int, xvars: dict):
+        """Recompute one shot's derived quantities from image triplets.
+
+        Uses the current ROI and OD-view crop to match interactive recalculation
+        behavior requested from the viewer settings menu.
+        """
+        try:
+            _, od, sum_od_x, sum_od_y = self._compute_od_and_sums(
+                np.asarray(img_atoms), np.asarray(img_light), np.asarray(img_dark)
+            )
+            return self._compute_shot_result(od, sum_od_x, sum_od_y, shot_index, xvars)
+        except Exception:
+            od = np.zeros_like(np.asarray(img_atoms))
+            sum_od_x = np.zeros(od.shape[1]) if od.ndim == 2 else np.array([])
+            sum_od_y = np.zeros(od.shape[0]) if od.ndim == 2 else np.array([])
+            return self._compute_shot_result(od, sum_od_x, sum_od_y, shot_index, xvars)
+
     # ------------------------------------------------------------------
     #  Derived-quantity computation
     # ------------------------------------------------------------------
 
     def _emit_shot_result(self):
         """Compute derived quantities from the current shot and emit."""
-        result = self._build_base_result()
+        shot_index = self._shot_index
+        result = self._compute_shot_result(
+            self.od,
+            self.sum_od_x,
+            self.sum_od_y,
+            shot_index,
+            dict(self._xvars),
+        )
+        self._shot_index += 1
 
-        od = self.od  # 2-D array for this shot
+        try:
+            self.shot_result.emit(result)
+        except RuntimeError:
+            pass
+
+    def _compute_shot_result(self, od, sum_od_x, sum_od_y, shot_index: int, xvars: dict):
+        result: dict = {
+            "shot_index": int(shot_index),
+            "timestamp": time.time(),
+            "xvars": dict(xvars),
+        }
 
         # Integrated OD
         try:
@@ -124,8 +160,8 @@ class Analyzer(QThread):
 
         # Sum OD peaks
         try:
-            result["sum_od_peak_x"] = float(np.max(self.sum_od_x))
-            result["sum_od_peak_y"] = float(np.max(self.sum_od_y))
+            result["sum_od_peak_x"] = float(np.max(sum_od_x))
+            result["sum_od_peak_y"] = float(np.max(sum_od_y))
         except Exception:
             result["sum_od_peak_x"] = np.nan
             result["sum_od_peak_y"] = np.nan
@@ -136,14 +172,14 @@ class Analyzer(QThread):
         if self.camera_params is not None:
             cp = self.camera_params
             px = cp.pixel_size_m / cp.magnification
-            xaxis_x = px * np.arange(self.sum_od_x.shape[-1])
-            xaxis_y = px * np.arange(self.sum_od_y.shape[-1])
+            xaxis_x = px * np.arange(sum_od_x.shape[-1])
+            xaxis_y = px * np.arange(sum_od_y.shape[-1])
             try:
-                fit_x = GaussianFit(xaxis_x, self.sum_od_x, print_errors=False)
+                fit_x = GaussianFit(xaxis_x, sum_od_x, print_errors=False)
             except Exception:
                 fit_x = None
             try:
-                fit_y = GaussianFit(xaxis_y, self.sum_od_y, print_errors=False)
+                fit_y = GaussianFit(xaxis_y, sum_od_y, print_errors=False)
             except Exception:
                 fit_y = None
 
@@ -175,13 +211,9 @@ class Analyzer(QThread):
             result["atom_number_fit_x"] = np.nan
             result["atom_number_fit_y"] = np.nan
 
-        self._append_xvar_fields(result)
-        self._append_apd_fields(result)
-
-        try:
-            self.shot_result.emit(result)
-        except RuntimeError:
-            pass
+        self._append_xvar_fields(result, xvars)
+        self._append_apd_fields(result, xvars)
+        return result
 
     def _build_base_result(self) -> dict:
         result: dict = {
@@ -192,26 +224,14 @@ class Analyzer(QThread):
         self._shot_index += 1
         return result
 
-    def _append_xvar_fields(self, result: dict):
-        for key, value in self._xvars.items():
+    def _append_xvar_fields(self, result: dict, xvars: dict | None = None):
+        source = self._xvars if xvars is None else xvars
+        for key, value in source.items():
             result[f"xvar.{key}"] = self._to_plot_scalar(value)
 
-    def _to_plot_scalar(self, value):
-        """Map any payload value to a scalar suitable for per-shot plotting."""
-        try:
-            if np.isscalar(value):
-                return float(value)
-            arr = np.asarray(value, dtype=float).reshape(-1)
-            if arr.size == 0:
-                return np.nan
-            if arr.size == 1:
-                return float(arr[0])
-            return float(np.nanmean(arr))
-        except Exception:
-            return np.nan
-
-    def _append_apd_fields(self, result: dict):
-        raw = self._xvars.get("post_shot_absorption", None)
+    def _append_apd_fields(self, result: dict, xvars: dict | None = None):
+        source = self._xvars if xvars is None else xvars
+        raw = source.get("post_shot_absorption", None)
         if raw is None:
             return
         try:
@@ -231,7 +251,21 @@ class Analyzer(QThread):
             result["atom_number_apd_total"] = float(n_up + n_down)
         except Exception:
             return
-        
+
+    def _to_plot_scalar(self, value):
+        """Map any payload value to a scalar suitable for per-shot plotting."""
+        try:
+            if np.isscalar(value):
+                return float(value)
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.size == 0:
+                return np.nan
+            if arr.size == 1:
+                return float(arr[0])
+            return float(np.nanmean(arr))
+        except Exception:
+            return np.nan
+
     def crop_od_to_view_range(self, od):
         """
         Crop the OD array to the current view range of the viewer's OD plot

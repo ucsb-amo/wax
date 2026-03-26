@@ -149,8 +149,8 @@ class XVarDisplay(QGroupBox):
         self.setMaximumHeight(82)
 
     def _format_value(self, value):
-        if isinstance(value, float):
-            return f"{value:.6g}"
+        if isinstance(value, (float, np.floating, int, np.integer)):
+            return f"{float(value):1.3g}"
         text = str(value)
         if len(text) > 18:
             return text[:15] + "..."
@@ -435,31 +435,35 @@ class LiveODClientWindow(QWidget):
 
         self.plot_x_selector = self.main_plot_panel.indep_combo
         self.plot_y_selector = self.main_plot_panel.qty_combo
-        self.plot_x_selector.setMinimumWidth(110)
-        self.plot_y_selector.setMinimumWidth(130)
-        self.plot_x_selector.setFixedHeight(24)
-        self.plot_y_selector.setFixedHeight(24)
-        self.main_plot_panel.options_button.setFixedHeight(24)
+        self.plot_x_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.plot_y_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.plot_x_selector.setSizeAdjustPolicy(self.plot_x_selector.SizeAdjustPolicy.AdjustToContents)
+        self.plot_y_selector.setSizeAdjustPolicy(self.plot_y_selector.SizeAdjustPolicy.AdjustToContents)
+        self.plot_x_selector.setMinimumHeight(22)
+        self.plot_y_selector.setMinimumHeight(22)
+        self.main_plot_panel.options_button.setMinimumHeight(22)
         self.main_plot_panel.options_button.setFixedWidth(30)
 
+        selector_stack = QVBoxLayout()
         y_stack = QHBoxLayout()
         y_stack.setContentsMargins(0, 0, 0, 0)
-        y_stack.setSpacing(4)
+        y_stack.setSpacing(2)
         y_lbl = QLabel("Y")
         y_lbl.setStyleSheet("color: #9db6cc; font-size: 10px; font-weight: 700;")
         y_stack.addWidget(y_lbl)
-        y_stack.addWidget(self.plot_y_selector)
+        y_stack.addWidget(self.plot_y_selector, stretch=1)
 
         x_stack = QHBoxLayout()
         x_stack.setContentsMargins(0, 0, 0, 0)
-        x_stack.setSpacing(4)
+        x_stack.setSpacing(2)
         x_lbl = QLabel("X")
         x_lbl.setStyleSheet("color: #9db6cc; font-size: 10px; font-weight: 700;")
         x_stack.addWidget(x_lbl)
-        x_stack.addWidget(self.plot_x_selector)
+        x_stack.addWidget(self.plot_x_selector, stretch=1)
 
-        plot_opts_row.addLayout(y_stack)
-        plot_opts_row.addLayout(x_stack)
+        selector_stack.addLayout(y_stack)
+        selector_stack.addLayout(x_stack)
+        plot_opts_row.addLayout(selector_stack)
         plot_opts_row.addWidget(self.main_plot_panel.options_button)
         plot_opts_row.addStretch(1)
         self.plot_options_widget.setLayout(plot_opts_row)
@@ -557,6 +561,8 @@ class LiveODClientWindow(QWidget):
         self._setup_layout()
 
         self.viewer_window.frame_changed.connect(self._on_frame_navigation_changed)
+        self.viewer_window.recompute_derived_requested.connect(self._recompute_derived_from_roi_view)
+        self.main_plot_panel.recomputeRequested.connect(self._recompute_derived_from_roi_view)
         self.viewer_window.auto_follow_button.toggled.connect(self._on_follow_toggled)
         self._update_follow_button_style(self.viewer_window.auto_follow_button.isChecked())
 
@@ -675,7 +681,7 @@ class LiveODClientWindow(QWidget):
         self.viewer_window.update_shot_count(0, N_shots)
         self._current_run_id = run_id
         self._refresh_status_summary()
-        self._set_main_display_mode("plot" if not self._setup_camera else "images")
+        self._set_main_display_mode("images" if self._setup_camera else "plot")
 
         # Set a sensible default ROI for the camera
         self._set_default_roi(camera_key)
@@ -798,6 +804,7 @@ class LiveODClientWindow(QWidget):
             camera_enabled=self._setup_camera,
         )
         win.closed.connect(self._on_plot_closed)
+        win.recomputeRequested.connect(self._recompute_derived_from_roi_view)
         self.analyzer.shot_result.connect(win.on_new_shot)
         self._plot_windows.append(win)
         if self._shot_history:
@@ -809,6 +816,10 @@ class LiveODClientWindow(QWidget):
         """De-register a closed pop-out window."""
         try:
             self.analyzer.shot_result.disconnect(win.on_new_shot)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            win.recomputeRequested.disconnect(self._recompute_derived_from_roi_view)
         except (TypeError, RuntimeError):
             pass
         if win in self._plot_windows:
@@ -834,12 +845,61 @@ class LiveODClientWindow(QWidget):
         if self._pending_run_visual_reset is None:
             return
         camera_key = self._pending_run_visual_reset.get("camera_key", "")
+        if self._setup_camera:
+            self._set_main_display_mode("images")
         self.main_plot_panel.on_run_started()
         for w in self._plot_windows:
             w.on_run_started()
         self.viewer_window.clear_plots()
         self._set_default_roi(camera_key)
         self._pending_run_visual_reset = None
+
+    def _recompute_derived_from_roi_view(self):
+        if not self._setup_camera:
+            self._append_inline_log("Recompute skipped: no camera data in this run.")
+            return
+
+        frames = list(getattr(self.viewer_window, "_frame_history", []))
+        if not frames:
+            self._append_inline_log("Recompute skipped: no image frames available.")
+            return
+
+        recomputed = []
+        for idx, frame in enumerate(frames):
+            try:
+                img_atoms, img_light, img_dark, *_rest = frame
+            except Exception:
+                continue
+            xvars = self._xvar_history_by_shot[idx] if idx < len(self._xvar_history_by_shot) else {}
+            result = self.analyzer.compute_shot_result_from_images(
+                img_atoms,
+                img_light,
+                img_dark,
+                shot_index=idx,
+                xvars=xvars,
+            )
+            recomputed.append(result)
+
+        if not recomputed:
+            self._append_inline_log("Recompute skipped: could not rebuild derived points.")
+            return
+
+        self._shot_history = recomputed
+        self.analyzer._shot_index = len(recomputed)
+
+        self.main_plot_panel.on_run_started()
+        for w in self._plot_windows:
+            w.on_run_started()
+        for shot in recomputed:
+            self.main_plot_panel.on_new_shot(shot)
+            for w in self._plot_windows:
+                w.on_new_shot(shot)
+
+        self.viewer_window.update_shot_count(len(recomputed), self._N_shots)
+        self._refresh_status_summary()
+        self._append_inline_log(
+            f"Recomputed {len(recomputed)} shots from images using current ROI/view crop."
+        )
 
     def _on_frame_navigation_changed(self, *_args):
         self._sync_xvars_to_current_frame()
