@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
+from waxx.util.live_od.gui.log_panel import FilteredLogPanel
+
 
 class SuppressPrints:
     def __init__(self, suppress=True):
@@ -177,9 +179,20 @@ class LiveODViewer(QWidget):
         )
         self.counts_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        self.output_window = QPlainTextEdit()
-        self.output_window.setReadOnly(True)
+        self.output_window = FilteredLogPanel(
+            title="Server Log",
+            show_timestamps=True,
+            max_entries=50000,
+            font_family="Consolas",
+            font_size=9,
+        )
         self.output_window.setMinimumSize(720, 340)
+        self.output_window.set_style_sheet(
+            "QPlainTextEdit {"
+            "  background: #0d1218; border: 1px solid #2a3745;"
+            "  border-radius: 6px;"
+            "}"
+        )
 
         self.log_dialog = QDialog(self)
         self.log_dialog.setWindowTitle("LiveOD Log")
@@ -252,7 +265,8 @@ class LiveODViewer(QWidget):
             v.ui.roiBtn.hide()
             v.ui.menuBtn.hide()
             self.set_pg_colormap(v, self._cmap_name)
-            v.getView().setAspectLocked(False)
+            # Keep displayed pixels square when panes are resized.
+            v.getView().setAspectLocked(True, ratio=1.0)
 
         self.img_atoms_view.getView().sigRangeChanged.connect(
             lambda *args: self._on_raw_range_changed(self.img_atoms_view)
@@ -273,8 +287,8 @@ class LiveODViewer(QWidget):
 
         raw_container = QWidget()
         raw_container.setLayout(raw_row)
-        raw_container.setMinimumHeight(170)
-        raw_container.setMaximumHeight(280)
+        raw_container.setMinimumHeight(120)
+        raw_container.setMaximumHeight(250)
 
         self.od_plot = pg.PlotWidget()
         self.od_img_item = pg.ImageItem()
@@ -337,7 +351,7 @@ class LiveODViewer(QWidget):
         main_vsplit = QSplitter(Qt.Orientation.Vertical)
         main_vsplit.addWidget(raw_container)
         main_vsplit.addWidget(od_container)
-        main_vsplit.setSizes([220, 740])
+        main_vsplit.setSizes([160, 760])
         main_vsplit.setChildrenCollapsible(True)
 
         layout = QVBoxLayout()
@@ -841,3 +855,36 @@ class LiveODViewer(QWidget):
             return x_range, y_range
         except Exception:
             return [0, 512], [0, 512]
+
+    def get_raw_view_range(self):
+        """Return the current raw-image view range as (x_range, y_range)."""
+        try:
+            x_range, y_range = self.img_atoms_view.getView().viewRange()
+            return x_range, y_range
+        except Exception:
+            return [0, 512], [0, 512]
+
+    def get_current_view_slices(self, image_shape):
+        """Map current raw-image view range to valid image slices (y, x)."""
+        try:
+            h = int(image_shape[0])
+            w = int(image_shape[1])
+        except Exception:
+            return slice(None), slice(None)
+
+        if h <= 0 or w <= 0:
+            return slice(None), slice(None)
+
+        x_range, y_range = self.get_raw_view_range()
+
+        x0 = max(0, min(w - 1, int(np.floor(min(x_range)))))
+        x1 = max(1, min(w, int(np.ceil(max(x_range)))))
+        y0 = max(0, min(h - 1, int(np.floor(min(y_range)))))
+        y1 = max(1, min(h, int(np.ceil(max(y_range)))))
+
+        if x1 <= x0:
+            x1 = min(w, x0 + 1)
+        if y1 <= y0:
+            y1 = min(h, y0 + 1)
+
+        return slice(y0, y1), slice(x0, x1)

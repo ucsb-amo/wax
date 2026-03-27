@@ -74,6 +74,12 @@ class CameraClient(CommClient):
         """Close the persistent connection."""
         if self._persistent_sock is not None:
             try:
+                # Signal the server we're done and wait for acknowledgment
+                reply = self._send_recv({"cmd": "disconnect"})
+            except Exception as e:
+                # If the send/recv fails, the connection is already broken
+                print(f"Error sending disconnect: {e}")
+            try:
                 self._persistent_sock.shutdown(socket.SHUT_RDWR)
             except Exception:
                 pass

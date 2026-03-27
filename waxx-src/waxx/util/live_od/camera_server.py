@@ -142,8 +142,8 @@ class CameraServer(UdpServer):
         # Command listener (blocks in accept loop)
         self.sock.bind((self.host, self.port))
         self.sock.listen(5)
-        self._log(f"Listening — command port: {self.host}:{self.port}")
-        self._log(f"Listening — viewer  port: {self.host}:{self.viewer_port}")
+        self._log(f"Listening — command port: {self.host}:{self.port}", level="debug")
+        self._log(f"Listening — viewer  port: {self.host}:{self.viewer_port}", level="debug")
 
         while self.running:
             try:
@@ -175,7 +175,7 @@ class CameraServer(UdpServer):
         try:
             self._viewer_sock.bind((self.host, self.viewer_port))
             self._viewer_sock.listen(10)
-            self._log(f"Viewer listener started on {self.host}:{self.viewer_port}")
+            self._log(f"Viewer listener started on {self.host}:{self.viewer_port}", level="debug")
             while self.running:
                 try:
                     conn, addr = self._viewer_sock.accept()
@@ -213,7 +213,7 @@ class CameraServer(UdpServer):
 
                 cmd = msg.get("cmd", "")
                 if cmd not in ("status", "check_interrupted"):
-                    self._log(f"<< command from {peer}: {cmd}")
+                    self._log(f"<< command from {peer}: {cmd}", level="debug")
 
                 if cmd == "new_run":
                     reply = self._handle_new_run(msg, peer=peer)
@@ -223,11 +223,18 @@ class CameraServer(UdpServer):
                     reply = self._handle_shot_done()
                 elif cmd == "run_complete":
                     reply = self._handle_run_complete()
-                    self._send_reply_and_disconnect(conn, reply)
-                    return
+                    send_msg(conn, reply)
+                    continue
                 elif cmd == "reset":
                     reply = self._handle_reset()
-                    self._send_reply_and_disconnect(conn, reply)
+                    send_msg(conn, reply)
+                    continue
+                elif cmd == "disconnect":
+                    # Client is done processing, safe to close connection now
+                    try:
+                        send_msg(conn, {"cmd": "ack"})
+                    except Exception:
+                        pass
                     return
                 elif cmd == "status":
                     try:
@@ -267,12 +274,11 @@ class CameraServer(UdpServer):
                 send_msg(conn, reply)
 
         except (ConnectionResetError, BrokenPipeError) as e:
-            self._log(f"Experiment connection closed by peer {peer}: {e}")
+            # Connection closed by experiment client (expected during shutdown)
+            pass
         except OSError as e:
-            # Windows reports forced socket close as WinError 10054.
-            if getattr(e, "winerror", None) == 10054:
-                self._log(f"Experiment connection closed by peer {peer}: {e}")
-            else:
+            # Windows reports forced socket close as WinError 10054 (expected during shutdown).
+            if getattr(e, "winerror", None) != 10054:
                 self._log(f"Error in experiment handler: {e}")
         except Exception as e:
             self._log(f"Error in experiment handler: {e}")
@@ -303,7 +309,8 @@ class CameraServer(UdpServer):
         if current_run_id == run_id:
             self._log(
                 f"Ignoring duplicate new_run for run_id={run_id} from {peer}; "
-                "current run data is still retained in memory."
+                "current run data is still retained in memory.",
+                level="debug",
             )
             return {"cmd": "camera_ready", "duplicate": True}
 
@@ -456,7 +463,7 @@ class CameraServer(UdpServer):
                 if self._run_start_info is not None:
                     self._run_start_info["available_data_fields"] = list(self._available_data_fields)
         parts = ", ".join(f"{k}={v}" for k, v in xvars.items())
-        self._log(f"xvars received: {parts}")
+        self._log(f"xvars received: {parts}", level="xvar")
         shot = {
             "shot_index": len(self._run_shot_history),
             "timestamp": time.time(),
@@ -1021,10 +1028,11 @@ class CameraServer(UdpServer):
 
             self._log(
                 f"Replayed active run to {addr_txt}: "
-                f"{len(shot_history)} xvar payloads, {len(image_history)} images."
+                f"{len(shot_history)} xvar payloads, {len(image_history)} images.",
+                level="debug",
             )
         except Exception as e:
-            self._log(f"Error replaying active run to {addr_txt}: {e}")
+            self._log(f"Error replaying active run to {addr_txt}: {e}", level="debug")
             with self._viewer_lock:
                 if conn in self._viewer_connections:
                     self._viewer_connections.remove(conn)
@@ -1081,14 +1089,18 @@ class CameraServer(UdpServer):
     #  Logging helper
     # ------------------------------------------------------------------
 
-    def _log(self, msg):
+    def _log(self, msg, level="normal"):
         """Print and emit a human-readable log message."""
         now = time.time()
+        lvl = str(level).lower()
+        if lvl not in ("normal", "debug", "xvar"):
+            lvl = "normal"
         with self._log_lock:
             entry = {
                 "index": len(self._log_history),
                 "timestamp": now,
                 "message": str(msg),
+                "level": lvl,
             }
             self._log_history.append(entry)
         print(f"[CameraServer] {msg}")

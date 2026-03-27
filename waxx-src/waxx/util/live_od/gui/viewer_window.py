@@ -37,6 +37,7 @@ from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.analyzer import Analyzer
 from waxx.util.live_od.gui.plotter import LiveODPlotter
 from waxx.util.live_od.gui.shot_plot_window import ShotPlotWindow
+from waxx.util.live_od.gui.log_panel import FilteredLogPanel, classify_log_level
 
 
 class ConnectionIndicator(QWidget):
@@ -249,7 +250,7 @@ class LiveODClientWindow(QWidget):
         )
         self.reset_button.clicked.connect(self._send_reset)
 
-        self.display_toggle_button = QPushButton("Show Plot")
+        self.display_toggle_button = QPushButton("Show 📈")
         self.display_toggle_button.setFixedHeight(28)
         self.display_toggle_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.display_toggle_button.setStyleSheet(
@@ -262,7 +263,7 @@ class LiveODClientWindow(QWidget):
         )
         self.display_toggle_button.clicked.connect(self._toggle_main_display)
 
-        self.viewer_window.new_plot_button.setText("New Plot 📈")
+        self.viewer_window.new_plot_button.setText("New 📈")
         self.viewer_window.new_plot_button.clicked.connect(self._open_new_plot)
         self.viewer_window.new_plot_button.setFixedHeight(28)
         self.viewer_window.new_plot_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -443,6 +444,12 @@ class LiveODClientWindow(QWidget):
         self.plot_y_selector.setMinimumHeight(22)
         self.main_plot_panel.options_button.setMinimumHeight(22)
         self.main_plot_panel.options_button.setFixedWidth(30)
+        self.plot_recompute_button = QPushButton("⟳")
+        self.plot_recompute_button.setToolTip("Recompute derived parameters from all raw images")
+        self.plot_recompute_button.setMinimumHeight(22)
+        self.plot_recompute_button.setFixedWidth(30)
+        self.plot_recompute_button.setStyleSheet("font-size: 11px; font-weight: bold;")
+        self.plot_recompute_button.clicked.connect(self._recompute_derived_from_roi_view)
 
         selector_stack = QVBoxLayout()
         y_stack = QHBoxLayout()
@@ -463,8 +470,16 @@ class LiveODClientWindow(QWidget):
 
         selector_stack.addLayout(y_stack)
         selector_stack.addLayout(x_stack)
+
+        right_button_col = QVBoxLayout()
+        right_button_col.setContentsMargins(0, 0, 0, 0)
+        right_button_col.setSpacing(2)
+        right_button_col.addWidget(self.main_plot_panel.options_button)
+        right_button_col.addWidget(self.plot_recompute_button)
+        right_button_col.addStretch(1)
+
         plot_opts_row.addLayout(selector_stack)
-        plot_opts_row.addWidget(self.main_plot_panel.options_button)
+        plot_opts_row.addLayout(right_button_col)
         plot_opts_row.addStretch(1)
         self.plot_options_widget.setLayout(plot_opts_row)
 
@@ -474,14 +489,15 @@ class LiveODClientWindow(QWidget):
         plot_controls_layout.addLayout(view_switch_col)
         plot_controls_layout.addWidget(self.mode_options_stack, stretch=1)
 
-        self.inline_log = QPlainTextEdit()
-        self.inline_log.setReadOnly(True)
-        self.inline_log.setMaximumBlockCount(200)
-        self.inline_log.setPlaceholderText("viewer log")
-        self.inline_log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.inline_log.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.inline_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.inline_log.setStyleSheet(
+        self.inline_log = FilteredLogPanel(
+            title="Viewer Log",
+            show_timestamps=False,
+            max_entries=200,
+            font_family="Consolas",
+            font_size=9,
+        )
+        self.inline_log.set_placeholder_text("viewer log")
+        self.inline_log.set_style_sheet(
             "QPlainTextEdit {"
             "  background: #0c131b;"
             "  border: 1px solid #233445;"
@@ -543,6 +559,7 @@ class LiveODClientWindow(QWidget):
         self._xvar_names: list[str] = []
         self._data_field_names: list[str] = []
         self._shot_history: list[dict] = []
+        self._raw_shot_history: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._xvar_history_by_shot: list[dict] = []
         self._last_viewed_frame_idx = -1
 
@@ -657,6 +674,7 @@ class LiveODClientWindow(QWidget):
         self._img_count = 0
         self._xvar_names = []
         self._shot_history = []
+        self._raw_shot_history = []
         self._xvar_history_by_shot = []
         self._last_viewed_frame_idx = -1
         self.main_plot_panel.update_xvar_names([])
@@ -709,6 +727,7 @@ class LiveODClientWindow(QWidget):
     def _on_image_received(self, image: np.ndarray, index: int):
         self._img_count += 1
         self.analyzer.got_img(image)
+        self._sync_raw_shot_history_from_analyzer()
         self.viewer_window.update_image_count(self._img_count, self._N_img)
         denom = self._N_pwa_per_shot + 2
         if denom > 0:
@@ -725,14 +744,9 @@ class LiveODClientWindow(QWidget):
         log_reply = ViewerClient.get_logs(self._server_ip, self._command_port, since=0, limit=50000)
         if isinstance(log_reply, dict):
             entries = list(log_reply.get("entries", []))
-            self.viewer_window.output_window.clear()
-            for entry in entries:
-                ts = float(entry.get("timestamp", 0.0))
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts > 0 else "--"
-                msg = str(entry.get("message", ""))
-                self.viewer_window.output_window.appendPlainText(f"[{stamp}] {msg}")
+            self.viewer_window.output_window.set_entries(entries)
         else:
-            self.viewer_window.output_window.appendPlainText("Could not fetch server logs.")
+            self.viewer_window.output_window.add_message("Could not fetch server logs.", level="normal")
 
         self.viewer_window.log_dialog.show()
         self.viewer_window.log_dialog.raise_()
@@ -750,6 +764,8 @@ class LiveODClientWindow(QWidget):
 
     def _on_xvars_received(self, xvars: dict):
         """Update the xvar display, analyzer state, and pop-out windows."""
+        parts = ", ".join(f"{k}={v}" for k, v in xvars.items())
+        self._append_inline_log(f"xvars received: {parts}", level="xvar")
         data_field_set = set(self._data_field_names)
         scan_xvars = {k: v for k, v in xvars.items() if k not in data_field_set}
 
@@ -859,22 +875,43 @@ class LiveODClientWindow(QWidget):
             self._append_inline_log("Recompute skipped: no camera data in this run.")
             return
 
-        frames = list(getattr(self.viewer_window, "_frame_history", []))
-        if not frames:
+        self._sync_raw_shot_history_from_analyzer()
+        raw_shots = list(self._raw_shot_history)
+        if not raw_shots:
+            # Backward-compatible fallback if a run predates raw-shot buffering.
+            frames = list(getattr(self.viewer_window, "_frame_history", []))
+            raw_shots = []
+            for frame in frames:
+                try:
+                    img_atoms, img_light, img_dark, *_rest = frame
+                    raw_shots.append((np.asarray(img_atoms), np.asarray(img_light), np.asarray(img_dark)))
+                except Exception:
+                    continue
+
+        if not raw_shots:
             self._append_inline_log("Recompute skipped: no image frames available.")
             return
 
         recomputed = []
-        for idx, frame in enumerate(frames):
-            try:
-                img_atoms, img_light, img_dark, *_rest = frame
-            except Exception:
+        for idx, shot_images in enumerate(raw_shots):
+            img_atoms, img_light, img_dark = shot_images
+            img_atoms = np.asarray(img_atoms)
+            img_light = np.asarray(img_light)
+            img_dark = np.asarray(img_dark)
+
+            y_slice, x_slice = self.viewer_window.get_current_view_slices(img_atoms.shape)
+            img_atoms_cropped = img_atoms[y_slice, x_slice]
+            img_light_cropped = img_light[y_slice, x_slice]
+            img_dark_cropped = img_dark[y_slice, x_slice]
+
+            if img_atoms_cropped.size == 0 or img_light_cropped.size == 0 or img_dark_cropped.size == 0:
                 continue
+
             xvars = self._xvar_history_by_shot[idx] if idx < len(self._xvar_history_by_shot) else {}
             result = self.analyzer.compute_shot_result_from_images(
-                img_atoms,
-                img_light,
-                img_dark,
+                img_atoms_cropped,
+                img_light_cropped,
+                img_dark_cropped,
                 shot_index=idx,
                 xvars=xvars,
             )
@@ -898,8 +935,20 @@ class LiveODClientWindow(QWidget):
         self.viewer_window.update_shot_count(len(recomputed), self._N_shots)
         self._refresh_status_summary()
         self._append_inline_log(
-            f"Recomputed {len(recomputed)} shots from images using current ROI/view crop."
+            f"Recomputed {len(recomputed)} shots from raw images using current ROI/view crop."
         )
+
+    def _sync_raw_shot_history_from_analyzer(self):
+        """Mirror analyzer raw-shot buffer into viewer-owned history for recompute stability."""
+        try:
+            analyzer_raw = self.analyzer.get_raw_shot_history()
+        except Exception:
+            return
+        if not analyzer_raw:
+            return
+        if len(analyzer_raw) <= len(self._raw_shot_history):
+            return
+        self._raw_shot_history.extend(analyzer_raw[len(self._raw_shot_history):])
 
     def _on_frame_navigation_changed(self, *_args):
         self._sync_xvars_to_current_frame()
@@ -971,11 +1020,12 @@ class LiveODClientWindow(QWidget):
         text = text.replace("[CameraServer] ", "")
         return text.strip()
 
-    def _append_inline_log(self, message: str):
+    def _append_inline_log(self, message: str, level: str | None = None):
         text = self._sanitize_inline_log_message(message)
         if not text:
             return
-        self.inline_log.appendPlainText(text)
+        log_level = level if level is not None else classify_log_level(text)
+        self.inline_log.add_message(text, level=log_level)
 
     def _on_connection_status_changed(self, connected: bool):
         self._server_connected = bool(connected)
@@ -1010,11 +1060,11 @@ class LiveODClientWindow(QWidget):
         self._main_display_mode = mode
         if mode == "plot":
             self.main_display_stack.setCurrentWidget(self.main_plot_panel)
-            self.display_toggle_button.setText("Show Images")
+            self.display_toggle_button.setText("Show 🖼️")
             self.mode_options_stack.setCurrentWidget(self.plot_options_widget)
         else:
             self.main_display_stack.setCurrentWidget(self.viewer_window)
-            self.display_toggle_button.setText("Show Plot")
+            self.display_toggle_button.setText("Show 📈")
             self.mode_options_stack.setCurrentWidget(self.image_options_widget)
 
     def _toggle_main_display(self):

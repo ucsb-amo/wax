@@ -40,28 +40,35 @@ import pyqtgraph as pg
 #  Available derived quantities
 # ======================================================================
 
-DERIVED_QUANTITIES = {
-    # key: display_name
-    "integrated_od":       "Integrated OD",
-    "atom_number":         "Atom number (integrated OD)",
-    "atom_number_fit_x":   "Atom number (fit area x)",
-    "atom_number_fit_y":   "Atom number (fit area y)",
-    "fit_sigma_x":         "σ_x  (Gaussian width x)",
-    "fit_sigma_y":         "σ_y  (Gaussian width y)",
-    "fit_center_x":        "Center x",
-    "fit_center_y":        "Center y",
-    "fit_amplitude_x":     "Amplitude x",
-    "fit_amplitude_y":     "Amplitude y",
-    "fit_offset_x":        "Offset x",
-    "fit_offset_y":        "Offset y",
-    "fit_area_x":          "Fit area x",
-    "fit_area_y":          "Fit area y",
-    "sum_od_peak_x":       "Sum OD peak x",
-    "sum_od_peak_y":       "Sum OD peak y",
-    "atom_number_apd_up":  "Atom number (APD up)",
-    "atom_number_apd_down":"Atom number (APD down)",
-    "atom_number_apd_total":"Atom number (APD total)",
-}
+# Ordered tree definition: (key, display_label, top_group, sub_group_or_None).
+# Insertion order controls the display order in the dropdown tree.
+DERIVED_QUANTITIES_TREE = [
+    # ---- Data / APD group (shown first) ----
+    ("atom_number_apd_up",    "Atom number (APD up)",    "data", None),
+    ("atom_number_apd_down",  "Atom number (APD down)",  "data", None),
+    ("atom_number_apd_total", "Atom number (APD total)", "data", None),
+    # ---- Image-derived group (shown second) ----
+    ("atom_number",       "Atom number",         "image", None),
+    ("atom_number_fit_x", "Atom number (fit x)", "image", "x_fit"),
+    ("atom_number_fit_y", "Atom number (fit y)", "image", "y_fit"),
+    # X fit sub-group
+    ("fit_sigma_x",     "σ_x  (Gaussian width x)", "image", "x_fit"),
+    ("fit_center_x",    "Center x",                "image", "x_fit"),
+    ("fit_amplitude_x", "Amplitude x",             "image", "x_fit"),
+    ("fit_offset_x",    "Offset x",                "image", "x_fit"),
+    ("fit_area_x",      "Fit area x",              "image", "x_fit"),
+    ("sum_od_peak_x",   "Sum OD peak x",           "image", "x_fit"),
+    # Y fit sub-group
+    ("fit_sigma_y",     "σ_y  (Gaussian width y)", "image", "y_fit"),
+    ("fit_center_y",    "Center y",                "image", "y_fit"),
+    ("fit_amplitude_y", "Amplitude y",             "image", "y_fit"),
+    ("fit_offset_y",    "Offset y",                "image", "y_fit"),
+    ("fit_area_y",      "Fit area y",              "image", "y_fit"),
+    ("sum_od_peak_y",   "Sum OD peak y",           "image", "y_fit"),
+]
+
+# Flat key→label lookup (used for axis labels, legends, etc.)
+DERIVED_QUANTITIES = {key: label for key, label, _g, _sg in DERIVED_QUANTITIES_TREE}
 
 APD_DERIVED_QUANTITY_KEYS = {
     "atom_number_apd_up",
@@ -70,22 +77,7 @@ APD_DERIVED_QUANTITY_KEYS = {
 }
 
 CAMERA_DERIVED_QUANTITY_KEYS = {
-    "integrated_od",
-    "atom_number",
-    "atom_number_fit_x",
-    "atom_number_fit_y",
-    "fit_sigma_x",
-    "fit_sigma_y",
-    "fit_center_x",
-    "fit_center_y",
-    "fit_amplitude_x",
-    "fit_amplitude_y",
-    "fit_offset_x",
-    "fit_offset_y",
-    "fit_area_x",
-    "fit_area_y",
-    "sum_od_peak_x",
-    "sum_od_peak_y",
+    key for key, _label, group, _sg in DERIVED_QUANTITIES_TREE if group == "image"
 }
 
 INDEPENDENT_VARIABLES = {
@@ -111,7 +103,9 @@ _COLOR_PRESETS = {
 
 _QUANTITY_GROUP_LABELS = {
     "image": "Image-derived",
-    "data": "Data parameters",
+    "data":  "Data parameters",
+    "x_fit": "X fit",
+    "y_fit": "Y fit",
 }
 
 _GROUP_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -123,20 +117,22 @@ _GROUP_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 class _CheckableCombo(QComboBox):
     """
-    Drop-down whose items have check-boxes.  At most ``max_checked``
-    items may be checked at once — checking a new one un-checks the
+    Drop-down with checkable leaf items arranged in a two-level tree
+    (top-group → optional sub-group → leaf).  At most ``max_checked``
+    leaf items may be checked at once; checking a new one un-checks the
     oldest.  The closed combo displays a summary of the selections.
 
     Emits ``selectionChanged`` whenever the set of checked keys changes.
     """
 
-    selectionChanged = pyqtSignal()  # fired when checked set changes
+    selectionChanged = pyqtSignal()
 
     def __init__(self, max_checked: int = 2, parent=None):
         super().__init__(parent)
         self._max = max_checked
         self._order: list[str] = []
         self._group_items: dict[str, QStandardItem] = {}
+        self._subgroup_items: dict[tuple[str, str], QStandardItem] = {}
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
         tree = QTreeView(self)
@@ -146,14 +142,20 @@ class _CheckableCombo(QComboBox):
         tree.setUniformRowHeights(True)
         self.setView(tree)
         self._model.itemChanged.connect(self._on_item_changed)
+        self.installEventFilter(self)
+        self.view().installEventFilter(self)
         self.view().viewport().installEventFilter(self)
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
         self.lineEdit().installEventFilter(self)
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.setMaxVisibleItems(24)
         self._update_display_text()
 
     def eventFilter(self, obj, event):
+        if obj is self.view() and event.type() == QEvent.Type.MouseButtonRelease:
+            # Block QComboBox default close behavior triggered from view release.
+            return True
         if obj is self.view().viewport():
             if (
                 event.type() == QEvent.Type.MouseButtonRelease
@@ -169,29 +171,30 @@ class _CheckableCombo(QComboBox):
                             else Qt.CheckState.Checked
                         )
                         item.setCheckState(new_state)
-                # Consume release to prevent default combo behavior from
-                # closing the popup after each click.
+                # Consume release to prevent Qt from closing popup after each click.
                 return True
         if (
-            obj is self.lineEdit()
-            and event.type() == QEvent.Type.MouseButtonPress
+            obj in (self, self.lineEdit())
+            and event.type() == QEvent.Type.MouseButtonRelease
             and event.button() == Qt.MouseButton.LeftButton
         ):
-            self.showPopup()
+            # Match normal combo behavior: open on release when closed.
+            # If already open, ignore opener release so it does not close.
+            if not self.view().isVisible():
+                self.showPopup()
             return True
         return super().eventFilter(obj, event)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and not self.view().isVisible():
-            self.showPopup()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
     # ---- public API -------------------------------------------------
 
-    def add_item(self, text: str, data=None, group: str | None = None):
-        parent = self._ensure_group_item(group) if group is not None else self._model.invisibleRootItem()
+    def add_item(self, text: str, data=None, group: str | None = None,
+                 subgroup: str | None = None):
+        if group is not None and subgroup is not None:
+            parent = self._ensure_subgroup_item(group, subgroup)
+        elif group is not None:
+            parent = self._ensure_group_item(group)
+        else:
+            parent = self._model.invisibleRootItem()
         item = QStandardItem(text)
         item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
         item.setData(Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
@@ -235,7 +238,9 @@ class _CheckableCombo(QComboBox):
         self._update_minimum_width_from_items()
         self.selectionChanged.emit()
 
-    def _ensure_group_item(self, group: str):
+    # ---- group / subgroup management --------------------------------
+
+    def _ensure_group_item(self, group: str) -> QStandardItem:
         if group in self._group_items:
             return self._group_items[group]
         label = _QUANTITY_GROUP_LABELS.get(group, group.title())
@@ -249,23 +254,50 @@ class _CheckableCombo(QComboBox):
         self._group_items[group] = item
         return item
 
+    def _ensure_subgroup_item(self, group: str, subgroup: str) -> QStandardItem:
+        sg_key = (group, subgroup)
+        if sg_key in self._subgroup_items:
+            return self._subgroup_items[sg_key]
+        parent = self._ensure_group_item(group)
+        label = _QUANTITY_GROUP_LABELS.get(subgroup, subgroup.replace("_", " ").title())
+        item = QStandardItem(label)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        font = item.font()
+        font.setItalic(True)
+        item.setFont(font)
+        item.setData(subgroup, _GROUP_ROLE)
+        parent.appendRow(item)
+        self._subgroup_items[sg_key] = item
+        return item
+
     def _remove_empty_group_items(self):
+        # Remove empty subgroups first
+        for sg_key, item in list(self._subgroup_items.items()):
+            if item.rowCount() == 0:
+                parent = item.parent() or self._model.invisibleRootItem()
+                parent.removeRow(item.row())
+                del self._subgroup_items[sg_key]
+        # Then remove empty top-level groups
         for group, item in list(self._group_items.items()):
             if item.rowCount() == 0:
                 self._model.removeRow(item.row())
                 del self._group_items[group]
 
-    def _item_for_key(self, key: str):
-        for group_item in self._group_items.values():
-            for row in range(group_item.rowCount()):
-                child = group_item.child(row)
-                if child is not None and child.data(Qt.ItemDataRole.UserRole) == key:
+    def _item_for_key(self, key: str) -> QStandardItem | None:
+        """Recursively find the leaf item whose UserRole data == key."""
+        def _search(parent: QStandardItem) -> QStandardItem | None:
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child is None:
+                    continue
+                if (child.data(Qt.ItemDataRole.UserRole) == key
+                        and bool(child.flags() & Qt.ItemFlag.ItemIsUserCheckable)):
                     return child
-        for row in range(self._model.rowCount()):
-            item = self._model.item(row)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == key:
-                return item
-        return None
+                found = _search(child)
+                if found is not None:
+                    return found
+            return None
+        return _search(self._model.invisibleRootItem())
 
     # ---- internals --------------------------------------------------
 
@@ -285,6 +317,8 @@ class _CheckableCombo(QComboBox):
         if item.hasChildren():
             return
         key = item.data(Qt.ItemDataRole.UserRole)
+        if key is None:
+            return
         if item.checkState() == Qt.CheckState.Checked:
             if key not in self._order:
                 self._order.append(key)
@@ -318,32 +352,53 @@ class _CheckableCombo(QComboBox):
 
     def _update_minimum_width_from_items(self):
         fm = self.fontMetrics()
-        max_text_width = 0
-        for row in range(self._model.rowCount()):
-            item = self._model.item(row)
-            if item is None:
-                continue
-            max_text_width = max(max_text_width, fm.horizontalAdvance(item.text()))
-            for child_row in range(item.rowCount()):
-                child = item.child(child_row)
+        max_w = 0
+
+        def _measure(parent: QStandardItem, depth: int):
+            nonlocal max_w
+            indent = depth * 20  # approximate QTreeView indent per level
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
                 if child is None:
                     continue
-                max_text_width = max(max_text_width, fm.horizontalAdvance(child.text()))
+                max_w = max(max_w, fm.horizontalAdvance(child.text()) + indent)
+                _measure(child, depth + 1)
 
-        # Padding includes tree indentation, checkbox indicator and frame.
-        min_width = max(120, max_text_width + 68)
+        _measure(self._model.invisibleRootItem(), 0)
+        min_width = max(120, max_w + 68)
         self.setMinimumWidth(min_width)
         if self.view() is not None:
             self.view().setMinimumWidth(min_width)
 
     def hidePopup(self):
-        # Allow normal hide
         super().hidePopup()
 
     def showPopup(self):
-        if isinstance(self.view(), QTreeView):
-            self.view().expandAll()
         super().showPopup()
+        if isinstance(self.view(), QTreeView):
+            tree = self.view()
+            # Collapse everything, then expand only top-level group rows so
+            # sub-groups (X fit / Y fit) are hidden until explicitly opened.
+            tree.collapseAll()
+            for row in range(self._model.rowCount()):
+                tree.expand(self._model.index(row, 0))
+            # Open with a taller popup so more tree rows are visible.
+            row_height = tree.sizeHintForRow(0)
+            if row_height <= 0:
+                row_height = 22
+            visible_rows = 0
+            for row in range(self._model.rowCount()):
+                parent_item = self._model.item(row)
+                visible_rows += 1
+                if parent_item is not None and tree.isExpanded(self._model.index(row, 0)):
+                    visible_rows += parent_item.rowCount()
+            popup_height = max(260, min(520, (visible_rows + 1) * row_height + 10))
+            tree.setMinimumHeight(popup_height)
+            tree.setMaximumHeight(popup_height)
+        # Re-install our filter so it runs before Qt's internal one
+        # (Qt installs its own inside showPopup; LIFO means ours goes first).
+        self.view().installEventFilter(self)
+        self.view().viewport().installEventFilter(self)
 
 
 # ======================================================================
@@ -443,9 +498,8 @@ class ShotPlotWindow(QWidget):
         self.qty_combo = _CheckableCombo(max_checked=2)
         self.qty_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.qty_combo.setMinimumWidth(100)
-        for key, label in DERIVED_QUANTITIES.items():
-            group = "data" if key in APD_DERIVED_QUANTITY_KEYS else "image"
-            self.qty_combo.add_item(label, data=key, group=group)
+        for key, label, group, subgroup in DERIVED_QUANTITIES_TREE:
+            self.qty_combo.add_item(label, data=key, group=group, subgroup=subgroup)
         self.qty_combo.selectionChanged.connect(self._on_quantity_selection_changed)
 
         # Independent variable selector
@@ -456,6 +510,9 @@ class ShotPlotWindow(QWidget):
         self.indep_combo.addItem("Timestamp (s)", userData="timestamp")
         for name in xvar_names:
             self.indep_combo.addItem(f"xvar: {name}", userData=f"xvar:{name}")
+        # Default to first xvar if available, otherwise shot_index
+        if xvar_names:
+            self.indep_combo.setCurrentIndex(2)  # First xvar is at index 2
         self.indep_combo.currentIndexChanged.connect(self._on_indep_changed)
         self.indep_combo.currentIndexChanged.connect(self._request_replot_no_autorange)
         self._update_selector_minimum_widths()
@@ -523,6 +580,10 @@ class ShotPlotWindow(QWidget):
         self.xlim_enable_check.stateChanged.connect(self._on_axis_override_changed)
         self.left_ylim_enable_check.stateChanged.connect(self._on_axis_override_changed)
         self.right_ylim_enable_check.stateChanged.connect(self._on_axis_override_changed)
+
+        self.link_ylim_check = QCheckBox("Link Y limits")
+        self.link_ylim_check.setChecked(False)
+        self.link_ylim_check.stateChanged.connect(self._on_link_ylim_changed)
         self.xlim_min_edit = QLineEdit()
         self.xlim_max_edit = QLineEdit()
         self.left_ylim_min_edit = QLineEdit()
@@ -649,6 +710,7 @@ class ShotPlotWindow(QWidget):
         right_ylim_row.addWidget(self.right_ylim_max_edit)
         right_ylim_widget.setLayout(right_ylim_row)
         form.addRow("Right Y", right_ylim_widget)
+        form.addRow("Link Y", self.link_ylim_check)
         form.addRow("Axes", self.options_autoscale_button)
         form.addRow("Derived", self.options_recompute_button)
 
@@ -762,11 +824,11 @@ class ShotPlotWindow(QWidget):
     def set_camera_enabled(self, enabled: bool):
         self._camera_enabled = bool(enabled)
         if self._camera_enabled:
-            for key, label in DERIVED_QUANTITIES.items():
+            for key, label, group, subgroup in DERIVED_QUANTITIES_TREE:
                 if key not in CAMERA_DERIVED_QUANTITY_KEYS:
                     continue
                 if not self.qty_combo.has_key(key):
-                    self.qty_combo.add_item(label, data=key, group="image")
+                    self.qty_combo.add_item(label, data=key, group=group, subgroup=subgroup)
         else:
             for key in CAMERA_DERIVED_QUANTITY_KEYS:
                 self.qty_combo.remove_key(key)
@@ -782,6 +844,15 @@ class ShotPlotWindow(QWidget):
         for name in names:
             label_prefix = "data" if str(name) in self._data_field_names else "xvar"
             self.indep_combo.addItem(f"{label_prefix}: {name}", userData=f"xvar:{name}")
+        # If xvars are now available and current selection is not an xvar, switch to first xvar
+        if names:
+            current_data = self.indep_combo.currentData()
+            if not (isinstance(current_data, str) and current_data.startswith("xvar:")):
+                # Find the first xvar item (should be right after shot_index and timestamp)
+                for i in range(self.indep_combo.count()):
+                    if str(self.indep_combo.itemData(i)).startswith("xvar:"):
+                        self.indep_combo.setCurrentIndex(i)
+                        break
         self._update_selector_minimum_widths()
 
     def update_data_field_names(self, names: list[str]):
@@ -922,6 +993,28 @@ class ShotPlotWindow(QWidget):
             self._seed_override_from_current_range("left")
         elif sender is self.right_ylim_enable_check and self.right_ylim_enable_check.isChecked():
             self._seed_override_from_current_range("right")
+        # If link is enabled, sync left → right when left limit changes
+        if self.link_ylim_check.isChecked():
+            if sender in (self.left_ylim_enable_check, self.left_ylim_min_edit, self.left_ylim_max_edit):
+                self.right_ylim_enable_check.blockSignals(True)
+                self.right_ylim_enable_check.setChecked(self.left_ylim_enable_check.isChecked())
+                self.right_ylim_enable_check.blockSignals(False)
+                self._sync_right_ylim_to_left()
+        self._apply_axis_overrides()
+
+    def _on_link_ylim_changed(self):
+        """When link Y limits is toggled, sync left and right y-axis limit controls."""
+        if self.link_ylim_check.isChecked():
+            # Link just turned on: copy left settings to right
+            self._sync_right_ylim_to_left()
+
+    def _sync_right_ylim_to_left(self):
+        """Copy left y-limit enable state and values to right y-limit controls."""
+        self._override_controls_updating = True
+        self.right_ylim_enable_check.setChecked(self.left_ylim_enable_check.isChecked())
+        self.right_ylim_min_edit.setText(self.left_ylim_min_edit.text())
+        self.right_ylim_max_edit.setText(self.left_ylim_max_edit.text())
+        self._override_controls_updating = False
         self._apply_axis_overrides()
 
     def _apply_plot_style(self):
@@ -1210,7 +1303,9 @@ class ShotPlotWindow(QWidget):
         count = max(self._value_length(value) for value in raw_values) if raw_values else 1
         if count <= 1:
             y = np.array([self._scalar_value(value) for value in raw_values], dtype=float)
-            return [(None, y)]
+            # When multi_value_count > 1, assign index 0 to scalars so they appear in legend
+            index = 0 if self._multi_value_count > 1 else None
+            return [(index, y)]
         lower, upper = self._selected_index_bounds(count)
         series = []
         for index in range(lower, upper + 1):
@@ -1333,7 +1428,9 @@ class ShotPlotWindow(QWidget):
         left_curves = self._ensure_curve_pool(self._left_curves, len(left_series), right_axis=False)
         array_legend_lines = []
         for order, ((index, y_vals), curve) in enumerate(zip(left_series, left_curves)):
-            color = self._series_color(self._series_colors[0], order, len(left_series))
+            # Use index position for color, not order, for consistency across axes
+            index_pos = index if index is not None else 0
+            color = self._series_color(self._series_colors[0], index_pos, max(self._multi_value_count, 1))
             mask = np.isfinite(x_vals) & np.isfinite(y_vals)
             curve.setData(x_vals[mask], y_vals[mask])
             self._style_curve(curve, color)
@@ -1359,7 +1456,9 @@ class ShotPlotWindow(QWidget):
             right_curves = self._ensure_curve_pool(self._right_curves, len(right_series), right_axis=True)
             right_finite = []
             for order, ((index, y_vals), curve) in enumerate(zip(right_series, right_curves)):
-                color = self._series_color(self._series_colors[1], order, len(right_series))
+                # Use index position for color, not order, for consistency across axes
+                index_pos = index if index is not None else 0
+                color = self._series_color(self._series_colors[1], index_pos, max(self._multi_value_count, 1))
                 mask = np.isfinite(x_vals) & np.isfinite(y_vals)
                 right_finite.append(y_vals[mask])
                 curve.setData(x=x_vals[mask], y=y_vals[mask])

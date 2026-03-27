@@ -10,23 +10,23 @@ The window is fully self-contained: pass *host*, *port*, and a
 *camera_nanny* and it will create / manage the ``CameraServer`` internally.
 """
 
-import sys
 import threading
 import time
-import numpy as np
+import os
+import subprocess
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QPlainTextEdit, QPushButton,
+    QLabel, QFrame, QPlainTextEdit, QPushButton, QDialog, QSizePolicy,
 )
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt, QTimer
 
 from waxx.util.live_od.camera_server import CameraServer
 from waxx.util.live_od.camera_nanny import CameraNanny
 from waxx.util.live_od.viewer_client import ViewerClient
 from waxx.util.live_od.gui.viewer_window import XVarDisplay
-from waxx.util.live_od.gui.shot_plot_window import ShotPlotWindow
+from waxx.util.live_od.gui.log_panel import FilteredLogPanel, classify_log_level
 from waxa.data.server_talk import server_talk as st
 
 
@@ -40,12 +40,13 @@ class StatusLight(QWidget):
     def __init__(self, label_text):
         super().__init__()
         self._dot = QFrame()
-        self._dot.setFixedSize(16, 16)
+        self._dot.setFixedSize(12, 12)
         self._label = QLabel(label_text)
-        self._label.setFont(QFont("Segoe UI", 10))
-        self._label.setStyleSheet("color: #e6f2ff; font-weight: 600;")
+        self._label.setFont(QFont("Segoe UI", 9))
+        self._label.setStyleSheet("color: #e3eef9; font-weight: 600;")
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
         layout.addWidget(self._dot)
         layout.addWidget(self._label)
         layout.addStretch()
@@ -63,7 +64,7 @@ class StatusLight(QWidget):
     def set_state(self, state: str):
         colour = self._COLOURS.get(state, "gray")
         self._dot.setStyleSheet(
-            f"background-color: {colour}; border-radius: 8px; "
+            f"background-color: {colour}; border-radius: 6px; "
             f"border: 1px solid #222;"
         )
 
@@ -118,23 +119,32 @@ class CameraServerWindow(QWidget):
         self.camera_light = StatusLight("Camera: –")
         self.grab_light = StatusLight("Grab loop: idle")
         self.viewer_light = StatusLight("Viewers: 0 connected")
+        for indicator in (self.server_light, self.camera_light, self.grab_light, self.viewer_light):
+            indicator.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.run_label = QLabel("Run ID: –")
-        self.run_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.run_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.run_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.run_label.setStyleSheet("color: #f2f8ff;")
+        self.run_label.setStyleSheet("color: #eaf3ff;")
+        self.run_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.xvar_display = XVarDisplay()
+        self.xvar_display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        self.log_box = QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setFont(QFont("Consolas", 9))
-        self.log_box.setMaximumBlockCount(2000)
-        self.log_box.setStyleSheet(
+        self.log_box = FilteredLogPanel(
+            title="Server Log",
+            show_timestamps=True,
+            max_entries=600,
+            font_family="Consolas",
+            font_size=9,
+        )
+        self.log_box.setMinimumHeight(125)
+        self.log_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.log_box.set_style_sheet(
             "QPlainTextEdit {"
-            "  background: #0b1118;"
-            "  color: #e6f2ff;"
-            "  border: 1px solid #2d435a;"
-            "  border-radius: 8px;"
+            "  background: #0f1823;"
+            "  color: #dbe9f8;"
+            "  border: 1px solid #30465d;"
+            "  border-radius: 7px;"
             "}"
         )
 
@@ -142,8 +152,8 @@ class CameraServerWindow(QWidget):
         self.toggle_server_button.setStyleSheet(
             "QPushButton {"
             "  background: #1e4f39; color: #e9fff2;"
-            "  border: 1px solid #4b876a; border-radius: 8px;"
-            "  font-size: 14px; font-weight: 700; padding: 8px 14px;"
+            "  border: 1px solid #4b876a; border-radius: 7px;"
+            "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
             "}"
             "QPushButton:hover { background: #27684b; }"
         )
@@ -153,53 +163,108 @@ class CameraServerWindow(QWidget):
         self.reset_button.setStyleSheet(
             "QPushButton {"
             "  background: #6e2a2f; color: #ffeef0;"
-            "  border: 1px solid #9a4a50; border-radius: 8px;"
-            "  font-size: 14px; font-weight: 700; padding: 8px 14px;"
+            "  border: 1px solid #9a4a50; border-radius: 7px;"
+            "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
             "}"
             "QPushButton:hover { background: #84343a; }"
         )
         self.reset_button.clicked.connect(self._send_reset)
 
-        self.new_plot_button = QPushButton("New Plot")
-        self.new_plot_button.setStyleSheet(
+        self.log_button = QPushButton("Full Log")
+        self.log_button.setStyleSheet(
+            "QPushButton {"
+            "  background: #3f5e1f; color: #f4ffe8;"
+            "  border: 1px solid #7ea55a; border-radius: 7px;"
+            "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
+            "}"
+            "QPushButton:hover { background: #4f7527; }"
+        )
+        self.log_button.clicked.connect(self._open_full_log)
+
+        self.open_viewer_button = QPushButton("Open Viewer")
+        self.open_viewer_button.setStyleSheet(
             "QPushButton {"
             "  background: #203754; color: #eaf5ff;"
-            "  border: 1px solid #4d78a8; border-radius: 8px;"
-            "  font-size: 14px; font-weight: 700; padding: 8px 14px;"
+            "  border: 1px solid #4d78a8; border-radius: 7px;"
+            "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
             "}"
             "QPushButton:hover { background: #29466a; }"
         )
-        self.new_plot_button.clicked.connect(self._open_new_plot)
+        self.open_viewer_button.clicked.connect(self._launch_viewer_window)
+
+        for btn in (self.toggle_server_button, self.reset_button, self.log_button, self.open_viewer_button):
+            btn.setFixedHeight(30)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.setStyleSheet(
-            "QWidget { background: #0b1118; color: #e6f2ff; }"
+            "QWidget { background: #0c131b; color: #e6f2ff; }"
             "QGroupBox, QFrame { color: #e6f2ff; }"
         )
 
+        self.log_dialog = QDialog(self)
+        self.log_dialog.setWindowTitle("Camera Server Log")
+        self.log_dialog.setMinimumSize(620, 360)
+        self.log_dialog.resize(940, 560)
+        self.full_log_box = FilteredLogPanel(
+            title="Server Log",
+            show_timestamps=True,
+            max_entries=50000,
+            font_family="Consolas",
+            font_size=9,
+        )
+        self.full_log_box.set_style_sheet(
+            "QPlainTextEdit {"
+            "  background: #0b1118;"
+            "  color: #e6f2ff;"
+            "  border: 1px solid #2d435a;"
+            "  border-radius: 8px;"
+            "}"
+        )
+        log_dialog_layout = QVBoxLayout()
+        log_dialog_layout.setContentsMargins(8, 8, 8, 8)
+        log_dialog_layout.addWidget(self.full_log_box)
+        self.log_dialog.setLayout(log_dialog_layout)
+
         # ---- Layout ----
+        left_lights = QVBoxLayout()
+        left_lights.setContentsMargins(0, 0, 0, 0)
+        left_lights.setSpacing(4)
+        left_lights.addWidget(self.server_light)
+        left_lights.addWidget(self.viewer_light)
+
+        right_lights = QVBoxLayout()
+        right_lights.setContentsMargins(0, 0, 0, 0)
+        right_lights.setSpacing(4)
+        right_lights.addWidget(self.camera_light)
+        right_lights.addWidget(self.grab_light)
+
         lights = QHBoxLayout()
-        lights.addWidget(self.server_light)
-        lights.addWidget(self.camera_light)
-        lights.addWidget(self.grab_light)
-        lights.addWidget(self.viewer_light)
+        lights.setContentsMargins(0, 0, 0, 0)
+        lights.setSpacing(8)
+        lights.addLayout(left_lights, stretch=1)
+        lights.addLayout(right_lights, stretch=1)
 
         xvar_row = QHBoxLayout()
+        xvar_row.setContentsMargins(0, 0, 0, 0)
         xvar_row.addWidget(self.xvar_display)
 
         button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(6)
         button_row.addWidget(self.toggle_server_button)
         button_row.addWidget(self.reset_button)
-        button_row.addWidget(self.new_plot_button)
+        button_row.addWidget(self.log_button)
+        button_row.addWidget(self.open_viewer_button)
         self._button_row = button_row
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        layout.addLayout(lights)
-        layout.addWidget(self.run_label)
-        layout.addLayout(xvar_row)
-        layout.addWidget(self.log_box, stretch=1)
-        layout.addLayout(button_row)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        layout.addLayout(lights, stretch=0)
+        layout.addWidget(self.run_label, stretch=0)
+        layout.addLayout(xvar_row, stretch=0)
+        layout.addWidget(self.log_box, stretch=1)  # Log grows/shrinks on resize
+        layout.addLayout(button_row, stretch=0)
         self.setLayout(layout)
 
         # ---- Connect server signals ----
@@ -216,12 +281,6 @@ class CameraServerWindow(QWidget):
         self._img_count = 0
         self._N_img = 0
         self._active_run = False   # True while a run is in progress
-        self._plot_windows: list[ShotPlotWindow] = []
-        self._plot_counter = 0
-        self._xvar_names: list[str] = []
-        self._data_field_names: list[str] = []
-        self._shot_index = 0
-        self._shot_history: list[dict] = []
 
         self._update_run_id_label()
         self._toggle_server()
@@ -244,8 +303,7 @@ class CameraServerWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _on_log(self, msg: str):
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_box.appendPlainText(f"[{timestamp}] {msg}")
+        self.log_box.add_message(msg, level=classify_log_level(msg))
 
     def _on_camera_status(self, status: int):
         if status == -1:
@@ -268,9 +326,6 @@ class CameraServerWindow(QWidget):
         camera_key = info.get("camera_key", "?")
         run_id = info.get("run_id", "?")
         N_img = info.get("N_img", 0)
-        self._shot_index = 0
-        self._shot_history = []
-        self._data_field_names = list(info.get("available_data_fields", []))
         self._N_img = N_img
         self._img_count = 0
         self._active_run = True
@@ -278,9 +333,6 @@ class CameraServerWindow(QWidget):
         self.run_label.setText(
             f"Run ID: {run_id}   |   Expecting {N_img} images"
         )
-        for w in self._plot_windows:
-            w.on_run_started()
-            w.update_data_field_names(self._data_field_names)
 
     def _on_run_completed(self):
         self._active_run = False
@@ -333,76 +385,53 @@ class CameraServerWindow(QWidget):
         """Update the xvar display when xvars are forwarded."""
         self.xvar_display.update_xvars(xvars)
 
-        scalar_names = [k for k, v in xvars.items() if np.isscalar(v)]
-        if scalar_names != self._xvar_names:
-            self._xvar_names = scalar_names
-            for w in self._plot_windows:
-                w.update_xvar_names(self._xvar_names)
+    def _open_full_log(self):
+        """Fetch full timestamped server logs and show them in a larger window."""
+        log_reply = ViewerClient.get_logs(
+            self._host,
+            self._port,
+            since=0,
+            limit=50000,
+        )
+        self.full_log_box.clear()
+        if isinstance(log_reply, dict):
+            entries = list(log_reply.get("entries", []))
+            self.full_log_box.set_entries(entries)
+        else:
+            self.full_log_box.add_message("Could not fetch server logs.", level="normal")
 
-        try:
-            names = list(self.server._available_data_fields)
-        except Exception:
-            names = []
-        if names != self._data_field_names:
-            self._data_field_names = names
-            for w in self._plot_windows:
-                w.update_data_field_names(self._data_field_names)
+        self.log_dialog.show()
+        self.log_dialog.raise_()
+        self.log_dialog.activateWindow()
 
-        shot = {
-            "shot_index": self._shot_index,
-            "timestamp": time.time(),
-            "xvars": dict(xvars),
-        }
-        try:
-            current_data_fields = dict(getattr(self.server, "_last_data_fields", {}))
-        except Exception:
-            current_data_fields = {}
-        if current_data_fields:
-            shot["data_fields"] = current_data_fields
-        self._shot_index += 1
-        for key, value in xvars.items():
-            shot[f"xvar.{key}"] = self._to_plot_scalar(value)
-        for key, value in current_data_fields.items():
-            shot[f"xvar.{key}"] = self._to_plot_scalar(value)
+    def _launch_viewer_window(self):
+        """Launch a viewer window via the live_od batch file."""
+        candidate_paths = []
+        code_root = os.environ.get("code")
+        if code_root:
+            candidate_paths.append(
+                os.path.join(code_root, "k-exp", "kexp", "_bat", "live_od.bat")
+            )
 
-        self._shot_history.append(shot)
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile:
+            candidate_paths.append(
+                os.path.join(user_profile, "code", "k-exp", "kexp", "_bat", "live_od.bat")
+            )
 
-        if not self._plot_windows:
+        viewer_bat = next((p for p in candidate_paths if os.path.exists(p)), "")
+        if not viewer_bat:
+            self._on_log("Viewer launch error: could not find live_od.bat")
             return
 
-        for w in self._plot_windows:
-            w.on_new_shot(shot)
-
-    def _open_new_plot(self):
-        self._plot_counter += 1
-        win = ShotPlotWindow(
-            window_id=self._plot_counter,
-            xvar_names=list(self._xvar_names),
-            data_field_names=list(self._data_field_names),
-        )
-        win.closed.connect(self._on_plot_closed)
-        self._plot_windows.append(win)
-        if self._shot_history:
-            for shot in self._shot_history:
-                win.on_new_shot(shot)
-        win.show()
-
-    def _to_plot_scalar(self, value):
         try:
-            if np.isscalar(value):
-                return float(value)
-            arr = np.asarray(value, dtype=float).reshape(-1)
-            if arr.size == 0:
-                return np.nan
-            if arr.size == 1:
-                return float(arr[0])
-            return float(np.nanmean(arr))
-        except Exception:
-            return np.nan
-
-    def _on_plot_closed(self, win: ShotPlotWindow):
-        if win in self._plot_windows:
-            self._plot_windows.remove(win)
+            subprocess.Popen(
+                ["cmd", "/c", viewer_bat],
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+            self._on_log(f"Launched viewer via {viewer_bat}")
+        except Exception as e:
+            self._on_log(f"Viewer launch error: {e}")
 
     def _send_reset(self):
         """Send a reset command to the camera server from the server window."""
@@ -426,8 +455,8 @@ class CameraServerWindow(QWidget):
             self.toggle_server_button.setStyleSheet(
                 "QPushButton {"
                 "  background: #1e4f39; color: #e9fff2;"
-                "  border: 1px solid #4b876a; border-radius: 8px;"
-                "  font-size: 14px; font-weight: 700; padding: 8px 14px;"
+                "  border: 1px solid #4b876a; border-radius: 7px;"
+                "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
                 "}"
                 "QPushButton:hover { background: #27684b; }"
             )
@@ -449,8 +478,8 @@ class CameraServerWindow(QWidget):
             self.toggle_server_button.setStyleSheet(
                 "QPushButton {"
                 "  background: #7b2f36; color: #ffeef0;"
-                "  border: 1px solid #a3575d; border-radius: 8px;"
-                "  font-size: 14px; font-weight: 700; padding: 8px 14px;"
+                "  border: 1px solid #a3575d; border-radius: 7px;"
+                "  font-size: 12px; font-weight: 700; padding: 5px 10px;"
                 "}"
                 "QPushButton:hover { background: #934048; }"
             )
@@ -461,8 +490,5 @@ class CameraServerWindow(QWidget):
             self._viewer_timer.start(1000)
 
     def closeEvent(self, event):
-        for w in list(self._plot_windows):
-            w.close()
-        self._plot_windows.clear()
         self.server.stop()
         super().closeEvent(event)

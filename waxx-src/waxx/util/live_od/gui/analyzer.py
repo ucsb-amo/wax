@@ -24,6 +24,7 @@ class Analyzer(QThread):
         self.camera_params = None   # set by viewer window on run_start
         self._shot_index = 0
         self._xvars: dict = {}      # latest xvar dict from server
+        self._raw_shot_history: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         
         # Initialize run parameters with defaults (will be set by get_img_number)
         self.N_img = 0
@@ -36,6 +37,18 @@ class Analyzer(QThread):
         self.N_shots = N_shots
         self.N_pwa_per_shot = N_pwa_per_shot
         self._shot_index = 0
+        self._raw_shot_history = []
+
+    def get_raw_shot_history(self):
+        """Return a copy of all raw image triplets captured in the current run."""
+        return [
+            (
+                np.asarray(img_atoms).copy(),
+                np.asarray(img_light).copy(),
+                np.asarray(img_dark).copy(),
+            )
+            for (img_atoms, img_light, img_dark) in self._raw_shot_history
+        ]
 
     def get_analysis_type(self, imaging_type):
         self.imaging_type = imaging_type
@@ -76,6 +89,13 @@ class Analyzer(QThread):
             self.img_atoms = self.imgs[0]
             self.img_light = self.imgs[self.N_pwa_per_shot]
             self.img_dark = self.imgs[self.N_pwa_per_shot + 1]
+            self._raw_shot_history.append(
+                (
+                    np.asarray(self.img_atoms).copy(),
+                    np.asarray(self.img_light).copy(),
+                    np.asarray(self.img_dark).copy(),
+                )
+            )
             self.od_raw, self.od, self.sum_od_x, self.sum_od_y = self._compute_od_and_sums(
                 self.img_atoms,
                 self.img_light,
@@ -118,7 +138,8 @@ class Analyzer(QThread):
                 np.asarray(img_atoms), np.asarray(img_light), np.asarray(img_dark)
             )
             return self._compute_shot_result(od, sum_od_x, sum_od_y, shot_index, xvars)
-        except Exception:
+        except Exception as e:
+            print(e)
             od = np.zeros_like(np.asarray(img_atoms))
             sum_od_x = np.zeros(od.shape[1]) if od.ndim == 2 else np.array([])
             sum_od_y = np.zeros(od.shape[0]) if od.ndim == 2 else np.array([])

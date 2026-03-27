@@ -51,8 +51,9 @@ class Expt(Dealer, Scanner, Scribe):
         self.ds = DataSaver()
     
     @kernel
-    def init_kernel_wax(self):
-        self.send_new_run()
+    def init_kernel_wax(self, notify_server=True):
+        if notify_server:
+            self.send_new_run()
 
     def finish_prepare_wax(self,N_repeats=[],shuffle=True):
         """

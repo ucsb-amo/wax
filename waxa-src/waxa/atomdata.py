@@ -69,6 +69,7 @@ class analysis_tags():
         self.xvars_shuffled = False
         self.transposed = False
         self.averaged = False
+        self.setup_camera = False
 
 class atom_number_apd():
     def __init__(self, n_up, n_down):
@@ -192,8 +193,10 @@ class atomdata():
             self.sum_od_x = np.array([])
             self.sum_od_y = np.array([])
             self.integrated_od = np.array([])
+            self._analysis_tags.setup_camera = False
             return
 
+        self._analysis_tags.setup_camera = True
         self._sort_images()
         if transpose_idx:
             self._analysis_tags.transposed = True
@@ -206,7 +209,9 @@ class atomdata():
     def analyze(self):
         if not self._has_captured_images():
             self.compute_apd_atom_number()
+            self._analysis_tags.setup_camera = False
             return
+        self._analysis_tags.setup_camera = True
         self.compute_raw_ods()
         self.analyze_ods()
 
@@ -220,6 +225,8 @@ class atomdata():
     def compute_raw_ods(self):
         """Computes the ODs. If not absorption analysis, OD = (pwa - dark)/(pwoa - dark).
         """        
+        if not self._analysis_tags.setup_camera:
+            return
         self.od_raw = compute_OD(self.img_atoms,self.img_light,self.img_dark,
                                  imaging_type=self._analysis_tags.imaging_type)
 
@@ -227,6 +234,8 @@ class atomdata():
         """Crops ODs, computes sum_ods, gaussian fits to sum_ods, and populates
         fit results.
         """
+        if not self._analysis_tags.setup_camera:
+            return
         self.od = self.roi.crop(self.od_raw)
         self.sum_od_x = np.sum(self.od,self.od.ndim-2)
         self.sum_od_y = np.sum(self.od,self.od.ndim-1)
@@ -279,6 +288,8 @@ class atomdata():
             self.atom_number_apd = atom_number_apd(number_up, number_down)
 
     def _sort_images(self):
+        if not self._analysis_tags.setup_camera:
+            return
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
         self.img_atoms = imgs_tuple[0]
         self.img_light = imgs_tuple[1]
@@ -311,6 +322,8 @@ class atomdata():
 
     ### Physics
     def compute_atom_number(self):
+        if not self._analysis_tags.setup_camera:
+            return
         self.atom_cross_section = 5.878324268151581e-13 # from kamo.Potassium39.get_cross_section
         dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
         
@@ -822,8 +835,14 @@ class atomdata():
             unpack_group(f,'params',self.params)
             unpack_group(f,'camera_params',self.camera_params)
             unpack_group(f,'run_info',self.run_info)
-            self.images = f['data']['images'][()]
-            self.image_timestamps = f['data']['image_timestamps'][()]
+            # Load images and timestamps if they exist, otherwise set to empty arrays
+            try:
+                self.images = f['data']['images'][()]
+                self.image_timestamps = f['data']['image_timestamps'][()]
+            except KeyError:
+                self.images = np.array([])
+                self.image_timestamps = np.array([])
+                
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
 
