@@ -2,7 +2,7 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 from waxa.image_processing import compute_OD, process_ODs
-from waxa.fitting import GaussianFit
+from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
 from queue import Queue
 
 # Cross-section for K-39 D2 cycling transition (m^2)
@@ -191,16 +191,12 @@ class Analyzer(QThread):
         fit_x = None
         fit_y = None
         if self.camera_params is not None:
-            cp = self.camera_params
-            px = cp.pixel_size_m / cp.magnification
-            xaxis_x = px * np.arange(sum_od_x.shape[-1])
-            xaxis_y = px * np.arange(sum_od_y.shape[-1])
             try:
-                fit_x = GaussianFit(xaxis_x, sum_od_x, print_errors=False)
+                fit_x = self._fit_sum_dist_atomdata_style(sum_od_x)
             except Exception:
                 fit_x = None
             try:
-                fit_y = GaussianFit(xaxis_y, sum_od_y, print_errors=False)
+                fit_y = self._fit_sum_dist_atomdata_style(sum_od_y)
             except Exception:
                 fit_y = None
 
@@ -235,6 +231,22 @@ class Analyzer(QThread):
         self._append_xvar_fields(result, xvars)
         self._append_apd_fields(result, xvars)
         return result
+
+    def _fit_sum_dist_atomdata_style(self, sum_dist):
+        """Use the same Gaussian fitting path as atomdata (fit_gaussian_sum_dist)."""
+        arr = np.asarray(sum_dist, dtype=float)
+        if arr.ndim == 0:
+            return None
+        # fit_gaussian_sum_dist expects the fit axis to be the last dimension.
+        # For live single-shot traces (1D), wrap to shape (1, N) and unwrap.
+        wrapped = arr.reshape(1, -1) if arr.ndim == 1 else arr
+        fits = fit_gaussian_sum_dist(wrapped, self.camera_params)
+        if isinstance(fits, np.ndarray):
+            if fits.ndim == 0:
+                return fits.item()
+            if fits.size > 0:
+                return fits.reshape(-1)[0]
+        return fits
 
     def _build_base_result(self) -> dict:
         result: dict = {

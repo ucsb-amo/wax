@@ -819,6 +819,18 @@ class LiveODClientWindow(QWidget):
             data_field_names=list(self._data_field_names),
             camera_enabled=self._setup_camera,
         )
+        # In pop-out windows, repurpose the reset/autorange control to
+        # recompute derived quantities from cached raw images using the
+        # current OD view crop.
+        try:
+            win.autorange_button.clicked.disconnect(win._enable_autorange)
+        except (TypeError, RuntimeError):
+            pass
+        win.autorange_button.setToolTip(
+            "Recompute derived parameters from cached raw images using current OD view crop"
+        )
+        win.autorange_button.clicked.connect(win._emit_recompute_requested)
+
         win.closed.connect(self._on_plot_closed)
         win.recomputeRequested.connect(self._recompute_derived_from_roi_view)
         self.analyzer.shot_result.connect(win.on_new_shot)
@@ -899,19 +911,14 @@ class LiveODClientWindow(QWidget):
             img_light = np.asarray(img_light)
             img_dark = np.asarray(img_dark)
 
-            y_slice, x_slice = self.viewer_window.get_current_view_slices(img_atoms.shape)
-            img_atoms_cropped = img_atoms[y_slice, x_slice]
-            img_light_cropped = img_light[y_slice, x_slice]
-            img_dark_cropped = img_dark[y_slice, x_slice]
-
-            if img_atoms_cropped.size == 0 or img_light_cropped.size == 0 or img_dark_cropped.size == 0:
+            if img_atoms.size == 0 or img_light.size == 0 or img_dark.size == 0:
                 continue
 
             xvars = self._xvar_history_by_shot[idx] if idx < len(self._xvar_history_by_shot) else {}
             result = self.analyzer.compute_shot_result_from_images(
-                img_atoms_cropped,
-                img_light_cropped,
-                img_dark_cropped,
+                img_atoms,
+                img_light,
+                img_dark,
                 shot_index=idx,
                 xvars=xvars,
             )
