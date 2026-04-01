@@ -62,6 +62,8 @@ class DAC_CH():
         dt = t/n
         A = -2*(vf-v0)**3/t**3
         B =  3*(vf-v0)**2/t**2
+        Adt3 = A * dt**3
+        Bdt2 = B * dt**2
         for i in range(n):
-            self.set(v = A*(i*dt)**3 + B*(i*dt)**2)
+            self.set(v = Adt3 * i**3 + Bdt2 * i**2 + v0)
             delay(dt)
