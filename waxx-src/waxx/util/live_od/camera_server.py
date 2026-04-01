@@ -212,7 +212,7 @@ class CameraServer(UdpServer):
                     break
 
                 cmd = msg.get("cmd", "")
-                if cmd not in ("status", "check_interrupted"):
+                if cmd not in ("status", "check_interrupted", "get_logs", "logs"):
                     self._log(f"<< command from {peer}: {cmd}", level="debug")
 
                 if cmd == "new_run":
@@ -339,7 +339,8 @@ class CameraServer(UdpServer):
 
         self.camera_status_signal.emit(0)  # baby born
         self._log(
-            f"Camera baby {self._camera_baby_name} {random.choice(BIRTH_EUPHEMISMS)} for run {run_id}."
+            f"Camera baby {self._camera_baby_name} {random.choice(BIRTH_EUPHEMISMS)} for run {run_id}.",
+            level="normal",
         )
 
         save_data = msg.get("save_data", True)
@@ -366,6 +367,7 @@ class CameraServer(UdpServer):
             self._camera = None
             self._camera_ready = True
             self._grab_active = False
+            self._interrupted = False
             self._image_processing_complete = True  # No grab loop, so mark as complete
             self._log(
                 f"Run ID: {run_id} | setup_camera=False | save_data: {save_data}"
@@ -503,20 +505,33 @@ class CameraServer(UdpServer):
         self._log("Experiment signalled run complete — waiting for grab loop and image processing...")
         self._wait_for_grab_complete()
         self._log("Grab loop and image processing complete.")
+        setup_camera = bool(self._run_info.get("setup_camera", True))
+        run_succeeded = (not setup_camera) or self._run_complete_notified
         if self._camera_baby_name:
-            self._log(
-                f"Run complete. {self._camera_baby_name} {random.choice(HONORABLE_DEATH_EUPHEMISMS)}."
-            )
+            if run_succeeded:
+                self._log(
+                    f"Run complete. {self._camera_baby_name} {random.choice(HONORABLE_DEATH_EUPHEMISMS)}.",
+                    level="normal",
+                )
+            else:
+                self._log(
+                    f"Run incomplete. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}.",
+                    level="normal",
+                )
 
         self._run_start_info = None  # Clear run info since run is complete
         self.camera_status_signal.emit(-1)
-        if not self._run_complete_notified:
+        if run_succeeded and not self._run_complete_notified:
             self._broadcast_to_viewers({"cmd": "run_complete"})
             self.run_completed_signal.emit()
             self._run_complete_notified = True
+
         try:
             self.server_talk.update_run_id()
-            self._log("Run ID advanced.")
+            if run_succeeded:
+                self._log("Run ID advanced.")
+            else:
+                self._log("Run incomplete: run ID advanced after run_complete.")
         except Exception as e:
             self._log(f"Error advancing run ID: {e}")
         return {"cmd": "ack"}
@@ -530,11 +545,15 @@ class CameraServer(UdpServer):
         import os
 
         run_was_active = self._run_start_info is not None
+        # If image acquisition already completed, preserve the finished file
+        # even if the experiment has not yet sent run_complete.
+        delete_incomplete_file = run_was_active and not self._run_complete_notified
         if run_was_active:
             self._log("RESET requested — stopping grab loop.")
             if self._camera_baby_name:
                 self._log(
-                    f"Reset received. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                    f"Reset received. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}.",
+                    level="normal",
                 )
         else:
             self._log("No active run; advancing run ID.")
@@ -551,9 +570,9 @@ class CameraServer(UdpServer):
                     self._log(f"Error closing data file: {e}")
                 self._data_file = None
 
-        # Delete the data file only for in-progress runs.
-        # If the run already completed, keep the finished dataset on reset.
-        if run_was_active:
+        # Delete only for truly in-progress runs.
+        # If acquisition already completed, keep the finished dataset.
+        if delete_incomplete_file:
             if self._data_filepath:
                 try:
                     if os.path.exists(self._data_filepath):
@@ -563,6 +582,8 @@ class CameraServer(UdpServer):
                         self._log(f"Data file already absent: {self._data_filepath}")
                 except Exception as e:
                     self._log(f"Error deleting data file: {e}")
+        elif run_was_active:
+            self._log("Run data preserved on reset: acquisition already completed.")
 
         self._camera_ready = False
         self._grab_active = False
@@ -847,7 +868,8 @@ class CameraServer(UdpServer):
             self._log(f"Grab error: {e}")
             if self._camera_baby_name and not self._interrupted:
                 self._log(
-                    f"Camera baby {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                    f"Camera baby {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}.",
+                    level="normal",
                 )
         finally:
             self._grab_active = False
@@ -928,7 +950,8 @@ class CameraServer(UdpServer):
             self._log(f"Grab incomplete: {count}/{N_img} images.")
             if self._camera_baby_name and not self._interrupted:
                 self._log(
-                    f"Run incomplete. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}."
+                    f"Run incomplete. {self._camera_baby_name} {random.choice(DISHONORABLE_DEATH_EUPHEMISMS)}.",
+                    level="normal",
                 )
             self._broadcast_to_viewers(
                 {"cmd": "run_incomplete", "count": count, "total": N_img}

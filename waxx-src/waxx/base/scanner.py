@@ -153,7 +153,7 @@ class Scanner():
         while scanning:
 
             self.core.wait_until_mu(now_mu())
-            self._check_data_file_exists()
+            self._check_if_interrupted()
             self.update_params_from_xvars()
             self.write_host_params_to_kernel()
             self.core.break_realtime()

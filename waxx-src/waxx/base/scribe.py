@@ -176,10 +176,8 @@ class Scribe:
         """
         return None
 
-    def _check_data_file_exists(self, raise_error=True) -> bool:
+    def _check_if_interrupted(self, raise_error=True) -> bool:
         """Check run liveness by polling the camera server for interruption."""
-        if not self.run_info.save_data:
-            return True
         try:
             interrupted = self.live_od_client.check_interrupted()
             if interrupted:
@@ -188,13 +186,14 @@ class Scribe:
                         self.monitor.update_device_states()
                         self.monitor.signal_end()
                     raise RuntimeError(
-                        f"Data file for run ID {self.run_info.run_id} not found."
+                        f"Server reports run {self.run_info.run_id} interrupted."
                     )
                 return False
             return True
         except RuntimeError:
             raise
-        except Exception:
+        except Exception as e:
+            print(e)
             return True
 
     def send_new_run(self):
@@ -209,19 +208,26 @@ class Scribe:
             run_info_attrs     = self._obj_to_pickle_dict(self.run_info)
             params_attrs       = self._obj_to_pickle_dict(self.params)
             camera_params_attrs = self._obj_to_pickle_dict(self.camera_params)
-        self.live_od_client.send_new_run(
-            camera_params=self.camera_params,
-            data_filepath=getattr(self.run_info, 'filepath', ''),
-            save_data=self.run_info.save_data,
-            setup_camera=self.setup_camera,
-            N_img=self.params.N_img,
-            N_shots=self.params.N_shots,
-            N_pwa_per_shot=self.p.N_pwa_per_shot,
-            imaging_type=self.run_info.imaging_type,
-            run_id=self.run_info.run_id,
-            data_spec=data_spec,
-            run_info_attrs=run_info_attrs,
-            params_attrs=params_attrs,
-            camera_params_attrs=camera_params_attrs,
-            available_data_fields=self._available_data_field_names(),
-        )
+        try:
+            self.live_od_client.send_new_run(
+                camera_params=self.camera_params,
+                data_filepath=getattr(self.run_info, 'filepath', ''),
+                save_data=self.run_info.save_data,
+                setup_camera=self.setup_camera,
+                N_img=self.params.N_img,
+                N_shots=self.params.N_shots,
+                N_pwa_per_shot=self.p.N_pwa_per_shot,
+                imaging_type=self.run_info.imaging_type,
+                run_id=self.run_info.run_id,
+                data_spec=data_spec,
+                run_info_attrs=run_info_attrs,
+                params_attrs=params_attrs,
+                camera_params_attrs=camera_params_attrs,
+                available_data_fields=self._available_data_field_names(),
+            )
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "duplicate run_id" in msg or "duplicate of a previous run" in msg:
+                print("run ID is a duplicate of a previous run")
+                raise RuntimeError("run ID is a duplicate of a previous run") from None
+            raise

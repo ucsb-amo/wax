@@ -1,6 +1,6 @@
 import time
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPlainTextEdit
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPlainTextEdit, QPushButton
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt
 
@@ -41,6 +41,13 @@ class FilteredLogPanel(QWidget):
         self.level_combo.setCurrentText("normal")
         self.level_combo.currentTextChanged.connect(self._refresh_visible_text)
 
+        self.timestamp_button = QPushButton("TS")
+        self.timestamp_button.setCheckable(True)
+        self.timestamp_button.setChecked(self._show_timestamps)
+        self.timestamp_button.setFixedWidth(30)
+        self.timestamp_button.setToolTip("Toggle timestamp display")
+        self.timestamp_button.toggled.connect(self._on_timestamp_toggled)
+
         self.text_box = QPlainTextEdit()
         self.text_box.setReadOnly(True)
         self.text_box.setFont(QFont(font_family, font_size))
@@ -51,6 +58,7 @@ class FilteredLogPanel(QWidget):
         top.setSpacing(6)
         top.addWidget(QLabel(title))
         top.addStretch(1)
+        top.addWidget(self.timestamp_button)
         top.addWidget(self.level_label)
         top.addWidget(self.level_combo)
 
@@ -60,6 +68,10 @@ class FilteredLogPanel(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.text_box)
         self.setLayout(layout)
+
+    def _on_timestamp_toggled(self, checked: bool):
+        self._show_timestamps = checked
+        self._refresh_visible_text()
 
     def set_placeholder_text(self, text: str):
         self.text_box.setPlaceholderText(str(text))

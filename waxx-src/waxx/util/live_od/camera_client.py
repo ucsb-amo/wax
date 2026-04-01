@@ -150,7 +150,17 @@ class CameraClient(CommClient):
             "camera_params_attrs": camera_params_attrs or {},
             "available_data_fields": available_data_fields or [],
         }
-        return self._send_recv(msg)
+        reply = self._send_recv(msg)
+        if not isinstance(reply, dict):
+            raise RuntimeError(f"Invalid new_run reply from server: {reply!r}")
+        if reply.get("cmd") != "camera_ready":
+            raise RuntimeError(f"new_run not acknowledged: {reply}")
+        if bool(reply.get("duplicate", False)):
+            raise RuntimeError(
+                "new_run rejected: server ignored duplicate run_id "
+                f"{run_id} (reply={reply})."
+            )
+        return reply
 
     def send_xvars(self, scan_xvars: list, data_fields: dict | None = None):
         """

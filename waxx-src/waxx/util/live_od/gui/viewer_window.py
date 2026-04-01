@@ -37,7 +37,7 @@ from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.analyzer import Analyzer
 from waxx.util.live_od.gui.plotter import LiveODPlotter
 from waxx.util.live_od.gui.shot_plot_window import ShotPlotWindow
-from waxx.util.live_od.gui.log_panel import FilteredLogPanel, classify_log_level
+from waxx.util.live_od.gui.log_panel import classify_log_level
 
 
 class ConnectionIndicator(QWidget):
@@ -285,7 +285,7 @@ class LiveODClientWindow(QWidget):
             self.viewer_window.log_button.clicked.disconnect(self.viewer_window._show_log_dialog)
         except Exception:
             pass
-        self.viewer_window.log_button.clicked.connect(self._show_server_log_dialog)
+        self.viewer_window.log_button.clicked.connect(self._focus_embedded_log)
         self.viewer_window.counts_label.hide()
         self.viewer_window.frame_index_label.hide()
 
@@ -489,24 +489,14 @@ class LiveODClientWindow(QWidget):
         plot_controls_layout.addLayout(view_switch_col)
         plot_controls_layout.addWidget(self.mode_options_stack, stretch=1)
 
-        self.inline_log = FilteredLogPanel(
-            title="Viewer Log",
-            show_timestamps=False,
-            max_entries=200,
-            font_family="Consolas",
-            font_size=9,
-        )
-        self.inline_log.set_placeholder_text("viewer log")
-        self.inline_log.set_style_sheet(
-            "QPlainTextEdit {"
-            "  background: #0c131b;"
-            "  border: 1px solid #233445;"
-            "  border-radius: 8px;"
-            "  padding: 2px 6px;"
-            "  color: #bfd0df;"
-            "  font-size: 11px;"
-            "}"
-        )
+        # Reuse the full server-log widget (same one used in LiveODViewer popup)
+        # directly in the main viewer layout.
+        self.inline_log = self.viewer_window.output_window
+        self.inline_log.setParent(None)
+        self.inline_log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.inline_log.setMinimumWidth(0)
+        self.inline_log.setMinimumHeight(0)
+        self.inline_log.setMaximumHeight(16777215)
 
         self.inline_log_frame = QFrame()
         self.inline_log_frame.setStyleSheet(
@@ -516,12 +506,18 @@ class LiveODClientWindow(QWidget):
         inline_log_layout.setContentsMargins(4, 4, 4, 4)
         inline_log_layout.setSpacing(6)
         inline_log_layout.addWidget(self.inline_log, stretch=1)
+
+        button_column_frame = QFrame()
+        button_column_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        button_column_frame.setMinimumWidth(86)
+        button_column_frame.setMaximumWidth(110)
+
         button_column = QVBoxLayout()
         button_column.setContentsMargins(0, 0, 0, 0)
         button_column.setSpacing(6)
         self.reset_button.setFixedHeight(24)
         self.reset_button.setMinimumWidth(68)
-        self.reset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Make reset button stretch vertically
+        self.reset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.reset_button.setStyleSheet(
             "QPushButton {"
             "  background: #a5222f; color: #fff5f6;"
@@ -532,7 +528,7 @@ class LiveODClientWindow(QWidget):
         )
         self.viewer_window.log_button.setFixedHeight(24)
         self.viewer_window.log_button.setMinimumWidth(68)
-        button_column.addWidget(self.reset_button, stretch=1)
+        button_column.addWidget(self.reset_button)
         button_column.addWidget(self.viewer_window.log_button)
         # Add server connection indicator below log button with label
         server_row = QHBoxLayout()
@@ -544,7 +540,11 @@ class LiveODClientWindow(QWidget):
         server_row.addWidget(self.connection_indicator)
         button_column.addLayout(server_row)
         button_column.addStretch(1)
-        inline_log_layout.addLayout(button_column)
+
+        button_column_frame.setLayout(button_column)
+        inline_log_layout.addWidget(button_column_frame, stretch=0)
+        inline_log_layout.setStretch(0, 1)
+        inline_log_layout.setStretch(1, 0)
         self.inline_log_frame.setLayout(inline_log_layout)
         self.inline_log_frame.setMinimumHeight(0)
 
@@ -573,6 +573,7 @@ class LiveODClientWindow(QWidget):
         self._current_run_id = None
         self._server_connected = False
         self._pending_run_visual_reset = None
+        self._server_log_next_index = 0
 
         # ---- layout ----
         self._setup_layout()
@@ -602,6 +603,11 @@ class LiveODClientWindow(QWidget):
         self._run_id_timer.timeout.connect(self._poll_server_status)
         self._run_id_timer.setSingleShot(False)
         self._run_id_timer.start(2500)
+
+        self._server_log_timer = QTimer(self)
+        self._server_log_timer.timeout.connect(self._poll_server_logs_incremental)
+        self._server_log_timer.setSingleShot(False)
+        self._server_log_timer.start(1000)
 
         # ---- start background threads ----
         self.plotter.start()
@@ -739,18 +745,12 @@ class LiveODClientWindow(QWidget):
         self._append_inline_log("Run complete.")
         self._poll_server_status()
 
-    def _show_server_log_dialog(self):
-        """Fetch full timestamped server logs and open a resizable log window."""
-        log_reply = ViewerClient.get_logs(self._server_ip, self._command_port, since=0, limit=50000)
-        if isinstance(log_reply, dict):
-            entries = list(log_reply.get("entries", []))
-            self.viewer_window.output_window.set_entries(entries)
-        else:
-            self.viewer_window.output_window.add_message("Could not fetch server logs.", level="normal")
-
-        self.viewer_window.log_dialog.show()
-        self.viewer_window.log_dialog.raise_()
-        self.viewer_window.log_dialog.activateWindow()
+    def _focus_embedded_log(self):
+        """Bring focus to the embedded full log widget and force a refresh."""
+        self._poll_server_logs_incremental()
+        self.inline_log.text_box.setFocus()
+        sb = self.inline_log.text_box.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _send_reset(self):
         """Send a reset command to the camera server."""
@@ -1034,12 +1034,56 @@ class LiveODClientWindow(QWidget):
         log_level = level if level is not None else classify_log_level(text)
         self.inline_log.add_message(text, level=log_level)
 
+    def _poll_server_logs_incremental(self):
+        """Incrementally fetch new timestamped server-log entries."""
+        if not self._server_connected:
+            return
+        try:
+            reply = ViewerClient.get_logs(
+                self._server_ip,
+                self._command_port,
+                since=self._server_log_next_index,
+                limit=500,
+            )
+        except Exception:
+            return
+
+        if not isinstance(reply, dict):
+            return
+
+        next_index = int(reply.get("next_index", self._server_log_next_index))
+        total_count = int(reply.get("total_count", next_index))
+        entries = list(reply.get("entries", []))
+
+        # Server restart/log reset: rebuild from the beginning.
+        if next_index < self._server_log_next_index or self._server_log_next_index > total_count:
+            self._server_log_next_index = 0
+            refill = ViewerClient.get_logs(
+                self._server_ip,
+                self._command_port,
+                since=0,
+                limit=50000,
+            )
+            if isinstance(refill, dict):
+                self.inline_log.set_entries(list(refill.get("entries", [])))
+                self._server_log_next_index = int(refill.get("next_index", 0))
+            return
+
+        for entry in entries:
+            self.inline_log.add_message(
+                str(entry.get("message", "")),
+                level=str(entry.get("level", "normal")),
+                timestamp=float(entry.get("timestamp", 0.0)),
+            )
+        self._server_log_next_index = next_index
+
     def _on_connection_status_changed(self, connected: bool):
         self._server_connected = bool(connected)
         self.connection_indicator.set_connected(self._server_connected)
         self._append_inline_log("Server connected." if connected else "Server disconnected.")
         if connected:
             self._poll_server_status()
+            self._poll_server_logs_incremental()
 
     def _poll_server_status(self):
         self._status_poller.poll(self._server_ip, self._command_port)
