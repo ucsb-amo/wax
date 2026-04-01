@@ -151,9 +151,18 @@ class MagnetometerServer:
             baud=self.baud,
             device_id=self.device_id,
         )
-        self.reader.open()
-        self.reader.setup()
-        print(f"[INFO] Sensor ready. Polling every {self.poll_interval:.3f} s.")
+        try:
+            self.reader.open()
+            self.reader.setup()
+            print(f"[INFO] Sensor ready. Polling every {self.poll_interval:.3f} s.")
+        except Exception as exc:
+            self.reader = None
+            print(
+                f"[ERROR] COM port connection failed "
+                f"({type(exc).__name__}: {exc}) — "
+                f"TCP server starting without serial. "
+                f"Use SERIAL_RECONNECT or RESTART_SERIAL to retry."
+            )
 
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
@@ -181,7 +190,6 @@ class MagnetometerServer:
     def _read_loop(self):
         last_values = None
         same_count = 0
-        bad_reads = 0
 
         while not self.stop_event.is_set():
             if not self.serial_should_be_connected:
@@ -189,10 +197,23 @@ class MagnetometerServer:
                     break
                 continue
 
-            try:
-                if not self._is_serial_connected():
+            # --- ensure serial is open (retry forever, never crash) ---
+            if not self._is_serial_connected():
+                print(f"[INFO] Serial not connected, attempting reconnect on {self.serial_port}.")
+                try:
                     self._reconnect()
+                    last_values = None
+                    same_count = 0
+                    print("[INFO] Sensor reconnected.")
+                except Exception as exc:
+                    if self.stop_event.is_set():
+                        break
+                    print(f"[WARN] Reconnect failed ({type(exc).__name__}: {exc}) — retrying in 5 s.")
+                    self.stop_event.wait(5.0)
+                    continue
 
+            # --- read one sample ---
+            try:
                 with self.serial_lock:
                     x_counts, y_counts, z_counts = self.reader.read_one()
                 values = (x_counts, y_counts, z_counts)
@@ -208,7 +229,6 @@ class MagnetometerServer:
                         f"Sensor readings stuck for {same_count} consecutive polls"
                     )
 
-                bad_reads = 0
                 x_G = x_counts / SENSOR_COUNTS_PER_GAUSS
                 y_G = y_counts / SENSOR_COUNTS_PER_GAUSS
                 z_G = z_counts / SENSOR_COUNTS_PER_GAUSS
@@ -223,21 +243,18 @@ class MagnetometerServer:
                     break
                 if not self.serial_should_be_connected:
                     continue
-                bad_reads += 1
-                print(f"[ERROR] Read error ({bad_reads}): {exc!r}")
-                print("[INFO] Starting serial disconnect/reconnect cycle.")
-                try:
-                    self._reconnect()
-                    last_values = None
-                    same_count = 0
-                    bad_reads = 0
-                    print("[INFO] Sensor reconnected.")
-                except Exception as reconnect_exc:
-                    if self.stop_event.is_set():
-                        break
-                    print(f"[FATAL] Reconnect failed: {reconnect_exc!r} — stopping read loop.")
-                    self.stop_event.set()
-                    break
+                print(f"[WARN] Read error ({type(exc).__name__}: {exc}) — resetting serial for reconnect.")
+                with self.serial_lock:
+                    if self.reader is not None:
+                        try:
+                            self.reader.close()
+                        except Exception:
+                            pass
+                        self.reader = None
+                last_values = None
+                same_count = 0
+                # skip to top of loop which will reconnect
+                continue
 
             if self.stop_event.wait(self.poll_interval):
                 break
@@ -347,6 +364,22 @@ class MagnetometerServer:
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
             return {"ok": True, "connected": self._is_serial_connected()}
+
+        if command == "RESTART_SERIAL":
+            self.serial_should_be_connected = True
+            try:
+                self._reconnect()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"Restart failed ({type(exc).__name__}: {exc})",
+                    "connected": False,
+                }
+            return {
+                "ok": True,
+                "connected": self._is_serial_connected(),
+                "message": "Serial restarted successfully",
+            }
 
         if command == "GET_FIELD":
             with self.history_lock:

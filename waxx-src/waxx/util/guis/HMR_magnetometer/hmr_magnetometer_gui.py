@@ -211,6 +211,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.latest_log_preview_label.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
+        self.latest_log_preview_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         action_col.addLayout(action_layout)
         action_col.addWidget(self.latest_log_preview_label)
         top.addWidget(action_group, 1)
@@ -274,6 +278,16 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         )
         self.serial_button.clicked.connect(self._toggle_serial_connection)
         right_controls.addWidget(self.serial_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        restart_serial_btn = QtWidgets.QPushButton("⟳ Restart")
+        restart_serial_btn.setFixedHeight(26)
+        restart_serial_btn.setToolTip("Force-restart the serial connection on the server")
+        restart_serial_btn.setStyleSheet(
+            "QPushButton { background: #f5f0e8; border: 1px solid #d4bc8a; color: #5a4317; border-radius: 7px; padding: 2px 8px; font-size: 11px; }"
+            "QPushButton:hover { background: #ede3ce; border-color: #c4a060; }"
+        )
+        restart_serial_btn.clicked.connect(self._restart_serial)
+        right_controls.addWidget(restart_serial_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
         right_controls.addStretch(1)
 
         top.addLayout(right_controls)
@@ -1038,7 +1052,13 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                         pad = 0.05 if abs(ymax - ymin) < 1e-12 else 0.1 * (ymax - ymin)
                         if abs(ymax - ymin) < 1e-12 and abs(ymin) >= 1:
                             pad = abs(ymin) * 0.05
-                        p.setYRange(ymin - pad, ymax + pad, padding=0)
+                        lo, hi = ymin - pad, ymax + pad
+                        MIN_RANGE_G = 0.003  # 10 mG minimum displayed range
+                        if (hi - lo) < MIN_RANGE_G:
+                            mid = (lo + hi) / 2
+                            lo = mid - MIN_RANGE_G / 2
+                            hi = mid + MIN_RANGE_G / 2
+                        p.setYRange(lo, hi, padding=0)
                 self._position_overlay(key)
         finally:
             self.internal_ylim_update = False
@@ -1201,6 +1221,18 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             self._set_status(result.get("message", f"Serial {action_name} command sent"))
         except Exception as exc:
             self._set_status(f"Serial control error: {exc}")
+        finally:
+            self._refresh_serial_status()
+
+    def _restart_serial(self):
+        self._set_status("Restarting serial connection...")
+        try:
+            result = self.client._restart_serial(timeout=5.0)
+            if not result.get("ok", False):
+                raise RuntimeError(result.get("error", "Restart command failed"))
+            self._set_status(result.get("message", "Serial restarted"))
+        except Exception as exc:
+            self._set_status(f"Serial restart error: {exc}")
         finally:
             self._refresh_serial_status()
 

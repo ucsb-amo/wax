@@ -119,6 +119,10 @@ class HMRClient:
         """Manually reconnect serial device on server."""
         return self._request("SERIAL_RECONNECT", timeout)
 
+    def _restart_serial(self, timeout: float = 4.0) -> dict:
+        """Force-restart (disconnect then reconnect) the serial device on server."""
+        return self._request("RESTART_SERIAL", timeout)
+
     def get_field_magnitude(self, timeout: float = 5.) -> float:
         """Return the latest total field magnitude in Gauss.
 
