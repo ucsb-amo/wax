@@ -632,7 +632,7 @@ class ALSLaserStartupController:
         """Query and optionally publish current laser state for external UIs."""
         frame = self.laser.stop_and_read()
         converted = self.laser.convert_frame(frame)
-        power_enabled = bool(frame.statuses.get("STS_RACK_PSU", 0)) or bool(
+        power_enabled = bool(frame.statuses.get("STS_RACK_PSU", 0)) and bool(
             frame.statuses.get("STS_RELAY_PSU", 0)
         )
         interlock_enabled = bool(self.laser.cmd_ask_interlock_sts())
@@ -672,7 +672,7 @@ class ALSLaserStartupController:
         rack_or_relay = bool(frame.statuses.get("STS_RACK_PSU", 0)) or bool(
             frame.statuses.get("STS_RELAY_PSU", 0)
         )
-        return rack_or_relay or bool(self.laser.cmd_ask_power_sts())
+        return rack_or_relay and bool(self.laser.cmd_ask_power_sts())
 
     def _is_interlock_enabled(self) -> bool:
         return bool(self.laser.cmd_ask_interlock_sts())

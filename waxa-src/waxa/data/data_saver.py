@@ -75,6 +75,9 @@ class DataSaver():
             params_dset = f.create_group('params')
             self._class_attr_to_dataset(params_dset,expt.params)
 
+            if expt_filepath:
+                f['run_info']['experiment_filepath'][...] = expt_filepath
+
             self._save_expt_files_text(f,expt_filepath)
 
             f.close()

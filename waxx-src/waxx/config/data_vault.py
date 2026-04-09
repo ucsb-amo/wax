@@ -29,7 +29,7 @@ class DataContainer():
             except Exception as e:
                 if self.shot_data.shape != self._per_shot_data_shape:
                     print(f"Value is not correct shape for data container '{self.key}':\n"+
-                    f"  expected shape {self._per_shot_data_shape} but value has shape {value.shape}. Skipping.")
+                    f"  expected shape {self._per_shot_data_shape} but value has shape {self.shot_data.shape}. Skipping.")
                 else:
                     print(f"An error occurred with 'put_data' for data container '{self.key}':")
                     print(e)
