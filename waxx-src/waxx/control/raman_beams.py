@@ -177,7 +177,7 @@ class RamanBeamPair():
             fraction_power_raman=dv,
             global_phase=dv, relative_phase=dv,
             t_phase_origin_mu=np.int64(-1),
-            phase_mode=0,
+            phase_mode=-1,
             init=False):
         """
         Set the parameters of the Raman beam pair and update the DDS channels as needed.
@@ -216,24 +216,10 @@ class RamanBeamPair():
         # Determine if frequency, amplitude, or v_pd should be updated
         freq_changed = (frequency_transition >= 0.) and (frequency_transition != self.frequency_transition)
         fraction_power_changed = (fraction_power_raman >= 0.) and (fraction_power_raman != self.fraction_power)
-        phase_mode_changed = bool(phase_mode) != (self.phase_mode == 1)
+        phase_mode_changed = (phase_mode >= 0) and (phase_mode != self.phase_mode)
         phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
         global_phase_changed = global_phase >= 0. and (global_phase != self.global_phase)
         relative_phase_changed = relative_phase >= 0. and (relative_phase != self.relative_phase)
-
-        # Update stored values
-        if freq_changed:
-            self.frequency_transition = frequency_transition if frequency_transition >= 0. else self.frequency_transition
-        if fraction_power_changed:
-            self.fraction_power = fraction_power_raman if fraction_power_raman >= 0. else self.fraction_power
-        if phase_mode_changed:
-            self.phase_mode = phase_mode
-        if phase_origin_changed:
-            self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
-        if global_phase_changed:
-            self.global_phase = global_phase if global_phase >= 0. else self.global_phase
-        if relative_phase_changed:
-            self.relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
 
         if init:
             freq_changed = True
@@ -242,6 +228,20 @@ class RamanBeamPair():
             phase_origin_changed = True
             global_phase_changed = True
             relative_phase_changed = True
+
+        # Update stored values
+        if freq_changed:
+            self.frequency_transition = frequency_transition if frequency_transition >= 0. else self.frequency_transition
+        if fraction_power_changed:
+            self.fraction_power = fraction_power_raman if fraction_power_raman >= 0. else self.fraction_power
+        if phase_mode_changed:
+            self.phase_mode = phase_mode if phase_mode >= 0 else self.phase_mode
+        if phase_origin_changed:
+            self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
+        if global_phase_changed:
+            self.global_phase = global_phase if global_phase >= 0. else self.global_phase
+        if relative_phase_changed:
+            self.relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
         
         if phase_mode_changed:
             self.dds0.set_phase_mode(self.phase_mode)
