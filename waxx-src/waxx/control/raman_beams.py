@@ -178,7 +178,7 @@ class RamanBeamPair():
             global_phase=dv, relative_phase=dv,
             t_phase_origin_mu=np.int64(-1),
             phase_mode=-1,
-            init=False):
+            init=False) -> TTuple([TFloat,TFloat]):
         """
         Set the parameters of the Raman beam pair and update the DDS channels as needed.
 
@@ -247,22 +247,37 @@ class RamanBeamPair():
             self.dds0.set_phase_mode(self.phase_mode)
             self.dds1.set_phase_mode(self.phase_mode)
 
+        p0 = 0.
+        p1 = 0.
+        t = 0
+        t0 = 0
+        t1 = 0
+        T_TRACKING_PHASE_OFFSET = 1960
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self._frequency_array = self.state_splitting_to_ao_frequency(self.frequency_transition)
 
             amp0 = np.sqrt(self.fraction_power) * self._amplitude_0
             amp1 = np.sqrt(self.fraction_power) * self._amplitude_1
 
-            self.dds0.set_dds(self._frequency_array[DDS0_IDX],
+            p0 = self.dds0.set_dds(self._frequency_array[DDS0_IDX],
                                 amp0,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase)
-            self.dds1.set_dds(self._frequency_array[DDS1_IDX],
+            t0 = now_mu() - T_TRACKING_PHASE_OFFSET # time that phase p0 corresponds to
+            p1 = self.dds1.set_dds(self._frequency_array[DDS1_IDX],
                                 amp1,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
+            t = now_mu()
+            t1 = t - T_TRACKING_PHASE_OFFSET # time that phase p1 corresponds to
+
+            p0 += np.pi/2 + self._frequency_array[DDS0_IDX] * (t - t0)
+            p1 += np.pi/2 + self._frequency_array[DDS1_IDX] * T_TRACKING_PHASE_OFFSET
+
         self.dds0.on()
         self.dds1.on()
+
+        return p0, t0, p1, t1
 
     @kernel
     def pulse(self,t):
