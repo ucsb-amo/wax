@@ -229,10 +229,15 @@ class DDS():
    def update_phase(self, t_mu=np.int64(-1)):
       if t_mu < 0:
          t_mu = now_mu()
+      # relative update ends up sucking, might as well recompute from origin on
+      # the fly
+
+      # old relative update code:
       # dt = t_mu - self._t_phase_mu
       # self._t_phase_mu = t_mu
       # self._phase_at_t = (self._phase_at_t + self.frequency * dt * TWOPI_NS) % TWOPI
       # return self._phase_at_t
+
       self._t_phase_mu = t_mu
       self._phase_at_t = self.get_phase(t_mu)
       return self._phase_at_t

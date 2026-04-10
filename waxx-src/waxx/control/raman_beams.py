@@ -8,6 +8,7 @@ from waxx.util.artiq.async_print import aprint
 from waxx.config.expt_params import ExptParams
 
 dv = -0.1
+dv_array = np.array([-0.1])
 di = 0
 
 DDS0_IDX = 0
@@ -49,6 +50,8 @@ class RamanBeamPair():
         self.t_rtio = np.zeros(5,dtype=np.int64)
         self.t_idx = 0
         self._init()
+
+        self._dummy = np.zeros(3).astype(float)
 
     @kernel
     def get_t(self):
@@ -270,7 +273,47 @@ class RamanBeamPair():
         self.dds1.on()
 
         return p0, p1
+    
+    @kernel
+    def get_phase(self,
+               t_mu=np.int64(-1),
+               t_mu_origin=np.int64(-1),
+               frequency_transition=dv,
+               relative_phase=dv) -> TTuple([TFloat,TFloat]):
+        """Get the current phase of each Raman beam at time t_mu relative to
+        t_mu_origin. 
+        
+        Accounts for the fact that the AOMs are double-passed, such
+        that the phase accumulated by each beam is twice that expected from the
+        oscillator frequency.
 
+        Args:
+            t_mu (int, optional): The time at which to get the phase in machine units.
+            t_mu_origin (int, optional): The time origin for the phase calculation in machine units.
+            frequency_transition (float, optional): The two-photon transition frequency (Hz).
+                If negative or unchanged, uses the current AO values.
+            relative_phase (float, optional): The relative phase between the Raman beams (radians).
+                If negative or unchanged, uses the current relative phase.
+
+        Returns:
+            A tuple containing the phase of each Raman beam (p0, p1) at time t_mu relative to t_mu_origin.
+        """
+        if frequency_transition == dv:
+            f0, f1 = self._frequency_array
+        else:
+            f_array = self.state_splitting_to_ao_frequency(frequency_transition)
+            f0 = f_array[DDS0_IDX]
+            f1 = f_array[DDS1_IDX]
+        relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
+
+        p0 = self.dds0.get_phase(t_mu,t_mu_origin,
+                                frequency=f0,
+                                phase_offset=self.global_phase)
+        p1 = self.dds1.get_phase(t_mu,t_mu_origin,
+                                frequency=f1,
+                                phase_offset=self.global_phase+relative_phase)
+        return 2*p0, 2*p1
+        
     @kernel
     def pulse(self,t):
         """Pulses the raman beam. Does not set the DDS channels -- use
