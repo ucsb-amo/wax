@@ -11,6 +11,8 @@ dv = -0.1
 dv_array = np.array([-0.1])
 di = 0
 
+TWOPI = 2*np.pi
+
 DDS0_IDX = 0
 DDS1_IDX = 1
 
@@ -94,7 +96,9 @@ class RamanBeamPair():
         self.dds1.on()
 
     @portable(flags={"fast-math"})
-    def state_splitting_to_ao_frequency(self,frequency_state_splitting) -> TArray(TFloat):
+    def state_splitting_to_ao_frequency(self,
+                                        frequency_state_splitting,
+                                        store_results=True) -> TArray(TFloat):
 
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
@@ -117,10 +121,14 @@ class RamanBeamPair():
 
         df_1 = df_0 * f
 
-        self._frequency_array[DDS0_IDX] = fc0 + c0 * df_0
-        self._frequency_array[DDS1_IDX] = fc1 - c0 * a0 * a1 * df_1
+        self._dummy[DDS0_IDX] = fc0 + c0 * df_0
+        self._dummy[DDS1_IDX] = fc1 - c0 * a0 * a1 * df_1
 
-        return self._frequency_array
+        if store_results:
+            self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
+            self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
+
+        return self._dummy
 
     @kernel
     def set_transition_frequency(self,frequency_transition=dv):
@@ -279,9 +287,10 @@ class RamanBeamPair():
                t_mu=np.int64(-1),
                t_mu_origin=np.int64(-1),
                frequency_transition=dv,
-               relative_phase=dv) -> TTuple([TFloat,TFloat]):
-        """Get the current phase of each Raman beam at time t_mu relative to
-        t_mu_origin. 
+               relative_phase=dv) -> TFloat:
+        """
+        Get the current relative phase of the Raman beams at time t_mu relative
+        to t_mu_origin. Defined as phi_0 - phi_1 (where phi_i is the phase of ddsi).
         
         Accounts for the fact that the AOMs are double-passed, such
         that the phase accumulated by each beam is twice that expected from the
@@ -298,12 +307,14 @@ class RamanBeamPair():
         Returns:
             A tuple containing the phase of each Raman beam (p0, p1) at time t_mu relative to t_mu_origin.
         """
-        if frequency_transition == dv:
-            f0, f1 = self._frequency_array
+        if frequency_transition == dv or frequency_transition == self.frequency_transition:
+            f0 = self._frequency_array[DDS0_IDX]
+            f1 = self._frequency_array[DDS1_IDX]
         else:
-            f_array = self.state_splitting_to_ao_frequency(frequency_transition)
-            f0 = f_array[DDS0_IDX]
-            f1 = f_array[DDS1_IDX]
+            self._dummy = self.state_splitting_to_ao_frequency(frequency_transition,
+                                                               store_results=False)
+            f0 = self._dummy[DDS0_IDX]
+            f1 = self._dummy[DDS1_IDX]
         relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
 
         p0 = self.dds0.get_phase(t_mu,t_mu_origin,
@@ -312,7 +323,7 @@ class RamanBeamPair():
         p1 = self.dds1.get_phase(t_mu,t_mu_origin,
                                 frequency=f1,
                                 phase_offset=self.global_phase+relative_phase)
-        return 2*p0, 2*p1
+        return 2*(p0-p1) % TWOPI
         
     @kernel
     def pulse(self,t):
