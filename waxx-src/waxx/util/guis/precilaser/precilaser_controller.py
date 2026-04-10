@@ -298,10 +298,10 @@ class PrecilaserStartupController:
     def __init__(
         self,
         laser: PrecilaserController,
-        seed_stabilize_s: float = 120.0,
-        laser_stabilize_s: float = 300.0,
+        seed_stabilize_s: float = 5.0,
+        laser_stabilize_s: float = 5.0,
         ramp_step_a: float = 1.0,
-        ramp_wait_s: float = 1.0,
+        ramp_wait_s: float = 5.0,
         target_working_current_a: float = 3.0,
         sleep_fn: Optional[Callable[[float], None]] = None,
         log_fn: Optional[Callable[[str], None]] = None,
@@ -344,6 +344,9 @@ class PrecilaserStartupController:
             return max(status.working_current_a, 0.0)
         return 0.0
 
+    def _read_status(self) -> PrecilaserStatus:
+        return self.laser.query_working_status()
+
     def _ramp_to_current(self, target_current_a: float, should_continue: Callable[[], bool]) -> list[float]:
         current = self._estimate_current()
         applied: list[float] = []
@@ -382,26 +385,36 @@ class PrecilaserStartupController:
 
     def run_turn_on_procedure(self, should_continue: Optional[Callable[[], bool]] = None) -> dict[str, object]:
         should_continue = (lambda: True) if should_continue is None else should_continue
+        initial_status = self._read_status()
 
-        self._log("Turn-on: setting working current to 0 A.")
-        self.laser.set_working_current(0.0)
+        if initial_status.laser_enabled:
+            self._log(
+                f"Turn-on: laser already enabled at {initial_status.working_current_a:.2f} A; "
+                "continuing from existing current."
+            )
+        else:
+            self._log("Turn-on: setting working current to 0 A.")
+            self.laser.set_working_current(0.0)
 
-        self._log("Turn-on: wait for seed-laser thermal stabilization.")
-        self._sleep_with_interrupt_check(self.seed_stabilize_s, should_continue)
+            self._log("Turn-on: wait for seed-laser thermal stabilization.")
+            self._sleep_with_interrupt_check(self.seed_stabilize_s, should_continue)
 
-        self._log("Turn-on: wait for amplifier/laser current stabilization.")
-        self._sleep_with_interrupt_check(self.laser_stabilize_s, should_continue)
+            self._log("Turn-on: wait for amplifier/laser current stabilization.")
+            self._sleep_with_interrupt_check(self.laser_stabilize_s, should_continue)
 
-        self._log("Turn-on: enabling laser drivers.")
-        self.laser.set_laser_enable(True)
+            self._log("Turn-on: enabling laser drivers.")
+            self.laser.set_laser_enable(True)
 
         self._log(f"Turn-on: ramping current to {self.target_working_current_a:.2f} A.")
         ramp_steps = self._ramp_to_current(self.target_working_current_a, should_continue)
 
-        self._log("Turn-on: enabling power-stability mode.")
-        self.laser.set_power_stability_mode(True)
+        if initial_status.power_stability_enabled:
+            self._log("Turn-on: power-stability mode already enabled.")
+        else:
+            self._log("Turn-on: enabling power-stability mode.")
+            self.laser.set_power_stability_mode(True)
 
-        final_status = self.laser.query_working_status()
+        final_status = self._read_status()
         return {
             "ramp_steps_a": ramp_steps,
             "final_status": final_status,
@@ -409,9 +422,13 @@ class PrecilaserStartupController:
 
     def run_turn_off_procedure(self, should_continue: Optional[Callable[[], bool]] = None) -> dict[str, object]:
         should_continue = (lambda: True) if should_continue is None else should_continue
+        initial_status = self._read_status()
 
-        self._log("Turn-off: disabling power-stability mode.")
-        self.laser.set_power_stability_mode(False)
+        if initial_status.power_stability_enabled:
+            self._log("Turn-off: disabling power-stability mode.")
+            self.laser.set_power_stability_mode(False)
+        else:
+            self._log("Turn-off: power-stability mode already disabled.")
 
         self._log("Turn-off: ramping working current to 0 A.")
         ramp_steps = self._ramp_to_current(0.0, should_continue)
@@ -421,10 +438,13 @@ class PrecilaserStartupController:
             )
             self._sleep_with_interrupt_check(self.ramp_wait_s, should_continue)
 
-        self._log("Turn-off: disabling laser drivers.")
-        self.laser.set_laser_enable(False)
+        if initial_status.laser_enabled:
+            self._log("Turn-off: disabling laser drivers.")
+            self.laser.set_laser_enable(False)
+        else:
+            self._log("Turn-off: laser drivers already disabled.")
 
-        final_status = self.laser.query_working_status()
+        final_status = self._read_status()
         return {
             "ramp_steps_a": ramp_steps,
             "final_status": final_status,

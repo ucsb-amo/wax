@@ -26,7 +26,7 @@ class RunInfo():
         self.run_datetime_str = time.strftime("%Y-%m-%d_%H-%M-%S", date)
 
         self.filepath = []
-        self.experiment_filepath = []
+        self.experiment_filepath = ""
         self.xvarnames = []
 
         from waxa import img_types as img
