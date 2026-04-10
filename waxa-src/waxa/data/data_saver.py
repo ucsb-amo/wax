@@ -118,7 +118,7 @@ class DataSaver():
         data.create_dataset('images',data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
-            this_data = vars(expt.data)[key]._run_data
+            this_data = expt.data.get_run_data(key)
             data.create_dataset(key, data=this_data)
 
         if expt.sort_idx:
@@ -154,7 +154,7 @@ class DataSaver():
                 this_data = f['data'][key][...]
             else:
                 # otherwise, take the data that was stuck into the array during the expt
-                this_data = this_dc._run_data
+                this_data = this_dc.get_run_data()
             if this_dc._external_data_bool or this_dc._data_gotten:
                 if expt.sort_idx:
                     # unshuffle if shuffled
