@@ -64,7 +64,6 @@ class Integrator():
         delay_mu(T_SETTLE_MU)
         
         v = self.sampler_ch.sample_single()
-        delay(3.e-6)
         return v
 
     @kernel
@@ -74,7 +73,7 @@ class Integrator():
         delay_mu(t)
 
     @kernel
-    def reset(self):
+    def reset(self, t=T_RESET_MU):
         self.ttl_reset.on()
-        delay_mu(T_RESET_MU)
+        delay_mu(t)
 
