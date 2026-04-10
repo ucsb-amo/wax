@@ -97,8 +97,7 @@ class RamanBeamPair():
 
     @portable(flags={"fast-math"})
     def state_splitting_to_ao_frequency(self,
-                                        frequency_state_splitting,
-                                        store_results=True) -> TArray(TFloat):
+                                        frequency_state_splitting) -> TArray(TFloat):
 
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
@@ -123,10 +122,6 @@ class RamanBeamPair():
 
         self._dummy[DDS0_IDX] = fc0 + c0 * df_0
         self._dummy[DDS1_IDX] = fc1 - c0 * a0 * a1 * df_1
-
-        if store_results:
-            self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
-            self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
 
         return self._dummy
 
@@ -225,12 +220,6 @@ class RamanBeamPair():
         """
 
         # Determine if frequency, amplitude, or v_pd should be updated
-        freq_changed = (frequency_transition >= 0.) and (frequency_transition != self.frequency_transition)
-        fraction_power_changed = (fraction_power_raman >= 0.) and (fraction_power_raman != self.fraction_power)
-        phase_mode_changed = (phase_mode >= 0) and (phase_mode != self.phase_mode)
-        phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
-        global_phase_changed = global_phase >= 0. and (global_phase != self.global_phase)
-        relative_phase_changed = relative_phase >= 0. and (relative_phase != self.relative_phase)
 
         if init:
             freq_changed = True
@@ -239,6 +228,13 @@ class RamanBeamPair():
             phase_origin_changed = True
             global_phase_changed = True
             relative_phase_changed = True
+        else:
+            freq_changed = (frequency_transition >= 0.) and (frequency_transition != self.frequency_transition)
+            fraction_power_changed = (fraction_power_raman >= 0.) and (fraction_power_raman != self.fraction_power)
+            phase_mode_changed = (phase_mode >= 0) and (phase_mode != self.phase_mode)
+            phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
+            global_phase_changed = global_phase >= 0. and (global_phase != self.global_phase)
+            relative_phase_changed = relative_phase >= 0. and (relative_phase != self.relative_phase)
 
         # Update stored values
         if freq_changed:
@@ -253,7 +249,7 @@ class RamanBeamPair():
             self.global_phase = global_phase if global_phase >= 0. else self.global_phase
         if relative_phase_changed:
             self.relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
-        
+
         if phase_mode_changed:
             self.dds0.set_phase_mode(self.phase_mode)
             self.dds1.set_phase_mode(self.phase_mode)
@@ -261,7 +257,10 @@ class RamanBeamPair():
         p0 = 0.
         p1 = 0.
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
-            self._frequency_array = self.state_splitting_to_ao_frequency(self.frequency_transition)
+            self._dummy = self.state_splitting_to_ao_frequency(self.frequency_transition)
+
+            self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
+            self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
 
             amp0 = np.sqrt(self.fraction_power) * self._amplitude_0
             amp1 = np.sqrt(self.fraction_power) * self._amplitude_1
@@ -307,23 +306,26 @@ class RamanBeamPair():
         Returns:
             A tuple containing the phase of each Raman beam (p0, p1) at time t_mu relative to t_mu_origin.
         """
+        # aprint(self.frequency_transition - frequency_transition, self.frequency_transition, frequency_transition)
         if frequency_transition == dv or frequency_transition == self.frequency_transition:
             f0 = self._frequency_array[DDS0_IDX]
             f1 = self._frequency_array[DDS1_IDX]
         else:
-            self._dummy = self.state_splitting_to_ao_frequency(frequency_transition,
-                                                               store_results=False)
+            self._dummy = self.state_splitting_to_ao_frequency(frequency_transition)
             f0 = self._dummy[DDS0_IDX]
             f1 = self._dummy[DDS1_IDX]
         relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
-
-        p0 = self.dds0.get_phase(t_mu,t_mu_origin,
+        aprint(f0,f1)
+        # aprint(frequency_transition,f0,f1,relative_phase)
+        p0 = self.dds0.get_phase(t_mu,
+                                t_mu_origin,
                                 frequency=f0,
                                 phase_offset=self.global_phase)
-        p1 = self.dds1.get_phase(t_mu,t_mu_origin,
+        p1 = self.dds1.get_phase(t_mu,
+                                t_mu_origin,
                                 frequency=f1,
                                 phase_offset=self.global_phase+relative_phase)
-        return 2*(p0-p1) % TWOPI
+        return (2*(p0-p1)) % TWOPI
         
     @kernel
     def pulse(self,t):
