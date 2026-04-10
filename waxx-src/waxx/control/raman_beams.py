@@ -1,6 +1,6 @@
 import numpy as np
 
-from artiq.experiment import kernel, portable, delay, TArray, TFloat, parallel
+from artiq.experiment import kernel, portable, delay, TArray, TFloat, parallel, TTuple
 from artiq.language.core import now_mu, at_mu
 
 from waxx.control.artiq.DDS import DDS
@@ -249,10 +249,6 @@ class RamanBeamPair():
 
         p0 = 0.
         p1 = 0.
-        t = 0
-        t0 = 0
-        t1 = 0
-        T_TRACKING_PHASE_OFFSET = 1960
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self._frequency_array = self.state_splitting_to_ao_frequency(self.frequency_transition)
 
@@ -263,21 +259,17 @@ class RamanBeamPair():
                                 amp0,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase)
-            t0 = now_mu() - T_TRACKING_PHASE_OFFSET # time that phase p0 corresponds to
             p1 = self.dds1.set_dds(self._frequency_array[DDS1_IDX],
                                 amp1,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
                                 phase=self.global_phase+self.relative_phase)
-            t = now_mu()
-            t1 = t - T_TRACKING_PHASE_OFFSET # time that phase p1 corresponds to
-
-            p0 += np.pi/2 + self._frequency_array[DDS0_IDX] * (t - t0)
-            p1 += np.pi/2 + self._frequency_array[DDS1_IDX] * T_TRACKING_PHASE_OFFSET
+            p0 = self.dds0.update_phase()
+            p1 = self.dds1.update_phase()
 
         self.dds0.on()
         self.dds1.on()
 
-        return p0, t0, p1, t1
+        return p0, p1
 
     @kernel
     def pulse(self,t):

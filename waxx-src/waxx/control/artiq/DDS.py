@@ -8,8 +8,15 @@ from artiq.coredevice.urukul import CPLD
 
 from waxx.util.artiq.async_print import aprint
 
+T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
 di2 = 2
+
+PHASE_MODE_TRACKING = 1
+PHASE_MODE_CONTINUOUS = 0
+
+TWOPI = 2 * np.pi
+TWOPI_NS = 2 * np.pi * 1.e-9
 
 class DDS():
 
@@ -18,7 +25,7 @@ class DDS():
       self.ch = ch
       self.frequency = frequency
       self.amplitude = amplitude
-      self.phase = 0.
+      self.phase_offset = 0.
       self.t_phase_origin_mu = np.int64(0)
 
       self.sw_state = 0
@@ -52,6 +59,9 @@ class DDS():
 
       self._t_set_delay_mu = self._t_set_xfer_mu + self._t_ref_period_mu + 1
       self._t_att_delay_mu = self._t_att_xfer_mu + self._t_ref_period_mu + 1
+
+      self._phase_at_t = 0. # phase at timestamp self._t_phase_mu
+      self._t_phase_mu = np.int64(0) # timestamp at which the wave has phase self._phase_at_mu
 
       self.dds_device.sw: ttl.TTLOut
 
@@ -169,12 +179,20 @@ class DDS():
 
       self.update_dac_bool()
       
-      # Determine if frequency, amplitude, or v_pd should be updated
-      freq_changed = (frequency >= 0.) and (frequency != self.frequency)
-      amp_changed = (amplitude >= 0.) and (amplitude != self.amplitude)
-      vpd_changed = (v_pd >= 0.) and (v_pd != self.v_pd)
-      phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
-      phase_changed = phase >= 0. and (phase != self.phase)
+      if init:
+         # If init is True, force update
+         freq_changed = True
+         amp_changed = True
+         vpd_changed = True
+         phase_origin_changed = True
+         phase_changed = True
+      else:
+         # Determine if frequency, amplitude, or v_pd should be updated
+         freq_changed = (frequency >= 0.) and (frequency != self.frequency)
+         amp_changed = (amplitude >= 0.) and (amplitude != self.amplitude)
+         vpd_changed = (v_pd >= 0.) and (v_pd != self.v_pd)
+         phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
+         phase_changed = phase >= 0. and (phase != self.phase_offset)
 
       # Update stored values
       if freq_changed:
@@ -186,22 +204,52 @@ class DDS():
       if phase_origin_changed:
          self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
-         self.phase = phase if phase >= 0. else self.phase
-
-      # If init is True, force update
-      if init:
-         freq_changed = True
-         amp_changed = True
-         vpd_changed = True
-         phase_origin_changed = True
-         phase_changed = True
+         self.phase_offset = phase if phase >= 0. else self.phase_offset
 
       # Set DDS and DAC as needed
       if self.dac_control_bool and (vpd_changed or init):
          self.update_dac_setpoint(self.v_pd)
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
-         self.dds_device.set(frequency=self.frequency, amplitude=self.amplitude, 
-                             phase=self.phase/(2*np.pi), ref_time_mu=self.t_phase_origin_mu)
+         phase = self.dds_device.set(frequency=self.frequency,
+                                    amplitude=self.amplitude, 
+                                    phase=self.phase_offset/TWOPI,
+                                    ref_time_mu=self.t_phase_origin_mu)
+         if self.phase_mode == PHASE_MODE_TRACKING:
+
+            self._t_phase_mu = now_mu()
+            self._phase_at_t = self.get_phase(self._t_phase_mu)
+
+            # phase += self.frequency * T_TRACKING_PHASE_LAG_MU * 1.e-9
+            # self._t_phase_mu = now_mu()
+            # phase = (phase * TWOPI) % TWOPI
+            # self._phase_at_t = phase
+      return phase
+   
+   @kernel
+   def update_phase(self, t_mu=np.int64(-1)):
+      if t_mu < 0:
+         t_mu = now_mu()
+      # dt = t_mu - self._t_phase_mu
+      # self._t_phase_mu = t_mu
+      # self._phase_at_t = (self._phase_at_t + self.frequency * dt * TWOPI_NS) % TWOPI
+      # return self._phase_at_t
+      self._t_phase_mu = t_mu
+      self._phase_at_t = self.get_phase(t_mu)
+      return self._phase_at_t
+   
+   @kernel
+   def get_phase(self,
+               t_mu=np.int64(-1),
+               t_mu_origin=np.int64(-1),
+               frequency=-0.1,
+               phase_offset=-0.1):
+      if t_mu < 0:
+         t_mu = now_mu()
+      t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
+      frequency = frequency if frequency >= 0. else self.frequency
+      phase_offset = phase_offset if phase_offset >= 0. else self.phase_offset
+      phase = phase_offset + frequency * (t_mu - t_mu_origin) * TWOPI_NS
+      return phase % TWOPI
    
    @kernel
    def update_dac_setpoint(self, v_pd=-0.1, dac_load = True):
