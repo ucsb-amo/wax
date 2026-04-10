@@ -268,11 +268,11 @@ class RamanBeamPair():
             p0 = self.dds0.set_dds(self._frequency_array[DDS0_IDX],
                                 amp0,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
-                                phase=self.global_phase)
+                                phase=self.global_phase/2)
             p1 = self.dds1.set_dds(self._frequency_array[DDS1_IDX],
                                 amp1,
                                 t_phase_origin_mu=self.t_phase_origin_mu,
-                                phase=self.global_phase+self.relative_phase)
+                                phase=(self.global_phase+self.relative_phase)/2)
             p0 = self.dds0.update_phase()
             p1 = self.dds1.update_phase()
 
