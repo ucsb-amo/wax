@@ -8,6 +8,7 @@ from artiq.coredevice.urukul import CPLD
 
 from waxx.util.artiq.async_print import aprint
 
+T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(1332)
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
 di2 = 2
@@ -202,7 +203,7 @@ class DDS():
       if self.dac_control_bool and vpd_changed:
          self.v_pd = v_pd if v_pd >= 0. else self.v_pd
       if phase_origin_changed:
-         self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
+         self.t_phase_origin_mu = t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
          self.phase_offset = phase if phase >= 0. else self.phase_offset
 
@@ -253,7 +254,7 @@ class DDS():
       t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
       frequency = frequency if frequency >= 0. else self.frequency
       phase_offset = phase_offset if phase_offset >= 0. else self.phase_offset
-      phase = phase_offset + frequency * (t_mu - t_mu_origin) * TWOPI_NS
+      phase = phase_offset + frequency * (t_mu - (t_mu_origin - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU)) * TWOPI_NS
       return phase % TWOPI
    
    @kernel

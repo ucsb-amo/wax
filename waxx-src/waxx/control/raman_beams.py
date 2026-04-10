@@ -3,7 +3,7 @@ import numpy as np
 from artiq.experiment import kernel, portable, delay, TArray, TFloat, parallel, TTuple
 from artiq.language.core import now_mu, at_mu
 
-from waxx.control.artiq.DDS import DDS
+from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU
 from waxx.util.artiq.async_print import aprint
 from waxx.config.expt_params import ExptParams
 
@@ -244,7 +244,7 @@ class RamanBeamPair():
         if phase_mode_changed:
             self.phase_mode = phase_mode if phase_mode >= 0 else self.phase_mode
         if phase_origin_changed:
-            self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
+            self.t_phase_origin_mu = t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU if t_phase_origin_mu > 0 else self.t_phase_origin_mu
         if global_phase_changed:
             self.global_phase = global_phase if global_phase >= 0. else self.global_phase
         if relative_phase_changed:
