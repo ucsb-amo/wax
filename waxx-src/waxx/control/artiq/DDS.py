@@ -8,7 +8,8 @@ from artiq.coredevice.urukul import CPLD
 
 from waxx.util.artiq.async_print import aprint
 
-T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(1332)
+T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
+
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
 di2 = 2
