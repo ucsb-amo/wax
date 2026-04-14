@@ -201,7 +201,7 @@ class DDS():
 
       # Update stored values
       if freq_changed:
-         last_frequency = self.frequency
+         # last_frequency = self.frequency
          self.frequency = frequency if frequency >= 0. else self.frequency
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
@@ -225,9 +225,10 @@ class DDS():
             self._t_phase_mu = now_mu()
             self._phase_at_t = self.get_phase(self._t_phase_mu)
 
-         if self.phase_mode == PHASE_MODE_CONTINUOUS:
-            self._t_last_change_mu = now_mu() - 90
-            self._phase_at_last_change += self.frequency * (t_mu - self._t_last_change_mu) * TWOPI_NS
+         # if self.phase_mode == PHASE_MODE_CONTINUOUS:
+         #    t_now = now_mu()
+         #    self._t_last_change_mu = t_now - 90
+         #    self._phase_at_last_change += self.frequency * (t_now - self._t_last_change_mu) * TWOPI_NS
             # phase += self.frequency * T_TRACKING_PHASE_LAG_MU * 1.e-9
             # self._t_phase_mu = now_mu()
             # phase = (phase * TWOPI) % TWOPI
