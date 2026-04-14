@@ -65,6 +65,9 @@ class DDS():
       self._phase_at_t = 0. # phase at timestamp self._t_phase_mu
       self._t_phase_mu = np.int64(0) # timestamp at which the wave has phase self._phase_at_mu
 
+      self._phase_at_last_change = 0
+      self._t_last_change_mu = np.int64(0)
+
       self.dds_device.sw: ttl.TTLOut
 
    @portable
@@ -180,7 +183,7 @@ class DDS():
       '''
 
       self.update_dac_bool()
-      
+
       if init:
          # If init is True, force update
          freq_changed = True
@@ -198,6 +201,7 @@ class DDS():
 
       # Update stored values
       if freq_changed:
+         last_frequency = self.frequency
          self.frequency = frequency if frequency >= 0. else self.frequency
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
@@ -221,6 +225,9 @@ class DDS():
             self._t_phase_mu = now_mu()
             self._phase_at_t = self.get_phase(self._t_phase_mu)
 
+         if self.phase_mode == PHASE_MODE_CONTINUOUS:
+            self._t_last_change_mu = now_mu() - 90
+            self._phase_at_last_change += self.frequency * (t_mu - self._t_last_change_mu) * TWOPI_NS
             # phase += self.frequency * T_TRACKING_PHASE_LAG_MU * 1.e-9
             # self._t_phase_mu = now_mu()
             # phase = (phase * TWOPI) % TWOPI
