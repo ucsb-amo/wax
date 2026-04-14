@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import signal
 import socket
 import threading
 import time
@@ -90,6 +92,7 @@ class PrecilaserLaserServer:
         self._log_lock = threading.Lock()
         self._log_entries: list[str] = []
         self._log_offset = 0
+        self._stopped = False
 
         self.log_handler = LogBufferHandler(self)
         self.log_handler.setFormatter(
@@ -112,6 +115,9 @@ class PrecilaserLaserServer:
                 LOGGER.exception("Initial serial connection failed: %s", exc)
 
     def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         self.running = False
         self.interrupt_sequence()
         if self.server_socket is not None:
@@ -444,6 +450,16 @@ class PrecilaserLaserServer:
 def main(host: str = "0.0.0.0", port: int = 5560, serial_port: str = "COM6") -> None:
     logging.basicConfig(level=logging.INFO)
     server = PrecilaserLaserServer(host=host, port=port, serial_port=serial_port)
+
+    # Ensure COM port is released on any exit path (crash, SIGTERM, atexit).
+    atexit.register(server.stop)
+
+    def _handle_sigterm(signum, frame):
+        LOGGER.info("SIGTERM received, stopping server")
+        server.stop()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     server.start()
     try:
         while True:

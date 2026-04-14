@@ -564,6 +564,7 @@ class ALSLaserStartupController:
         imon_pa_threshold_amps: float = 3.0,
         ramp_step_percent: float = 10.0,
         ramp_wait_seconds: float = 15.0,
+        turn_off_wait_seconds: float = 3.0,
         warmup_seconds: float = 30.0 * 60.0,
         poll_interval_seconds: float = 1.0,
         sleep_fn=None,
@@ -585,6 +586,7 @@ class ALSLaserStartupController:
         self.imon_pa_threshold_amps = float(imon_pa_threshold_amps)
         self.ramp_step_percent = float(ramp_step_percent)
         self.ramp_wait_seconds = float(ramp_wait_seconds)
+        self.turn_off_wait_seconds = float(turn_off_wait_seconds)
         self.warmup_seconds = float(warmup_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.sleep_fn = time.sleep if sleep_fn is None else sleep_fn
@@ -669,10 +671,10 @@ class ALSLaserStartupController:
 
     def _is_power_enabled(self) -> bool:
         frame = self.laser.stop_and_read()
-        rack_or_relay = bool(frame.statuses.get("STS_RACK_PSU", 0)) or bool(
+        rack_or_relay = bool(frame.statuses.get("STS_RACK_PSU", 0)) and bool(
             frame.statuses.get("STS_RELAY_PSU", 0)
         )
-        return rack_or_relay and bool(self.laser.cmd_ask_power_sts())
+        return rack_or_relay
 
     def _is_interlock_enabled(self) -> bool:
         return bool(self.laser.cmd_ask_interlock_sts())
@@ -814,7 +816,7 @@ class ALSLaserStartupController:
             return
         self._log("Turn-off Step 2: disabling second stage.")
         self.laser.cmd_set_second_stage_off()
-        self._sleep_with_log(self.ramp_wait_seconds, "second stage shutdown")
+        self._sleep_with_log(self.turn_off_wait_seconds, "second stage shutdown")
         self._interrogate_laser_state("after turn-off step 2")
 
     def step_3_turn_off_interlock(self) -> None:
@@ -824,7 +826,7 @@ class ALSLaserStartupController:
             return
         self._log("Turn-off Step 3: disabling interlock.")
         self.laser.cmd_set_interlock_off()
-        self._sleep_with_log(self.ramp_wait_seconds, "interlock shutdown")
+        self._sleep_with_log(self.turn_off_wait_seconds, "interlock shutdown")
         self._interrogate_laser_state("after turn-off step 3")
 
     def step_4_turn_off_laser_power(self) -> None:
