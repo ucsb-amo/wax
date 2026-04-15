@@ -315,7 +315,7 @@ class RamanBeamPair():
             f0 = self._dummy[DDS0_IDX]
             f1 = self._dummy[DDS1_IDX]
         relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
-        aprint(f0,f1)
+    
         # aprint(frequency_transition,f0,f1,relative_phase)
         p0 = self.dds0.get_phase(t_mu,
                                 t_mu_origin,
