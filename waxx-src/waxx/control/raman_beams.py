@@ -1,5 +1,6 @@
 import numpy as np
 
+from artiq.coredevice.ad9910 import _AD9910_REG_PROFILE0
 from artiq.experiment import kernel, portable, delay, TArray, TFloat, parallel, TTuple
 from artiq.language.core import now_mu, at_mu
 
@@ -17,6 +18,9 @@ DDS0_IDX = 0
 DDS1_IDX = 1
 
 class RamanBeamPair():
+    kernel_invariants = {
+        "_sysclk_per_mu"
+    }
     def __init__(self,
                  dds0:DDS,
                  dds1:DDS,
@@ -54,6 +58,14 @@ class RamanBeamPair():
         self._init()
 
         self._dummy = np.zeros(3).astype(float)
+
+        self._sysclk_per_mu = self.dds0.dds_device.sysclk_per_mu
+        self._f_to_ftw = self.dds0.dds_device.frequency_to_ftw
+        self._turns_to_pow = self.dds0.dds_device.turns_to_pow
+        self._amp_to_asf = self.dds0.dds_device.amplitude_to_asf
+        self._pow_relphase = np.int32(0)
+        self._asf0 = np.int32(0)
+        self._asf1 = np.int32(0)
 
     @kernel
     def get_t(self):
@@ -178,6 +190,43 @@ class RamanBeamPair():
         self.dds_sw.off()
 
     @kernel
+    def set_frequency_fast(self,
+                 frequency_transition=dv):
+        
+        self.state_splitting_to_ao_frequency(frequency_transition)
+        f0 = self._dummy[DDS0_IDX]
+        f1 = self._dummy[DDS1_IDX]
+
+        dt = np.int32(now_mu()) - np.int32(self.t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU)
+        a = dt * self._sysclk_per_mu
+
+        ftw0 = self._f_to_ftw(f0)
+        ftw1 = self._f_to_ftw(f1)
+        
+        pow0 = a * ftw0
+        pow1 = self._pow_relphase + a * ftw1
+
+        dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
+        dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
+
+        at_mu(now_mu() & ~7)
+        with parallel:
+            self.dds0.dds_device.set_cfr1(phase_autoclear=1)
+            self.dds1.dds_device.set_cfr1(phase_autoclear=1)
+        with parallel:
+            self.dds0.dds_device.write64(_AD9910_REG_PROFILE0,
+                            dds0_asf_pow_data, ftw0)
+            self.dds1.dds_device.write64(_AD9910_REG_PROFILE0,
+                            dds1_asf_pow_data, ftw1)
+        with parallel:
+            self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+            self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+        with parallel:
+            self.dds0.dds_device.set_cfr1()
+            self.dds1.dds_device.set_cfr1()
+        at_mu(now_mu() & ~7)
+
+    @kernel
     def set(self,
             frequency_transition=dv,
             fraction_power_raman=dv,
@@ -241,6 +290,7 @@ class RamanBeamPair():
             self.frequency_transition = frequency_transition if frequency_transition >= 0. else self.frequency_transition
         if fraction_power_changed:
             self.fraction_power = fraction_power_raman if fraction_power_raman >= 0. else self.fraction_power
+            
         if phase_mode_changed:
             self.phase_mode = phase_mode if phase_mode >= 0 else self.phase_mode
         if phase_origin_changed:
@@ -249,7 +299,7 @@ class RamanBeamPair():
             self.global_phase = global_phase if global_phase >= 0. else self.global_phase
         if relative_phase_changed:
             self.relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
-
+            self._pow_relphase = self._turns_to_pow(self.relative_phase/(4*np.pi))
         if phase_mode_changed:
             self.dds0.set_phase_mode(self.phase_mode)
             self.dds1.set_phase_mode(self.phase_mode)
@@ -259,11 +309,13 @@ class RamanBeamPair():
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self._dummy = self.state_splitting_to_ao_frequency(self.frequency_transition)
 
-            self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
-            self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
-
             amp0 = np.sqrt(self.fraction_power) * self._amplitude_0
             amp1 = np.sqrt(self.fraction_power) * self._amplitude_1
+            self._asf0 = self._amp_to_asf(amp0)
+            self._asf1 = self._amp_to_asf(amp1)
+
+            self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
+            self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
 
             p0 = self.dds0.set_dds(self._frequency_array[DDS0_IDX],
                                 amp0,
