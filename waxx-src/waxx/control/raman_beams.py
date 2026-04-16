@@ -109,7 +109,7 @@ class RamanBeamPair():
 
     @portable(flags={"fast-math"})
     def state_splitting_to_ao_frequency(self,
-                                        frequency_state_splitting) -> TArray(TFloat):
+                                        frequency_state_splitting):
 
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
@@ -134,8 +134,6 @@ class RamanBeamPair():
 
         self._dummy[DDS0_IDX] = fc0 + c0 * df_0
         self._dummy[DDS1_IDX] = fc1 - c0 * a0 * a1 * df_1
-
-        return self._dummy
 
     @kernel
     def set_transition_frequency(self,frequency_transition=dv):
@@ -307,7 +305,7 @@ class RamanBeamPair():
         p0 = 0.
         p1 = 0.
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
-            self._dummy = self.state_splitting_to_ao_frequency(self.frequency_transition)
+            self.state_splitting_to_ao_frequency(self.frequency_transition)
 
             amp0 = np.sqrt(self.fraction_power) * self._amplitude_0
             amp1 = np.sqrt(self.fraction_power) * self._amplitude_1
@@ -363,11 +361,11 @@ class RamanBeamPair():
             f0 = self._frequency_array[DDS0_IDX]
             f1 = self._frequency_array[DDS1_IDX]
         else:
-            self._dummy = self.state_splitting_to_ao_frequency(frequency_transition)
+            self.state_splitting_to_ao_frequency(frequency_transition)
             f0 = self._dummy[DDS0_IDX]
             f1 = self._dummy[DDS1_IDX]
         relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
-        aprint(f0,f1)
+    
         # aprint(frequency_transition,f0,f1,relative_phase)
         p0 = self.dds0.get_phase(t_mu,
                                 t_mu_origin,

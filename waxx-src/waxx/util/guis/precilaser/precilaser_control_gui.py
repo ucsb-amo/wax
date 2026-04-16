@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -188,16 +189,44 @@ class PrecilaserControlGUI(QMainWindow):
         layout.addWidget(self.laser_toggle_button)
         self._update_laser_button()
 
-        current_row = QHBoxLayout()
-        self.current_input = QLineEdit()
-        self.current_input.setPlaceholderText("Working current (A)")
-        self.current_input.returnPressed.connect(self._submit_working_current)
-        current_row.addWidget(self.current_input)
+        current_box = QGroupBox("Working Current")
+        current_box_layout = QVBoxLayout(current_box)
+        current_box_layout.setContentsMargins(10, 6, 10, 6)
+        current_box_layout.setSpacing(4)
 
-        self.set_current_button = QPushButton("Set Current")
-        self.set_current_button.clicked.connect(self._submit_working_current)
-        current_row.addWidget(self.set_current_button)
-        layout.addLayout(current_row)
+        header_row = QHBoxLayout()
+        header_row.addStretch()
+        self.current_edit_checkbox = QCheckBox("Edit")
+        self.current_edit_checkbox.setChecked(False)
+        self.current_edit_checkbox.stateChanged.connect(self._on_current_edit_toggled)
+        header_row.addWidget(self.current_edit_checkbox)
+        current_box_layout.addLayout(header_row)
+
+        self.current_display_label = QLabel("-- A")
+        self.current_display_label.setStyleSheet(
+            "font-size: 36px; font-weight: 800; color: #295c67;"
+        )
+        self.current_display_label.setMinimumHeight(52)
+        self.current_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        current_box_layout.addWidget(self.current_display_label)
+
+        self.current_input = QLineEdit()
+        self.current_input.setStyleSheet(
+            "font-size: 26px; font-weight: 700; color: #295c67;"
+        )
+        self.current_input.setMinimumHeight(44)
+        self.current_input.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.current_input.setPlaceholderText("A")
+        self.current_input.returnPressed.connect(self._submit_working_current)
+        current_box_layout.addWidget(self.current_input)
+
+        self.current_submit_hint = QLabel("ENTER to submit")
+        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c;")
+        self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        current_box_layout.addWidget(self.current_submit_hint)
+
+        layout.addWidget(current_box)
+        self._update_current_edit_mode()
 
         seq_row = QHBoxLayout()
         self.startup_button = QPushButton("Start Turn On")
@@ -394,6 +423,21 @@ class PrecilaserControlGUI(QMainWindow):
         except Exception as exc:
             self._append_log(f"ERROR set stability: {exc}")
 
+    def _update_current_edit_mode(self) -> None:
+        is_editing = self.current_edit_checkbox.isChecked()
+        self.current_display_label.setVisible(not is_editing)
+        self.current_input.setVisible(is_editing)
+        self.current_submit_hint.setVisible(is_editing)
+        if is_editing:
+            current_text = self.current_display_label.text().replace(" A", "").strip()
+            if current_text and current_text != "--":
+                self.current_input.setText(current_text)
+            self.current_input.selectAll()
+            self.current_input.setFocus()
+
+    def _on_current_edit_toggled(self, state) -> None:
+        self._update_current_edit_mode()
+
     def _submit_working_current(self):
         text = self.current_input.text().strip()
         if not text:
@@ -407,6 +451,7 @@ class PrecilaserControlGUI(QMainWindow):
         try:
             if self.client.set_working_current(value):
                 self._set_status_message(f"Working current set to {value:.2f} A")
+                self.current_edit_checkbox.setChecked(False)
         except Exception as exc:
             self._append_log(f"ERROR set current: {exc}")
 
@@ -495,6 +540,13 @@ class PrecilaserControlGUI(QMainWindow):
                 label.setText(f"{float(status.get('working_current_a', 0.0)):.2f}")
             else:
                 label.setText("--")
+
+        if not self.current_edit_checkbox.isChecked():
+            if stage_currents:
+                total_current_a = sum(float(c) for c in stage_currents)
+            else:
+                total_current_a = float(status.get("working_current_a", 0.0))
+            self.current_display_label.setText(f"{total_current_a:.2f} A")
 
         seq_state = str(sequence.get("state", "IDLE"))
         seq_type = str(sequence.get("type") or "-")

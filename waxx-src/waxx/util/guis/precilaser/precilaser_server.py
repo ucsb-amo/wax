@@ -19,6 +19,8 @@ from waxx.util.guis.precilaser.precilaser_controller import (
 
 LOGGER = logging.getLogger("precilaser_server")
 LOGGER.setLevel(logging.INFO)
+CONTROLLER_LOGGER = logging.getLogger("precilaser_controller")
+CONTROLLER_LOGGER.setLevel(logging.INFO)
 
 
 class ConnectionState(Enum):
@@ -104,6 +106,7 @@ class PrecilaserLaserServer:
             return
         self.running = True
         LOGGER.addHandler(self.log_handler)
+        CONTROLLER_LOGGER.addHandler(self.log_handler)
         self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.accept_thread.start()
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -134,6 +137,7 @@ class PrecilaserLaserServer:
             self.sequence_thread.join(timeout=2.0)
         self.disconnect_laser()
         LOGGER.removeHandler(self.log_handler)
+        CONTROLLER_LOGGER.removeHandler(self.log_handler)
         self.log_handler.close()
 
     def append_log_entry(self, message: str) -> None:
@@ -257,8 +261,7 @@ class PrecilaserLaserServer:
     def _poll_loop(self) -> None:
         while self.running:
             try:
-                if self.sequence_state != SequenceState.RUNNING:
-                    self.poll_status()
+                self.poll_status()
             except Exception as exc:
                 LOGGER.exception("Background polling failed: %s", exc)
             time.sleep(self.poll_interval_s)
@@ -287,10 +290,32 @@ class PrecilaserLaserServer:
             with self._state_lock:
                 self.status = updated_status
         except Exception as exc:
-            if isinstance(exc, ValueError) and "Invalid frame tail" in str(exc):
+            exc_str = str(exc)
+            if isinstance(exc, ValueError) and "Invalid frame tail" in exc_str:
                 self._recover_serial_after_invalid_tail_locked(exc)
                 return
+            if isinstance(exc, ValueError) and "checksum mismatch" in exc_str.lower():
+                self._recover_serial_after_checksum_error_locked(exc)
+                return
             self._handle_serial_error(exc)
+
+    def _recover_serial_after_checksum_error_locked(self, exc: Exception) -> None:
+        LOGGER.info("Checksum error, restarting COM connection")
+        try:
+            if self.laser is not None:
+                try:
+                    self.laser.close()
+                except Exception:
+                    pass
+            time.sleep(0.5)
+            self.laser = PrecilaserController(port=self.serial_port)
+            self.laser.connect()
+            with self._state_lock:
+                self.status.connected = True
+                self.status.connection_state = ConnectionState.CONNECTED
+        except Exception as reconnect_exc:
+            LOGGER.exception("Serial reconnect after checksum error failed: %s", reconnect_exc)
+            self._handle_serial_error(reconnect_exc)
 
     def _recover_serial_after_invalid_tail_locked(self, exc: Exception) -> None:
         LOGGER.debug("Invalid frame tail detected (%s); reconnecting serial", exc)
@@ -419,19 +444,24 @@ class PrecilaserLaserServer:
     def _run_shutdown_sequence(self) -> None:
         self._run_sequence("SHUTDOWN")
 
+    def _on_ramp_step(self, current_a: float) -> None:
+        """Called after each ramp step to push working_current_a into the snapshot without a serial round-trip."""
+        with self._state_lock:
+            self.status.working_current_a = current_a
+
     def _run_sequence(self, sequence_type: str) -> None:
         try:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
             startup_controller = PrecilaserStartupController(self.laser)
+            startup_controller.on_step = self._on_ramp_step
             if sequence_type == "STARTUP":
-                with self._laser_lock:
-                    startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
-                    self._poll_status_locked()
+                startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
             else:
-                with self._laser_lock:
-                    startup_controller.run_turn_off_procedure(should_continue=self._should_continue_sequence)
-                    self._poll_status_locked()
+                startup_controller.run_turn_off_procedure(should_continue=self._should_continue_sequence)
+
+            # Pull a final full snapshot at sequence end (PD, temp, stage currents, flags).
+            self.poll_status()
 
             with self._state_lock:
                 self.sequence_state = SequenceState.COMPLETED
