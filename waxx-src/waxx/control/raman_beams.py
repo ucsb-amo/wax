@@ -188,9 +188,26 @@ class RamanBeamPair():
         self.dds_sw.off()
 
     @kernel
+    def set_up_fast_frequency_update(self):
+        at_mu(now_mu() & ~7)
+        with parallel:
+            self.dds0.dds_device.set_cfr1(phase_autoclear=1)
+            self.dds1.dds_device.set_cfr1(phase_autoclear=1)
+        at_mu(now_mu() & ~7)
+
+    @kernel
+    def clean_up_fast_frequency_update(self):
+        at_mu(now_mu() & ~7)
+        with parallel:
+            self.dds0.dds_device.set_cfr1()
+            self.dds1.dds_device.set_cfr1()
+        at_mu(now_mu() & ~7)
+
+    @kernel
     def set_frequency_fast(self,
-                 frequency_transition=dv):
+                 frequency_transition):
         
+        self.frequency_transition = frequency_transition
         self.state_splitting_to_ao_frequency(frequency_transition)
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
@@ -209,9 +226,6 @@ class RamanBeamPair():
 
         at_mu(now_mu() & ~7)
         with parallel:
-            self.dds0.dds_device.set_cfr1(phase_autoclear=1)
-            self.dds1.dds_device.set_cfr1(phase_autoclear=1)
-        with parallel:
             self.dds0.dds_device.write64(_AD9910_REG_PROFILE0,
                             dds0_asf_pow_data, ftw0)
             self.dds1.dds_device.write64(_AD9910_REG_PROFILE0,
@@ -219,9 +233,6 @@ class RamanBeamPair():
         with parallel:
             self.dds0.dds_device.cpld.io_update.pulse_mu(8)
             self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-        with parallel:
-            self.dds0.dds_device.set_cfr1()
-            self.dds1.dds_device.set_cfr1()
         at_mu(now_mu() & ~7)
 
     @kernel
