@@ -17,7 +17,8 @@ class SLM:
         self.params = expt_params
         self.core = core
 
-    def write_phase_mask(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot', initialize=False):
+    def write_phase_mask(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot', initialize=False,
+                         verbose=True):
         """Writes a phase spot of given dimension and phase to the specified
         position on the slm display.
 
@@ -72,13 +73,15 @@ class SLM:
                 }
             # command = f"{int(dimension)} {phase/np.pi} {x_center} {y_center} {mask}"
             self._send_command(command)
-            print(f"\nSent: {command}")
-            print(f"-> mask: {mask_type}, dimension = {dimension} um, phase = {phase/np.pi} pi, x-center = {x_center}, y-center = {y_center}\n")
+            if verbose:
+                print(f"\nSent: {command}")
+                print(f"-> mask: {mask_type}, dimension = {dimension} um, phase = {phase/np.pi} pi, x-center = {x_center}, y-center = {y_center}\n")
         except Exception as e:
             print(f"Error sending phase spot: {e}")
 
     @kernel
-    def write_phase_mask_kernel(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot',initialize=False):
+    def write_phase_mask_kernel(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot',initialize=False,
+                                verbose=True):
         """Writes a phase spot of given dimension and phase to the specified
         position on the slm display.
 
@@ -100,7 +103,7 @@ class SLM:
             False for letting SLM self-reinitialze automatically. 
         """    
         self.core.wait_until_mu(now_mu())
-        self.write_phase_mask(dimension, phase, x_center, y_center, mask_type, initialize)
+        self.write_phase_mask(dimension, phase, x_center, y_center, mask_type, initialize, verbose)
         delay(SLM_RPC_DELAY)
 
     def _send_command(self, command):
