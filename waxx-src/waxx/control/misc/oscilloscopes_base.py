@@ -59,7 +59,7 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
         # self.serial = idn[2]
         # self.firmware = idn[3]
 
-    def read_sweep(self, src_channel:int, preamble=None):
+    def read_sweep(self, src_channel:int, preamble=None, channel_type='C'):
         """_summary_
 
         :param src_channel: The channel to be sampled. Zero-indexed.
@@ -72,7 +72,7 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
         # Send command that specifies the source waveform to be transferred
 
         self.write(":WAVeform:STARt 0")
-        self.write(f":WAVeform:SOURce C{src_channel+1}")
+        self.write(f":WAVeform:SOURce {channel_type}{src_channel+1}")
         if preamble == None:
             preamble = self.get_waveform_preamble()
         adc_bit = preamble[-1]
