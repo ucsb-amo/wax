@@ -332,7 +332,7 @@ class atomdata():
                 ValueError: If the subset contains repeats but not all values
                 have the same count.
             """
-            
+            which_shot_idx = np.atleast_1d(which_shot_idx)
             arr = ad.xvars[which_xvar_idx]
             _, counts = np.unique(arr, return_counts=True)
             slicing_repeat_axis_bool = np.any(counts > 1)
@@ -427,19 +427,23 @@ class atomdata():
             ad.xvardims[which_xvar_idx] = len(ad.xvars[which_shot_idx])
 
         def slice_ndarray(array):
-            return np.take(array,
-                        indices=which_shot_idx,
-                        axis=which_xvar_idx)
+            sliced_array = np.take(array,
+                                   indices=which_shot_idx,
+                                   axis=which_xvar_idx)
+            if ad.Nvars < self.Nvars and sliced_array.shape[which_xvar_idx] == 1:
+                sliced_array = np.squeeze(sliced_array, axis=which_xvar_idx)
+            return sliced_array
         nd_keys = ['img_atoms','img_light','img_dark',
                 'img_timestamp_atoms','img_timestamp_light','img_timestamp_dark']
         for k in nd_keys:
             vars(ad)[k] = slice_ndarray(vars(ad)[k])
         for k in self.data.keys:
-            vars(self.data)[k] = slice_ndarray(vars(ad.data)[k])
+            vars(ad.data)[k] = slice_ndarray(vars(self.data)[k])
         if hasattr(self,'scope_data'):
-            for k in self.scope_data.keys():
-                for ch in self.scope_data[k].keys():
-                    self.scope_data[k][ch] = slice_ndarray(ad.scope_data[k][ch])
+            for k in ad.scope_data.keys():
+                for ch in ad.scope_data[k].keys():
+                    ad.scope_data[k][ch].t = slice_ndarray(self.scope_data[k][ch].t)
+                    ad.scope_data[k][ch].v = slice_ndarray(self.scope_data[k][ch].v)
 
         ad.params.N_img = np.prod(ad.xvardims)
         ad.params.N_shots = int(ad.params.N_shots / sliced_xvardim)
