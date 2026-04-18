@@ -219,11 +219,10 @@ class server_talk():
         with h5py.File(original_data_filepath) as file:
             unpack_group(file,'run_info',ri)
 
-        ds = DataSaver()
+        ds = DataSaver(data_dir=self.data_dir, server_talk=self)
         lite_data_path, lite_data_folder = ds._data_path(ri,lite=True)
 
-        if not os.path.exists(lite_data_folder):
-            os.mkdir(lite_data_folder)
+        os.makedirs(lite_data_folder, exist_ok=True)
 
         with h5py.File(lite_data_path,'w') as f_lite:
             with h5py.File(original_data_filepath,'r') as f_src:
@@ -245,7 +244,7 @@ class server_talk():
                 for key in akeys:
                     f_lite.attrs[key] = f_src.attrs[key]
 
-                roi = ROI(rid,roi_id=roi_id,use_saved_roi=use_saved_roi)
+                roi = ROI(rid,roi_id=roi_id,use_saved_roi=use_saved_roi,server_talk=self)
                 
                 N_img = f_src['data']['images'].shape[0]
                 px = np.diff(roi.roix)[0]
