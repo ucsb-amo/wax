@@ -105,7 +105,7 @@ def guess_unit(name, values):
     # Amplitude / power fraction (dimensionless)
     if (lname.startswith("amp_") or
             lname.startswith("pfrac_") or "fraction" in lname):
-        return "(amp)", 1.0
+        return "amp", 1.0
     
     if (lname.startswith("phase_")):
         return "π", 1/np.pi
