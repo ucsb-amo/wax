@@ -77,6 +77,7 @@ class DataSaver():
 
             if expt_filepath:
                 f['run_info']['experiment_filepath'][...] = expt_filepath
+                f.attrs['experiment_filepath'] = expt_filepath
 
             self._save_expt_files_text(f,expt_filepath)
 
