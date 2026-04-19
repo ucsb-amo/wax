@@ -127,12 +127,32 @@ def guess_unit(name, values):
     return None, 1.0
 
 
-def detect_unit(ad: atomdata, xvar_idx, xvarunit="", xvarmult=1.0):
+def detect_unit(
+    ad: atomdata | None = None,
+    xvar_idx=0,
+    xvarunit="",
+    xvarmult=1.0,
+    xvarnames=None,
+    xvar_values=None,
+    params_obj=None,
+    verbose=False,
+):
 
-    xvarname = _normalize_name(ad.xvarnames[xvar_idx])
-    xvar_vals = ad.xvars[xvar_idx]
+    if ad is None and xvarnames is None:
+        raise ValueError("detect_unit requires either `ad` or `xvarnames`.")
 
-    unit_from_comment, mult_from_comment = get_param(ad.params, xvarname)
+    if ad is not None:
+        xvarname = _normalize_name(ad.xvarnames[xvar_idx])
+        xvar_vals = ad.xvars[xvar_idx]
+        params_obj = ad.params if params_obj is None else params_obj
+    else:
+        xvarname = _normalize_name(xvarnames[xvar_idx])
+        xvar_vals = [] if xvar_values is None else xvar_values
+
+    unit_from_comment = None
+    mult_from_comment = 1.0
+    if params_obj is not None:
+        unit_from_comment, mult_from_comment = get_param(params_obj, xvarname)
 
     source = "comment"
     if unit_from_comment is None:
@@ -143,9 +163,10 @@ def detect_unit(ad: atomdata, xvar_idx, xvarunit="", xvarmult=1.0):
 
     final_mult = xvarmult if xvarmult != 1.0 else (mult_from_comment or 1.0)
 
-    print(f"xvar = {xvarname}, source = {source}, "
-          f"detected unit = {unit_from_comment}, multiplier = {mult_from_comment:.1e}")
-    print(f"final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
+    if verbose:
+        print(f"xvar = {xvarname}, source = {source}, "
+              f"detected unit = {unit_from_comment}, multiplier = {mult_from_comment:.1e}")
+        print(f"final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
 
     return final_unit, final_mult, xvarname
 

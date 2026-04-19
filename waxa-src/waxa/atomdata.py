@@ -22,6 +22,25 @@ class ScopeTraceArray():
         self.t = t
         self.v = v
 
+class _RepeatDataVault():
+    def __init__(self):
+        self.keys = []
+
+class _RepeatSEMDataProxy():
+    def __init__(self, source, sem_divisor):
+        self._source = source
+        self._sem_divisor = sem_divisor
+
+    def __getattr__(self, key):
+        value = getattr(self._source, key)
+        if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.number):
+            return value / self._sem_divisor
+        return value
+
+    @property
+    def keys(self):
+        return self._source.keys
+
 def format_scope_data(dataset, old_method=False):
     scope_dict = dict()
     for scope_key in dataset.keys():
@@ -101,6 +120,34 @@ class atomdata():
     '''
     Use to store and do basic analysis on data for every experiment.
     '''
+    def __getattribute__(self, name):
+        if name in ['_repeat_sem_source',
+                    '_repeat_sem_divisor',
+                    '_sem_scale_value',
+                    '_sem_scale_scope_data',
+                    '__dict__',
+                    '__class__']:
+            return object.__getattribute__(self, name)
+
+        sem_source = object.__getattribute__(self, '__dict__').get('_repeat_sem_source', None)
+        if sem_source is not None:
+            if name == 'data':
+                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+                return _RepeatSEMDataProxy(sem_source.data, sem_divisor)
+            if name == 'scope_data':
+                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+                return object.__getattribute__(self, '_sem_scale_scope_data')(sem_source.scope_data, sem_divisor)
+
+            local_dict = object.__getattribute__(self, '__dict__')
+            if name in local_dict:
+                return object.__getattribute__(self, name)
+
+            source_value = getattr(sem_source, name)
+            sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+            return object.__getattribute__(self, '_sem_scale_value')(source_value, sem_divisor)
+
+        return object.__getattribute__(self, name)
+
     def __init__(self,
                 idx=0,
                 roi_id=None,
@@ -138,6 +185,12 @@ class atomdata():
         '''
 
         self._lite = lite
+
+        self.avg = None
+        self.std = None
+        self.sem = None
+        self._repeat_sem_source = None
+        self._repeat_sem_divisor = None
 
         self.server_talk = server_talk
 
@@ -181,7 +234,34 @@ class atomdata():
 
     def save_roi_h5(self,printouts=False):
         self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
-            
+
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True):
+        """Creates a lite (ROI-cropped) copy of this run's data file.
+
+        By default uses the ROI already loaded in this atomdata instance. The
+        current ROI is saved to the h5 file first so that create_lite_copy
+        can read it back automatically.
+
+        Parameters
+        ----------
+        roi_id : None, int, or str
+            Override the ROI source. If None (default), uses the ROI currently
+            stored in this atomdata instance. If an int, interpreted as a run
+            ID whose saved ROI will be used. If a str, looks up the key in
+            roi.xlsx.
+        use_saved_roi : bool
+            Passed through to server_talk.create_lite_copy. Has no effect when
+            roi_id is None, since the current ROI is written to the file first.
+        """
+        if roi_id is None:
+            self.roi.save_roi_h5(lite=self._lite, printouts=False)
+            use_saved_roi = True
+        self.server_talk.create_lite_copy(
+            self.run_info.run_id,
+            roi_id=roi_id,
+            use_saved_roi=use_saved_roi,
+        )
+
     ### Analysis
 
     def _initial_analysis(self,transpose_idx,avg_repeats):
@@ -193,6 +273,7 @@ class atomdata():
         if avg_repeats:
             self.avg_repeats(reanalyze=False)
         self.analyze_ods()
+        self._refresh_repeat_statistics()
 
     def analyze(self):
         self.compute_raw_ods()
@@ -298,17 +379,30 @@ class atomdata():
         self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section  
         self.atom_number = np.sum(np.sum(self.atom_number_density,-2),-1)
 
-    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0):
+    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
         that xvar, and returns an atomdata of reduced dimensionality as if that
         variable had been held constant.
 
+        If the data has repeats on the axis being sliced:
+          - Multi-axis scans (Nvars > 1): the repeats are automatically moved one
+            axis deeper before slicing, so the result retains all repeats on the
+            adjacent axis.
+          - Single-axis scans (Nvars == 1): all shots whose xvar value equals the
+            value at which_shot_idx are returned together (i.e. all repeats of
+            that unique value), unless ignore_repeats=True.
+
+        If the data has repeats on a different axis, they are left untouched and
+        appear on the same axis in the returned atomdata.
+
         Args:
-            ad (atomdata): The atomdata to be sliced.
-            which_shot_idx (list): The indices of the xvar value to select. If
-            of length 1, reduces the dimensionality of the dataset.
-            which_xvar_idx (int): The index of the xvar (or equivalently, the
-            axis of the data) to slice along.
+            which_shot_idx (int or list): The index (or indices) into the xvar
+            specified by which_xvar_idx to select. When selecting a single index
+            from a multi-axis scan this reduces the dimensionality by one.
+            which_xvar_idx (int): The index of the xvar axis to slice along.
+            ignore_repeats (bool): Only relevant for single-axis scans with
+            repeats. When True, return only the single shot at which_shot_idx
+            rather than all repeats of the corresponding unique value.
 
         Returns:
             atomdata: The sliced atomdata object.
@@ -318,38 +412,48 @@ class atomdata():
                        avg_repeats=self._analysis_tags.averaged,
                        roi_id=self.run_info.run_id)
 
-        # repeat handling is broken right now, in that if the repeats are on the
-        # first axis, the function won't return an atomdata with all the repeats. To
-        # be fixed later.
-        def check_for_repeat_axis(which_xvar_idx, which_shot_idx):
-            """
-            Checks if the axis being sliced (which_xvar_idx) contains repeated values,
-            and if a subset (which_shot_idx) is selected, whether the subset contains
-            repeats, and if so, whether each value appears the same number of times.
-            Returns:
-                n_repeats (int): Number of repeats in the subset.
-            Raises:
-                ValueError: If the subset contains repeats but not all values
-                have the same count.
-            """
-            which_shot_idx = np.atleast_1d(which_shot_idx)
-            arr = ad.xvars[which_xvar_idx]
-            _, counts = np.unique(arr, return_counts=True)
-            slicing_repeat_axis_bool = np.any(counts > 1)
-            if slicing_repeat_axis_bool:
-                print(f"Warning: this run has {ad.params.N_repeats} repeats, which are by default associated with xvar0. Depending on your choice of 'which_shot_idx', you may miss some repeats.")
+        # Normalize which_shot_idx early so the rest of the logic uses ndarrays.
+        which_shot_idx = ensure_ndarray(which_shot_idx, enforce_1d=True)
 
-            n_repeats = 1
-            if slicing_repeat_axis_bool and len(which_shot_idx) > 1:
-                subset = arr[which_shot_idx]
-                _, subset_counts = np.unique(subset, return_counts=True)
-                if np.any(subset_counts > 1):
-                    if not np.all(subset_counts == subset_counts[0]):
-                        raise ValueError("When slicing into the axis with repeats, you must slice the same number of repeats for each value.")
-                    n_repeats = subset_counts[0]
-            return n_repeats
-        
-        ad.params.N_repeats = check_for_repeat_axis(which_xvar_idx,which_shot_idx)
+        # Detect whether any axis carries repeated xvar values.
+        _has_repeats = False
+        _repeat_axis = -1
+        _n_repeats = 1
+        if not self._analysis_tags.averaged:
+            try:
+                _repeat_axis, _n_repeats = ad._get_repeat_axis_info()
+                _has_repeats = True
+            except ValueError:
+                pass
+
+        if _has_repeats and _repeat_axis == which_xvar_idx:
+            if ad.Nvars > 1:
+                # Move repeats one axis deeper so the slice axis becomes clean.
+                # Normalize which_shot_idx in case it references a repeated
+                # position in the original (longer) axis.
+                which_shot_idx = np.unique(which_shot_idx // _n_repeats)
+                _target = (which_xvar_idx + 1
+                           if which_xvar_idx + 1 < ad.Nvars
+                           else which_xvar_idx - 1)
+                ad.reassign_repeats(_target)
+            elif not ignore_repeats:
+                # Single-axis scan: expand the selection to include all repeats
+                # of the unique value at the requested index.
+                target_value = ad.xvars[0][which_shot_idx[0]]
+                which_shot_idx = np.where(
+                    np.isclose(np.asarray(ad.xvars[0], dtype=float),
+                               float(target_value))
+                )[0]
+
+        # N_repeats on the returned atomdata: stays non-1 whenever repeats
+        # survive the slice (i.e. in every case except a single-axis slice
+        # with ignore_repeats=True that strips the only repeat axis).
+        _repeats_survive = _has_repeats and not (
+            _repeat_axis == which_xvar_idx
+            and ad.Nvars == 1
+            and ignore_repeats
+        )
+        ad.params.N_repeats = _n_repeats if _repeats_survive else 1
 
         # replace the param for the xvar being sliced with the slice value
         vars(ad.params)[ad.xvarnames[which_xvar_idx]] = ad.xvars[which_xvar_idx][which_shot_idx]
@@ -384,8 +488,6 @@ class atomdata():
             if n_pad > 0:
                 taken = np.concatenate([taken, -1 * np.ones(n_pad, dtype=ad.sort_idx[which_xvar_idx].dtype)])
             return taken
-        
-        which_shot_idx = ensure_ndarray(which_shot_idx, enforce_1d=True)
 
         # remove the xvars, xvarnames, and xvardims entry for that xvar
         keys = ['xvars','xvarnames','xvardims']
@@ -424,7 +526,7 @@ class atomdata():
             ad.xvars[which_xvar_idx] = np.take(ad.xvars[which_xvar_idx],
                                                indices=which_shot_idx,
                                                axis=0)
-            ad.xvardims[which_xvar_idx] = len(ad.xvars[which_shot_idx])
+            ad.xvardims[which_xvar_idx] = len(ad.xvars[which_xvar_idx])
 
         def slice_ndarray(array):
             sliced_array = np.take(array,
@@ -450,6 +552,7 @@ class atomdata():
         ad.params.N_shots_with_repeats = int(ad.params.N_shots_with_repeats / sliced_xvardim)
 
         ad.analyze()
+        ad._refresh_repeat_statistics()
 
         return ad
 
@@ -457,6 +560,327 @@ class atomdata():
 
     def _storage_key(self,key):
         return "_" + key + "_stored"
+
+    def _sem_scale_value(self, value, sem_divisor):
+        if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.number):
+            return value / sem_divisor
+        return value
+
+    def _sem_scale_scope_data(self, scope_data, sem_divisor):
+        scaled_scope = dict()
+        for scope_key, channel_dict in scope_data.items():
+            scaled_scope[scope_key] = dict()
+            for ch, trace in channel_dict.items():
+                t = trace.t
+                v = trace.v
+                if isinstance(t, np.ndarray) and np.issubdtype(t.dtype, np.number):
+                    t = t / sem_divisor
+                if isinstance(v, np.ndarray) and np.issubdtype(v.dtype, np.number):
+                    v = v / sem_divisor
+                scaled_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t, v)
+        return scaled_scope
+
+    def _copy_metadata_to_repeat_sibling(self, ad_out, xvar_idx, n_repeats):
+        from copy import deepcopy
+
+        ad_out._lite = self._lite
+        ad_out.server_talk = self.server_talk
+        ad_out._ds = self._ds
+        ad_out._dealer = None
+        ad_out.images = self.images
+        ad_out.image_timestamps = self.image_timestamps
+        ad_out.experiment_code = self.experiment_code
+
+        ad_out.params = deepcopy(self.params)
+        ad_out.p = ad_out.params
+        ad_out.camera_params = deepcopy(self.camera_params)
+        ad_out.run_info = deepcopy(self.run_info)
+        ad_out.roi = deepcopy(self.roi)
+
+        ad_out.xvarnames = deepcopy(self.xvarnames)
+        ad_out.xvars = [np.array(x, copy=True) for x in self.xvars]
+        ad_out.Nvars = len(ad_out.xvars)
+        ad_out.xvardims = np.array([len(x) for x in ad_out.xvars], dtype=int)
+
+        ad_out.xvars[xvar_idx] = self._get_unique_repeated_xvar(xvar_idx, n_repeats)
+        ad_out.xvardims[xvar_idx] = len(ad_out.xvars[xvar_idx])
+        for idx, key in enumerate(ad_out.xvarnames):
+            vars(ad_out.params)[key] = ad_out.xvars[idx]
+        ad_out.params.N_repeats = np.ones(ad_out.Nvars, dtype=int)
+
+        ad_out.sort_idx = np.array([])
+        ad_out.sort_N = np.array([])
+
+        ad_out.data = _RepeatDataVault()
+        ad_out.avg = None
+        ad_out.std = None
+        ad_out.sem = None
+        ad_out._repeat_sem_source = None
+        ad_out._repeat_sem_divisor = None
+
+        ad_out._analysis_tags = analysis_tags(self._analysis_tags.roi_id, self._analysis_tags.imaging_type)
+        ad_out._analysis_tags.xvars_shuffled = False
+        ad_out._analysis_tags.transposed = self._analysis_tags.transposed
+        ad_out._analysis_tags.averaged = False
+
+    def _reduce_repeat_ndarray(self, arr: np.ndarray, xvar_idx: int, n_repeats: int, reducer: str):
+        arr = np.asarray(arr)
+        split_shape = (*arr.shape[0:xvar_idx], -1, n_repeats, *arr.shape[(xvar_idx+1):])
+        reshaped = arr.reshape(split_shape)
+        if reducer == 'mean':
+            return np.mean(reshaped, axis=xvar_idx+1, dtype=np.float64)
+        if reducer == 'std':
+            return np.std(reshaped, axis=xvar_idx+1, dtype=np.float64)
+        raise ValueError(f'Unknown repeat reducer: {reducer}')
+
+    def _is_scan_shaped_numeric_array(self, value):
+        if not isinstance(value, np.ndarray):
+            return False
+        if not np.issubdtype(value.dtype, np.number):
+            return False
+        if value.ndim < self.Nvars:
+            return False
+        return tuple(value.shape[:self.Nvars]) == tuple(self.xvardims)
+
+    def _build_repeat_stat_atomdata(self, xvar_idx, n_repeats, reducer='mean'):
+        ad_out = object.__new__(atomdata)
+        self._copy_metadata_to_repeat_sibling(ad_out, xvar_idx, n_repeats)
+
+        reduce_op = lambda x: self._reduce_repeat_ndarray(x, xvar_idx, n_repeats, reducer)
+
+        for key, value in vars(self).items():
+            if key in ['avg', 'std', 'sem',
+                       '_repeat_sem_source', '_repeat_sem_divisor',
+                       'params', 'p', 'camera_params', 'run_info', 'roi',
+                       'data', 'scope_data', '_analysis_tags', '_dealer',
+                       '_ds', 'server_talk']:
+                continue
+            if self._is_scan_shaped_numeric_array(value):
+                vars(ad_out)[key] = reduce_op(value)
+            elif key not in vars(ad_out):
+                vars(ad_out)[key] = value
+
+        for key in self.data.keys:
+            value = vars(self.data)[key]
+            if self._is_scan_shaped_numeric_array(value):
+                vars(ad_out.data)[key] = reduce_op(value)
+            else:
+                vars(ad_out.data)[key] = value
+            ad_out.data.keys.append(key)
+
+        if hasattr(self, 'scope_data'):
+            ad_out.scope_data = dict()
+            for scope_key in self.scope_data.keys():
+                ad_out.scope_data[scope_key] = dict()
+                for ch, trace in self.scope_data[scope_key].items():
+                    t = trace.t
+                    v = trace.v
+                    if self._is_scan_shaped_numeric_array(t):
+                        t = reduce_op(t)
+                    if self._is_scan_shaped_numeric_array(v):
+                        v = reduce_op(v)
+                    ad_out.scope_data[scope_key][ch] = ScopeTraceArray(scope_key, ch, t, v)
+
+        return ad_out
+
+    def _build_repeat_sem_atomdata(self, std, n_repeats):
+        ad_sem = object.__new__(atomdata)
+        ad_sem._repeat_sem_source = std
+        ad_sem._repeat_sem_divisor = np.sqrt(n_repeats)
+        ad_sem.avg = None
+        ad_sem.std = None
+        ad_sem.sem = None
+        return ad_sem
+
+    def _clear_repeat_statistics(self):
+        self.avg = None
+        self.std = None
+        self.sem = None
+
+    def _refresh_repeat_statistics(self):
+        try:
+            xvar_idx, n_repeats = self._get_repeat_axis_info()
+            _ = self._get_unique_repeated_xvar(xvar_idx, n_repeats)
+        except Exception:
+            self._clear_repeat_statistics()
+            return
+
+        self.avg = self._build_repeat_stat_atomdata(xvar_idx, n_repeats, reducer='mean')
+        self.std = self._build_repeat_stat_atomdata(xvar_idx, n_repeats, reducer='std')
+        self.sem = self._build_repeat_sem_atomdata(self.std, n_repeats)
+
+    def _get_repeat_axis_info(self):
+        repeat_axes = []
+        repeat_counts = []
+        for axis_idx, values in enumerate(self.xvars):
+            values = np.asarray(values)
+            _, counts = np.unique(values, return_counts=True)
+            repeated_counts = counts[counts > 1]
+            if repeated_counts.size == 0:
+                continue
+            unique_counts = np.unique(repeated_counts)
+            if unique_counts.size != 1:
+                raise ValueError('Number of repeats per value of an xvar must be the same for all values.')
+            repeat_axes.append(axis_idx)
+            repeat_counts.append(int(unique_counts[0]))
+
+        if len(repeat_axes) == 0:
+            raise ValueError('No repeated xvar axis was found in this atomdata.')
+        if len(repeat_axes) > 1:
+            raise ValueError(f'Found repeated values on multiple xvar axes: {repeat_axes}.')
+        return repeat_axes[0], repeat_counts[0]
+
+    def _get_unique_repeated_xvar(self, xvar_idx, n_repeats):
+        values = np.asarray(self.xvars[xvar_idx])
+        if values.size % n_repeats != 0:
+            raise ValueError('Repeated xvar length must be divisible by the repeat count.')
+        reshaped = values.reshape(-1, n_repeats)
+        unique_values = reshaped[:, 0]
+        if not np.all(reshaped == unique_values[:, None]):
+            raise ValueError('Repeated xvar values must be grouped consecutively to reassign repeats.')
+        return unique_values
+
+    def _reassign_repeat_ndarray(self, arr, source_xvar_idx, target_xvar_idx, n_repeats, old_xvardims):
+        arr = np.asarray(arr)
+        old_xvardims = tuple(np.asarray(old_xvardims, dtype=int))
+        if arr.ndim < len(old_xvardims):
+            raise ValueError('Array does not have enough dimensions to match the scan axes.')
+        if tuple(arr.shape[:len(old_xvardims)]) != old_xvardims:
+            raise ValueError('Array leading dimensions do not match the current xvar dimensions.')
+
+        source_size = old_xvardims[source_xvar_idx]
+        if source_size % n_repeats != 0:
+            raise ValueError('Repeat axis length must be divisible by the repeat count.')
+
+        expanded_shape = list(old_xvardims)
+        expanded_shape[source_xvar_idx] = source_size // n_repeats
+        expanded_shape.insert(source_xvar_idx + 1, n_repeats)
+        arr = arr.reshape(*expanded_shape, *arr.shape[len(old_xvardims):])
+
+        expanded_axes = []
+        for axis_idx in range(len(old_xvardims)):
+            expanded_axis = axis_idx
+            if axis_idx > source_xvar_idx:
+                expanded_axis += 1
+            expanded_axes.append(expanded_axis)
+
+        repeat_axis = source_xvar_idx + 1
+        transpose_idx = []
+        for axis_idx, expanded_axis in enumerate(expanded_axes):
+            transpose_idx.append(expanded_axis)
+            if axis_idx == target_xvar_idx:
+                transpose_idx.append(repeat_axis)
+
+        trailing_axes = list(range(len(old_xvardims) + 1, arr.ndim))
+        arr = np.transpose(arr, transpose_idx + trailing_axes)
+
+        new_xvardims = list(old_xvardims)
+        new_xvardims[source_xvar_idx] //= n_repeats
+        new_xvardims[target_xvar_idx] *= n_repeats
+        arr = arr.reshape(*new_xvardims, *arr.shape[(len(old_xvardims) + 1):])
+        return arr
+
+    def reassign_repeats(self, xvar_idx):
+        """Move repeated shots from their current xvar axis to another axis.
+
+        This only supports data that is already unshuffled, with repeats created
+        by consecutive np.repeat calls on a single xvar axis.
+
+        Args:
+            xvar_idx (int): The xvar index that should own the repeats after the
+            reassignment.
+        """
+        if self._analysis_tags.xvars_shuffled:
+            raise ValueError('Repeat reassignment only supports unshuffled atomdata. Call unshuffle() first.')
+
+        if not isinstance(xvar_idx, (int, np.integer)):
+            raise TypeError('xvar_idx must be an integer.')
+        if xvar_idx < 0 or xvar_idx >= len(self.xvars):
+            raise IndexError('xvar_idx is out of range for this atomdata.')
+
+        source_xvar_idx, n_repeats = self._get_repeat_axis_info()
+        if source_xvar_idx == xvar_idx:
+            return
+
+        old_xvardims = np.array(self.xvardims, dtype=int)
+        self.img_atoms = self._reassign_repeat_ndarray(self.img_atoms,
+                                                       source_xvar_idx,
+                                                       xvar_idx,
+                                                       n_repeats,
+                                                       old_xvardims)
+        self.img_light = self._reassign_repeat_ndarray(self.img_light,
+                                                       source_xvar_idx,
+                                                       xvar_idx,
+                                                       n_repeats,
+                                                       old_xvardims)
+        self.img_dark = self._reassign_repeat_ndarray(self.img_dark,
+                                                      source_xvar_idx,
+                                                      xvar_idx,
+                                                      n_repeats,
+                                                      old_xvardims)
+
+        self.img_timestamp_atoms = self._reassign_repeat_ndarray(self.img_timestamp_atoms,
+                                                                 source_xvar_idx,
+                                                                 xvar_idx,
+                                                                 n_repeats,
+                                                                 old_xvardims)
+        self.img_timestamp_light = self._reassign_repeat_ndarray(self.img_timestamp_light,
+                                                                 source_xvar_idx,
+                                                                 xvar_idx,
+                                                                 n_repeats,
+                                                                 old_xvardims)
+        self.img_timestamp_dark = self._reassign_repeat_ndarray(self.img_timestamp_dark,
+                                                                source_xvar_idx,
+                                                                xvar_idx,
+                                                                n_repeats,
+                                                                old_xvardims)
+
+        for key in self.data.keys:
+            vars(self.data)[key] = self._reassign_repeat_ndarray(vars(self.data)[key],
+                                                                 source_xvar_idx,
+                                                                 xvar_idx,
+                                                                 n_repeats,
+                                                                 old_xvardims)
+
+        if hasattr(self,'scope_data'):
+            for scope_key in self.scope_data.keys():
+                for ch in self.scope_data[scope_key].keys():
+                    self.scope_data[scope_key][ch].t = self._reassign_repeat_ndarray(self.scope_data[scope_key][ch].t,
+                                                                                     source_xvar_idx,
+                                                                                     xvar_idx,
+                                                                                     n_repeats,
+                                                                                     old_xvardims)
+                    self.scope_data[scope_key][ch].v = self._reassign_repeat_ndarray(self.scope_data[scope_key][ch].v,
+                                                                                     source_xvar_idx,
+                                                                                     xvar_idx,
+                                                                                     n_repeats,
+                                                                                     old_xvardims)
+
+        self.xvars[source_xvar_idx] = self._get_unique_repeated_xvar(source_xvar_idx, n_repeats)
+        self.xvars[xvar_idx] = np.repeat(np.asarray(self.xvars[xvar_idx]), n_repeats)
+        self.xvardims = np.array([len(x) for x in self.xvars], dtype=int)
+        self.Nvars = len(self.xvars)
+        for axis_idx, key in enumerate(self.xvarnames):
+            vars(self.params)[key] = self.xvars[axis_idx]
+
+        new_n_repeats = np.ones(self.Nvars, dtype=int)
+        new_n_repeats[xvar_idx] = n_repeats
+        self.params.N_repeats = new_n_repeats
+
+        self.sort_idx = np.array([])
+        self.sort_N = np.array([])
+        self._dealer = self._init_dealer()
+        self.images = self._dealer.stack_linear_data_ndarray(self.img_atoms,
+                                                             self.img_light,
+                                                             self.img_dark)
+        self.image_timestamps = self._dealer.stack_linear_data_ndarray(self.img_timestamp_atoms,
+                                                                       self.img_timestamp_light,
+                                                                       self.img_timestamp_dark)
+        self._dealer.images = self.images
+        self._dealer.image_timestamps = self.image_timestamps
+
+        self._sort_images()
+        self.analyze()
 
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
         """
@@ -468,6 +892,7 @@ class atomdata():
             reanalyze (bool, optional): _description_. Defaults to True.
         """
         if not self._analysis_tags.averaged:
+            self._refresh_repeat_statistics()
             if not xvars_to_avg:
                 xvars_to_avg = list(range(len(self.xvars)))
             if not isinstance(xvars_to_avg,list):
@@ -564,6 +989,7 @@ class atomdata():
 
             self.analyze_ods()
             self._analysis_tags.averaged = False
+            self._refresh_repeat_statistics()
         else:
             print("Atomdata is not repeat averaged. To average, use Atomdata.avg_repeats().")
 
@@ -804,6 +1230,7 @@ class atomdata():
             unpack_group(f,'params',self.params)
             unpack_group(f,'camera_params',self.camera_params)
             unpack_group(f,'run_info',self.run_info)
+            print(self.run_info.run_id)
             self.images = f['data']['images'][()]
             self.image_timestamps = f['data']['image_timestamps'][()]
             self.xvarnames = f.attrs['xvarnames'][()]

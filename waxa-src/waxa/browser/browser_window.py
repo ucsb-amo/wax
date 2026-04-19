@@ -1,0 +1,2277 @@
+import json
+import os
+import re
+import sys
+from datetime import date, timedelta
+
+from PyQt6.QtCore import QDate, QSettings, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontDatabase, QKeySequence, QPen, QShortcut
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+    QStyle,
+)
+
+from .run_summary import RunSummary
+from .scanner import BatchLiteCreateWorker, LiteCreateWorker, RunScanner, ScanWorker, XvarDetailLoader
+from ..data.server_talk import server_talk
+
+
+class DateSeparatorDelegate(QStyledItemDelegate):
+    """Draw a subtle separator line above rows where the run date changes."""
+
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+
+        table = self.parent_window.table
+
+        # Draw a very subtle vertical divider at each column boundary.
+        if index.column() < table.columnCount() - 1:
+            painter.save()
+            pen = QPen(QColor("#e7edf2"))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            rect = option.rect
+            x = rect.right()
+            painter.drawLine(x, rect.top() + 3, x, rect.bottom() - 3)
+            painter.restore()
+
+        # Draw separators once per row (first column only) to avoid per-cell
+        # overhead on large tables.
+        if index.column() != 0:
+            return
+
+        if index.row() <= 0:
+            return
+
+        current_run = self.parent_window._get_run_for_row(index.row())
+        previous_run = self.parent_window._get_run_for_row(index.row() - 1)
+
+        if current_run is None or previous_run is None:
+            return
+
+        if current_run.run_date_str == previous_run.run_date_str:
+            return
+
+        painter.save()
+        pen = QPen(QColor("#bac6cf"))
+        pen.setWidth(1)
+        painter.setPen(pen)
+
+        rect = option.rect
+        left = 2
+        right = table.viewport().width() - 2
+        y = rect.top() + 1
+        painter.drawLine(left, y, right, y)
+        painter.restore()
+
+
+class CopyPathLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class ScrollableValueField(QScrollArea):
+    """Single-line scrollable value field that doesn't force parent width expansion."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._label = QLabel("-", self)
+        self._label.setWordWrap(False)
+        self._label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.setWidget(self._label)
+        self.setWidgetResizable(False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+
+        field_height = self.fontMetrics().height() + 10
+        self.setFixedHeight(field_height)
+
+    def setText(self, text: str):
+        value = "-" if text is None else str(text)
+        self._label.setText(value)
+        self._label.adjustSize()
+        self._label.setToolTip(value)
+        self.setToolTip(value)
+
+    def text(self):
+        return self._label.text()
+
+    def setTextInteractionFlags(self, flags):
+        self._label.setTextInteractionFlags(flags)
+
+
+class RunDetailPane(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        summary_group = QGroupBox("Run summary", self)
+        summary_form = QFormLayout(summary_group)
+        summary_form.setContentsMargins(10, 10, 10, 10)
+        summary_form.setVerticalSpacing(4)
+
+        self.run_id_value = QLabel("-", self)
+        self.datetime_value = QLabel("-", self)
+        self.experiment_value = ScrollableValueField(self)
+        self.xvardims_value = QLabel("-", self)
+        self.tags_value = QLabel("-", self)
+        self.comment_value = ScrollableValueField(self)
+        for label in [
+            self.run_id_value,
+            self.datetime_value,
+            self.experiment_value,
+            self.xvardims_value,
+            self.tags_value,
+            self.comment_value,
+        ]:
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        summary_form.addRow("Run ID", self.run_id_value)
+        summary_form.addRow("Datetime", self.datetime_value)
+        summary_form.addRow("Experiment", self.experiment_value)
+        summary_form.addRow("Xvar dims", self.xvardims_value)
+        summary_form.addRow("Tags", self.tags_value)
+        summary_form.addRow("Comment", self.comment_value)
+
+        xvars_group = QGroupBox("Xvars", self)
+        xvars_layout = QVBoxLayout(xvars_group)
+        xvars_layout.setContentsMargins(10, 10, 10, 10)
+        self.xvar_table = QTableWidget(self)
+        self.xvar_table.setObjectName("xvarTable")
+        self.xvar_table.setColumnCount(5)
+        self.xvar_table.setHorizontalHeaderLabels(["xvarname", "min", "max", "unit", "N"])
+        self.xvar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.xvar_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.xvar_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.xvar_table.setAlternatingRowColors(True)
+        self.xvar_table.setShowGrid(False)
+        self.xvar_table.verticalHeader().setVisible(False)
+        xvar_header = self.xvar_table.horizontalHeader()
+        xvar_header.setStretchLastSection(False)
+        xvar_header.setSectionsMovable(False)
+        xvar_header.setMinimumSectionSize(30)
+        xvar_header.setDefaultSectionSize(22)
+        xvar_header.setMaximumHeight(22)
+        for col in range(5):
+            xvar_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        # Col 0 (xvarname) stretches; fixed widths for numeric/unit cols
+        xvar_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        xvar_header.resizeSection(1, 72)
+        xvar_header.resizeSection(2, 72)
+        xvar_header.resizeSection(3, 52)
+        xvar_header.resizeSection(4, 38)
+        self.xvar_table.setMinimumHeight(80)
+        xvars_layout.addWidget(self.xvar_table)
+
+        containers_group = QGroupBox("Data containers", self)
+        containers_layout = QVBoxLayout(containers_group)
+        containers_layout.setContentsMargins(10, 10, 10, 10)
+        self.data_list = QListWidget(self)
+        self.data_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.data_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.data_list.setMinimumHeight(140)
+        containers_layout.addWidget(self.data_list)
+
+        paths_group = QFrame(self)
+        paths_group.setObjectName("pathsRow")
+        paths_layout = QHBoxLayout(paths_group)
+        paths_layout.setContentsMargins(0, 0, 0, 0)
+        paths_layout.setSpacing(6)
+        self.experiment_path_value = CopyPathLabel("-", self)
+        self.filepath_value = CopyPathLabel("-", self)
+        self.experiment_path_value.setWordWrap(False)
+        self.filepath_value.setWordWrap(False)
+        self.experiment_path_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.filepath_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.experiment_path_value.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.filepath_value.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.experiment_path_value.setObjectName("pathValueLabel")
+        self.filepath_value.setObjectName("pathValueLabel")
+        self.experiment_path_value.setToolTip("-")
+        self.filepath_value.setToolTip("-")
+        self.experiment_path_value.clicked.connect(
+            lambda: self._copy_path_text(self.experiment_path_value.text(), "Experiment")
+        )
+        self.filepath_value.clicked.connect(lambda: self._copy_path_text(self.filepath_value.text(), "HDF5"))
+
+        self.exp_open_btn = QToolButton(self)
+        self.exp_open_btn.setToolTip("Open experiment folder")
+        self.exp_open_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.exp_open_btn.clicked.connect(
+            lambda: self._open_path_directory(self.experiment_path_value.toolTip())
+        )
+
+        self.h5_open_btn = QToolButton(self)
+        self.h5_open_btn.setToolTip("Open HDF5 folder")
+        self.h5_open_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.h5_open_btn.clicked.connect(lambda: self._open_path_directory(self.filepath_value.toolTip()))
+
+        # expt pill: folder button + path label
+        exp_pill = QFrame(self)
+        exp_pill.setObjectName("pathPill")
+        exp_pill_layout = QHBoxLayout(exp_pill)
+        exp_pill_layout.setContentsMargins(4, 2, 6, 2)
+        exp_pill_layout.setSpacing(4)
+        exp_pill_layout.addWidget(self.exp_open_btn)
+        exp_pill_layout.addWidget(self.experiment_path_value, 1)
+
+        # h5 pill: folder button + path label
+        h5_pill = QFrame(self)
+        h5_pill.setObjectName("pathPill")
+        h5_pill_layout = QHBoxLayout(h5_pill)
+        h5_pill_layout.setContentsMargins(4, 2, 6, 2)
+        h5_pill_layout.setSpacing(4)
+        h5_pill_layout.addWidget(self.h5_open_btn)
+        h5_pill_layout.addWidget(self.filepath_value, 1)
+
+        paths_layout.addWidget(exp_pill, 1)
+        paths_layout.addWidget(h5_pill, 1)
+
+        paths_group.setMaximumHeight(36)
+
+        right_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        right_splitter.addWidget(xvars_group)
+        right_splitter.addWidget(containers_group)
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setSizes([430, 300])
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        main_splitter.addWidget(summary_group)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 4)
+        main_splitter.setSizes([220, 760])
+
+        layout.addWidget(main_splitter, 1)
+        layout.addWidget(paths_group, 0)
+
+    @staticmethod
+    def _shorten_path(path: str) -> str:
+        """Replace everything up to and including the 'code' folder with '%code%'."""
+        if not path or path == "-":
+            return path
+        # Normalise separators for matching, then find the 'code' segment
+        norm = path.replace("\\", "/")
+        lower = norm.lower()
+        # Match e.g. "c:/users/bananas/code/" or ending exactly at "code"
+        import re as _re
+        m = _re.search(r'^.+?/code(?=/|$)', lower)
+        if not m:
+            return path
+        remainder = norm[m.end():].lstrip("/")
+        return "%code%/" + remainder if remainder else "%code%"
+
+    def _copy_path_text(self, path_text: str, label: str):
+        clean = (path_text or "").strip()
+        if not clean or clean == "-":
+            self.show_message(f"No {label.lower()} path to copy.")
+            return
+        QApplication.clipboard().setText(clean)
+        self.show_message(f"Copied {label.lower()} path to clipboard.")
+
+    def _open_path_directory(self, path_text: str):
+        path_text = self._shorten_path(path_text)
+        clean = (path_text or "").strip()
+        if not clean or clean == "-":
+            self.show_message("No path available.")
+            return
+
+        # Expand %VAR% placeholders (e.g. %code%) so shortened paths work too
+        expanded = os.path.expandvars(clean)
+        path = os.path.normpath(expanded)
+        if os.path.isdir(path):
+            folder = path
+        else:
+            folder = os.path.dirname(path)
+
+        if not folder or not os.path.isdir(folder):
+            self.show_message("Folder does not exist for this path.")
+            return
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        self.show_message("Opened folder in system file explorer.")
+
+    def _open_file_in_default_program(self, path_text: str, label: str = "file"):
+        clean = (path_text or "").strip()
+        if not clean or clean == "-":
+            self.show_message(f"No {label.lower()} available.")
+            return
+
+        expanded = os.path.expandvars(clean)
+        path = os.path.normpath(expanded)
+        if not os.path.isfile(path):
+            self.show_message(f"{label} does not exist for this path.")
+            return
+
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        if opened:
+            self.show_message(f"Opened {label.lower()} in default program.")
+        else:
+            self.show_message(f"Could not open {label.lower()} in default program.")
+
+    def show_message(self, text: str):
+        window = self.window()
+        if hasattr(window, "status_label"):
+            window.status_label.setText(text)
+
+    def clear_details(self):
+        self.run_id_value.setText("-")
+        self.datetime_value.setText("-")
+        self.experiment_value.setText("-")
+        self.xvardims_value.setText("-")
+        self.tags_value.setText("-")
+        self.comment_value.setText("-")
+        self.experiment_path_value.setText("-")
+        self.filepath_value.setText("-")
+        self.experiment_path_value.setToolTip("-")
+        self.filepath_value.setToolTip("-")
+        self.xvar_table.setRowCount(0)
+        self.data_list.clear()
+        self.show_message("Select a run to load details.")
+
+    def set_run(self, run: RunSummary, datetime_text: str, xvardims_text: str):
+        self.run_id_value.setText(str(run.run_id))
+        self.datetime_value.setText(datetime_text or "-")
+        self.experiment_value.setText(run.experiment_name or "-")
+        self.xvardims_value.setText(xvardims_text or "()")
+        self.tags_value.setText(", ".join(run.tags) if run.tags else "-")
+        self.comment_value.setText(run.comment if run.comment else "-")
+        self.experiment_path_value.setText(self._shorten_path(run.experiment_filepath or "-"))
+        self.filepath_value.setText(self._shorten_path(run.filepath or "-"))
+        self.experiment_path_value.setToolTip(run.experiment_filepath or "-")
+        self.filepath_value.setToolTip(run.filepath or "-")
+
+        rows = run.xvar_details or [{"name": "(no xvar details)", "min": "", "max": "", "n": ""}]
+        self.xvar_table.setRowCount(len(rows))
+        for row_idx, item in enumerate(rows):
+            values = [
+                item["name"],
+                item["min"],
+                item["max"],
+                item.get("unit", ""),
+                str(item["n"]),
+            ]
+            for col_idx, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                self.xvar_table.setItem(row_idx, col_idx, table_item)
+
+        self.data_list.clear()
+        if run.data_container_keys:
+            for key in run.data_container_keys:
+                QListWidgetItem(key, self.data_list)
+        else:
+            QListWidgetItem("(none)", self.data_list)
+
+
+class DataBrowserWindow(QMainWindow):
+    COL_RUN_ID = 0
+    COL_DATETIME = 1
+    COL_EXPERIMENT = 2
+    COL_XVARDIMS = 3
+    COL_XVARS = 4
+    COL_DATA_KEYS = 5
+    COL_SCOPE = 6
+    COL_LITE = 7
+    COL_TAGS = 8
+    COLUMN_LABELS = {
+        COL_RUN_ID: "run_id",
+        COL_DATETIME: "datetime",
+        COL_EXPERIMENT: "experiment",
+        COL_XVARDIMS: "xvardims",
+        COL_XVARS: "xvarnames",
+        COL_DATA_KEYS: "data containers",
+        COL_SCOPE: "scope",
+        COL_LITE: "lite",
+        COL_TAGS: "tags",
+    }
+
+    def __init__(self, data_dir: str):
+        super().__init__()
+        self.settings = QSettings("WeldLab", "WAXADataBrowser")
+        # Prefer a user-overridden data dir from settings; fall back to what was passed
+        saved_dir = self.settings.value("dataDir", "", type=str)
+        self.data_dir = saved_dir if (saved_dir and os.path.isdir(saved_dir)) else data_dir
+        self._scan_worker = None
+        self._xvar_loader = None
+        self._lite_worker = None
+        self._scan_request_id = 0
+        self._detail_request_id = 0
+
+        self._runs_by_id = {}
+        self._scan_loaded_count = 0
+        self._active_filter_terms = []
+        self._field_actions = {}
+        self._busy_ops = 0
+        self._pending_focus_run_id = None
+        self._pending_requested_run_id = None
+        self._server_talk = server_talk(data_dir=self.data_dir)
+
+        self.setWindowTitle("Data Browser")
+        self.resize(980, 760)
+        self.setMinimumSize(980, 620)
+
+        self._setup_ui()
+        self._start_scan()
+
+    def _setup_ui(self):
+        root = QWidget(self)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        self.date_from = QDateEdit(self)
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(QDate.currentDate().addDays(-7))
+
+        self.date_to = QDateEdit(self)
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(QDate.currentDate())
+
+        self.refresh_btn = QPushButton("Refresh", self)
+        self.refresh_btn.clicked.connect(self._start_scan)
+
+        self.fields_btn = QToolButton(self)
+        self.fields_btn.setText("Fields")
+        self.fields_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.fields_menu = QMenu(self.fields_btn)
+        self.fields_btn.setMenu(self.fields_menu)
+
+        self.status_label = QLabel("Ready", self)
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setMinimumHeight(22)
+        self.status_label.setMaximumHeight(22)
+        self.activity_indicator = QLabel("", self)
+        self.activity_indicator.setObjectName("activityIndicator")
+        self.activity_indicator.setFixedSize(14, 14)
+
+        date_group = QFrame(self)
+        date_group.setObjectName("toolbarGroup")
+        date_group_layout = QHBoxLayout(date_group)
+        date_group_layout.setContentsMargins(8, 4, 8, 4)
+        date_group_layout.setSpacing(6)
+        date_group_layout.addWidget(self.refresh_btn)
+        date_group_layout.addWidget(QLabel("From", self))
+        date_group_layout.addWidget(self.date_from)
+        date_group_layout.addWidget(QLabel("To", self))
+        date_group_layout.addWidget(self.date_to)
+        self.loaded_chip = self._make_stat_chip("Loaded", "0")
+        self.visible_chip = self._make_stat_chip("Visible", "0")
+        self.selected_chip = self._make_stat_chip("Selected", "none")
+        self.visible_chip.hide()
+        self.selected_chip.hide()
+
+        self.today_btn = QToolButton(self)
+        self.today_btn.setText("Today")
+        self.today_btn.clicked.connect(lambda: self._apply_date_preset(0))
+        self.three_day_btn = QToolButton(self)
+        self.three_day_btn.setText("3 days")
+        self.three_day_btn.clicked.connect(lambda: self._apply_date_preset(2))
+        self.week_btn = QToolButton(self)
+        self.week_btn.setText("1 week")
+        self.week_btn.clicked.connect(lambda: self._apply_date_preset(6))
+        self.month_btn = QToolButton(self)
+        self.month_btn.setText("1 month")
+        self.month_btn.clicked.connect(lambda: self._apply_date_preset(29))
+        preset_group = QFrame(self)
+        preset_group.setObjectName("toolbarGroup")
+        preset_group_layout = QHBoxLayout(preset_group)
+        preset_group_layout.setContentsMargins(8, 4, 8, 4)
+        preset_group_layout.setSpacing(6)
+        for button in [self.today_btn, self.three_day_btn, self.week_btn, self.month_btn]:
+            preset_group_layout.addWidget(button)
+
+        toolbar.addWidget(date_group)
+        toolbar.addWidget(preset_group)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.loaded_chip)
+        toolbar.addWidget(self.activity_indicator)
+
+        self.options_btn = QToolButton(self)
+        self.options_btn.setToolTip("Options")
+        self.options_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.options_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.options_menu = QMenu(self.options_btn)
+        self.options_btn.setMenu(self.options_menu)
+
+        self.search_input = QLineEdit(self)
+        self.search_input.setPlaceholderText("xvarname search")
+        self.search_input.textChanged.connect(self._on_filter_text_changed)
+        self.search_input.setClearButtonEnabled(True)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        self.run_id_jump_input = QLineEdit(self)
+        self.run_id_jump_input.setPlaceholderText("by run ID")
+        self.run_id_jump_input.setFixedWidth(110)
+        self.run_id_jump_input.returnPressed.connect(self._jump_to_run_id)
+
+        self.run_id_jump_btn = QPushButton("Go", self)
+        self.run_id_jump_btn.setFixedWidth(44)
+        self.run_id_jump_btn.clicked.connect(self._jump_to_run_id)
+
+        self.experiment_filter_input = QLineEdit(self)
+        self.experiment_filter_input.setPlaceholderText("experiment search")
+        self.experiment_filter_input.textChanged.connect(self._on_filter_text_changed)
+
+        self.tag_filter_input = QLineEdit(self)
+        self.tag_filter_input.setPlaceholderText("tag search")
+        self.tag_filter_input.setClearButtonEnabled(True)
+        self.tag_filter_input.textChanged.connect(self._on_filter_text_changed)
+
+        filter_row.addWidget(self.run_id_jump_input)
+        filter_row.addWidget(self.run_id_jump_btn)
+        filter_row.addWidget(self.search_input, 2)
+        filter_row.addWidget(self.experiment_filter_input, 2)
+        filter_row.addWidget(self.tag_filter_input, 1)
+        filter_row.addWidget(self.fields_btn)
+        filter_row.addWidget(self.options_btn)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "run_id",
+                "datetime",
+                "experiment",
+                "xvardims",
+                "xvarnames",
+                "data containers",
+                "scope",
+                "lite",
+                "tags",
+            ]
+        )
+        self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setShowGrid(False)
+        self.table.setCornerButtonEnabled(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(self.COL_RUN_ID, 78)
+        header.resizeSection(self.COL_DATETIME, 185)
+        header.resizeSection(self.COL_EXPERIMENT, 190)
+        header.resizeSection(self.COL_XVARDIMS, 90)
+        header.resizeSection(self.COL_XVARS, 230)
+        header.resizeSection(self.COL_DATA_KEYS, 250)
+        header.resizeSection(self.COL_SCOPE, 70)
+        header.resizeSection(self.COL_LITE, 58)
+        header.resizeSection(self.COL_TAGS, 180)
+        header.sortIndicatorChanged.connect(self._refresh_date_separators)
+
+        self._date_separator_delegate = DateSeparatorDelegate(self)
+        self.table.setItemDelegate(self._date_separator_delegate)
+        self._initialize_field_selector()
+        self._load_field_visibility_settings()
+        self._initialize_options_menu()
+
+        self.detail_pane = RunDetailPane(self)
+
+        splitter = QSplitter(Qt.Orientation.Vertical, self)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self.detail_pane)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([560, 150])
+
+        self._splitter = splitter
+
+        self._apply_styles()
+
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(0)
+        status_row.addWidget(self.status_label, 1)
+
+        layout.addLayout(toolbar)
+        layout.addLayout(filter_row)
+        layout.addWidget(splitter)
+        layout.addLayout(status_row)
+
+        # Keep filter-row navigation deterministic left-to-right.
+        QWidget.setTabOrder(self.run_id_jump_input, self.run_id_jump_btn)
+        QWidget.setTabOrder(self.run_id_jump_btn, self.search_input)
+        QWidget.setTabOrder(self.search_input, self.experiment_filter_input)
+        QWidget.setTabOrder(self.experiment_filter_input, self.tag_filter_input)
+
+        self.setCentralWidget(root)
+        self._install_shortcuts()
+        self._set_activity_idle()
+
+    def _initialize_field_selector(self):
+        self.fields_menu.clear()
+        self._field_actions = {}
+
+        for col in range(self.table.columnCount()):
+            label = self.COLUMN_LABELS.get(col, self.table.horizontalHeaderItem(col).text())
+            action = QAction(label, self.fields_menu)
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.toggled.connect(lambda checked, c=col: self._on_field_toggled(c, checked))
+            self.fields_menu.addAction(action)
+            self._field_actions[col] = action
+
+    def _on_field_toggled(self, column: int, checked: bool):
+        visible_cols = [
+            col for col, action in self._field_actions.items() if action.isChecked() or col == column and checked
+        ]
+        if not visible_cols:
+            # Keep at least one field visible to avoid a blank table.
+            action = self._field_actions.get(column)
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(True)
+                action.blockSignals(False)
+            self.status_label.setText("At least one field must stay visible")
+            return
+
+        self.table.setColumnHidden(column, not checked)
+        self._save_field_visibility_settings()
+
+    def _save_field_visibility_settings(self):
+        visible_columns = [
+            int(col) for col, action in self._field_actions.items() if action.isChecked()
+        ]
+        self.settings.setValue("tableVisibleColumns", visible_columns)
+
+    def _load_field_visibility_settings(self):
+        raw = self.settings.value("tableVisibleColumns", [], type=list)
+        if not isinstance(raw, list):
+            raw = []
+
+        try:
+            visible = {int(item) for item in raw}
+        except Exception:
+            visible = set()
+
+        if not visible:
+            # Default: hide bulky/secondary columns; keep tags visible.
+            visible = set(range(self.table.columnCount())) - {
+                self.COL_DATA_KEYS,
+                self.COL_SCOPE,
+                self.COL_LITE,
+            }
+
+        for col in range(self.table.columnCount()):
+            should_show = col in visible
+            action = self._field_actions.get(col)
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(should_show)
+                action.blockSignals(False)
+            self.table.setColumnHidden(col, not should_show)
+
+    def _make_stat_chip(self, label: str, value: str):
+        chip = QFrame(self)
+        chip.setObjectName("statChip")
+        chip_layout = QVBoxLayout(chip)
+        chip_layout.setContentsMargins(8, 5, 8, 5)
+        chip_layout.setSpacing(0)
+
+        label_widget = QLabel(label, chip)
+        label_widget.setObjectName("statChipLabel")
+        value_widget = QLabel(value, chip)
+        value_widget.setObjectName("statChipValue")
+        chip_layout.addWidget(label_widget)
+        chip_layout.addWidget(value_widget)
+        chip.value_widget = value_widget
+        return chip
+
+    def _set_stat_chip_value(self, chip: QFrame, value: str):
+        chip.value_widget.setText(value)
+
+    def _set_activity_busy(self, text=None):
+        self._busy_ops += 1
+        self.activity_indicator.setStyleSheet(
+            "QLabel#activityIndicator {"
+            "background: #f7b955; border: 1px solid #d59b3c;"
+            "border-radius: 7px; min-width: 14px; max-width: 14px;"
+            "min-height: 14px; max-height: 14px; }"
+        )
+        if text:
+            self.status_label.setText(text)
+
+    def _set_activity_idle(self, text=None):
+        self._busy_ops = max(0, self._busy_ops - 1)
+        if self._busy_ops > 0:
+            return
+        self.activity_indicator.setStyleSheet(
+            "QLabel#activityIndicator {"
+            "background: #63c889; border: 1px solid #49a66f;"
+            "border-radius: 7px; min-width: 14px; max-width: 14px;"
+            "min-height: 14px; max-height: 14px; }"
+        )
+        if text:
+            self.status_label.setText(text)
+
+    def _apply_styles(self):
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #eef3f6;
+            }
+            QLabel {
+                color: #22303a;
+            }
+            QFrame#statChip {
+                background: #ffffff;
+                border: 1px solid #d7dfe6;
+                border-radius: 8px;
+            }
+            QFrame#toolbarGroup {
+                background: #ffffff;
+                border: 1px solid #d7dfe6;
+                border-radius: 8px;
+            }
+            QLabel#statChipLabel {
+                color: #71828c;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QLabel#statChipValue {
+                color: #17384b;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QLineEdit, QDateEdit, QPushButton, QComboBox, QListWidget, QTableWidget {
+                background: #ffffff;
+                border: 1px solid #d5dde4;
+                border-radius: 8px;
+                padding: 4px 7px;
+                min-height: 22px;
+            }
+            QLineEdit:focus, QDateEdit:focus, QTableWidget:focus, QComboBox:focus, QListWidget:focus {
+                border: 1px solid #6f93aa;
+            }
+            QPushButton, QToolButton {
+                background: #1d506b;
+                color: #ffffff;
+                font-weight: 600;
+                padding: 4px 10px;
+                border: none;
+                border-radius: 8px;
+                min-height: 22px;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background: #276382;
+            }
+            QGroupBox {
+                color: #2a3f4b;
+                font-weight: 700;
+                border: 1px solid #d7dfe6;
+                border-radius: 8px;
+                margin-top: 6px;
+                background: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }
+            QLabel#statusLabel {
+                color: #495d69;
+                padding: 2px 4px 0 4px;
+            }
+            QLabel#pathBadge {
+                color: #0f3a4f;
+                background: #d9edf7;
+                border: 1px solid #b8d7e6;
+                border-radius: 5px;
+                padding: 0px 4px;
+                font-weight: 700;
+                font-size: 10px;
+            }
+            QLabel#pathValueLabel {
+                color: #0b4d6f;
+                text-decoration: underline;
+                padding: 0 2px;
+            }
+            QLabel#pathValueLabel:hover {
+                color: #0a6c96;
+            }
+            QFrame#pathPill {
+                background: #f0f6fa;
+                border: 1px solid #c8dbe6;
+                border-radius: 6px;
+            }
+            QHeaderView::section {
+                background: #ebf1f4;
+                color: #2a3f4b;
+                border: none;
+                border-right: 1px solid #d6dee5;
+                border-bottom: 1px solid #d6dee5;
+                padding: 2px 5px;
+                font-weight: 700;
+            }
+            QTableWidget#xvarTable QHeaderView::section {
+                padding: 1px 4px;
+                font-weight: 700;
+            }
+            QTableWidget {
+                alternate-background-color: #f8fbfc;
+                selection-background-color: #dcebf3;
+                selection-color: #13212b;
+            }
+            QMenu {
+                background: #ffffff;
+                color: #22303a;
+                border: 1px solid #d5dde4;
+            }
+            QMenu::item:disabled {
+                color: #a8b6bf;
+            }
+            QSplitter::handle {
+                background: #dbe4ea;
+                height: 6px;
+            }
+            QSplitter::handle:hover {
+                background: #c1ccd5;
+            }
+            """
+        )
+
+    def _fixed_width_font(self):
+        families = QFontDatabase.families()
+        preferred = ["Consolas", "Cascadia Mono", "Courier New"]
+        for family in preferred:
+            if family in families:
+                return QFont(family, 10)
+        font = QFont()
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPointSize(10)
+        return font
+
+    def _start_scan(self):
+        if not self.data_dir:
+            self.status_label.setText("DATA_DIR is empty")
+            return
+
+        self._set_activity_busy("Scanning data…")
+
+        self._scan_request_id += 1
+        current_scan_id = self._scan_request_id
+        self._detail_request_id += 1
+
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.request_stop()
+            # Do not wait here; stale worker outputs are ignored via request ids.
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        self._runs_by_id = {}
+        self._scan_loaded_count = 0
+        self.detail_pane.clear_details()
+        self._set_stat_chip_value(self.loaded_chip, "0")
+        self._set_stat_chip_value(self.visible_chip, "0")
+        self._set_stat_chip_value(self.selected_chip, "none")
+
+        date_from = self.date_from.date().toPyDate()
+        date_to = self.date_to.date().toPyDate()
+        self._active_filter_terms = self._parse_search_terms(self.search_input.text())
+
+        if date_from > date_to:
+            self.status_label.setText("Invalid date range")
+            self._set_activity_idle()
+            return
+
+        scanner = RunScanner(self.data_dir, date_from, date_to)
+        self._scan_worker = ScanWorker(scanner, batch_size=256)
+        self._scan_worker.run_batch_found.connect(
+            lambda runs, rid=current_scan_id: self._append_run_batch_guarded(runs, rid)
+        )
+        # Backward-compatible path if the worker emits single rows.
+        self._scan_worker.run_found.connect(
+            lambda run, rid=current_scan_id: self._append_run_guarded(run, rid)
+        )
+        self._scan_worker.scan_done.connect(
+            lambda count, rid=current_scan_id: self._on_scan_done_guarded(count, rid)
+        )
+        self._scan_worker.scan_error.connect(
+            lambda msg, rid=current_scan_id: self._on_scan_error_guarded(msg, rid)
+        )
+
+        self.refresh_btn.setEnabled(False)
+        self.status_label.setText("Scanning...")
+        self._scan_worker.start()
+
+    def _append_run(self, run: RunSummary):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        run_id_item = QTableWidgetItem(str(run.run_id))
+        run_id_item.setData(Qt.ItemDataRole.UserRole, int(run.run_id))
+        datetime_item = QTableWidgetItem(self._format_datetime_for_table(run.run_datetime_str))
+        datetime_item.setData(Qt.ItemDataRole.UserRole, run.run_datetime_str)
+        expt_item = QTableWidgetItem(run.experiment_name or "-")
+        expt_item.setToolTip(run.experiment_filepath or run.experiment_name or "")
+        xvardims_item = QTableWidgetItem(self._format_xvardims(run.xvardims))
+        xvars_item = QTableWidgetItem(self._format_name_list_for_table(run.xvarnames))
+        xvars_item.setToolTip("\n".join(run.xvarnames))
+
+        data_preview = self._format_data_container_preview(run.data_container_keys)
+        data_item = QTableWidgetItem(data_preview)
+        data_item.setToolTip("\n".join(run.data_container_keys))
+
+        scope_item = QTableWidgetItem("yes" if run.has_scope_data else "-")
+        lite_item = QTableWidgetItem("lite" if run.has_lite else "-")
+        tags_item = QTableWidgetItem(", ".join(run.tags) if run.tags else "")
+
+        self.table.setItem(row, self.COL_RUN_ID, run_id_item)
+        self.table.setItem(row, self.COL_DATETIME, datetime_item)
+        self.table.setItem(row, self.COL_EXPERIMENT, expt_item)
+        self.table.setItem(row, self.COL_XVARDIMS, xvardims_item)
+        self.table.setItem(row, self.COL_XVARS, xvars_item)
+        self.table.setItem(row, self.COL_DATA_KEYS, data_item)
+        self.table.setItem(row, self.COL_SCOPE, scope_item)
+        self.table.setItem(row, self.COL_LITE, lite_item)
+        self.table.setItem(row, self.COL_TAGS, tags_item)
+
+        if run.has_lite:
+            self._set_lite_highlight(row, True)
+
+        self._style_row_items(row, run)
+
+        self._runs_by_id[run.run_id] = run
+        self._scan_loaded_count += 1
+
+        if self._active_filter_terms:
+            self.table.setRowHidden(row, not self._run_matches_terms(run, self._active_filter_terms))
+
+        if self._scan_loaded_count <= 10 or self._scan_loaded_count % 50 == 0:
+            self.status_label.setText("Scanning...")
+        self._update_summary_chips()
+
+    def _append_run_batch(self, runs: list):
+        if not runs:
+            return
+
+        self.table.setUpdatesEnabled(False)
+        try:
+            for run in runs:
+                self._append_run(run)
+        finally:
+            self.table.setUpdatesEnabled(True)
+
+    def _append_run_guarded(self, run: RunSummary, scan_request_id: int):
+        if scan_request_id != self._scan_request_id:
+            return
+        self._append_run(run)
+
+    def _append_run_batch_guarded(self, runs: list, scan_request_id: int):
+        if scan_request_id != self._scan_request_id:
+            return
+        self._append_run_batch(runs)
+
+    def _on_filter_text_changed(self, *_args):
+        self._active_filter_terms = self._parse_search_terms(self.search_input.text())
+        self._apply_filter()
+
+    def _apply_date_preset(self, days_back: int):
+        self.date_to.setDate(QDate.currentDate())
+        self.date_from.setDate(QDate.currentDate().addDays(-days_back))
+        self._start_scan()
+
+    def _jump_to_run_id(self):
+        self._set_activity_busy("Searching run ID…")
+        raw = self.run_id_jump_input.text().strip()
+        if not raw:
+            self.status_label.setText("Enter a run ID")
+            self._set_activity_idle()
+            return
+        try:
+            requested_run_id = int(raw)
+        except ValueError:
+            self.status_label.setText("Run ID must be an integer")
+            self._set_activity_idle()
+            return
+
+        resolved_run_id, run_date = self._find_nearest_run_date_and_id(requested_run_id)
+        if resolved_run_id is None or run_date is None:
+            self.status_label.setText("No HDF5 runs found in data directory")
+            self._set_activity_idle()
+            return
+
+        center_qdate = QDate(run_date.year, run_date.month, run_date.day)
+        self.date_from.setDate(center_qdate.addDays(-3))
+        self.date_to.setDate(center_qdate.addDays(3))
+
+        # Clear active filters so the target row stays visible.
+        self.search_input.clear()
+        self.experiment_filter_input.clear()
+        self.tag_filter_input.clear()
+
+        self._pending_focus_run_id = int(resolved_run_id)
+        self._pending_requested_run_id = int(requested_run_id)
+        self._set_activity_idle()
+        self._start_scan()
+
+    def _find_nearest_run_date_and_id(self, requested_run_id: int):
+        try:
+            return self._server_talk.find_nearest_run_date_and_id(requested_run_id)
+        except Exception:
+            return None, None
+
+    def _focus_row_by_run_id(self, run_id: int):
+        row = self._find_row_for_run_id(run_id)
+        if row is None:
+            return False
+        self.table.selectRow(row)
+        item = self.table.item(row, self.COL_RUN_ID)
+        if item is not None:
+            self.table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+        return True
+
+    def _install_shortcuts(self):
+
+        refresh_ctrl_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        refresh_ctrl_shortcut.activated.connect(self._start_scan)
+
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        copy_shortcut.activated.connect(self._copy_selected_run_id)
+
+        copy_lite_shortcut = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        copy_lite_shortcut.activated.connect(self._copy_selected_lite_arg)
+
+        create_lite_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        create_lite_shortcut.activated.connect(self._create_lite_for_selected)
+
+        open_data_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
+        open_data_shortcut.activated.connect(self._open_selected_data_location)
+
+        open_experiment_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        open_experiment_shortcut.activated.connect(self._open_selected_experiment_location)
+
+        edit_tags_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        edit_tags_shortcut.activated.connect(self._edit_tags_for_selected)
+
+        cycle_search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        cycle_search_shortcut.activated.connect(self._focus_next_search_field)
+
+    def _show_hotkeys_guide(self):
+        entries = [
+            ("Ctrl+L", "Create lite dataset(s)"),
+            ("Ctrl+D", "Open data location"),
+            ("Ctrl+E", "Open experiment location"),
+            ("Ctrl+T", "Edit tags for selected run"),
+            ("Ctrl+F", "Cycle search focus: xvar -> experiment -> tag"),
+            ("Ctrl+R", "Refresh")
+        ]
+        text = "\n".join(f"{key:<8} {description}" for key, description in entries)
+        QMessageBox.information(self, "Hotkeys", text)
+
+    def _focus_next_search_field(self):
+        fields = [self.search_input, self.experiment_filter_input, self.tag_filter_input]
+        focused = self.focusWidget()
+        if focused in fields:
+            idx = fields.index(focused)
+            target = fields[(idx + 1) % len(fields)]
+        else:
+            target = fields[0]
+        target.setFocus()
+        target.selectAll()
+
+    def _open_selected_data_location(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            self.status_label.setText("No run selected")
+            return
+        self.detail_pane._open_path_directory(run.filepath)
+
+    def _open_selected_experiment_location(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            self.status_label.setText("No run selected")
+            return
+        self.detail_pane._open_path_directory(run.experiment_filepath)
+
+    def _edit_tags_for_selected(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            self.status_label.setText("No run selected")
+            return
+        self._edit_tags_for_run(run, row)
+
+    def _load_saved_searches(self):
+        pass  # removed — saved searches feature has been removed
+
+    def _save_current_search(self):
+        pass
+
+    def _apply_saved_search(self, index: int):
+        pass
+
+    def _copy_selected_run_id(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            return
+        QApplication.clipboard().setText(str(run.run_id))
+        self.status_label.setText(f"Copied: {run.run_id}")
+
+    def _copy_selected_lite_arg(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None or not run.has_lite:
+            return
+        text = f"{run.run_id}, lite=True"
+        QApplication.clipboard().setText(text)
+        self.status_label.setText(f"Copied: {text}")
+
+    def _create_lite_for_selected(self):
+        selected_rows = self._get_selected_rows()
+        run_ids = []
+        for row in selected_rows:
+            run = self._get_run_for_row(row)
+            if run is not None:
+                run_ids.append(int(run.run_id))
+        if not run_ids:
+            return
+        self._start_lite_creation_for_runs(run_ids)
+
+    def _format_data_container_preview(self, keys: list[str]):
+        return self._format_name_list_for_table(keys)
+
+    def _format_xvardims(self, xvardims: tuple[int, ...]):
+        if not xvardims:
+            return "()"
+        return str(tuple(int(value) for value in xvardims))
+
+    def _format_name_list_for_table(self, names: list[str], max_items: int = 5):
+        if not names:
+            return "-"
+        if len(names) <= max_items:
+            return "  |  ".join(names)
+        shown = "  |  ".join(names[:max_items])
+        remaining = len(names) - max_items
+        return f"{shown}  |  +{remaining} more"
+
+    def _format_datetime_for_table(self, run_datetime_str: str):
+        if not run_datetime_str:
+            return ""
+
+        def normalize_date(date_text: str):
+            return date_text.replace("-", "/").strip()
+
+        parts = run_datetime_str.split("_")
+        if len(parts) != 2:
+            return run_datetime_str.replace("_", " ").replace("-", "/").strip()
+        date_str, time_str = parts
+        date_str = normalize_date(date_str)
+        time_bits = time_str.split("-")
+        if len(time_bits) >= 2:
+            hour_str, minute_str = time_bits[0], time_bits[1]
+            use_ampm = bool(self.settings.value("timeFormatAMPM", True, type=bool))
+            if use_ampm:
+                try:
+                    hour = int(hour_str)
+                    suffix = "AM" if hour < 12 else "PM"
+                    display_hour = hour % 12 or 12
+                    return f"{date_str} {display_hour}:{minute_str} {suffix}"
+                except ValueError:
+                    pass
+            return f"{date_str} {hour_str}:{minute_str}"
+        return f"{date_str} {time_str.strip()}"
+
+    def _set_lite_highlight(self, row: int, enabled: bool):
+        color = QColor(220, 245, 223) if enabled else QColor(255, 255, 255)
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is not None:
+                item.setBackground(color)
+
+    def _style_row_items(self, row: int, run: RunSummary):
+        xvardims_item = self.table.item(row, self.COL_XVARDIMS)
+        if xvardims_item is not None:
+            xvardims_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            xvardims_item.setForeground(QColor("#607380"))
+
+        experiment_item = self.table.item(row, self.COL_EXPERIMENT)
+        if experiment_item is not None:
+            experiment_item.setForeground(QColor("#17384b"))
+
+        scope_item = self.table.item(row, self.COL_SCOPE)
+        if scope_item is not None:
+            scope_item.setText("scope" if run.has_scope_data else "-")
+            scope_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if run.has_scope_data:
+                scope_item.setBackground(QColor("#e1eef4"))
+                scope_item.setForeground(QColor("#24536b"))
+
+        lite_item = self.table.item(row, self.COL_LITE)
+        if lite_item is not None:
+            lite_item.setText("lite" if run.has_lite else "-")
+            lite_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if run.has_lite:
+                lite_item.setBackground(QColor("#def2e4"))
+                lite_item.setForeground(QColor("#29603a"))
+
+    def _update_summary_chips(self):
+        visible_count = 0
+        for row in range(self.table.rowCount()):
+            if not self.table.isRowHidden(row):
+                visible_count += 1
+        self._set_stat_chip_value(self.loaded_chip, str(self.table.rowCount()))
+        self._set_stat_chip_value(self.visible_chip, str(visible_count))
+
+    def _on_scan_done(self, count: int):
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(self.COL_RUN_ID, Qt.SortOrder.DescendingOrder)
+        self.refresh_btn.setEnabled(True)
+        self.status_label.setText("Ready")
+        self._refresh_date_separators()
+        self._apply_filter()
+        self._update_summary_chips()
+
+        if self._pending_focus_run_id is not None:
+            focused = self._focus_row_by_run_id(self._pending_focus_run_id)
+            requested = self._pending_requested_run_id
+            if focused:
+                if requested is not None and int(requested) != int(self._pending_focus_run_id):
+                    self.status_label.setText(
+                        f"Run {requested} not found; focused nearest run {self._pending_focus_run_id}"
+                    )
+                else:
+                    self.status_label.setText(f"Focused run {self._pending_focus_run_id}")
+            else:
+                self.status_label.setText("Could not focus requested run")
+            self._pending_focus_run_id = None
+            self._pending_requested_run_id = None
+
+        self._set_activity_idle()
+
+    def _on_scan_done_guarded(self, count: int, scan_request_id: int):
+        if scan_request_id != self._scan_request_id:
+            return
+        self._on_scan_done(count)
+
+    def _refresh_date_separators(self):
+        # Trigger table repaint so the delegate can draw date separators.
+        self.table.viewport().update()
+
+    def _on_scan_error(self, message: str):
+        self.refresh_btn.setEnabled(True)
+        self.status_label.setText("Scan failed")
+        QMessageBox.warning(self, "Scan Error", message)
+        self._set_activity_idle()
+
+    def _on_scan_error_guarded(self, message: str, scan_request_id: int):
+        if scan_request_id != self._scan_request_id:
+            return
+        self._on_scan_error(message)
+
+    def _apply_filter(self):
+        terms = self._active_filter_terms
+
+        for row in range(self.table.rowCount()):
+            run = self._get_run_for_row(row)
+            if run is None:
+                self.table.setRowHidden(row, True)
+                continue
+            self.table.setRowHidden(row, not self._run_matches_terms(run, terms))
+        self._update_summary_chips()
+
+    def _parse_search_terms(self, query: str):
+        normalized_query = query.strip().lower()
+        return [term.strip() for term in normalized_query.split("+") if term.strip()]
+
+    def _run_matches_terms(self, run: RunSummary, terms: list[str]):
+        experiment_query = self.experiment_filter_input.text().strip().lower()
+        if experiment_query and experiment_query not in (run.experiment_name or "").lower():
+            return False
+
+        tag_query = self.tag_filter_input.text().strip().lower()
+        if tag_query:
+            if not any(tag_query in t.lower() for t in run.tags):
+                return False
+
+        if not terms:
+            return True
+
+        xvarnames = [name.lower() for name in run.xvarnames]
+        normalized_xvarnames = [self._normalize_match_text(name) for name in xvarnames]
+        for term in terms:
+            normalized_term = self._normalize_match_text(term)
+            if not any(
+                self._matches_xvar_term(term, normalized_term, name, normalized_name)
+                for name, normalized_name in zip(xvarnames, normalized_xvarnames)
+            ):
+                return False
+        return True
+
+    def _matches_xvar_term(self, term: str, normalized_term: str, raw_name: str, normalized_name: str):
+        if term in raw_name:
+            return True
+        if normalized_term and normalized_term in normalized_name:
+            return True
+        if normalized_term and self._is_subsequence(normalized_term, normalized_name):
+            return True
+        return False
+
+    def _is_subsequence(self, needle: str, haystack: str):
+        # Ordered fuzzy matching in O(len(haystack)): allows characters
+        # between query letters, e.g. "frmn" -> "frequencyramantransition".
+        if not needle:
+            return True
+        i = 0
+        for char in haystack:
+            if char == needle[i]:
+                i += 1
+                if i == len(needle):
+                    return True
+        return False
+
+    def _normalize_match_text(self, value: str):
+        # Remove separators/punctuation so short patterns like "tr" can match
+        # names like "t_raman" while preserving normal substring behavior.
+        return re.sub(r"[^a-z0-9]", "", value.lower())
+
+    def _get_selected_row(self):
+        indexes = self.table.selectionModel().selectedRows()
+        if not indexes:
+            return -1
+        return indexes[0].row()
+
+    def _get_selected_rows(self):
+        indexes = self.table.selectionModel().selectedRows()
+        rows = sorted({idx.row() for idx in indexes})
+        return rows
+
+    def _on_selection_changed(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            self._set_stat_chip_value(self.selected_chip, "none")
+            self.detail_pane.clear_details()
+            return
+
+        self._detail_request_id += 1
+        current_detail_id = self._detail_request_id
+        self._set_stat_chip_value(self.selected_chip, str(run.run_id))
+
+        if run.xvar_details:
+            self._show_run_details(run)
+            return
+
+        if self._xvar_loader is not None and self._xvar_loader.isRunning():
+            self._xvar_loader.quit()
+            self._xvar_loader.wait()
+
+        self.detail_pane.clear_details()
+        self._set_activity_busy("Loading run details…")
+        self._xvar_loader = XvarDetailLoader(run.filepath, run.xvarnames)
+        self._xvar_loader.details_ready.connect(
+            lambda details, run_id=run.run_id, req_id=current_detail_id: self._on_xvar_details_ready_guarded(run_id, details, req_id)
+        )
+        self._xvar_loader.details_error.connect(
+            lambda msg, req_id=current_detail_id: self._on_xvar_details_error_guarded(msg, req_id)
+        )
+        self._xvar_loader.start()
+
+    def _on_xvar_details_ready(self, run_id: int, details: list):
+        run = self._runs_by_id.get(run_id)
+        if run is None:
+            self._set_activity_idle()
+            return
+        run.xvar_details = details
+        self._show_run_details(run)
+        self._set_activity_idle()
+
+    def _on_xvar_details_ready_guarded(self, run_id: int, details: list, detail_request_id: int):
+        if detail_request_id != self._detail_request_id:
+            return
+        self._on_xvar_details_ready(run_id, details)
+
+    def _on_xvar_details_error_guarded(self, message: str, detail_request_id: int):
+        if detail_request_id != self._detail_request_id:
+            return
+        self.detail_pane.show_message(f"Failed to load xvar details: {message}")
+        self._set_activity_idle()
+
+    def _show_run_details(self, run: RunSummary):
+        self.detail_pane.set_run(
+            run,
+            self._format_datetime_for_table(run.run_datetime_str),
+            self._format_xvardims(run.xvardims),
+        )
+
+    def _on_row_double_clicked(self, item):
+        self._copy_selected_run_id()
+
+    def _on_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        run = self._get_run_for_row(row)
+        if run is None:
+            return
+
+        # Right-clicking a non-selected row should target only that row.
+        selected_rows = self._get_selected_rows()
+        if row not in selected_rows:
+            self.table.clearSelection()
+            self.table.selectRow(row)
+            selected_rows = [row]
+
+        selected_run_rows = []
+        for selected_row in selected_rows:
+            selected_run = self._get_run_for_row(selected_row)
+            if selected_run is not None:
+                selected_run_rows.append((selected_run, selected_row))
+
+        if not selected_run_rows:
+            return
+
+        is_multi_selection = len(selected_run_rows) > 1
+
+        menu = QMenu(self)
+        create_action = menu.addAction("Create Lite Dataset")
+        copy_lite_arg_action = menu.addAction("Copy Lite Arg")
+        open_h5_action = menu.addAction("Open H5 File")
+
+        if not run.has_lite:
+            copy_lite_arg_action.setEnabled(False)
+
+        if is_multi_selection:
+            copy_lite_arg_action.setEnabled(False)
+            open_h5_action.setEnabled(False)
+
+        menu.addSeparator()
+        add_tag_menu = menu.addMenu("Add Tag")
+        common_tag_actions = {}
+        common_tags = self._get_common_tags()
+        if common_tags:
+            for tag in common_tags:
+                action = add_tag_menu.addAction(tag)
+                action.setCheckable(True)
+                action.setChecked(self._all_selected_runs_have_tag(selected_run_rows, tag))
+                common_tag_actions[action] = tag
+        else:
+            add_tag_menu.addAction("(no common tags)").setEnabled(False)
+        add_tag_menu.addSeparator()
+        add_custom_tag_action = add_tag_menu.addAction("Custom Tag…")
+        edit_tags_action = add_tag_menu.addAction("Edit Tags…")
+        edit_common_tags_action = add_tag_menu.addAction("Edit Common Tags…")
+        if is_multi_selection:
+            edit_tags_action.setEnabled(False)
+
+        edit_comment_action = menu.addAction("Edit Comment…")
+
+        menu.addSeparator()
+        roi_action = menu.addAction("Select ROI…")
+        if is_multi_selection:
+            roi_action.setEnabled(False)
+
+        menu.addSeparator()
+        view_files_submenu = self._build_view_files_submenu(menu, run)
+        if is_multi_selection:
+            view_files_submenu.menuAction().setEnabled(False)
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is create_action:
+            self._start_lite_creation_for_runs([r.run_id for r, _ in selected_run_rows])
+        elif chosen is copy_lite_arg_action:
+            if is_multi_selection:
+                return
+            text = f"{run.run_id}, lite=True"
+            QApplication.clipboard().setText(text)
+            self.status_label.setText(f"Copied: {text}")
+        elif chosen is open_h5_action:
+            self._open_file_in_default_program(run.filepath, "H5 file")
+        elif chosen in common_tag_actions:
+            self._toggle_common_tag_for_runs(selected_run_rows, common_tag_actions[chosen])
+        elif chosen is add_custom_tag_action:
+            self._add_custom_tag_to_runs(selected_run_rows)
+        elif chosen is edit_tags_action:
+            self._edit_tags_for_run(run, row)
+        elif chosen is edit_comment_action:
+            self._edit_comment_for_runs([r for r, _ in selected_run_rows])
+        elif chosen is edit_common_tags_action:
+            self._edit_common_tags()
+        elif chosen is roi_action:
+            self._open_roi_select_for_run(run)
+
+# ---------------------------------------------------------------------------
+# Tags & comment editing
+# ---------------------------------------------------------------------------
+
+    def _edit_tags_for_run(self, run: RunSummary, row: int):
+        current = ", ".join(run.tags)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit Tags — run {run.run_id}")
+        dlg.resize(460, 190)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+        note = QLabel("Enter comma-separated tags:", dlg)
+        layout.addWidget(note)
+        edit = QLineEdit(current, dlg)
+        edit.setClearButtonEnabled(True)
+        layout.addWidget(edit)
+
+        common_row = QHBoxLayout()
+        common_row.setSpacing(6)
+        common_tags_btn = QToolButton(dlg)
+        common_tags_btn.setText("Common Tags")
+        common_tags_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        common_tags_menu = QMenu(common_tags_btn)
+        common_tags_btn.setMenu(common_tags_menu)
+
+        edit_common_btn = QPushButton("Edit Common Tags…", dlg)
+        common_row.addWidget(common_tags_btn)
+        common_row.addWidget(edit_common_btn)
+        common_row.addStretch(1)
+        layout.addLayout(common_row)
+
+        def parse_edit_tags() -> list[str]:
+            tags = []
+            seen = set()
+            for raw_tag in edit.text().split(","):
+                tag = raw_tag.strip()
+                if not tag:
+                    continue
+                key = tag.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tags.append(tag)
+            return tags
+
+        def set_edit_tags(tags: list[str]):
+            edit.setText(", ".join(tags))
+
+        def toggle_common_tag(tag: str):
+            tags = parse_edit_tags()
+            key = tag.lower()
+            if any(existing.lower() == key for existing in tags):
+                tags = [existing for existing in tags if existing.lower() != key]
+            else:
+                tags.append(tag)
+            set_edit_tags(tags)
+
+        def sync_common_checks():
+            active = {tag.lower() for tag in parse_edit_tags()}
+            for action in common_tags_menu.actions():
+                data_tag = action.data()
+                if not isinstance(data_tag, str):
+                    continue
+                action.blockSignals(True)
+                action.setChecked(data_tag.lower() in active)
+                action.blockSignals(False)
+
+        def rebuild_common_tags_menu():
+            common_tags_menu.clear()
+            tags = self._get_common_tags()
+            if not tags:
+                common_tags_menu.addAction("(no common tags)").setEnabled(False)
+                return
+            for common_tag in tags:
+                action = common_tags_menu.addAction(common_tag)
+                action.setCheckable(True)
+                action.setData(common_tag)
+                action.triggered.connect(
+                    lambda checked=False, t=common_tag: toggle_common_tag(t)
+                )
+            sync_common_checks()
+
+        edit.textChanged.connect(sync_common_checks)
+        edit_common_btn.clicked.connect(lambda: (self._edit_common_tags(), rebuild_common_tags_menu()))
+        rebuild_common_tags_menu()
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        raw = edit.text()
+        new_tags = [t.strip() for t in raw.split(",") if t.strip()]
+        self._write_run_annotation(run, tags=new_tags)
+        run.tags = new_tags
+        tags_item = self.table.item(row, self.COL_TAGS)
+        if tags_item is not None:
+            tags_item.setText(", ".join(new_tags))
+        self.status_label.setText(f"Tags saved for run {run.run_id}")
+        # Reapply filter in case tag filter is active
+        self._apply_filter()
+
+    def _edit_comment_for_run(self, run: RunSummary):
+        self._edit_comment_for_runs([run])
+
+    def _edit_comment_for_runs(self, runs: list[RunSummary]):
+        if not runs:
+            return
+
+        multiple = len(runs) > 1
+        dlg = QDialog(self)
+        if multiple:
+            dlg.setWindowTitle(f"Edit Comment — {len(runs)} runs")
+        else:
+            dlg.setWindowTitle(f"Edit Comment — run {runs[0].run_id}")
+        dlg.resize(480, 200)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+        edit = QTextEdit(dlg)
+        if not multiple:
+            edit.setPlainText(runs[0].comment or "")
+        layout.addWidget(edit)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_comment = edit.toPlainText()
+        for run in runs:
+            self._write_run_annotation(run, comment=new_comment)
+            run.comment = new_comment
+
+        if multiple:
+            self.status_label.setText(f"Comment saved for {len(runs)} runs")
+        else:
+            self.status_label.setText(f"Comment saved for run {runs[0].run_id}")
+
+        # Refresh detail pane if the currently shown run was edited.
+        selected_row = self._get_selected_row()
+        selected_run = self._get_run_for_row(selected_row)
+        if selected_run is not None and any(int(r.run_id) == int(selected_run.run_id) for r in runs):
+            self._show_run_details(selected_run)
+
+    def _write_run_annotation(self, run: RunSummary, tags=None, comment=None):
+        """Write browser_tags / browser_comment attrs to the HDF5 file in-place."""
+        self._set_activity_busy("Saving annotations…")
+        try:
+            import h5py as _h5py
+            with _h5py.File(run.filepath, "a") as f:
+                if tags is not None:
+                    f.attrs["browser_tags"] = json.dumps(tags)
+                if comment is not None:
+                    f.attrs["browser_comment"] = comment
+        except Exception as exc:
+            QMessageBox.warning(self, "Write Error", f"Could not save annotation:\n{exc}")
+        finally:
+            self._set_activity_idle()
+
+    def _get_common_tags(self):
+        raw = self.settings.value("commonTags", [], type=list)
+        if not isinstance(raw, list):
+            return []
+        cleaned = []
+        seen = set()
+        for value in raw:
+            tag = str(value).strip()
+            if not tag:
+                continue
+            key = tag.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(tag)
+        return cleaned
+
+    def _set_common_tags(self, tags: list[str]):
+        cleaned = []
+        seen = set()
+        for value in tags:
+            tag = str(value).strip()
+            if not tag:
+                continue
+            key = tag.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(tag)
+        self.settings.setValue("commonTags", cleaned)
+
+    def _run_has_tag(self, run: RunSummary, tag: str):
+        key = (tag or "").strip().lower()
+        if not key:
+            return False
+        return any(str(existing).strip().lower() == key for existing in (run.tags or []))
+
+    def _all_selected_runs_have_tag(self, run_rows: list[tuple[RunSummary, int]], tag: str):
+        if not run_rows:
+            return False
+        return all(self._run_has_tag(run, tag) for run, _ in run_rows)
+
+    def _toggle_common_tag_for_runs(self, run_rows: list[tuple[RunSummary, int]], tag: str):
+        tag = (tag or "").strip()
+        if not tag or not run_rows:
+            return
+
+        remove_from_all = self._all_selected_runs_have_tag(run_rows, tag)
+        changed = 0
+        for run, row in run_rows:
+            tags = list(run.tags or [])
+            if remove_from_all:
+                new_tags = [t for t in tags if str(t).strip().lower() != tag.lower()]
+            else:
+                if any(str(t).strip().lower() == tag.lower() for t in tags):
+                    new_tags = tags
+                else:
+                    new_tags = tags + [tag]
+
+            if new_tags == tags:
+                continue
+
+            self._write_run_annotation(run, tags=new_tags)
+            run.tags = new_tags
+            tags_item = self.table.item(row, self.COL_TAGS)
+            if tags_item is not None:
+                tags_item.setText(", ".join(new_tags))
+            changed += 1
+
+        selected_row = self._get_selected_row()
+        selected_run = self._get_run_for_row(selected_row)
+        if selected_run is not None:
+            self._show_run_details(selected_run)
+
+        self._apply_filter()
+
+        total = len(run_rows)
+        if remove_from_all:
+            if total == 1:
+                self.status_label.setText(f"Removed tag '{tag}' from run {run_rows[0][0].run_id}")
+            else:
+                self.status_label.setText(f"Removed tag '{tag}' from {changed}/{total} runs")
+        else:
+            if total == 1:
+                self.status_label.setText(f"Added tag '{tag}' to run {run_rows[0][0].run_id}")
+            else:
+                self.status_label.setText(f"Applied tag '{tag}' to all {total} runs ({changed} changed)")
+
+    def _edit_common_tags(self):
+        current = self._get_common_tags()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Common Tags")
+        dlg.resize(420, 240)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+        note = QLabel("Enter tags separated by commas or new lines:", dlg)
+        layout.addWidget(note)
+        edit = QTextEdit(dlg)
+        edit.setPlainText("\n".join(current))
+        layout.addWidget(edit)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        raw = edit.toPlainText().replace(",", "\n")
+        parsed = [item.strip() for item in raw.splitlines() if item.strip()]
+        self._set_common_tags(parsed)
+        self.status_label.setText("Common tags updated")
+
+    def _add_tag_to_run(self, run: RunSummary, row: int, tag: str):
+        self._add_tag_to_runs([(run, row)], tag)
+
+    def _add_tag_to_runs(self, run_rows: list[tuple[RunSummary, int]], tag: str):
+        tag = (tag or "").strip()
+        if not tag:
+            return
+
+        added_count = 0
+        unchanged_count = 0
+        for run, row in run_rows:
+            tags = list(run.tags or [])
+            if any(existing.lower() == tag.lower() for existing in tags):
+                unchanged_count += 1
+                continue
+            tags.append(tag)
+            self._write_run_annotation(run, tags=tags)
+            run.tags = tags
+            tags_item = self.table.item(row, self.COL_TAGS)
+            if tags_item is not None:
+                tags_item.setText(", ".join(tags))
+            added_count += 1
+
+        selected_row = self._get_selected_row()
+        selected_run = self._get_run_for_row(selected_row)
+        if selected_run is not None:
+            self._show_run_details(selected_run)
+
+        self._apply_filter()
+        total = len(run_rows)
+        if total == 1 and added_count == 1:
+            self.status_label.setText(f"Added tag '{tag}' to run {run_rows[0][0].run_id}")
+            return
+        self.status_label.setText(
+            f"Added tag '{tag}' to {added_count}/{total} runs"
+            + ("" if unchanged_count == 0 else f" ({unchanged_count} unchanged)")
+        )
+
+    def _add_custom_tag_to_run(self, run: RunSummary, row: int):
+        self._add_custom_tag_to_runs([(run, row)])
+
+    def _add_custom_tag_to_runs(self, run_rows: list[tuple[RunSummary, int]]):
+        if not run_rows:
+            return
+
+        run_count = len(run_rows)
+        dlg = QDialog(self)
+        if run_count == 1:
+            dlg.setWindowTitle(f"Add Tag — run {run_rows[0][0].run_id}")
+        else:
+            dlg.setWindowTitle(f"Add Tag — {run_count} runs")
+        dlg.resize(380, 110)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+        edit = QLineEdit(dlg)
+        edit.setPlaceholderText("new tag")
+        edit.setClearButtonEnabled(True)
+        layout.addWidget(edit)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tag = edit.text().strip()
+        if not tag:
+            return
+        self._add_tag_to_runs(run_rows, tag)
+
+    def _start_lite_creation(self, run_id: int):
+        self._start_lite_creation_for_runs([run_id])
+
+    def _start_lite_creation_for_runs(self, run_ids: list[int]):
+        unique_run_ids = sorted({int(rid) for rid in run_ids})
+        if not unique_run_ids:
+            return
+
+        if self._lite_worker is not None and self._lite_worker.isRunning():
+            QMessageBox.information(self, "Busy", "A lite creation job is already running.")
+            return
+
+        if len(unique_run_ids) == 1:
+            run_id = unique_run_ids[0]
+            self._lite_worker = LiteCreateWorker(self.data_dir, run_id)
+            self.status_label.setText(f"Creating lite dataset for run {run_id}...")
+        else:
+            self._lite_worker = BatchLiteCreateWorker(self.data_dir, unique_run_ids)
+            oldest = min(unique_run_ids)
+            self.status_label.setText(
+                f"Select ROI on oldest selected run {oldest}; creating lite datasets for {len(unique_run_ids)} runs..."
+            )
+
+        self._lite_worker.created.connect(self._on_lite_created)
+        if hasattr(self._lite_worker, "completed"):
+            self._lite_worker.completed.connect(self._on_lite_batch_completed)
+        self._lite_worker.error.connect(self._on_lite_error)
+        self._lite_worker.start()
+
+    def _on_lite_batch_completed(self, created_count: int, total_count: int):
+        self.status_label.setText(f"Lite creation complete: {created_count}/{total_count} runs")
+
+    def _on_lite_created(self, run_id: int, lite_path: str):
+        row = self._find_row_for_run_id(run_id)
+        run = self._runs_by_id.get(run_id)
+        if row is None or run is None:
+            self.status_label.setText(f"Lite created for run {run_id}")
+            return
+
+        run.has_lite = True
+
+        lite_item = self.table.item(row, self.COL_LITE)
+        if lite_item is None:
+            lite_item = QTableWidgetItem("lite")
+            self.table.setItem(row, self.COL_LITE, lite_item)
+        else:
+            lite_item.setText("lite")
+
+        self._set_lite_highlight(row, True)
+        self._style_row_items(row, run)
+        self.status_label.setText(f"Lite created: {lite_path}")
+
+    def _on_lite_error(self, message: str):
+        self.status_label.setText("Lite creation failed")
+        QMessageBox.warning(self, "Lite Creation Error", message)
+
+    def _get_run_for_row(self, row: int):
+        if row < 0:
+            return None
+        run_id_item = self.table.item(row, self.COL_RUN_ID)
+        if run_id_item is None:
+            return None
+        run_id = run_id_item.data(Qt.ItemDataRole.UserRole)
+        if run_id is None:
+            try:
+                run_id = int(run_id_item.text())
+            except ValueError:
+                return None
+        return self._runs_by_id.get(int(run_id))
+
+    def _find_row_for_run_id(self, run_id: int):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, self.COL_RUN_ID)
+            if item is None:
+                continue
+            item_run_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_run_id is None:
+                try:
+                    item_run_id = int(item.text())
+                except ValueError:
+                    continue
+            if int(item_run_id) == int(run_id):
+                return row
+        return None
+
+    def _open_file_in_default_program(self, path_text: str, label: str = "file"):
+        clean = (path_text or "").strip()
+        if not clean or clean == "-":
+            self.status_label.setText(f"No {label.lower()} available.")
+            return
+
+        expanded = os.path.expandvars(clean)
+        path = os.path.normpath(expanded)
+        if not os.path.isfile(path):
+            self.status_label.setText(f"{label} does not exist for this path.")
+            return
+
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        if opened:
+            self.status_label.setText(f"Opened {label.lower()} in default program.")
+        else:
+            self.status_label.setText(f"Could not open {label.lower()} in default program.")
+
+
+# ---------------------------------------------------------------------------
+# Options helpers
+# ---------------------------------------------------------------------------
+
+    def _initialize_options_menu(self):
+        self.options_menu.clear()
+
+        change_dir_action = QAction("Change Data Directory…", self.options_menu)
+        change_dir_action.triggered.connect(self._change_data_dir)
+        self.options_menu.addAction(change_dir_action)
+
+        hotkeys_action = QAction("Hotkeys Guide…", self.options_menu)
+        hotkeys_action.triggered.connect(self._show_hotkeys_guide)
+        self.options_menu.addAction(hotkeys_action)
+
+        edit_common_tags_action = QAction("Edit Common Tags…", self.options_menu)
+        edit_common_tags_action.triggered.connect(self._edit_common_tags)
+        self.options_menu.addAction(edit_common_tags_action)
+
+        self.options_menu.addSeparator()
+
+        self._dark_mode_action = QAction("Dark Mode", self.options_menu)
+        self._dark_mode_action.setCheckable(True)
+        self._dark_mode_action.setChecked(bool(self.settings.value("darkMode", False, type=bool)))
+        self._dark_mode_action.toggled.connect(self._on_dark_mode_toggled)
+        self.options_menu.addAction(self._dark_mode_action)
+
+        self.options_menu.addSeparator()
+
+        time_menu = self.options_menu.addMenu("Time Format")
+        self._time_24h_action = QAction("24-hour (military)", time_menu)
+        self._time_24h_action.setCheckable(True)
+        self._time_ampm_action = QAction("12-hour (AM/PM)", time_menu)
+        self._time_ampm_action.setCheckable(True)
+        time_menu.addAction(self._time_24h_action)
+        time_menu.addAction(self._time_ampm_action)
+
+        use_ampm = bool(self.settings.value("timeFormatAMPM", True, type=bool))
+        self._time_24h_action.setChecked(not use_ampm)
+        self._time_ampm_action.setChecked(use_ampm)
+        self._time_24h_action.triggered.connect(lambda: self._set_time_format(False))
+        self._time_ampm_action.triggered.connect(lambda: self._set_time_format(True))
+
+        # Apply dark mode if previously enabled
+        if self._dark_mode_action.isChecked():
+            self._apply_dark_mode(True)
+
+    def _change_data_dir(self):
+        new_dir = QFileDialog.getExistingDirectory(
+            self, "Select Data Directory", self.data_dir or os.path.expanduser("~")
+        )
+        if new_dir and os.path.isdir(new_dir):
+            self.data_dir = new_dir
+            self._server_talk = server_talk(data_dir=self.data_dir)
+            self.settings.setValue("dataDir", new_dir)
+            self.status_label.setText(f"Data dir: {new_dir}")
+            self._start_scan()
+
+    def _on_dark_mode_toggled(self, checked: bool):
+        self.settings.setValue("darkMode", checked)
+        self._apply_dark_mode(checked)
+
+    def _apply_dark_mode(self, dark: bool):
+        if dark:
+            extra = """
+            QMainWindow, QWidget { background: #1e2832; color: #d0dce6; }
+            QLabel { color: #d0dce6; }
+            QFrame#statChip, QFrame#toolbarGroup {
+                background: #263340; border-color: #3a4f60;
+            }
+            QLineEdit, QDateEdit, QPushButton, QListWidget, QTableWidget, QTextEdit {
+                background: #263340; border-color: #3a4f60; color: #d0dce6;
+            }
+            QGroupBox { background: #263340; border-color: #3a4f60; color: #9bbdd0; }
+            QHeaderView::section { background: #1e2832; color: #9bbdd0; border-right: 1px solid #3a4f60; border-bottom: 1px solid #3a4f60; }
+            QTableWidget { alternate-background-color: #222d38; selection-background-color: #2d5470; color: #d0dce6; }
+            QMenu { background: #263340; color: #d0dce6; }
+            QMenu::item:disabled { color: #6f7f8b; }
+            QDialog { background: #1e2832; color: #d0dce6; }
+            QDialogButtonBox QPushButton { background: #3a4f60; color: #d0dce6; }
+            QLabel#fileViewerPathLabel { color: #9bc4dc; }
+            """
+            self.setStyleSheet(self.styleSheet() + extra)
+        else:
+            self._apply_styles()
+
+    def _set_time_format(self, use_ampm: bool):
+        self.settings.setValue("timeFormatAMPM", use_ampm)
+        self._time_24h_action.setChecked(not use_ampm)
+        self._time_ampm_action.setChecked(use_ampm)
+        # Reformat visible datetime cells
+        for row in range(self.table.rowCount()):
+            run = self._get_run_for_row(row)
+            if run is None:
+                continue
+            item = self.table.item(row, self.COL_DATETIME)
+            if item is not None:
+                item.setText(self._format_datetime_for_table(run.run_datetime_str))
+
+# ---------------------------------------------------------------------------
+# ROI selection (right-click action)
+# ---------------------------------------------------------------------------
+
+    def _open_roi_select_for_run(self, run: RunSummary):
+        """Open ROI selector once and save ROI to the run's h5 file."""
+        self.status_label.setText(f"Opening ROI selector for run {run.run_id}…")
+        self._set_activity_busy("Selecting ROI…")
+
+        class _ROIWorker(QThread if False else __import__("PyQt6.QtCore", fromlist=["QThread"]).QThread):
+            done = pyqtSignal(str)
+            error = pyqtSignal(str)
+
+            def __init__(self, run_id, filepath):
+                super().__init__()
+                self.run_id = run_id
+                self.filepath = filepath
+
+            def run(self):
+                try:
+                    from waxa.roi import ROI
+                    roi = ROI(run_id=self.run_id, use_saved_roi=False, printouts=False)
+                    roi.save_roi_h5(printouts=False)
+                    self.done.emit(f"ROI saved for run {self.run_id}")
+                except Exception as exc:
+                    self.error.emit(str(exc))
+
+        worker = _ROIWorker(run.run_id, run.filepath)
+        worker.done.connect(lambda msg: (self.status_label.setText(msg), self._set_activity_idle()))
+        worker.error.connect(lambda msg: (
+            self.status_label.setText("ROI select failed"),
+            QMessageBox.warning(self, "ROI Error", msg),
+            self._set_activity_idle(),
+        ))
+        # Keep reference alive
+        if not hasattr(self, "_roi_workers"):
+            self._roi_workers = []
+        self._roi_workers = [w for w in self._roi_workers if w.isRunning()]
+        self._roi_workers.append(worker)
+        worker.start()
+
+# ---------------------------------------------------------------------------
+# Experiment file viewer (right-click submenu)
+# ---------------------------------------------------------------------------
+
+    _EXPT_FILE_ATTR_KEYS = [
+        "expt_file",
+        "control_file",
+        "cooling_file",
+        "sequence_file",
+        "imaging_file",
+    ]
+
+    def _build_view_files_submenu(self, menu: QMenu, run: RunSummary):
+        """Populate a submenu with one action per experiment file attr found in the HDF5."""
+        submenu = menu.addMenu("View Experiment Files")
+        try:
+            import h5py
+            with h5py.File(run.filepath, "r") as f:
+                found = False
+                for key in self._EXPT_FILE_ATTR_KEYS:
+                    raw = f.attrs.get(key)
+                    if raw is None:
+                        continue
+                    raw_str = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+                    label = f"{key.replace('_file', '').replace('_', ' ').title()}"
+                    action = submenu.addAction(f"  {label}")
+                    action.triggered.connect(
+                        lambda checked=False, k=key, path=raw_str, rid=run.run_id: self._open_file_viewer(rid, k, path)
+                    )
+                    found = True
+                if not found:
+                    submenu.addAction("(no files in attributes)").setEnabled(False)
+        except Exception as exc:
+            submenu.addAction(f"Error: {exc}").setEnabled(False)
+        return submenu
+
+    def _open_file_viewer(self, run_id: int, attr_key: str, file_path: str):
+        """Open a resizable popup showing the content of a Python source file."""
+        win = QDialog(self)
+        fallback_names = {
+            "expt_file": "expt.py",
+            "control_file": "control.py",
+            "cooling_file": "cooling.py",
+            "sequence_file": "sequence.py",
+            "imaging_file": "imaging.py",
+        }
+        basename = fallback_names.get(attr_key, "unknown.py")
+        win.setWindowTitle(f"Run ID {run_id} - {basename}")
+        win.setSizeGripEnabled(True)
+        win.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        win.resize(600, 400)
+        win.setMinimumSize(480, 300)
+        win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        layout = QVBoxLayout(win)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        path_label = QLabel(file_path, win)
+        path_label.setObjectName("fileViewerPathLabel")
+        path_label.setWordWrap(True)
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(path_label)
+
+        editor = QPlainTextEdit(win)
+        editor.setReadOnly(True)
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        font = QFont("Consolas", 10)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        editor.setFont(font)
+        dark_mode = bool(self.settings.value("darkMode", False, type=bool))
+        if dark_mode:
+            editor.setStyleSheet(
+                "QPlainTextEdit { background: #1b2530; color: #d7e3ec; border: 1px solid #3a4f60; }"
+            )
+        else:
+            editor.setStyleSheet(
+                "QPlainTextEdit { background: #ffffff; color: #1f2a33; border: 1px solid #d5dde4; }"
+            )
+
+        # Try to load from disk; fall back to a clear error message
+        norm_path = os.path.normpath(file_path)
+        if os.path.isfile(norm_path):
+            try:
+                with open(norm_path, "r", encoding="utf-8", errors="replace") as fh:
+                    editor.setPlainText(fh.read())
+            except Exception as exc:
+                editor.setPlainText(f"Could not read file:\n{exc}")
+        else:
+            editor.setPlainText(f"File not found on this machine:\n{norm_path}")
+
+        layout.addWidget(editor)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, win)
+        btns.rejected.connect(win.accept)
+        layout.addWidget(btns)
+
+        win.show()
+        # Keep reference so the window isn't garbage-collected
+        if not hasattr(self, "_file_viewer_windows"):
+            self._file_viewer_windows = []
+        self._file_viewer_windows.append(win)
+        win.finished.connect(lambda: self._file_viewer_windows.remove(win) if win in self._file_viewer_windows else None)
+
+
+def launch(data_dir: str):
+    app = QApplication.instance()
+    app_created = app is None
+    if app_created:
+        app = QApplication(sys.argv)
+
+    window = DataBrowserWindow(data_dir)
+    window.show()
+
+    if app_created:
+        app.exec()
+
+    return window
+
+
+if __name__ == "__main__":
+    launch(os.getenv("data", ""))

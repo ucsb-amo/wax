@@ -1,8 +1,10 @@
 import os
 import subprocess
+import bisect
 from datetime import datetime, timedelta
 import glob
 import numpy as np
+import h5py
 
 MAP_BAT_PATH = "\"G:\\Shared drives\\Weld Lab Shared Drive\\Infrastructure\\map_network_drives_PeterRecommended.bat\""
 
@@ -27,6 +29,10 @@ class server_talk():
         self._bat_on_data_dir_disconnected = on_data_dir_disconnected_bat_path
 
         self._lite = False
+        self._run_index_cache = {
+            False: None,
+            True: None,
+        }
 
         self.set_data_dir()
 
@@ -66,16 +72,29 @@ class server_talk():
         '''
         if path == "":
             latest_file = self.get_latest_data_file(lite)
+            if latest_file is None:
+                raise ValueError("No completed data files were found.")
             latest_rid = self.run_id_from_filepath(latest_file,lite)
             if idx == 0:
                 file = latest_file
             if idx <= 0:
-                file = self.recurse_find_data_file(latest_rid+idx,lite)
-            if idx > 0:
-                if latest_rid - idx < 10000:
-                    file = self.recurse_find_data_file(idx,lite)
+                relative_idx = abs(int(idx))
+                if lite:
+                    run_id = self.get_completed_run_id_by_relative_index(relative_idx, lite=False)
+                    if run_id is None:
+                        raise ValueError("No completed data files were found.")
+                    file = self.find_data_file_by_run_id(run_id, lite=True, raise_on_missing=False)
+                    if file is None:
+                        regular_file = self.find_data_file_by_run_id(run_id, lite=False, raise_on_missing=False)
+                        if regular_file is not None:
+                            raise ValueError(
+                                f"A lite copy does not exist for run ID {run_id}. Load the regular data or create a lite copy first."
+                            )
+                        raise ValueError(f"Data file with run ID {run_id:1.0f} was not found.")
                 else:
-                    file = self.all_glob_find_data_file(idx,lite)
+                    file = self.get_completed_data_file_by_relative_index(relative_idx, lite=False)
+            if idx > 0:
+                file = self.find_data_file_by_run_id(idx, lite=lite)
         else:
             if path.endswith('.hdf5'):
                 file = path
@@ -111,27 +130,63 @@ class server_talk():
         
     def get_latest_data_file(self,lite=False):
         self.check_for_mapped_data_dir()
-        folderpath = self.get_latest_date_folder(lite)
-        pattern = os.path.join(folderpath,'*.hdf5')
-        files = list(glob.iglob(pattern))
-        # Filter out files that do not exist before sorting
-        existing_files = [f for f in files if os.path.exists(f)]
-        files_sorted = sorted(
-            existing_files,
-            key=os.path.getmtime,
-            reverse=True)
-        latest_file = None
-        for file in files_sorted:
-            try:
-                # Try to access getmtime, which will raise FileNotFoundError if missing
-                os.path.getmtime(file)
-                latest_file = file
-                break
-            except FileNotFoundError:
-                continue
-        return latest_file
+        return self.get_completed_data_file_by_relative_index(0, lite=lite)
+
+    def _is_completed_run(self, filepath):
+        try:
+            with h5py.File(filepath, 'r') as f:
+                raw_xvarnames = f.attrs.get('xvarnames')
+                if raw_xvarnames is None:
+                    return True
+
+                if isinstance(raw_xvarnames, np.ndarray):
+                    xvarnames = [str(value.decode('utf-8', errors='replace') if isinstance(value, (bytes, np.bytes_)) else value) for value in raw_xvarnames.tolist()]
+                elif isinstance(raw_xvarnames, (list, tuple)):
+                    xvarnames = [str(value.decode('utf-8', errors='replace') if isinstance(value, (bytes, np.bytes_)) else value) for value in raw_xvarnames]
+                else:
+                    xvarnames = [str(raw_xvarnames.decode('utf-8', errors='replace') if isinstance(raw_xvarnames, (bytes, np.bytes_)) else raw_xvarnames)]
+
+                xvarnames = [name for name in xvarnames if str(name).strip()]
+                if not xvarnames:
+                    return True
+
+                if 'params' not in f:
+                    return False
+
+                for name in xvarnames:
+                    if name not in f['params']:
+                        return False
+                    values = np.asarray(f['params'][name][()])
+                    if values.ndim == 0:
+                        return False
+                return True
+        except Exception:
+            return False
+
+    def _iter_completed_data_files_desc(self, lite=False):
+        index = self._get_run_index(lite=lite)
+        for run_id in reversed(index['run_ids']):
+            path = index['paths_by_run_id'].get(run_id)
+            if path and self._is_completed_run(path):
+                yield path
+
+    def get_completed_data_file_by_relative_index(self, relative_idx=0, lite=False):
+        for idx, path in enumerate(self._iter_completed_data_files_desc(lite=lite)):
+            if idx == int(relative_idx):
+                return path
+        return None
+
+    def get_completed_run_id_by_relative_index(self, relative_idx=0, lite=False):
+        path = self.get_completed_data_file_by_relative_index(relative_idx=relative_idx, lite=lite)
+        if path is None:
+            return None
+        return self.run_id_from_filepath(path, lite=lite)
 
     def recurse_find_data_file(self,r_id,lite=False,days_ago=0):
+        indexed_file = self.find_data_file_by_run_id(r_id, lite=lite, raise_on_missing=False)
+        if indexed_file is not None:
+            return indexed_file
+
         date = datetime.today() - timedelta(days=days_ago)
 
         if date < self._first_data_folder_date:
@@ -146,6 +201,9 @@ class server_talk():
             pattern = os.path.join(folderpath,'*.hdf5')
             files = np.array(list(glob.iglob(pattern)))
             r_ids = np.array([self.run_id_from_filepath(file,lite) for file in files])
+
+            if len(r_ids) > 0 and int(np.max(r_ids)) < int(r_id):
+                raise ValueError(f"Data file with run ID {r_id:1.0f} was not found.")
 
             files_mask = (r_id == r_ids)
             file_with_rid = files[files_mask]
@@ -163,13 +221,93 @@ class server_talk():
         return file_with_rid
 
     def all_glob_find_data_file(self,run_id,lite=False):
+        return self.find_data_file_by_run_id(run_id, lite=lite)
+
+    def _build_run_index(self, lite=False):
         self.set_data_dir(lite)
-        folderpath=os.path.join(self.data_dir,'*','*.hdf5')
-        list_of_files = glob.glob(folderpath)
-        rids = [self.run_id_from_filepath(file,lite) for file in list_of_files]
-        rid_idx = rids.index(run_id)
-        file = list_of_files[rid_idx]
-        return file
+        root = self.data_dir
+        paths_by_run_id = {}
+        dates_by_run_id = {}
+
+        if not root or not os.path.isdir(root):
+            return {
+                'run_ids': [],
+                'paths_by_run_id': {},
+                'dates_by_run_id': {},
+            }
+
+        for date_entry in os.scandir(root):
+            if not date_entry.is_dir():
+                continue
+            try:
+                run_date = datetime.strptime(date_entry.name, '%Y-%m-%d').date()
+            except ValueError:
+                continue
+
+            for file_entry in os.scandir(date_entry.path):
+                if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
+                    continue
+                try:
+                    run_id = int(file_entry.name.split('_')[0])
+                except Exception:
+                    continue
+
+                existing = paths_by_run_id.get(run_id)
+                if existing is None:
+                    paths_by_run_id[run_id] = file_entry.path
+                    dates_by_run_id[run_id] = run_date
+                else:
+                    try:
+                        if os.path.getmtime(file_entry.path) > os.path.getmtime(existing):
+                            paths_by_run_id[run_id] = file_entry.path
+                            dates_by_run_id[run_id] = run_date
+                    except OSError:
+                        pass
+
+        run_ids = sorted(paths_by_run_id.keys())
+        return {
+            'run_ids': run_ids,
+            'paths_by_run_id': paths_by_run_id,
+            'dates_by_run_id': dates_by_run_id,
+        }
+
+    def _get_run_index(self, lite=False, refresh=False):
+        if refresh or self._run_index_cache.get(bool(lite)) is None:
+            self._run_index_cache[bool(lite)] = self._build_run_index(lite=lite)
+        return self._run_index_cache[bool(lite)]
+
+    def find_data_file_by_run_id(self, run_id, lite=False, raise_on_missing=True, refresh=False):
+        index = self._get_run_index(lite=lite, refresh=refresh)
+        path = index['paths_by_run_id'].get(int(run_id))
+        if path is None and not refresh:
+            return self.find_data_file_by_run_id(run_id, lite=lite, raise_on_missing=raise_on_missing, refresh=True)
+        if path is None and raise_on_missing:
+            raise ValueError(f"Data file with run ID {run_id:1.0f} was not found.")
+        return path
+
+    def find_nearest_run_date_and_id(self, requested_run_id, lite=False, refresh=False):
+        index = self._get_run_index(lite=lite, refresh=refresh)
+        run_ids = index['run_ids']
+        if not run_ids and not refresh:
+            return self.find_nearest_run_date_and_id(requested_run_id, lite=lite, refresh=True)
+        if not run_ids:
+            return None, None
+
+        requested_run_id = int(requested_run_id)
+        dates_by_run_id = index['dates_by_run_id']
+
+        if requested_run_id in dates_by_run_id:
+            return requested_run_id, dates_by_run_id[requested_run_id]
+
+        insert_idx = bisect.bisect_left(run_ids, requested_run_id)
+        candidates = []
+        if insert_idx > 0:
+            candidates.append(run_ids[insert_idx - 1])
+        if insert_idx < len(run_ids):
+            candidates.append(run_ids[insert_idx])
+
+        nearest_run_id = min(candidates, key=lambda rid: (abs(rid - requested_run_id), rid))
+        return nearest_run_id, dates_by_run_id[nearest_run_id]
 
     def run_id_from_filepath(self,filepath,lite=False):
         self.set_data_dir(lite)
