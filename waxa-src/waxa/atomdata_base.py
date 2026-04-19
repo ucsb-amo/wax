@@ -356,6 +356,10 @@ class atomdata_base():
 
         self._lite = lite
 
+        # Lightweight profiling aid for load/analysis latency investigations.
+        self._timing_enabled = True
+        self._timing = {}
+
         self.avg = None
         self.std = None
         self.sem = None
@@ -368,9 +372,13 @@ class atomdata_base():
 
         self.server_talk = server_talk
 
+        t_init = time.perf_counter()
+        t_stage = time.perf_counter()
         self._load_data(idx, path, lite=lite, roi_id=roi_id)
+        self._timing['init_load_data_s'] = time.perf_counter() - t_stage
 
         ### Helper objects
+        t_stage = time.perf_counter()
         self._ds = DataSaver()
         self._dealer = self._init_dealer()
         self._analysis_tags = analysis_tags(roi_id,self.run_info.imaging_type)
@@ -381,8 +389,30 @@ class atomdata_base():
                        server_talk=self.server_talk,
                        current_file_path=self._data_file_path,
                        current_saved_roi=self._saved_roi_from_file)
+        self._timing['init_setup_helpers_roi_s'] = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         self._unshuffle_old_data()
+        self._timing['init_unshuffle_old_data_s'] = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         self._initial_analysis(transpose_idx,avg_repeats)
+        self._timing['init_initial_analysis_s'] = time.perf_counter() - t_stage
+        self._timing['init_total_s'] = time.perf_counter() - t_init
+
+        if self._timing_enabled:
+            print(
+                (
+                    "[atomdata timing] init total={:.3f}s | load_data={:.3f}s | "
+                    "setup+roi={:.3f}s | unshuffle_old={:.3f}s | initial_analysis={:.3f}s"
+                ).format(
+                    self._timing['init_total_s'],
+                    self._timing['init_load_data_s'],
+                    self._timing['init_setup_helpers_roi_s'],
+                    self._timing['init_unshuffle_old_data_s'],
+                    self._timing['init_initial_analysis_s'],
+                )
+            )
 
     ###
     def recrop(self,roi_id=None,use_saved=False):
@@ -464,20 +494,98 @@ class atomdata_base():
     ### Analysis
 
     def _initial_analysis(self,transpose_idx,avg_repeats):
+        t0 = time.perf_counter()
+
+        t_stage = time.perf_counter()
         self._sort_images()
+        t_sort = time.perf_counter() - t_stage
+
         if transpose_idx:
             self._analysis_tags.transposed = True
+            t_stage = time.perf_counter()
             self.transpose_data(transpose_idx=False,reanalyze=False)
+            t_transpose = time.perf_counter() - t_stage
+        else:
+            t_transpose = 0.0
+
+        t_stage = time.perf_counter()
         self.compute_raw_ods()
+        t_compute_raw = time.perf_counter() - t_stage
+
         if avg_repeats:
+            t_stage = time.perf_counter()
             self.avg_repeats(reanalyze=False)
+            t_avg_repeats = time.perf_counter() - t_stage
+        else:
+            t_avg_repeats = 0.0
+
+        t_stage = time.perf_counter()
         self.analyze_ods()
+        t_analyze_ods = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         self._refresh_repeat_statistics()
+        t_repeat_stats = time.perf_counter() - t_stage
+        t_total = time.perf_counter() - t0
+
+        self._timing['initial_analysis_sort_images_s'] = t_sort
+        self._timing['initial_analysis_transpose_s'] = t_transpose
+        self._timing['initial_analysis_compute_raw_ods_s'] = t_compute_raw
+        self._timing['initial_analysis_avg_repeats_s'] = t_avg_repeats
+        self._timing['initial_analysis_analyze_ods_s'] = t_analyze_ods
+        self._timing['initial_analysis_refresh_repeat_stats_s'] = t_repeat_stats
+        self._timing['initial_analysis_total_s'] = t_total
+
+        if self._timing_enabled:
+            print(
+                (
+                    "[atomdata timing] initial_analysis total={:.3f}s | sort_images={:.3f}s | "
+                    "transpose={:.3f}s | compute_raw_ods={:.3f}s | avg_repeats={:.3f}s | "
+                    "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s"
+                ).format(
+                    t_total,
+                    t_sort,
+                    t_transpose,
+                    t_compute_raw,
+                    t_avg_repeats,
+                    t_analyze_ods,
+                    t_repeat_stats,
+                )
+            )
 
     def analyze(self):
+        t0 = time.perf_counter()
+
+        t_stage = time.perf_counter()
         self.compute_raw_ods()
+        t_compute_raw = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         self.analyze_ods()
+        t_analyze_ods = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         self._refresh_repeat_statistics()
+        t_repeat_stats = time.perf_counter() - t_stage
+        t_total = time.perf_counter() - t0
+
+        self._timing['analyze_compute_raw_ods_s'] = t_compute_raw
+        self._timing['analyze_analyze_ods_s'] = t_analyze_ods
+        self._timing['analyze_refresh_repeat_stats_s'] = t_repeat_stats
+        self._timing['analyze_total_s'] = t_total
+
+        if self._timing_enabled:
+            print(
+                (
+                    "[atomdata timing] analyze total={:.3f}s | compute_raw_ods={:.3f}s | "
+                    "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s"
+                ).format(
+                    t_total,
+                    t_compute_raw,
+                    t_analyze_ods,
+                    t_repeat_stats,
+                )
+            )
 
     def compute_raw_ods(self):
         """Computes the ODs. If not absorption analysis, OD = (pwa - dark)/(pwoa - dark).
@@ -1472,20 +1580,34 @@ class atomdata_base():
         return dealer
 
     def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True):
+        t_load_total = time.perf_counter()
+        timing = {}
+
         try:
+            t_stage = time.perf_counter()
             file, rid = self.server_talk.get_data_file(idx, path, lite)
+            timing['get_data_file_initial_s'] = time.perf_counter() - t_stage
         except ValueError as e:
+            timing['get_data_file_initial_s'] = time.perf_counter() - t_stage
             msg = str(e)
             lite_missing = ("was not found" in msg or "lite copy does not exist" in msg)
             if lite and _allow_lite_autocreate and lite_missing:
                 # Missing lite file: load regular data, generate lite copy, then retry lite load.
+                t_stage = time.perf_counter()
                 self._load_data(idx, path, lite=False, roi_id=roi_id, _allow_lite_autocreate=False)
+                timing['fallback_full_load_s'] = time.perf_counter() - t_stage
+
+                t_stage = time.perf_counter()
                 self.server_talk.create_lite_copy(
                     self.run_info.run_id,
                     roi_id=roi_id,
                     use_saved_roi=(roi_id is None),
                 )
+                timing['fallback_create_lite_copy_s'] = time.perf_counter() - t_stage
+
+                t_stage = time.perf_counter()
                 file, rid = self.server_talk.get_data_file(self.run_info.run_id, "", lite=True)
+                timing['get_data_file_retry_lite_s'] = time.perf_counter() - t_stage
             else:
                 raise
 
@@ -1493,7 +1615,11 @@ class atomdata_base():
         self._saved_roi_from_file = False
         self.scope_data = {}
 
+        t_stage = time.perf_counter()
         with h5py.File(file,'r') as f:
+            timing['h5_open_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
             self.params = ExptParams()
             self.p = self.params
             self.camera_params = CameraParams()
@@ -1502,22 +1628,28 @@ class atomdata_base():
             unpack_group(f,'params',self.params)
             unpack_group(f,'camera_params',self.camera_params)
             unpack_group(f,'run_info',self.run_info)
+            timing['h5_unpack_headers_s'] = time.perf_counter() - t_stage
 
             print(self.run_info.run_id)
 
+            t_stage = time.perf_counter()
             self.images = f['data']['images'][()]
             self.image_timestamps = f['data']['image_timestamps'][()]
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
+            timing['h5_read_core_arrays_s'] = time.perf_counter() - t_stage
 
+            t_stage = time.perf_counter()
             if 'roix' in f.attrs and 'roiy' in f.attrs:
                 self._saved_roi_from_file = [f.attrs['roix'], f.attrs['roiy']]
+            timing['h5_saved_roi_attrs_s'] = time.perf_counter() - t_stage
 
             class DataVault():
                 def __init__(self):
                     self.keys = []
             self.data = DataVault()
 
+            t_stage = time.perf_counter()
             all_keys = list(f['data'].keys())
             filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data']]
 
@@ -1527,7 +1659,9 @@ class atomdata_base():
 
                 vars(self.data)[k] = data_k
                 self.data.keys.append(k)
+            timing['h5_read_datavault_s'] = time.perf_counter() - t_stage
 
+            t_stage = time.perf_counter()
             try:
                 experiment_text = f.attrs['expt_file']
                 params_text = f.attrs['params_file']
@@ -1545,14 +1679,18 @@ class atomdata_base():
                                                 cooling_text,
                                                 imaging_text,
                                                 control_text)
+            timing['h5_read_experiment_text_s'] = time.perf_counter() - t_stage
 
+            t_stage = time.perf_counter()
             if 'sort_idx' in all_keys and 'sort_N' in all_keys:
                 self.sort_idx = f['data']['sort_idx'][()]
                 self.sort_N = f['data']['sort_N'][()]
             else:
                 self.sort_idx = np.array([])
                 self.sort_N = np.array([])
+            timing['h5_read_sort_metadata_s'] = time.perf_counter() - t_stage
 
+            t_stage = time.perf_counter()
             try:
                 if 'scope_data' in all_keys:
                     d = f['data']['scope_data']
@@ -1562,6 +1700,39 @@ class atomdata_base():
                     self.scope_data = format_scope_data(d, old_method=old_method_bool)
             except Exception as e:
                 print(e)
+            timing['h5_read_scope_data_s'] = time.perf_counter() - t_stage
+
+        timing['load_total_s'] = time.perf_counter() - t_load_total
+        self._timing.update({f'load_{k}': v for k, v in timing.items()})
+
+        if self._timing_enabled:
+            print(
+                (
+                    "[atomdata timing] load total={:.3f}s | get_data_file(initial)={:.3f}s | "
+                    "h5_open={:.3f}s | headers={:.3f}s | core_arrays={:.3f}s | "
+                    "datavault={:.3f}s | scope_data={:.3f}s"
+                ).format(
+                    timing.get('load_total_s', 0.0),
+                    timing.get('get_data_file_initial_s', 0.0),
+                    timing.get('h5_open_s', 0.0),
+                    timing.get('h5_unpack_headers_s', 0.0),
+                    timing.get('h5_read_core_arrays_s', 0.0),
+                    timing.get('h5_read_datavault_s', 0.0),
+                    timing.get('h5_read_scope_data_s', 0.0),
+                )
+            )
+
+            if 'get_data_file_retry_lite_s' in timing or 'fallback_create_lite_copy_s' in timing:
+                print(
+                    (
+                        "[atomdata timing] load fallback | full_load={:.3f}s | "
+                        "create_lite_copy={:.3f}s | get_data_file(retry_lite)={:.3f}s"
+                    ).format(
+                        timing.get('fallback_full_load_s', 0.0),
+                        timing.get('fallback_create_lite_copy_s', 0.0),
+                        timing.get('get_data_file_retry_lite_s', 0.0),
+                    )
+                )
 
     def __getattribute__(self, name):
         if name in ['_repeat_sem_source',

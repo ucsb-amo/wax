@@ -9,6 +9,25 @@ from waxa.config.img_types import img_types
 
 import h5py
 
+_ROI_EXCEL_CACHE = {}
+
+def _load_roi_excel_cached(path):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+
+    cached = _ROI_EXCEL_CACHE.get(path)
+    if cached is not None and cached['mtime'] == mtime:
+        return cached['df']
+
+    df = pd.read_excel(path)
+    _ROI_EXCEL_CACHE[path] = {
+        'mtime': mtime,
+        'df': df,
+    }
+    return df
+
 class ROI():
     def __init__(self,
                  run_id=0,
@@ -199,7 +218,7 @@ class ROI():
         self.key = key
         if key == "":
             raise ValueError("ROI key must be a non-empty string.")
-        roicsv = pd.read_excel(self.server_talk.roi_csv_path)
+        roicsv = _load_roi_excel_cached(self.server_talk.roi_csv_path)
         keymatch = roicsv.loc[ roicsv['key'] == self.key ]
         if np.any(keymatch):
             if printouts: print(f"ROI {key} found.")
@@ -271,6 +290,9 @@ class ROI():
 
         # Save the updated dataframe back to the excel file
         df.to_excel(self.server_talk.roi_csv_path, index=False)
+        # Invalidate cached spreadsheet after write.
+        if self.server_talk.roi_csv_path in _ROI_EXCEL_CACHE:
+            del _ROI_EXCEL_CACHE[self.server_talk.roi_csv_path]
         print(f"Updated the spreadsheet ROI with key {key}.")
 
 class roi_creator():
