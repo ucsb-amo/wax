@@ -88,6 +88,7 @@ class analysis_tags():
         self.xvars_shuffled = False
         self.transposed = False
         self.averaged = False
+        self.repeats_reassigned = False
 
 class atom_number_apd():
     def __init__(self, n_up, n_down):
@@ -438,12 +439,20 @@ class atomdata():
                 ad.reassign_repeats(_target)
             elif not ignore_repeats:
                 # Single-axis scan: expand the selection to include all repeats
-                # of the unique value at the requested index.
-                target_value = ad.xvars[0][which_shot_idx[0]]
-                which_shot_idx = np.where(
-                    np.isclose(np.asarray(ad.xvars[0], dtype=float),
-                               float(target_value))
-                )[0]
+                # for every selected index value (supports list inputs).
+                xvals = np.asarray(ad.xvars[0])
+                selected_vals = xvals[which_shot_idx]
+                if np.issubdtype(xvals.dtype, np.number):
+                    mask = np.any(
+                        np.isclose(
+                            xvals[:, None].astype(float),
+                            np.asarray(selected_vals, dtype=float)[None, :],
+                        ),
+                        axis=1,
+                    )
+                else:
+                    mask = np.isin(xvals, selected_vals)
+                which_shot_idx = np.where(mask)[0]
 
         # N_repeats on the returned atomdata: stays non-1 whenever repeats
         # survive the slice (i.e. in every case except a single-axis slice
@@ -622,6 +631,7 @@ class atomdata():
         ad_out._analysis_tags.xvars_shuffled = False
         ad_out._analysis_tags.transposed = self._analysis_tags.transposed
         ad_out._analysis_tags.averaged = False
+        ad_out._analysis_tags.repeats_reassigned = self._analysis_tags.repeats_reassigned
 
     def _reduce_repeat_ndarray(self, arr: np.ndarray, xvar_idx: int, n_repeats: int, reducer: str):
         arr = np.asarray(arr)
@@ -881,6 +891,7 @@ class atomdata():
 
         self._sort_images()
         self.analyze()
+        self._analysis_tags.repeats_reassigned = True
 
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
         """
@@ -1151,6 +1162,8 @@ class atomdata():
         self.xvars = self._unpack_xvars()
 
     def reshuffle(self):
+        if self._analysis_tags.repeats_reassigned:
+            raise ValueError("Cannot reshuffle after repeats have been reassigned.")
         if self._analysis_tags.xvars_shuffled == False:
             self._shuff(reshuffle_bool=True)
             self._sort_images()
