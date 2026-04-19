@@ -17,7 +17,9 @@ class ROI():
                  use_saved_roi=True,
                  lite=False,
                  printouts=True,
-                 server_talk=None):
+                 server_talk=None,
+                 current_file_path=None,
+                 current_saved_roi=None):
         
         if server_talk == None:
             self.server_talk = st()
@@ -28,6 +30,8 @@ class ROI():
         self.roiy = [-1,-1]
         self.key = key
         self.run_id = run_id
+        self._current_file_path = current_file_path
+        self._current_saved_roi = current_saved_roi
         self.load_roi(roi_id,
                       use_saved=use_saved_roi,
                       lite=lite,
@@ -153,7 +157,23 @@ class ROI():
         if run_id == []:
             run_id = self.run_id
         try:
-            fpath, run_id = self.server_talk.get_data_file(run_id,lite=lite)
+            # Fast path: atomdata already loaded this file and optionally read
+            # roix/roiy, so avoid another resolver + file-open roundtrip.
+            if run_id == self.run_id and self._current_saved_roi is not None:
+                if self._current_saved_roi is False:
+                    if printouts: print(f"No ROI saved in run {run_id} (cached).")
+                    return False
+                roix, roiy = self._current_saved_roi
+                self.roix = roix
+                self.roiy = roiy
+                if printouts: print(f"ROI loaded from run {run_id} (cached).")
+                return True
+
+            if run_id == self.run_id and self._current_file_path is not None:
+                fpath = self._current_file_path
+            else:
+                fpath, run_id = self.server_talk.get_data_file(run_id,lite=lite)
+
             with h5py.File(fpath) as f:
                 roix = f.attrs['roix']
                 roiy = f.attrs['roiy']
@@ -213,7 +233,13 @@ class ROI():
         """        
         if run_id == []:
             run_id = self.run_id
-        update_bool, roix, roiy = roi_creator(run_id, self.key, self.server_talk).get_roi_rectangle()
+        file_path = self._current_file_path if run_id == self.run_id else None
+        update_bool, roix, roiy = roi_creator(
+            run_id,
+            self.key,
+            self.server_talk,
+            file_path=file_path,
+        ).get_roi_rectangle()
         if update_bool:
             self.roix, self.roiy = roix, roiy
         else:
@@ -248,27 +274,103 @@ class ROI():
         print(f"Updated the spreadsheet ROI with key {key}.")
 
 class roi_creator():
-    def __init__(self,run_id,key,server_talk):
+    window_name = 'recrop'
+
+    def __init__(self, run_id, key, server_talk, file_path=None):
 
         self.key = key
         self.run_id = run_id
+        self.server_talk = server_talk
 
-        filepath, _ = server_talk.get_data_file(run_id)
-        self.h5_file = h5py.File(filepath)
-        self.N_img = self.h5_file['data']['images'].shape[0]//3
-        # try:
-        #     self.analysis_type = self.h5_file['run_info']['imaging_type'][()]
-        # except Exception as e:
-        #     print(e)
-        self.analysis_type = img_types.ABSORPTION
+        if file_path is None:
+            filepath, _ = server_talk.get_data_file(run_id)
+        else:
+            filepath = file_path
+
+        self.h5_file = h5py.File(filepath, 'r')
+        self.images = self.h5_file['data']['images']
+        self.N_img = self.images.shape[0] // 3
+        try:
+            self.analysis_type = self.h5_file['run_info']['imaging_type'][()]
+        except Exception:
+            self.analysis_type = img_types.ABSORPTION
+        self._od_cache = {}
 
         self.image = self.get_od(0)
 
         self.drawing = False
         self.start_x, self.start_y = -1, -1
         self.end_x, self.end_y = -1, -1
-        
-    def get_od(self,idx):
+
+    def _clip_point(self, x, y, shape):
+        y_max, x_max = shape[:2]
+        clipped_x = max(min(int(x), x_max - 1), 0)
+        clipped_y = max(min(int(y), y_max - 1), 0)
+        return clipped_x, clipped_y
+
+    def _map_display_point_to_original(self, x, y, zoom_region, original_shape, display_shape):
+        x, y = self._clip_point(x, y, display_shape)
+        if zoom_region is None:
+            return x, y
+
+        display_h, display_w = display_shape[:2]
+        x0, y0, x1, y1 = zoom_region
+        zoom_w = max(x1 - x0, 1)
+        zoom_h = max(y1 - y0, 1)
+
+        mapped_x = x0 + int(x * zoom_w / display_w)
+        mapped_y = y0 + int(y * zoom_h / display_h)
+        return self._clip_point(mapped_x, mapped_y, original_shape)
+
+    def _extract_display_image(self, original_image, zoom_region):
+        if zoom_region is None:
+            return original_image.copy()
+
+        x0, y0, x1, y1 = zoom_region
+        if x1 <= x0 or y1 <= y0:
+            return original_image.copy()
+
+        zoomed_region = original_image[y0:y1, x0:x1]
+        if zoomed_region.size == 0:
+            return original_image.copy()
+
+        return cv2.resize(
+            zoomed_region,
+            (original_image.shape[1], original_image.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    def _colorize_image(self, image):
+        max_pixel_value = float(np.max(image))
+        if max_pixel_value <= 0.0:
+            normalized_image = np.zeros_like(image, dtype=np.uint8)
+        else:
+            threshold = max(self.cmap_juice_factor * max_pixel_value, np.finfo(float).eps)
+            normalized_image = np.clip(image, 0, threshold)
+            normalized_image = cv2.normalize(normalized_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
+
+    def _prepare_window(self, image_shape):
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        max_width = 1400
+        max_height = 900
+        height, width = image_shape[:2]
+        scale = min(max_width / max(width, 1), max_height / max(height, 1), 1.0)
+        window_width = max(400, int(width * scale))
+        window_height = max(300, int(height * scale))
+        cv2.resizeWindow(self.window_name, window_width, window_height)
+        try:
+            import win32con
+            import win32gui
+
+            hwnd = win32gui.FindWindow(None, self.window_name)
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+    def get_od(self, idx):
         """Computes the idx'th OD for display in the ROI selection GUI.
 
         Args:
@@ -277,11 +379,12 @@ class roi_creator():
         Returns:
             np.ndarray: the OD to display.
         """        
-        pwa = self.h5_file['data']['images'][3*idx]
-        pwoa = self.h5_file['data']['images'][3*idx+1]
-        dark = self.h5_file['data']['images'][3*idx+2]
-        od = compute_OD(pwa,pwoa,dark,self.analysis_type)
-        return od
+        if idx not in self._od_cache:
+            pwa = self.images[3 * idx]
+            pwoa = self.images[3 * idx + 1]
+            dark = self.images[3 * idx + 2]
+            self._od_cache[idx] = compute_OD(pwa, pwoa, dark, self.analysis_type)
+        return self._od_cache[idx]
         
     def get_roi_rectangle(self):
         """Brings up the GUI to select an ROI over a display of the ODs from a
@@ -302,8 +405,8 @@ class roi_creator():
             tuple: roix, given as [roix0, roix1] (left and right bounds of the ROI).
             tuple: roiy, given as [roiy0, roiy1] (top and bottom bounds of the ROI).
         """       
-        image = self.image
-        original_image = image.copy()  # Store the full-scale image
+        original_image = self.image.copy()
+        display_image = original_image.copy()
         img_index = 0
         zooming = False
         zoom_region = None  # Store zoomed region coordinates
@@ -314,42 +417,57 @@ class roi_creator():
         self.cmap_juice_factor = 1.
 
         def draw_rectangle(event, x, y, flags, param):
-            nonlocal image, zoom_region, zooming
+            nonlocal display_image, zoom_region, zooming
 
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.drawing = True
-                self.start_x, self.start_y = x, y
+                self.start_x, self.start_y = self._clip_point(x, y, display_image.shape)
                 
             elif event == cv2.EVENT_MBUTTONDOWN:
                 zooming = True
-                image = original_image.copy()  # Restore full-size image
-                zoom_region = None
-                self.start_x, self.start_y = x, y
+                self.start_x, self.start_y = self._clip_point(x, y, display_image.shape)
 
             elif event == cv2.EVENT_MOUSEMOVE:
                 if self.drawing or zooming:
-                    self.end_x = max(min(x, image.shape[1] - 1), 0)
-                    self.end_y = max(min(y, image.shape[0] - 1), 0)
+                    self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
                     
             elif event == cv2.EVENT_LBUTTONUP:
                 self.drawing = False
-                self.end_x = max(min(x, image.shape[1] - 1), 0)
-                self.end_y = max(min(y, image.shape[0] - 1), 0)
+                self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
 
             elif event == cv2.EVENT_MBUTTONUP:
                 zooming = False
-                self.end_x = max(min(x, image.shape[1] - 1), 0)
-                self.end_y = max(min(y, image.shape[0] - 1), 0)
+                self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
                 try:
                     if self.start_x != -1 and self.start_y != -1 and self.end_x != -1 and self.end_y != -1:
-                        zoom_region = (self.start_x, self.start_y, self.end_x, self.end_y)
-                        zoomed_region = image[self.start_y:self.end_y, self.start_x:self.end_x]
-                        image = cv2.resize(zoomed_region,
-                                        (original_image.shape[1], original_image.shape[0]),
-                                        interpolation=cv2.INTER_LINEAR)
-                except:
-                    image = original_image.copy()
+                        mapped_start = self._map_display_point_to_original(
+                            self.start_x,
+                            self.start_y,
+                            zoom_region,
+                            original_image.shape,
+                            display_image.shape,
+                        )
+                        mapped_end = self._map_display_point_to_original(
+                            self.end_x,
+                            self.end_y,
+                            zoom_region,
+                            original_image.shape,
+                            display_image.shape,
+                        )
+                        x0, x1 = sorted([mapped_start[0], mapped_end[0]])
+                        y0, y1 = sorted([mapped_start[1], mapped_end[1]])
+                        if x1 > x0 and y1 > y0:
+                            zoom_region = (x0, y0, x1, y1)
+                            display_image = self._extract_display_image(original_image, zoom_region)
+                except Exception:
+                    display_image = original_image.copy()
                     zoom_region = None
+                self.start_x, self.start_y = -1, -1
+                self.end_x, self.end_y = -1, -1
+
+            elif event == cv2.EVENT_MOUSEWHEEL:
+                zoom_region = None
+                display_image = original_image.copy()
                 self.start_x, self.start_y = -1, -1
                 self.end_x, self.end_y = -1, -1
 
@@ -358,8 +476,7 @@ class roi_creator():
                 zooming = False
                 self.start_x, self.start_y = -1, -1
                 self.end_x, self.end_y = -1, -1
-                # image = original_image.copy()  # Restore full-size image
-                # zoom_region = None  # Clear zoom region
+                
 
         def adjust_colormap_scale(key):
             """Adjusts the colormap scale factor based on arrow key input."""
@@ -370,93 +487,73 @@ class roi_creator():
             elif key == 0x280000:  # Down arrow key (decrease fraction)
                 self.cmap_juice_factor = min(self.cmap_juice_factor + step_size, 1.0)
 
-        def update_image_to_colormap(image):
-            """Updates the displayed image based on the current scale factor."""
-            
-            # normalized_image = image
-            max_pixel_value = np.max(image)  # Find the maximum pixel value in the original unnormalized image
-            threshold = self.cmap_juice_factor * max_pixel_value  # Apply scaling factor
+        self._prepare_window(display_image.shape)
+        cv2.setMouseCallback(self.window_name, draw_rectangle)
 
-            # Normalize with the threshold
-            normalized_image = np.clip(image, 0, threshold)
-            normalized_image = cv2.normalize(normalized_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-            # Apply the Inferno colormap
-            # colored_image = normalized_image
-            colored_image = cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
-
-            cv2.imshow('recrop', colored_image)
-
-            return colored_image
-
-        cv2.namedWindow('recrop')
-        cv2.setWindowProperty('recrop', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         try:
-            import win32gui
-            import win32con
+            while True:
+                overlay_image = self._colorize_image(display_image)
 
-            hwnd = win32gui.FindWindow(None, 'recrop')
-            win32gui.SetForegroundWindow(hwnd)
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-        except:
-            pass
-        cv2.setMouseCallback('recrop', draw_rectangle)
+                if self.start_x != -1 and self.start_y != -1 and self.end_x != -1 and self.end_y != -1:
+                    color = (255, 255, 255)
+                    thickness = 2 if self.drawing else 1
+                    line_type = cv2.LINE_8 if self.drawing else cv2.LINE_4
+                    cv2.rectangle(
+                        overlay_image,
+                        (self.start_x, self.start_y),
+                        (self.end_x, self.end_y),
+                        color,
+                        thickness,
+                        line_type,
+                    )
 
-        while True:
+                cv2.imshow(self.window_name, overlay_image)
 
-            img_copy = image.copy()
-            
-            if self.start_x != -1 and self.start_y != -1 and self.end_x != -1 and self.end_y != -1:
-                c = np.max(img_copy)
-                color = (c, c, c)
-                thickness = 2 if self.drawing else 1
-                line_type = cv2.LINE_8 if self.drawing else cv2.LINE_4  # Solid for LMB, dotted for MMB
-                cv2.rectangle(img_copy, (self.start_x, self.start_y), (self.end_x, self.end_y), color, thickness, line_type)
+                key = cv2.waitKeyEx(15)
+                if key == 13:
+                    break
 
-            img_copy = update_image_to_colormap(img_copy)
+                if key in [0x260000, 0x280000]:
+                    adjust_colormap_scale(key)
 
-            key = cv2.waitKeyEx(1)
-            if key == 13:  # Enter key
-                break
+                elif key in [2555904, 2424832]:
+                    if key == 2555904:
+                        img_index = (img_index + 1) % self.N_img
+                    else:
+                        img_index = (img_index - 1) % self.N_img
+                    original_image = self.get_od(img_index).copy()
+                    display_image = self._extract_display_image(original_image, zoom_region)
 
-            if key in [0x260000, 0x280000]:  # Up or down arrow key
-                adjust_colormap_scale(key)
+                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
 
-            elif key == 2555904 or key == 2424832: # Right arrow key ➡️ (2555904) and left arrow key ⬅️ (2424832)
-                if key == 2555904:
-                    img_index = (img_index + 1) % self.N_img
-                elif key == 2424832:
-                    img_index = (img_index - 1) % self.N_img
-                image = self.get_od(img_index)
-                if zoom_region:
-                    start_x, start_y, end_x, end_y = zoom_region
-                    zoomed_region = image[start_y:end_y, start_x:end_x]
-                    image = cv2.resize(zoomed_region,
-                                    (original_image.shape[1], original_image.shape[0]),
-                                    interpolation=cv2.INTER_LINEAR)
-
-            if cv2.getWindowProperty('recrop', cv2.WND_PROP_VISIBLE) < 1:  # If window "X" button clicked
-                break
-
-            if key == 27:  # Escape key
-                break
-
-        cv2.destroyAllWindows()
-        self.h5_file.close()
+                if key == 27:
+                    break
+        finally:
+            try:
+                cv2.destroyWindow(self.window_name)
+            except Exception:
+                cv2.destroyAllWindows()
+            self.h5_file.close()
 
         if zoom_region == None:
-            x_origin, y_origin = 0, 0
-            scale_x, scale_y = 1, 1
+            mapped_start_x, mapped_start_y = self.start_x, self.start_y
+            mapped_end_x, mapped_end_y = self.end_x, self.end_y
         else:
-            scale_x = (zoom_region[2] - zoom_region[0]) / original_image.shape[1]
-            scale_y = (zoom_region[3] - zoom_region[1]) / original_image.shape[0]
-            x_origin = zoom_region[0]
-            y_origin = zoom_region[1]
-
-        mapped_start_x = x_origin + int(self.start_x * scale_x)
-        mapped_end_x = x_origin + int(self.end_x * scale_x)
-        mapped_start_y = y_origin + int(self.start_y * scale_y)
-        mapped_end_y = y_origin + int(self.end_y * scale_y)
+            mapped_start_x, mapped_start_y = self._map_display_point_to_original(
+                self.start_x,
+                self.start_y,
+                zoom_region,
+                original_image.shape,
+                display_image.shape,
+            )
+            mapped_end_x, mapped_end_y = self._map_display_point_to_original(
+                self.end_x,
+                self.end_y,
+                zoom_region,
+                original_image.shape,
+                display_image.shape,
+            )
 
         out = np.array([mapped_start_x, mapped_start_y, mapped_end_x, mapped_end_y])
         update_bool = not np.all(out == -1)

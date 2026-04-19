@@ -79,7 +79,11 @@ class GaussianFit(Fit):
 
         popt, pcov = curve_fit(self._fit_func, x[fit_mask], y[fit_mask],
                         p0=[*guesses],
-                        bounds=((0,0,-np.inf,-np.inf),(np.inf,np.inf,np.inf,np.inf)))
+                        bounds=((0,0,-np.inf,-np.inf),(np.inf,np.inf,np.inf,np.inf)),
+                        maxfev=300,
+                        ftol=1e-6,
+                        xtol=1e-6,
+                        gtol=1e-5)
         return popt
     
     def _gaussian_guesses(self,x,y,
@@ -100,9 +104,12 @@ class GaussianFit(Fit):
             print(ynorm)
 
         peak_idx, prop = find_peaks(ynorm[convwidth:],prominence=fractional_peak_prominence)
+        if len(peak_idx) == 0:
+            raise RuntimeError("No peaks detected for Gaussian guess.")
         peak_idx += convwidth
         # get the most prominent peak if > 1
         prom = prop['prominences']
+        which_peak = int(max(0, min(which_peak, len(prom) - 1)))
         idx_idx = np.flip(np.argsort(prom))[which_peak]
         peak_idx = peak_idx[idx_idx]
         prom = prom[idx_idx]
@@ -121,6 +128,11 @@ class GaussianFit(Fit):
         miny = np.abs(ynorm_base_at_zero - threshold_ynorm_at_width)
         how_close_is_close = 0.5 * threshold_ynorm_at_width
         mask = miny < how_close_is_close
+        if not np.any(mask):
+            mask = np.zeros_like(miny, dtype=bool)
+            lo = max(0, peak_idx - convwidth)
+            hi = min(len(mask), peak_idx + convwidth + 1)
+            mask[lo:hi] = True
   
         # find the x value in the region where the y value is near the threshold
         # value which is closest to the x value at the peak (x[idx])
@@ -143,7 +155,9 @@ class GaussianFit(Fit):
         x_nearest = x[mask][idx_nearest]
 
         # construct a mask for the fitting based on a multiple of the estimated peak width
-        peak_width_idx = np.abs(peak_idx - np.where(x == x_nearest)[0][0])
+        nearest_idx = int(np.searchsorted(x, x_nearest, side='left'))
+        nearest_idx = max(0, min(nearest_idx, len(x) - 1))
+        peak_width_idx = np.abs(peak_idx - nearest_idx)
         if peak_width_idx == 1:
             peak_width_idx = 2
         N_peak_widths_mask = 4.
