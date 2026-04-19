@@ -121,34 +121,7 @@ class atomdata():
     '''
     Use to store and do basic analysis on data for every experiment.
     '''
-    def __getattribute__(self, name):
-        if name in ['_repeat_sem_source',
-                    '_repeat_sem_divisor',
-                    '_sem_scale_value',
-                    '_sem_scale_scope_data',
-                    '__dict__',
-                    '__class__']:
-            return object.__getattribute__(self, name)
-
-        sem_source = object.__getattribute__(self, '__dict__').get('_repeat_sem_source', None)
-        if sem_source is not None:
-            if name == 'data':
-                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
-                return _RepeatSEMDataProxy(sem_source.data, sem_divisor)
-            if name == 'scope_data':
-                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
-                return object.__getattribute__(self, '_sem_scale_scope_data')(sem_source.scope_data, sem_divisor)
-
-            local_dict = object.__getattribute__(self, '__dict__')
-            if name in local_dict:
-                return object.__getattribute__(self, name)
-
-            source_value = getattr(sem_source, name)
-            sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
-            return object.__getattribute__(self, '_sem_scale_value')(source_value, sem_divisor)
-
-        return object.__getattribute__(self, name)
-
+    
     def __init__(self,
                 idx=0,
                 roi_id=None,
@@ -813,37 +786,18 @@ class atomdata():
             return
 
         old_xvardims = np.array(self.xvardims, dtype=int)
-        self.img_atoms = self._reassign_repeat_ndarray(self.img_atoms,
-                                                       source_xvar_idx,
-                                                       xvar_idx,
-                                                       n_repeats,
-                                                       old_xvardims)
-        self.img_light = self._reassign_repeat_ndarray(self.img_light,
-                                                       source_xvar_idx,
-                                                       xvar_idx,
-                                                       n_repeats,
-                                                       old_xvardims)
-        self.img_dark = self._reassign_repeat_ndarray(self.img_dark,
-                                                      source_xvar_idx,
-                                                      xvar_idx,
-                                                      n_repeats,
-                                                      old_xvardims)
-
-        self.img_timestamp_atoms = self._reassign_repeat_ndarray(self.img_timestamp_atoms,
-                                                                 source_xvar_idx,
-                                                                 xvar_idx,
-                                                                 n_repeats,
-                                                                 old_xvardims)
-        self.img_timestamp_light = self._reassign_repeat_ndarray(self.img_timestamp_light,
-                                                                 source_xvar_idx,
-                                                                 xvar_idx,
-                                                                 n_repeats,
-                                                                 old_xvardims)
-        self.img_timestamp_dark = self._reassign_repeat_ndarray(self.img_timestamp_dark,
-                                                                source_xvar_idx,
-                                                                xvar_idx,
-                                                                n_repeats,
-                                                                old_xvardims)
+        keys = [
+            'img_atoms', 'img_light', 'img_dark',
+            'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark'
+        ]
+        for key in keys:
+            vars(self)[key] = self._reassign_repeat_ndarray(
+                vars(self)[key],
+                source_xvar_idx,
+                xvar_idx,
+                n_repeats,
+                old_xvardims
+            )
 
         for key in self.data.keys:
             vars(self.data)[key] = self._reassign_repeat_ndarray(vars(self.data)[key],
@@ -855,16 +809,14 @@ class atomdata():
         if hasattr(self,'scope_data'):
             for scope_key in self.scope_data.keys():
                 for ch in self.scope_data[scope_key].keys():
-                    self.scope_data[scope_key][ch].t = self._reassign_repeat_ndarray(self.scope_data[scope_key][ch].t,
-                                                                                     source_xvar_idx,
-                                                                                     xvar_idx,
-                                                                                     n_repeats,
-                                                                                     old_xvardims)
-                    self.scope_data[scope_key][ch].v = self._reassign_repeat_ndarray(self.scope_data[scope_key][ch].v,
-                                                                                     source_xvar_idx,
-                                                                                     xvar_idx,
-                                                                                     n_repeats,
-                                                                                     old_xvardims)
+                    for ax in ['t', 'v']:
+                        vars(self.scope_data[scope_key][ch])[ax] = self._reassign_repeat_ndarray(
+                            vars(self.scope_data[scope_key][ch])[ax],
+                            source_xvar_idx,
+                            xvar_idx,
+                            n_repeats,
+                            old_xvardims
+                        )
 
         self.xvars[source_xvar_idx] = self._get_unique_repeated_xvar(source_xvar_idx, n_repeats)
         self.xvars[xvar_idx] = np.repeat(np.asarray(self.xvars[xvar_idx]), n_repeats)
@@ -1290,6 +1242,34 @@ class atomdata():
                     self.scope_data = format_scope_data(d,old_method=old_method_bool)
             except Exception as e:
                 print(e)
+
+    def __getattribute__(self, name):
+        if name in ['_repeat_sem_source',
+                    '_repeat_sem_divisor',
+                    '_sem_scale_value',
+                    '_sem_scale_scope_data',
+                    '__dict__',
+                    '__class__']:
+            return object.__getattribute__(self, name)
+
+        sem_source = object.__getattribute__(self, '__dict__').get('_repeat_sem_source', None)
+        if sem_source is not None:
+            if name == 'data':
+                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+                return _RepeatSEMDataProxy(sem_source.data, sem_divisor)
+            if name == 'scope_data':
+                sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+                return object.__getattribute__(self, '_sem_scale_scope_data')(sem_source.scope_data, sem_divisor)
+
+            local_dict = object.__getattribute__(self, '__dict__')
+            if name in local_dict:
+                return object.__getattribute__(self, name)
+
+            source_value = getattr(sem_source, name)
+            sem_divisor = object.__getattribute__(self, '_repeat_sem_divisor')
+            return object.__getattribute__(self, '_sem_scale_value')(source_value, sem_divisor)
+
+        return object.__getattribute__(self, name)
 
 # class ConcatAtomdata(atomdata):
 #     def __init__(self,rids=[],roi_id=None,lite=False):
