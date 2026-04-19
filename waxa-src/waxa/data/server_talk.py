@@ -2,6 +2,7 @@ import os
 import subprocess
 import bisect
 import time
+import json
 from datetime import datetime, timedelta
 import glob
 import numpy as np
@@ -12,6 +13,9 @@ RUN_INDEX_TTL_S = 300.0
 RECENT_COMPLETED_TRUST_WINDOW = 16
 RELATIVE_INDEX_FRESH_FIRST_MAX = 8
 SERVER_TALK_TIMING_ENABLED = False
+RUN_INDEX_DISK_CACHE_ENABLED = True
+RUN_INDEX_DISK_TTL_S = 3600.0
+RUN_INDEX_DISK_CACHE_FILENAME = ".waxa_run_index_cache_v1.json"
 
 class server_talk():
     def __init__(self,
@@ -46,10 +50,15 @@ class server_talk():
         self._run_index_ttl_s = RUN_INDEX_TTL_S
         self._recent_completed_trust_window = RECENT_COMPLETED_TRUST_WINDOW
         self._timing_enabled = SERVER_TALK_TIMING_ENABLED
+        self._run_index_disk_cache_enabled = RUN_INDEX_DISK_CACHE_ENABLED
+        self._run_index_disk_ttl_s = RUN_INDEX_DISK_TTL_S
 
         self.set_data_dir()
 
     def set_data_dir(self, lite=False):
+
+        old_data_dir = self.data_dir
+        old_lite = self._lite
 
         if self._lite == lite:
             pass
@@ -58,6 +67,125 @@ class server_talk():
         else:
             self.data_dir = os.path.join(self.data_dir, "_lite")
         self._lite = lite
+
+        # Data-root changes invalidate cached index metadata.
+        if old_data_dir != self.data_dir or old_lite != self._lite:
+            self._run_index_cache = {
+                False: None,
+                True: None,
+            }
+            self._run_index_cache_time = {
+                False: 0.0,
+                True: 0.0,
+            }
+            self._completion_cache = {}
+
+    def _run_index_cache_path(self, lite=False):
+        self.set_data_dir(lite)
+        root = self.data_dir
+        if not root:
+            return None
+        return os.path.join(root, RUN_INDEX_DISK_CACHE_FILENAME)
+
+    def _serialize_run_index(self, index):
+        out = {
+            'run_ids': [int(v) for v in index.get('run_ids', [])],
+            'paths_by_run_id': {},
+            'dates_by_run_id': {},
+        }
+        for rid, path in index.get('paths_by_run_id', {}).items():
+            out['paths_by_run_id'][str(int(rid))] = path
+        for rid, run_date in index.get('dates_by_run_id', {}).items():
+            if isinstance(run_date, datetime):
+                run_date_str = run_date.date().isoformat()
+            elif hasattr(run_date, 'isoformat'):
+                run_date_str = run_date.isoformat()
+            elif run_date is None:
+                run_date_str = None
+            else:
+                run_date_str = str(run_date)
+            out['dates_by_run_id'][str(int(rid))] = run_date_str
+        return out
+
+    def _deserialize_run_index(self, payload):
+        run_ids = sorted([int(v) for v in payload.get('run_ids', [])])
+        paths_by_run_id = {
+            int(rid): path
+            for rid, path in payload.get('paths_by_run_id', {}).items()
+        }
+        dates_by_run_id = {}
+        for rid, run_date in payload.get('dates_by_run_id', {}).items():
+            rid_int = int(rid)
+            if run_date is None:
+                continue
+            try:
+                dates_by_run_id[rid_int] = datetime.strptime(run_date, '%Y-%m-%d').date()
+            except Exception:
+                # Keep permissive parsing behavior for forward compatibility.
+                try:
+                    dates_by_run_id[rid_int] = datetime.fromisoformat(run_date).date()
+                except Exception:
+                    continue
+        return {
+            'run_ids': run_ids,
+            'paths_by_run_id': paths_by_run_id,
+            'dates_by_run_id': dates_by_run_id,
+        }
+
+    def _load_run_index_from_disk(self, lite=False):
+        if not self._run_index_disk_cache_enabled:
+            return None
+
+        cache_path = self._run_index_cache_path(lite=lite)
+        if cache_path is None or not os.path.isfile(cache_path):
+            return None
+
+        try:
+            age_s = time.time() - os.path.getmtime(cache_path)
+            if age_s > self._run_index_disk_ttl_s:
+                return None
+        except OSError:
+            return None
+
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if payload.get('version') != 1:
+                return None
+            if bool(payload.get('lite')) != bool(lite):
+                return None
+            if payload.get('data_dir') != self.data_dir:
+                return None
+            return self._deserialize_run_index(payload.get('index', {}))
+        except Exception:
+            return None
+
+    def _save_run_index_to_disk(self, index, lite=False):
+        if not self._run_index_disk_cache_enabled:
+            return
+
+        cache_path = self._run_index_cache_path(lite=lite)
+        if cache_path is None:
+            return
+
+        payload = {
+            'version': 1,
+            'lite': bool(lite),
+            'data_dir': self.data_dir,
+            'created_unix_s': time.time(),
+            'index': self._serialize_run_index(index),
+        }
+        tmp_path = f"{cache_path}.tmp"
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def get_data_file(self, idx=0, path="", lite=False):
         '''
@@ -87,7 +215,10 @@ class server_talk():
         if path == "":
             if idx <= 0:
                 relative_idx = abs(int(idx))
-                fresh_first = (relative_idx <= RELATIVE_INDEX_FRESH_FIRST_MAX)
+                # If an index is already available in memory or on disk, prefer it
+                # even for very recent relative lookups to avoid fresh directory scans.
+                cached_index_available = self._get_run_index(lite=False, allow_build=False) is not None
+                fresh_first = (relative_idx <= RELATIVE_INDEX_FRESH_FIRST_MAX) and (not cached_index_available)
                 if lite:
                     run_id = self.get_completed_run_id_by_relative_index(
                         relative_idx,
@@ -213,9 +344,12 @@ class server_talk():
 
     def _iter_completed_data_files_desc_fresh(self, lite=False):
         self.check_for_mapped_data_dir()
+        yielded = 0
         for date_dir in self._iter_date_dirs_desc(lite=lite):
             for path in self._iter_hdf5_files_desc(date_dir):
-                if self._is_completed_run(path):
+                # Favor speed for newest files; keep strict completion checks for older files.
+                if yielded < self._recent_completed_trust_window or self._is_completed_run(path):
+                    yielded += 1
                     yield path
 
     def _is_completed_run(self, filepath):
@@ -419,15 +553,31 @@ class server_talk():
             'dates_by_run_id': dates_by_run_id,
         }
 
-    def _get_run_index(self, lite=False, refresh=False):
+    def _get_run_index(self, lite=False, refresh=False, allow_build=True):
         t0 = time.perf_counter()
         lite_key = bool(lite)
         cache_age_s = time.time() - self._run_index_cache_time[lite_key]
         cache_stale = cache_age_s > self._run_index_ttl_s
-        if refresh or self._run_index_cache.get(lite_key) is None or cache_stale:
-            self._run_index_cache[lite_key] = self._build_run_index(lite=lite)
-            self._run_index_cache_time[lite_key] = time.time()
-            self._log_timing(f"_build_run_index(lite={lite})", t0)
+        in_memory = self._run_index_cache.get(lite_key)
+
+        if not refresh and in_memory is not None and not cache_stale:
+            return in_memory
+
+        if not refresh:
+            disk_index = self._load_run_index_from_disk(lite=lite)
+            if disk_index is not None:
+                self._run_index_cache[lite_key] = disk_index
+                self._run_index_cache_time[lite_key] = time.time()
+                self._log_timing(f"_load_run_index_from_disk(lite={lite})", t0)
+                return disk_index
+
+        if not allow_build:
+            return None
+
+        self._run_index_cache[lite_key] = self._build_run_index(lite=lite)
+        self._save_run_index_to_disk(self._run_index_cache[lite_key], lite=lite)
+        self._run_index_cache_time[lite_key] = time.time()
+        self._log_timing(f"_build_run_index(lite={lite})", t0)
         return self._run_index_cache[lite_key]
 
     def _find_data_file_by_run_id_fresh(self, run_id, lite=False):
@@ -471,6 +621,7 @@ class server_talk():
         except Exception:
             pass
         self._run_index_cache_time[bool(lite)] = time.time()
+        self._save_run_index_to_disk(cache, lite=lite)
 
     def find_data_file_by_run_id(self, run_id, lite=False, raise_on_missing=True, refresh=False):
         t0 = time.perf_counter()
