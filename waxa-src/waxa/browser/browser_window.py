@@ -42,8 +42,66 @@ from PyQt6.QtWidgets import (
 )
 
 from .run_summary import RunSummary
-from .scanner import BatchLiteCreateWorker, LiteCreateWorker, RunScanner, ScanWorker, XvarDetailLoader
+from .scanner import (
+    PARAM_SEARCH_MODES,
+    BatchLiteCreateWorker,
+    LiteCreateWorker,
+    ParamSearchLoader,
+    RunScanner,
+    ScanWorker,
+    XvarDetailLoader,
+)
 from ..data.server_talk import server_talk
+
+
+def parse_name_search_terms(query: str):
+    normalized_query = (query or "").strip().lower()
+    return [term.strip() for term in normalized_query.split("+") if term.strip()]
+
+
+def normalize_match_text(value: str):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def is_subsequence(needle: str, haystack: str):
+    if not needle:
+        return True
+    index = 0
+    for char in haystack:
+        if char == needle[index]:
+            index += 1
+            if index == len(needle):
+                return True
+    return False
+
+
+def name_matches_term(term: str, raw_name: str):
+    raw_name = (raw_name or "").lower()
+    normalized_name = normalize_match_text(raw_name)
+    normalized_term = normalize_match_text(term)
+    if term in raw_name:
+        return True
+    if normalized_term and normalized_term in normalized_name:
+        return True
+    if normalized_term and is_subsequence(normalized_term, normalized_name):
+        return True
+    return False
+
+
+def name_matches_all_terms(raw_name: str, terms: list[str]):
+    if not terms:
+        return True
+    return all(name_matches_term(term, raw_name) for term in terms)
+
+
+def any_name_matches_all_terms(names: list[str], terms: list[str]):
+    if not terms:
+        return True
+    lowered_names = [str(name).lower() for name in names]
+    for term in terms:
+        if not any(name_matches_term(term, name) for name in lowered_names):
+            return False
+    return True
 
 
 class DateSeparatorDelegate(QStyledItemDelegate):
@@ -140,6 +198,174 @@ class ScrollableValueField(QScrollArea):
 
     def setTextInteractionFlags(self, flags):
         self._label.setTextInteractionFlags(flags)
+
+
+class ParamSearchDialog(QDialog):
+    MODE_LABELS = {
+        "params": "Params",
+        "camera_params": "Camera Params",
+        "data": "Data Containers",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._records_by_mode = {mode: [] for mode in PARAM_SEARCH_MODES}
+        self._filtered_records = []
+        self._active_mode = "params"
+        self._mode_buttons = {}
+
+        self.setWindowTitle("Param Search")
+        self.resize(860, 560)
+        self.setMinimumSize(700, 420)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        toggle_group = QFrame(self)
+        toggle_group.setObjectName("toolbarGroup")
+        toggle_layout = QHBoxLayout(toggle_group)
+        toggle_layout.setContentsMargins(6, 4, 6, 4)
+        toggle_layout.setSpacing(4)
+
+        for mode in PARAM_SEARCH_MODES:
+            button = QToolButton(toggle_group)
+            button.setText(self.MODE_LABELS.get(mode, mode))
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.clicked.connect(lambda checked=False, m=mode: self._on_mode_selected(m, checked))
+            toggle_layout.addWidget(button)
+            self._mode_buttons[mode] = button
+
+        self.search_input = QLineEdit(self)
+        self.search_input.setPlaceholderText("search params")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._apply_filter)
+
+        top_row.addWidget(toggle_group)
+        top_row.addWidget(self.search_input, 1)
+
+        self.status_label = QLabel("Ready", self)
+        self.status_label.setObjectName("statusLabel")
+
+        self.results_table = QTableWidget(self)
+        self.results_table.setColumnCount(3)
+        self.results_table.setHorizontalHeaderLabels(["name", "dtype", "preview"])
+        self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.results_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setWordWrap(False)
+        self.results_table.setShowGrid(False)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.verticalHeader().setDefaultSectionSize(28)
+        self.results_table.itemSelectionChanged.connect(self._update_detail_from_selection)
+        header = self.results_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.resizeSection(1, 120)
+
+        self.detail_value = QPlainTextEdit(self)
+        self.detail_value.setReadOnly(True)
+        self.detail_value.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.detail_value.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.detail_value.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if parent is not None and hasattr(parent, "_fixed_width_font"):
+            self.detail_value.setFont(parent._fixed_width_font())
+
+        layout.addLayout(top_row)
+        layout.addWidget(self.results_table, 1)
+        layout.addWidget(self.detail_value, 1)
+        layout.addWidget(self.status_label)
+
+        self._mode_buttons[self._active_mode].setChecked(True)
+        self._set_mode(self._active_mode)
+
+    def set_run(self, run: RunSummary):
+        self.setWindowTitle(f"Run {run.run_id} - Param Search")
+
+    def set_loading_state(self, run: RunSummary):
+        self.set_run(run)
+        self.status_label.setText("Loading values…")
+        self.results_table.setRowCount(0)
+        self.detail_value.setPlainText("Loading values…")
+
+    def set_error_message(self, message: str):
+        self.status_label.setText("Load failed")
+        self.results_table.setRowCount(0)
+        self.detail_value.setPlainText(message)
+
+    def set_records(self, records_by_mode: dict):
+        self._records_by_mode = {mode: list(records_by_mode.get(mode, [])) for mode in PARAM_SEARCH_MODES}
+        self._apply_filter()
+
+    def focus_search(self):
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def set_mode(self, mode: str):
+        button = self._mode_buttons.get(mode)
+        if button is not None:
+            button.setChecked(True)
+            self._set_mode(mode)
+
+    def _on_mode_selected(self, mode: str, checked: bool):
+        if checked:
+            self._set_mode(mode)
+
+    def _set_mode(self, mode: str):
+        self._active_mode = mode if mode in PARAM_SEARCH_MODES else "params"
+        self._apply_filter()
+
+    def _apply_filter(self):
+        terms = parse_name_search_terms(self.search_input.text())
+        source_records = self._records_by_mode.get(self._active_mode, [])
+        self._filtered_records = [
+            record for record in source_records if name_matches_all_terms(record.get("name", ""), terms)
+        ]
+
+        self.results_table.setRowCount(len(self._filtered_records))
+        for row, record in enumerate(self._filtered_records):
+            values = [
+                record.get("name", "-"),
+                record.get("dtype", "-"),
+                record.get("preview", "-"),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, record)
+                self.results_table.setItem(row, col, item)
+
+        total = len(source_records)
+        count = len(self._filtered_records)
+        self.status_label.setText(f"{count} matching entries" + ("" if count == total else f" of {total}"))
+
+        if self._filtered_records:
+            self.results_table.selectRow(0)
+            self._update_detail_from_selection()
+        else:
+            self.detail_value.setPlainText("No matching values.")
+
+    def _update_detail_from_selection(self):
+        row = self.results_table.currentRow()
+        if row < 0 or row >= len(self._filtered_records):
+            self.detail_value.setPlainText("No matching values.")
+            return
+
+        record = self._filtered_records[row]
+        detail_lines = [
+            f"name: {record.get('name', '-')}",
+            f"dtype: {record.get('dtype', '-')}",
+            "",
+            record.get("detail", record.get("preview", "-")),
+        ]
+        self.detail_value.setPlainText("\n".join(detail_lines))
 
 
 class RunDetailPane(QWidget):
@@ -441,9 +667,11 @@ class DataBrowserWindow(QMainWindow):
         self.data_dir = saved_dir if (saved_dir and os.path.isdir(saved_dir)) else data_dir
         self._scan_worker = None
         self._xvar_loader = None
+        self._param_search_loader = None
         self._lite_worker = None
         self._scan_request_id = 0
         self._detail_request_id = 0
+        self._param_search_request_id = 0
 
         self._runs_by_id = {}
         self._scan_loaded_count = 0
@@ -452,6 +680,7 @@ class DataBrowserWindow(QMainWindow):
         self._busy_ops = 0
         self._pending_focus_run_id = None
         self._pending_requested_run_id = None
+        self._param_search_dialog = None
         self._server_talk = server_talk(data_dir=self.data_dir)
 
         self.setWindowTitle("Data Browser")
@@ -820,6 +1049,9 @@ class DataBrowserWindow(QMainWindow):
             QPushButton:hover, QToolButton:hover {
                 background: #276382;
             }
+            QPushButton:checked, QToolButton:checked {
+                background: #4c7f98;
+            }
             QGroupBox {
                 color: #2a3f4b;
                 font-weight: 700;
@@ -1109,6 +1341,9 @@ class DataBrowserWindow(QMainWindow):
         edit_tags_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
         edit_tags_shortcut.activated.connect(self._edit_tags_for_selected)
 
+        param_search_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
+        param_search_shortcut.activated.connect(self._open_param_search_for_selected)
+
         cycle_search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         cycle_search_shortcut.activated.connect(self._focus_next_search_field)
 
@@ -1117,6 +1352,7 @@ class DataBrowserWindow(QMainWindow):
             ("Ctrl+L", "Create lite dataset(s)"),
             ("Ctrl+D", "Open data location"),
             ("Ctrl+E", "Open experiment location"),
+            ("Ctrl+P", "Search params for selected run"),
             ("Ctrl+T", "Edit tags for selected run"),
             ("Ctrl+F", "Cycle search focus: xvar -> experiment -> tag"),
             ("Ctrl+R", "Refresh")
@@ -1339,8 +1575,7 @@ class DataBrowserWindow(QMainWindow):
         self._update_summary_chips()
 
     def _parse_search_terms(self, query: str):
-        normalized_query = query.strip().lower()
-        return [term.strip() for term in normalized_query.split("+") if term.strip()]
+        return parse_name_search_terms(query)
 
     def _run_matches_terms(self, run: RunSummary, terms: list[str]):
         experiment_query = self.experiment_filter_input.text().strip().lower()
@@ -1355,43 +1590,17 @@ class DataBrowserWindow(QMainWindow):
         if not terms:
             return True
 
-        xvarnames = [name.lower() for name in run.xvarnames]
-        normalized_xvarnames = [self._normalize_match_text(name) for name in xvarnames]
-        for term in terms:
-            normalized_term = self._normalize_match_text(term)
-            if not any(
-                self._matches_xvar_term(term, normalized_term, name, normalized_name)
-                for name, normalized_name in zip(xvarnames, normalized_xvarnames)
-            ):
-                return False
-        return True
+        return any_name_matches_all_terms(run.xvarnames, terms)
 
     def _matches_xvar_term(self, term: str, normalized_term: str, raw_name: str, normalized_name: str):
-        if term in raw_name:
-            return True
-        if normalized_term and normalized_term in normalized_name:
-            return True
-        if normalized_term and self._is_subsequence(normalized_term, normalized_name):
-            return True
-        return False
+        del normalized_term, normalized_name
+        return name_matches_term(term, raw_name)
 
     def _is_subsequence(self, needle: str, haystack: str):
-        # Ordered fuzzy matching in O(len(haystack)): allows characters
-        # between query letters, e.g. "frmn" -> "frequencyramantransition".
-        if not needle:
-            return True
-        i = 0
-        for char in haystack:
-            if char == needle[i]:
-                i += 1
-                if i == len(needle):
-                    return True
-        return False
+        return is_subsequence(needle, haystack)
 
     def _normalize_match_text(self, value: str):
-        # Remove separators/punctuation so short patterns like "tr" can match
-        # names like "t_raman" while preserving normal substring behavior.
-        return re.sub(r"[^a-z0-9]", "", value.lower())
+        return normalize_match_text(value)
 
     def _get_selected_row(self):
         indexes = self.table.selectionModel().selectedRows()
@@ -1493,6 +1702,7 @@ class DataBrowserWindow(QMainWindow):
         create_action = menu.addAction("Create Lite Dataset")
         copy_lite_arg_action = menu.addAction("Copy Lite Arg")
         open_h5_action = menu.addAction("Open H5 File")
+        search_params_action = menu.addAction("Search Params…")
 
         if not run.has_lite:
             copy_lite_arg_action.setEnabled(False)
@@ -1500,6 +1710,7 @@ class DataBrowserWindow(QMainWindow):
         if is_multi_selection:
             copy_lite_arg_action.setEnabled(False)
             open_h5_action.setEnabled(False)
+            search_params_action.setEnabled(False)
 
         menu.addSeparator()
         add_tag_menu = menu.addMenu("Add Tag")
@@ -1543,6 +1754,8 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText(f"Copied: {text}")
         elif chosen is open_h5_action:
             self._open_file_in_default_program(run.filepath, "H5 file")
+        elif chosen is search_params_action:
+            self._open_param_search_for_selected()
         elif chosen in common_tag_actions:
             self._toggle_common_tag_for_runs(selected_run_rows, common_tag_actions[chosen])
         elif chosen is add_custom_tag_action:
@@ -1911,6 +2124,74 @@ class DataBrowserWindow(QMainWindow):
     def _start_lite_creation(self, run_id: int):
         self._start_lite_creation_for_runs([run_id])
 
+    def _ensure_param_search_dialog(self):
+        if self._param_search_dialog is None:
+            self._param_search_dialog = ParamSearchDialog(self)
+            saved_mode = self.settings.value("paramSearchMode", "params", type=str)
+            self._param_search_dialog.set_mode(saved_mode)
+            self._param_search_dialog.finished.connect(self._on_param_search_dialog_closed)
+        return self._param_search_dialog
+
+    def _on_param_search_dialog_closed(self):
+        if self._param_search_dialog is not None:
+            self.settings.setValue("paramSearchMode", self._param_search_dialog._active_mode)
+
+    def _open_param_search_for_selected(self):
+        row = self._get_selected_row()
+        run = self._get_run_for_row(row)
+        if run is None:
+            self.status_label.setText("No run selected")
+            return
+
+        selected_rows = self._get_selected_rows()
+        if len(selected_rows) > 1:
+            self.status_label.setText("Select a single run for param search")
+            return
+
+        dialog = self._ensure_param_search_dialog()
+        dialog.set_loading_state(run)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.focus_search()
+
+        self._set_activity_busy("Loading params…")
+        self._param_search_request_id += 1
+        current_request_id = self._param_search_request_id
+        self._param_search_loader = ParamSearchLoader(run.filepath)
+        self._param_search_loader.records_ready.connect(
+            lambda records, rid=run.run_id, req_id=current_request_id: self._on_param_search_records_ready_guarded(rid, records, req_id)
+        )
+        self._param_search_loader.load_error.connect(
+            lambda message, req_id=current_request_id: self._on_param_search_error_guarded(message, req_id)
+        )
+        self._param_search_loader.start()
+
+    def _on_param_search_records_ready(self, run_id: int, records: dict):
+        dialog = self._ensure_param_search_dialog()
+        selected_run = self._runs_by_id.get(run_id)
+        if selected_run is not None:
+            dialog.set_run(selected_run)
+        dialog.set_records(records)
+        self.settings.setValue("paramSearchMode", dialog._active_mode)
+        self.status_label.setText(f"Loaded params for run {run_id}")
+        self._set_activity_idle()
+
+    def _on_param_search_records_ready_guarded(self, run_id: int, records: dict, request_id: int):
+        if request_id != self._param_search_request_id:
+            self._set_activity_idle()
+            return
+        self._on_param_search_records_ready(run_id, records)
+
+    def _on_param_search_error_guarded(self, message: str, request_id: int):
+        if request_id != self._param_search_request_id:
+            self._set_activity_idle()
+            return
+        dialog = self._ensure_param_search_dialog()
+        dialog.set_error_message(message)
+        self.status_label.setText("Param search failed")
+        self._set_activity_idle()
+
     def _start_lite_creation_for_runs(self, run_ids: list[int]):
         unique_run_ids = sorted({int(rid) for rid in run_ids})
         if not unique_run_ids:
@@ -2085,6 +2366,7 @@ class DataBrowserWindow(QMainWindow):
             QLineEdit, QDateEdit, QPushButton, QListWidget, QTableWidget, QTextEdit {
                 background: #263340; border-color: #3a4f60; color: #d0dce6;
             }
+            QPushButton:checked, QToolButton:checked { background: #40627a; }
             QGroupBox { background: #263340; border-color: #3a4f60; color: #9bbdd0; }
             QHeaderView::section { background: #1e2832; color: #9bbdd0; border-right: 1px solid #3a4f60; border-bottom: 1px solid #3a4f60; }
             QTableWidget { alternate-background-color: #222d38; selection-background-color: #2d5470; color: #d0dce6; }

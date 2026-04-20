@@ -19,6 +19,8 @@ EXCLUDED_DATA_KEYS = {
     "scope_data",
 }
 
+PARAM_SEARCH_MODES = ("params", "camera_params", "data")
+
 
 def _decode_str(value):
     if isinstance(value, bytes):
@@ -44,6 +46,154 @@ def _path_basename_no_ext(path_value):
     if basename.endswith(".py"):
         basename = basename[:-3]
     return basename, path_str
+
+
+def _preview_dataset_value(dataset, max_items: int = 8):
+    try:
+        if dataset.shape == ():
+            return dataset[()]
+        if dataset.size == 0:
+            return np.asarray(dataset[()])
+        if dataset.size <= max_items:
+            return np.asarray(dataset[()])
+
+        first_dim = dataset.shape[0] if dataset.shape else 0
+        slice_len = max(1, min(max_items, first_dim))
+        sample = np.asarray(dataset[tuple([slice(0, slice_len)] + [slice(None)] * (dataset.ndim - 1))])
+        return sample
+    except Exception:
+        return None
+
+
+def _stringify_value(value, max_chars: int = 240):
+    if value is None:
+        return "-"
+
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, np.bytes_):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, np.ndarray):
+        if value.dtype.kind in {"S", "U", "O"}:
+            text = np.array2string(
+                np.asarray([_decode_str(item) for item in value.reshape(-1)]).reshape(value.shape),
+                threshold=8,
+                edgeitems=3,
+            )
+        else:
+            text = np.array2string(value, threshold=8, edgeitems=3)
+    elif isinstance(value, np.generic):
+        text = str(value.item())
+    elif isinstance(value, (list, tuple)):
+        text = repr(value)
+    else:
+        text = str(value)
+
+    text = text.strip() or "-"
+    if len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
+
+
+def _decimals_from_spacing(scaled_values):
+    finite = np.asarray(scaled_values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size < 2:
+        return 6
+
+    unique_sorted = np.unique(np.sort(finite))
+    if unique_sorted.size < 2:
+        return 6
+
+    diffs = np.diff(unique_sorted)
+    positive = diffs[diffs > 0]
+    if positive.size == 0:
+        return 6
+
+    step = float(np.min(positive))
+    decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
+    return max(0, min(10, decimals + 1))
+
+
+def _format_numeric_value(value: float, multiplier: float, decimals: int):
+    scaled = float(value) * float(multiplier)
+    if not np.isfinite(scaled):
+        return "NA"
+    if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
+        return f"{scaled:.6g}"
+    return f"{scaled:.{decimals}f}"
+
+
+def _min_max_summary(name: str, values):
+    array = np.asarray(values)
+    if array.size == 0:
+        return None
+    # Only show min/max for actual arrays, not scalar values.
+    if array.ndim == 0:
+        return None
+
+    flat = array.reshape(-1)
+    if np.issubdtype(flat.dtype, np.number):
+        finite = flat[np.isfinite(flat)]
+        if finite.size == 0:
+            return "min: NA | max: NA"
+
+        unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=finite)
+        unit = unit or ""
+        scaled_vals = np.asarray(finite, dtype=np.float64) * float(multiplier)
+        decimals = _decimals_from_spacing(scaled_vals)
+        min_text = _format_numeric_value(np.nanmin(finite), multiplier, decimals)
+        max_text = _format_numeric_value(np.nanmax(finite), multiplier, decimals)
+        unit_suffix = f" {unit}" if unit else ""
+        return f"min: {min_text}{unit_suffix} | max: {max_text}{unit_suffix}"
+
+    as_text = [_decode_str(item) for item in flat]
+    return f"min: {min(as_text)} | max: {max(as_text)}"
+
+
+def _build_value_record(mode: str, name: str, value, dataset=None):
+    array_value = None
+    shape = "()"
+    dtype_name = type(value).__name__
+
+    if dataset is not None:
+        shape = str(tuple(int(dim) for dim in dataset.shape)) if dataset.shape else "()"
+        dtype_name = str(dataset.dtype)
+        array_value = _preview_dataset_value(dataset)
+    else:
+        array_value = np.asarray(value) if isinstance(value, (list, tuple, np.ndarray, np.generic)) else value
+        if isinstance(array_value, np.ndarray):
+            shape = str(tuple(int(dim) for dim in array_value.shape)) if array_value.shape else "()"
+            dtype_name = str(array_value.dtype)
+
+    preview_source = array_value if array_value is not None else value
+    preview = _stringify_value(preview_source, max_chars=160)
+    detail = _stringify_value(preview_source, max_chars=8000)
+
+    if mode in {"params", "camera_params"}:
+        values_for_summary = value
+        if values_for_summary is None and dataset is not None:
+            try:
+                values_for_summary = dataset[()]
+            except Exception:
+                values_for_summary = None
+        stats_text = _min_max_summary(str(name), values_for_summary) if values_for_summary is not None else None
+        if stats_text:
+            preview = _stringify_value(f"{stats_text} | {preview}", max_chars=160)
+            detail = f"{stats_text}\n\n{detail}"
+
+    if dataset is not None and dataset.size > 8:
+        detail += f"\n\nPreview truncated from dataset with shape {shape} and dtype {dtype_name}."
+
+    return {
+        "mode": mode,
+        "name": str(name),
+        "dtype": dtype_name,
+        "shape": shape,
+        "preview": preview,
+        "detail": detail,
+        "size": int(dataset.size) if dataset is not None else int(np.asarray(array_value).size) if isinstance(array_value, np.ndarray) else 1,
+    }
 
 
 def _is_completed_run(h5file):
@@ -364,6 +514,66 @@ class XvarDetailLoader(QThread):
             "min": min(as_text),
             "max": max(as_text),
         }
+
+
+class ParamSearchLoader(QThread):
+    records_ready = pyqtSignal(dict)
+    load_error = pyqtSignal(str)
+
+    def __init__(self, filepath: str):
+        super().__init__()
+        self.filepath = filepath
+
+    def run(self):
+        records = {mode: [] for mode in PARAM_SEARCH_MODES}
+        try:
+            with h5py.File(self.filepath, "r") as f:
+                records["params"] = self._load_group_records(f, "params")
+                records["camera_params"] = self._load_group_records(f, "camera_params")
+                records["data"] = self._load_data_records(f)
+            self.records_ready.emit(records)
+        except Exception as exc:
+            self.load_error.emit(str(exc))
+
+    def _load_group_records(self, h5file, group_name: str):
+        if group_name not in h5file:
+            return []
+
+        records = []
+        group = h5file[group_name]
+        for key in sorted(group.keys()):
+            dataset = group[key]
+            try:
+                value = dataset[()]
+            except Exception:
+                value = None
+            records.append(_build_value_record(group_name, key, value, dataset=dataset))
+        return records
+
+    def _load_data_records(self, h5file):
+        if "data" not in h5file:
+            return []
+
+        records = []
+        group = h5file["data"]
+        for key in sorted(group.keys()):
+            item = group[key]
+            if isinstance(item, h5py.Group):
+                records.append(
+                    {
+                        "mode": "data",
+                        "name": str(key),
+                        "dtype": "group",
+                        "shape": "-",
+                        "preview": f"group with {len(item.keys())} entries",
+                        "detail": f"HDF5 group '{key}' with children: {', '.join(sorted(item.keys())) or '(none)'}",
+                        "size": len(item.keys()),
+                    }
+                )
+                continue
+
+            records.append(_build_value_record("data", key, None, dataset=item))
+        return records
 
 
 class LiteCreateWorker(QThread):
