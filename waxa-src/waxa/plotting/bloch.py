@@ -670,8 +670,8 @@ def plot_replay_bloch_vs_time(
     draw_bloch_sphere(ax_bloch, sphere_alpha=sphere_alpha)
 
     ax_bloch.plot(sx, sy, sz, color="tab:blue", lw=1.8, alpha=0.9)
-    ax_bloch.scatter([sx[0]], [sy[0]], [sz[0]], color="tab:green", s=34, depthshade=False, label="start")
-    ax_bloch.scatter([sx[-1]], [sy[-1]], [sz[-1]], color="tab:red", s=36, depthshade=False, label="end")
+    ax_bloch.scatter([sx[0]], [sy[0]], [sz[0]], color="tab:green", marker='o', s=34, depthshade=False, label="start")
+    ax_bloch.scatter([sx[-1]], [sy[-1]], [sz[-1]], color="tab:red", marker='x', s=36, depthshade=False, label="end")
     ax_bloch.legend(loc="upper left", fontsize="small")
 
     ax_time.plot(t, sx, label="s_x", lw=1.4)
