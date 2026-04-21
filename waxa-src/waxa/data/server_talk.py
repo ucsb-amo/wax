@@ -1,21 +1,14 @@
 import os
 import subprocess
-import bisect
 import time
-import json
 from datetime import datetime, timedelta
 import glob
 import numpy as np
 import h5py
 
 MAP_BAT_PATH = "\"G:\\Shared drives\\Weld Lab Shared Drive\\Infrastructure\\map_network_drives_PeterRecommended.bat\""
-RUN_INDEX_TTL_S = 300.0
 RECENT_COMPLETED_TRUST_WINDOW = 16
-RELATIVE_INDEX_FRESH_FIRST_MAX = 8
 SERVER_TALK_TIMING_ENABLED = False
-RUN_INDEX_DISK_CACHE_ENABLED = True
-RUN_INDEX_DISK_TTL_S = 3600.0
-RUN_INDEX_DISK_CACHE_FILENAME = ".waxa_run_index_cache_v1.json"
 
 class server_talk():
     def __init__(self,
@@ -38,28 +31,12 @@ class server_talk():
         self._bat_on_data_dir_disconnected = on_data_dir_disconnected_bat_path
 
         self._lite = False
-        self._run_index_cache = {
-            False: None,
-            True: None,
-        }
-        self._run_index_cache_time = {
-            False: 0.0,
-            True: 0.0,
-        }
-        self._completion_cache = {}
-        self._run_index_ttl_s = RUN_INDEX_TTL_S
         self._recent_completed_trust_window = RECENT_COMPLETED_TRUST_WINDOW
         self._timing_enabled = SERVER_TALK_TIMING_ENABLED
-        self._run_index_disk_cache_enabled = RUN_INDEX_DISK_CACHE_ENABLED
-        self._run_index_disk_ttl_s = RUN_INDEX_DISK_TTL_S
 
         self.set_data_dir()
 
     def set_data_dir(self, lite=False):
-
-        old_data_dir = self.data_dir
-        old_lite = self._lite
-
         if self._lite == lite:
             pass
         elif not lite:
@@ -67,125 +44,6 @@ class server_talk():
         else:
             self.data_dir = os.path.join(self.data_dir, "_lite")
         self._lite = lite
-
-        # Data-root changes invalidate cached index metadata.
-        if old_data_dir != self.data_dir or old_lite != self._lite:
-            self._run_index_cache = {
-                False: None,
-                True: None,
-            }
-            self._run_index_cache_time = {
-                False: 0.0,
-                True: 0.0,
-            }
-            self._completion_cache = {}
-
-    def _run_index_cache_path(self, lite=False):
-        self.set_data_dir(lite)
-        root = self.data_dir
-        if not root:
-            return None
-        return os.path.join(root, RUN_INDEX_DISK_CACHE_FILENAME)
-
-    def _serialize_run_index(self, index):
-        out = {
-            'run_ids': [int(v) for v in index.get('run_ids', [])],
-            'paths_by_run_id': {},
-            'dates_by_run_id': {},
-        }
-        for rid, path in index.get('paths_by_run_id', {}).items():
-            out['paths_by_run_id'][str(int(rid))] = path
-        for rid, run_date in index.get('dates_by_run_id', {}).items():
-            if isinstance(run_date, datetime):
-                run_date_str = run_date.date().isoformat()
-            elif hasattr(run_date, 'isoformat'):
-                run_date_str = run_date.isoformat()
-            elif run_date is None:
-                run_date_str = None
-            else:
-                run_date_str = str(run_date)
-            out['dates_by_run_id'][str(int(rid))] = run_date_str
-        return out
-
-    def _deserialize_run_index(self, payload):
-        run_ids = sorted([int(v) for v in payload.get('run_ids', [])])
-        paths_by_run_id = {
-            int(rid): path
-            for rid, path in payload.get('paths_by_run_id', {}).items()
-        }
-        dates_by_run_id = {}
-        for rid, run_date in payload.get('dates_by_run_id', {}).items():
-            rid_int = int(rid)
-            if run_date is None:
-                continue
-            try:
-                dates_by_run_id[rid_int] = datetime.strptime(run_date, '%Y-%m-%d').date()
-            except Exception:
-                # Keep permissive parsing behavior for forward compatibility.
-                try:
-                    dates_by_run_id[rid_int] = datetime.fromisoformat(run_date).date()
-                except Exception:
-                    continue
-        return {
-            'run_ids': run_ids,
-            'paths_by_run_id': paths_by_run_id,
-            'dates_by_run_id': dates_by_run_id,
-        }
-
-    def _load_run_index_from_disk(self, lite=False):
-        if not self._run_index_disk_cache_enabled:
-            return None
-
-        cache_path = self._run_index_cache_path(lite=lite)
-        if cache_path is None or not os.path.isfile(cache_path):
-            return None
-
-        try:
-            age_s = time.time() - os.path.getmtime(cache_path)
-            if age_s > self._run_index_disk_ttl_s:
-                return None
-        except OSError:
-            return None
-
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
-            if payload.get('version') != 1:
-                return None
-            if bool(payload.get('lite')) != bool(lite):
-                return None
-            if payload.get('data_dir') != self.data_dir:
-                return None
-            return self._deserialize_run_index(payload.get('index', {}))
-        except Exception:
-            return None
-
-    def _save_run_index_to_disk(self, index, lite=False):
-        if not self._run_index_disk_cache_enabled:
-            return
-
-        cache_path = self._run_index_cache_path(lite=lite)
-        if cache_path is None:
-            return
-
-        payload = {
-            'version': 1,
-            'lite': bool(lite),
-            'data_dir': self.data_dir,
-            'created_unix_s': time.time(),
-            'index': self._serialize_run_index(index),
-        }
-        tmp_path = f"{cache_path}.tmp"
-        try:
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, cache_path)
-        except Exception:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
 
     def get_data_file(self, idx=0, path="", lite=False):
         '''
@@ -215,22 +73,12 @@ class server_talk():
         if path == "":
             if idx <= 0:
                 relative_idx = abs(int(idx))
-                # If an index is already available in memory or on disk, prefer it
-                # even for very recent relative lookups to avoid fresh directory scans.
-                cached_index_available = self._get_run_index(lite=False, allow_build=False) is not None
-                fresh_first = (relative_idx <= RELATIVE_INDEX_FRESH_FIRST_MAX) and (not cached_index_available)
                 if lite:
                     run_id = self.get_completed_run_id_by_relative_index(
                         relative_idx,
                         lite=False,
-                        use_fresh_scan=fresh_first,
+                        use_fresh_scan=True,
                     )
-                    if run_id is None:
-                        run_id = self.get_completed_run_id_by_relative_index(
-                            relative_idx,
-                            lite=False,
-                            use_fresh_scan=not fresh_first,
-                        )
                     if run_id is None:
                         raise ValueError("No completed data files were found.")
                     file = self.find_data_file_by_run_id(run_id, lite=True, raise_on_missing=False)
@@ -245,14 +93,8 @@ class server_talk():
                     file = self.get_completed_data_file_by_relative_index(
                         relative_idx,
                         lite=False,
-                        use_fresh_scan=fresh_first,
+                        use_fresh_scan=True,
                     )
-                    if file is None:
-                        file = self.get_completed_data_file_by_relative_index(
-                            relative_idx,
-                            lite=False,
-                            use_fresh_scan=not fresh_first,
-                        )
                 if file is None:
                     raise ValueError("No completed data files were found.")
             if idx > 0:
@@ -354,21 +196,10 @@ class server_talk():
 
     def _is_completed_run(self, filepath):
         try:
-            mtime = os.path.getmtime(filepath)
-        except OSError:
-            mtime = None
-
-        cached = self._completion_cache.get(filepath)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-
-        try:
             with h5py.File(filepath, 'r') as f:
                 raw_xvarnames = f.attrs.get('xvarnames')
                 if raw_xvarnames is None:
-                    is_completed = True
-                    self._completion_cache[filepath] = (mtime, is_completed)
-                    return is_completed
+                    return True
 
                 if isinstance(raw_xvarnames, np.ndarray):
                     xvarnames = [str(value.decode('utf-8', errors='replace') if isinstance(value, (bytes, np.bytes_)) else value) for value in raw_xvarnames.tolist()]
@@ -379,47 +210,23 @@ class server_talk():
 
                 xvarnames = [name for name in xvarnames if str(name).strip()]
                 if not xvarnames:
-                    is_completed = True
-                    self._completion_cache[filepath] = (mtime, is_completed)
-                    return is_completed
+                    return True
 
                 if 'params' not in f:
-                    is_completed = False
-                    self._completion_cache[filepath] = (mtime, is_completed)
-                    return is_completed
+                    return False
 
                 for name in xvarnames:
                     if name not in f['params']:
-                        is_completed = False
-                        self._completion_cache[filepath] = (mtime, is_completed)
-                        return is_completed
+                        return False
                     values = np.asarray(f['params'][name][()])
                     if values.ndim == 0:
-                        is_completed = False
-                        self._completion_cache[filepath] = (mtime, is_completed)
-                        return is_completed
-                is_completed = True
-                self._completion_cache[filepath] = (mtime, is_completed)
-                return is_completed
+                        return False
+                return True
         except Exception:
-            self._completion_cache[filepath] = (mtime, False)
             return False
 
     def _iter_completed_data_files_desc(self, lite=False):
-        index = self._get_run_index(lite=lite)
-        for idx, run_id in enumerate(reversed(index['run_ids'])):
-            path = index['paths_by_run_id'].get(run_id)
-            if not path:
-                continue
-
-            # Newest files dominate relative lookups. Trust a short recent window
-            # and avoid expensive HDF5 completion checks there.
-            if idx < self._recent_completed_trust_window:
-                yield path
-                continue
-
-            if self._is_completed_run(path):
-                yield path
+        yield from self._iter_completed_data_files_desc_fresh(lite=lite)
 
     def get_completed_data_file_by_relative_index(self, relative_idx=0, lite=False, use_fresh_scan=True):
         t0 = time.perf_counter()
@@ -465,10 +272,6 @@ class server_talk():
         return out
 
     def recurse_find_data_file(self,r_id,lite=False,days_ago=0):
-        indexed_file = self.find_data_file_by_run_id(r_id, lite=lite, raise_on_missing=False)
-        if indexed_file is not None:
-            return indexed_file
-
         date = datetime.today() - timedelta(days=days_ago)
 
         if date < self._first_data_folder_date:
@@ -505,18 +308,16 @@ class server_talk():
     def all_glob_find_data_file(self,run_id,lite=False):
         return self.find_data_file_by_run_id(run_id, lite=lite)
 
-    def _build_run_index(self, lite=False):
+    def _find_data_file_by_run_id_fresh(self, run_id, lite=False):
+        self.check_for_mapped_data_dir()
+        run_id = int(run_id)
+        prefix = f"{run_id:07d}_"
+        candidate_paths = []
+
         self.set_data_dir(lite)
         root = self.data_dir
-        paths_by_run_id = {}
-        dates_by_run_id = {}
-
         if not root or not os.path.isdir(root):
-            return {
-                'run_ids': [],
-                'paths_by_run_id': {},
-                'dates_by_run_id': {},
-            }
+            return None
 
         for date_entry in os.scandir(root):
             if not date_entry.is_dir():
@@ -525,70 +326,9 @@ class server_talk():
                 run_date = datetime.strptime(date_entry.name, '%Y-%m-%d').date()
             except ValueError:
                 continue
-
-            for file_entry in os.scandir(date_entry.path):
-                if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
-                    continue
-                try:
-                    run_id = int(file_entry.name.split('_')[0])
-                except Exception:
-                    continue
-
-                existing = paths_by_run_id.get(run_id)
-                if existing is None:
-                    paths_by_run_id[run_id] = file_entry.path
-                    dates_by_run_id[run_id] = run_date
-                else:
-                    try:
-                        if os.path.getmtime(file_entry.path) > os.path.getmtime(existing):
-                            paths_by_run_id[run_id] = file_entry.path
-                            dates_by_run_id[run_id] = run_date
-                    except OSError:
-                        pass
-
-        run_ids = sorted(paths_by_run_id.keys())
-        return {
-            'run_ids': run_ids,
-            'paths_by_run_id': paths_by_run_id,
-            'dates_by_run_id': dates_by_run_id,
-        }
-
-    def _get_run_index(self, lite=False, refresh=False, allow_build=True):
-        t0 = time.perf_counter()
-        lite_key = bool(lite)
-        cache_age_s = time.time() - self._run_index_cache_time[lite_key]
-        cache_stale = cache_age_s > self._run_index_ttl_s
-        in_memory = self._run_index_cache.get(lite_key)
-
-        if not refresh and in_memory is not None and not cache_stale:
-            return in_memory
-
-        if not refresh:
-            disk_index = self._load_run_index_from_disk(lite=lite)
-            if disk_index is not None:
-                self._run_index_cache[lite_key] = disk_index
-                self._run_index_cache_time[lite_key] = time.time()
-                self._log_timing(f"_load_run_index_from_disk(lite={lite})", t0)
-                return disk_index
-
-        if not allow_build:
-            return None
-
-        self._run_index_cache[lite_key] = self._build_run_index(lite=lite)
-        self._save_run_index_to_disk(self._run_index_cache[lite_key], lite=lite)
-        self._run_index_cache_time[lite_key] = time.time()
-        self._log_timing(f"_build_run_index(lite={lite})", t0)
-        return self._run_index_cache[lite_key]
-
-    def _find_data_file_by_run_id_fresh(self, run_id, lite=False):
-        self.check_for_mapped_data_dir()
-        run_id = int(run_id)
-        prefix = f"{run_id}_"
-        candidate_paths = []
-
-        for date_dir in self._iter_date_dirs_desc(lite=lite):
+            
             try:
-                for file_entry in os.scandir(date_dir):
+                for file_entry in os.scandir(date_entry.path):
                     if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
                         continue
                     if file_entry.name.startswith(prefix):
@@ -605,69 +345,54 @@ class server_talk():
         candidate_paths.sort(key=lambda item: item[0], reverse=True)
         return candidate_paths[0][1]
 
-    def _update_run_index_cache_with_path(self, run_id, path, lite=False):
-        cache = self._run_index_cache.get(bool(lite))
-        if cache is None:
-            return
-        run_id = int(run_id)
-        cache['paths_by_run_id'][run_id] = path
-        if run_id not in cache['run_ids']:
-            cache['run_ids'].append(run_id)
-            cache['run_ids'].sort()
-
-        date_folder = os.path.basename(os.path.dirname(path))
-        try:
-            cache['dates_by_run_id'][run_id] = datetime.strptime(date_folder, '%Y-%m-%d').date()
-        except Exception:
-            pass
-        self._run_index_cache_time[bool(lite)] = time.time()
-        self._save_run_index_to_disk(cache, lite=lite)
-
     def find_data_file_by_run_id(self, run_id, lite=False, raise_on_missing=True, refresh=False):
         t0 = time.perf_counter()
-        index = self._get_run_index(lite=lite, refresh=refresh)
-        path = index['paths_by_run_id'].get(int(run_id))
+        path = self._find_data_file_by_run_id_fresh(run_id, lite=lite)
+        
+        # If not found on first pass, retry once with explicit state reset
         if path is None and not refresh:
-            # Strict-fresh targeted lookup before paying full index rebuild cost.
-            fresh_path = self._find_data_file_by_run_id_fresh(run_id, lite=lite)
-            if fresh_path is not None:
-                self._update_run_index_cache_with_path(run_id, fresh_path, lite=lite)
-                self._log_timing(f"find_data_file_by_run_id(run_id={run_id}, lite={lite}, refresh={refresh})", t0)
-                return fresh_path
-
-            # Fallback to full index rebuild once.
-            return self.find_data_file_by_run_id(run_id,
-                                                 lite=lite,
-                                                 raise_on_missing=raise_on_missing,
-                                                 refresh=True)
+            self.set_data_dir(lite)  # Ensure clean state
+            path = self._find_data_file_by_run_id_fresh(run_id, lite=lite)
+        
         if path is None and raise_on_missing:
             raise ValueError(f"Data file with run ID {run_id:1.0f} was not found.")
         self._log_timing(f"find_data_file_by_run_id(run_id={run_id}, lite={lite}, refresh={refresh})", t0)
         return path
 
     def find_nearest_run_date_and_id(self, requested_run_id, lite=False, refresh=False):
-        index = self._get_run_index(lite=lite, refresh=refresh)
-        run_ids = index['run_ids']
-        if not run_ids and not refresh:
-            return self.find_nearest_run_date_and_id(requested_run_id, lite=lite, refresh=True)
-        if not run_ids:
-            return None, None
-
+        self.check_for_mapped_data_dir()
         requested_run_id = int(requested_run_id)
-        dates_by_run_id = index['dates_by_run_id']
+        nearest_run_id = None
+        nearest_run_date = None
+        nearest_key = None
 
-        if requested_run_id in dates_by_run_id:
-            return requested_run_id, dates_by_run_id[requested_run_id]
+        for date_dir in self._iter_date_dirs_desc(lite=lite):
+            date_folder = os.path.basename(date_dir)
+            try:
+                run_date = datetime.strptime(date_folder, '%Y-%m-%d').date()
+            except ValueError:
+                continue
 
-        insert_idx = bisect.bisect_left(run_ids, requested_run_id)
-        candidates = []
-        if insert_idx > 0:
-            candidates.append(run_ids[insert_idx - 1])
-        if insert_idx < len(run_ids):
-            candidates.append(run_ids[insert_idx])
+            try:
+                for file_entry in os.scandir(date_dir):
+                    if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
+                        continue
+                    try:
+                        run_id = int(file_entry.name.split('_')[0])
+                    except Exception:
+                        continue
 
-        nearest_run_id = min(candidates, key=lambda rid: (abs(rid - requested_run_id), rid))
-        return nearest_run_id, dates_by_run_id[nearest_run_id]
+                    key = (abs(run_id - requested_run_id), run_id)
+                    if nearest_key is None or key < nearest_key:
+                        nearest_key = key
+                        nearest_run_id = run_id
+                        nearest_run_date = run_date
+            except OSError:
+                continue
+
+        if nearest_run_id is None:
+            return None, None
+        return nearest_run_id, nearest_run_date
 
     def run_id_from_filepath(self,filepath,lite=False):
         self.set_data_dir(lite)
