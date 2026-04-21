@@ -1,11 +1,10 @@
 import json
-import logging
 import os
 import re
 import sys
 from datetime import date, timedelta
 
-from PyQt6.QtCore import QDate, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QDate, QSettings, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontDatabase, QKeySequence, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -20,7 +19,6 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -54,9 +52,6 @@ from .scanner import (
     XvarDetailLoader,
 )
 from ..data.server_talk import server_talk
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 def parse_name_search_terms(query: str):
@@ -218,7 +213,6 @@ class ParamSearchDialog(QDialog):
         self._filtered_records = []
         self._active_mode = "params"
         self._mode_buttons = {}
-        self._selection_locked = False
 
         self.setWindowTitle("Param Search")
         self.resize(860, 560)
@@ -251,13 +245,8 @@ class ParamSearchDialog(QDialog):
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._apply_filter)
 
-        self.run_badge = QLabel("run -", self)
-        self.run_badge.setObjectName("paramRunBadge")
-        self.run_badge.setProperty("state", "active")
-
         top_row.addWidget(toggle_group)
         top_row.addWidget(self.search_input, 1)
-        top_row.addWidget(self.run_badge)
 
         self.status_label = QLabel("Ready", self)
         self.status_label.setObjectName("statusLabel")
@@ -297,36 +286,9 @@ class ParamSearchDialog(QDialog):
 
         self._mode_buttons[self._active_mode].setChecked(True)
         self._set_mode(self._active_mode)
-        self._apply_badge_style()
-
-    def _apply_badge_style(self):
-        state = "inactive" if self._selection_locked else "active"
-        self.run_badge.setProperty("state", state)
-        self.run_badge.style().unpolish(self.run_badge)
-        self.run_badge.style().polish(self.run_badge)
-
-    def _set_controls_enabled(self, enabled: bool):
-        self.search_input.setEnabled(enabled)
-        self.results_table.setEnabled(enabled)
-        self.detail_value.setEnabled(enabled)
-        for button in self._mode_buttons.values():
-            button.setEnabled(enabled)
-
-    def set_selection_lock_state(self, locked: bool):
-        self._selection_locked = bool(locked)
-        if self._selection_locked:
-            self.run_badge.setText("multiple selected")
-            self._set_controls_enabled(False)
-            self.status_label.setText("Select a single run for param search")
-            self.detail_value.setPlainText("Param search paused while multiple runs are selected.")
-        else:
-            self._set_controls_enabled(True)
-        self._apply_badge_style()
 
     def set_run(self, run: RunSummary):
         self.setWindowTitle(f"Run {run.run_id} - Param Search")
-        self.run_badge.setText(f"run {run.run_id}")
-        self._apply_badge_style()
 
     def set_loading_state(self, run: RunSummary):
         self.set_run(run)
@@ -404,55 +366,6 @@ class ParamSearchDialog(QDialog):
             record.get("detail", record.get("preview", "-")),
         ]
         self.detail_value.setPlainText("\n".join(detail_lines))
-
-
-class RunIdLookupWorker(QThread):
-    lookup_ready = pyqtSignal(object, object)
-    lookup_error = pyqtSignal(str)
-
-    def __init__(self, server: server_talk, requested_run_id: int, parent=None):
-        super().__init__(parent)
-        self._server = server
-        self._requested_run_id = int(requested_run_id)
-
-    def run(self):
-        try:
-            resolved_run_id, run_date = self._server.find_nearest_run_date_and_id(self._requested_run_id)
-            self.lookup_ready.emit(resolved_run_id, run_date)
-        except Exception as exc:
-            self.lookup_error.emit(str(exc))
-
-
-class LatestCompletedRunWorker(QThread):
-    latest_ready = pyqtSignal(object)
-    latest_error = pyqtSignal(str)
-
-    def __init__(self, server: server_talk, parent=None):
-        super().__init__(parent)
-        self._server = server
-
-    def run(self):
-        try:
-            latest_path = self._server.get_completed_data_file_by_relative_index(
-                relative_idx=0,
-                lite=False,
-                use_fresh_scan=True,
-            )
-            if not latest_path:
-                self.latest_ready.emit(None)
-                return
-
-            # Auto-refresh should only react to genuinely completed runs.
-            # The server uses a trust-window optimization for recent files,
-            # so validate strictly here before emitting a run id.
-            if not self._server._is_completed_run(latest_path):
-                self.latest_ready.emit(None)
-                return
-
-            latest_run_id = self._server.run_id_from_filepath(latest_path, lite=False)
-            self.latest_ready.emit(latest_run_id)
-        except Exception as exc:
-            self.latest_error.emit(str(exc))
 
 
 class RunDetailPane(QWidget):
@@ -756,13 +669,9 @@ class DataBrowserWindow(QMainWindow):
         self._xvar_loader = None
         self._param_search_loader = None
         self._lite_worker = None
-        self._run_id_lookup_worker = None
-        self._latest_run_check_worker = None
         self._scan_request_id = 0
         self._detail_request_id = 0
         self._param_search_request_id = 0
-        self._run_id_lookup_request_id = 0
-        self._latest_run_check_request_id = 0
 
         self._runs_by_id = {}
         self._scan_loaded_count = 0
@@ -772,12 +681,7 @@ class DataBrowserWindow(QMainWindow):
         self._pending_focus_run_id = None
         self._pending_requested_run_id = None
         self._param_search_dialog = None
-        self._param_search_current_run_id = None
-        self._param_search_loading_run_id = None
         self._server_talk = server_talk(data_dir=self.data_dir)
-        self._auto_refresh_timer = QTimer(self)
-        self._auto_refresh_timer.setSingleShot(False)
-        self._auto_refresh_timer.timeout.connect(self._on_auto_refresh_timeout)
 
         self.setWindowTitle("Data Browser")
         self.resize(980, 760)
@@ -836,9 +740,6 @@ class DataBrowserWindow(QMainWindow):
         self.visible_chip.hide()
         self.selected_chip.hide()
 
-        self.three_hour_btn = QToolButton(self)
-        self.three_hour_btn.setText("3 hours")
-        self.three_hour_btn.clicked.connect(lambda: self._apply_recent_hours_preset(3))
         self.today_btn = QToolButton(self)
         self.today_btn.setText("Today")
         self.today_btn.clicked.connect(lambda: self._apply_date_preset(0))
@@ -851,24 +752,17 @@ class DataBrowserWindow(QMainWindow):
         self.month_btn = QToolButton(self)
         self.month_btn.setText("1 month")
         self.month_btn.clicked.connect(lambda: self._apply_date_preset(29))
-        self.auto_refresh_btn = QToolButton(self)
-        self.auto_refresh_btn.setText("Auto")
-        self.auto_refresh_btn.setCheckable(True)
-        self.auto_refresh_btn.setToolTip("Auto-refresh when new valid runs appear")
-        self.auto_refresh_btn.setObjectName("autoRefreshBtn")
-        self.auto_refresh_btn.toggled.connect(self._on_auto_refresh_toggled)
         preset_group = QFrame(self)
         preset_group.setObjectName("toolbarGroup")
         preset_group_layout = QHBoxLayout(preset_group)
         preset_group_layout.setContentsMargins(8, 4, 8, 4)
         preset_group_layout.setSpacing(6)
-        for button in [self.three_hour_btn, self.today_btn, self.three_day_btn, self.week_btn, self.month_btn]:
+        for button in [self.today_btn, self.three_day_btn, self.week_btn, self.month_btn]:
             preset_group_layout.addWidget(button)
 
         toolbar.addWidget(date_group)
         toolbar.addWidget(preset_group)
         toolbar.addStretch(1)
-        toolbar.addWidget(self.auto_refresh_btn)
         toolbar.addWidget(self.loaded_chip)
         toolbar.addWidget(self.activity_indicator)
 
@@ -997,9 +891,6 @@ class DataBrowserWindow(QMainWindow):
         self.setCentralWidget(root)
         self._install_shortcuts()
         self._set_activity_idle()
-        auto_enabled = bool(self.settings.value("autoRefreshEnabled", False, type=bool))
-        self.auto_refresh_btn.setChecked(auto_enabled)
-        self._sync_auto_refresh_timer(show_status=False)
 
     def _initialize_field_selector(self):
         self.fields_menu.clear()
@@ -1161,24 +1052,6 @@ class DataBrowserWindow(QMainWindow):
             QPushButton:checked, QToolButton:checked {
                 background: #4c7f98;
             }
-            QToolButton#autoRefreshBtn {
-                background: #f6f7f9;
-                color: #214056;
-                border: 1px solid #b9c9d5;
-                border-radius: 12px;
-                padding: 4px 12px;
-                min-height: 24px;
-                font-weight: 700;
-            }
-            QToolButton#autoRefreshBtn:hover {
-                background: #edf2f6;
-                border-color: #95aebf;
-            }
-            QToolButton#autoRefreshBtn:checked {
-                background: #2f8f5b;
-                color: #ffffff;
-                border: 1px solid #267247;
-            }
             QGroupBox {
                 color: #2a3f4b;
                 font-weight: 700;
@@ -1244,19 +1117,6 @@ class DataBrowserWindow(QMainWindow):
             QMenu::item:disabled {
                 color: #a8b6bf;
             }
-            QLabel#paramRunBadge {
-                background: #d9edf7;
-                color: #174760;
-                border: 1px solid #b7d6e6;
-                border-radius: 10px;
-                padding: 2px 8px;
-                font-weight: 700;
-            }
-            QLabel#paramRunBadge[state="inactive"] {
-                background: #eceff2;
-                color: #7a8790;
-                border: 1px solid #d0d7de;
-            }
             QSplitter::handle {
                 background: #dbe4ea;
                 height: 6px;
@@ -1282,13 +1142,6 @@ class DataBrowserWindow(QMainWindow):
         if not self.data_dir:
             self.status_label.setText("DATA_DIR is empty")
             return
-
-        LOGGER.info(
-            "Starting scan: data_dir=%s date_from=%s date_to=%s",
-            self.data_dir,
-            self.date_from.date().toString("yyyy-MM-dd"),
-            self.date_to.date().toString("yyyy-MM-dd"),
-        )
 
         self._set_activity_busy("Scanning data…")
 
@@ -1337,80 +1190,6 @@ class DataBrowserWindow(QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.status_label.setText("Scanning...")
         self._scan_worker.start()
-
-    def _auto_refresh_interval_seconds(self):
-        value = int(self.settings.value("autoRefreshIntervalSec", 10, type=int))
-        return max(1, value)
-
-    def _sync_auto_refresh_timer(self, show_status=True):
-        if not hasattr(self, "auto_refresh_btn"):
-            return
-
-        enabled = bool(self.auto_refresh_btn.isChecked())
-        interval_sec = self._auto_refresh_interval_seconds()
-        self.settings.setValue("autoRefreshEnabled", enabled)
-
-        if enabled:
-            self._auto_refresh_timer.start(interval_sec * 1000)
-            if show_status:
-                self.status_label.setText(f"Auto-refresh on ({interval_sec}s)")
-        else:
-            self._auto_refresh_timer.stop()
-            if show_status:
-                self.status_label.setText("Auto-refresh off")
-
-    def _on_auto_refresh_toggled(self, checked: bool):
-        self._sync_auto_refresh_timer(show_status=True)
-
-    def _on_auto_refresh_timeout(self):
-        if self._scan_worker is not None and self._scan_worker.isRunning():
-            LOGGER.info("Auto-refresh tick skipped: scan already running")
-            return
-
-        if self._latest_run_check_worker is not None and self._latest_run_check_worker.isRunning():
-            LOGGER.info("Auto-refresh tick skipped: latest-run check already running")
-            return
-
-        self._latest_run_check_request_id += 1
-        current_request_id = self._latest_run_check_request_id
-        self._latest_run_check_worker = LatestCompletedRunWorker(self._server_talk, self)
-        self._latest_run_check_worker.latest_ready.connect(
-            lambda latest_run_id, req_id=current_request_id: self._on_latest_run_check_ready_guarded(latest_run_id, req_id)
-        )
-        self._latest_run_check_worker.latest_error.connect(
-            lambda message, req_id=current_request_id: self._on_latest_run_check_error_guarded(message, req_id)
-        )
-        self._latest_run_check_worker.start()
-
-    def _on_latest_run_check_ready_guarded(self, latest_run_id, request_id: int):
-        if request_id != self._latest_run_check_request_id:
-            return
-
-        if latest_run_id is None:
-            LOGGER.info("Auto-refresh tick: no completed runs found")
-            return
-
-        current_latest = max((int(run_id) for run_id in self._runs_by_id.keys()), default=-1)
-        if int(latest_run_id) <= int(current_latest):
-            LOGGER.info(
-                "Auto-refresh tick: no new valid run (latest_completed=%s current_latest=%s)",
-                latest_run_id,
-                current_latest,
-            )
-            return
-
-        LOGGER.info(
-            "Auto-refresh tick: new run detected (latest_completed=%s current_latest=%s)",
-            latest_run_id,
-            current_latest,
-        )
-        self.status_label.setText("New run detected, refreshing…")
-        self._start_scan()
-
-    def _on_latest_run_check_error_guarded(self, message: str, request_id: int):
-        if request_id != self._latest_run_check_request_id:
-            return
-        LOGGER.warning("Auto-refresh latest-run check failed: %s", message)
 
     def _append_run(self, run: RunSummary):
         row = self.table.rowCount()
@@ -1489,62 +1268,25 @@ class DataBrowserWindow(QMainWindow):
         self.date_from.setDate(QDate.currentDate().addDays(-days_back))
         self._start_scan()
 
-    def _apply_recent_hours_preset(self, hours_back: int):
-        del hours_back
-        # Date filter granularity is day-level, so recent-hours maps to today.
-        self.date_to.setDate(QDate.currentDate())
-        self.date_from.setDate(QDate.currentDate())
-        self._start_scan()
-
     def _jump_to_run_id(self):
+        self._set_activity_busy("Searching run ID…")
         raw = self.run_id_jump_input.text().strip()
         if not raw:
             self.status_label.setText("Enter a run ID")
+            self._set_activity_idle()
             return
         try:
             requested_run_id = int(raw)
         except ValueError:
             self.status_label.setText("Run ID must be an integer")
-            return
-
-        if self._run_id_lookup_worker is not None and self._run_id_lookup_worker.isRunning():
-            self.status_label.setText("Run ID search already in progress")
-            LOGGER.info("Run ID lookup request ignored: another lookup is already running")
-            return
-
-        LOGGER.info("Run ID lookup started: requested_run_id=%s", requested_run_id)
-        self._set_activity_busy("Searching run ID…")
-        self.run_id_jump_btn.setEnabled(False)
-
-        self._run_id_lookup_request_id += 1
-        current_request_id = self._run_id_lookup_request_id
-        self._run_id_lookup_worker = RunIdLookupWorker(self._server_talk, requested_run_id, self)
-        self._run_id_lookup_worker.lookup_ready.connect(
-            lambda resolved_run_id, run_date, req_id=current_request_id, requested=requested_run_id:
-            self._on_run_id_lookup_ready_guarded(requested, resolved_run_id, run_date, req_id)
-        )
-        self._run_id_lookup_worker.lookup_error.connect(
-            lambda message, req_id=current_request_id: self._on_run_id_lookup_error_guarded(message, req_id)
-        )
-        self._run_id_lookup_worker.start()
-
-    def _on_run_id_lookup_ready_guarded(self, requested_run_id: int, resolved_run_id, run_date, request_id: int):
-        if request_id != self._run_id_lookup_request_id:
-            return
-
-        self.run_id_jump_btn.setEnabled(True)
-        if resolved_run_id is None or run_date is None:
-            LOGGER.info("Run ID lookup complete: no runs found (requested=%s)", requested_run_id)
-            self.status_label.setText("No HDF5 runs found in data directory")
             self._set_activity_idle()
             return
 
-        LOGGER.info(
-            "Run ID lookup complete: requested=%s resolved=%s date=%s",
-            requested_run_id,
-            resolved_run_id,
-            run_date,
-        )
+        resolved_run_id, run_date = self._find_nearest_run_date_and_id(requested_run_id)
+        if resolved_run_id is None or run_date is None:
+            self.status_label.setText("No HDF5 runs found in data directory")
+            self._set_activity_idle()
+            return
 
         center_qdate = QDate(run_date.year, run_date.month, run_date.day)
         self.date_from.setDate(center_qdate.addDays(-3))
@@ -1559,15 +1301,6 @@ class DataBrowserWindow(QMainWindow):
         self._pending_requested_run_id = int(requested_run_id)
         self._set_activity_idle()
         self._start_scan()
-
-    def _on_run_id_lookup_error_guarded(self, message: str, request_id: int):
-        if request_id != self._run_id_lookup_request_id:
-            return
-        LOGGER.error("Run ID lookup failed: %s", message)
-        self.run_id_jump_btn.setEnabled(True)
-        self.status_label.setText("Run ID search failed")
-        QMessageBox.warning(self, "Run ID Search Error", message)
-        self._set_activity_idle()
 
     def _find_nearest_run_date_and_id(self, requested_run_id: int):
         try:
@@ -1785,7 +1518,6 @@ class DataBrowserWindow(QMainWindow):
         self._set_stat_chip_value(self.visible_chip, str(visible_count))
 
     def _on_scan_done(self, count: int):
-        LOGGER.info("Scan completed: count=%s", count)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(self.COL_RUN_ID, Qt.SortOrder.DescendingOrder)
         self.refresh_btn.setEnabled(True)
@@ -1821,7 +1553,6 @@ class DataBrowserWindow(QMainWindow):
         self.table.viewport().update()
 
     def _on_scan_error(self, message: str):
-        LOGGER.error("Scan failed: %s", message)
         self.refresh_btn.setEnabled(True)
         self.status_label.setText("Scan failed")
         QMessageBox.warning(self, "Scan Error", message)
@@ -1848,12 +1579,12 @@ class DataBrowserWindow(QMainWindow):
 
     def _run_matches_terms(self, run: RunSummary, terms: list[str]):
         experiment_query = self.experiment_filter_input.text().strip().lower()
-        if experiment_query and not name_matches_term(experiment_query, run.experiment_name or ""):
+        if experiment_query and experiment_query not in (run.experiment_name or "").lower():
             return False
 
         tag_query = self.tag_filter_input.text().strip().lower()
         if tag_query:
-            if not any(name_matches_term(tag_query, t) for t in run.tags):
+            if not any(tag_query in t.lower() for t in run.tags):
                 return False
 
         if not terms:
@@ -1883,22 +1614,12 @@ class DataBrowserWindow(QMainWindow):
         return rows
 
     def _on_selection_changed(self):
-        selected_rows = self._get_selected_rows()
-        if len(selected_rows) > 1:
-            self._set_stat_chip_value(self.selected_chip, "multi")
-            self._sync_param_search_to_selected_run(None, selection_locked=True)
-        else:
-            self._sync_param_search_to_selected_run(None, selection_locked=False)
-
         row = self._get_selected_row()
         run = self._get_run_for_row(row)
         if run is None:
             self._set_stat_chip_value(self.selected_chip, "none")
             self.detail_pane.clear_details()
-            self._sync_param_search_to_selected_run(None, selection_locked=False)
             return
-
-        self._sync_param_search_to_selected_run(run, selection_locked=False)
 
         self._detail_request_id += 1
         current_detail_id = self._detail_request_id
@@ -1909,9 +1630,8 @@ class DataBrowserWindow(QMainWindow):
             return
 
         if self._xvar_loader is not None and self._xvar_loader.isRunning():
-            # Keep UI responsive on rapid row changes; stale loader results are
-            # ignored via detail request ids.
             self._xvar_loader.quit()
+            self._xvar_loader.wait()
 
         self.detail_pane.clear_details()
         self._set_activity_busy("Loading run details…")
@@ -2415,55 +2135,6 @@ class DataBrowserWindow(QMainWindow):
     def _on_param_search_dialog_closed(self):
         if self._param_search_dialog is not None:
             self.settings.setValue("paramSearchMode", self._param_search_dialog._active_mode)
-        self._param_search_current_run_id = None
-        self._param_search_loading_run_id = None
-
-    def _sync_param_search_to_selected_run(self, run: RunSummary | None, selection_locked: bool = False):
-        dialog = self._param_search_dialog
-        if dialog is None or not dialog.isVisible():
-            return
-
-        dialog.set_selection_lock_state(selection_locked)
-        if selection_locked:
-            LOGGER.info("Param search sync paused: multiple runs selected")
-            return
-
-        if run is None:
-            return
-        self._load_param_search_for_run(run, show_dialog=False, focus_search=False, force=False)
-
-    def _load_param_search_for_run(self, run: RunSummary, show_dialog: bool, focus_search: bool, force: bool):
-        dialog = self._ensure_param_search_dialog()
-
-        if show_dialog:
-            dialog.show()
-            dialog.raise_()
-            dialog.activateWindow()
-        if focus_search:
-            dialog.focus_search()
-
-        target_run_id = int(run.run_id)
-        if not force:
-            if self._param_search_loading_run_id == target_run_id:
-                return
-            if self._param_search_current_run_id == target_run_id:
-                dialog.set_run(run)
-                return
-
-        LOGGER.info("Param search load started: run_id=%s", target_run_id)
-        dialog.set_loading_state(run)
-        self._set_activity_busy("Loading params…")
-        self._param_search_request_id += 1
-        current_request_id = self._param_search_request_id
-        self._param_search_loading_run_id = target_run_id
-        self._param_search_loader = ParamSearchLoader(run.filepath)
-        self._param_search_loader.records_ready.connect(
-            lambda records, rid=run.run_id, req_id=current_request_id: self._on_param_search_records_ready_guarded(rid, records, req_id)
-        )
-        self._param_search_loader.load_error.connect(
-            lambda message, req_id=current_request_id: self._on_param_search_error_guarded(message, req_id)
-        )
-        self._param_search_loader.start()
 
     def _open_param_search_for_selected(self):
         row = self._get_selected_row()
@@ -2477,17 +2148,31 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText("Select a single run for param search")
             return
 
-        self._load_param_search_for_run(run, show_dialog=True, focus_search=True, force=False)
+        dialog = self._ensure_param_search_dialog()
+        dialog.set_loading_state(run)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.focus_search()
+
+        self._set_activity_busy("Loading params…")
+        self._param_search_request_id += 1
+        current_request_id = self._param_search_request_id
+        self._param_search_loader = ParamSearchLoader(run.filepath)
+        self._param_search_loader.records_ready.connect(
+            lambda records, rid=run.run_id, req_id=current_request_id: self._on_param_search_records_ready_guarded(rid, records, req_id)
+        )
+        self._param_search_loader.load_error.connect(
+            lambda message, req_id=current_request_id: self._on_param_search_error_guarded(message, req_id)
+        )
+        self._param_search_loader.start()
 
     def _on_param_search_records_ready(self, run_id: int, records: dict):
-        LOGGER.info("Param search load completed: run_id=%s", run_id)
         dialog = self._ensure_param_search_dialog()
         selected_run = self._runs_by_id.get(run_id)
         if selected_run is not None:
             dialog.set_run(selected_run)
         dialog.set_records(records)
-        self._param_search_current_run_id = int(run_id)
-        self._param_search_loading_run_id = None
         self.settings.setValue("paramSearchMode", dialog._active_mode)
         self.status_label.setText(f"Loaded params for run {run_id}")
         self._set_activity_idle()
@@ -2502,10 +2187,8 @@ class DataBrowserWindow(QMainWindow):
         if request_id != self._param_search_request_id:
             self._set_activity_idle()
             return
-        LOGGER.error("Param search load failed: %s", message)
         dialog = self._ensure_param_search_dialog()
         dialog.set_error_message(message)
-        self._param_search_loading_run_id = None
         self.status_label.setText("Param search failed")
         self._set_activity_idle()
 
@@ -2513,8 +2196,6 @@ class DataBrowserWindow(QMainWindow):
         unique_run_ids = sorted({int(rid) for rid in run_ids})
         if not unique_run_ids:
             return
-
-        LOGGER.info("Lite creation requested: run_ids=%s", unique_run_ids)
 
         if self._lite_worker is not None and self._lite_worker.isRunning():
             QMessageBox.information(self, "Busy", "A lite creation job is already running.")
@@ -2538,11 +2219,9 @@ class DataBrowserWindow(QMainWindow):
         self._lite_worker.start()
 
     def _on_lite_batch_completed(self, created_count: int, total_count: int):
-        LOGGER.info("Lite creation batch completed: created=%s total=%s", created_count, total_count)
         self.status_label.setText(f"Lite creation complete: {created_count}/{total_count} runs")
 
     def _on_lite_created(self, run_id: int, lite_path: str):
-        LOGGER.info("Lite created: run_id=%s path=%s", run_id, lite_path)
         row = self._find_row_for_run_id(run_id)
         run = self._runs_by_id.get(run_id)
         if row is None or run is None:
@@ -2563,7 +2242,6 @@ class DataBrowserWindow(QMainWindow):
         self.status_label.setText(f"Lite created: {lite_path}")
 
     def _on_lite_error(self, message: str):
-        LOGGER.error("Lite creation failed: %s", message)
         self.status_label.setText("Lite creation failed")
         QMessageBox.warning(self, "Lite Creation Error", message)
 
@@ -2634,10 +2312,6 @@ class DataBrowserWindow(QMainWindow):
         edit_common_tags_action.triggered.connect(self._edit_common_tags)
         self.options_menu.addAction(edit_common_tags_action)
 
-        auto_refresh_interval_action = QAction("Set Auto-Refresh Interval…", self.options_menu)
-        auto_refresh_interval_action.triggered.connect(self._set_auto_refresh_interval)
-        self.options_menu.addAction(auto_refresh_interval_action)
-
         self.options_menu.addSeparator()
 
         self._dark_mode_action = QAction("Dark Mode", self.options_menu)
@@ -2665,27 +2339,6 @@ class DataBrowserWindow(QMainWindow):
         # Apply dark mode if previously enabled
         if self._dark_mode_action.isChecked():
             self._apply_dark_mode(True)
-
-    def _set_auto_refresh_interval(self):
-        current_value = self._auto_refresh_interval_seconds()
-        value, ok = QInputDialog.getInt(
-            self,
-            "Auto-Refresh Interval",
-            "Seconds:",
-            current_value,
-            1,
-            3600,
-            1,
-        )
-        if not ok:
-            return
-
-        self.settings.setValue("autoRefreshIntervalSec", int(value))
-        self._sync_auto_refresh_timer(show_status=False)
-        if self.auto_refresh_btn.isChecked():
-            self.status_label.setText(f"Auto-refresh interval set to {int(value)}s")
-        else:
-            self.status_label.setText(f"Auto-refresh interval saved ({int(value)}s)")
 
     def _change_data_dir(self):
         new_dir = QFileDialog.getExistingDirectory(
@@ -2722,20 +2375,6 @@ class DataBrowserWindow(QMainWindow):
             QDialog { background: #1e2832; color: #d0dce6; }
             QDialogButtonBox QPushButton { background: #3a4f60; color: #d0dce6; }
             QLabel#fileViewerPathLabel { color: #9bc4dc; }
-            QToolButton#autoRefreshBtn {
-                background: #2a3946;
-                color: #cde1ee;
-                border: 1px solid #4f6779;
-            }
-            QToolButton#autoRefreshBtn:hover {
-                background: #324556;
-                border-color: #6a8396;
-            }
-            QToolButton#autoRefreshBtn:checked {
-                background: #2f8f5b;
-                color: #ffffff;
-                border: 1px solid #46ab74;
-            }
             """
             self.setStyleSheet(self.styleSheet() + extra)
         else:

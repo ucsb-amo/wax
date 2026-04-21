@@ -149,20 +149,6 @@ class   atomdata(atomdata_base):
 
             self.atom_number_apd = atom_number_apd(number_up, number_down)
 
-    def apd_to_sz(self,v_apd,
-                  v_apd_all_up = None,
-                  v_apd_all_down = None):
-        v_apd_all_up = v_apd_all_up if v_apd_all_up is not None else self.p.v_apd_all_up
-        v_apd_all_down = v_apd_all_down if v_apd_all_down is not None else self.p.v_apd_all_down
-        return 2 * ( v_apd - v_apd_all_down ) / ( v_apd_all_up - v_apd_all_down ) - 1
-
-    def apd_std_to_sz(self,v_apd_std,
-                      v_apd_all_up = None,
-                      v_apd_all_down = None):
-        v_apd_all_up = v_apd_all_up if v_apd_all_up is not None else self.p.v_apd_all_up
-        v_apd_all_down = v_apd_all_down if v_apd_all_down is not None else self.p.v_apd_all_down
-        return 2 * v_apd_std / ( v_apd_all_up - v_apd_all_down )
-
     def _sort_images(self):
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
         self.img_atoms = imgs_tuple[0]
