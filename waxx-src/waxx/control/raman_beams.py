@@ -3,7 +3,7 @@ from numpy import int64
 
 from artiq.coredevice.ad9910 import _AD9910_REG_PROFILE0
 from artiq.experiment import TArray, TFloat, TTuple, TFloat, parallel
-from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu
+from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
 from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU
 from waxx.util.artiq.async_print import aprint
@@ -230,15 +230,16 @@ class RamanBeamPair():
         dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
 
         with parallel:
-            self.dds0.dds_device.write64(_AD9910_REG_PROFILE0,
-                            dds0_asf_pow_data, ftw0)
-            self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-            delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
-        with parallel:
-            self.dds1.dds_device.write64(_AD9910_REG_PROFILE0,
-                            dds1_asf_pow_data, ftw1)
-            self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-            delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
+            with sequential:
+                self.dds0.dds_device.write64(_AD9910_REG_PROFILE0,
+                                dds0_asf_pow_data, ftw0)
+                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+                delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
+            with sequential:
+                self.dds1.dds_device.write64(_AD9910_REG_PROFILE0,
+                                dds1_asf_pow_data, ftw1)
+                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+                delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
 
         at_mu(now_mu() & ~7)
 
@@ -310,7 +311,7 @@ class RamanBeamPair():
         if phase_mode_changed:
             self.phase_mode = phase_mode if phase_mode >= 0 else self.phase_mode
         if phase_origin_changed:
-            self.t_phase_origin_mu = t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU if t_phase_origin_mu > 0 else self.t_phase_origin_mu
+            self.t_phase_origin_mu = t_phase_origin_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
         if global_phase_changed:
             self.global_phase = global_phase if global_phase >= 0. else self.global_phase
         if relative_phase_changed:
