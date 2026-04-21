@@ -1,8 +1,9 @@
 import numpy as np
+from numpy import int64
 
 from artiq.coredevice.ad9910 import _AD9910_REG_PROFILE0
-from artiq.experiment import kernel, portable, delay, TArray, TFloat, parallel, TTuple
-from artiq.language.core import now_mu, at_mu
+from artiq.experiment import TArray, TFloat, TTuple, TFloat, parallel
+from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu
 
 from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU
 from waxx.util.artiq.async_print import aprint
@@ -212,6 +213,10 @@ class RamanBeamPair():
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
 
+        
+        at_mu(now_mu() & ~7)
+        # t0 = now_mu()
+
         dt = np.int32(now_mu()) - np.int32(self.t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU)
         a = dt * self._sysclk_per_mu
 
@@ -224,15 +229,17 @@ class RamanBeamPair():
         dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
         dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
 
-        at_mu(now_mu() & ~7)
         with parallel:
             self.dds0.dds_device.write64(_AD9910_REG_PROFILE0,
                             dds0_asf_pow_data, ftw0)
+            self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+            delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
+        with parallel:
             self.dds1.dds_device.write64(_AD9910_REG_PROFILE0,
                             dds1_asf_pow_data, ftw1)
-        with parallel:
             self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-            self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+            delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
+
         at_mu(now_mu() & ~7)
 
     @kernel
@@ -315,6 +322,8 @@ class RamanBeamPair():
 
         p0 = 0.
         p1 = 0.
+
+        # t0 = now_mu()
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self.state_splitting_to_ao_frequency(self.frequency_transition)
 
@@ -326,16 +335,18 @@ class RamanBeamPair():
             self._frequency_array[DDS0_IDX] = self._dummy[DDS0_IDX]
             self._frequency_array[DDS1_IDX] = self._dummy[DDS1_IDX]
 
-            p0 = self.dds0.set_dds(self._frequency_array[DDS0_IDX],
-                                amp0,
-                                t_phase_origin_mu=self.t_phase_origin_mu,
-                                phase=self.global_phase/2)
-            p1 = self.dds1.set_dds(self._frequency_array[DDS1_IDX],
-                                amp1,
-                                t_phase_origin_mu=self.t_phase_origin_mu,
-                                phase=(self.global_phase+self.relative_phase)/2)
+            with parallel:
+                p0 = self.dds0.set_dds(self._frequency_array[DDS0_IDX],
+                                    amp0,
+                                    t_phase_origin_mu=self.t_phase_origin_mu,
+                                    phase=self.global_phase/2)
+                p1 = self.dds1.set_dds(self._frequency_array[DDS1_IDX],
+                                    amp1,
+                                    t_phase_origin_mu=self.t_phase_origin_mu,
+                                    phase=(self.global_phase+self.relative_phase)/2)
             p0 = self.dds0.update_phase()
             p1 = self.dds1.update_phase()
+            # aprint(now_mu()-t0)
 
         self.dds0.on()
         self.dds1.on()
@@ -396,9 +407,11 @@ class RamanBeamPair():
         Args:
             t (float): The pulse duration in seconds.
         """        
-        self.on()
+        # self.on()
+        self.dds_sw.dds_device.sw.on()
         delay(t)
-        self.off()
+        self.dds_sw.dds_device.sw.off()
+        # self.off()
 
     @kernel
     def sweep(self,t,
