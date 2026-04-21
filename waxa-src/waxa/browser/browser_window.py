@@ -906,8 +906,8 @@ class DataBrowserWindow(QMainWindow):
 
         filter_row.addWidget(self.run_id_jump_input)
         filter_row.addWidget(self.run_id_jump_btn)
-        filter_row.addWidget(self.search_input, 2)
         filter_row.addWidget(self.experiment_filter_input, 2)
+        filter_row.addWidget(self.search_input, 2)
         filter_row.addWidget(self.tag_filter_input, 1)
         filter_row.addWidget(self.fields_btn)
         filter_row.addWidget(self.options_btn)
@@ -1621,14 +1621,14 @@ class DataBrowserWindow(QMainWindow):
             ("Ctrl+E", "Open experiment location"),
             ("Ctrl+P", "Search params for selected run"),
             ("Ctrl+T", "Edit tags for selected run"),
-            ("Ctrl+F", "Cycle search focus: xvar -> experiment -> tag"),
+            ("Ctrl+F", "Cycle search focus: experiment -> xvar -> tag"),
             ("Ctrl+R", "Refresh")
         ]
         text = "\n".join(f"{key:<8} {description}" for key, description in entries)
         QMessageBox.information(self, "Hotkeys", text)
 
     def _focus_next_search_field(self):
-        fields = [self.search_input, self.experiment_filter_input, self.tag_filter_input]
+        fields = [self.experiment_filter_input, self.search_input, self.tag_filter_input]
         focused = self.focusWidget()
         if focused in fields:
             idx = fields.index(focused)
