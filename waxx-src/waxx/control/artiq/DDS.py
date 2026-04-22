@@ -2,6 +2,7 @@ from artiq.experiment import *
 from artiq.experiment import delay_mu, delay, parallel
 from artiq.language.core import now_mu, at_mu
 import numpy as np
+from numpy import int32, int64
 
 from artiq.coredevice import ad9910, ad53xx, ttl
 from artiq.coredevice.urukul import CPLD
@@ -9,6 +10,7 @@ from artiq.coredevice.urukul import CPLD
 from waxx.util.artiq.async_print import aprint
 
 T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
+T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU = np.int64(104)
 
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
@@ -62,11 +64,15 @@ class DDS():
       self._t_set_delay_mu = self._t_set_xfer_mu + self._t_ref_period_mu + 1
       self._t_att_delay_mu = self._t_att_xfer_mu + self._t_ref_period_mu + 1
 
-      self._phase_at_t = 0. # phase at timestamp self._t_phase_mu
+      self._phase_at_t = 0 # phase at timestamp self._t_phase_mu
       self._t_phase_mu = np.int64(0) # timestamp at which the wave has phase self._phase_at_mu
 
-      self._phase_at_last_change = 0
-      self._t_last_change_mu = np.int64(0)
+      self._t_io_update_delay_mu = np.int32(0)
+      self._last_ftw = 0
+      self._ftw = 0
+      self._pow = 0
+      self._phase_t_last_set = 0
+      self._t_last_set_mu = np.int64(0)
 
       self.dds_device.sw: ttl.TTLOut
 
@@ -79,6 +85,10 @@ class DDS():
    def _restore_defaults(self):
       self.frequency = self._frequency_default
       self.amplitude = self._amplitude_default
+
+   @portable
+   def set_io_update_delay_mu(self,t_io_mu):
+      self._t_io_update_delay_mu = np.int32(t_io_mu)
 
    @portable
    def update_dac_bool(self):
@@ -153,6 +163,7 @@ class DDS():
    @kernel(flags={"fast-math"})
    def set_dds(self, frequency=-0.1, amplitude=-0.1, v_pd=-0.1, phase=0.,
                t_phase_origin_mu=np.int64(-1),
+               dt_phase_origin_shift_mu=T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU,
                init=False):
       '''
       Set the DDS (Direct Digital Synthesizer) frequency, amplitude, phase, and optionally DAC voltage.
@@ -199,72 +210,83 @@ class DDS():
          phase_origin_changed = t_phase_origin_mu >= 0. and (t_phase_origin_mu != self.t_phase_origin_mu)
          phase_changed = phase >= 0. and (phase != self.phase_offset)
 
+      self._last_ftw = self.dds_device.frequency_to_ftw(self.frequency)
       # Update stored values
       if freq_changed:
-         # last_frequency = self.frequency
          self.frequency = frequency if frequency >= 0. else self.frequency
+         self._ftw = self.dds_device.frequency_to_ftw(self.frequency)
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
       if self.dac_control_bool and vpd_changed:
          self.v_pd = v_pd if v_pd >= 0. else self.v_pd
       if phase_origin_changed:
-         self.t_phase_origin_mu = t_phase_origin_mu - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU if t_phase_origin_mu > 0 else self.t_phase_origin_mu
+         self.t_phase_origin_mu = t_phase_origin_mu - dt_phase_origin_shift_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
          self.phase_offset = phase if phase >= 0. else self.phase_offset
+         self._pow = self.dds_device.turns_to_pow(self.phase_offset/TWOPI)
 
       # Set DDS and DAC as needed
       if self.dac_control_bool and (vpd_changed or init):
          self.update_dac_setpoint(self.v_pd)
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
-         phase = self.dds_device.set(frequency=self.frequency,
+         
+         self.dds_device.set(frequency=self.frequency,
                                     amplitude=self.amplitude, 
                                     phase=self.phase_offset/TWOPI,
                                     ref_time_mu=self.t_phase_origin_mu)
          if self.phase_mode == PHASE_MODE_TRACKING:
-
             self._t_phase_mu = now_mu()
             self._phase_at_t = self.get_phase(self._t_phase_mu)
 
-         # if self.phase_mode == PHASE_MODE_CONTINUOUS:
-         #    t_now = now_mu()
-         #    self._t_last_change_mu = t_now - 90
-         #    self._phase_at_last_change += self.frequency * (t_now - self._t_last_change_mu) * TWOPI_NS
-            # phase += self.frequency * T_TRACKING_PHASE_LAG_MU * 1.e-9
-            # self._t_phase_mu = now_mu()
-            # phase = (phase * TWOPI) % TWOPI
-            # self._phase_at_t = phase
-      return phase
-   
+         else:
+            self.update_phase_at_set(last_ftw=self._last_ftw)
+
    @kernel
-   def update_phase(self, t_mu=np.int64(-1)):
-      if t_mu < 0:
-         t_mu = now_mu()
-      # relative update ends up sucking, might as well recompute from origin on
-      # the fly
+   def reset_phase(self):
+      self._t_last_set_mu = now_mu()
+      self._phase_t_last_set = 0
+      
+   @kernel
+   def update_phase_at_set(self, last_ftw=-1000):
+      last_ftw = last_ftw if last_ftw != -1000 else self._last_ftw
+      t_now = now_mu()
+      t_set = self._t_last_set_mu
+      # self._phase_at_last_change += self.get_phase() + last_frequency * T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU * TWOPI_NS
+      # self._t_last_change_mu = t_now + T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
+      T = T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
+      t_last_change_mu = t_set + T
+      if t_now < t_last_change_mu:
+         self._phase_t_last_set += int32(last_ftw * (t_now - t_set))
+      else:
+         self._phase_t_last_set += int32(last_ftw * T + self._ftw * (t_now - t_last_change_mu))
+      self._t_last_set_mu = now_mu()
 
-      # old relative update code:
-      # dt = t_mu - self._t_phase_mu
-      # self._t_phase_mu = t_mu
-      # self._phase_at_t = (self._phase_at_t + self.frequency * dt * TWOPI_NS) % TWOPI
-      # return self._phase_at_t
-
-      self._t_phase_mu = t_mu
-      self._phase_at_t = self.get_phase(t_mu)
-      return self._phase_at_t
-   
    @kernel
    def get_phase(self,
                t_mu=np.int64(-1),
                t_mu_origin=np.int64(-1),
-               frequency=-0.1,
-               phase_offset=-0.1):
-      if t_mu < 0:
-         t_mu = now_mu()
-      t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
-      frequency = frequency if frequency >= 0. else self.frequency
-      phase_offset = phase_offset if phase_offset >= 0. else self.phase_offset
-      phase = phase_offset + frequency * (t_mu - (t_mu_origin - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU)) * TWOPI_NS
-      return phase % TWOPI
+               ftw=-1000,
+               pow=-1000,
+               last_ftw=-1000):
+      ftw = ftw if ftw != -1000 else self._ftw
+      pow = pow if pow != -1000 else self._pow
+      last_ftw = last_ftw if last_ftw != -1000 else self._last_ftw
+      t_mu = t_mu if t_mu >= 0 else now_mu()
+
+      if self.phase_mode == PHASE_MODE_TRACKING:
+         t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
+         phase = pow + ftw * (t_mu - (t_mu_origin - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU))
+      else: # continuous, does not correctly account for manual phase stepping
+         t_set = self._t_last_set_mu
+         t_last_change_mu = t_set + T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
+
+         phase = int32(self._phase_t_last_set)
+         if t_mu < t_last_change_mu:
+            phase += int32(last_ftw * (t_mu - t_set))
+         else:
+            phase += int32(last_ftw * T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU \
+                        + self._ftw * (t_mu - t_last_change_mu))
+      return phase & int32(0xffff)
    
    @kernel
    def update_dac_setpoint(self, v_pd=-0.1, dac_load = True):
@@ -328,9 +350,9 @@ class DDS():
 
    @kernel
    def init(self):
-      self.cpld_device.init()
+      self.cpld_device.init(blind=True)
       delay(1*ms)
-      self.dds_device.init()
+      self.dds_device.init(blind=True)
       delay(1*ms)
 
    def read_db(self,ddb):
