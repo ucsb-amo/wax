@@ -2,6 +2,7 @@ pyproject.toml
 setup.py
 waxa/__init__.py
 waxa/atomdata.py
+waxa/atomdata_base.py
 waxa/roi.py
 waxa.egg-info/PKG-INFO
 waxa.egg-info/SOURCES.txt
@@ -11,6 +12,11 @@ waxa/base/__init__.py
 waxa/base/dealer.py
 waxa/base/scribe.py
 waxa/base/xvar.py
+waxa/browser/__init__.py
+waxa/browser/browser_window.py
+waxa/browser/cache.py
+waxa/browser/run_summary.py
+waxa/browser/scanner.py
 waxa/config/__init__.py
 waxa/config/expt_params.py
 waxa/config/img_types.py
@@ -41,6 +47,7 @@ waxa/image_processing/__init__.py
 waxa/image_processing/compute_ODs.py
 waxa/image_processing/compute_gaussian_cloud_params.py
 waxa/plotting/__init__.py
+waxa/plotting/bloch.py
 waxa/plotting/misc_analysis.py
 waxa/plotting/plotting_1d.py
 waxa/plotting/plotting_2d.py
