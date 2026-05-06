@@ -10,7 +10,7 @@ from artiq.coredevice.urukul import CPLD
 from waxx.util.artiq.async_print import aprint
 
 T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
-T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU = np.int64(104)
+T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU = np.int64(108)
 
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
@@ -70,6 +70,7 @@ class DDS():
       self._last_ftw = 0
       self._ftw = 0
       self._pow = 0
+      self._asf = 0
       self._phase_t_last_set = 0
       self._t_last_set_mu = np.int64(0)
 
@@ -216,6 +217,7 @@ class DDS():
          self._ftw = self.dds_device.frequency_to_ftw(self.frequency)
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
+         self._asf = self.dds_device.amplitude_to_asf(self.amplitude)
       if self.dac_control_bool and vpd_changed:
          self.v_pd = v_pd if v_pd >= 0. else self.v_pd
       if phase_origin_changed:
@@ -348,10 +350,10 @@ class DDS():
          self.phase_mode = mode
 
    @kernel
-   def init(self):
-      self.cpld_device.init(blind=True)
+   def init(self, blind=False):
+      self.cpld_device.init(blind=blind)
       delay(1*ms)
-      self.dds_device.init(blind=True)
+      self.dds_device.init(blind=blind)
       delay(1*ms)
 
    def read_db(self,ddb):
