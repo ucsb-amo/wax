@@ -44,7 +44,6 @@ class DDS():
       self.cpld_name = []
       self.cpld_device = CPLD
       self.bus_channel = []
-      self.ftw_per_hz = 0
       if device_db is not None:
          self.read_db(device_db)
       
@@ -339,15 +338,5 @@ class DDS():
       self.cpld_name = v["arguments"]["cpld_device"]
       spi_dev = ddb[self.cpld_name]["arguments"]["spi_device"]
       self.bus_channel = ddb[spi_dev]["arguments"]["channel"]
-      pll = v["arguments"]["pll_n"]
-      refclk = ddb[self.cpld_name]["arguments"]["refclk"]
-
-      sysclk = refclk / 4 * pll
-      max_freq = 1 << 32
-
-      self.ftw_per_hz = 1 / sysclk * max_freq
-
-   def ftw_to_freq(self,ftw):
-      return ftw / self.ftw_per_hz
    
    

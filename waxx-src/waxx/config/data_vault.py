@@ -54,7 +54,7 @@ class DataContainer():
             y = [y]*d
         self._run_data = np.asarray(y)
         # squeeze the data shape axes if they have length == 1
-        self.squeeze_axes(xvd)
+        # self.squeeze_axes(xvd)
 
     def squeeze_axes(self, xvardims):
         """Identifies if the per-shot data has any axes with dimension 1. If so,
