@@ -2,12 +2,24 @@ import numpy as np
 import pandas as pd
 import os
 import cv2
+import sys
 
 from waxa.data.server_talk import server_talk as st
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.config.img_types import img_types
 
 import h5py
+
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QDialog, QVBoxLayout, QHBoxLayout,
+        QWidget, QLabel, QComboBox, QSizePolicy, QFrame, QPushButton,
+    )
+    from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+    from PyQt6.QtCore import Qt, QRect, QPoint
+    _PYQT6_AVAILABLE = True
+except ImportError:
+    _PYQT6_AVAILABLE = False
 
 _ROI_EXCEL_CACHE = {}
 
@@ -295,6 +307,601 @@ class ROI():
             del _ROI_EXCEL_CACHE[self.server_talk.roi_csv_path]
         print(f"Updated the spreadsheet ROI with key {key}.")
 
+class _RoiImageWidget(QWidget):
+    """Image display area for ROI selection. Handles rendering and forwards
+    mouse events to the owning _RoiSelectorDialog."""
+
+    def __init__(self, dialog, parent=None):
+        super().__init__(parent)
+        self._dialog = dialog
+        self._pixmap = None
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMinimumSize(400, 300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_pixmap(self, pixmap):
+        self._pixmap = pixmap
+        self.update()
+
+    def _image_rect(self):
+        """QRect within the widget where the image is letterboxed."""
+        if self._pixmap is None or self._pixmap.width() <= 0 or self._pixmap.height() <= 0:
+            return QRect(0, 0, self.width(), self.height())
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        ww, wh = self.width(), self.height()
+        scale = min(ww / pw, wh / ph)
+        iw, ih = int(pw * scale), int(ph * scale)
+        return QRect((ww - iw) // 2, (wh - ih) // 2, iw, ih)
+
+    def widget_to_display(self, px, py):
+        """Map widget pixel coordinates to display_image pixel coordinates."""
+        rect = self._image_rect()
+        dw, dh = self._dialog.display_size()
+        lx = max(0, min(px - rect.x(), rect.width() - 1))
+        ly = max(0, min(py - rect.y(), rect.height() - 1))
+        dx = int(lx * dw / max(rect.width(), 1))
+        dy = int(ly * dh / max(rect.height(), 1))
+        return max(0, min(dx, dw - 1)), max(0, min(dy, dh - 1))
+
+    def display_to_widget(self, dx, dy):
+        """Map display_image pixel coordinates to widget coordinates."""
+        rect = self._image_rect()
+        dw, dh = self._dialog.display_size()
+        wx = rect.x() + int(dx * rect.width() / max(dw, 1))
+        wy = rect.y() + int(dy * rect.height() / max(dh, 1))
+        return wx, wy
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(20, 20, 20))
+
+        if self._pixmap is not None:
+            painter.drawPixmap(self._image_rect(), self._pixmap)
+
+        # ── Active ROI rectangle ───────────────────────────────────────────
+        roi_disp = self._dialog.active_roi_in_display_coords()
+        if roi_disp is not None:
+            dx0, dx1, dy0, dy1 = roi_disp
+            wx0, wy0 = self.display_to_widget(dx0, dy0)
+            wx1, wy1 = self.display_to_widget(dx1, dy1)
+            is_preset = self._dialog.active_roi_source.startswith("preset:")
+            pen = QPen(QColor(255, 220, 0) if is_preset else QColor(255, 255, 255), 2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRect(QPoint(wx0, wy0), QPoint(wx1, wy1)))
+
+        # ── In-progress ROI drag (dashed white) ───────────────────────────
+        drag = self._dialog.drag_rect_in_display_coords()
+        if drag is not None:
+            dx0, dy0, dx1, dy1 = drag
+            wx0, wy0 = self.display_to_widget(dx0, dy0)
+            wx1, wy1 = self.display_to_widget(dx1, dy1)
+            pen = QPen(QColor(255, 255, 255), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRect(QPoint(wx0, wy0), QPoint(wx1, wy1)))
+
+        # ── In-progress zoom drag (dotted cyan) ───────────────────────────
+        zoom_drag = self._dialog.zoom_drag_in_display_coords()
+        if zoom_drag is not None:
+            dx0, dy0, dx1, dy1 = zoom_drag
+            wx0, wy0 = self.display_to_widget(dx0, dy0)
+            wx1, wy1 = self.display_to_widget(dx1, dy1)
+            pen = QPen(QColor(0, 200, 255), 1, Qt.PenStyle.DotLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRect(QPoint(wx0, wy0), QPoint(wx1, wy1)))
+
+        painter.end()
+
+    def mousePressEvent(self, event):
+        dx, dy = self.widget_to_display(event.pos().x(), event.pos().y())
+        self._dialog.on_mouse_press(event.button(), dx, dy)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        dx, dy = self.widget_to_display(event.pos().x(), event.pos().y())
+        self._dialog.on_mouse_move(dx, dy)
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        dx, dy = self.widget_to_display(event.pos().x(), event.pos().y())
+        self._dialog.on_mouse_release(event.button(), dx, dy)
+        self.update()
+
+    def wheelEvent(self, event):
+        self._dialog.on_wheel(event.angleDelta().y())
+        self.update()
+
+    def keyPressEvent(self, event):
+        self._dialog.keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        self.update()
+
+
+class _RoiSelectorDialog(QDialog):
+    """Full PyQt6 ROI selector window.
+
+    Top bar: instructions, preset dropdown, live ROI status, warning.
+    Below: resizable image canvas with all mouse interactions.
+    """
+
+    def __init__(self, creator, preset_entries, parent=None):
+        super().__init__(parent)
+        self.creator = creator
+        self.preset_entries = preset_entries
+        self.preset_keys = [e[0] for e in preset_entries]
+
+        # ── Image / zoom state ────────────────────────────────────────────
+        self.original_image = creator.image.copy()
+        self.display_image = self.original_image.copy()
+        self.zoom_region = None          # (x0, y0, x1, y1) in original coords
+        self.img_index = 0
+
+        # ── ROI state ─────────────────────────────────────────────────────
+        self.active_roi_bounds = None    # (x0, x1, y0, y1) in original coords
+        self.active_roi_source = "none"
+        self.warning_message = ""
+        self.preset_index = -1
+
+        # ── Drawing state (in display_image pixel coords) ─────────────────
+        self._draw_start = None
+        self._draw_end = None
+        self._is_drawing = False
+        self._zoom_start = None
+        self._zoom_end = None
+        self._is_zooming = False
+
+        # ── Result ────────────────────────────────────────────────────────
+        self.result_update_bool = False
+        self.result_roix = np.array([-1, -1])
+        self.result_roiy = np.array([-1, -1])
+
+        self._build_ui()
+        self._refresh_image()
+        self.setWindowTitle("ROI Selector")
+        self.resize(1200, 800)
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.setStyleSheet(
+            "QDialog { background: #0f1117; }"
+            "QFrame#top_bar {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #171c2b, stop:1 #22293d);"
+            "  border: 1px solid #3a435e; border-radius: 8px;"
+            "}"
+            "QLabel#instructions { color: #a8b2c8; font-size: 11px; }"
+            "QLabel#status_label { color: #ffe18a; font-size: 12px; font-family: Consolas, monospace; }"
+            "QLabel#warning_label { color: #ff8a8a; font-size: 11px; }"
+            "QComboBox { background: #252c40; color: white; border: 1px solid #576081; "
+            "  padding: 3px 8px; font-size: 12px; min-height: 26px; border-radius: 5px; }"
+            "QComboBox::drop-down { border: 0px; width: 20px; }"
+            "QComboBox QAbstractItemView { background: #252c40; color: white; "
+            "  selection-background-color: #3f5b96; border: 1px solid #576081; }"
+            "QPushButton {"
+            "  background: #2a324a; color: #f3f5fb; border: 1px solid #5f6a90; "
+            "  border-radius: 5px; padding: 4px 10px; min-height: 26px; font-size: 11px;"
+            "}"
+            "QPushButton:hover { background: #364264; }"
+            "QPushButton:pressed { background: #20273a; }"
+            "QPushButton#accent { background: #3f6fd8; border: 1px solid #82a4f1; }"
+            "QPushButton#accent:hover { background: #5582e5; }"
+        )
+
+        # Top bar
+        top_bar = QFrame()
+        top_bar.setObjectName("top_bar")
+        top_bar.setFrameShape(QFrame.Shape.StyledPanel)
+        top_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        top_layout = QVBoxLayout(top_bar)
+        top_layout.setContentsMargins(10, 8, 10, 8)
+        top_layout.setSpacing(8)
+
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(8)
+
+        self.btn_prev_img = self._make_toolbar_button("Prev Img [←]", self._action_prev_image)
+        self.btn_next_img = self._make_toolbar_button("Next Img [→]", self._action_next_image)
+        self.btn_zoom_out = self._make_toolbar_button("Zoom Out [RMB/Wheel]", self._action_zoom_out)
+        self.btn_clear = self._make_toolbar_button("Clear ROI [RMB@Full]", self._action_clear)
+        self.btn_brighter = self._make_toolbar_button("Brighter [↑]", self._action_brighter)
+        self.btn_dimmer = self._make_toolbar_button("Dimmer [↓]", self._action_dimmer)
+        self.btn_prev_preset = self._make_toolbar_button("Preset - [O]", self._action_prev_preset)
+        self.btn_next_preset = self._make_toolbar_button("Preset + [P]", self._action_next_preset)
+        self.btn_accept = self._make_toolbar_button("Accept [Enter]", self._accept_roi, accent=True)
+        self.btn_cancel = self._make_toolbar_button("Cancel [Esc]", self._cancel_dialog)
+
+        controls_row.addWidget(self.btn_prev_img)
+        controls_row.addWidget(self.btn_next_img)
+        controls_row.addWidget(self.btn_zoom_out)
+        controls_row.addWidget(self.btn_clear)
+        controls_row.addWidget(self.btn_brighter)
+        controls_row.addWidget(self.btn_dimmer)
+        controls_row.addWidget(self.btn_prev_preset)
+        controls_row.addWidget(self.btn_next_preset)
+
+        controls_row.addStretch(1)
+
+        controls_row.addWidget(self.btn_cancel)
+        controls_row.addWidget(self.btn_accept)
+        top_layout.addLayout(controls_row)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(12)
+
+        instructions = QLabel(
+            "Mouse: LMB drag ROI, MMB drag zoom in, RMB zoom out/clear, Wheel zoom out"
+        )
+        instructions.setObjectName("instructions")
+        instructions.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        info_row.addWidget(instructions, 1)
+
+        preset_label = QLabel("Preset:")
+        preset_label.setStyleSheet("color: #d4d8e8; font-size: 12px;")
+        info_row.addWidget(preset_label)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(240)
+        self.preset_combo.addItem("(none)")
+        for key in self.preset_keys:
+            self.preset_combo.addItem(key)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
+        info_row.addWidget(self.preset_combo)
+
+        self.roi_label = QLabel("ROI: none")
+        self.roi_label.setObjectName("status_label")
+        self.roi_label.setMinimumWidth(280)
+        info_row.addWidget(self.roi_label)
+
+        self.warning_label = QLabel("")
+        self.warning_label.setObjectName("warning_label")
+        self.warning_label.setMinimumWidth(300)
+        info_row.addWidget(self.warning_label, 1)
+
+        top_layout.addLayout(info_row)
+
+        layout.addWidget(top_bar)
+
+        # Image canvas
+        self.image_widget = _RoiImageWidget(self)
+        layout.addWidget(self.image_widget)
+
+        self.image_widget.setStyleSheet("border: 1px solid #2f3447; border-radius: 8px;")
+
+    def _make_toolbar_button(self, text, callback, accent=False):
+        btn = QPushButton(text)
+        if accent:
+            btn.setObjectName("accent")
+        btn.clicked.connect(callback)
+        return btn
+
+    # ── Image rendering ───────────────────────────────────────────────────
+
+    def display_size(self):
+        """Return (width, height) of the current display_image."""
+        h, w = self.display_image.shape[:2]
+        return w, h
+
+    def _refresh_image(self):
+        colorized = self.creator._colorize_image(self.display_image)
+        h, w = colorized.shape[:2]
+        rgb = colorized[:, :, ::-1].copy()   # BGR → RGB
+        qimage = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+        self.image_widget.set_pixmap(QPixmap.fromImage(qimage))
+        self._update_labels()
+
+    def _update_labels(self):
+        if self.active_roi_bounds is None:
+            self.roi_label.setText("ROI: none")
+        else:
+            x0, x1, y0, y1 = self.active_roi_bounds
+            src = self.active_roi_source
+            self.roi_label.setText(f"ROI  x:[{x0}, {x1}]  y:[{y0}, {y1}]  ({src})")
+        self.warning_label.setText(self.warning_message)
+
+    # ── Preset helpers ────────────────────────────────────────────────────
+
+    def _on_preset_combo_changed(self, index):
+        if index <= 0:
+            self.preset_index = -1
+            return
+        self._apply_preset(index - 1)   # offset for "(none)" entry
+
+    def _resolve_preset_bounds(self, roix, roiy, image_shape):
+        # Backward compatibility: sentinel ROI (-1,-1,-1,-1) means full image.
+        if int(roix[0]) == -1 and int(roix[1]) == -1 and int(roiy[0]) == -1 and int(roiy[1]) == -1:
+            h, w = image_shape[:2]
+            return (0, w, 0, h), False, True, True
+
+        roi_bounds, was_clamped, valid = self.creator._clamp_roi_to_shape(
+            roix, roiy, image_shape
+        )
+        return roi_bounds, was_clamped, valid, False
+
+    def _apply_preset(self, preset_idx):
+        if not (0 <= preset_idx < len(self.preset_entries)):
+            return
+        key, roix, roiy = self.preset_entries[preset_idx]
+        roi_bounds, was_clamped, valid, is_full_image_sentinel = self._resolve_preset_bounds(
+            roix, roiy, self.original_image.shape
+        )
+        self.preset_index = preset_idx
+        if not valid:
+            self.warning_message = f"Preset '{key}' is invalid for this image size."
+            self.active_roi_bounds = None
+            self.active_roi_source = f"preset:{key}"
+            self._draw_start = self._draw_end = None
+            self._is_drawing = False
+            self._update_labels()
+            self.image_widget.update()
+            return
+        if is_full_image_sentinel:
+            self.warning_message = f"Preset '{key}' uses whole image."
+        elif was_clamped:
+            self.warning_message = f"Preset '{key}' clamped to image bounds."
+        else:
+            self.warning_message = ""
+        self.active_roi_bounds = roi_bounds
+        self.active_roi_source = f"preset:{key}"
+        self._draw_start = self._draw_end = None
+        self._is_drawing = False
+        self._update_labels()
+        self.image_widget.update()
+
+    def _apply_preset_and_sync_combo(self, preset_idx):
+        self._apply_preset(preset_idx)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(preset_idx + 1)   # +1 for "(none)"
+        self.preset_combo.blockSignals(False)
+
+    def _reset_combo_to_none(self):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+
+    # ── Coordinate query methods (called by _RoiImageWidget.paintEvent) ───
+
+    def active_roi_in_display_coords(self):
+        """Return (dx0, dx1, dy0, dy1) in display_image coords, or None."""
+        if self.active_roi_bounds is None:
+            return None
+        return self.creator._map_original_roi_to_display(
+            self.active_roi_bounds,
+            self.zoom_region,
+            self.original_image.shape,
+            self.display_image.shape,
+        )
+
+    def drag_rect_in_display_coords(self):
+        """Return (dx0, dy0, dx1, dy1) for the in-progress ROI drag, or None."""
+        if not self._is_drawing or self._draw_start is None or self._draw_end is None:
+            return None
+        return (self._draw_start[0], self._draw_start[1],
+                self._draw_end[0], self._draw_end[1])
+
+    def zoom_drag_in_display_coords(self):
+        """Return (dx0, dy0, dx1, dy1) for the in-progress zoom drag, or None."""
+        if not self._is_zooming or self._zoom_start is None or self._zoom_end is None:
+            return None
+        return (self._zoom_start[0], self._zoom_start[1],
+                self._zoom_end[0], self._zoom_end[1])
+
+    # ── Mouse event handlers (called from _RoiImageWidget) ────────────────
+
+    def on_mouse_press(self, button, dx, dy):
+        if button == Qt.MouseButton.LeftButton:
+            self._is_drawing = True
+            self._draw_start = (dx, dy)
+            self._draw_end = (dx, dy)
+            self.active_roi_bounds = None
+            self.active_roi_source = "none"
+            self.warning_message = ""
+            self._reset_combo_to_none()
+            self._update_labels()
+        elif button == Qt.MouseButton.MiddleButton:
+            self._is_zooming = True
+            self._zoom_start = (dx, dy)
+            self._zoom_end = (dx, dy)
+        elif button == Qt.MouseButton.RightButton:
+            if self.zoom_region is not None:
+                self._action_zoom_out()
+            else:
+                self._action_clear()
+
+    def on_mouse_move(self, dx, dy):
+        if self._is_drawing:
+            self._draw_end = (dx, dy)
+        elif self._is_zooming:
+            self._zoom_end = (dx, dy)
+
+    def on_mouse_release(self, button, dx, dy):
+        if button == Qt.MouseButton.LeftButton and self._is_drawing:
+            self._is_drawing = False
+            self._draw_end = (dx, dy)
+            if self._draw_start is not None:
+                orig_s = self.creator._map_display_point_to_original(
+                    self._draw_start[0], self._draw_start[1],
+                    self.zoom_region, self.original_image.shape, self.display_image.shape,
+                )
+                orig_e = self.creator._map_display_point_to_original(
+                    self._draw_end[0], self._draw_end[1],
+                    self.zoom_region, self.original_image.shape, self.display_image.shape,
+                )
+                roi_bounds, _, valid = self.creator._clamp_roi_to_shape(
+                    [orig_s[0], orig_e[0]], [orig_s[1], orig_e[1]], self.original_image.shape,
+                )
+                if valid:
+                    self.active_roi_bounds = roi_bounds
+                    self.active_roi_source = "manual"
+                    self.warning_message = ""
+                else:
+                    self.active_roi_bounds = None
+                    self.active_roi_source = "none"
+                self._update_labels()
+
+        elif button == Qt.MouseButton.MiddleButton and self._is_zooming:
+            self._is_zooming = False
+            if self._zoom_start is not None and self._zoom_end is not None:
+                orig_s = self.creator._map_display_point_to_original(
+                    self._zoom_start[0], self._zoom_start[1],
+                    self.zoom_region, self.original_image.shape, self.display_image.shape,
+                )
+                orig_e = self.creator._map_display_point_to_original(
+                    self._zoom_end[0], self._zoom_end[1],
+                    self.zoom_region, self.original_image.shape, self.display_image.shape,
+                )
+                x0, x1 = sorted([orig_s[0], orig_e[0]])
+                y0, y1 = sorted([orig_s[1], orig_e[1]])
+                if x1 > x0 and y1 > y0:
+                    self.zoom_region = (x0, y0, x1, y1)
+                    self.display_image = self.creator._extract_display_image(
+                        self.original_image, self.zoom_region
+                    )
+                    self._refresh_image()
+            self._zoom_start = self._zoom_end = None
+
+    def on_wheel(self, delta):
+        if self.zoom_region is not None:
+            self._action_zoom_out()
+
+    # ── Toolbar button actions ────────────────────────────────────────────
+
+    def _adjust_colormap(self, make_brighter):
+        step = 0.00025 if self.creator.analysis_type == img_types.DISPERSIVE else 0.1
+        max_joos = 0.0005 if self.creator.analysis_type == img_types.DISPERSIVE else 0.05
+        if make_brighter:
+            self.creator.cmap_juice_factor = max(
+                self.creator.cmap_juice_factor - step, max_joos
+            )
+        else:
+            self.creator.cmap_juice_factor = min(
+                self.creator.cmap_juice_factor + step, 1.0
+            )
+        self._refresh_image()
+
+    def _action_prev_image(self):
+        self.img_index = (self.img_index - 1) % self.creator.N_img
+        self._change_image()
+
+    def _action_next_image(self):
+        self.img_index = (self.img_index + 1) % self.creator.N_img
+        self._change_image()
+
+    def _action_zoom_out(self):
+        if self.zoom_region is not None:
+            self.zoom_region = None
+            self.display_image = self.original_image.copy()
+            self._refresh_image()
+
+    def _action_clear(self):
+        self._draw_start = self._draw_end = None
+        self._is_drawing = False
+        self._is_zooming = False
+        self._zoom_start = self._zoom_end = None
+        self.active_roi_bounds = None
+        self.active_roi_source = "none"
+        self.warning_message = ""
+        self._reset_combo_to_none()
+        self._update_labels()
+        self.image_widget.update()
+
+    def _action_brighter(self):
+        self._adjust_colormap(make_brighter=True)
+
+    def _action_dimmer(self):
+        self._adjust_colormap(make_brighter=False)
+
+    def _action_next_preset(self):
+        if len(self.preset_entries) == 0:
+            return
+        new_idx = 0 if self.preset_index < 0 else (self.preset_index + 1) % len(self.preset_entries)
+        self._apply_preset_and_sync_combo(new_idx)
+
+    def _action_prev_preset(self):
+        if len(self.preset_entries) == 0:
+            return
+        new_idx = (len(self.preset_entries) - 1) if self.preset_index < 0 else (self.preset_index - 1) % len(self.preset_entries)
+        self._apply_preset_and_sync_combo(new_idx)
+
+    def _cancel_dialog(self):
+        self.result_update_bool = False
+        self.result_roix = np.array([-1, -1])
+        self.result_roiy = np.array([-1, -1])
+        self.reject()
+
+    # ── Key events ────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._accept_roi()
+            return
+        if key == Qt.Key.Key_Escape:
+            self._cancel_dialog()
+            return
+
+        if key == Qt.Key.Key_Right:
+            self._action_next_image()
+        elif key == Qt.Key.Key_Left:
+            self._action_prev_image()
+
+        elif key == Qt.Key.Key_Up:
+            self._action_brighter()
+        elif key == Qt.Key.Key_Down:
+            self._action_dimmer()
+
+        elif key == Qt.Key.Key_P and len(self.preset_entries) > 0:
+            self._action_next_preset()
+        elif key == Qt.Key.Key_O and len(self.preset_entries) > 0:
+            self._action_prev_preset()
+
+    # ── Image switching ───────────────────────────────────────────────────
+
+    def _change_image(self):
+        self.original_image = self.creator.get_od(self.img_index).copy()
+        self.display_image = self.creator._extract_display_image(
+            self.original_image, self.zoom_region
+        )
+        if self.active_roi_source.startswith("preset:") and 0 <= self.preset_index < len(self.preset_entries):
+            key, roix, roiy = self.preset_entries[self.preset_index]
+            roi_bounds, was_clamped, valid, is_full_image_sentinel = self._resolve_preset_bounds(
+                roix, roiy, self.original_image.shape
+            )
+            if valid:
+                self.active_roi_bounds = roi_bounds
+                if is_full_image_sentinel:
+                    self.warning_message = f"Preset '{key}' uses whole image."
+                else:
+                    self.warning_message = f"Preset '{key}' clamped to image bounds." if was_clamped else ""
+            else:
+                self.active_roi_bounds = None
+                self.warning_message = f"Preset '{key}' is invalid for this image size."
+        self._refresh_image()
+
+    # ── Accept / finalise ─────────────────────────────────────────────────
+
+    def _accept_roi(self):
+        if self.active_roi_bounds is not None:
+            x0, x1, y0, y1 = self.active_roi_bounds
+            self.result_update_bool = True
+            self.result_roix = np.sort([x0, x1])
+            self.result_roiy = np.sort([y0, y1])
+        else:
+            self.result_update_bool = False
+            self.result_roix = np.array([-1, -1])
+            self.result_roiy = np.array([-1, -1])
+        self.accept()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class roi_creator():
     window_name = 'recrop'
 
@@ -372,26 +979,6 @@ class roi_creator():
             normalized_image = cv2.normalize(normalized_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
 
-    def _prepare_window(self, image_shape):
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        max_width = 1400
-        max_height = 900
-        height, width = image_shape[:2]
-        scale = min(max_width / max(width, 1), max_height / max(height, 1), 1.0)
-        window_width = max(400, int(width * scale))
-        window_height = max(300, int(height * scale))
-        cv2.resizeWindow(self.window_name, window_width, window_height)
-        try:
-            import win32con
-            import win32gui
-
-            hwnd = win32gui.FindWindow(None, self.window_name)
-            if hwnd:
-                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
-                win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-
     def get_od(self, idx):
         """Computes the idx'th OD for display in the ROI selection GUI.
 
@@ -407,7 +994,72 @@ class roi_creator():
             dark = self.images[3 * idx + 2]
             self._od_cache[idx] = compute_OD(pwa, pwoa, dark, self.analysis_type)
         return self._od_cache[idx]
-        
+
+    def _clamp_roi_to_shape(self, roix, roiy, image_shape):
+        height, width = image_shape[:2]
+        raw_x0 = int(min(roix))
+        raw_x1 = int(max(roix))
+        raw_y0 = int(min(roiy))
+        raw_y1 = int(max(roiy))
+
+        x0 = max(0, min(raw_x0, width))
+        x1 = max(0, min(raw_x1, width))
+        y0 = max(0, min(raw_y0, height))
+        y1 = max(0, min(raw_y1, height))
+
+        was_clamped = (x0 != raw_x0) or (x1 != raw_x1) or (y0 != raw_y0) or (y1 != raw_y1)
+        valid = (x1 > x0) and (y1 > y0)
+        return (x0, x1, y0, y1), was_clamped, valid
+
+    def _map_original_roi_to_display(self, roi_bounds, zoom_region, original_shape, display_shape):
+        x0, x1, y0, y1 = roi_bounds
+        display_h, display_w = display_shape[:2]
+
+        if zoom_region is None:
+            dx0 = max(0, min(int(x0), display_w - 1))
+            dx1 = max(0, min(int(x1), display_w - 1))
+            dy0 = max(0, min(int(y0), display_h - 1))
+            dy1 = max(0, min(int(y1), display_h - 1))
+            return dx0, dx1, dy0, dy1
+
+        zx0, zy0, zx1, zy1 = zoom_region
+        zoom_w = max(zx1 - zx0, 1)
+        zoom_h = max(zy1 - zy0, 1)
+
+        def map_x(x):
+            return int((x - zx0) * display_w / zoom_w)
+
+        def map_y(y):
+            return int((y - zy0) * display_h / zoom_h)
+
+        dx0 = max(0, min(map_x(x0), display_w - 1))
+        dx1 = max(0, min(map_x(x1), display_w - 1))
+        dy0 = max(0, min(map_y(y0), display_h - 1))
+        dy1 = max(0, min(map_y(y1), display_h - 1))
+        return dx0, dx1, dy0, dy1
+
+    def _load_excel_roi_presets(self):
+        presets = []
+        try:
+            roidf = _load_roi_excel_cached(self.server_talk.roi_csv_path)
+            expected_cols = {'key', 'roix0', 'roix1', 'roiy0', 'roiy1'}
+            if not expected_cols.issubset(set(roidf.columns)):
+                return presets
+
+            for _, row in roidf.iterrows():
+                key = str(row['key']).strip() if not pd.isna(row['key']) else ""
+                if key == "":
+                    continue
+                try:
+                    roix = [int(row['roix0']), int(row['roix1'])]
+                    roiy = [int(row['roiy0']), int(row['roiy1'])]
+                except Exception:
+                    continue
+                presets.append((key, roix, roiy))
+        except Exception:
+            return []
+        return presets
+
     def get_roi_rectangle(self):
         """Brings up the GUI to select an ROI over a display of the ODs from a
         given run.
@@ -416,9 +1068,11 @@ class roi_creator():
             LMB + drag: Select an ROI rectangle.
             MMB + drag: Draw a dotted-line rectangle for zooming.
             MMB release: Zoom in to the selected region.
-            RMB: Clear the drawn ROI.
+            RMB: Zoom out if zoomed; clear the drawn ROI at full scale.
             Mouse wheel scroll down: Zoom back out to full scale.
             L/R arrow keys: Scroll through ODs from the run while keeping zoom.
+            P / O: Cycle through saved ROI presets from roi.xlsx.
+            Up / Down arrows: Adjust colormap brightness.
             Enter: Submit your selection.
             Escape / "X" button: Close the GUI without submitting selection.
 
@@ -426,159 +1080,22 @@ class roi_creator():
             bool: Whether an ROI has been selected.
             tuple: roix, given as [roix0, roix1] (left and right bounds of the ROI).
             tuple: roiy, given as [roiy0, roiy1] (top and bottom bounds of the ROI).
-        """       
-        original_image = self.image.copy()
-        display_image = original_image.copy()
-        img_index = 0
-        zooming = False
-        zoom_region = None  # Store zoomed region coordinates
-        # if self.analysis_type != img_types.ABSORPTION:
-        #     self.cmap_juice_factor = 0.01
-        # else:
-        #     self.cmap_juice_factor = 0.8
-        self.cmap_juice_factor = 1.
+        """
+        if not _PYQT6_AVAILABLE:
+            raise ImportError(
+                "PyQt6 is required for the ROI selector. Install it with: pip install PyQt6"
+            )
+        self.cmap_juice_factor = 1.0
+        preset_entries = self._load_excel_roi_presets()
 
-        def draw_rectangle(event, x, y, flags, param):
-            nonlocal display_image, zoom_region, zooming
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
 
-            if event == cv2.EVENT_LBUTTONDOWN:
-                self.drawing = True
-                self.start_x, self.start_y = self._clip_point(x, y, display_image.shape)
-                
-            elif event == cv2.EVENT_MBUTTONDOWN:
-                zooming = True
-                self.start_x, self.start_y = self._clip_point(x, y, display_image.shape)
-
-            elif event == cv2.EVENT_MOUSEMOVE:
-                if self.drawing or zooming:
-                    self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
-                    
-            elif event == cv2.EVENT_LBUTTONUP:
-                self.drawing = False
-                self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
-
-            elif event == cv2.EVENT_MBUTTONUP:
-                zooming = False
-                self.end_x, self.end_y = self._clip_point(x, y, display_image.shape)
-                try:
-                    if self.start_x != -1 and self.start_y != -1 and self.end_x != -1 and self.end_y != -1:
-                        mapped_start = self._map_display_point_to_original(
-                            self.start_x,
-                            self.start_y,
-                            zoom_region,
-                            original_image.shape,
-                            display_image.shape,
-                        )
-                        mapped_end = self._map_display_point_to_original(
-                            self.end_x,
-                            self.end_y,
-                            zoom_region,
-                            original_image.shape,
-                            display_image.shape,
-                        )
-                        x0, x1 = sorted([mapped_start[0], mapped_end[0]])
-                        y0, y1 = sorted([mapped_start[1], mapped_end[1]])
-                        if x1 > x0 and y1 > y0:
-                            zoom_region = (x0, y0, x1, y1)
-                            display_image = self._extract_display_image(original_image, zoom_region)
-                except Exception:
-                    display_image = original_image.copy()
-                    zoom_region = None
-                self.start_x, self.start_y = -1, -1
-                self.end_x, self.end_y = -1, -1
-
-            elif event == cv2.EVENT_MOUSEWHEEL:
-                zoom_region = None
-                display_image = original_image.copy()
-                self.start_x, self.start_y = -1, -1
-                self.end_x, self.end_y = -1, -1
-
-            elif event == cv2.EVENT_RBUTTONDOWN:
-                self.drawing = False
-                zooming = False
-                self.start_x, self.start_y = -1, -1
-                self.end_x, self.end_y = -1, -1
-                
-
-        def adjust_colormap_scale(key):
-            """Adjusts the colormap scale factor based on arrow key input."""
-            step_size = 0.00025 if self.analysis_type == img_types.DISPERSIVE else 0.1
-            max_joos = 0.0005 if self.analysis_type == img_types.DISPERSIVE else 0.05
-            if key == 0x260000:  # Up arrow key (increase fraction)
-                self.cmap_juice_factor = max(self.cmap_juice_factor - step_size, max_joos)
-            elif key == 0x280000:  # Down arrow key (decrease fraction)
-                self.cmap_juice_factor = min(self.cmap_juice_factor + step_size, 1.0)
-
-        self._prepare_window(display_image.shape)
-        cv2.setMouseCallback(self.window_name, draw_rectangle)
-
+        dialog = _RoiSelectorDialog(self, preset_entries)
         try:
-            while True:
-                overlay_image = self._colorize_image(display_image)
-
-                if self.start_x != -1 and self.start_y != -1 and self.end_x != -1 and self.end_y != -1:
-                    color = (255, 255, 255)
-                    thickness = 2 if self.drawing else 1
-                    line_type = cv2.LINE_8 if self.drawing else cv2.LINE_4
-                    cv2.rectangle(
-                        overlay_image,
-                        (self.start_x, self.start_y),
-                        (self.end_x, self.end_y),
-                        color,
-                        thickness,
-                        line_type,
-                    )
-
-                cv2.imshow(self.window_name, overlay_image)
-
-                key = cv2.waitKeyEx(15)
-                if key == 13:
-                    break
-
-                if key in [0x260000, 0x280000]:
-                    adjust_colormap_scale(key)
-
-                elif key in [2555904, 2424832]:
-                    if key == 2555904:
-                        img_index = (img_index + 1) % self.N_img
-                    else:
-                        img_index = (img_index - 1) % self.N_img
-                    original_image = self.get_od(img_index).copy()
-                    display_image = self._extract_display_image(original_image, zoom_region)
-
-                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-
-                if key == 27:
-                    break
+            dialog.exec()
         finally:
-            try:
-                cv2.destroyWindow(self.window_name)
-            except Exception:
-                cv2.destroyAllWindows()
             self.h5_file.close()
 
-        if zoom_region == None:
-            mapped_start_x, mapped_start_y = self.start_x, self.start_y
-            mapped_end_x, mapped_end_y = self.end_x, self.end_y
-        else:
-            mapped_start_x, mapped_start_y = self._map_display_point_to_original(
-                self.start_x,
-                self.start_y,
-                zoom_region,
-                original_image.shape,
-                display_image.shape,
-            )
-            mapped_end_x, mapped_end_y = self._map_display_point_to_original(
-                self.end_x,
-                self.end_y,
-                zoom_region,
-                original_image.shape,
-                display_image.shape,
-            )
-
-        out = np.array([mapped_start_x, mapped_start_y, mapped_end_x, mapped_end_y])
-        update_bool = not np.all(out == -1)
-        if mapped_start_x == mapped_end_x or mapped_start_y == mapped_end_y:
-            update_bool = False
-        return update_bool, np.sort([mapped_start_x, mapped_end_x]), np.sort([mapped_end_y, mapped_start_y])
+        return dialog.result_update_bool, dialog.result_roix, dialog.result_roiy
