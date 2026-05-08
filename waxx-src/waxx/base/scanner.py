@@ -174,10 +174,19 @@ class Scanner():
 
             self.core.wait_until_mu(now_mu())
             scanning = self.step_scan()
+            self.update_scan_xvar_counters()
 
             self.core.break_realtime()
 
         self.post_scan()
+
+    @kernel
+    def update_scan_xvar_counters(self):
+        for xvar in self.scan_xvars:
+            xvar.counter = self.return_scan_xvar_counter(xvar.position)
+
+    def return_scan_xvar_counter(self, idx) -> TInt32:
+        return self.scan_xvars[idx].counter
 
     def update_params_from_xvars(self):
         """Updates the host ExptParams attributes and recomputes derived

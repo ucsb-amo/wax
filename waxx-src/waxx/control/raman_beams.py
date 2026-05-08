@@ -213,7 +213,7 @@ class RamanBeamPair():
                 self.dds1.dds_device.set_cfr1()
             at_mu(now_mu() & ~7)
 
-    @kernel
+    @kernel(flags={"fast-math"})
     def set_frequency_fast(self,
                  frequency_transition,
                  dt_phase_origin_shift_mu=T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU):
@@ -226,6 +226,7 @@ class RamanBeamPair():
 
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
+        # aprint(f0,f1)
 
         ftw0 = self._f_to_ftw(f0)
         ftw1 = self._f_to_ftw(f1)
@@ -242,8 +243,10 @@ class RamanBeamPair():
 
         dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
         dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
-
+        
+        t0 = now_mu()
         at_mu(now_mu() & ~7)
+        t1 = now_mu()
         
         with parallel:
             with sequential:
@@ -251,24 +254,27 @@ class RamanBeamPair():
                                 dds0_asf_pow_data, ftw0)
                 delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
                 self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+                self.dds0.frequency = f0
+                self.dds0._ftw = ftw0
+                self.dds0.update_phase_at_set() # after at mu? no...
                 
             with sequential:
                 self.dds1.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
                                 dds1_asf_pow_data, ftw1)
                 delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
                 self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+                self.dds1.frequency = f1
+                self.dds1._ftw = ftw1
+                self.dds1.update_phase_at_set() # after at mu? no...
 
         at_mu(now_mu() & ~7)
+        
+        # delay(10.e-6)
+        # t1 = now_mu()
 
-        self.dds0.frequency = f0
-        self.dds1.frequency = f1
-        self.dds0._ftw = ftw0
-        self.dds1._ftw = ftw1
+        # aprint(t1-t0)
 
-        self.dds0.update_phase_at_set() # after at mu? no...
-        self.dds1.update_phase_at_set() # after at mu? no...
-
-    @kernel
+    @kernel(flags={"fast-math"})
     def set(self,
             frequency_transition=dv,
             fraction_power_raman=dv,
@@ -374,7 +380,7 @@ class RamanBeamPair():
         self.dds0.on()
         self.dds1.on()
     
-    @kernel
+    @kernel(flags={"fast-math"})
     def get_phase(self,
                t_mu=np.int64(-1),
                t_mu_origin=np.int64(-1),
@@ -424,7 +430,7 @@ class RamanBeamPair():
             p1 = self.dds1.get_phase()
         return (2*(p0-p1)) & int32(0xffff)
     
-    @portable
+    @portable(flags={"fast-math"})
     def pow_to_phase(self, pow) -> TFloat:
         return self.dds0.dds_device.pow_to_turns(pow) * TWOPI
         

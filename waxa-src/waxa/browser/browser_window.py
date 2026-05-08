@@ -780,6 +780,7 @@ class DataBrowserWindow(QMainWindow):
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh_timeout)
 
         self.setWindowTitle("Data Browser")
+        self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.resize(980, 760)
         self.setMinimumSize(980, 620)
 
