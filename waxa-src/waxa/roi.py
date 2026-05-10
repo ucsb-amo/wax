@@ -14,9 +14,10 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QDialog, QVBoxLayout, QHBoxLayout,
         QWidget, QLabel, QComboBox, QSizePolicy, QFrame, QPushButton,
+        QMessageBox,
     )
-    from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
-    from PyQt6.QtCore import Qt, QRect, QPoint
+    from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence, QFont, QIcon
+    from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QCoreApplication
     _PYQT6_AVAILABLE = True
 except ImportError:
     _PYQT6_AVAILABLE = False
@@ -169,7 +170,12 @@ class ROI():
         Returns:
             px, py: The image dimensions (rows, columns).
         """        
-        fpath, _ = self.server_talk.get_data_file(self.run_id)
+        # Reuse the already-resolved file path when available to avoid
+        # re-triggering network drive checks.
+        if self._current_file_path is not None:
+            fpath = self._current_file_path
+        else:
+            fpath, _ = self.server_talk.get_data_file(self.run_id)
         with h5py.File(fpath) as f:
             py, px = f['data']['images'].shape[-2:]
         return px, py
@@ -317,7 +323,7 @@ class _RoiImageWidget(QWidget):
         self._pixmap = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(400, 300)
+        self.setMinimumSize(180, 120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_pixmap(self, pixmap):
@@ -429,7 +435,18 @@ class _RoiSelectorDialog(QDialog):
     """
 
     def __init__(self, creator, preset_entries, parent=None):
+        # Set window flags before calling super().__init__()
+        if sys.platform.startswith("win"):
+            # Use Qt.WindowType instead of passing to super
+            pass
         super().__init__(parent)
+        
+        if sys.platform.startswith("win"):
+            self.setWindowFlags(
+                self.windowFlags()
+                | Qt.WindowType.WindowStaysOnTopHint
+            )
+        
         self.creator = creator
         self.preset_entries = preset_entries
         self.preset_keys = [e[0] for e in preset_entries]
@@ -460,16 +477,18 @@ class _RoiSelectorDialog(QDialog):
         self.result_roiy = np.array([-1, -1])
 
         self._build_ui()
+        self._setup_hotkeys()
         self._refresh_image()
         self.setWindowTitle("ROI Selector")
-        self.resize(1200, 800)
+        self._set_emoji_window_icon()
+        self.resize(450, 550)
 
     # ── UI construction ───────────────────────────────────────────────────
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         self.setStyleSheet(
             "QDialog { background: #0f1117; }"
@@ -478,11 +497,13 @@ class _RoiSelectorDialog(QDialog):
             "  border: 1px solid #3a435e; border-radius: 8px;"
             "}"
             "QLabel#instructions { color: #a8b2c8; font-size: 11px; }"
+            "QLabel#group_label { color: #d4d8e8; font-size: 10px; }"
             "QLabel#status_label { color: #ffe18a; font-size: 12px; font-family: Consolas, monospace; }"
             "QLabel#warning_label { color: #ff8a8a; font-size: 11px; }"
             "QComboBox { background: #252c40; color: white; border: 1px solid #576081; "
-            "  padding: 3px 8px; font-size: 12px; min-height: 26px; border-radius: 5px; }"
+            "  padding: 2px 6px; font-size: 11px; min-height: 22px; border-radius: 5px; }"
             "QComboBox::drop-down { border: 0px; width: 20px; }"
+            "QComboBox::down-arrow { image: none; width: 0px; height: 0px; }"
             "QComboBox QAbstractItemView { background: #252c40; color: white; "
             "  selection-background-color: #3f5b96; border: 1px solid #576081; }"
             "QPushButton {"
@@ -493,6 +514,16 @@ class _RoiSelectorDialog(QDialog):
             "QPushButton:pressed { background: #20273a; }"
             "QPushButton#accent { background: #3f6fd8; border: 1px solid #82a4f1; }"
             "QPushButton#accent:hover { background: #5582e5; }"
+            "QPushButton#mini {"
+            "  padding: 0px 2px; min-height: 18px; min-width: 18px;"
+            "  font-size: 12px; border-radius: 4px;"
+            "}"
+            "QPushButton#mini_accent {"
+            "  padding: 0px 2px; min-height: 18px; min-width: 18px;"
+            "  font-size: 12px; border-radius: 4px;"
+            "  background: #3f6fd8; border: 1px solid #82a4f1; color: #f3f5fb;"
+            "}"
+            "QPushButton#mini_accent:hover { background: #5582e5; }"
         )
 
         # Top bar
@@ -501,68 +532,116 @@ class _RoiSelectorDialog(QDialog):
         top_bar.setFrameShape(QFrame.Shape.StyledPanel)
         top_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         top_layout = QVBoxLayout(top_bar)
-        top_layout.setContentsMargins(10, 8, 10, 8)
-        top_layout.setSpacing(8)
+        top_layout.setContentsMargins(8, 6, 8, 6)
+        top_layout.setSpacing(6)
 
         controls_row = QHBoxLayout()
-        controls_row.setSpacing(8)
+        controls_row.setSpacing(6)
 
-        self.btn_prev_img = self._make_toolbar_button("Prev Img [←]", self._action_prev_image)
-        self.btn_next_img = self._make_toolbar_button("Next Img [→]", self._action_next_image)
-        self.btn_zoom_out = self._make_toolbar_button("Zoom Out [RMB/Wheel]", self._action_zoom_out)
-        self.btn_clear = self._make_toolbar_button("Clear ROI [RMB@Full]", self._action_clear)
-        self.btn_brighter = self._make_toolbar_button("Brighter [↑]", self._action_brighter)
-        self.btn_dimmer = self._make_toolbar_button("Dimmer [↓]", self._action_dimmer)
-        self.btn_prev_preset = self._make_toolbar_button("Preset - [O]", self._action_prev_preset)
-        self.btn_next_preset = self._make_toolbar_button("Preset + [P]", self._action_next_preset)
-        self.btn_accept = self._make_toolbar_button("Accept [Enter]", self._accept_roi, accent=True)
-        self.btn_cancel = self._make_toolbar_button("Cancel [Esc]", self._cancel_dialog)
+        img_widget = QWidget()
+        img_layout = QVBoxLayout(img_widget)
+        img_layout.setContentsMargins(0, 0, 0, 0)
+        img_layout.setSpacing(2)
+        img_buttons_widget = QWidget()
+        img_buttons_layout = QHBoxLayout(img_buttons_widget)
+        img_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        img_buttons_layout.setSpacing(4)
+        self.btn_prev_img = self._make_toolbar_button("⬅️", self._action_prev_image, mini=True)
+        self.btn_prev_img.setToolTip("Previous image")
+        self.btn_next_img = self._make_toolbar_button("➡️", self._action_next_image, mini=True)
+        self.btn_next_img.setToolTip("Next image")
+        img_buttons_layout.addWidget(self.btn_prev_img)
+        img_buttons_layout.addWidget(self.btn_next_img)
+        img_layout.addWidget(img_buttons_widget)
 
-        controls_row.addWidget(self.btn_prev_img)
-        controls_row.addWidget(self.btn_next_img)
-        controls_row.addWidget(self.btn_zoom_out)
-        controls_row.addWidget(self.btn_clear)
-        controls_row.addWidget(self.btn_brighter)
-        controls_row.addWidget(self.btn_dimmer)
-        controls_row.addWidget(self.btn_prev_preset)
-        controls_row.addWidget(self.btn_next_preset)
+        gain_buttons_widget = QWidget()
+        gain_buttons_layout = QHBoxLayout(gain_buttons_widget)
+        gain_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        gain_buttons_layout.setSpacing(4)
 
-        controls_row.addStretch(1)
+        self.btn_dimmer = self._make_toolbar_button("🌙", self._action_dimmer, mini=True)
+        self.btn_dimmer.setToolTip("Dimmer (Down Arrow)")
+        self.btn_brighter = self._make_toolbar_button("☀️", self._action_brighter, mini=True)
+        self.btn_brighter.setToolTip("Brighter (Up Arrow)")
+        gain_buttons_layout.addWidget(self.btn_dimmer)
+        gain_buttons_layout.addWidget(self.btn_brighter)
+        img_layout.addWidget(gain_buttons_widget)
 
-        controls_row.addWidget(self.btn_cancel)
-        controls_row.addWidget(self.btn_accept)
-        top_layout.addLayout(controls_row)
-
-        info_row = QHBoxLayout()
-        info_row.setSpacing(12)
-
-        instructions = QLabel(
-            "Mouse: LMB drag ROI, MMB drag zoom in, RMB zoom out/clear, Wheel zoom out"
-        )
-        instructions.setObjectName("instructions")
-        instructions.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        info_row.addWidget(instructions, 1)
-
-        preset_label = QLabel("Preset:")
-        preset_label.setStyleSheet("color: #d4d8e8; font-size: 12px;")
-        info_row.addWidget(preset_label)
+        bold_font = self.btn_prev_img.font()
+        bold_font.setBold(True)
+        self.btn_prev_img.setFont(bold_font)
+        self.btn_next_img.setFont(bold_font)
+        self.btn_dimmer.setFont(bold_font)
+        self.btn_brighter.setFont(bold_font)
 
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(240)
-        self.preset_combo.addItem("(none)")
+        self.preset_combo.setMinimumWidth(130)
+        self.preset_combo.addItem("select preset")
+        placeholder_font = QFont(self.preset_combo.font())
+        placeholder_font.setItalic(True)
+        self.preset_combo.setItemData(0, placeholder_font, Qt.ItemDataRole.FontRole)
         for key in self.preset_keys:
             self.preset_combo.addItem(key)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
-        info_row.addWidget(self.preset_combo)
+        self.preset_combo.setToolTip("Choose a saved ROI preset")
+
+        self.btn_zoom_out = self._make_toolbar_button("Zoom Out", self._action_zoom_out, mini=True)
+        self.btn_zoom_out.setToolTip("Zoom out (Right Mouse Button or Mouse Wheel)")
+        self.btn_clear = self._make_toolbar_button("Clear ROI", self._action_clear, mini=True)
+        self.btn_clear.setToolTip("Clear current ROI at full scale")
+        self.btn_help = self._make_toolbar_button("Instructions", self._show_instructions, mini=True)
+        self.btn_help.setMinimumHeight(22)
+        self.btn_help.setMaximumHeight(22)
+        self.btn_help.setToolTip("Show mouse and keyboard instructions")
+        
+        zoom_clear_widget = QWidget()
+        zoom_clear_layout = QVBoxLayout(zoom_clear_widget)
+        zoom_clear_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_clear_layout.setSpacing(2)
+        zoom_clear_layout.addWidget(self.btn_zoom_out)
+        zoom_clear_layout.addWidget(self.btn_clear)
+        zoom_clear_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+        self.btn_accept = self._make_toolbar_button("Accept", self._accept_roi, accent=True, mini=True)
+        self.btn_accept.setToolTip("Accept ROI (Enter)")
+        self.btn_cancel = self._make_toolbar_button("Cancel", self._cancel_dialog, mini=True)
+        self.btn_cancel.setToolTip("Cancel ROI selection (Escape)")
+        
+        action_widget = QWidget()
+        action_layout = QVBoxLayout(action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(2)
+        action_layout.addWidget(self.btn_cancel)
+        action_layout.addWidget(self.btn_accept)
+        action_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+        centered_help_widget = QWidget()
+        centered_help_layout = QHBoxLayout(centered_help_widget)
+        centered_help_layout.setContentsMargins(0, 0, 0, 0)
+        centered_help_layout.setSpacing(0)
+        centered_help_layout.addStretch(1)
+        centered_help_layout.addWidget(self.btn_help)
+        centered_help_layout.addStretch(1)
+        centered_help_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        controls_row.addWidget(img_widget)
+        controls_row.addWidget(zoom_clear_widget)
+        controls_row.addWidget(self.preset_combo)
+        controls_row.addWidget(centered_help_widget, 1)
+        controls_row.addWidget(action_widget)
+        top_layout.addLayout(controls_row)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(8)
 
         self.roi_label = QLabel("ROI: none")
         self.roi_label.setObjectName("status_label")
-        self.roi_label.setMinimumWidth(280)
+        self.roi_label.setMinimumWidth(120)
         info_row.addWidget(self.roi_label)
 
         self.warning_label = QLabel("")
         self.warning_label.setObjectName("warning_label")
-        self.warning_label.setMinimumWidth(300)
+        self.warning_label.setMinimumWidth(140)
         info_row.addWidget(self.warning_label, 1)
 
         top_layout.addLayout(info_row)
@@ -575,12 +654,120 @@ class _RoiSelectorDialog(QDialog):
 
         self.image_widget.setStyleSheet("border: 1px solid #2f3447; border-radius: 8px;")
 
-    def _make_toolbar_button(self, text, callback, accent=False):
+    def _make_toolbar_button(self, text, callback, accent=False, mini=False):
         btn = QPushButton(text)
-        if accent:
+        if mini and accent:
+            btn.setObjectName("mini_accent")
+        elif mini:
+            btn.setObjectName("mini")
+        elif accent:
             btn.setObjectName("accent")
         btn.clicked.connect(callback)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         return btn
+
+    def _set_emoji_window_icon(self):
+        icon = QIcon()
+        emoji = "🖼️"
+        for size in (16, 24, 32, 48, 64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            font = QFont("Segoe UI Emoji")
+            font.setPixelSize(max(10, int(size * 0.78)))
+            painter.setFont(font)
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+            painter.end()
+            icon.addPixmap(pixmap)
+
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+
+    def _show_instructions(self):
+        message = (
+            "<div style='background:#0f1117;color:#e6e9f5;font-size:12px;line-height:1.45;'>"
+            "<table style='width:100%;border-collapse:collapse;'>"
+            "<tr>"
+            "<td style='vertical-align:top;padding-right:18px;'>"
+            "<div style='margin:0 0 8px 0;'><b>Mouse Controls</b></div>"
+            "<div style='margin:0 0 0.2em 0;'>LMB + drag: Select ROI rectangle</div>"
+            "<div style='margin:0 0 0.2em 0;'>MMB + drag: Draw zoom region</div>"
+            "<div style='margin:0 0 0.2em 0;'>MMB release: Zoom in to selected region</div>"
+            "<div style='margin:0 0 0.2em 0;'>RMB: Zoom out if zoomed, otherwise clear ROI</div>"
+            "<div style='margin:0 0 0.2em 0;'>Mouse wheel: Zoom out to full scale</div>"
+            "</td>"
+            "<td style='vertical-align:top;padding-left:18px;'>"
+            "<div style='margin:0 0 8px 0;'><b>Keyboard Controls</b></div>"
+            "<div style='margin:0 0 0.2em 0;'>Left Arrow: Previous image</div>"
+            "<div style='margin:0 0 0.2em 0;'>Right Arrow: Next image</div>"
+            "<div style='margin:0 0 0.2em 0;'>Up Arrow: Brighter</div>"
+            "<div style='margin:0 0 0.2em 0;'>Down Arrow: Dimmer</div>"
+            "<div style='margin:0 0 0.2em 0;'>Enter: Accept ROI</div>"
+            "<div style='margin:0 0 0.2em 0;'>Escape: Cancel</div>"
+            "</td>"
+            "</tr>"
+            "</table>"
+            "</div>"
+        )
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("ROI Selector Instructions")
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
+        msg_box.setText(message)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Close)
+        msg_box.setWindowModality(Qt.WindowModality.NonModal)
+        msg_box.setModal(False)
+        msg_box.setStyleSheet(
+            "QMessageBox { background: #0f1117; color: #e6e9f5; }"
+            "QLabel { color: #e6e9f5; }"
+            "QPushButton {"
+            "  background: #2a324a; color: #f3f5fb; border: 1px solid #5f6a90;"
+            "  border-radius: 5px; padding: 4px 10px; min-height: 24px;"
+            "}"
+            "QPushButton:hover { background: #364264; }"
+            "QPushButton:pressed { background: #20273a; }"
+        )
+        self._instructions_box = msg_box
+        msg_box.show()
+
+    def _setup_hotkeys(self):
+        # Keep arrow hotkeys active even when another child widget (e.g. combo)
+        # temporarily owns focus when the dialog first appears.
+        self._shortcuts = []
+
+        def bind(key, callback):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
+
+        bind("Left", self._action_prev_image)
+        bind("Right", self._action_next_image)
+        bind("Up", self._action_brighter)
+        bind("Down", self._action_dimmer)
+
+    def _focus_image_canvas(self):
+        # Explicit activation helps foreground modal dialogs on Windows.
+        if not self.isVisible():
+            return
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.requestActivate()
+        self.raise_()
+        self.activateWindow()
+        self.image_widget.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._focus_image_canvas()
+        # Retry focus aggressively on all platforms to ensure it sticks.
+        QTimer.singleShot(0, self._focus_image_canvas)
+        QTimer.singleShot(25, self._focus_image_canvas)
+        QTimer.singleShot(75, self._focus_image_canvas)
+        QTimer.singleShot(200, self._focus_image_canvas)
 
     # ── Image rendering ───────────────────────────────────────────────────
 
@@ -612,7 +799,7 @@ class _RoiSelectorDialog(QDialog):
         if index <= 0:
             self.preset_index = -1
             return
-        self._apply_preset(index - 1)   # offset for "(none)" entry
+        self._apply_preset(index - 1)   # offset for placeholder entry
 
     def _resolve_preset_bounds(self, roix, roiy, image_shape):
         # Backward compatibility: sentinel ROI (-1,-1,-1,-1) means full image.
@@ -658,7 +845,7 @@ class _RoiSelectorDialog(QDialog):
     def _apply_preset_and_sync_combo(self, preset_idx):
         self._apply_preset(preset_idx)
         self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentIndex(preset_idx + 1)   # +1 for "(none)"
+        self.preset_combo.setCurrentIndex(preset_idx + 1)   # +1 for placeholder
         self.preset_combo.blockSignals(False)
 
     def _reset_combo_to_none(self):
@@ -774,7 +961,7 @@ class _RoiSelectorDialog(QDialog):
     # ── Toolbar button actions ────────────────────────────────────────────
 
     def _adjust_colormap(self, make_brighter):
-        step = 0.00025 if self.creator.analysis_type == img_types.DISPERSIVE else 0.1
+        step = 0.001 if self.creator.analysis_type == img_types.DISPERSIVE else 0.2
         max_joos = 0.0005 if self.creator.analysis_type == img_types.DISPERSIVE else 0.05
         if make_brighter:
             self.creator.cmap_juice_factor = max(
@@ -818,18 +1005,6 @@ class _RoiSelectorDialog(QDialog):
     def _action_dimmer(self):
         self._adjust_colormap(make_brighter=False)
 
-    def _action_next_preset(self):
-        if len(self.preset_entries) == 0:
-            return
-        new_idx = 0 if self.preset_index < 0 else (self.preset_index + 1) % len(self.preset_entries)
-        self._apply_preset_and_sync_combo(new_idx)
-
-    def _action_prev_preset(self):
-        if len(self.preset_entries) == 0:
-            return
-        new_idx = (len(self.preset_entries) - 1) if self.preset_index < 0 else (self.preset_index - 1) % len(self.preset_entries)
-        self._apply_preset_and_sync_combo(new_idx)
-
     def _cancel_dialog(self):
         self.result_update_bool = False
         self.result_roix = np.array([-1, -1])
@@ -857,11 +1032,6 @@ class _RoiSelectorDialog(QDialog):
             self._action_brighter()
         elif key == Qt.Key.Key_Down:
             self._action_dimmer()
-
-        elif key == Qt.Key.Key_P and len(self.preset_entries) > 0:
-            self._action_next_preset()
-        elif key == Qt.Key.Key_O and len(self.preset_entries) > 0:
-            self._action_prev_preset()
 
     # ── Image switching ───────────────────────────────────────────────────
 
@@ -1071,7 +1241,6 @@ class roi_creator():
             RMB: Zoom out if zoomed; clear the drawn ROI at full scale.
             Mouse wheel scroll down: Zoom back out to full scale.
             L/R arrow keys: Scroll through ODs from the run while keeping zoom.
-            P / O: Cycle through saved ROI presets from roi.xlsx.
             Up / Down arrows: Adjust colormap brightness.
             Enter: Submit your selection.
             Escape / "X" button: Close the GUI without submitting selection.
@@ -1092,8 +1261,16 @@ class roi_creator():
         if app is None:
             app = QApplication(sys.argv)
 
-        dialog = _RoiSelectorDialog(self, preset_entries)
+        parent_window = app.activeWindow()
+        dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window)
         try:
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            # Show and activate the dialog before entering the modal loop.
+            dialog.show()
+            # Process pending events to ensure window is fully rendered.
+            QCoreApplication.processEvents()
+            dialog._focus_image_canvas()
+            # Now enter modal exec with proper focus.
             dialog.exec()
         finally:
             self.h5_file.close()

@@ -8,7 +8,7 @@ from waxa.data.server_talk import server_talk as st
 from waxa.atomdata_base import atomdata_base, atom_number_apd, unpack_group
 
 
-class   atomdata(atomdata_base):
+class atomdata(atomdata_base):
     """User-facing atomdata class with analysis-focused methods.
 
     Heavy data loading, repeat handling, shuffling, slicing, and transpose
