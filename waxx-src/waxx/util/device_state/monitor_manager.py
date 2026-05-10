@@ -22,6 +22,13 @@ class MonitorManager(QThread):
             run_expt_command = r"%kpy% & ar " + str(expt_path)
             self.msg.emit("Starting monitor...")
             result = run(run_expt_command, stdout=PIPE, stderr=PIPE, universal_newlines=True, shell=True)
-            print(result)
+            combined_output = (result.stdout or "") + (result.stderr or "")
+            if "WinError 10054" in combined_output:
+                print("Monitor interrupted. Was another experiment submitted?")
+            else:
+                print(result)
         except Exception as e:
-            print(e)
+            if "WinError 10054" in str(e):
+                print("Monitor interrupted. Was another experiment submitted?")
+            else:
+                print(e)
