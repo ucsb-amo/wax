@@ -355,6 +355,10 @@ class atomdata_base():
         '''
 
         self._lite = lite
+        # When loading lite data, ignore any passed roi_id since lite files
+        # are already pre-cropped to a specific ROI at creation time.
+        if lite:
+            roi_id = None
 
         # Lightweight profiling aid for load/analysis latency investigations.
         self._timing_enabled = True
@@ -597,7 +601,12 @@ class atomdata_base():
         """Crops ODs, computes sum_ods, gaussian fits to sum_ods, and populates
         fit results.
         """
-        self.od = self.roi.crop(self.od_raw)
+        # Lite files store images already cropped to an ROI during creation.
+        # Avoid applying ROI cropping a second time on load.
+        if self._lite:
+            self.od = self.od_raw
+        else:
+            self.od = self.roi.crop(self.od_raw)
         self.sum_od_x = np.sum(self.od,self.od.ndim-2)
         self.sum_od_y = np.sum(self.od,self.od.ndim-1)
 

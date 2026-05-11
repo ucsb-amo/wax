@@ -109,5 +109,11 @@ class Expt(Dealer, Scanner, Scribe):
         if hasattr(self,'monitor'):
             self.monitor.update_device_states()
             self.monitor.signal_end()
+
+        rid = self.run_info.run_id
+        print(f'run id {rid} complete')
+
+        from waxx.util.notifications import send_run_done_email
+        send_run_done_email(self.run_info.run_id, expt_filepath)
                 
         # server_talk.play_random_sound()

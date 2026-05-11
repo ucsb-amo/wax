@@ -297,9 +297,11 @@ def rabi_oscillation(ad:atomdata,
 
         if fit_params_on_plot:
             try:
-                fit_params_str = fr"$\Omega$ = $2\pi \\times {popt[0]/(2*np.pi)/1.e3:1.2f}$ kHz"\
-                    +rf"\n$A = {popt[3]:1.2f}$, $B = {popt[2]:1.2f}$"\
-                    +fr"\n$\\tau = {popt[4]*1.e6:1.2f}$ us"
+                fit_params_str = (
+                    f"Omega = 2pi x {popt[0]/(2*np.pi)/1.e3:1.2f} kHz\n"
+                    f"A = {popt[3]:1.2f}, B = {popt[2]:1.2f}\n"
+                    f"tau = {popt[4]*1.e6:1.2f} us"
+                )
                 if fit_params_on_left:
                     x_pos = 0.05
                     ha = 'left'

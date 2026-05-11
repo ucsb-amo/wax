@@ -76,7 +76,7 @@ def send_run_done_email(
     run_id,
     experiment_filename,
     timestamp=None,
-    recipient='jpagett@ucsb.edu',
+    recipient='herberthearsall@gmail.com',
     credentials_filepath=None,
 ):
     """Send a run-completion notification email.
@@ -104,7 +104,7 @@ def send_run_done_email(
         Timestamp string for the subject.  Defaults to the current local time
         formatted as ``YYYY-MM-DD HH:MM:SS``.
     recipient : str, optional
-        Destination address.  Defaults to ``jpagett@ucsb.edu``.
+        Destination address.  Defaults to ``herberthearsall@gmail.com``.
     credentials_filepath : str, optional
         Override the default credential file path.
     """
