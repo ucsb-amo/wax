@@ -115,5 +115,3 @@ class Expt(Dealer, Scanner, Scribe):
 
         from waxx.util.notifications import send_run_done_email
         send_run_done_email(self.run_info.run_id, expt_filepath)
-                
-        # server_talk.play_random_sound()
