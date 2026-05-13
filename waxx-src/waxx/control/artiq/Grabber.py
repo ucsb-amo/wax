@@ -2,7 +2,6 @@ from artiq.coredevice.grabber import Grabber as grabber_artiq, OutOfSyncExceptio
 from artiq.coredevice.rtio import rtio_output, rtio_input_timestamped_data
 from artiq.language import delay, kernel
 import numpy as np
-from kexp.util.artiq.async_print import aprint
 
 T_GRABBER_SETUP = 10.e-6
 
