@@ -13,21 +13,15 @@ class DataSaver():
                  data_dir="",
                  expt_repo_src_directory="",
                  expt_params_relative_filepath="",
-                 cooling_relative_filepath="",
-                 imaging_relative_filepath="",
-                 control_relative_filepath="",
+                 base_class_relative_dirpath="",
                  server_talk=None):
         
         self._data_dir = data_dir
         self._expt_repo_path = expt_repo_src_directory
         self._expt_params_path = os.path.join(expt_repo_src_directory,
                                               expt_params_relative_filepath)
-        self._cooling_path = os.path.join(expt_repo_src_directory,
-                                          cooling_relative_filepath)
-        self._imaging_path = os.path.join(expt_repo_src_directory,
-                                          imaging_relative_filepath)
-        self._control_path = os.path.join(expt_repo_src_directory,
-                                          control_relative_filepath)
+        self._base_class_dir = os.path.join(expt_repo_src_directory,
+                                            base_class_relative_dirpath)
 
         if server_talk == None:
             server_talk = st(data_dir=data_dir)
@@ -196,46 +190,44 @@ class DataSaver():
         self._check_for_expt_files()
 
         f = h5File
-        if expt_filepath:
-                with open(expt_filepath) as expt_file:
-                    expt_text = expt_file.read()
-                f.attrs["expt_file"] = expt_text
-        else:
-            f.attrs["expt_file"] = ""
-
-        if self._expt_params_path:
-            with open(self._expt_params_path) as params_file:
-                params_file = params_file.read()
-            f.attrs["params_file"] = params_file
+        f.attrs["expt_file"] = self._read_text_file_safe(expt_filepath, "experiment") if expt_filepath else ""
+        f.attrs["params_file"] = self._read_text_file_safe(self._expt_params_path, "params")
         
-        if self._cooling_path:
-            with open(self._cooling_path) as cooling_file:
-                cooling_file = cooling_file.read()
-            f.attrs["cooling_file"] = cooling_file
+        # Save all .py files from the base class directory
+        if self._base_class_dir and os.path.isdir(self._base_class_dir):
+            try:
+                filenames = sorted(os.listdir(self._base_class_dir))
+            except Exception as e:
+                print(f"Failed to list base class directory {self._base_class_dir}: {e}")
+                filenames = []
 
-        if self._imaging_path:
-            with open(self._imaging_path) as imaging_file:
-                imaging_file = imaging_file.read()
-            f.attrs["imaging_file"] = imaging_file
-
-        if self._control_path:
-            with open(self._control_path) as file:
-                file = file.read()
-            f.attrs["control_file"] = file
+            for filename in filenames:
+                if filename.endswith('.py') and not filename.startswith('__'):
+                    filepath = os.path.join(self._base_class_dir, filename)
+                    if os.path.isfile(filepath):
+                        key = f"base_class_{filename[:-3]}"  # remove .py extension
+                        f.attrs[key] = self._read_text_file_safe(filepath, filename)
 
     def _check_for_expt_files(self):
         if not os.path.isfile(self._expt_params_path):
             print(f'expt_params file not found at {self._expt_params_path}, saving contents skipped')
             self._expt_params_path = ""
-        if not os.path.isfile(self._cooling_path):
-            print(f'cooling file not found at {self._cooling_path}, saving contents skipped')
-            self._cooling_path = ""
-        if not os.path.isfile(self._imaging_path):
-            print(f'imaging file not found at {self._imaging_path}, saving contents skipped')
-            self._imaging_path = ""
-        if not os.path.isfile(self._control_path):
-            print(f'control file not found at {self._control_path}, saving contents skipped')
-            self._control_path = ""
+        if not os.path.isdir(self._base_class_dir):
+            print(f'base class directory not found at {self._base_class_dir}, saving base class files skipped')
+            self._base_class_dir = ""
+
+    def _read_text_file_safe(self, filepath, label="file"):
+        if not filepath:
+            return ""
+        if not os.path.isfile(filepath):
+            print(f'{label} file not found at {filepath}, saving contents skipped')
+            return ""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception as e:
+            print(f'Unable to read {label} file at {filepath}: {e}')
+            return ""
 
     def _class_attr_to_dataset(self,dset,obj):
         try:

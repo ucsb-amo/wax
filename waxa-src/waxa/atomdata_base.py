@@ -306,12 +306,14 @@ class expt_code():
                  params,
                  cooling,
                  imaging,
-                 control):
+                 control,
+                 base_files=None):
         self.experiment = experiment
         self.params = params
         self.cooling = cooling
         self.imaging = imaging
         self.control = control
+        self.base_files = base_files if base_files is not None else {}
 
 class atomdata_base():
     '''
@@ -1672,22 +1674,49 @@ class atomdata_base():
 
             t_stage = time.perf_counter()
             try:
-                experiment_text = f.attrs['expt_file']
-                params_text = f.attrs['params_file']
-                cooling_text = f.attrs['cooling_file']
-                imaging_text = f.attrs['imaging_file']
-                control_text = f.attrs['control_file']
-            except:
+                attrs = f.attrs
+
+                def _attr_text(key, default=""):
+                    val = attrs.get(key, default)
+                    if val is None:
+                        return default
+                    if isinstance(val, bytes):
+                        return val.decode("utf-8", errors="replace")
+                    if isinstance(val, np.ndarray):
+                        if val.shape == ():
+                            scalar = val.item()
+                            if isinstance(scalar, bytes):
+                                return scalar.decode("utf-8", errors="replace")
+                            return str(scalar)
+                        return str(val)
+                    return str(val)
+
+                experiment_text = _attr_text('expt_file', "")
+                params_text = _attr_text('params_file', "")
+
+                # Legacy keys are preserved for older files; new files store
+                # all base-class sources under base_class_<module_name>.
+                base_files = {}
+                for attr_key in attrs.keys():
+                    if attr_key.startswith('base_class_'):
+                        base_files[attr_key] = _attr_text(attr_key, "")
+
+                cooling_text = _attr_text('cooling_file', _attr_text('base_class_cooling', ""))
+                imaging_text = _attr_text('imaging_file', _attr_text('base_class_image', ""))
+                control_text = _attr_text('control_file', _attr_text('base_class_control', ""))
+            except Exception:
                 experiment_text = ""
                 params_text = ""
                 cooling_text = ""
                 imaging_text = ""
                 control_text = ""
+                base_files = {}
             self.experiment_code = expt_code(experiment_text,
                                                 params_text,
                                                 cooling_text,
                                                 imaging_text,
-                                                control_text)
+                                                control_text,
+                                                base_files=base_files)
             timing['h5_read_experiment_text_s'] = time.perf_counter() - t_stage
 
             t_stage = time.perf_counter()
