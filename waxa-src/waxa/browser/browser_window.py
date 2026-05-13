@@ -340,8 +340,9 @@ class ParamSearchDialog(QDialog):
         self.detail_value.setPlainText(message)
 
     def set_records(self, records_by_mode: dict):
+        selected_name = self._selected_record_name()
         self._records_by_mode = {mode: list(records_by_mode.get(mode, [])) for mode in PARAM_SEARCH_MODES}
-        self._apply_filter()
+        self._apply_filter(preferred_name=selected_name)
 
     def focus_search(self):
         self.search_input.setFocus()
@@ -361,7 +362,13 @@ class ParamSearchDialog(QDialog):
         self._active_mode = mode if mode in PARAM_SEARCH_MODES else "params"
         self._apply_filter()
 
-    def _apply_filter(self):
+    def _selected_record_name(self):
+        row = self.results_table.currentRow()
+        if row < 0 or row >= len(self._filtered_records):
+            return None
+        return self._filtered_records[row].get("name")
+
+    def _apply_filter(self, preferred_name: str | None = None):
         terms = parse_name_search_terms(self.search_input.text())
         source_records = self._records_by_mode.get(self._active_mode, [])
         self._filtered_records = [
@@ -385,7 +392,13 @@ class ParamSearchDialog(QDialog):
         self.status_label.setText(f"{count} matching entries" + ("" if count == total else f" of {total}"))
 
         if self._filtered_records:
-            self.results_table.selectRow(0)
+            preferred_row = 0
+            if preferred_name:
+                for row, record in enumerate(self._filtered_records):
+                    if record.get("name") == preferred_name:
+                        preferred_row = row
+                        break
+            self.results_table.selectRow(preferred_row)
             self._update_detail_from_selection()
         else:
             self.detail_value.setPlainText("No matching values.")
@@ -496,8 +509,8 @@ class RunDetailPane(QWidget):
         xvars_layout.setContentsMargins(10, 10, 10, 10)
         self.xvar_table = QTableWidget(self)
         self.xvar_table.setObjectName("xvarTable")
-        self.xvar_table.setColumnCount(5)
-        self.xvar_table.setHorizontalHeaderLabels(["xvarname", "min", "max", "unit", "N"])
+        self.xvar_table.setColumnCount(6)
+        self.xvar_table.setHorizontalHeaderLabels(["xvarname", "min", "max", "unit", "preview", "N"])
         self.xvar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.xvar_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.xvar_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -510,14 +523,15 @@ class RunDetailPane(QWidget):
         xvar_header.setMinimumSectionSize(30)
         xvar_header.setDefaultSectionSize(22)
         xvar_header.setMaximumHeight(22)
-        for col in range(5):
+        for col in range(6):
             xvar_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-        # Col 0 (xvarname) stretches; fixed widths for numeric/unit cols
+        # Col 0 (xvarname) and preview stretch; fixed widths for numeric/unit cols.
         xvar_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        xvar_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         xvar_header.resizeSection(1, 72)
         xvar_header.resizeSection(2, 72)
         xvar_header.resizeSection(3, 52)
-        xvar_header.resizeSection(4, 38)
+        xvar_header.resizeSection(5, 52)
         self.xvar_table.setMinimumHeight(80)
         xvars_layout.addWidget(self.xvar_table)
 
@@ -690,6 +704,18 @@ class RunDetailPane(QWidget):
         self.data_list.clear()
         self.show_message("Select a run to load details.")
 
+    @staticmethod
+    def _format_xvar_n_value(n_value, n_repeats: int, row_idx: int):
+        try:
+            n_int = int(n_value)
+        except (TypeError, ValueError):
+            return str(n_value)
+
+        repeats = max(1, int(n_repeats or 1))
+        if row_idx == 0 and repeats > 1 and n_int > 0 and n_int % repeats == 0:
+            return f"{repeats} x {n_int // repeats}"
+        return str(n_int)
+
     def set_run(self, run: RunSummary, datetime_text: str, xvardims_text: str):
         self.run_id_value.setText(str(run.run_id))
         self.datetime_value.setText(datetime_text or "-")
@@ -710,7 +736,8 @@ class RunDetailPane(QWidget):
                 item["min"],
                 item["max"],
                 item.get("unit", ""),
-                str(item["n"]),
+                item.get("preview", "-"),
+                self._format_xvar_n_value(item["n"], run.n_repeats, row_idx),
             ]
             for col_idx, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
@@ -729,16 +756,18 @@ class DataBrowserWindow(QMainWindow):
     COL_DATETIME = 1
     COL_EXPERIMENT = 2
     COL_XVARDIMS = 3
-    COL_XVARS = 4
-    COL_DATA_KEYS = 5
-    COL_SCOPE = 6
-    COL_LITE = 7
-    COL_TAGS = 8
+    COL_N_REPEATS = 4
+    COL_XVARS = 5
+    COL_DATA_KEYS = 6
+    COL_SCOPE = 7
+    COL_LITE = 8
+    COL_TAGS = 9
     COLUMN_LABELS = {
         COL_RUN_ID: "run_id",
         COL_DATETIME: "datetime",
         COL_EXPERIMENT: "experiment",
         COL_XVARDIMS: "xvardims",
+        COL_N_REPEATS: "N_r",
         COL_XVARS: "xvarnames",
         COL_DATA_KEYS: "data containers",
         COL_SCOPE: "scope",
@@ -914,13 +943,14 @@ class DataBrowserWindow(QMainWindow):
         filter_row.addWidget(self.options_btn)
 
         self.table = QTableWidget(self)
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels(
             [
                 "run_id",
                 "datetime",
                 "experiment",
                 "xvardims",
+                "N_r",
                 "xvarnames",
                 "data containers",
                 "scope",
@@ -952,6 +982,7 @@ class DataBrowserWindow(QMainWindow):
         header.resizeSection(self.COL_DATETIME, 185)
         header.resizeSection(self.COL_EXPERIMENT, 190)
         header.resizeSection(self.COL_XVARDIMS, 90)
+        header.resizeSection(self.COL_N_REPEATS, 82)
         header.resizeSection(self.COL_XVARS, 230)
         header.resizeSection(self.COL_DATA_KEYS, 250)
         header.resizeSection(self.COL_SCOPE, 70)
@@ -1047,6 +1078,9 @@ class DataBrowserWindow(QMainWindow):
             visible = {int(item) for item in raw}
         except Exception:
             visible = set()
+
+        if visible:
+            visible.add(self.COL_N_REPEATS)
 
         if not visible:
             # Default: hide bulky/secondary columns; keep tags visible.
@@ -1424,6 +1458,7 @@ class DataBrowserWindow(QMainWindow):
         expt_item = QTableWidgetItem(run.experiment_name or "-")
         expt_item.setToolTip(run.experiment_filepath or run.experiment_name or "")
         xvardims_item = QTableWidgetItem(self._format_xvardims(run.xvardims))
+        n_repeats_item = QTableWidgetItem(str(int(run.n_repeats)))
         xvars_item = QTableWidgetItem(self._format_name_list_for_table(run.xvarnames))
         xvars_item.setToolTip("\n".join(run.xvarnames))
 
@@ -1439,6 +1474,7 @@ class DataBrowserWindow(QMainWindow):
         self.table.setItem(row, self.COL_DATETIME, datetime_item)
         self.table.setItem(row, self.COL_EXPERIMENT, expt_item)
         self.table.setItem(row, self.COL_XVARDIMS, xvardims_item)
+        self.table.setItem(row, self.COL_N_REPEATS, n_repeats_item)
         self.table.setItem(row, self.COL_XVARS, xvars_item)
         self.table.setItem(row, self.COL_DATA_KEYS, data_item)
         self.table.setItem(row, self.COL_SCOPE, scope_item)
@@ -1756,6 +1792,11 @@ class DataBrowserWindow(QMainWindow):
         if xvardims_item is not None:
             xvardims_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             xvardims_item.setForeground(QColor("#607380"))
+
+        n_repeats_item = self.table.item(row, self.COL_N_REPEATS)
+        if n_repeats_item is not None:
+            n_repeats_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            n_repeats_item.setForeground(QColor("#607380"))
 
         experiment_item = self.table.item(row, self.COL_EXPERIMENT)
         if experiment_item is not None:
