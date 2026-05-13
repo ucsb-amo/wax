@@ -151,6 +151,24 @@ def _min_max_summary(name: str, values):
     return f"min: {min(as_text)} | max: {max(as_text)}"
 
 
+def _read_n_repeats_value(h5file):
+    if "params" not in h5file or "N_repeats" not in h5file["params"]:
+        return 1
+
+    raw = np.asarray(h5file["params"]["N_repeats"][()]).reshape(-1)
+    if raw.size == 0:
+        return 1
+
+    finite = raw[np.isfinite(raw)]
+    if finite.size == 0:
+        return 1
+
+    try:
+        return max(1, int(finite[0]))
+    except Exception:
+        return 1
+
+
 def _build_value_record(mode: str, name: str, value, dataset=None):
     array_value = None
     shape = "()"
@@ -294,6 +312,7 @@ class RunScanner:
                 xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
                 experiment_name, experiment_filepath = self._read_experiment_info(f)
                 xvardims = self._read_xvardims(f, xvarnames)
+                n_repeats = _read_n_repeats_value(f)
 
                 if "data" in f:
                     data_keys = list(f["data"].keys())
@@ -330,6 +349,7 @@ class RunScanner:
                     xvardims=xvardims,
                     data_container_keys=data_container_keys,
                     has_scope_data=has_scope_data,
+                    n_repeats=n_repeats,
                     has_lite=has_lite,
                     tags=tags,
                     comment=comment,
@@ -457,7 +477,7 @@ class XvarDetailLoader(QThread):
         array = np.asarray(values)
         if array.size == 0:
             unit, _, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=array)
-            return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA"}
+            return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA", "preview": "-"}
 
         flat = array.reshape(-1)
         n = int(flat.size)
@@ -493,26 +513,47 @@ class XvarDetailLoader(QThread):
                 return f"{scaled:.6g}"
             return f"{scaled:.{decimals}f}"
 
+        def unique_preserve_order(items):
+            unique_items = []
+            for item in items:
+                if any(item == existing for existing in unique_items):
+                    continue
+                unique_items.append(item)
+            return unique_items
+
+        def format_preview_text(items, formatter=str):
+            if not items:
+                return "-"
+
+            formatted = [formatter(item) for item in items]
+            if len(formatted) <= 6:
+                return ", ".join(formatted)
+            return ", ".join([*formatted[:3], "...", *formatted[-3:]])
+
         if np.issubdtype(flat.dtype, np.number):
             min_val = float(np.nanmin(flat))
             max_val = float(np.nanmax(flat))
             scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
             decimals = decimals_from_spacing(scaled_vals)
+            preview_values = unique_preserve_order(np.asarray(flat).tolist())
             return {
                 "name": name,
                 "unit": unit,
                 "n": n,
                 "min": format_numeric_value(min_val, decimals),
                 "max": format_numeric_value(max_val, decimals),
+                "preview": format_preview_text(preview_values, lambda value: format_numeric_value(value, decimals)),
             }
 
         as_text = [_decode_str(item) for item in flat]
+        preview_values = unique_preserve_order(as_text)
         return {
             "name": name,
             "unit": unit,
             "n": n,
             "min": min(as_text),
             "max": max(as_text),
+            "preview": format_preview_text(preview_values),
         }
 
 

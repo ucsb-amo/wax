@@ -13,6 +13,7 @@ class RunSummary:
     xvardims: tuple[int, ...]
     data_container_keys: list[str]
     has_scope_data: bool
+    n_repeats: int = 1
     has_lite: bool = False
     xvar_details: list[dict] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
@@ -30,6 +31,7 @@ class RunSummary:
             "xvardims": list(self.xvardims),
             "data_container_keys": list(self.data_container_keys),
             "has_scope_data": self.has_scope_data,
+            "n_repeats": int(self.n_repeats),
             "has_lite": self.has_lite,
             "tags": list(self.tags),
             "comment": self.comment,
@@ -48,6 +50,7 @@ class RunSummary:
             xvardims=tuple(int(value) for value in payload.get("xvardims", [])),
             data_container_keys=list(payload.get("data_container_keys", [])),
             has_scope_data=bool(payload.get("has_scope_data", False)),
+            n_repeats=int(payload.get("n_repeats", 1) or 1),
             has_lite=bool(payload.get("has_lite", False)),
             tags=list(payload.get("tags", [])),
             comment=payload.get("comment", ""),
