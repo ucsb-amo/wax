@@ -62,7 +62,10 @@ class RamanBeamPair():
 
         self._dummy = np.zeros(3).astype(float)
 
-        self._sysclk_per_mu = self.dds0.dds_device.sysclk_per_mu
+        try:
+            self._sysclk_per_mu = self.dds0.dds_device.sysclk_per_mu
+        except Exception as e:
+            print(e)
         self._f_to_ftw = self.dds0.dds_device.frequency_to_ftw
         self._turns_to_pow = self.dds0.dds_device.turns_to_pow
         self._amp_to_asf = self.dds0.dds_device.amplitude_to_asf
