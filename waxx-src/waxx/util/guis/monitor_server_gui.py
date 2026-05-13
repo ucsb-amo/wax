@@ -1,7 +1,7 @@
 import socket
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 import time
 
 from waxx.util.device_state.monitor_manager import MonitorManager
@@ -43,6 +43,11 @@ class MonitorServerGUI(QWidget):
         self.server_port = monitor_server_port
 
         self.setWindowTitle("Monitor Server")
+        eye_icon = self._create_eye_icon()
+        self.setWindowIcon(eye_icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(eye_icon)
         self.setGeometry(100, 100, 250, 80)
 
         self.monitor_manager = MonitorManager(monitor_expt_path)
@@ -59,6 +64,20 @@ class MonitorServerGUI(QWidget):
         self.monitor_check_timer.setInterval(125)
         self.monitor_check_timer.timeout.connect(self.check_monitor_status)
         self.monitor_check_timer.start()
+
+    @staticmethod
+    def _create_eye_icon(size=64):
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        font = QFont("Segoe UI Emoji")
+        font.setPixelSize(int(size * 0.8))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "👁")
+        painter.end()
+
+        return QIcon(pixmap)
 
     def setup_ui(self):
         layout = QVBoxLayout()

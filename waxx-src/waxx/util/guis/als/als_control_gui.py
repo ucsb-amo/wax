@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QCheckBox, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtCore import QSize
 
 from waxx.util.guis.als.als_gui_client import ALSGuiClient
@@ -26,6 +26,26 @@ from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserS
 
 LOGGER = logging.getLogger("als_laser_gui")
 LOGGER.setLevel(logging.INFO)
+
+
+def create_emoji_icon(emoji: str) -> QIcon:
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128):
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        font = QFont()
+        font.setPixelSize(max(12, int(size * 0.8)))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+        painter.end()
+
+        icon.addPixmap(pixmap)
+
+    return icon
 
 class LogEmitter(QObject):
     message_logged = pyqtSignal(str)
@@ -526,6 +546,11 @@ class ALSControlGUI(QMainWindow):
         self.ip = ip
         self.port = port
         self.serial_port = serial_port
+        self._window_icon = create_emoji_icon("🔫")
+        self.setWindowIcon(self._window_icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(self._window_icon)
         
         # Current status
         self.status = LaserStatus()

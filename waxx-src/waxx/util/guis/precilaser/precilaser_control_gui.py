@@ -8,7 +8,7 @@ import sys
 from typing import Any
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +29,26 @@ from waxx.util.guis.precilaser.precilaser_gui_client import PrecilaserGuiClient
 
 LOGGER = logging.getLogger("precilaser_gui")
 LOGGER.setLevel(logging.INFO)
+
+
+def create_emoji_icon(emoji: str) -> QIcon:
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128):
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        font = QFont()
+        font.setPixelSize(max(12, int(size * 0.8)))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+        painter.end()
+
+        icon.addPixmap(pixmap)
+
+    return icon
 
 
 class StatusDot(QPushButton):
@@ -76,6 +96,11 @@ class PrecilaserControlGUI(QMainWindow):
         self.ip = ip
         self.port = int(port)
         self.client = PrecilaserGuiClient(host=ip, port=port)
+        self._window_icon = create_emoji_icon("💀")
+        self.setWindowIcon(self._window_icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(self._window_icon)
         self._next_log_index = 0
         self._last_remote_error: str | None = None
         self._laser_enabled = False

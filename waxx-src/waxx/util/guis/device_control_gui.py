@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget
 )
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon, QPainter, QPixmap
 
 from PyQt6.QtCore import Qt
 
@@ -631,6 +631,7 @@ class DeviceStateGUI(QMainWindow):
         """Setup the main UI"""
         self.setWindowTitle("Device State Control")
         self.setGeometry(100, 100, 1200, 800)
+        self._set_window_icon()
         
         # Create central widget and main layout
         central_widget = QWidget()
@@ -777,6 +778,29 @@ class DeviceStateGUI(QMainWindow):
         # Setup TTL tab
         self.ttl_layout = QGridLayout()
         self.ttl_tab.setLayout(self.ttl_layout)
+
+    def _set_window_icon(self):
+        """Set a game-controller emoji icon for the window and taskbar."""
+        icon = QIcon()
+
+        for size in (16, 24, 32, 48, 64, 128):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            font = QFont("Segoe UI Emoji")
+            font.setPixelSize(int(size * 0.8))
+            painter.setFont(font)
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "🎮")
+            painter.end()
+
+            icon.addPixmap(pixmap)
+
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
 
     def setup_timer(self):
         """Setup timer for periodic config file checking"""
