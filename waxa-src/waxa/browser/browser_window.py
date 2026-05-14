@@ -219,6 +219,7 @@ class ParamSearchDialog(QDialog):
         self._active_mode = "params"
         self._mode_buttons = {}
         self._selection_locked = False
+        self._preferred_name_by_mode = {mode: None for mode in PARAM_SEARCH_MODES}
 
         self.setWindowTitle("Param Search")
         self.resize(860, 560)
@@ -329,6 +330,7 @@ class ParamSearchDialog(QDialog):
         self._apply_badge_style()
 
     def set_loading_state(self, run: RunSummary):
+        self._remember_selection_for_active_mode()
         self.set_run(run)
         self.status_label.setText("Loading values…")
         self.results_table.setRowCount(0)
@@ -340,9 +342,9 @@ class ParamSearchDialog(QDialog):
         self.detail_value.setPlainText(message)
 
     def set_records(self, records_by_mode: dict):
-        selected_name = self._selected_record_name()
         self._records_by_mode = {mode: list(records_by_mode.get(mode, [])) for mode in PARAM_SEARCH_MODES}
-        self._apply_filter(preferred_name=selected_name)
+        preferred_name = self._preferred_name_by_mode.get(self._active_mode)
+        self._apply_filter(preferred_name=preferred_name)
 
     def focus_search(self):
         self.search_input.setFocus()
@@ -359,14 +361,21 @@ class ParamSearchDialog(QDialog):
             self._set_mode(mode)
 
     def _set_mode(self, mode: str):
+        self._remember_selection_for_active_mode()
         self._active_mode = mode if mode in PARAM_SEARCH_MODES else "params"
-        self._apply_filter()
+        preferred_name = self._preferred_name_by_mode.get(self._active_mode)
+        self._apply_filter(preferred_name=preferred_name)
 
     def _selected_record_name(self):
         row = self.results_table.currentRow()
         if row < 0 or row >= len(self._filtered_records):
             return None
         return self._filtered_records[row].get("name")
+
+    def _remember_selection_for_active_mode(self):
+        selected_name = self._selected_record_name()
+        if selected_name:
+            self._preferred_name_by_mode[self._active_mode] = selected_name
 
     def _apply_filter(self, preferred_name: str | None = None):
         terms = parse_name_search_terms(self.search_input.text())
@@ -399,6 +408,9 @@ class ParamSearchDialog(QDialog):
                         preferred_row = row
                         break
             self.results_table.selectRow(preferred_row)
+            selected_name = self._filtered_records[preferred_row].get("name")
+            if selected_name:
+                self._preferred_name_by_mode[self._active_mode] = selected_name
             self._update_detail_from_selection()
         else:
             self.detail_value.setPlainText("No matching values.")
@@ -410,6 +422,9 @@ class ParamSearchDialog(QDialog):
             return
 
         record = self._filtered_records[row]
+        selected_name = record.get("name")
+        if selected_name:
+            self._preferred_name_by_mode[self._active_mode] = selected_name
         detail_lines = [
             f"name: {record.get('name', '-')}",
             f"dtype: {record.get('dtype', '-')}",

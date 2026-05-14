@@ -124,19 +124,65 @@ def _format_numeric_value(value: float, multiplier: float, decimals: int):
     return f"{scaled:.{decimals}f}"
 
 
-def _min_max_summary(name: str, values):
+def _axis_all_same(value_array: np.ndarray, axis: int):
+    if value_array.shape[axis] <= 1:
+        return True
+
+    reference = np.take(value_array, 0, axis=axis)
+    reference = np.expand_dims(reference, axis=axis)
+    try:
+        equal_mask = value_array == reference
+    except Exception:
+        return False
+
+    if np.issubdtype(value_array.dtype, np.floating):
+        equal_mask = equal_mask | (np.isnan(value_array) & np.isnan(reference))
+    elif np.issubdtype(value_array.dtype, np.complexfloating):
+        equal_mask = equal_mask | (
+            np.isnan(value_array.real)
+            & np.isnan(reference.real)
+            & np.isnan(value_array.imag)
+            & np.isnan(reference.imag)
+        )
+
+    try:
+        return bool(np.all(equal_mask))
+    except Exception:
+        return False
+
+
+def _all_same_summary(values):
+    array = np.asarray(values)
+
+    if array.size == 0:
+        return "all_same: -"
+
+    if array.ndim == 0:
+        return "all_same: True"
+
+    same_flags = tuple(_axis_all_same(array, axis) for axis in range(array.ndim))
+    if all(same_flags):
+        return "all_same: True"
+    return f"all_same: {same_flags}"
+
+
+def _value_summary(name: str, values):
     array = np.asarray(values)
     if array.size == 0:
         return None
-    # Only show min/max for actual arrays, not scalar values.
+
+    all_same_text = _all_same_summary(array)
+
     if array.ndim == 0:
-        return None
+        scalar = array.item()
+        scalar_text = _decode_str(scalar) if isinstance(scalar, (bytes, np.bytes_)) else str(scalar)
+        return f"min: {scalar_text} | max: {scalar_text} | {all_same_text}"
 
     flat = array.reshape(-1)
     if np.issubdtype(flat.dtype, np.number):
         finite = flat[np.isfinite(flat)]
         if finite.size == 0:
-            return "min: NA | max: NA"
+            return f"min: NA | max: NA | {all_same_text}"
 
         unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=finite)
         unit = unit or ""
@@ -145,10 +191,10 @@ def _min_max_summary(name: str, values):
         min_text = _format_numeric_value(np.nanmin(finite), multiplier, decimals)
         max_text = _format_numeric_value(np.nanmax(finite), multiplier, decimals)
         unit_suffix = f" {unit}" if unit else ""
-        return f"min: {min_text}{unit_suffix} | max: {max_text}{unit_suffix}"
+        return f"min: {min_text}{unit_suffix} | max: {max_text}{unit_suffix} | {all_same_text}"
 
     as_text = [_decode_str(item) for item in flat]
-    return f"min: {min(as_text)} | max: {max(as_text)}"
+    return f"min: {min(as_text)} | max: {max(as_text)} | {all_same_text}"
 
 
 def _read_n_repeats_value(h5file):
@@ -188,14 +234,14 @@ def _build_value_record(mode: str, name: str, value, dataset=None):
     preview = _stringify_value(preview_source, max_chars=160)
     detail = _stringify_value(preview_source, max_chars=8000)
 
-    if mode in {"params", "camera_params"}:
+    if dataset is not None or mode in {"params", "camera_params"}:
         values_for_summary = value
         if values_for_summary is None and dataset is not None:
             try:
                 values_for_summary = dataset[()]
             except Exception:
                 values_for_summary = None
-        stats_text = _min_max_summary(str(name), values_for_summary) if values_for_summary is not None else None
+        stats_text = _value_summary(str(name), values_for_summary) if values_for_summary is not None else None
         if stats_text:
             preview = _stringify_value(f"{stats_text} | {preview}", max_chars=160)
             detail = f"{stats_text}\n\n{detail}"
