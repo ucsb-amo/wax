@@ -15,6 +15,7 @@ waxx/config/dac_id.py
 waxx/config/data_vault.py
 waxx/config/dds_id.py
 waxx/config/expt_params.py
+waxx/config/ip.py
 waxx/config/sampler_id.py
 waxx/config/shuttler_id.py
 waxx/config/siglent_id.py
@@ -60,6 +61,7 @@ waxx/control/tweezer/spectrum_DDS_tweezer.py
 waxx/control/tweezer/tweezer_xmesh.py
 waxx/util/__init__.py
 waxx/util/import_module_from_file.py
+waxx/util/notifications.py
 waxx/util/artiq/__init__.py
 waxx/util/artiq/async_print.py
 waxx/util/comms_server/__init__.py
