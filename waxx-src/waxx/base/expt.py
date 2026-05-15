@@ -95,7 +95,8 @@ class Expt(Dealer, Scanner, Scribe):
     def compute_new_derived(self):
         pass
     
-    def end_wax(self, expt_filepath):
+    def end_wax(self, expt_filepath,
+                notify=False):
 
         self.scope_data.close()
 
@@ -113,5 +114,6 @@ class Expt(Dealer, Scanner, Scribe):
         rid = self.run_info.run_id
         print(f'run id {rid} complete')
 
-        from waxx.util.notifications import send_run_done_email
-        send_run_done_email(self.run_info.run_id, expt_filepath)
+        if notify:
+            from waxx.util.notifications import send_run_done_email
+            send_run_done_email(self.run_info.run_id, expt_filepath)
