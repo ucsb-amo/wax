@@ -5,12 +5,14 @@ import numpy as np
 from numpy import int32, int64
 
 from artiq.coredevice import ad9910, ad53xx, ttl
-from artiq.coredevice.urukul import CPLD
+import artiq.coredevice.urukul as urukul
+from artiq.coredevice import spi2 as spi
 
 from waxx.util.artiq.async_print import aprint
 
 T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
-T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU = np.int64(108)
+# T_AD9910_PIPELINE_LATENCY_MU = np.int64(107)
+T_AD9910_PIPELINE_LATENCY_MU = np.int64(108)
 
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
@@ -44,7 +46,7 @@ class DDS():
       self.dds_device = ad9910.AD9910
       self.name = f'urukul{self.urukul_idx}_ch{self.ch}'
       self.cpld_name = []
-      self.cpld_device = CPLD
+      self.cpld_device = urukul.CPLD
       self.bus_channel = []
       if device_db is not None:
          self.read_db(device_db)
@@ -66,15 +68,20 @@ class DDS():
       self._phase_at_t = 0 # phase at timestamp self._t_phase_mu
       self._t_phase_mu = np.int64(0) # timestamp at which the wave has phase self._phase_at_mu
 
-      self._t_io_update_delay_mu = np.int32(0)
+      self._t_io_update_delay_mu = np.int64(0)
       self._last_ftw = 0
       self._ftw = 0
       self._pow = 0
       self._asf = 0
       self._phase_t_last_set = 0
       self._t_last_set_mu = np.int64(0)
+      self._t_last_change_mu = np.int64(0)
 
       self.dds_device.sw: ttl.TTLOut
+
+   @kernel
+   def _store_io_update_delay(self):
+      self._t_io_update_delay_mu = T_AD9910_PIPELINE_LATENCY_MU - np.int64(4) + self.dds_device.sync_data.io_update_delay
 
    @portable
    def _stash_defaults(self):
@@ -85,10 +92,6 @@ class DDS():
    def _restore_defaults(self):
       self.frequency = self._frequency_default
       self.amplitude = self._amplitude_default
-
-   @portable
-   def set_io_update_delay_mu(self,t_io_mu):
-      self._t_io_update_delay_mu = np.int32(t_io_mu)
 
    @portable
    def update_dac_bool(self):
@@ -235,58 +238,41 @@ class DDS():
                                     amplitude=self.amplitude, 
                                     phase=self.phase_offset/TWOPI,
                                     ref_time_mu=self.t_phase_origin_mu)
-         if self.phase_mode == PHASE_MODE_TRACKING:
-            self._t_phase_mu = now_mu()
-            self._phase_at_t = self.get_phase(self._t_phase_mu)
+         # if self.phase_mode == PHASE_MODE_TRACKING:
+         #    self._t_phase_mu = now_mu()
+         #    self._phase_at_t = self.get_phase(self._t_phase_mu)
 
-         else:
-            self.update_phase_at_set(last_ftw=self._last_ftw)
+         # else:
+         self.update_phase_at_set()
 
    @kernel
    def reset_phase(self):
-      self._t_last_set_mu = now_mu()
+      self._t_last_change_mu = now_mu()
       self._phase_t_last_set = 0
       
    @kernel
-   def update_phase_at_set(self, last_ftw=-1000):
-      last_ftw = last_ftw if last_ftw != -1000 else self._last_ftw
+   def update_phase_at_set(self):
       t_now = now_mu()
-      t_set = self._t_last_set_mu
-      # self._phase_at_last_change += self.get_phase() + last_frequency * T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU * TWOPI_NS
-      # self._t_last_change_mu = t_now + T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
-      T = T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
-      t_last_change_mu = t_set + T
-      if t_now < t_last_change_mu:
-         self._phase_t_last_set += int32(last_ftw * (t_now - t_set))
-      else:
-         self._phase_t_last_set += int32(last_ftw * T + self._ftw * (t_now - t_last_change_mu))
-      self._t_last_set_mu = now_mu()
+      
+      T = self._t_io_update_delay_mu
+
+      self._phase_t_last_set += int32(self._last_ftw * T + self._ftw * (t_now - self._t_last_change_mu))
+
+      self._t_last_set_mu = t_now
+      self._t_last_change_mu = self._t_last_set_mu + T
 
    @kernel
-   def get_phase(self,
-               t_mu=np.int64(-1),
-               t_mu_origin=np.int64(-1),
-               ftw=-1000,
-               pow=-1000,
-               last_ftw=-1000):
-      ftw = ftw if ftw != -1000 else self._ftw
-      pow = pow if pow != -1000 else self._pow
-      last_ftw = last_ftw if last_ftw != -1000 else self._last_ftw
-      t_mu = t_mu if t_mu >= 0 else now_mu()
+   def get_phase(self):
+      t_mu = now_mu()
 
-      if self.phase_mode == PHASE_MODE_TRACKING:
-         t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
-         phase = pow + ftw * (t_mu - (t_mu_origin - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU))
-      else: # continuous, does not correctly account for manual phase stepping
-         t_set = self._t_last_set_mu
-         t_last_change_mu = t_set + T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU
+      # if self.phase_mode == PHASE_MODE_TRACKING:
+      #    t_mu_origin = t_mu_origin if t_mu_origin > 0 else self.t_phase_origin_mu
+      #    phase = pow + ftw * (t_mu - (t_mu_origin - T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU))
 
-         phase = int32(self._phase_t_last_set)
-         if t_mu < t_last_change_mu:
-            phase += int32(last_ftw * (t_mu - t_set))
-         else:
-            phase += int32(last_ftw * T_AD9910_CONTINUOUS_MODE_UPDATE_LAG_MU \
-                        + self._ftw * (t_mu - t_last_change_mu))
+      # else: # continuous, does not correctly account for manual phase stepping
+      phase = int32(self._phase_t_last_set)
+      phase += int32(self._last_ftw * T_AD9910_PIPELINE_LATENCY_MU \
+                  + self._ftw * (t_mu - self._t_last_change_mu))
       return phase & int32(0xffff)
    
    @kernel
@@ -355,6 +341,27 @@ class DDS():
       delay(1*ms)
       self.dds_device.init(blind=blind)
       delay(1*ms)
+
+   @kernel
+   def write_frequency_register_mu(self, ftw):
+      """
+      Directly writes the frequency tuning word (FTW) to the DDS register. This
+      is a low-level operation that bypasses the usual frequency setting
+      methods, and should be used with caution. 
+      
+      Does not pulse the IO update pin, so the new frequency will not take
+      effect until the next scheduled IO update. This method is intended for
+      advanced users who need precise control over the timing of frequency
+      changes and are familiar with the internal workings of the AD9910 DDS.
+      """
+      # ftw = self.ftw
+      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG, 8,
+      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
+      # self.dds_device.bus.write((ad9910._AD9910_REG_PROFILE0 + 7) << 24)
+      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG | spi.SPI_END, 32,
+      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
+      # self.dds_device.bus.write(ftw)
+      # don't use rn, corrupts SPI transaction
 
    def read_db(self,ddb):
       '''read out info from ddb. ftw_per_hz comes from artiq.frontend.moninj, line 206-207'''

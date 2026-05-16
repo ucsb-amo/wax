@@ -5,7 +5,7 @@ from artiq.coredevice.ad9910 import _AD9910_REG_PROFILE0
 from artiq.experiment import TArray, TFloat, TTuple, TFloat, parallel
 from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
-from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU
+from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU, T_AD9910_PIPELINE_LATENCY_MU
 from waxx.util.artiq.async_print import aprint
 from waxx.config.expt_params import ExptParams
 
@@ -247,35 +247,29 @@ class RamanBeamPair():
         dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
         dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
         
-        t0 = now_mu()
         at_mu(now_mu() & ~7)
-        t1 = now_mu()
-        
         with parallel:
             with sequential:
                 self.dds0.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
                                 dds0_asf_pow_data, ftw0)
                 delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
                 self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-                self.dds0.frequency = f0
-                self.dds0._ftw = ftw0
-                self.dds0.update_phase_at_set() # after at mu? no...
                 
             with sequential:
                 self.dds1.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
                                 dds1_asf_pow_data, ftw1)
                 delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
                 self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-                self.dds1.frequency = f1
-                self.dds1._ftw = ftw1
-                self.dds1.update_phase_at_set() # after at mu? no...
-
+                
         at_mu(now_mu() & ~7)
-        
-        # delay(10.e-6)
-        # t1 = now_mu()
 
-        # aprint(t1-t0)
+        self.dds0.frequency = f0
+        self.dds0._ftw = ftw0
+        self.dds0.update_phase_at_set()
+
+        self.dds1.frequency = f1
+        self.dds1._ftw = ftw1
+        self.dds1.update_phase_at_set()
 
     @kernel(flags={"fast-math"})
     def set(self,
