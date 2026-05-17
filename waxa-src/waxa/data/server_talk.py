@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 import glob
@@ -117,15 +118,19 @@ class server_talk():
     def check_for_mapped_data_dir(self):
         self.set_data_dir()
         if not os.path.exists(self.data_dir):
-            print(f"Data dir ({self.data_dir}) not found. Attempting to re-map network drives.")
-            cmd = self._bat_on_data_dir_disconnected         
-            result = subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-            if not os.path.exists(self.data_dir):
-                print(f"Data dir still not found. Are you connected to the physics network?") 
-                return False
+            if sys.platform == "win32":
+                print(f"Data dir ({self.data_dir}) not found. Attempting to re-map network drives.")
+                cmd = self._bat_on_data_dir_disconnected
+                subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                if not os.path.exists(self.data_dir):
+                    print(f"Data dir still not found. Are you connected to the physics network?")
+                    return False
+                else:
+                    print("Network drives successfully mapped.")
+                    return True
             else:
-                print("Network drives successfully mapped.")
-                return True
+                print(f"Data dir ({self.data_dir}) not found. Are you connected to the network?")
+                return False
         else:
             return True
 
