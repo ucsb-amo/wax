@@ -96,7 +96,7 @@ class Expt(Dealer, Scanner, Scribe):
         pass
     
     def end_wax(self, expt_filepath,
-                notify=False):
+                notify=True):
 
         self.scope_data.close()
 
