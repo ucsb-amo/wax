@@ -2962,6 +2962,9 @@ def launch(data_dir: str):
     app = QApplication.instance()
     app_created = app is None
     if app_created:
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("weldlab.kexp.gui.data_browser")
         app = QApplication(sys.argv)
 
     window = DataBrowserWindow(data_dir)
