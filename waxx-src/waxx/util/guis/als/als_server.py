@@ -12,10 +12,13 @@ from enum import Enum
 from typing import Optional
 
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
+from waxx.util.notifications import send_email
 
 
 LOGGER = logging.getLogger("als_laser_server")
 LOGGER.setLevel(logging.INFO)
+
+ALS_STARTUP_NOTIFICATION_RECIPIENT = "herberthearsall@gmail.com"
 
 
 class ConnectionState(Enum):
@@ -579,6 +582,8 @@ class ALSLaserServer:
                 self.current_step_number = None
                 self.current_step_started_epoch = None
             LOGGER.info("%s sequence completed", sequence_type.title())
+            if sequence_type == "STARTUP":
+                self._send_startup_done_notification()
         except InterruptedError:
             LOGGER.warning("%s sequence interrupted", sequence_type.title())
             with self._state_lock:
@@ -634,6 +639,19 @@ class ALSLaserServer:
             self.startup_step_notes[index] = note
         else:
             self.shutdown_step_notes[index] = note
+
+    def _send_startup_done_notification(self) -> None:
+        subject = f"ALS startup done on {socket.gethostname()}"
+        body = "ALS startup sequence completed successfully; laser is ramped on."
+        try:
+            send_email(ALS_STARTUP_NOTIFICATION_RECIPIENT, subject, body)
+            LOGGER.info(
+                "Startup notification sent to %s: %s",
+                ALS_STARTUP_NOTIFICATION_RECIPIENT,
+                subject,
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to send ALS startup notification: %s", exc)
 
 
 def main(host: str = "0.0.0.0", port: int = 5557, serial_port: str = "COM6") -> None:
