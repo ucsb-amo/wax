@@ -163,6 +163,8 @@ class ALSLaserServer(WaxxServer):
         self._waxx_port = self.port
         self._start_beacon()
         self.running = True
+        LOGGER.addHandler(self.log_handler)
+        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.accept_thread.start()
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()

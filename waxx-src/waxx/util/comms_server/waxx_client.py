@@ -97,7 +97,7 @@ class _ServiceDiscoveryRegistry:
             except Exception:
                 pass
 
-    def discover(self, server_id: str, timeout: float = 3.0) -> tuple[str, int] | None:
+    def discover(self, server_id: str, timeout: float = 5.0) -> tuple[str, int] | None:
         """Block until ``server_id`` appears in cache or ``timeout`` expires.
 
         Returns ``(ip, port)`` or ``None`` — never raises.
