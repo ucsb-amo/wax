@@ -177,12 +177,26 @@ class Expt(Dealer, Scanner, Scribe):
             self.monitor.update_device_states()
             self.monitor.signal_end()
 
-        rid = self.run_info.run_id
-        print(f'run id {rid} complete')
+        self._run_done_printout(expt_filepath)
 
         if notify:
             from waxx.util.notifications import send_run_done_email
             send_run_done_email(self.run_info.run_id, expt_filepath)
+
+    def _run_done_printout(self, expt_filepath):
+        rid = self.run_info.run_id
+        import datetime
+        dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        expt_name = self._expt_name_from_filepath(expt_filepath)
+        name_str = f"  ({expt_name})" if expt_name else ""
+        print(f'run id {rid} complete at {dt}{name_str}')
+
+    @staticmethod
+    def _expt_name_from_filepath(expt_filepath):
+        """Return the stem (filename without extension) of expt_filepath."""
+        if not expt_filepath:
+            return ""
+        return Path(expt_filepath).stem
 
     # ------------------------------------------------------------------
     # Payload serialisation helpers
