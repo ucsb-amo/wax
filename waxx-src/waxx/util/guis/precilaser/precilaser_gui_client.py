@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import socket
 
+from waxx.util.comms_server.waxx_client import WaxxClient
 
-class PrecilaserGuiClient:
-    def __init__(self, host: str = "192.168.1.76", port: int = 5560, timeout_s: float = 2.0):
-        self.host = host
-        self.port = port
+
+class PrecilaserGuiClient(WaxxClient):
+    def __init__(self, timeout_s: float = 2.0):
+        super().__init__("precilaser")
         self.timeout_s = timeout_s
 
     def _send_command(self, command: str) -> str:

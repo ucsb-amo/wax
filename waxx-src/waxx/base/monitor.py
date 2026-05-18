@@ -27,7 +27,7 @@ class Monitor:
     Detects changes in device state configuration and updates hardware devices.
     """
      
-    def __init__(self, expt, monitor_server_ip, device_state_json_path):
+    def __init__(self, expt, device_state_json_path):
         """
         Initialize the device state updater.
         
@@ -47,7 +47,7 @@ class Monitor:
 
         self.expt = expt
 
-        self._monitor_client = MonitorClient(monitor_server_ip)
+        self._monitor_client = MonitorClient()
 
     def update_device_states(self):
         self.generator.generate()

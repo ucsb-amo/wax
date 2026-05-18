@@ -46,8 +46,6 @@ class FixedPrecisionAxisItem(pg.AxisItem):
 class MagnetometerGUI(QtWidgets.QMainWindow):
     def __init__(
         self,
-        server_host: str = DEFAULT_SERVER_HOST,
-        server_port: int = DEFAULT_SERVER_PORT,
         reference_csv_path=None,
     ):
         super().__init__()
@@ -73,9 +71,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.mag_buffer = deque(maxlen=PLOT_BUFFER_MAXLEN)
 
         # Settings
-        self.server_host = server_host
-        self.server_port = server_port
-        self.client = HMRClient(host=server_host, port=server_port)
+        self.client = HMRClient()
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.window_s = DEFAULT_TIME_WINDOW
         self.stats_window_s = DEFAULT_STATS_WINDOW_S

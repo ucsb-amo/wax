@@ -1004,7 +1004,7 @@ class ALSControlGUI(QMainWindow):
     
     def _init_workers(self):
         """Initialize remote ALS server client and fetch initial state."""
-        self.remote_client = ALSGuiClient(host=self.ip, port=self.port, timeout_s=0.75)
+        self.remote_client = ALSGuiClient(timeout_s=0.75)
         QTimer.singleShot(0, self._sync_remote_state)
     
     def _toggle_connection(self):

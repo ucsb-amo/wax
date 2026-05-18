@@ -1,17 +1,17 @@
 import socket
 
-class CommClient:
-    """
-    A client for sending UDP messages to a server.
-    """
-    def __init__(self, server_ip, server_port=6789):
-        """
-        Initializes the CommClient.
+from waxx.util.comms_server.waxx_client import WaxxClient
 
-        :param server_ip: The IP address of the server.
-        :param server_port: The port of the server. Defaults to 6789.
-        """
-        self.server_address = (server_ip, server_port)
+class CommClient(WaxxClient):
+    """
+    A TCP client that discovers its server via UDP broadcast.
+
+    ``server_id`` is the discovery key (e.g. ``"monitor"``).  Raises
+    ``RuntimeError`` if the server is not discovered within the timeout.
+    """
+    def __init__(self, server_id: str, discovery_timeout: float = 3.0):
+        super().__init__(server_id, discovery_timeout=discovery_timeout)
+        self.server_address = (self.host, self.port)
         
     def send_message(self, message):
         """
@@ -40,8 +40,8 @@ class CommClient:
         self.sock.close()
 
 class MonitorClient(CommClient):
-    def __init__(self, server_ip, server_port=6789):
-        super().__init__(server_ip,server_port)
+    def __init__(self, discovery_timeout: float = 3.0):
+        super().__init__("monitor", discovery_timeout=discovery_timeout)
 
     def send_end(self):
         self.send_message("run complete")

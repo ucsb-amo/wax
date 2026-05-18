@@ -15,8 +15,8 @@ class MonitorUDPServer(UdpServer):
 
     reset_signal = pyqtSignal()
 
-    def __init__(self, host, port):
-        super().__init__(host,port)
+    def __init__(self, port):
+        super().__init__(host="0.0.0.0", port=port, server_id="monitor")
 
         self.status = Status()
         self._print_connections_bool = False
@@ -34,12 +34,10 @@ class MonitorUDPServer(UdpServer):
 
 class MonitorServerGUI(QWidget):
     def __init__(self,
-                monitor_server_ip, 
                 monitor_server_port,
                 monitor_expt_path):
         super().__init__()
 
-        self.server_ip = monitor_server_ip
         self.server_port = monitor_server_port
 
         self.setWindowTitle("Monitor Server")
@@ -93,7 +91,7 @@ class MonitorServerGUI(QWidget):
     def setup_udp_server(self):
         self.server_thread = QThread()
         
-        self.udp_server = MonitorUDPServer(self.server_ip, self.server_port)
+        self.udp_server = MonitorUDPServer(self.server_port)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)

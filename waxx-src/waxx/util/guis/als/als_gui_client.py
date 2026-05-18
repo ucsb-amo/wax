@@ -11,13 +11,14 @@ import socket
 import json
 from typing import Optional
 
+from waxx.util.comms_server.waxx_client import WaxxClient
 
-class ALSGuiClient:
+
+class ALSGuiClient(WaxxClient):
     """TCP client for remote control and monitoring of the ALS server."""
 
-    def __init__(self, host: str = "192.168.1.76", port: int = 5555, timeout_s: float = 2.0):
-        self.host = host
-        self.port = port
+    def __init__(self, timeout_s: float = 2.0):
+        super().__init__("als_laser")
         self.timeout_s = timeout_s
 
     def _send_command(self, command: str) -> str:

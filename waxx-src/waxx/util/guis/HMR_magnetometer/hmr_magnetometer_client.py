@@ -21,6 +21,8 @@ import numpy as np
 import json
 import socket
 
+from waxx.util.comms_server.waxx_client import WaxxClient
+
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 50000
 
@@ -38,17 +40,11 @@ def _request(command: str, host: str, port: int, timeout: float) -> dict:
     return json.loads(b"".join(chunks).decode("utf-8").strip())
 
 
-class HMRClient:
-    """Client for the HMR2300 magnetometer TCP server.
+class HMRClient(WaxxClient):
+    """Client for the HMR2300 magnetometer TCP server."""
 
-    Args:
-        host: Server hostname or IP address.
-        port: TCP port the server is listening on.
-    """
-
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
+    def __init__(self):
+        super().__init__("magnetometer")
 
     def _request(self, command: str, timeout: float) -> dict:
         return _request(command, self.host, self.port, timeout)

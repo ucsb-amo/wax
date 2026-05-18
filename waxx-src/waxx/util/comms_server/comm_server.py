@@ -6,20 +6,27 @@ from PyQt6.QtGui import QFont
 import os
 from pathlib import Path
 
+from waxx.util.comms_server.waxx_server import WaxxServer
+
 class ReadyBit:
     READY = 0
     LOADING = 1
     NOT_READY = 2
 STATES = ReadyBit()
 
-class UdpServer(QObject):
+class UdpServer(QObject, WaxxServer):
     """
-    A UDP server that listens for messages in a QThread.
+    A TCP server (QObject-based) that listens for connections in a QThread.
+    Optionally broadcasts a UDP service-discovery beacon when server_id is given.
     """
     message_received = pyqtSignal(str)
 
-    def __init__(self, host, port):
-        super().__init__()
+    def __init__(self, host: str = "0.0.0.0", port: int = None, server_id: str = None):
+        super().__init__()  # QObject.__init__ (first in MRO)
+        # WaxxServer.__init__ called explicitly to avoid cooperative-super MRO conflict
+        if server_id is not None:
+            WaxxServer.__init__(self, server_id, port)
+        self.server_id = server_id
         self.host = host
         self.port = port
         self.running = False
@@ -32,6 +39,8 @@ class UdpServer(QObject):
 
         self.sock.bind((self.host, self.port))
         self.running = True
+        if self.server_id is not None:
+            self._start_beacon()
 
         self.sock.listen(5)
         print(f"Server listening on {self.host}:{self.port}")
@@ -57,6 +66,8 @@ class UdpServer(QObject):
         print("UDP Server stopped.")
 
     def stop(self):
+        if self.server_id is not None:
+            self._stop_beacon()
         self.running = False
         # Unblock the socket by sending a dummy message to it
         try:

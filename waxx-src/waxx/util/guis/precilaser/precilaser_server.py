@@ -15,6 +15,7 @@ from waxx.util.guis.precilaser.precilaser_controller import (
     PrecilaserController,
     PrecilaserStartupController,
 )
+from waxx.util.comms_server.waxx_server import WaxxServer
 
 
 LOGGER = logging.getLogger("precilaser_server")
@@ -59,7 +60,7 @@ class LogBufferHandler(logging.Handler):
         self.server.append_log_entry(self.format(record))
 
 
-class PrecilaserLaserServer:
+class PrecilaserLaserServer(WaxxServer):
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -69,6 +70,7 @@ class PrecilaserLaserServer:
         max_log_entries: int = 2000,
         auto_connect: bool = True,
     ):
+        WaxxServer.__init__(self, "precilaser", port)
         self.host = host
         self.port = int(port)
         self.serial_port = serial_port
@@ -104,6 +106,7 @@ class PrecilaserLaserServer:
     def start(self) -> None:
         if self.running:
             return
+        self._start_beacon()
         self.running = True
         LOGGER.addHandler(self.log_handler)
         CONTROLLER_LOGGER.addHandler(self.log_handler)
@@ -120,6 +123,7 @@ class PrecilaserLaserServer:
     def stop(self) -> None:
         if self._stopped:
             return
+        self._stop_beacon()
         self._stopped = True
         self.running = False
         self.interrupt_sequence()

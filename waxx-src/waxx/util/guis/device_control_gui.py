@@ -570,11 +570,11 @@ class MonitorStatusChecker(QThread):
     status_updated = pyqtSignal(int)
     connection_failed = pyqtSignal()
 
-    def __init__(self,server_addr):
+    def __init__(self):
         super().__init__()
         
         # Setup monitor client
-        self.monitor_client = MonitorClient(*server_addr)
+        self.monitor_client = MonitorClient()
         self.status_checker = None
         self.running = True
         self.retry_connection = False
@@ -602,8 +602,6 @@ class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management"""
     
     def __init__(self,
-                  monitor_server_ip,
-                  monitor_server_port,
                   device_state_json_path,
                   server_talk: server_talk,
                   dds_frame,
@@ -616,7 +614,6 @@ class DeviceStateGUI(QMainWindow):
         self.dds_frame_obj = dds_frame
         self.dac_frame_obj = dac_frame
 
-        self.server_addr = (monitor_server_ip, monitor_server_port)
         self.connection_failed = False
 
         self.server_talk = server_talk
@@ -810,7 +807,7 @@ class DeviceStateGUI(QMainWindow):
         
     def setup_status_checker(self):
         """Setup the status checker thread"""
-        self.status_checker = MonitorStatusChecker(self.server_addr)
+        self.status_checker = MonitorStatusChecker()
         self.status_checker.status_updated.connect(self.update_status_button)
         self.status_checker.connection_failed.connect(self.on_connection_failed)
         self.status_checker.start()

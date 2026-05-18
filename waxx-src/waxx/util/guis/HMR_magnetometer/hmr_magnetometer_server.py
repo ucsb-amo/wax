@@ -30,6 +30,8 @@ from datetime import datetime
 import serial
 import serial.tools.list_ports
 
+from waxx.util.comms_server.waxx_server import WaxxServer
+
 DEFAULT_SERIAL_PORT = "COM33"
 DEFAULT_BAUD = 9600
 DEFAULT_DEVICE_ID = "00"
@@ -108,7 +110,7 @@ class HMR2300Reader:
         raise ValueError(f"Could not parse sensor reply: {last_reply!r}")
 
 
-class MagnetometerServer:
+class MagnetometerServer(WaxxServer):
     """Headless server: reads HMR2300 and serves field data over TCP."""
 
     def __init__(
@@ -121,6 +123,7 @@ class MagnetometerServer:
         server_port=DEFAULT_SERVER_PORT,
         reference_csv_path=None,
     ):
+        WaxxServer.__init__(self, "magnetometer", server_port)
         self.serial_port = serial_port
         self.baud = baud
         self.device_id = device_id
@@ -167,6 +170,7 @@ class MagnetometerServer:
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
 
+        self._start_beacon()
         print(f"[INFO] Starting TCP server on {self.server_host}:{self.server_port}")
         try:
             self._server_loop()
@@ -175,6 +179,7 @@ class MagnetometerServer:
             read_thread.join(timeout=2.0)
 
     def shutdown(self):
+        self._stop_beacon()
         self.stop_event.set()
         if self.reader is not None:
             try:

@@ -91,11 +91,9 @@ class StatusDot(QPushButton):
 
 
 class PrecilaserControlGUI(QMainWindow):
-    def __init__(self, ip: str = "192.168.1.76", port: int = 5560):
+    def __init__(self):
         super().__init__()
-        self.ip = ip
-        self.port = int(port)
-        self.client = PrecilaserGuiClient(host=ip, port=port)
+        self.client = PrecilaserGuiClient()
         self._window_icon = create_emoji_icon("💀")
         self.setWindowIcon(self._window_icon)
         app = QApplication.instance()

@@ -13,6 +13,7 @@ from typing import Optional
 
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
 from waxx.util.notifications import send_email
+from waxx.util.comms_server.waxx_server import WaxxServer
 
 
 LOGGER = logging.getLogger("als_laser_server")
@@ -83,7 +84,7 @@ class _LockedLaserProxy:
         return _locked_call
 
 
-class ALSLaserServer:
+class ALSLaserServer(WaxxServer):
     STARTUP_STEPS = [
         (1, "Turn Power On", "step_1_turn_laser_power_on"),
         (2, "Turn Interlock On", "step_2_turn_interlock_on"),
@@ -109,6 +110,7 @@ class ALSLaserServer:
         max_log_entries: int = 2000,
         auto_connect: bool = True,
     ):
+        WaxxServer.__init__(self, "als_laser", port)
         self.host = host
         self.port = int(port)
         self.serial_port = serial_port
@@ -152,6 +154,7 @@ class ALSLaserServer:
     def start(self) -> None:
         if self.running:
             return
+        self._start_beacon()
         self.running = True
         LOGGER.addHandler(self.log_handler)
         self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -168,6 +171,7 @@ class ALSLaserServer:
                 LOGGER.exception("Initial serial connection failed: %s", exc)
 
     def stop(self) -> None:
+        self._stop_beacon()
         self.running = False
         self.interrupt_sequence()
         if self.server_socket is not None:
