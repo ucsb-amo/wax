@@ -1644,8 +1644,16 @@ class atomdata_base():
             print(self.run_info.run_id)
 
             t_stage = time.perf_counter()
-            self.images = f['data']['images'][()]
-            self.image_timestamps = f['data']['image_timestamps'][()]
+            # has_images=False means no camera images were captured (e.g.
+            # save_data=True but setup_camera=False).  Old files that pre-date
+            # this attribute always have images, so we default to True.
+            self._has_images = bool(f.attrs.get('has_images', True))
+            if self._has_images:
+                self.images = f['data']['images'][()]
+                self.image_timestamps = f['data']['image_timestamps'][()]
+            else:
+                self.images = np.array([])
+                self.image_timestamps = np.array([])
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
             timing['h5_read_core_arrays_s'] = time.perf_counter() - t_stage

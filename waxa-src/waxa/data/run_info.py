@@ -5,13 +5,14 @@ class RunInfo():
     def __init__(self,
                  expt_obj=None,
                  save_data=True,
-                 server_talk=None):
+                 server_talk=None,
+                 defer_run_id=False):
         if server_talk == None:
             server_talk = st()
         else:
             server_talk = server_talk
 
-        if expt_obj != None:
+        if expt_obj is not None and not defer_run_id:
             self.run_id = server_talk.get_run_id()
             print(f'Run id: {self.run_id}')
         else:

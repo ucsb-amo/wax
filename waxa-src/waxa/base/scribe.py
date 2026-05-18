@@ -52,6 +52,14 @@ class Scribe():
                     raise ValueError("Timed out waiting for data to be available.")        
                 
     def wait_for_camera_ready(self,timeout=-1.) -> bool:
+        # New path: delegate to the ZMQ client when available.
+        if getattr(self, 'live_od_client', None) is not None:
+            cam_timeout = timeout if timeout > 0. else 60.0
+            self.live_od_client.wait_cam_ready(timeout=cam_timeout)
+            print('Acknowledged camera ready signal.')
+            return True
+
+        # Legacy path: poll the HDF5 camera_ready attribute.
         count = 1
         t0 = time.time()
         waiting = True
@@ -134,6 +142,8 @@ class Scribe():
             else:
                 paths = [filepath]
             for path in paths:
+                if isinstance(path, np.ndarray):
+                    path = path.item() if path.size == 1 else None
                 if path and not os.path.exists(path):
                     if raise_error:
                         if hasattr(self,'monitor'):

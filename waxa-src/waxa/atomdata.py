@@ -75,6 +75,22 @@ class atomdata(atomdata_base):
     ### Analysis methods
 
     def _initial_analysis(self, transpose_idx, avg_repeats):
+        if not getattr(self, '_has_images', True):
+            # No camera images were captured for this run; skip all
+            # image-based analysis and set image-derived attrs to None.
+            self.img_atoms = None
+            self.img_light = None
+            self.img_dark  = None
+            self.od_raw    = None
+            self.od        = None
+            self.sum_od_x  = None
+            self.sum_od_y  = None
+            self.integrated_od = None
+            self.atom_number   = None
+            self.cloudfit_x    = None
+            self.cloudfit_y    = None
+            self._refresh_repeat_statistics()
+            return
         self._sort_images()
         if transpose_idx:
             self._analysis_tags.transposed = True
@@ -86,6 +102,8 @@ class atomdata(atomdata_base):
         self._refresh_repeat_statistics()
 
     def analyze(self):
+        if not getattr(self, '_has_images', True):
+            return
         self.compute_raw_ods()
         self.analyze_ods()
         self._refresh_repeat_statistics()
