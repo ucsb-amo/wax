@@ -12,7 +12,7 @@ from waxa.base.scribe import Scribe
 from waxa.dummy.camera_params import CameraParams
 from waxa import img_types
 
-from artiq.language.core import kernel_from_string, now_mu
+from artiq.language.core import kernel_from_string, now_mu, TerminationRequested
 
 from waxx.config.data_vault import DataVault
 from waxx.base.scanner import Scanner
@@ -128,9 +128,9 @@ class Expt(Dealer, Scanner, Scribe):
         """RPC: notify the liveOD server that one shot has completed."""
         n = self._shot_complete_count + 1
         N = self._N_shots_total
-        print(f"shot {n}/{N}")
         _client = getattr(self, 'live_od_client', None)
         if _client is None:
+            print(f"shot {n}/{N}")
             self._shot_complete_count += 1
             return
         try:
@@ -140,12 +140,16 @@ class Expt(Dealer, Scanner, Scribe):
             }
         except Exception:
             xvar_values = {}
-        _client.shot_complete(
+        reset_requested = _client.shot_complete(
             self._shot_complete_count,
             self._N_shots_total,
             xvar_values,
         )
         self._shot_complete_count += 1
+        print(f"shot {n}/{N} done")
+        if reset_requested:
+            _client.abort_run()
+            raise TerminationRequested
     
     def compute_new_derived(self):
         pass

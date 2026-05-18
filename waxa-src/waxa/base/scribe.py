@@ -129,27 +129,50 @@ class Scribe():
                 if not self._check_data_file_exists(raise_error=False):
                     break
 
+    # def _check_data_file_exists(self, raise_error=True) -> bool:
+    #     """
+    #     Checks if the data file exists if saving data is enabled. Raises an
+    #     error if not found.
+    #     """
+    #     if hasattr(self, 'run_info'):
+    #         filepath = getattr(self.run_info, 'filepath', None)
+    #         if isinstance(filepath, list):
+    #             # If filepath is a list, check all paths
+    #             paths = filepath
+    #         else:
+    #             paths = [filepath]
+    #         for path in paths:
+    #             if isinstance(path, np.ndarray):
+    #                 path = path.item() if path.size == 1 else None
+    #             if path and not os.path.exists(path):
+    #                 if raise_error:
+    #                     if hasattr(self,'monitor'):
+    #                         self.monitor.update_device_states()
+    #                         self.monitor.signal_end()
+    #                     raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
+    #                 else:
+    #                     return False
+    #         return True
+        
     def _check_data_file_exists(self, raise_error=True) -> bool:
+        """Override: use ZMQ poll to check for a reset request instead of
+        checking whether the data file still exists on disk.
+
+        Falls back to the parent (file-based) check when no live_od_client
+        is attached (e.g. suppress_live_od=True runs, or no liveOD server).
         """
-        Checks if the data file exists if saving data is enabled. Raises an
-        error if not found.
-        """
-        if hasattr(self, 'run_info'):
-            filepath = getattr(self.run_info, 'filepath', None)
-            if isinstance(filepath, list):
-                # If filepath is a list, check all paths
-                paths = filepath
-            else:
-                paths = [filepath]
-            for path in paths:
-                if isinstance(path, np.ndarray):
-                    path = path.item() if path.size == 1 else None
-                if path and not os.path.exists(path):
-                    if raise_error:
-                        if hasattr(self,'monitor'):
-                            self.monitor.update_device_states()
-                            self.monitor.signal_end()
-                        raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
-                    else:
-                        return False
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            reset = _client.poll_reset()
+            if reset and raise_error:
+                if hasattr(self,'monitor'):
+                    self.monitor.update_device_states()
+                    self.monitor.signal_end()
+                _client.abort_run()
+                raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
             return True
+        else:
+            return False
+        
+    def _check_for_abort_signal(self, raise_error=True) -> bool:
+        return self._check_data_file_exists(raise_error)

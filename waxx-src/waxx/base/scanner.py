@@ -144,10 +144,11 @@ class Scanner():
         self.pre_scan()
 
         scanning = True
+        aborted_bool = False
 
         while scanning:
 
-            self._check_data_file_exists()
+            aborted_bool = self._check_for_abort_signal()
             
             self.core.wait_until_mu(now_mu())
             self.update_params_from_xvars()

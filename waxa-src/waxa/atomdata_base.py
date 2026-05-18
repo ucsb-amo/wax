@@ -1526,7 +1526,8 @@ class atomdata_base():
     ## Unshuffling
 
     def _shuff(self, reshuffle_bool):
-        self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
+        if getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0:
+            self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self, reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self.params, reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self.data,
@@ -1541,7 +1542,9 @@ class atomdata_base():
             raise ValueError("Cannot reshuffle after repeats have been reassigned.")
         if self._analysis_tags.xvars_shuffled == False:
             self._shuff(reshuffle_bool=True)
-            self._sort_images()
+            _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+            if _has_images:
+                self._sort_images()
             self.analyze()
             self._analysis_tags.xvars_shuffled = True
         else:
@@ -1551,7 +1554,9 @@ class atomdata_base():
         if self._analysis_tags.xvars_shuffled == True:
             self._shuff(reshuffle_bool=False)
             if reanalyze:
-                self._sort_images()
+                _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+                if _has_images:
+                    self._sort_images()
                 self.analyze()
             self._analysis_tags.xvars_shuffled = False
         else:
