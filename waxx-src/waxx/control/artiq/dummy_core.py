@@ -11,3 +11,7 @@ class DummyCore():
     @kernel
     def reset(self):
         pass
+
+    @kernel
+    def get_rtio_counter_mu(self):
+        pass
