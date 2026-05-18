@@ -220,6 +220,7 @@ class RamanBeamPair():
     def set_frequency_fast(self,
                  frequency_transition,
                  dt_phase_origin_shift_mu=T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU):
+        # pass
         
         self.dds0._last_ftw = self.dds0._ftw    
         self.dds1._last_ftw = self.dds1._ftw
@@ -229,10 +230,17 @@ class RamanBeamPair():
 
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
-        # aprint(f0,f1)
+        # # aprint(f0,f1)
 
-        ftw0 = self._f_to_ftw(f0)
-        ftw1 = self._f_to_ftw(f1)
+        # ftw0 = self._f_to_ftw(f0)
+        # ftw1 = self._f_to_ftw(f1)
+        ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
+        ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
+
+        dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
+        dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
+
+        at_mu(now_mu() & ~7)
 
         if self.phase_mode == 1:
             dt = np.int32(now_mu()) - np.int32(self.t_phase_origin_mu - dt_phase_origin_shift_mu)
@@ -246,30 +254,41 @@ class RamanBeamPair():
 
         dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
         dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
+
+        # self.dds0.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
+        #                         dds0_asf_pow_data, ftw0)
+        # self.dds1.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
+        #                         dds1_asf_pow_data, ftw1)
         
-        at_mu(now_mu() & ~7)
+        # delay_mu(dt0)
+        # self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+        # delay_mu(-dt0)
+        # delay_mu(-8)
+        # delay_mu(dt1)
+        # self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+
         with parallel:
             with sequential:
                 self.dds0.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
                                 dds0_asf_pow_data, ftw0)
-                delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
+                delay_mu(dt0)
                 self.dds0.dds_device.cpld.io_update.pulse_mu(8)
                 
             with sequential:
                 self.dds1.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
                                 dds1_asf_pow_data, ftw1)
-                delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
+                delay_mu(dt1)
                 self.dds1.dds_device.cpld.io_update.pulse_mu(8)
                 
         at_mu(now_mu() & ~7)
 
         self.dds0.frequency = f0
         self.dds0._ftw = ftw0
-        self.dds0.update_phase_at_set()
+        # self.dds0.update_phase_at_set()
 
         self.dds1.frequency = f1
         self.dds1._ftw = ftw1
-        self.dds1.update_phase_at_set()
+        # self.dds1.update_phase_at_set()
 
     @kernel(flags={"fast-math"})
     def set(self,
