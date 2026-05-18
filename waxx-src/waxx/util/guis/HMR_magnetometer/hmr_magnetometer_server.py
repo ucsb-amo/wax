@@ -37,7 +37,7 @@ DEFAULT_BAUD = 9600
 DEFAULT_DEVICE_ID = "00"
 DEFAULT_POLL_INTERVAL = 0.12
 DEFAULT_SERVER_HOST = "0.0.0.0"
-DEFAULT_SERVER_PORT = 50000
+DEFAULT_SERVER_PORT = 0
 MAX_HISTORY = 10000
 SENSOR_COUNTS_PER_GAUSS = 15000.0
 MAX_STUCK_SAME_VALUES = 20
@@ -129,7 +129,7 @@ class MagnetometerServer(WaxxServer):
         self.device_id = device_id
         self.poll_interval = poll_interval
         self.server_host = server_host
-        self.server_port = server_port
+        self.server_port = server_port  # may be 0 until run() binds
         self.reference_csv_path = reference_csv_path
 
         self.reader = None
@@ -170,10 +170,17 @@ class MagnetometerServer(WaxxServer):
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
 
+        # Pre-bind to learn the OS-assigned port before the beacon fires.
+        _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _srv.bind((self.server_host, self.server_port))
+        self.server_port = _srv.getsockname()[1]
+        self._waxx_port = self.server_port
+
         self._start_beacon()
         print(f"[INFO] Starting TCP server on {self.server_host}:{self.server_port}")
         try:
-            self._server_loop()
+            self._server_loop(_srv)
         finally:
             self.stop_event.set()
             read_thread.join(timeout=2.0)
@@ -313,10 +320,12 @@ class MagnetometerServer(WaxxServer):
     # TCP server loop (main thread)
     # ------------------------------------------------------------------
 
-    def _server_loop(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+    def _server_loop(self, srv: socket.socket = None):
+        if srv is None:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.server_host, self.server_port))
+        with srv:
             srv.listen(16)
             srv.settimeout(1.0)
             print(f"[INFO] Listening on {self.server_host}:{self.server_port}")

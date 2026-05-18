@@ -104,7 +104,7 @@ class ALSLaserServer(WaxxServer):
     def __init__(
         self,
         host: str = "0.0.0.0",
-        port: int = 5557,
+        port: int = 0,
         serial_port: str = "COM6",
         poll_interval_s: float = 1.0,
         max_log_entries: int = 2000,
@@ -154,10 +154,15 @@ class ALSLaserServer(WaxxServer):
     def start(self) -> None:
         if self.running:
             return
+        # Pre-bind to learn the OS-assigned port before the beacon fires.
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _sock.bind((self.host, 0))
+        self.server_socket = _sock
+        self.port = _sock.getsockname()[1]
+        self._waxx_port = self.port
         self._start_beacon()
         self.running = True
-        LOGGER.addHandler(self.log_handler)
-        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.accept_thread.start()
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
@@ -242,9 +247,10 @@ class ALSLaserServer(WaxxServer):
 
     def _accept_loop(self) -> None:
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
+            if self.server_socket is None:
+                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(16)
             self.server_socket.settimeout(1.0)
             LOGGER.info("ALS server listening on %s:%s", self.host, self.port)
@@ -658,7 +664,7 @@ class ALSLaserServer(WaxxServer):
             LOGGER.warning("Failed to send ALS startup notification: %s", exc)
 
 
-def main(host: str = "0.0.0.0", port: int = 5557, serial_port: str = "COM6") -> None:
+def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6") -> None:
     logging.basicConfig(level=logging.INFO)
     server = ALSLaserServer(host=host, port=port, serial_port=serial_port)
     server.start()

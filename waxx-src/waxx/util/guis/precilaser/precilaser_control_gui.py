@@ -277,7 +277,7 @@ class PrecilaserControlGUI(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setSpacing(8)
 
-        self.connection_label = QLabel(f"Server: {self.ip}:{self.port}")
+        self.connection_label = QLabel(f"Server: {self.client.host}:{self.client.port}")
         self.connection_label.setStyleSheet("font-size: 16px; font-weight: 700;")
         layout.addWidget(self.connection_label)
 
@@ -582,9 +582,9 @@ class PrecilaserControlGUI(QMainWindow):
 
 
 
-def main(ip: str = "192.168.1.76", port: int = 5560):
+def main():
     app = QApplication(sys.argv)
-    window = PrecilaserControlGUI(ip=ip, port=port)
+    window = PrecilaserControlGUI()
     window.show()
     sys.exit(app.exec())
 

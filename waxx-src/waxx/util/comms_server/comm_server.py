@@ -21,7 +21,7 @@ class UdpServer(QObject, WaxxServer):
     """
     message_received = pyqtSignal(str)
 
-    def __init__(self, host: str = "0.0.0.0", port: int = None, server_id: str = None):
+    def __init__(self, host: str = "0.0.0.0", port: int = 0, server_id: str = None):
         super().__init__()  # QObject.__init__ (first in MRO)
         # WaxxServer.__init__ called explicitly to avoid cooperative-super MRO conflict
         if server_id is not None:
@@ -38,6 +38,8 @@ class UdpServer(QObject, WaxxServer):
     def run(self):
 
         self.sock.bind((self.host, self.port))
+        self.port = self.sock.getsockname()[1]   # read back OS-assigned port
+        self._waxx_port = self.port              # sync beacon before _start_beacon()
         self.running = True
         if self.server_id is not None:
             self._start_beacon()
