@@ -220,6 +220,30 @@ class RamanBeamPair():
         self.dds1.reset_phase()
 
     @kernel
+    def _set_single_tone_profile(self):
+        # Restore profile0 ASF from Raman cached state before fast FTW-only updates.
+        hi0 = int32((self._asf0 << 16) | (self.dds0._pow & 0xffff))
+        hi1 = int32((self._asf1 << 16) | (self.dds1._pow & 0xffff))
+        lo0 = int32(self.dds0._ftw)
+        lo1 = int32(self.dds1._ftw)
+
+        with parallel:
+            self.dds0.dds_device.write64(_AD9910_REG_PROFILE0, hi0, lo0)
+            self.dds1.dds_device.write64(_AD9910_REG_PROFILE0, hi1, lo1)
+
+        with parallel:
+            self.dds0.dds_device.set_cfr1(
+                phase_autoclear=1,
+                internal_profile=0,  # select single tone mode
+                ram_enable=0,
+                ram_destination=0)
+            self.dds1.dds_device.set_cfr1(
+                phase_autoclear=1,
+                internal_profile=0,
+                ram_enable=0,
+                ram_destination=0)
+
+    @kernel
     def set_up_fast_frequency_update(self, aggressive_mode=0):
         # aggressive_mode options:
         # 0 -> safe mode: stage config only, address is written inside set_frequency_fast
@@ -230,20 +254,11 @@ class RamanBeamPair():
         #         self.dds0.dds_device.set_cfr1(phase_autoclear=1)
         #         self.dds1.dds_device.set_cfr1(phase_autoclear=1)
         #     at_mu(now_mu() & ~7)
+        # First restore ASF in single-tone profile registers from Raman stored state.
+        self._set_single_tone_profile()
+
         # Force single tone mode (use global FTW register, not profile)
-        with parallel:
-            self.dds0.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,  # select single tone mode
-                ram_enable=0,
-                ram_destination=0
-            )
-            self.dds1.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,
-                ram_enable=0,
-                ram_destination=0
-            )
+        
         at_mu(now_mu() & ~7)
 
         self._invalidate_fast_frequency_update_state()
@@ -251,9 +266,9 @@ class RamanBeamPair():
 
         # First stage happens here so callers do not need to stage immediately after setup.
         if self._fast_freq_aggressive_enabled == 1:
-            self.stage_fast_frequency_update_aggressive()
+            self.stage_ffua()
         else:
-            self.stage_fast_frequency_update()
+            self.stage_ffu()
 
         # Precompute linear map: transition frequency -> AO frequency and FTW.
         # This keeps set_frequency_fast to a few fused multiply-add operations.
@@ -307,7 +322,7 @@ class RamanBeamPair():
         self.reset_fast_frequency_update_stage()
 
     @kernel
-    def stage_fast_frequency_update(self):
+    def stage_ffu(self):
         # Stage 8-bit header-write config for the next FTW transaction.
         if self._fast_freq_addr_pending0 == 1 or self._fast_freq_addr_pending1 == 1:
             self._invalidate_fast_frequency_update_state()
@@ -322,11 +337,11 @@ class RamanBeamPair():
         self._fast_freq_stage_valid = np.int32(1)
 
     @kernel
-    def stage_fast_frequency_update_aggressive(self):
+    def stage_ffua(self):
         # Aggressive: prewrite FTW address and 32-bit SPI_END config in slack.
         # Consume with data write only, no config needed in hot path.
         if self._fast_freq_aggressive_enabled == 0:
-            self.stage_fast_frequency_update()
+            self.stage_ffu()
             return
 
         # Guard: do not prewrite twice before a consume.
@@ -445,7 +460,7 @@ class RamanBeamPair():
             if self._fast_freq_addr_pending0 == 1 or self._fast_freq_addr_pending1 == 1:
                 self._invalidate_fast_frequency_update_state()
             if self._fast_freq_stage_valid == 0:
-                self.stage_fast_frequency_update()
+                self.stage_ffu()
 
             with parallel:
                 with sequential:
