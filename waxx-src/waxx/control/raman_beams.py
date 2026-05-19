@@ -1,15 +1,17 @@
 import numpy as np
 from numpy import int64, int32
 
-from artiq.coredevice.ad9910 import _AD9910_REG_PROFILE0, _AD9910_REG_FTW
+from artiq.coredevice.ad9910 import _AD9910_REG_FTW
+from artiq.coredevice import ad9910
 from artiq.coredevice import spi2 as spi
 from artiq.coredevice import urukul
-from artiq.experiment import TArray, TFloat, TTuple, TFloat, parallel
+from artiq.experiment import TArray, TFloat, TTuple, parallel
 from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
 from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU, T_AD9910_PIPELINE_LATENCY_MU
-from waxx.util.artiq.async_print import aprint
 from waxx.config.expt_params import ExptParams
+
+from waxx.util.artiq.async_print import aprint
 
 dv = -0.1
 dv_array = np.array([-0.1])
@@ -220,63 +222,62 @@ class RamanBeamPair():
         self.dds1.reset_phase()
 
     @kernel
-    def _set_single_tone_profile(self):
-        # Restore profile0 ASF from Raman cached state before fast FTW-only updates.
-        # aprint(self.dds0.dds_device.asf_to_amplitude(self._asf0),
-        #         self.dds1.dds_device.asf_to_amplitude(self._asf1))
-        hi0 = int32((self._asf0 << 16) | (self.dds0._pow & 0xffff))
-        hi1 = int32((self._asf1 << 16) | (self.dds1._pow & 0xffff))
-        lo0 = int32(self.dds0._ftw)
-        lo1 = int32(self.dds1._ftw)
+    def _configure_ffua_profile(self):
+        # In fast mode, source frequency from the FTW register and keep POW constant from RAM.
+        # Use the ASF register for amplitude so RAM profile setup does not clobber the active
+        # single-tone profile amplitude on shared-profile Urukul cards.
+        ram_word0 = int32((self.dds0._pow << 16))  # ASF bits ignored in RAM_DEST_POW mode
+        ram_word1 = int32((self.dds1._pow << 16))
+
         dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
         dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
 
         with parallel:
-            self.dds0.dds_device.write64(_AD9910_REG_PROFILE0, hi0, lo0)
-            self.dds1.dds_device.write64(_AD9910_REG_PROFILE0, hi1, lo1)
+            self.dds0.dds_device.set_cfr2(asf_profile_enable=0)
+            self.dds1.dds_device.set_cfr2(asf_profile_enable=0)
 
         with parallel:
             self.dds0.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,
-                ram_enable=0,
-                ram_destination=0)
+                ram_enable=1,
+                ram_destination=ad9910.RAM_DEST_POW,
+                osk_enable=1
+            )
             self.dds1.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,
-                ram_enable=0,
-                ram_destination=0)
+                ram_enable=1,
+                ram_destination=ad9910.RAM_DEST_POW,
+                osk_enable=1
+            )
 
-        # with parallel:
-        #     self.dds0.dds_device.cpld.set_profile(self.dds0.dds_device.chip_select - 4, 0)
-        #     self.dds1.dds_device.cpld.set_profile(self.dds1.dds_device.chip_select - 4, 0)
-
-        at_mu(now_mu() & ~7)
         with parallel:
-            with sequential:
-                delay_mu(dt0)
-                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-            with sequential:
-                delay_mu(dt1)
-                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-        at_mu(now_mu() & ~7)
+            self.dds0.dds_device.set_profile_ram(
+                start=0, end=0, step=1, profile=urukul.DEFAULT_PROFILE,
+                mode=ad9910.RAM_MODE_DIRECTSWITCH
+            )
+            self.dds1.dds_device.set_profile_ram(
+                start=0, end=0, step=1, profile=urukul.DEFAULT_PROFILE,
+                mode=ad9910.RAM_MODE_DIRECTSWITCH
+            )
+
+        with parallel:
+            self.dds0.dds_device.write_ram([ram_word0])
+            self.dds1.dds_device.write_ram([ram_word1])
+
+        with parallel:
+            self.dds0.dds_device.set_mu(ftw=self.dds0._ftw, asf=self._asf0,
+                                        ram_destination=ad9910.RAM_DEST_POW,
+                                        phase_mode=0)
+            self.dds1.dds_device.set_mu(ftw=self.dds1._ftw, asf=self._asf1,
+                                        ram_destination=ad9910.RAM_DEST_POW,
+                                        phase_mode=0)
 
     @kernel
     def set_up_fast_frequency_update(self, aggressive_mode=0):
         # aggressive_mode options:
-        # 0 -> safe mode: stage config only, address is written inside set_frequency_fast
-        # 1 -> aggressive mode: prewrite FTW address and 32-bit config in slack, consume data-only
-        # if self.phase_mode == 1: # tracking mode only
-        #     at_mu(now_mu() & ~7)
-        #     with parallel:
-        #         self.dds0.dds_device.set_cfr1(phase_autoclear=1)
-        #         self.dds1.dds_device.set_cfr1(phase_autoclear=1)
-        #     at_mu(now_mu() & ~7)
-        # First restore ASF in single-tone profile registers from Raman stored state.
-        self._set_single_tone_profile()
+        # 0 -> safe mode: address+data written inside set_frequency_fast
+        # 1 -> aggressive mode: address/config prewritten in slack, data-only hot path
 
-        # Force single tone mode (use global FTW register, not profile)
-        
+        self._configure_ffua_profile()
+
         at_mu(now_mu() & ~7)
 
         self._invalidate_fast_frequency_update_state()
@@ -288,8 +289,9 @@ class RamanBeamPair():
         else:
             self.stage_ffu()
 
+        at_mu(now_mu() & ~7)
+
         # Precompute linear map: transition frequency -> AO frequency and FTW.
-        # This keeps set_frequency_fast to a few fused multiply-add operations.
         # self.state_splitting_to_ao_frequency(0.)
         # f0_lo = self._dummy[DDS0_IDX]
         # f1_lo = self._dummy[DDS1_IDX]
@@ -306,8 +308,6 @@ class RamanBeamPair():
         # ftw0_hi = self.dds0.dds_device.frequency_to_ftw(f0_hi)
         # ftw1_lo = self.dds1.dds_device.frequency_to_ftw(f1_lo)
         # ftw1_hi = self.dds1.dds_device.frequency_to_ftw(f1_hi)
-
-        # # aprint()
 
         # self._ftw_offset0 = ftw0_lo
         # self._ftw_coeff0 = float(ftw0_hi - ftw0_lo)
@@ -353,7 +353,6 @@ class RamanBeamPair():
             self.dds1.dds_device.bus.set_config_mu(
                 urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
             )
-        at_mu(now_mu() & ~7)
         self._fast_freq_stage_valid = np.int32(1)
 
     @kernel
@@ -413,12 +412,26 @@ class RamanBeamPair():
         dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
         at_mu(now_mu() & ~7)
         with parallel:
-            self.dds0.dds_device.set_cfr1()
-            self.dds1.dds_device.set_cfr1()
-        with parallel:
-            self.dds0.dds_device.cpld.set_profile(self.dds0.dds_device.chip_select - 4, urukul.DEFAULT_PROFILE)
-            self.dds1.dds_device.cpld.set_profile(self.dds1.dds_device.chip_select - 4, urukul.DEFAULT_PROFILE)
+            self.dds0.dds_device.set_cfr2(
+                sync_validation_disable=1
+            )
+            self.dds1.dds_device.set_cfr2(
+                sync_validation_disable=1
+            )
 
+        with parallel:
+            self.dds0.dds_device.set_cfr1(
+                phase_autoclear=1,
+                internal_profile=0,
+                ram_enable=0,
+                ram_destination=0
+            )
+            self.dds1.dds_device.set_cfr1(
+                phase_autoclear=1,
+                internal_profile=0,
+                ram_enable=0,
+                ram_destination=0
+            )
         at_mu(now_mu() & ~7)
         with parallel:
             with sequential:
@@ -443,41 +456,25 @@ class RamanBeamPair():
     def set_frequency_fast(self,
                  frequency_transition,
                  dt_phase_origin_shift_mu=T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU):
-        # pass
-        
         self.dds0._last_ftw = self.dds0._ftw    
         self.dds1._last_ftw = self.dds1._ftw
 
-        # self.frequency_transition = frequency_transition
+        self.frequency_transition = frequency_transition
         # f0 = self._f_offset0 + self._f_coeff0 * frequency_transition
         # f1 = self._f_offset1 + self._f_coeff1 * frequency_transition
+        # ftw0 = int32(self._ftw_offset0 + self._ftw_coeff0 * frequency_transition)
+        # ftw1 = int32(self._ftw_offset1 + self._ftw_coeff1 * frequency_transition)
 
         self.state_splitting_to_ao_frequency(frequency_transition)
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
-
-        # ftw0 = int32(self._ftw_offset0 + self._ftw_coeff0 * frequency_transition)
-        # ftw1 = int32(self._ftw_offset1 + self._ftw_coeff1 * frequency_transition)
         ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
-        ftw1 = int32(self.dds0.dds_device.ftw_per_hz * f0)
+        ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
 
         dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
         dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
 
         at_mu(now_mu() & ~7)
-
-        # if self.phase_mode == 1:
-        #     dt = np.int32(now_mu()) - np.int32(self.t_phase_origin_mu - dt_phase_origin_shift_mu)
-        #     a = np.int32(dt * self._sysclk_per_mu / 2)
-            
-        #     pow0 = a * ftw0
-        #     pow1 = self._pow_relphase + a * ftw1
-        # else:
-        #     pow0 = 0
-        #     pow1 = 0
-
-        # dds0_asf_pow_data = (self._asf0 << 16) | (pow0 & 0xffff)
-        # dds1_asf_pow_data = (self._asf1 << 16) | (pow1 & 0xffff)
 
         # Aggressive: only write data + io_update if address and config pre-staged.
         use_aggressive = (
