@@ -98,22 +98,44 @@ class WaxxServer:
     def _get_local_ip() -> str | None:
         """Return the primary LAN IP for service-discovery beacons.
 
-        Uses the routing-table trick — connects a UDP socket to a well-known
-        external address and reads back the source IP the OS would assign.
-        No packet is ever transmitted; the OS just consults its routing table.
-        Tries several probe addresses so it works on air-gapped labs and on
-        machines with USB-to-Ethernet adapters on any subnet.
+        Uses the routing-table trick — connects a UDP socket to a probe address
+        and reads back the source IP the OS would assign.  No packet is ever
+        transmitted; the OS just consults its routing table.
+
+        Strategy (handles multi-homed machines such as lab Ethernet + campus WiFi):
+
+        1. Probe the lab gateway (192.168.1.1) first.  Accept the result only if
+           it lands on 192.168.1.x — this uniquely identifies the lab adapter
+           even when an internet-facing adapter is also present.
+        2. Fall back to generic probes for machines on other subnets (USB-Ethernet
+           adapters, different lab network ranges, etc.).  Any non-loopback,
+           non-APIPA address is accepted.
         """
-        for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1", "10.0.0.1"):
+        # Priority 1: lab subnet (192.168.1.x)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.168.1.1", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip.startswith("192.168.1.") and ip != "0.0.0.0":
+                return ip
+        except Exception:
+            pass
+
+        # Priority 2: any other private/routable adapter (USB-Ethernet, other subnets)
+        for probe in ("10.0.0.1", "172.16.0.1", "8.8.8.8", "1.1.1.1"):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.connect((probe, 80))
                 ip = s.getsockname()[0]
                 s.close()
-                if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+                if (ip and ip != "0.0.0.0"
+                        and not ip.startswith("127.")
+                        and not ip.startswith("169.254.")):
                     return ip
             except Exception:
                 pass
+
         return None
 
     def _beacon_loop(self) -> None:
