@@ -95,27 +95,31 @@ class WaxxServer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_subnet_ip(prefix: str = "192.168.1.") -> str | None:
-        """Return the local IP on the ``prefix`` subnet, or ``None``.
+    def _get_local_ip() -> str | None:
+        """Return the primary LAN IP for service-discovery beacons.
 
-        Uses the UDP connect trick — queries the OS routing table without
-        transmitting any packets.
+        Uses the routing-table trick — connects a UDP socket to a well-known
+        external address and reads back the source IP the OS would assign.
+        No packet is ever transmitted; the OS just consults its routing table.
+        Tries several probe addresses so it works on air-gapped labs and on
+        machines with USB-to-Ethernet adapters on any subnet.
         """
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("192.168.1.1", 1))
-            ip = s.getsockname()[0]
-            s.close()
-            if ip.startswith(prefix):
-                return ip
-        except Exception:
-            pass
+        for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1", "10.0.0.1"):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((probe, 80))
+                ip = s.getsockname()[0]
+                s.close()
+                if ip and not ip.startswith("127.") and ip != "0.0.0.0":
+                    return ip
+            except Exception:
+                pass
         return None
 
     def _beacon_loop(self) -> None:
         """Daemon thread: broadcast a JSON beacon every ``beacon_interval`` seconds.
 
-        Retries ``_get_subnet_ip()`` on every iteration so that a server started
+        Retries ``_get_local_ip()`` on every iteration so that a server started
         before the NIC is fully up will begin advertising once the interface appears.
         """
         sock: socket.socket | None = None
@@ -133,9 +137,9 @@ class WaxxServer:
         })
 
         while not self._waxx_beacon_stop.is_set():
-            ip = self._get_subnet_ip()
+            ip = self._get_local_ip()
             if ip is None:
-                logger.debug("[WaxxServer] No 192.168.1.x NIC found, will retry.")
+                logger.debug("[WaxxServer] Could not determine local LAN IP, will retry.")
             else:
                 payload = json.dumps({
                     "server_id": self._waxx_server_id,
