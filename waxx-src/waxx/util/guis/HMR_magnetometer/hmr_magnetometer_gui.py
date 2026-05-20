@@ -868,10 +868,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         try:
             self.client._ping(timeout=2.0)
         except Exception as exc:
+            host = self.client.host
+            port = self.client.port
             QtWidgets.QMessageBox.critical(
                 self,
                 "Connection Error",
-                f"Cannot reach server at {self.server_host}:{self.server_port}\n\n{exc}",
+                f"Cannot reach server at {host}:{port}\n\n{exc}",
             )
             self._set_status("Connection failed")
             return
@@ -885,7 +887,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         )
         self.worker_thread.start()
         self.toggle_button.setText("Stop")
-        self._set_status(f"Connected to {self.server_host}:{self.server_port}")
+        self._set_status(f"Connected to {self.client.host}:{self.client.port}")
 
     def stop_monitor(self):
         self.running = False
