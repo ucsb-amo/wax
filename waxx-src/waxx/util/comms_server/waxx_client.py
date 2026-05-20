@@ -161,6 +161,7 @@ class WaxxClient:
     """
 
     def __init__(self, server_id: str, discovery_timeout: float = 3.0) -> None:
+        self._waxx_server_id = server_id
         result = _registry.discover(server_id, timeout=discovery_timeout)
         if result is None:
             raise RuntimeError(
@@ -170,3 +171,19 @@ class WaxxClient:
             )
         self.host, self.port = result
         logger.debug("[WaxxClient] Discovered %s @ %s:%d", server_id, self.host, self.port)
+
+    def _rediscover(self, timeout: float = 2.0) -> bool:
+        """Refresh ``self.host`` and ``self.port`` from the latest beacon.
+
+        Call this when a connection attempt fails so that if the server
+        restarted on a new ephemeral port the client picks up the new address
+        before retrying.  Returns ``True`` if a (possibly updated) entry was
+        found, ``False`` if the server is currently unreachable.
+        """
+        entry = _registry.discover(self._waxx_server_id, timeout=timeout)
+        if entry is None:
+            return False
+        self.host, self.port = entry
+        logger.debug("[WaxxClient] Rediscovered %s @ %s:%d",
+                     self._waxx_server_id, self.host, self.port)
+        return True
