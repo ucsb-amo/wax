@@ -572,15 +572,20 @@ class MonitorStatusChecker(QThread):
 
     def __init__(self):
         super().__init__()
-        
-        # Setup monitor client
-        self.monitor_client = MonitorClient()
+        self.monitor_client: MonitorClient | None = None
         self.status_checker = None
         self.running = True
         self.retry_connection = False
 
     def run(self):
         while self.running:
+            if self.monitor_client is None:
+                try:
+                    self.monitor_client = MonitorClient(discovery_timeout=0.5)
+                except RuntimeError:
+                    self.connection_failed.emit()
+                    time.sleep(2.0)
+                    continue
             try:
                 status = self.monitor_client.check_status()
                 if status is not None:
@@ -588,9 +593,11 @@ class MonitorStatusChecker(QThread):
                 time.sleep(0.5)
             except Exception as e:
                 print(f"Connection error: {e}")
+                # Reset client so the next iteration re-runs service discovery.
+                # This handles server restarts (new dynamic port) cleanly.
+                self.monitor_client = None
                 self.connection_failed.emit()
-                # Automatically retry after 0.25 seconds
-                time.sleep(0.25)
+                time.sleep(2.0)
             
     def stop(self):
         self.running = False

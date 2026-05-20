@@ -17,8 +17,8 @@ from waxx.util.comms_server.waxx_client import WaxxClient
 class ALSGuiClient(WaxxClient):
     """TCP client for remote control and monitoring of the ALS server."""
 
-    def __init__(self, timeout_s: float = 2.0):
-        super().__init__("als_laser")
+    def __init__(self, timeout_s: float = 2.0, discovery_timeout: float = 3.0):
+        super().__init__("als_laser", discovery_timeout=discovery_timeout)
         self.timeout_s = timeout_s
 
     def _send_command(self, command: str) -> str:

@@ -1004,7 +1004,11 @@ class ALSControlGUI(QMainWindow):
     
     def _init_workers(self):
         """Initialize remote ALS server client and fetch initial state."""
-        self.remote_client = ALSGuiClient(timeout_s=0.75)
+        try:
+            self.remote_client = ALSGuiClient(timeout_s=0.75)
+        except RuntimeError:
+            self.remote_client = None
+            return
         QTimer.singleShot(0, self._sync_remote_state)
     
     def _toggle_connection(self):
@@ -1101,7 +1105,10 @@ class ALSControlGUI(QMainWindow):
     def _sync_remote_state(self):
         """Poll the ALS server for latest state and logs."""
         if self.remote_client is None:
-            return
+            try:
+                self.remote_client = ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
+            except RuntimeError:
+                return
         try:
             snapshot = self.remote_client.get_snapshot()
             self._last_remote_error = None

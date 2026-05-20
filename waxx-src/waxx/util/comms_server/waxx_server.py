@@ -121,41 +121,63 @@ class WaxxServer:
 
         Retries ``_get_local_ip()`` on every iteration so that a server started
         before the NIC is fully up will begin advertising once the interface appears.
+
+        The beacon socket is bound to the specific local IP so that the UDP
+        broadcast is transmitted on the correct adapter (e.g. the lab Ethernet
+        rather than a WiFi default-route adapter).  The socket is recreated
+        whenever the detected IP changes (e.g. adapter comes up late).
         """
         sock: socket.socket | None = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        except Exception as exc:
-            logger.warning("[WaxxServer] Could not create beacon socket: %s", exc)
-            return
+        current_bound_ip: str | None = None
 
-        payload_template = json.dumps({
-            "server_id": self._waxx_server_id,
-            "port": self._waxx_port,
-            "ip": None,  # replaced each iteration
-        })
+        def _close_sock() -> None:
+            nonlocal sock, current_bound_ip
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock = None
+                current_bound_ip = None
 
         while not self._waxx_beacon_stop.is_set():
             ip = self._get_local_ip()
+
             if ip is None:
                 logger.debug("[WaxxServer] Could not determine local LAN IP, will retry.")
-            else:
-                payload = json.dumps({
-                    "server_id": self._waxx_server_id,
-                    "ip": ip,
-                    "port": self._waxx_port,
-                }).encode()
+                self._waxx_beacon_stop.wait(timeout=self._waxx_beacon_interval)
+                continue
+
+            # (Re)create socket when the local IP changes or on first use.
+            # Binding to the specific IP forces the OS to send the broadcast
+            # out on that adapter rather than the default-route interface.
+            if ip != current_bound_ip:
+                _close_sock()
                 try:
-                    sock.sendto(payload, (_BROADCAST_ADDR, DISCOVERY_PORT))
-                    logger.debug("[WaxxServer] Beacon: %s @ %s:%d",
-                                 self._waxx_server_id, ip, self._waxx_port)
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.bind((ip, 0))
+                    current_bound_ip = ip
+                    logger.debug("[WaxxServer] Beacon socket bound to %s", ip)
                 except Exception as exc:
-                    logger.warning("[WaxxServer] Beacon send failed: %s", exc)
+                    logger.warning("[WaxxServer] Could not create beacon socket on %s: %s", ip, exc)
+                    _close_sock()
+                    self._waxx_beacon_stop.wait(timeout=self._waxx_beacon_interval)
+                    continue
+
+            payload = json.dumps({
+                "server_id": self._waxx_server_id,
+                "ip": ip,
+                "port": self._waxx_port,
+            }).encode()
+            try:
+                sock.sendto(payload, (_BROADCAST_ADDR, DISCOVERY_PORT))
+                logger.debug("[WaxxServer] Beacon: %s @ %s:%d",
+                             self._waxx_server_id, ip, self._waxx_port)
+            except Exception as exc:
+                logger.warning("[WaxxServer] Beacon send failed: %s", exc)
+                _close_sock()
 
             self._waxx_beacon_stop.wait(timeout=self._waxx_beacon_interval)
 
-        try:
-            sock.close()
-        except Exception:
-            pass
+        _close_sock()

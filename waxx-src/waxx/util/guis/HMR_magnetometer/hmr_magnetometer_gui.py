@@ -71,7 +71,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.mag_buffer = deque(maxlen=PLOT_BUFFER_MAXLEN)
 
         # Settings
-        self.client = HMRClient()
+        try:
+            self.client: HMRClient | None = HMRClient()
+        except RuntimeError:
+            self.client = None
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.window_s = DEFAULT_TIME_WINDOW
         self.stats_window_s = DEFAULT_STATS_WINDOW_S
@@ -850,6 +853,13 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         if self.running or (self.worker_thread and self.worker_thread.is_alive()):
             return
 
+        if self.client is None:
+            try:
+                self.client = HMRClient(discovery_timeout=0.1)
+            except RuntimeError:
+                self._set_status("Server not found — retrying...")
+                return
+
         self._sync_settings()
         self.stop_event.clear()
         self._reset_display()
@@ -1178,6 +1188,20 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
     def _refresh_serial_status(self):
         if self.serial_button is None:
             return
+        if self.client is None:
+            try:
+                self.client = HMRClient(discovery_timeout=0.1)
+                # Successfully connected — try to start monitor if not running.
+                if not self.running:
+                    self.start_monitor()
+            except RuntimeError:
+                self.serial_connected = None
+                self.serial_button.setText("Serial: ?")
+                self.serial_button.setStyleSheet(
+                    "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+                    "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+                )
+                return
         try:
             result = self.client._get_serial_status(timeout=1.5)
             connected = bool(result.get("connected", False))

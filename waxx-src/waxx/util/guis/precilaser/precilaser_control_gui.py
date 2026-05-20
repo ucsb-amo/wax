@@ -93,7 +93,7 @@ class StatusDot(QPushButton):
 class PrecilaserControlGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.client = PrecilaserGuiClient()
+        self.client: PrecilaserGuiClient | None = None
         self._window_icon = create_emoji_icon("💀")
         self.setWindowIcon(self._window_icon)
         app = QApplication.instance()
@@ -277,7 +277,7 @@ class PrecilaserControlGUI(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setSpacing(8)
 
-        self.connection_label = QLabel(f"Server: {self.client.host}:{self.client.port}")
+        self.connection_label = QLabel("Server: (searching...)")
         self.connection_label.setStyleSheet("font-size: 16px; font-weight: 700;")
         layout.addWidget(self.connection_label)
 
@@ -500,6 +500,15 @@ class PrecilaserControlGUI(QMainWindow):
             self._append_log(f"ERROR interrupt sequence: {exc}")
 
     def _sync_remote_state(self) -> None:
+        if self.client is None:
+            try:
+                self.client = PrecilaserGuiClient(discovery_timeout=0.1)
+                self.connection_label.setText(
+                    f"Server: {self.client.host}:{self.client.port}"
+                )
+            except RuntimeError:
+                self.connection_label.setText("Server: (searching...)")
+                return
         try:
             snapshot = self.client.get_snapshot()
             self._apply_snapshot(snapshot)

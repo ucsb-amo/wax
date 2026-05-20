@@ -43,8 +43,8 @@ def _request(command: str, host: str, port: int, timeout: float) -> dict:
 class HMRClient(WaxxClient):
     """Client for the HMR2300 magnetometer TCP server."""
 
-    def __init__(self):
-        super().__init__("magnetometer")
+    def __init__(self, discovery_timeout: float = 3.0):
+        super().__init__("magnetometer", discovery_timeout=discovery_timeout)
 
     def _request(self, command: str, timeout: float) -> dict:
         return _request(command, self.host, self.port, timeout)
