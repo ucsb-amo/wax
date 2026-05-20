@@ -41,7 +41,7 @@ import threading
 logger = logging.getLogger(__name__)
 
 DISCOVERY_PORT: int = 50099
-_BROADCAST_ADDR = "255.255.255.255"
+_BROADCAST_ADDR = "192.168.1.255"   # directed broadcast for lab subnet (more reliable than 255.255.255.255)
 
 
 class WaxxServer:
