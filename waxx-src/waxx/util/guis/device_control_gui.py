@@ -583,6 +583,10 @@ class MonitorStatusChecker(QThread):
                 try:
                     self.monitor_client = MonitorClient(discovery_timeout=0.5)
                 except RuntimeError:
+                    from waxx.util.comms_server.waxx_client import _registry
+                    with _registry._lock:
+                        known = dict(_registry._cache)
+                    print(f"[DeviceGUI] Monitor discovery failed. Beacon cache: {known or '(empty — no beacons received)'}")
                     self.connection_failed.emit()
                     time.sleep(2.0)
                     continue
@@ -592,7 +596,11 @@ class MonitorStatusChecker(QThread):
                     self.status_updated.emit(int(status))
                 time.sleep(0.5)
             except Exception as e:
-                print(f"Connection error: {e}")
+                from waxx.util.comms_server.waxx_client import _registry
+                with _registry._lock:
+                    known = dict(_registry._cache)
+                print(f"[DeviceGUI] Connection error: {e}")
+                print(f"[DeviceGUI] Beacon cache at failure time: {known or '(empty)'}")
                 # Reset client so the next iteration re-runs service discovery.
                 # This handles server restarts (new dynamic port) cleanly.
                 self.monitor_client = None
