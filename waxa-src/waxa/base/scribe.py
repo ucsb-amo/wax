@@ -59,7 +59,18 @@ class Scribe():
             print('Acknowledged camera ready signal.')
             return True
 
-        # Legacy path: poll the HDF5 camera_ready attribute.
+        # Legacy path: the old CameraMother file-watching mechanism has been
+        # removed; camera_ready is no longer written to HDF5. Polling here
+        # would block for the full timeout (45 s) and then crash. Fail fast
+        # instead with a clear diagnostic.
+        raise RuntimeError(
+            "wait_for_camera_ready: no LiveOD server connection (live_od_client "
+            "is not set) but setup_camera=True. The legacy HDF5-polling path is "
+            "no longer supported (CameraMother file-watching was removed). Either "
+            "ensure the LiveOD server window is running on the control PC, or "
+            "pass setup_camera=False / suppress_live_od=True to Base.__init__."
+        )
+        # --- legacy code kept for reference (unreachable) ---
         count = 1
         t0 = time.time()
         waiting = True
