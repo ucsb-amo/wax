@@ -119,6 +119,11 @@ class Scribe():
     def remove_incomplete_data(self,delete_data_bool=True):
         # msg = "Something went wrong."
         if delete_data_bool:
+            # File may already have been deleted by the server (e.g. via
+            # _finalize_reset_run) before CameraBaby's grab loop timed out
+            # and called dishonorable_death.  If so, there is nothing to do.
+            if not getattr(self, 'data_filepath', None) or not os.path.exists(self.data_filepath):
+                return
             msg = "Destroying incomplete data."
             count = 0
             while True:
