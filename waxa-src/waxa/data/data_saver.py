@@ -171,7 +171,8 @@ class DataSaver():
                 # 2 = axis for picking time or voltage axis
                 # Npts = points per scan
                 if expt.sort_idx:
-                    data = expt._unshuffle_ndarray(data,exclude_dims=3).astype(np.float32)
+                    data = expt._unshuffle_ndarray(data,exclude_dims=3)
+                data = data.astype(np.float32)
                 this_scope_data = scope_data.create_group(scope.label)
                 # time/voltage axis always -2, take the first one for each capture
                 # only take one time axis for all the channels on a given shot
@@ -180,8 +181,8 @@ class DataSaver():
                 # take the voltage values
                 # resulting shape: (n0,...,nN,Nch,Npts)
                 v = np.take(data,1,-2)
-                this_scope_data.create_dataset('t',data=t)
-                this_scope_data.create_dataset('v',data=v)
+                this_scope_data.create_dataset('t', data=t, compression='gzip', compression_opts=4)
+                this_scope_data.create_dataset('v', data=v, compression='gzip', compression_opts=4)
 
     def _save_expt_files_text(self,
                               h5File:h5py.File,
@@ -627,9 +628,10 @@ class DataSaver():
             if sort_idx_raw:
                 data = self._unshuffle_single_array(
                     data, sort_idx_raw, sort_N_raw, exclude_dims=3
-                ).astype(np.float32)
+                )
+            data = data.astype(np.float32)
             this_scope = scope_data_grp.create_group(label)
             t = np.take(np.take(data, 0, axis=-2), 0, axis=-2)
             v = np.take(data, 1, axis=-2)
-            this_scope.create_dataset("t", data=t)
-            this_scope.create_dataset("v", data=v)
+            this_scope.create_dataset("t", data=t, compression='gzip', compression_opts=4)
+            this_scope.create_dataset("v", data=v, compression='gzip', compression_opts=4)
