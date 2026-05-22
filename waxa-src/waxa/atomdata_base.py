@@ -388,13 +388,16 @@ class atomdata_base():
         self._ds = DataSaver()
         self._dealer = self._init_dealer()
         self._analysis_tags = analysis_tags(roi_id,self.run_info.imaging_type)
-        self.roi = ROI(run_id = self.run_info.run_id,
-                       roi_id = roi_id,
-                       use_saved_roi = not skip_saved_roi,
-                       lite = self._lite,
-                       server_talk=self.server_talk,
-                       current_file_path=self._data_file_path,
-                       current_saved_roi=self._saved_roi_from_file)
+        if self._has_images:
+            self.roi = ROI(run_id = self.run_info.run_id,
+                           roi_id = roi_id,
+                           use_saved_roi = not skip_saved_roi,
+                           lite = self._lite,
+                           server_talk=self.server_talk,
+                           current_file_path=self._data_file_path,
+                           current_saved_roi=self._saved_roi_from_file)
+        else:
+            self.roi = None
         self._timing['init_setup_helpers_roi_s'] = time.perf_counter() - t_stage
 
         t_stage = time.perf_counter()
@@ -1332,7 +1335,7 @@ class atomdata_base():
                 self.xvars[xvar_idx] = np.unique(self.xvars[xvar_idx])
                 vars(self.params)[self.xvarnames[xvar_idx]] = self.xvars[xvar_idx]
                 self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
-            self.params.N_repeats = np.ones(len(self.xvars),dtype=int)
+            self.params.N_repeats = 1
         
             if reanalyze:
                 # don't unshuffle xvars again -- that will be confusing
@@ -1658,8 +1661,9 @@ class atomdata_base():
             t_stage = time.perf_counter()
             # has_images=False means no camera images were captured (e.g.
             # save_data=True but setup_camera=False).  Old files that pre-date
-            # this attribute always have images, so we default to True.
-            self._has_images = bool(f.attrs.get('has_images', True))
+            # this attribute always have images, so we default to whether the
+            # 'images' dataset actually exists in the file.
+            self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
             if self._has_images:
                 self.images = f['data']['images'][()]
                 self.image_timestamps = f['data']['image_timestamps'][()]

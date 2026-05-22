@@ -13,7 +13,7 @@ import os
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton,
                              QDialog, QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QFormLayout,
-                             QMenuBar, QMenu, QSplitter)
+                             QMenuBar, QMenu, QSplitter, QWidgetAction)
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QIcon
 from PyQt6.QtCore import QTimer, Qt, QRect, QPoint
 from pypylon import pylon
@@ -206,39 +206,52 @@ class CountsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Button layout
-        button_layout = QHBoxLayout()
-        
-        # Clear button
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self.clear_data)
-        button_layout.addWidget(clear_button)
-        
-        # Settings button
-        settings_button = QPushButton("Settings")
-        settings_button.clicked.connect(self.show_settings)
-        button_layout.addWidget(settings_button)
-        
-        layout.addLayout(button_layout)
-        
         # PyQtGraph plot
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setLabel('left', 'Pixel Counts')
+        self.plot_widget.setContentsMargins(0, 0, 0, 0)
         self.plot_widget.setLabel('bottom', 'seconds ago')
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
-        self.plot_widget.enableAutoRange()
         layout.addWidget(self.plot_widget)
-        
-        self.setLayout(layout)
-        
+
+        # Persistent main curve (green)
+        self.plot_item = self.plot_widget.getPlotItem()
+        self.main_curve = self.plot_item.plot(pen=pg.mkPen('g', width=2))
+
+        # Second ViewBox for normalized right y-axis
+        self.vb2 = pg.ViewBox()
+        self.plot_item.scene().addItem(self.vb2)
+        self.plot_item.getAxis('right').linkToView(self.vb2)
+        self.vb2.setXLink(self.plot_item)
+        self.plot_item.vb.sigResized.connect(self._sync_vb2_geometry)
+        self.plot_item.hideAxis('right')
+
+        # Dotted reference line at y=1 on normalized axis
+        self.norm_ref_line = pg.InfiniteLineItem(pos=1, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine, width=1))
+        self.vb2.addItem(self.norm_ref_line)
+        self.norm_ref_line.hide()
+
         self.timestamps = []
         self.counts = []
         self.start_time = None
         self.fixed_interval = True
         self.time_window = 30
+        self.normalize = True
+        self.norm_reference = None
+        self.auto_rescale = True
+        self.show_norm_reference_line = True
         self.settings_dialog = None
+        self.viewer = None
+
+        # Add horizontal reference line at y=1 for normalized plot
+        self.norm_line = pg.InfiniteLine(pos=1, angle=0, pen=pg.mkPen('w', style=pg.QtCore.Qt.PenStyle.DashLine, width=1))
+        self.vb2.addItem(self.norm_line)
+        self.norm_line.hide()
+
+        self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
     
     def add_count(self, count):
         if self.start_time is None:
@@ -248,12 +261,36 @@ class CountsPanel(QWidget):
         self.counts.append(count)
         self.update_plot()
     
+    def _on_plot_clicked(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.timestamps:
+            pos = event.scenePos()
+            mouse_point = self.plot_item.vb.mapSceneToView(pos)
+            self.norm_reference = mouse_point.y()
+            self.normalize = True
+            if self.viewer:
+                self.viewer.normalize_action.blockSignals(True)
+                self.viewer.normalize_action.setChecked(True)
+                self.viewer.normalize_action.blockSignals(False)
+            self.update_plot()
+
+    def clear_normalization(self):
+        self.norm_reference = None
+        self.normalize = False
+        if self.viewer:
+            self.viewer.normalize_action.blockSignals(True)
+            self.viewer.normalize_action.setChecked(False)
+            self.viewer.normalize_action.blockSignals(False)
+        self.update_plot()
+
+    def _sync_vb2_geometry(self):
+        self.vb2.setGeometry(self.plot_item.vb.sceneBoundingRect())
+        self.vb2.linkedViewChanged(self.plot_item.vb, self.vb2.XAxis)
+
     def update_plot(self):
-        self.plot_widget.clear()
-        plot_item = self.plot_widget.getPlotItem()
+        plot_item = self.plot_item
 
         if len(self.timestamps) == 0:
-            plot_item.enableAutoRange()
+            self.main_curve.setData([], [])
             return
 
         # Transform timestamps to "seconds ago" (0 = now, negative = older)
@@ -261,7 +298,6 @@ class CountsPanel(QWidget):
         t_ago = [t - current_time for t in self.timestamps]
 
         if self.fixed_interval:
-            # Slice data within the rolling window
             start_idx = 0
             for i, t in enumerate(t_ago):
                 if t >= -self.time_window:
@@ -269,22 +305,36 @@ class CountsPanel(QWidget):
                     break
             plot_timestamps = t_ago[start_idx:]
             plot_counts = self.counts[start_idx:]
-
-            # Lock X range to fixed window, keep Y auto
             plot_item.enableAutoRange(axis='x', enable=False)
-            plot_item.enableAutoRange(axis='y', enable=True)
             plot_item.setXRange(-self.time_window, 0, padding=0)
         else:
             plot_timestamps = t_ago
             plot_counts = self.counts
-            # Auto-range both axes when not fixed interval
             plot_item.enableAutoRange(axis='x', enable=True)
-            plot_item.enableAutoRange(axis='y', enable=True)
 
-        # Draw data if any points exist (green line, no points)
-        if len(plot_timestamps) > 0:
-            self.plot_widget.plot(plot_timestamps, plot_counts, pen=pg.mkPen('g', width=2))
-    
+        # Update main curve
+        self.main_curve.setData(plot_timestamps, plot_counts)
+
+        # Left Y auto-range
+        plot_item.enableAutoRange(axis='y', enable=self.auto_rescale)
+
+        # Normalized right axis
+        if self.normalize and len(plot_counts) > 0:
+            if self.norm_reference is None:
+                self.norm_reference = float(np.mean(plot_counts))
+            ref = self.norm_reference
+            if ref != 0:
+                norm_max = max(plot_counts) / ref
+                norm_min = min(plot_counts) / ref
+                if self.auto_rescale:
+                    self.vb2.setYRange(norm_min, norm_max, padding=0.1)
+            plot_item.showAxis('right')
+            plot_item.getAxis('right').setLabel('Normalized')
+            self.norm_ref_line.show()
+        else:
+            plot_item.hideAxis('right')
+            self.norm_ref_line.hide()
+
     def show_settings(self):
         if self.settings_dialog is None:
             self.settings_dialog = CountsSettingsDialog(self)
@@ -324,6 +374,7 @@ class BaslerCameraViewer(QMainWindow):
         self.current_pixmap = None
         self.settings_dialog = None
         self.saturation_in_box_only = True
+        self.saved_norm_reference = None
         self.load_rectangle()
         
         self.initUI()
@@ -335,15 +386,85 @@ class BaslerCameraViewer(QMainWindow):
 
         # Create menu bar
         menubar = self.menuBar()
-        settings_menu = menubar.addMenu("Settings")
-        settings_action = settings_menu.addAction("Camera Settings")
-        settings_action.triggered.connect(self.show_settings_dialog)
-        self.sat_in_box_action = settings_menu.addAction("Saturation warning only in box")
+
+        # Camera menu with inline gain / exposure spinboxes
+        cam_menu = menubar.addMenu("Camera")
+
+        def _make_row(menu, label_text, widget, label_width=90):
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(8, 2, 8, 2)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(label_width)
+            layout.addWidget(lbl)
+            layout.addWidget(widget)
+            wa = QWidgetAction(menu)
+            wa.setDefaultWidget(row)
+            menu.addAction(wa)
+
+        self.gain_spinbox = QDoubleSpinBox()
+        self.gain_spinbox.setRange(0, 100)
+        self.gain_spinbox.setDecimals(2)
+        self.gain_spinbox.setEnabled(False)
+        self.gain_spinbox.valueChanged.connect(self._on_gain_changed)
+        _make_row(cam_menu, "Gain (dB):", self.gain_spinbox)
+
+        self.exposure_spinbox = QDoubleSpinBox()
+        self.exposure_spinbox.setRange(0, 1000000)
+        self.exposure_spinbox.setDecimals(2)
+        self.exposure_spinbox.setSuffix(" µs")
+        self.exposure_spinbox.setEnabled(False)
+        self.exposure_spinbox.valueChanged.connect(self._on_exposure_changed)
+        _make_row(cam_menu, "Exposure:", self.exposure_spinbox)
+
+        cam_menu.addSeparator()
+        self.sat_in_box_action = cam_menu.addAction("Sat. warning in box")
         self.sat_in_box_action.setCheckable(True)
         self.sat_in_box_action.setChecked(self.saturation_in_box_only)
         self.sat_in_box_action.toggled.connect(lambda checked: setattr(self, 'saturation_in_box_only', checked))
 
-        # Central widget — horizontal split: camera left, counts right
+        counts_menu = menubar.addMenu("Counts")
+        clear_action = counts_menu.addAction("Clear")
+        clear_action.triggered.connect(lambda: self.counts_panel.clear_data())
+        counts_menu.addSeparator()
+
+        # Inline fixed-interval toggle
+        self.fixed_interval_btn = QPushButton("On")
+        self.fixed_interval_btn.setCheckable(True)
+        self.fixed_interval_btn.setChecked(True)
+        self.fixed_interval_btn.setFixedWidth(44)
+        self.fixed_interval_btn.toggled.connect(self._on_fixed_interval_menu_toggled)
+        _make_row(counts_menu, "Fixed interval:", self.fixed_interval_btn, label_width=100)
+
+        # Inline time-window spinbox
+        self.time_window_menu_spinbox = QSpinBox()
+        self.time_window_menu_spinbox.setRange(1, 300)
+        self.time_window_menu_spinbox.setValue(30)
+        self.time_window_menu_spinbox.setSuffix(" s")
+        self.time_window_menu_spinbox.valueChanged.connect(self._on_time_window_menu_changed)
+        _make_row(counts_menu, "Time window:", self.time_window_menu_spinbox, label_width=100)
+
+        counts_menu.addSeparator()
+        self.normalize_action = counts_menu.addAction("Normalize")
+        self.normalize_action.setCheckable(True)
+        self.normalize_action.setChecked(True)
+        self.normalize_action.toggled.connect(self._on_normalize_toggled)
+        self.norm_ref_line_action = counts_menu.addAction("Reference line at y=1")
+        self.norm_ref_line_action.setCheckable(True)
+        self.norm_ref_line_action.setChecked(True)
+        self.norm_ref_line_action.toggled.connect(self._on_norm_ref_line_toggled)
+        clear_norm_action = counts_menu.addAction("Clear Normalization")
+        clear_norm_action.triggered.connect(lambda: self.counts_panel.clear_normalization())
+        self.auto_rescale_action = counts_menu.addAction("Auto-rescale Y")
+        self.auto_rescale_action.setCheckable(True)
+        self.auto_rescale_action.setChecked(True)
+        self.auto_rescale_action.toggled.connect(self._on_auto_rescale_toggled)
+
+        # Stream toggle action directly on menu bar
+        self.stream_action = menubar.addAction("Stop Stream")
+        self.stream_action.triggered.connect(self.on_toggle_stream)
+
+        # Central widget - horizontal split: camera left, counts right
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         outer_layout = QVBoxLayout(central_widget)
@@ -366,30 +487,27 @@ class BaslerCameraViewer(QMainWindow):
         self.image_label.mouseReleaseEvent = self.on_image_mouse_release
         camera_layout.addWidget(self.image_label)
 
-        self.toggle_button = QPushButton("Stop")
-        self.toggle_button.clicked.connect(self.on_toggle_stream)
-        camera_layout.addWidget(self.toggle_button)
-
         splitter.addWidget(camera_widget)
-        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(0, 2)
 
         # Right side: counts panel (always visible)
         self.counts_panel = CountsPanel()
+        self.counts_panel.viewer = self
+        if self.saved_norm_reference is not None:
+            self.counts_panel.norm_reference = self.saved_norm_reference
         splitter.addWidget(self.counts_panel)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setHandleWidth(2)
     
     def on_toggle_stream(self):
         if self.is_streaming:
-            # Stop streaming and close camera
             self.timer.stop()
             self.camera.StopGrabbing()
             self.camera.Close()
             self.is_streaming = False
-            self.toggle_button.setText("Start")
-            self.toggle_button.setStyleSheet("")
+            self.stream_action.setText("Start Stream")
             self.image_label.setText("Stream stopped")
         else:
-            # Attempt to (re)connect and start streaming
             self.connect_camera()
     
     def show_settings_dialog(self):
@@ -401,7 +519,65 @@ class BaslerCameraViewer(QMainWindow):
         else:
             self.settings_dialog.raise_()
             self.settings_dialog.activateWindow()
-    
+
+    def _update_camera_menu_spinboxes(self):
+        """Sync the inline camera menu spinboxes to the current camera state."""
+        try:
+            self.gain_spinbox.setRange(self.camera.Gain.GetMin(), self.camera.Gain.GetMax())
+            self.gain_spinbox.blockSignals(True)
+            self.gain_spinbox.setValue(self.camera.Gain.GetValue())
+            self.gain_spinbox.blockSignals(False)
+            self.gain_spinbox.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            exp_min = self.camera.ExposureTime.GetMin()
+            exp_max = self.camera.ExposureTime.GetMax()
+            self.exposure_spinbox.setRange(exp_min, exp_max)
+            self.exposure_spinbox.blockSignals(True)
+            self.exposure_spinbox.setValue(self.camera.ExposureTime.GetValue())
+            self.exposure_spinbox.blockSignals(False)
+            self.exposure_spinbox.setEnabled(True)
+        except Exception:
+            pass
+
+    def _on_gain_changed(self, value):
+        if self.camera is not None:
+            try:
+                self.camera.Gain.SetValue(value)
+            except Exception as e:
+                print(f"Error setting gain: {e}")
+
+    def _on_exposure_changed(self, value):
+        if self.camera is not None:
+            try:
+                self.camera.ExposureTime.SetValue(value)
+            except Exception as e:
+                print(f"Error setting exposure time: {e}")
+
+    def _on_fixed_interval_menu_toggled(self, checked):
+        self.fixed_interval_btn.setText("On" if checked else "Off")
+        self.counts_panel.fixed_interval = checked
+        self.counts_panel.update_plot()
+
+    def _on_time_window_menu_changed(self, value):
+        self.counts_panel.time_window = value
+        self.counts_panel.update_plot()
+
+    def _on_norm_ref_line_toggled(self, checked):
+        self.counts_panel.show_norm_reference_line = checked
+        self.counts_panel.update_plot()
+
+    def _on_normalize_toggled(self, checked):
+        self.counts_panel.normalize = checked
+        if checked and self.counts_panel.counts:
+            self.counts_panel.norm_reference = float(np.mean(self.counts_panel.counts))
+        self.counts_panel.update_plot()
+
+    def _on_auto_rescale_toggled(self, checked):
+        self.counts_panel.auto_rescale = checked
+        self.counts_panel.update_plot()
+
     def label_to_image_coords(self, label_pos):
         """Convert label coordinates to original image coordinates"""
         if self.last_image is None:
@@ -457,6 +633,8 @@ class BaslerCameraViewer(QMainWindow):
                 with open(self.rect_file, 'r') as f:
                     data = json.load(f)
                     self.current_rect = QRect(data['x1'], data['y1'], data['x2'] - data['x1'], data['y2'] - data['y1'])
+                    if 'norm_reference' in data and data['norm_reference'] is not None:
+                        self.saved_norm_reference = data['norm_reference']
             except:
                 self.current_rect = None
     
@@ -468,7 +646,7 @@ class BaslerCameraViewer(QMainWindow):
             y2 = max(self.rect_start.y(), self.rect_end.y())
             self.current_rect = QRect(x1, y1, x2 - x1, y2 - y1)
             
-            data = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+            data = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'norm_reference': self.counts_panel.norm_reference}
             with open(self.rect_file, 'w') as f:
                 json.dump(data, f)
     
@@ -526,15 +704,17 @@ class BaslerCameraViewer(QMainWindow):
                 self.camera.ExposureTime.SetValue(1000)
             except Exception as e:
                 print(f"Could not set default exposure time: {e}")
-            
+
+            # Sync camera menu spinboxes to the current camera state
+            self._update_camera_menu_spinboxes()
+
             # Start grabbing
             self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
             self.is_streaming = True
             # Connected: stop retrying, reset button UI
             if self.retry_timer.isActive():
                 self.retry_timer.stop()
-            self.toggle_button.setText("Stop")
-            self.toggle_button.setStyleSheet("")
+            self.stream_action.setText("Stop Stream")
             
             # Start timer for frame updates
             self.timer.start(30)  # Update every 30ms (~33fps)
@@ -546,10 +726,8 @@ class BaslerCameraViewer(QMainWindow):
             self.connecting = False
 
     def set_failed_state(self):
-        # Indicate failure and schedule retry
         self.is_streaming = False
-        self.toggle_button.setText("Could not open camera")
-        self.toggle_button.setStyleSheet("background-color: orange; color: black;")
+        self.stream_action.setText("Could not open camera — retrying")
         if not self.retry_timer.isActive():
             self.retry_timer.start()
     
@@ -591,7 +769,7 @@ class BaslerCameraViewer(QMainWindow):
                 if self.show_rectangle:
                     qt_image = qt_image.copy()
                     painter = QPainter(qt_image)
-                    painter.setPen(QPen(QColor(0, 255, 0), 2))
+                    painter.setPen(QPen(QColor(0, 255, 0), 3))
                     
                     # Draw current rectangle being drawn
                     if self.rect_start and self.rect_end:

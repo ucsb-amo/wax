@@ -4,6 +4,7 @@ from matplotlib.axes import Axes
 import numpy as np
 from waxa import atomdata
 from waxa.helper import xlabels_1d
+from waxa.helper.datasmith import key_from_attribute
 import inspect
 import re
 def _normalize_name(name):
@@ -30,6 +31,31 @@ UNIT_MAP_FROM_COMMENT = {
     "unitless":  ("", 1.0),
 }
 
+def errorplot(ad, mean=None, yerr=None, y=None):
+
+    unit, mult, xvarname = detect_unit(ad, xvar_idx=0)
+
+    plt.figure(figsize=(4, 3), layout='constrained')
+
+    if mean is not None:
+        if yerr is None:
+            yerr = np.zeros_like(mean)
+        plt.errorbar(
+            ad.avg.xvars[0] * mult,
+            mean,
+            yerr=yerr,
+            fmt='o-',lw=1,ms=4)
+
+    if y is not None:
+        plt.scatter(ad.xvars[0] * mult,
+                    y,
+                    s=10, zorder=5, alpha=0.25)
+
+    key = key_from_attribute(ad, y)
+    plt.xlabel(f"{xvarname} ({unit})")
+    plt.ylabel(f"{key}")
+    plt.title(f"run {ad.run_info.run_id}")
+    plt.show()
 
 def get_param(params_obj, param_name):
     param_name = _normalize_name(param_name)

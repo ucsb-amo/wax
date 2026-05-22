@@ -379,16 +379,13 @@ class RamanBeamPair():
 
     @kernel
     def _restore_default_profile_mode(self):
-        dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
-        dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
-        at_mu(now_mu() & ~7)
-        with parallel:
-            self.dds0.dds_device.set_cfr2(
-                sync_validation_disable=1
-            )
-            self.dds1.dds_device.set_cfr2(
-                sync_validation_disable=1
-            )
+        # with parallel:
+        #     self.dds0.dds_device.set_cfr2(
+        #         sync_validation_disable=1
+        #     )
+        #     self.dds1.dds_device.set_cfr2(
+        #         sync_validation_disable=1
+        #     )
 
         with parallel:
             self.dds0.dds_device.set_cfr1(
@@ -403,15 +400,8 @@ class RamanBeamPair():
                 ram_enable=0,
                 ram_destination=0
             )
-        at_mu(now_mu() & ~7)
-        with parallel:
-            with sequential:
-                delay_mu(dt0)
-                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-            with sequential:
-                delay_mu(dt1)
-                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-        at_mu(now_mu() & ~7)
+
+        self.io_update()
 
     @kernel
     def clean_up_fast_frequency_update(self):

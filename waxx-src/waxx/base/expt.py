@@ -114,10 +114,11 @@ class Expt(Dealer, Scanner, Scribe):
             if response['run_id']:
                 print(f"Run ID: {self.run_info.run_id}")
         else:
-            # Legacy fallback: create HDF5 file locally
-            if self.setup_camera:
-                self.data_filepath = self.ds.create_data_file(self)
-                print(self.data_filepath)
+            if self.run_info.save_data:
+                raise RuntimeError(
+                    "No liveOD server connection found. "
+                    "Start the liveOD GUI before running experiments."
+                )
 
     @kernel
     def cleanup_scan_kernel_wax(self):
