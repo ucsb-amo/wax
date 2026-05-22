@@ -230,7 +230,7 @@ class CountsPanel(QWidget):
         self.plot_item.hideAxis('right')
 
         # Dotted reference line at y=1 on normalized axis
-        self.norm_ref_line = pg.InfiniteLineItem(pos=1, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine, width=1))
+        self.norm_ref_line = pg.InfiniteLine(pos=1, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine, width=1))
         self.vb2.addItem(self.norm_ref_line)
         self.norm_ref_line.hide()
 

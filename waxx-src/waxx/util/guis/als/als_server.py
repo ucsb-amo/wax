@@ -154,10 +154,14 @@ class ALSLaserServer(WaxxServer):
     def start(self) -> None:
         if self.running:
             return
-        # Pre-bind to learn the OS-assigned port before the beacon fires.
+        # Pre-bind and start listening so the TCP server is ready before the
+        # beacon fires and before we attempt the COM connection.  This lets the
+        # GUI connect and display server status even while connect_laser() is
+        # still running (or has failed).
         _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         _sock.bind((self.host, 0))
+        _sock.listen(16)
         self.server_socket = _sock
         self.port = _sock.getsockname()[1]
         self._waxx_port = self.port
@@ -172,10 +176,19 @@ class ALSLaserServer(WaxxServer):
             atexit.register(self._cleanup_on_exit)
             self._cleanup_registered = True
         if self.auto_connect:
-            try:
-                self.connect_laser()
-            except Exception as exc:
-                LOGGER.exception("Initial serial connection failed: %s", exc)
+            threading.Thread(target=self._initial_connect, daemon=True).start()
+
+    def _initial_connect(self) -> None:
+        """Connect to the serial port in a background thread.
+
+        Called once from start() so that the TCP server is already accepting
+        connections (and the GUI can poll status) while the COM port is being
+        opened.
+        """
+        try:
+            self.connect_laser()
+        except Exception as exc:
+            LOGGER.exception("Initial serial connection failed: %s", exc)
 
     def stop(self) -> None:
         self._stop_beacon()

@@ -1,8 +1,6 @@
-from waxa import atomdata
-
 def load_atomdata(idx=0, roi_id=None, path = "",
                   skip_saved_roi = False,
-                  transpose_idx = [], avg_repeats = False) -> atomdata:
+                  transpose_idx = [], avg_repeats = False):
     '''
     Returns the atomdata stored in the `idx`th newest file at `path`.
 
@@ -43,6 +41,7 @@ def load_atomdata(idx=0, roi_id=None, path = "",
     ad: atomdata
     '''
 
+    from waxa import atomdata
     ad = atomdata(idx,roi_id,path,
                   skip_saved_roi,
                   transpose_idx,

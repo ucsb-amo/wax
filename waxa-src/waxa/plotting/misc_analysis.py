@@ -3,13 +3,15 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
-from waxa import atomdata
 from waxa.helper.datasmith import normalize, crop_array_by_index, find_n_max_indices
 
-def get_best_result_idx(ad:atomdata,
+def get_best_result_idx(ad,
                         figure_of_merit_key='atom_number',
                         figure_of_merit_array=[],
                         N_best_shots=5):
+    
+    from waxa import atomdata
+    ad: atomdata
     
     fom_array = np.array([])
     try:
@@ -41,7 +43,7 @@ def get_best_result_idx(ad:atomdata,
 
     return n_best_shot_dict_list
 
-def plot_n_best_od(ad:atomdata,
+def plot_n_best_od(ad,
                 figure_of_merit_key = 'atom_number',
                 figure_of_merit_array = [],
                 figure_of_merit_label = "",

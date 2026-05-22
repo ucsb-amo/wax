@@ -3,7 +3,6 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
-from waxa import atomdata
 from waxa.helper import *
 
 dv = -1000.
@@ -11,13 +10,14 @@ dv_fit_guess_rabi_frequency = 1.e5
 
 class TOF():
     def __init__(self,
-                 atomdata,
+                 ad,
                  sigma_fit_axis,
                  shot_idx=0,
                  include_idx = [0,-1],
                  exclude_idx = []):
         
-        ad = atomdata
+        from waxa import atomdata
+        ad: atomdata
         
         if sigma_fit_axis == 'y':
             cloudfits = ad.cloudfit_y
@@ -81,7 +81,7 @@ def get_B(f_mf0_mf1_transition,
 
         return find_xval(f_mf0_mf1_transition,f_transitions,B)
 
-def rabi_oscillation(ad:atomdata,
+def rabi_oscillation(ad,
                      rf_frequency_hz,
                      pulse_times_array=[],
                      populations_array=[],
@@ -141,6 +141,9 @@ def rabi_oscillation(ad:atomdata,
         t_pi: The pi pulse time in seconds.
         popt: The fit result (order Omega, phi, B, A, tau)
     """
+
+    from waxa import atomdata
+    ad: atomdata
 
     # Define the Rabi oscillation function
     def _fit_func_rabi_oscillation(t, Omega, phi, B, A, tau):
@@ -323,7 +326,7 @@ def rabi_oscillation(ad:atomdata,
 
     return t_pi, popt
 
-def rabi_oscillation_2d(ad:atomdata,
+def rabi_oscillation_2d(ad,
                         populations_array=[],
                         include_idx=[0,-1],
                         exclude_idx=[],
@@ -394,6 +397,9 @@ def rabi_oscillation_2d(ad:atomdata,
         rf_frequencies (np.array): The RF frequencies at which each Rabi
         frequency / pi pulse time was measured.
     """    
+
+    from waxa import atomdata
+    ad: atomdata
     
     rabi_frequencies_hz = []
     t_pis = []

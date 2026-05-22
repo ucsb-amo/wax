@@ -498,7 +498,8 @@ class RunDetailPane(QWidget):
 
         self.run_id_value = QLabel("-", self)
         self.datetime_value = QLabel("-", self)
-        self.experiment_value = ScrollableValueField(self)
+        self.experiment_value = QLabel("-", self)
+        self.experiment_value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.xvardims_value = QLabel("-", self)
         self.tags_value = QLabel("-", self)
         self.comment_value = ScrollableValueField(self)
@@ -540,13 +541,13 @@ class RunDetailPane(QWidget):
         xvar_header.setMaximumHeight(22)
         for col in range(6):
             xvar_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-        # Col 0 (xvarname) and preview stretch; fixed widths for numeric/unit cols.
+        # Col 0 (xvarname) stretches; fixed defaults for all other cols.
         xvar_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        xvar_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        xvar_header.resizeSection(1, 72)
-        xvar_header.resizeSection(2, 72)
-        xvar_header.resizeSection(3, 52)
-        xvar_header.resizeSection(5, 52)
+        xvar_header.resizeSection(1, 44)
+        xvar_header.resizeSection(2, 44)
+        xvar_header.resizeSection(3, 40)
+        xvar_header.resizeSection(4, 90)
+        xvar_header.resizeSection(5, 32)
         self.xvar_table.setMinimumHeight(80)
         xvars_layout.addWidget(self.xvar_table)
 
@@ -734,7 +735,9 @@ class RunDetailPane(QWidget):
     def set_run(self, run: RunSummary, datetime_text: str, xvardims_text: str):
         self.run_id_value.setText(str(run.run_id))
         self.datetime_value.setText(datetime_text or "-")
-        self.experiment_value.setText(run.experiment_name or "-")
+        _expt_name = run.experiment_name or "-"
+        self.experiment_value.setText(_expt_name)
+        self.experiment_value.setToolTip(_expt_name)
         self.xvardims_value.setText(xvardims_text or "()")
         self.tags_value.setText(", ".join(run.tags) if run.tags else "-")
         self.comment_value.setText(run.comment if run.comment else "-")
@@ -2907,13 +2910,8 @@ class DataBrowserWindow(QMainWindow):
         win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         layout = QVBoxLayout(win)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        path_label = QLabel(file_path, win)
-        path_label.setObjectName("fileViewerPathLabel")
-        path_label.setWordWrap(True)
-        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(path_label)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         editor = QPlainTextEdit(win)
         editor.setReadOnly(True)
@@ -2945,10 +2943,6 @@ class DataBrowserWindow(QMainWindow):
             editor.setPlainText(f"File not found on this machine:\n{norm_path}")
 
         layout.addWidget(editor)
-
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, win)
-        btns.rejected.connect(win.accept)
-        layout.addWidget(btns)
 
         win.show()
         # Keep reference so the window isn't garbage-collected

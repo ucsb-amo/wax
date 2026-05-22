@@ -106,10 +106,14 @@ class PrecilaserLaserServer(WaxxServer):
     def start(self) -> None:
         if self.running:
             return
-        # Pre-bind to learn the OS-assigned port before the beacon fires.
+        # Pre-bind and start listening so the TCP server is ready before the
+        # beacon fires and before we attempt the COM connection.  This lets the
+        # GUI connect and display server status even while connect_laser() is
+        # still running (or has failed).
         _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         _sock.bind((self.host, 0))
+        _sock.listen(16)
         self.server_socket = _sock
         self.port = _sock.getsockname()[1]
         self._waxx_port = self.port
@@ -122,10 +126,19 @@ class PrecilaserLaserServer(WaxxServer):
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
         if self.auto_connect:
-            try:
-                self.connect_laser()
-            except Exception as exc:
-                LOGGER.exception("Initial serial connection failed: %s", exc)
+            threading.Thread(target=self._initial_connect, daemon=True).start()
+
+    def _initial_connect(self) -> None:
+        """Connect to the serial port in a background thread.
+
+        Called once from start() so that the TCP server is already accepting
+        connections (and the GUI can poll status) while the COM port is being
+        opened.
+        """
+        try:
+            self.connect_laser()
+        except Exception as exc:
+            LOGGER.exception("Initial serial connection failed: %s", exc)
 
     def stop(self) -> None:
         if self._stopped:
@@ -462,30 +475,83 @@ class PrecilaserLaserServer(WaxxServer):
             self.status.working_current_a = current_a
 
     def _run_sequence(self, sequence_type: str) -> None:
-        try:
-            if self.laser is None:
-                raise RuntimeError("Laser not connected")
-            startup_controller = PrecilaserStartupController(self.laser)
-            startup_controller.on_step = self._on_ramp_step
-            if sequence_type == "STARTUP":
-                startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
-            else:
-                startup_controller.run_turn_off_procedure(should_continue=self._should_continue_sequence)
+        max_reconnect_attempts = 3
+        reconnect_attempt = 0
+        while True:
+            try:
+                with self._laser_lock:
+                    if self.laser is None:
+                        raise RuntimeError("Laser not connected")
+                    laser_ref = self.laser
+                startup_controller = PrecilaserStartupController(laser_ref)
+                startup_controller.on_step = self._on_ramp_step
+                if sequence_type == "STARTUP":
+                    startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
+                else:
+                    startup_controller.run_turn_off_procedure(should_continue=self._should_continue_sequence)
 
-            # Pull a final full snapshot at sequence end (PD, temp, stage currents, flags).
-            self.poll_status()
+                # Pull a final full snapshot at sequence end (PD, temp, stage currents, flags).
+                self.poll_status()
 
-            with self._state_lock:
-                self.sequence_state = SequenceState.COMPLETED
-            LOGGER.info("%s sequence completed", sequence_type.title())
-        except Exception as exc:
-            LOGGER.exception("%s sequence failed: %s", sequence_type.title(), exc)
-            with self._state_lock:
-                self.sequence_state = SequenceState.INTERRUPTED
-        finally:
-            with self._state_lock:
-                if self.sequence_state != SequenceState.RUNNING:
-                    pass
+                with self._state_lock:
+                    self.sequence_state = SequenceState.COMPLETED
+                LOGGER.info("%s sequence completed", sequence_type.title())
+                return
+            except Exception as exc:
+                # User-requested interrupt: stop without retrying.
+                if not self._should_continue_sequence():
+                    LOGGER.warning("%s sequence interrupted", sequence_type.title())
+                    with self._state_lock:
+                        self.sequence_state = SequenceState.INTERRUPTED
+                    return
+                if isinstance(exc, RuntimeError) and "interrupted" in str(exc).lower():
+                    LOGGER.warning("%s sequence interrupted", sequence_type.title())
+                    with self._state_lock:
+                        self.sequence_state = SequenceState.INTERRUPTED
+                    return
+
+                # COM / serial error: try to reconnect and resume from current laser state.
+                reconnect_attempt += 1
+                if reconnect_attempt > max_reconnect_attempts:
+                    LOGGER.exception(
+                        "%s sequence failed after %d reconnect attempt(s): %s",
+                        sequence_type.title(), reconnect_attempt - 1, exc,
+                    )
+                    with self._state_lock:
+                        self.sequence_state = SequenceState.INTERRUPTED
+                    return
+
+                LOGGER.warning(
+                    "COM error during %s sequence (reconnect attempt %d/%d): %s"
+                    " — reconnecting and resuming...",
+                    sequence_type.lower(), reconnect_attempt, max_reconnect_attempts, exc,
+                )
+                try:
+                    with self._laser_lock:
+                        if self.laser is not None:
+                            try:
+                                self.laser.close()
+                            except Exception:
+                                pass
+                        time.sleep(self.reconnect_delay_s)
+                        self.laser = PrecilaserController(port=self.serial_port)
+                        self.laser.connect()
+                        with self._state_lock:
+                            self.status.connected = True
+                            self.status.connection_state = ConnectionState.CONNECTED
+                    LOGGER.info(
+                        "Reconnected on %s; resuming %s sequence",
+                        self.serial_port, sequence_type.lower(),
+                    )
+                except Exception as reconnect_exc:
+                    LOGGER.exception(
+                        "Serial reconnect during %s sequence failed: %s",
+                        sequence_type.lower(), reconnect_exc,
+                    )
+                    with self._state_lock:
+                        self.status = LaserStatus(
+                            connected=False, connection_state=ConnectionState.ERROR
+                        )
 
 
 

@@ -39,6 +39,19 @@ def _request(command: str, host: str, port: int, timeout: float) -> dict:
                 break
     return json.loads(b"".join(chunks).decode("utf-8").strip())
 
+class HMRDummy():
+    """Fallback dummy client that returns zeros for all field values."""
+
+    def get_field_magnitude(self, timeout: float = 5.) -> float:
+        return float(0.)
+
+    def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
+        return np.zeros(4, dtype=float)
+
+    def get_reference_field_array_with_metadata(self, date=None, timeout: float = 2.0):
+        field_vec = np.zeros(4, dtype=float)
+        metadata = {"timestamp_s": 0.0, "datetime_iso": ""}
+        return field_vec, metadata
 
 class HMRClient(WaxxClient):
     """Client for the HMR2300 magnetometer TCP server."""

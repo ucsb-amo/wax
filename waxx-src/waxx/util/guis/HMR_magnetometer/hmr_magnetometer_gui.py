@@ -11,6 +11,7 @@ Usage::
 
 import argparse
 import csv
+import logging
 import math
 import os
 import queue
@@ -33,6 +34,8 @@ PLOT_BUFFER_MAXLEN = 2000
 STATS_WINDOW = 200
 DEFAULT_STATS_WINDOW_S = 10.0
 READOUT_PANEL_WIDTH = 300
+
+logger = logging.getLogger(__name__)
 
 class FixedPrecisionAxisItem(pg.AxisItem):
     def __init__(self, orientation, decimals=4, **kwargs):
@@ -925,6 +928,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 if self.stop_event.is_set() or session_id != self.session_id:
                     return
                 consec_errors += 1
+                logger.warning("Server poll error #%d: %s", consec_errors, exc)
                 self.data_queue.put({
                     "session_id": session_id,
                     "warning": f"Server poll error ({consec_errors}): {exc}",
@@ -979,6 +983,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 self._update_plot()
 
         except Exception as exc:
+            logger.warning("_process_queue: unhandled exception: %s", exc)
             self._set_status(f"GUI error: {exc}")
 
     # ------------------------------------------------------------------
@@ -1208,6 +1213,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             result = self.client._get_serial_status(timeout=1.5)
             connected = bool(result.get("connected", False))
         except Exception:
+            logger.debug("_refresh_serial_status: serial status query failed", exc_info=True)
+            # Drop the client so the next tick re-discovers via beacon
+            # (handles server restart at a new port).
+            self.client = None
             self.serial_connected = None
             self.serial_button.setText("Serial: ?")
             self.serial_button.setStyleSheet(
@@ -1215,6 +1224,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
             )
             return
+
+        # Server is reachable — restart the monitor if it stopped due to errors.
+        if not self.running:
+            self.start_monitor()
 
         self.serial_connected = connected
         if connected:

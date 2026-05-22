@@ -79,8 +79,6 @@ class WaxxServer:
             daemon=True,
         )
         self._waxx_beacon_thread.start()
-        logger.info("[WaxxServer] Beacon started: %s on port %d",
-                    self._waxx_server_id, self._waxx_port)
 
     def _stop_beacon(self) -> None:
         """Signal the beacon thread to stop and wait briefly for it."""
@@ -88,7 +86,6 @@ class WaxxServer:
         if self._waxx_beacon_thread is not None:
             self._waxx_beacon_thread.join(timeout=self._waxx_beacon_interval + 1.0)
             self._waxx_beacon_thread = None
-        logger.info("[WaxxServer] Beacon stopped: %s", self._waxx_server_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -166,7 +163,6 @@ class WaxxServer:
             ip = self._get_local_ip()
 
             if ip is None:
-                logger.debug("[WaxxServer] Could not determine local LAN IP, will retry.")
                 self._waxx_beacon_stop.wait(timeout=self._waxx_beacon_interval)
                 continue
 
@@ -180,7 +176,6 @@ class WaxxServer:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                     sock.bind((ip, 0))
                     current_bound_ip = ip
-                    logger.debug("[WaxxServer] Beacon socket bound to %s", ip)
                 except Exception as exc:
                     logger.warning("[WaxxServer] Could not create beacon socket on %s: %s", ip, exc)
                     _close_sock()
@@ -194,8 +189,6 @@ class WaxxServer:
             }).encode()
             try:
                 sock.sendto(payload, (_BROADCAST_ADDR, DISCOVERY_PORT))
-                logger.debug("[WaxxServer] Beacon: %s @ %s:%d",
-                             self._waxx_server_id, ip, self._waxx_port)
             except Exception as exc:
                 logger.warning("[WaxxServer] Beacon send failed: %s", exc)
                 _close_sock()

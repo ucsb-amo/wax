@@ -413,10 +413,6 @@ class RunScanner:
         return fallback_str, fallback_str
 
     def _read_xvardims(self, h5file, xvarnames):
-        if "data" in h5file and "sort_N" in h5file["data"]:
-            sort_n = np.asarray(h5file["data"]["sort_N"][()]).reshape(-1)
-            return tuple(int(value) for value in sort_n.tolist())
-
         if "params" in h5file:
             dims = []
             for name in xvarnames:

@@ -1,8 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from waxa import atomdata
 
-def plot_image_grid(ad:atomdata,
+
+def plot_image_grid(ad,
                     ndarray = [],
                     xvarformat="1.2f",
                      xvar0format="",
@@ -11,6 +11,8 @@ def plot_image_grid(ad:atomdata,
                      xvar1mult=1.,
                      max_od=0.,
                      figsize=[]):
+    from waxa import atomdata
+    ad: atomdata
     if not xvar0format:
         xvar0format = xvarformat
     if not xvar1format:
@@ -140,7 +142,7 @@ def mixOD_grid(ad,
     
     plt.gca().set_aspect(aspect)
 
-def plot_sum_od_fits(ad:atomdata,axis=0,
+def plot_sum_od_fits(ad,axis=0,
                      xvarformat='1.3f',
                      xvar0format='',
                      xvar1format='',
@@ -148,6 +150,9 @@ def plot_sum_od_fits(ad:atomdata,axis=0,
                      xvar1mult=1.,
                      max_od=0.,
                      figsize=[]):
+    
+    from waxa import atomdata
+    ad: atomdata
     
     if not xvar0format:
         xvar0format = xvarformat

@@ -93,7 +93,6 @@ class _ServiceDiscoveryRegistry:
                 port = int(msg["port"])
                 with self._lock:
                     self._cache[server_id] = (ip, port)
-                logger.debug("[WaxxClient] Cached beacon: %s @ %s:%d", server_id, ip, port)
             except Exception:
                 pass
 
