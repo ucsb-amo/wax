@@ -145,7 +145,10 @@ class ROI():
             self.roiy = [0,py]
 
     def save_roi_h5(self, lite=False, printouts=False):
-        fpath, _ = self.server_talk.get_data_file(self.run_id,lite=lite)
+        if self._current_file_path is not None:
+            fpath = self._current_file_path
+        else:
+            fpath, _ = self.server_talk.get_data_file(self.run_id, lite=lite)
         with h5py.File(fpath,'r+') as f:
             f.attrs['roix'] = self.roix
             f.attrs['roiy'] = self.roiy

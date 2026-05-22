@@ -1644,6 +1644,13 @@ class atomdata_base():
             unpack_group(f,'params',self.params)
             unpack_group(f,'camera_params',self.camera_params)
             unpack_group(f,'run_info',self.run_info)
+
+            # N_repeats must always be an int. HDF5 may store it as a
+            # 0-d array, a 1-element array, or a list — normalise here.
+            _nr = self.params.N_repeats
+            if hasattr(_nr, '__len__'):
+                _nr = int(np.asarray(_nr).flat[0])
+            self.params.N_repeats = int(_nr)
             timing['h5_unpack_headers_s'] = time.perf_counter() - t_stage
 
             print(self.run_info.run_id)

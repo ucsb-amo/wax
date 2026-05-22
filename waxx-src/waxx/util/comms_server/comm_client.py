@@ -19,19 +19,25 @@ class CommClient(WaxxClient):
 
         :param message: The message to send (string).
         """
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            self.sock.connect(self.server_address)
-            self.sock.sendall(message.encode())
-            reply = self.sock.recv(1024)
-            return reply.decode()
-        except Exception as e:
-            if "[WinError 10061]" in str(e):
-                print("Connection refused [WinError 10061]: Unable to reach the server")
-            else:
-                print(e)
-        finally:
-            self.sock.close()
+        for attempt in range(2):
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                self.sock.connect(self.server_address)
+                self.sock.sendall(message.encode())
+                reply = self.sock.recv(1024)
+                return reply.decode()
+            except Exception as e:
+                if attempt == 0:
+                    # Rediscover server in case it restarted at a new IP/port.
+                    if self._rediscover(timeout=2.0):
+                        self.server_address = (self.host, self.port)
+                    continue
+                if "[WinError 10061]" in str(e):
+                    print("Connection refused [WinError 10061]: Unable to reach the server")
+                else:
+                    print(e)
+            finally:
+                self.sock.close()
         
     def close(self):
         """

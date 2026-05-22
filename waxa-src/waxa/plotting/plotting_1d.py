@@ -342,10 +342,11 @@ def plot_sum_od_fits(ad:atomdata,axis=0,
 
     if figsize:
         fig, ax = plt.subplots(Nr,Ns,
-                               figsize=figsize,layout='tight')
+                               figsize=figsize,
+                               layout='constrained')
     else:
         fig, ax = plt.subplots(Nr,Ns,
-                           layout='tight')
+                           layout='constrained')
 
     if isinstance(ax, Axes):
         ax = [ax]

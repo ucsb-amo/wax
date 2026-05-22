@@ -13,8 +13,8 @@ import os
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton,
                              QDialog, QHBoxLayout, QSlider, QSpinBox, QDoubleSpinBox, QFormLayout,
-                             QMenuBar, QMenu)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+                             QMenuBar, QMenu, QSplitter)
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QIcon
 from PyQt6.QtCore import QTimer, Qt, QRect, QPoint
 from pypylon import pylon
 import pyqtgraph as pg
@@ -99,7 +99,7 @@ class CameraSettingsDialog(QDialog):
         exposure_layout.addWidget(self.exposure_slider)
         exposure_layout.addWidget(self.exposure_spinbox)
         layout.addRow("Exposure Time:", exposure_layout)
-        
+
         self.setLayout(layout)
     
     def on_gain_slider_changed(self, value):
@@ -143,6 +143,7 @@ class CameraSettingsDialog(QDialog):
             self.camera.ExposureTime.SetValue(self.exposure_spinbox.value())
         except Exception as e:
             print(f"Error setting exposure time: {e}")
+
 
 
 class CountsSettingsDialog(QDialog):
@@ -201,23 +202,12 @@ class CountsSettingsDialog(QDialog):
             self.parent_counts.time_window = self.time_window_spinbox.value()
 
 
-class CountsWindow(QDialog):
+class CountsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Pixel Counts")
-        self.parent_viewer = parent
-        
-        # Position to the right of parent window
-        if parent:
-            parent_geometry = parent.geometry()
-            x = parent_geometry.right() + 10
-            y = parent_geometry.top()
-            self.setGeometry(x, y, 500, 400)
-        else:
-            self.setGeometry(200, 200, 500, 400)
-        
+
         layout = QVBoxLayout()
-        
+
         # Button layout
         button_layout = QHBoxLayout()
         
@@ -236,7 +226,7 @@ class CountsWindow(QDialog):
         # PyQtGraph plot
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setLabel('left', 'Pixel Counts')
-        self.plot_widget.setLabel('bottom', 'Time', units='s')
+        self.plot_widget.setLabel('bottom', 'seconds ago')
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
         self.plot_widget.enableAutoRange()
         layout.addWidget(self.plot_widget)
@@ -261,38 +251,36 @@ class CountsWindow(QDialog):
     def update_plot(self):
         self.plot_widget.clear()
         plot_item = self.plot_widget.getPlotItem()
-        
-        # Determine which data to plot
-        if self.fixed_interval and len(self.timestamps) > 0:
-            current_time = self.timestamps[-1]
-            # Keep a full-width window even if not enough data yet
-            if current_time < self.time_window:
-                start_time = 0
-                end_time = self.time_window
-            else:
-                start_time = current_time - self.time_window
-                end_time = current_time
-            
-            # Slice data within window
+
+        if len(self.timestamps) == 0:
+            plot_item.enableAutoRange()
+            return
+
+        # Transform timestamps to "seconds ago" (0 = now, negative = older)
+        current_time = self.timestamps[-1]
+        t_ago = [t - current_time for t in self.timestamps]
+
+        if self.fixed_interval:
+            # Slice data within the rolling window
             start_idx = 0
-            for i, t in enumerate(self.timestamps):
-                if t >= start_time:
+            for i, t in enumerate(t_ago):
+                if t >= -self.time_window:
                     start_idx = i
                     break
-            plot_timestamps = self.timestamps[start_idx:]
+            plot_timestamps = t_ago[start_idx:]
             plot_counts = self.counts[start_idx:]
-            
+
             # Lock X range to fixed window, keep Y auto
             plot_item.enableAutoRange(axis='x', enable=False)
             plot_item.enableAutoRange(axis='y', enable=True)
-            plot_item.setXRange(start_time, end_time, padding=0)
+            plot_item.setXRange(-self.time_window, 0, padding=0)
         else:
-            plot_timestamps = self.timestamps
+            plot_timestamps = t_ago
             plot_counts = self.counts
-            # Auto-range both axes when not fixed interval or no data
+            # Auto-range both axes when not fixed interval
             plot_item.enableAutoRange(axis='x', enable=True)
             plot_item.enableAutoRange(axis='y', enable=True)
-        
+
         # Draw data if any points exist (green line, no points)
         if len(plot_timestamps) > 0:
             self.plot_widget.plot(plot_timestamps, plot_counts, pen=pg.mkPen('g', width=2))
@@ -311,14 +299,6 @@ class CountsWindow(QDialog):
         self.start_time = None
         self.update_plot()
     
-    def closeEvent(self, event):
-        if self.settings_dialog:
-            self.settings_dialog.close()
-        if self.parent_viewer:
-            self.parent_viewer.counts_window = None
-            self.parent_viewer.show_rectangle = False
-        super().closeEvent(event)
-
 class BaslerCameraViewer(QMainWindow):
     def __init__(self,basler_serial="40277706"):
         super().__init__()
@@ -338,51 +318,65 @@ class BaslerCameraViewer(QMainWindow):
         self.rect_start = None
         self.rect_end = None
         self.current_rect = None
-        self.show_rectangle = False
-        self.counts_window = None
+        self.show_rectangle = True
         self.rect_file = "camera_rect.json"
         self.last_image = None
         self.current_pixmap = None
         self.settings_dialog = None
+        self.saturation_in_box_only = True
         self.load_rectangle()
         
         self.initUI()
         self.connect_camera()
     
     def initUI(self):
-        self.setWindowTitle("Basler Camera Stream")
-        self.setGeometry(100, 100, 768, 432)
-        
+        self.setWindowTitle("Basler Stream")
+        self.setGeometry(100, 100, 1280, 500)
+
         # Create menu bar
         menubar = self.menuBar()
         settings_menu = menubar.addMenu("Settings")
         settings_action = settings_menu.addAction("Camera Settings")
         settings_action.triggered.connect(self.show_settings_dialog)
-        
-        # Add a direct Counts action on the menu bar
-        counts_action = menubar.addAction("Counts")
-        counts_action.triggered.connect(self.show_counts_window)
-        
-        # Central widget and layout
+        self.sat_in_box_action = settings_menu.addAction("Saturation warning only in box")
+        self.sat_in_box_action.setCheckable(True)
+        self.sat_in_box_action.setChecked(self.saturation_in_box_only)
+        self.sat_in_box_action.toggled.connect(lambda checked: setattr(self, 'saturation_in_box_only', checked))
+
+        # Central widget — horizontal split: camera left, counts right
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
-        
-        # Image label
+        outer_layout = QVBoxLayout(central_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer_layout.addWidget(splitter)
+
+        # Left side: camera image + toggle button
+        camera_widget = QWidget()
+        camera_layout = QVBoxLayout(camera_widget)
+        camera_layout.setContentsMargins(0, 0, 0, 0)
+
         self.image_label = QLabel()
         self.image_label.setStyleSheet("background-color: black;")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(1, 1)
         self.image_label.mousePressEvent = self.on_image_mouse_press
         self.image_label.mouseMoveEvent = self.on_image_mouse_move
         self.image_label.mouseReleaseEvent = self.on_image_mouse_release
-        layout.addWidget(self.image_label)
-        
-        # Toggle button
+        camera_layout.addWidget(self.image_label)
+
         self.toggle_button = QPushButton("Stop")
         self.toggle_button.clicked.connect(self.on_toggle_stream)
-        layout.addWidget(self.toggle_button)
-        
-        central_widget.setLayout(layout)
+        camera_layout.addWidget(self.toggle_button)
+
+        splitter.addWidget(camera_widget)
+        splitter.setStretchFactor(0, 3)
+
+        # Right side: counts panel (always visible)
+        self.counts_panel = CountsPanel()
+        splitter.addWidget(self.counts_panel)
+        splitter.setStretchFactor(1, 2)
     
     def on_toggle_stream(self):
         if self.is_streaming:
@@ -442,15 +436,6 @@ class BaslerCameraViewer(QMainWindow):
         image_y = int(pixmap_y * scale_y)
         
         return QPoint(image_x, image_y)
-    
-    def show_counts_window(self):
-        if self.counts_window is None:
-            self.counts_window = CountsWindow(self)
-            self.counts_window.show()
-            self.show_rectangle = True
-        else:
-            self.counts_window.raise_()
-            self.counts_window.activateWindow()
     
     def on_image_mouse_press(self, event):
         if self.show_rectangle:
@@ -515,7 +500,7 @@ class BaslerCameraViewer(QMainWindow):
             # Open camera
             self.camera.Open()
             model_name = self.camera.GetDeviceInfo().GetModelName()
-            self.setWindowTitle(f"Basler Camera Stream - {model_name}")
+            self.setWindowTitle(f"Basler Camera Stream - {model_name} ({self.SERIAL_NUMBER})")
             
             # Get maximum pixel value from camera
             try:
@@ -533,7 +518,7 @@ class BaslerCameraViewer(QMainWindow):
             
             # Set default values
             try:
-                self.camera.Gain.SetValue(5)
+                self.camera.Gain.SetValue(0)
             except Exception as e:
                 print(f"Could not set default gain: {e}")
             
@@ -585,17 +570,17 @@ class BaslerCameraViewer(QMainWindow):
                 else:  # Color
                     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 
-                # Calculate pixel counts if rectangle is defined and counts window is open
-                if self.counts_window and self.current_rect:
+                # Calculate pixel counts if rectangle is defined
+                if self.current_rect:
                     x1 = max(0, self.current_rect.x())
                     y1 = max(0, self.current_rect.y())
                     x2 = min(image.shape[1], self.current_rect.x() + self.current_rect.width())
                     y2 = min(image.shape[0], self.current_rect.y() + self.current_rect.height())
-                    
+
                     if x2 > x1 and y2 > y1:
                         roi = image[y1:y2, x1:x2]
                         pixel_sum = np.sum(roi)
-                        self.counts_window.add_count(pixel_sum)
+                        self.counts_panel.add_count(pixel_sum)
                 
                 # Convert to QImage
                 h, w, ch = image_rgb.shape
@@ -624,7 +609,15 @@ class BaslerCameraViewer(QMainWindow):
                 
                 # Check for saturated pixels
                 max_pixel_value = self.max_pixel_value if hasattr(self, 'max_pixel_value') else 255
-                is_saturated = np.any(image == max_pixel_value)
+                if self.saturation_in_box_only and self.current_rect and self.current_rect.width() > 0 and self.current_rect.height() > 0:
+                    sx1 = max(0, self.current_rect.x())
+                    sy1 = max(0, self.current_rect.y())
+                    sx2 = min(image.shape[1], self.current_rect.x() + self.current_rect.width())
+                    sy2 = min(image.shape[0], self.current_rect.y() + self.current_rect.height())
+                    check_region = image[sy1:sy2, sx1:sx2] if sx2 > sx1 and sy2 > sy1 else image
+                else:
+                    check_region = image
+                is_saturated = np.any(check_region == max_pixel_value)
                 
                 # Draw saturation warning if needed
                 if is_saturated:
@@ -640,7 +633,7 @@ class BaslerCameraViewer(QMainWindow):
                 
                 # Scale to fit label
                 pixmap = QPixmap.fromImage(qt_image)
-                scaled_pixmap = pixmap.scaledToWidth(self.image_label.width(), Qt.TransformationMode.SmoothTransformation)
+                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 self.image_label.setPixmap(scaled_pixmap)
                 self.current_pixmap = pixmap
             
@@ -654,8 +647,6 @@ class BaslerCameraViewer(QMainWindow):
             self.retry_timer.stop()
         if self.settings_dialog:
             self.settings_dialog.close()
-        if self.counts_window:
-            self.counts_window.close()
         if self.camera:
             self.timer.stop()
             self.camera.StopGrabbing()
@@ -663,7 +654,23 @@ class BaslerCameraViewer(QMainWindow):
         super().closeEvent(event)
 
 def main():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('kexp.mot_viewer')
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+
+    # Render red ball emoji as window/taskbar icon
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setFont(QFont("Segoe UI Emoji", 48))
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "\U0001f534")
+    painter.end()
+    app.setWindowIcon(QIcon(pixmap))
+
     viewer = BaslerCameraViewer()
     viewer.show()
     sys.exit(app.exec())

@@ -137,6 +137,8 @@ class HMRClient(WaxxClient):
                 if attempt == max_attempts - 1:
                     print(f"Reading magnetometer failed after {max_attempts} attempts: {e}")
                     return float(0.)
+                # Attempt to find the server at a new IP/port before retrying.
+                self._rediscover(timeout=1.0)
 
     def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
         """Return [Bx, By, Bz, Btot] from the newest reference at or before *date*.
