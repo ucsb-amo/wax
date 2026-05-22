@@ -594,7 +594,15 @@ class MonitorStatusChecker(QThread):
                 status = self.monitor_client.check_status()
                 if status is not None:
                     self.status_updated.emit(int(status))
-                time.sleep(0.5)
+                    time.sleep(0.5)
+                else:
+                    # send_message() swallows exceptions and returns None on
+                    # failure — treat this as a lost connection and force
+                    # re-discovery on the next iteration.
+                    print("[DeviceGUI] check_status returned None — forcing rediscovery")
+                    self.monitor_client = None
+                    self.connection_failed.emit()
+                    time.sleep(2.0)
             except Exception as e:
                 from waxx.util.comms_server.waxx_client import _registry
                 with _registry._lock:

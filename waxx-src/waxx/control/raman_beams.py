@@ -76,16 +76,10 @@ class RamanBeamPair():
         self._pow_relphase = np.int32(0)
         self._asf0 = np.int32(0)
         self._asf1 = np.int32(0)
-
-        # precomputed linear coefficients for set_frequency_fast (set by set_up_fast_frequency_update)
-        self._f_offset0 = 0.
-        self._f_coeff0 = 0.
-        self._f_offset1 = 0.
-        self._f_coeff1 = 0.
-        self._ftw_offset0 = 0
-        self._ftw_coeff0 = 0.
-        self._ftw_offset1 = 0
-        self._ftw_coeff1 = 0.
+        self._new_ftw0 = np.int32(0)
+        self._new_ftw1 = np.int32(0)
+        self._new_f0 = 0.
+        self._new_f1 = 0.
 
         self._fast_freq_stage_valid = np.int32(0)
         self._fast_freq_aggressive_enabled = np.int32(0)
@@ -291,29 +285,6 @@ class RamanBeamPair():
 
         at_mu(now_mu() & ~7)
 
-        # Precompute linear map: transition frequency -> AO frequency and FTW.
-        # self.state_splitting_to_ao_frequency(0.)
-        # f0_lo = self._dummy[DDS0_IDX]
-        # f1_lo = self._dummy[DDS1_IDX]
-        # self.state_splitting_to_ao_frequency(1.)
-        # f0_hi = self._dummy[DDS0_IDX]
-        # f1_hi = self._dummy[DDS1_IDX]
-
-        # self._f_offset0 = f0_lo
-        # self._f_coeff0 = f0_hi - f0_lo
-        # self._f_offset1 = f1_lo
-        # self._f_coeff1 = f1_hi - f1_lo
-
-        # ftw0_lo = self.dds0.dds_device.frequency_to_ftw(f0_lo)
-        # ftw0_hi = self.dds0.dds_device.frequency_to_ftw(f0_hi)
-        # ftw1_lo = self.dds1.dds_device.frequency_to_ftw(f1_lo)
-        # ftw1_hi = self.dds1.dds_device.frequency_to_ftw(f1_hi)
-
-        # self._ftw_offset0 = ftw0_lo
-        # self._ftw_coeff0 = float(ftw0_hi - ftw0_lo)
-        # self._ftw_offset1 = ftw1_lo
-        # self._ftw_coeff1 = float(ftw1_hi - ftw1_lo)
-
     @kernel
     def _invalidate_fast_frequency_update_state(self):
         self._fast_freq_event_token = np.int32(self._fast_freq_event_token + 1)
@@ -452,18 +423,40 @@ class RamanBeamPair():
         self._aggressive_config_pending1 = np.int32(0)
         self._restore_default_profile_mode()
 
+    @kernel
+    def io_update(self):
+        at_mu(now_mu() & ~7)
+
+        dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
+        dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
+
+        with parallel:
+            with sequential:
+                delay_mu(dt0)
+                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+            with sequential:
+                delay_mu(dt1)
+                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+    
+        at_mu(now_mu() & ~7)
+
+        self.dds0.frequency = self._new_f0
+        self.dds0._ftw = self._new_ftw0
+        # self.dds0.update_phase_at_set()
+
+        self.dds1.frequency = self._new_f1
+        self.dds1._ftw = self._new_ftw1
+        # self.dds1.update_phase_at_set()
+
     @kernel(flags={"fast-math"})
     def set_frequency_fast(self,
                  frequency_transition,
-                 dt_phase_origin_shift_mu=T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU):
+                 do_io_update=True):
+        
         self.dds0._last_ftw = self.dds0._ftw    
         self.dds1._last_ftw = self.dds1._ftw
 
         self.frequency_transition = frequency_transition
-        # f0 = self._f_offset0 + self._f_coeff0 * frequency_transition
-        # f1 = self._f_offset1 + self._f_coeff1 * frequency_transition
-        # ftw0 = int32(self._ftw_offset0 + self._ftw_coeff0 * frequency_transition)
-        # ftw1 = int32(self._ftw_offset1 + self._ftw_coeff1 * frequency_transition)
 
         self.state_splitting_to_ao_frequency(frequency_transition)
         f0 = self._dummy[DDS0_IDX]
@@ -471,8 +464,10 @@ class RamanBeamPair():
         ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
         ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
 
-        dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
-        dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
+        self._new_f0 = f0
+        self._new_f1 = f1
+        self._new_ftw0 = ftw0
+        self._new_ftw1 = ftw1
 
         at_mu(now_mu() & ~7)
 
@@ -490,12 +485,8 @@ class RamanBeamPair():
             with parallel:
                 with sequential:
                     self.dds0.dds_device.bus.write(ftw0)
-                    delay_mu(dt0)
-                    self.dds0.dds_device.cpld.io_update.pulse_mu(8)
                 with sequential:
                     self.dds1.dds_device.bus.write(ftw1)
-                    delay_mu(dt1)
-                    self.dds1.dds_device.cpld.io_update.pulse_mu(8)
             self.reset_fast_frequency_update_stage()
         else:
             if self._fast_freq_addr_pending0 == 1 or self._fast_freq_addr_pending1 == 1:
@@ -510,26 +501,16 @@ class RamanBeamPair():
                         urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
                     )
                     self.dds0.dds_device.bus.write(ftw0)
-                    delay_mu(dt0)
-                    self.dds0.dds_device.cpld.io_update.pulse_mu(8)
                 with sequential:
                     self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
                     self.dds1.dds_device.bus.set_config_mu(
                         urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
                     )
                     self.dds1.dds_device.bus.write(ftw1)
-                    delay_mu(dt1)
-                    self.dds1.dds_device.cpld.io_update.pulse_mu(8)
             self._fast_freq_stage_valid = np.int32(0)
-        
-        at_mu(now_mu() & ~7)
-        self.dds0.frequency = f0
-        self.dds0._ftw = ftw0
-        # self.dds0.update_phase_at_set()
-
-        self.dds1.frequency = f1
-        self.dds1._ftw = ftw1
-        # self.dds1.update_phase_at_set()
+            
+        if do_io_update:
+            self.io_update()
 
     @kernel(flags={"fast-math"})
     def set(self,
