@@ -277,9 +277,10 @@ class PrecilaserControlGUI(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setSpacing(8)
 
-        self.connection_label = QLabel("Server: (searching...)")
-        self.connection_label.setStyleSheet("font-size: 16px; font-weight: 700;")
-        layout.addWidget(self.connection_label)
+        self.server_conn_button = QPushButton("Server: searching\u2026")
+        self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.server_conn_button.clicked.connect(self._retry_server_connection)
+        layout.addWidget(self.server_conn_button)
 
         self.connection_state_value = QLabel("DISCONNECTED")
         self.connection_state_value.setStyleSheet("font-size: 14px; font-weight: 700;")
@@ -499,18 +500,40 @@ class PrecilaserControlGUI(QMainWindow):
         except Exception as exc:
             self._append_log(f"ERROR interrupt sequence: {exc}")
 
+    def _set_server_conn_button_state(self, state: str) -> None:
+        """Update the server TCP connection button appearance.
+
+        state: 'searching' | 'connected' | 'lost'
+        """
+        if state == "connected" and self.client is not None:
+            text = f"Server: {self.client.host}:{self.client.port}"
+            style = "background-color: #2ba363; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+        elif state == "lost":
+            text = "Server: lost \u2014 click to retry"
+            style = "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+        else:
+            text = "Server: searching\u2026"
+            style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+        self.server_conn_button.setText(text)
+        self.server_conn_button.setStyleSheet(style)
+
+    def _retry_server_connection(self) -> None:
+        """Force immediate server rediscovery when the user clicks the connection button."""
+        self.client = None
+        self._set_server_conn_button_state("searching")
+        self._sync_remote_state()
+
     def _sync_remote_state(self) -> None:
         if self.client is None:
             try:
                 self.client = PrecilaserGuiClient(discovery_timeout=0.1)
-                self.connection_label.setText(
-                    f"Server: {self.client.host}:{self.client.port}"
-                )
+                self._set_server_conn_button_state("connected")
             except RuntimeError:
-                self.connection_label.setText("Server: (searching...)")
+                self._set_server_conn_button_state("searching")
                 return
         try:
             snapshot = self.client.get_snapshot()
+            self._set_server_conn_button_state("connected")
             self._apply_snapshot(snapshot)
             log_count = int(snapshot.get("log_count", self._next_log_index))
             self._sync_logs(log_count)
@@ -520,6 +543,9 @@ class PrecilaserControlGUI(QMainWindow):
             if err != self._last_remote_error:
                 self._append_log(f"ERROR remote sync: {err}")
                 self._last_remote_error = err
+            # Null the client so the next tick triggers full rediscovery.
+            self.client = None
+            self._set_server_conn_button_state("lost")
 
     def _sync_logs(self, log_count: int) -> None:
         if log_count <= self._next_log_index:

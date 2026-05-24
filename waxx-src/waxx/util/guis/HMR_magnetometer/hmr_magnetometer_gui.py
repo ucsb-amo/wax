@@ -272,6 +272,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         )
         right_controls.addWidget(settings_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
 
+        self.server_conn_button = QtWidgets.QPushButton("Server: searching\u2026")
+        self.server_conn_button.setFixedHeight(28)
+        self.server_conn_button.clicked.connect(self._retry_server_connection)
+        self._update_server_conn_button("searching")
+        right_controls.addWidget(self.server_conn_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
         self.serial_button = QtWidgets.QPushButton("Serial: ?")
         self.serial_button.setFixedHeight(28)
         self.serial_button.setStyleSheet(
@@ -1192,16 +1198,50 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.log_dialog = None
         self.log_text = None
 
+    def _update_server_conn_button(self, state: str) -> None:
+        """Update the server TCP connection button appearance.
+
+        state: 'searching' | 'connected' | 'lost'
+        """
+        if state == "connected" and self.client is not None:
+            text = f"Server: {self.client.host}:{self.client.port}"
+            style = (
+                "QPushButton { background: #e9f7ef; border: 1px solid #95d3ab; color: #2f6a45; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #dcf0e5; border-color: #77c594; }"
+            )
+        elif state == "lost":
+            text = "Server: lost \u2014 retry"
+            style = (
+                "QPushButton { background: #fbeeee; border: 1px solid #e6abab; color: #8b4040; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #f7dfdf; border-color: #d88f8f; }"
+            )
+        else:
+            text = "Server: searching\u2026"
+            style = (
+                "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+            )
+        self.server_conn_button.setText(text)
+        self.server_conn_button.setStyleSheet(style)
+
+    def _retry_server_connection(self) -> None:
+        """Force immediate server rediscovery when the user clicks the connection button."""
+        self.client = None
+        self._update_server_conn_button("searching")
+        self._refresh_serial_status()
+
     def _refresh_serial_status(self):
         if self.serial_button is None:
             return
         if self.client is None:
             try:
                 self.client = HMRClient(discovery_timeout=0.1)
+                self._update_server_conn_button("connected")
                 # Successfully connected — try to start monitor if not running.
                 if not self.running:
                     self.start_monitor()
             except RuntimeError:
+                self._update_server_conn_button("searching")
                 self.serial_connected = None
                 self.serial_button.setText("Serial: ?")
                 self.serial_button.setStyleSheet(
@@ -1217,6 +1257,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             # Drop the client so the next tick re-discovers via beacon
             # (handles server restart at a new port).
             self.client = None
+            self._update_server_conn_button("lost")
             self.serial_connected = None
             self.serial_button.setText("Serial: ?")
             self.serial_button.setStyleSheet(
@@ -1225,6 +1266,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             )
             return
 
+        self._update_server_conn_button("connected")
         # Server is reachable — restart the monitor if it stopped due to errors.
         if not self.running:
             self.start_monitor()

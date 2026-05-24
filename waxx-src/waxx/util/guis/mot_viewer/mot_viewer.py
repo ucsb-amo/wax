@@ -229,9 +229,9 @@ class CountsPanel(QWidget):
         self.plot_item.vb.sigResized.connect(self._sync_vb2_geometry)
         self.plot_item.hideAxis('right')
 
-        # Dotted reference line at y=1 on normalized axis
-        self.norm_ref_line = pg.InfiniteLine(pos=1, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine, width=1))
-        self.vb2.addItem(self.norm_ref_line)
+        # Dotted reference line at the raw norm_reference value on the left axis
+        self.norm_ref_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine, width=1))
+        self.plot_item.addItem(self.norm_ref_line)
         self.norm_ref_line.hide()
 
         self.timestamps = []
@@ -330,6 +330,7 @@ class CountsPanel(QWidget):
                     self.vb2.setYRange(norm_min, norm_max, padding=0.1)
             plot_item.showAxis('right')
             plot_item.getAxis('right').setLabel('Normalized')
+            self.norm_ref_line.setValue(self.norm_reference)
             self.norm_ref_line.show()
         else:
             plot_item.hideAxis('right')
@@ -696,12 +697,12 @@ class BaslerCameraViewer(QMainWindow):
             
             # Set default values
             try:
-                self.camera.Gain.SetValue(0)
+                self.camera.Gain.SetValue(12)
             except Exception as e:
                 print(f"Could not set default gain: {e}")
             
             try:
-                self.camera.ExposureTime.SetValue(1000)
+                self.camera.ExposureTime.SetValue(300)
             except Exception as e:
                 print(f"Could not set default exposure time: {e}")
 

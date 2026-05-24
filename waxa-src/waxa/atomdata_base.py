@@ -1642,7 +1642,7 @@ class atomdata_base():
         # figure out dimensions of each xvar
         self.xvardims = np.zeros(self.Nvars,dtype=int)
         for i in range(self.Nvars):
-            if type(xvars[i]) == np.int64:
+            if np.ndim(xvars[i]) == 0:
                 raise ValueError(f'Run {self.run_info.run_id} did not have a scanned parameter.')
             self.xvardims[i] = np.int32(len(xvars[i]))
 

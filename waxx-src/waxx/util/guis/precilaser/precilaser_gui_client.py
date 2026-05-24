@@ -14,17 +14,28 @@ class PrecilaserGuiClient(WaxxClient):
         self.timeout_s = timeout_s
 
     def _send_command(self, command: str) -> str:
+        """Send a single command and return a single-line server response.
+
+        On a connection-level error, rediscovers the server via UDP broadcast
+        and retries once — handles server restarts on a new ephemeral port.
+        """
         payload = f"{command}\n".encode("utf-8")
-        with socket.create_connection((self.host, self.port), timeout=self.timeout_s) as sock:
-            sock.settimeout(self.timeout_s)
-            sock.sendall(payload)
-            chunks = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8", errors="replace").strip()
+        for attempt in range(2):
+            try:
+                with socket.create_connection((self.host, self.port), timeout=self.timeout_s) as sock:
+                    sock.settimeout(self.timeout_s)
+                    sock.sendall(payload)
+                    chunks = []
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                return b"".join(chunks).decode("utf-8", errors="replace").strip()
+            except (ConnectionRefusedError, ConnectionResetError, OSError, socket.timeout):
+                if attempt == 0 and self._rediscover(timeout=2.0):
+                    continue
+                raise
 
     def _send_ok_command(self, command: str) -> bool:
         response = self._send_command(command)
