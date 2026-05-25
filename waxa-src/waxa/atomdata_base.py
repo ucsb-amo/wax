@@ -672,6 +672,7 @@ class atomdata_base():
             self.atom_number_apd = atom_number_apd(number_up, number_down)
 
     def _sort_images(self):
+        print(self.images.shape)
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
         self.img_atoms = imgs_tuple[0]
         self.img_light = imgs_tuple[1]

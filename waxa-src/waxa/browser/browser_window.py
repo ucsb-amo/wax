@@ -2040,6 +2040,7 @@ class DataBrowserWindow(QMainWindow):
 
         menu = QMenu(self)
         create_action = menu.addAction("Create Lite Dataset")
+        copy_run_id_action = menu.addAction("Copy Run ID")
         copy_lite_arg_action = menu.addAction("Copy Lite Arg")
         open_h5_action = menu.addAction("Open H5 File")
         search_params_action = menu.addAction("Search Params…")
@@ -2086,6 +2087,14 @@ class DataBrowserWindow(QMainWindow):
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is create_action:
             self._start_lite_creation_for_runs([r.run_id for r, _ in selected_run_rows])
+        elif chosen is copy_run_id_action:
+            if is_multi_selection:
+                ids = [r.run_id for r, _ in selected_run_rows]
+                text = "[" + ", ".join(str(i) for i in ids) + "]"
+            else:
+                text = str(run.run_id)
+            QApplication.clipboard().setText(text)
+            self.status_label.setText(f"Copied: {text}")
         elif chosen is copy_lite_arg_action:
             if is_multi_selection:
                 return

@@ -7,6 +7,7 @@
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .atomdata import atomdata
+    from .atomdata_vault import AtomdataVault
     from .data.load_atomdata import load_atomdata
     from .roi import ROI
     from .config.img_types import img_types
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 
 _lazy = {
     'atomdata':     '.atomdata',
+    'AtomdataVault': '.atomdata_vault',
     'load_atomdata': '.data.load_atomdata',
     'ROI':          '.roi',
     'img_types':    '.config.img_types',
