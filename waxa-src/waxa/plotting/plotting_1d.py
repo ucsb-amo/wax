@@ -31,7 +31,8 @@ UNIT_MAP_FROM_COMMENT = {
     "unitless":  ("", 1.0),
 }
 
-def errorplot(ad, mean=None, yerr=None, y=None):
+def errorplot(ad, mean=None, yerr=None, y=None,
+              ymult = 1., yunit = None):
 
     unit, mult, xvarname = detect_unit(ad, xvar_idx=0)
 
@@ -43,18 +44,19 @@ def errorplot(ad, mean=None, yerr=None, y=None):
             yerr = np.zeros_like(mean)
         axs[0].errorbar(
             ad.avg.xvars[0] * mult,
-            mean,
-            yerr=yerr,
+            mean * ymult,
+            yerr=yerr * ymult,
             fmt='o-',lw=1,ms=4)
 
     if y is not None:
         axs[0].scatter(ad.xvars[0] * mult,
-                    y,
+                    y * ymult,
                     s=10, zorder=5, alpha=0.25)
 
     key = key_from_attribute(ad, y)
     axs[0].set_xlabel(f"{xvarname} ({unit})")
-    axs[0].set_ylabel(f"{key}")
+    ylabel = f"{key} ({yunit})" if yunit is not None else f"{key}"
+    axs[0].set_ylabel(ylabel)
     axs[0].set_title(f"run {ad.run_info.run_id}")
 
     return fig, axs

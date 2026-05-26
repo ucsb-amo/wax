@@ -47,7 +47,11 @@ class UdpServer(QObject, WaxxServer):
         self.sock.listen(5)
         print(f"Server listening on {self.host}:{self.port}")
         while self.running:
-            conn, addr = self.sock.accept()
+            try:
+                conn, addr = self.sock.accept()
+            except socket.error:
+                # accept() raised — server socket was closed (stop()) or similar.
+                break
             if self._print_connections_bool:
                 print(f"Connected by {addr}")
             try:
@@ -62,7 +66,7 @@ class UdpServer(QObject, WaxxServer):
             except socket.error as e:
                 if self.running:
                     print(f"Socket error: {e}")
-                break
+                # Do not break here — continue accepting new connections after transient errors.
             finally:
                 conn.close()
         print("UDP Server stopped.")

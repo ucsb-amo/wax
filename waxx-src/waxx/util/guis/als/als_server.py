@@ -3,6 +3,8 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import logging.handlers
+import os
 import pathlib
 import signal
 import socket
@@ -832,8 +834,19 @@ class ALSLaserServer(WaxxServer):
             LOGGER.warning("Failed to send ALS startup notification: %s", exc)
 
 
-def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6") -> None:
+def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6", log_path: str | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
+    if log_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        _fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logging.getLogger().addHandler(_fh)
+        LOGGER.info("Logging to file: %s", log_path)
     server = ALSLaserServer(host=host, port=port, serial_port=serial_port)
     server.start()
 

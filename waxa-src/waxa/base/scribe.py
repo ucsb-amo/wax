@@ -170,7 +170,7 @@ class Scribe():
     #                     return False
     #         return True
         
-    def _check_data_file_exists(self, raise_error=True) -> bool:
+    def _check_for_abort_signal(self, raise_error=True) -> bool:
         """Override: use ZMQ poll to check for a reset request instead of
         checking whether the data file still exists on disk.
 
@@ -186,9 +186,27 @@ class Scribe():
                     self.monitor.signal_end()
                 _client.abort_run()
                 raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
-            return True
+            return reset
         else:
             return False
         
-    def _check_for_abort_signal(self, raise_error=True) -> bool:
-        return self._check_data_file_exists(raise_error)
+    def _check_data_file_exists(self, raise_error=True) -> bool:
+        return self._check_for_abort_signal(raise_error)
+
+    def _send_abort_to_server(self):
+        """Notify the liveOD server that the run has been aborted due to
+        an RTIOUnderflow.  Called as an RPC from the scan kernel after the
+        current scan loop iteration completes.
+
+        Raises RuntimeError after notifying the server so that the caller
+        (scan()) propagates the exception out of run(), preventing analyze()
+        from executing and the experiment from sending a spurious END_RUN.
+        """
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            if hasattr(self, 'monitor'):
+                self.monitor.update_device_states()
+                self.monitor.signal_end()
+            _client.abort_run()
+        print(f'[Scanner] RTIOUnderflow: run {self.run_info.run_id} aborted.')
+        raise RuntimeError(f'RTIOUnderflow: run {self.run_info.run_id} aborted.')

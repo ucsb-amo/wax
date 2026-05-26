@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 import glob
@@ -34,6 +35,7 @@ class server_talk():
         self._lite = False
         self._recent_completed_trust_window = RECENT_COMPLETED_TRUST_WINDOW
         self._timing_enabled = SERVER_TALK_TIMING_ENABLED
+        self._run_id_lock = threading.Lock()  # serialises get_run_id / update_run_id
 
         self.set_data_dir()
 
@@ -368,34 +370,26 @@ class server_talk():
 
     def get_run_id(self):
         self.set_data_dir()
-
-        pwd = os.getcwd()
-        os.chdir(self.data_dir)
-        with open(self.run_id_path,'r') as f:
-            rid = f.read()
-        os.chdir(pwd)
+        with self._run_id_lock:
+            with open(self.run_id_path, 'r') as f:
+                rid = f.read()
         return int(rid)
 
-    def update_run_id(self,run_info=None):
+    def update_run_id(self, run_info=None):
         self.set_data_dir()
-
-        pwd = os.getcwd()
-        os.chdir(self.data_dir)
-
-        if run_info is not None:
-            rid = run_info.run_id
-        else:
-            with open(self.run_id_path,'r') as f:
-                try: 
-                    rid = int(f.read())
-                except:
-                    print(f'run id file at {self.run_id_path} is empty -- extracting from latest data file')
-                    rid = self.run_id_from_filepath(self.get_latest_data_file())
-        rid += 1
-        with open(self.run_id_path,'w') as f:
-            f.write(f"{rid}")
-
-        os.chdir(pwd)
+        with self._run_id_lock:
+            if run_info is not None:
+                rid = run_info.run_id
+            else:
+                with open(self.run_id_path, 'r') as f:
+                    try:
+                        rid = int(f.read())
+                    except:
+                        print(f'run id file at {self.run_id_path} is empty -- extracting from latest data file')
+                        rid = self.run_id_from_filepath(self.get_latest_data_file())
+            rid += 1
+            with open(self.run_id_path, 'w') as f:
+                f.write(f"{rid}")
 
     def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True):
         from waxa.data import RunInfo, DataSaver

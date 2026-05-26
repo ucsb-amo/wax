@@ -113,7 +113,7 @@ class MonitorServerGUI(QWidget):
     def restart_monitor(self):
         if self.monitor_manager.isRunning():
             self.monitor_manager.terminate()
-            time.sleep(0.125)
+            self.monitor_manager.wait(500)  # wait up to 500 ms for thread to actually finish
         self.monitor_manager.start()
         self.set_status(STATES.LOADING)
 
