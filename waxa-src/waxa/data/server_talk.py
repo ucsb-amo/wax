@@ -39,6 +39,15 @@ class server_talk():
 
         self.set_data_dir()
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state['_run_id_lock']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._run_id_lock = threading.Lock()
+
     def set_data_dir(self, lite=False):
         if self._lite == lite:
             pass
