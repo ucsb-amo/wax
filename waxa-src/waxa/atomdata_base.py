@@ -1204,8 +1204,28 @@ class atomdata_base():
             ad_std.data.keys.append(key)
 
         if hasattr(self, 'scope_data'):
-            ad_avg.scope_data = self.scope_data
-            ad_std.scope_data = self.scope_data
+            avg_scope = {}
+            std_scope = {}
+            for scope_key, channel_dict in self.scope_data.items():
+                avg_scope[scope_key] = {}
+                std_scope[scope_key] = {}
+                for ch, trace in channel_dict.items():
+                    t = trace.t
+                    v = trace.v
+                    if self._is_scan_shaped_numeric_array(t):
+                        t_avg, t_std = self._reduce_repeat_ndarray_mean_std(t, xvar_idx, n_repeats)
+                    else:
+                        t_avg = t
+                        t_std = t
+                    if self._is_scan_shaped_numeric_array(v):
+                        v_avg, v_std = self._reduce_repeat_ndarray_mean_std(v, xvar_idx, n_repeats)
+                    else:
+                        v_avg = v
+                        v_std = v
+                    avg_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_avg, v_avg)
+                    std_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_std, v_std)
+            ad_avg.scope_data = avg_scope
+            ad_std.scope_data = std_scope
 
         return ad_avg, ad_std
 
