@@ -7,6 +7,7 @@ to avoid duplicating the shared f\u2080 / \u0394 widget.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 
 import numpy as np
@@ -40,9 +41,10 @@ class BristolDetuningWidget(QWidget):
     """Compact detuning plotter — controls along the top, plot in centre,
     shared detuning display at the bottom."""
 
-    def __init__(self, client: BristolWavemeterGuiClient):
+    def __init__(self):
         super().__init__()
-        self._client = client
+        self._client: BristolWavemeterGuiClient | None = None
+        self._connecting = False
         self._times: list[float] = []
         self._detunings_ghz: list[float] = []
         self._start_time = time.time()
@@ -50,13 +52,37 @@ class BristolDetuningWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update)
         self._timer.start(_POLL_MS)
+        self._try_connect()
+
+    # ------------------------------------------------------------------
+    # Deferred connection
+    # ------------------------------------------------------------------
+
+    def _try_connect(self) -> None:
+        """Spawn a background thread to discover and connect to the server."""
+        if self._connecting:
+            return
+        self._connecting = True
+        self._status_lbl.setText("◌")
+        self._status_lbl.setStyleSheet("color: #888888; font-size: 10px;")
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self) -> None:
+        try:
+            self._client = BristolWavemeterGuiClient()
+        except RuntimeError:
+            pass  # _update will retry via _try_connect
+        finally:
+            self._connecting = False
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setSpacing(4)
         root.setContentsMargins(8, 6, 8, 6)
 
-        # \u2500\u2500 Top control bar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        top = QHBoxLayout()\n        top.setSpacing(6)
+        # top control bar
+        top = QHBoxLayout()
+        top.setSpacing(6)
 
         self._wm_lbl = QLabel("f = \u2014 THz")
         self._wm_lbl.setFont(QFont("Monospace", 10, QFont.Weight.Bold))
@@ -86,7 +112,7 @@ class BristolDetuningWidget(QWidget):
 
         root.addLayout(top)
 
-        # \u2500\u2500 Plot \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        self._plot = pg.PlotWidget()
+        self._plot = pg.PlotWidget()
         self._plot.setLabel("left", "\u0394f", units="GHz")
         self._plot.setLabel("bottom", "t", units="s")
         self._plot.getAxis("left").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
@@ -94,16 +120,22 @@ class BristolDetuningWidget(QWidget):
         self._curve = self._plot.plot(pen=pg.mkPen("#ffaa00", width=1.5))
         root.addWidget(self._plot, 1)
 
-        # \u2500\u2500 Avg / std bar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        self._avg_lbl = QLabel("avg: \u2014")
+        self._avg_lbl = QLabel("avg: \u2014")
         self._avg_lbl.setFont(QFont("Monospace", 11, QFont.Weight.Bold))
         self._avg_lbl.setStyleSheet("color: #ff8888;")
         self._avg_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         root.addWidget(self._avg_lbl)
 
-        # \u2500\u2500 Shared f\u2080 + \u0394 display \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        self._det_display = BristolDetuningDisplay()
+        self._det_display = BristolDetuningDisplay()
         root.addWidget(self._det_display)
 
     def _update(self) -> None:
+        if self._client is None:
+            if not self._connecting:
+                self._try_connect()
+            self._wm_lbl.setText("f = \u2014 THz")
+            return
+
         t = time.time() - self._start_time
         freq_thz = None
 
@@ -156,13 +188,13 @@ class BristolDetuningWidget(QWidget):
 
 
 class BristolClientWindow(QMainWindow):
-    def __init__(self, client: BristolWavemeterGuiClient):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Bristol Wavemeter — Detuning")
         self.setWindowIcon(_make_sine_icon())
         self.setStyleSheet(DARK_STYLESHEET)
         self.setMinimumSize(500, 380)
-        self.setCentralWidget(BristolDetuningWidget(client))
+        self.setCentralWidget(BristolDetuningWidget())
 
 
 def main() -> None:
@@ -176,8 +208,7 @@ def main() -> None:
 
     app = QApplication.instance() or QApplication(sys.argv)
     apply_dark_palette(app)
-    client = BristolWavemeterGuiClient()
-    win = BristolClientWindow(client)
+    win = BristolClientWindow()
     win.show()
     sys.exit(app.exec())
 
