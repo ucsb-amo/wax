@@ -160,8 +160,7 @@ class SDG6000X_CH():
             self._instr._set_amp_command(self.ch,self._p.amplitude_vpp)
 
     def init_rpc(self):
-        self._stash_defaults()
-        self.fetch_state()
+        self._restore_defaults()
         self.set_rpc()
         self.set_output_rpc(state=1)
 
