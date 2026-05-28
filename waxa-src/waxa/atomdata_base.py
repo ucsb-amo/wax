@@ -1829,7 +1829,7 @@ class atomdata_base():
 
             t_stage = time.perf_counter()
             all_keys = list(f['data'].keys())
-            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data']]
+            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data', 'timestamp_shot_end']]
 
             for k in filtered_keys:
                 data_k = f['data'][k][()]
@@ -1838,6 +1838,13 @@ class atomdata_base():
                 vars(self.data)[k] = data_k
                 self.data.keys.append(k)
             timing['h5_read_datavault_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
+            if 'timestamp_shot_end' in all_keys:
+                self.timestamp_shot_end = f['data']['timestamp_shot_end'][()]
+            else:
+                self.timestamp_shot_end = np.array([])
+            timing['h5_read_timestamp_shot_end_s'] = time.perf_counter() - t_stage
 
             t_stage = time.perf_counter()
             try:
