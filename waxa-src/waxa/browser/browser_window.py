@@ -547,7 +547,7 @@ class RunDetailPane(QWidget):
         xvar_header.resizeSection(2, 44)
         xvar_header.resizeSection(3, 40)
         xvar_header.resizeSection(4, 90)
-        xvar_header.resizeSection(5, 32)
+        xvar_header.resizeSection(5, 55)
         self.xvar_table.setMinimumHeight(80)
         xvars_layout.addWidget(self.xvar_table)
 
