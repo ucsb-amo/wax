@@ -1659,8 +1659,6 @@ class atomdata_base():
         xvars = []
         for i in range(self.Nvars):
             xvars.append(vars(self.params)[xvarnames[i]])
-
-        print(xvars)
         
         # figure out dimensions of each xvar
         self.xvardims = np.zeros(self.Nvars,dtype=int)
