@@ -117,6 +117,21 @@ class _ServiceDiscoveryRegistry:
         with self._lock:
             return self._cache.get(server_id)
 
+    def discover_prefix(self, prefix: str, collect_for: float = 3.0) -> dict[str, tuple[str, int]]:
+        """Return all cached entries whose ``server_id`` starts with ``prefix``.
+
+        Waits up to ``collect_for`` seconds so that any servers currently
+        beaconing have time to appear in the cache, then returns a snapshot.
+        Returns an empty dict if no matching servers are found.
+        """
+        if self._running:
+            deadline = time.monotonic() + collect_for
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+        with self._lock:
+            return {sid: addr for sid, addr in self._cache.items()
+                    if sid.startswith(prefix)}
+
 
 # Module-level singleton — starts listening immediately on import.
 _registry = _ServiceDiscoveryRegistry()
@@ -141,6 +156,21 @@ def discover(server_id: str, timeout: float = 3.0) -> tuple[str, int] | None:
         ip, port = result
     """
     return _registry.discover(server_id, timeout=timeout)
+
+
+def discover_prefix(prefix: str, collect_for: float = 3.0) -> dict[str, tuple[str, int]]:
+    """Return all currently-beaconing servers whose ``server_id`` starts with ``prefix``.
+
+    Waits ``collect_for`` seconds for beacons to accumulate, then returns a
+    ``{server_id: (ip, port)}`` snapshot.  Returns an empty dict if none found.
+
+    Example::
+
+        servers = discover_prefix("basler_server:", collect_for=3.0)
+        for sid, (ip, port) in servers.items():
+            print(sid, ip, port)
+    """
+    return _registry.discover_prefix(prefix, collect_for=collect_for)
 
 
 # ---------------------------------------------------------------------------
