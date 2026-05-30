@@ -7,9 +7,29 @@ import time
 from waxx.util.artiq.async_print import aprint
 
 class WavemeterController(MOGDevice):
+    _instances: dict = {}
+
+    def __new__(cls, addr, port=None, timeout=1, check=True):
+        # Normalize the connection key the same way MOGDevice.__init__ does,
+        # so that WavemeterController("192.168.x.y") always returns the same
+        # object regardless of how many times it is called on one PC.
+        if ":" not in addr:
+            _port = port if port is not None else 7802
+            key = f"{addr}:{_port}"
+        else:
+            key = addr
+        if key not in cls._instances:
+            instance = super().__new__(cls)
+            instance._initialized = False
+            cls._instances[key] = instance
+        return cls._instances[key]
+
     def __init__(self, addr, port=None, timeout=1, check=True):
-        super().__init__(addr,port,timeout,check)
+        if self._initialized:
+            return
+        super().__init__(addr, port, timeout, check)
         self.set_units()
+        self._initialized = True
 
     def check_ch(self) -> int:
         try:
