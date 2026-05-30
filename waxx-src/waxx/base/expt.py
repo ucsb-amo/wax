@@ -160,16 +160,17 @@ class Expt(Dealer, Scanner, Scribe):
 
         self.scope_data.close()
 
+        self.cleanup_scanned()
+
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
-            self.cleanup_scanned()
             payload = self._serialize_end_payload(expt_filepath)
+            # print(payload)
             _client.end_run(payload)
         else:
             # Legacy fallback
             if self.setup_camera:
                 if self.run_info.save_data:
-                    self.cleanup_scanned()
                     self.write_data(expt_filepath)
                 else:
                     self.remove_incomplete_data()
