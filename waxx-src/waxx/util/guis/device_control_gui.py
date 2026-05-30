@@ -177,14 +177,13 @@ class DDSWidget(DeviceWidget):
             self.has_unsaved_changes = False
             self.update_default_button_state()
         else:
-            # Reset to default values
+            # Reset to default values — mark as pending until Enter is pressed
             if hasattr(self.dds_frame_obj, self.device_name):
                 dds = vars(self.dds_frame_obj)[self.device_name]
                 self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
                 # self.state_button.setChecked(dds.sw_state)
                 self.vpd_spinbox.setValue(dds.v_pd)
-                self.on_update_clicked()
         
     def on_state_button_toggled(self, checked):
         if checked:
@@ -426,10 +425,10 @@ class DACWidget(DeviceWidget):
             self.has_unsaved_changes = False
             self.update_default_button_state()
         else:
+            # Reset to default value — mark as pending until Enter is pressed
             if hasattr(self.dac_frame_obj, self.device_name):
                 dac = vars(self.dac_frame_obj)[self.device_name]
                 self.voltage_spinbox.setValue(dac.v)
-                self.on_update_clicked()
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""

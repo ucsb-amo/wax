@@ -132,7 +132,6 @@ class SDG6000X_CH():
         self._p.amplitude_vpp = amp
         self._p.state = state
 
-    @portable
     def set_rpc(self,
             frequency=dv,
             amplitude=dv,
@@ -141,6 +140,7 @@ class SDG6000X_CH():
         if init:
             freq_changed = True
             amp_changed = True
+            self._restore_defaults()
         else:
             freq_changed = (frequency >= 0.) and (frequency != self._p.frequency)
             amp_changed = (amplitude >= 0.) and (amplitude != self._p.amplitude_vpp)
@@ -159,9 +159,39 @@ class SDG6000X_CH():
             self._p.amplitude_vpp = amplitude if amplitude!=dv else self._p.amplitude_vpp
             self._instr._set_amp_command(self.ch,self._p.amplitude_vpp)
 
+    @kernel
+    def sweep(self, frequency_end=dv, frequency_step=1.e6, reset=False):
+        self.core.wait_until_mu(now_mu())
+        self.sweep_rpc(frequency_end, frequency_step, reset)
+        self.core.break_realtime()
+
+    def sweep_rpc(self,
+                  frequency_end=dv,
+                  frequency_step=1e6,
+                  reset=False):
+        import time
+
+        if frequency_end == dv or reset == True:
+            frequency_end = self._frequency_default
+
+        f0 = self._p.frequency
+        ff = frequency_end
+
+        if f0 == ff:
+            return
+        
+        direction = 1 if ff >= f0 else -1
+        df = abs(frequency_step) * direction
+        f = f0
+        while direction * (ff - f) > abs(df):
+            f += df
+            time.sleep(0.05)
+            self.set_rpc(f)
+        time.sleep(0.05)
+        self.set_rpc(ff)
+
     def init_rpc(self):
-        self._restore_defaults()
-        self.set_rpc()
+        self.sweep_rpc(reset=True)
         self.set_output_rpc(state=1)
 
     @kernel
