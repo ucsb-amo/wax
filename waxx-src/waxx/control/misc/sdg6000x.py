@@ -167,9 +167,12 @@ class SDG6000X_CH():
 
     def sweep_rpc(self,
                   frequency_end=dv,
-                  frequency_step=1e6,
+                  frequency_step=2.e6,
                   reset=False):
         import time
+        T = 0.025
+
+        self.fetch_state()
 
         if frequency_end == dv or reset == True:
             frequency_end = self._frequency_default
@@ -185,9 +188,9 @@ class SDG6000X_CH():
         f = f0
         while direction * (ff - f) > abs(df):
             f += df
-            time.sleep(0.05)
+            time.sleep(T)
             self.set_rpc(f)
-        time.sleep(0.05)
+        time.sleep(T)
         self.set_rpc(ff)
 
     def init_rpc(self):
