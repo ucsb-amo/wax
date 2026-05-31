@@ -71,17 +71,14 @@ class SDG6000X_CH():
 
         self.core = core
 
-    @portable
     def _stash_defaults(self):
         self._frequency_default = self._p.frequency
         self._amplitude_vpp_default = self._p.amplitude_vpp
 
-    @portable
     def _restore_defaults(self):
         self._p.frequency = self._frequency_default
         self._p.amplitude_vpp = self._amplitude_vpp_default
 
-    @portable
     def set_output_rpc(self,state=1,init=False):
         # Turns out it's better just to poll the state of the device, then only
         # turn it on if the device was off before. Otherwise, sending the "ON"
@@ -97,9 +94,7 @@ class SDG6000X_CH():
             self._p.state = state if state >= 0. else self._p.state
             self._instr._sw_output(self.ch,self._p.state)
 
-    @portable
     def fetch_state(self):
-
         reply = self._instr.ask(f"C{self.ch}:BSWV?")
         def parse_params(response):
             frq_start = response.find('FRQ,') + 4
