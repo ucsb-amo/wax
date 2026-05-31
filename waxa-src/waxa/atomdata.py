@@ -7,6 +7,14 @@ from waxa.config.img_types import img_types as img
 from waxa.data.server_talk import server_talk as st
 from waxa.atomdata_base import atomdata_base, atom_number_apd, unpack_group
 
+# Type-checking-only imports so IDEs can offer richer autocompletion against
+# the experiment-specific subclasses (kexp's ExptParams / DataVault) when
+# kexp is installed. NEVER executed at runtime — waxa has no kexp dependency.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from kexp.config.expt_params import ExptParams as _KexpExptParams  # type: ignore[import-not-found]
+    from kexp.config.data_vault import DataVault as _KexpDataVault  # type: ignore[import-not-found]
+
 
 class atomdata(atomdata_base):
     """User-facing atomdata class with analysis-focused methods.
@@ -14,6 +22,13 @@ class atomdata(atomdata_base):
     Heavy data loading, repeat handling, shuffling, slicing, and transpose
     machinery lives in atomdata_base.
     """
+
+    # Class-level annotations are inherited by instances and let Pylance
+    # surface kexp's params/data attributes for `ad = atomdata(...)`.
+    if TYPE_CHECKING:
+        params: "_KexpExptParams"
+        p: "_KexpExptParams"
+        data: "_KexpDataVault"
 
     def __init__(
         self,

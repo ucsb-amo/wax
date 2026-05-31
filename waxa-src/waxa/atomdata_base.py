@@ -14,6 +14,20 @@ from waxa.data.run_info import RunInfo
 from waxa.config.expt_params import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
+
+# Type-checking-only imports so that IDEs (Pylance/Pyright) can offer richer
+# autocompletion for the experiment-specific subclasses when they are
+# installed alongside waxa. These imports are NEVER executed at runtime, so
+# waxa retains zero runtime dependency on kexp. If kexp is not installed,
+# the static analyzer simply leaves these names unresolved (no runtime
+# effect) and falls back to inferred types.
+from typing import TYPE_CHECKING, Union
+if TYPE_CHECKING:
+    from waxa.config.expt_params import ExptParams as _WaxaExptParams
+    from kexp.config.expt_params import ExptParams as _KexpExptParams  # type: ignore[import-not-found]
+    from kexp.config.data_vault import DataVault as _KexpDataVault  # type: ignore[import-not-found]
+    _ExptParamsHint = Union[_KexpExptParams, _WaxaExptParams]
+    _DataVaultHint = _KexpDataVault
     
 class ScopeTraceArray():
     def __init__(self, scope_key, ch, t, v):
@@ -319,7 +333,13 @@ class atomdata_base():
     '''
     Use to store and do basic analysis on data for every experiment.
     '''
-    
+
+    # Class-level annotation purely for IDE autocompletion. Resolves to
+    # kexp.config.data_vault.DataVault when kexp is installed, otherwise the
+    # name remains unresolved (no runtime effect — see TYPE_CHECKING block).
+    if TYPE_CHECKING:
+        data: "_DataVaultHint"
+
     def __init__(self,
                 idx=0,
                 roi_id=None,
@@ -366,9 +386,12 @@ class atomdata_base():
         self._timing_enabled = True
         self._timing = {}
 
-        # for syntax highlighting, overloaded later
-        self.params = ExptParams()
-        self.p = self.params
+        # for syntax highlighting, overloaded later. The type annotations
+        # below let IDEs surface kexp's ExptParams / DataVault attributes
+        # when kexp is installed (see TYPE_CHECKING block at top of file);
+        # otherwise they fall back to the waxa base classes.
+        self.params: "_ExptParamsHint" = ExptParams()
+        self.p: "_ExptParamsHint" = self.params
         self.camera_params = CameraParams()
         self.run_info = RunInfo()
 
