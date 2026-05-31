@@ -143,7 +143,7 @@ class MonitorServerGUI(QWidget):
         print(f"Message received: {message}")
         if "run complete" in message:
             print("Run complete message received. Restarting monitor.")
-            self.monitor_manager.start()
+            self.restart_monitor()
             self.set_status(STATES.LOADING)
         elif "monitor ready" in message:
             print("Monitor ready message received.")

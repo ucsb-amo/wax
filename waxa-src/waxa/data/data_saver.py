@@ -282,6 +282,22 @@ class DataSaver():
     # Server-side methods (called by LiveODServer, not the experiment)
     # ------------------------------------------------------------------
 
+    def compute_data_filepath_from_payload(self, payload: dict, run_id: int) -> str:
+        """Return the HDF5 file path for a run without creating the file.
+
+        Pure string computation — no I/O, no network calls.  Safe to call
+        on any thread including the ZMQ REP handler thread.
+        """
+        class _RunInfoProxy:
+            pass
+        ri = _RunInfoProxy()
+        ri.run_id = run_id
+        ri.run_date_str = str(payload.get("run_date_str", ""))
+        ri.run_datetime_str = str(payload.get("run_datetime_str", ""))
+        ri.expt_class = str(payload.get("expt_class", "expt"))
+        fpath, _ = self._data_path(ri)
+        return fpath
+
     def create_data_file_from_payload(self, payload: dict, run_id: int) -> str:
         """Create an HDF5 data file from an INIT_RUN payload.
 
@@ -325,6 +341,7 @@ class DataSaver():
 
         f.attrs["has_images"] = capture_images
         f.attrs["xvarnames"] = list(payload.get("xvarnames", []))
+        f.attrs["run_complete"] = False
 
         # Images pre-allocation
         if capture_images:
@@ -384,11 +401,20 @@ class DataSaver():
         os.chdir(pwd)
         return fpath
 
-    def save_data_from_payload(self, payload: dict, filepath: str):
+    def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None):
         """Write final experiment data to an existing HDF5 file.
 
         This is the server-side counterpart of ``save_data``.  It is
         called by ``LiveODServer`` after receiving the END_RUN message.
+
+        Parameters
+        ----------
+        shot_timestamps:
+            Optional list/array of Unix timestamps (one per shot) recorded
+            server-side.  When provided they are reshaped, unshuffled, and
+            written as ``data/timestamp_shot_end`` inside the same ``with``
+            block as all other end-of-run data — before ``run_complete`` is
+            set to ``True``.
         """
         sort_idx_raw = payload.get("sort_idx", [])
         sort_N_raw = payload.get("sort_N", [])
@@ -476,6 +502,24 @@ class DataSaver():
             f.attrs["params_file"] = payload.get("params_file_text", "")
             for key, text in payload.get("base_class_texts", {}).items():
                 f.attrs[key] = text
+
+            # --- shot timestamps (server-side, one per shot) ---
+            if shot_timestamps:
+                _ts = np.array(shot_timestamps, dtype=np.float64)
+                xvardims = list(payload.get("xvardims", []))
+                if xvardims and int(np.prod(xvardims)) == len(_ts):
+                    _ts = _ts.reshape(xvardims)
+                if sort_idx_raw:
+                    _ts = self._unshuffle_single_array(
+                        _ts, sort_idx_raw, sort_N_raw, exclude_dims=0
+                    )
+                grp = f["data"]
+                if "timestamp_shot_end" in grp:
+                    del grp["timestamp_shot_end"]
+                grp.create_dataset("timestamp_shot_end", data=_ts)
+
+            # --- mark file as fully written ---
+            f.attrs["run_complete"] = True
 
         print("[DataSaver] Parameters saved, data closed.")
         os.chdir(pwd)

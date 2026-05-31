@@ -111,7 +111,7 @@ class _ServiceDiscoveryRegistry:
                 entry = self._cache.get(server_id)
             if entry is not None:
                 return entry
-            time.sleep(0.1)
+            time.sleep(0.025)
 
         # One final check after the sleep loop exits.
         with self._lock:

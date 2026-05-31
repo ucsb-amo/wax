@@ -283,6 +283,17 @@ class BaslerCameraServer(WaxxServer):
             if instance_index == 0
             else f"{BASLER_SERVER_PREFIX}{hostname}:{instance_index}"
         )
+
+        # Guard: refuse to start if another server with the same ID is already
+        # beaconing on the network (same host, same instance_index).
+        from waxx.util.comms_server.waxx_client import discover as _discover
+        if _discover(sid, timeout=1.5) is not None:
+            raise RuntimeError(
+                f"A BaslerCameraServer with ID '{sid}' is already running on "
+                f"the network. Stop the existing instance first, or start this "
+                f"one with a different instance_index."
+            )
+
         WaxxServer.__init__(self, sid, port)
         self._cameras: dict[str, _ManagedCamera] = {}
         self._running = False

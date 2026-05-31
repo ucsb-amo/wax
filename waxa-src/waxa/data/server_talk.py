@@ -9,7 +9,7 @@ import numpy as np
 import h5py
 
 MAP_BAT_PATH = "\"G:\\Shared drives\\Weld Lab Shared Drive\\Infrastructure\\map_network_drives_PeterRecommended.bat\""
-RECENT_COMPLETED_TRUST_WINDOW = 16
+RECENT_COMPLETED_TRUST_WINDOW = 0
 SERVER_TALK_TIMING_ENABLED = False
 
 class server_talk():
@@ -210,6 +210,15 @@ class server_talk():
     def _is_completed_run(self, filepath):
         try:
             with h5py.File(filepath, 'r') as f:
+                # Fast path: explicit completion marker (present in new files).
+                # True  → fully written; False → still being written by server.
+                # None  → old file without the attr; fall through to xvar check.
+                rc = f.attrs.get('run_complete', None)
+                if rc is True:
+                    return True
+                if rc is False:
+                    return False
+
                 raw_xvarnames = f.attrs.get('xvarnames')
                 if raw_xvarnames is None:
                     return True

@@ -158,9 +158,15 @@ class Expt(Dealer, Scanner, Scribe):
     def end_wax(self, expt_filepath,
                 notify=True):
 
-        self.scope_data.close()
+        print(f"[end_wax] called, run_id={self.run_info.run_id}")
+        try:
+            self.scope_data.close()
+        except Exception as _e:
+            print(f"[end_wax] WARNING: scope_data.close() raised: {_e} — continuing.")
+        print(f"[end_wax] scope_data closed")
 
         self.cleanup_scanned()
+        print(f"[end_wax] cleanup_scanned complete")
 
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
@@ -264,9 +270,14 @@ class Expt(Dealer, Scanner, Scribe):
         scope_data_list = []
         if self.scope_data._scope_trace_taken:
             for scope in self.scope_data.scopes:
+                try:
+                    reshaped = scope.reshape_data()
+                except Exception as _e:
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} — scope data will be empty for this run.")
+                    reshaped = None
                 scope_data_list.append({
                     'label': str(scope.label),
-                    'data': scope.reshape_data(),
+                    'data': reshaped,
                 })
 
         # DataVault

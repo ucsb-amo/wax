@@ -53,7 +53,7 @@ class WaxxServer:
     """
 
     def __init__(self, server_id: str = None, port: int = None,
-                 beacon_interval: float = 2.0, **kwargs) -> None:
+                 beacon_interval: float = 0.5, **kwargs) -> None:
         if server_id is None or port is None:
             # Called via cooperative super() chain without args — skip init.
             # WaxxServer must be initialised explicitly: WaxxServer.__init__(self, id, port)
