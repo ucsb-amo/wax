@@ -41,9 +41,14 @@ class WavemeterController(MOGDevice):
 
     def set_channel(self, ch):
         try:
-            last_ch = self.check_ch()
-            if last_ch != ch:
-                self._set_channel(ch)
+            self._set_channel(ch)
+            for attempt in range(3):
+                time.sleep(0.075)
+                last_ch = self.check_ch()
+                if last_ch == ch:
+                    break
+            else:
+                aprint(f'Failed to set channel to {ch}, got {last_ch}')
         except:
             aprint('Failed to set channel')
         
