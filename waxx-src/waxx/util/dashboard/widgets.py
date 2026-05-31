@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -185,10 +186,14 @@ class CollapsibleGroupBox(QWidget):
         title: str = "",
         *,
         expanded: bool = True,
+        scrollable: bool = False,
+        max_expanded_height: int = 240,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self._expanded = bool(expanded)
+        self._scrollable = bool(scrollable)
+        self._max_expanded_height = int(max_expanded_height)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -212,8 +217,27 @@ class CollapsibleGroupBox(QWidget):
         self._content.setFrameShape(QFrame.Shape.NoFrame)
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(8, 0, 4, 4)
-        outer.addWidget(self._content)
-        self._content.setVisible(self._expanded)
+
+        if self._scrollable:
+            # Wrap the content in a QScrollArea so expanding the box does
+            # not push the parent panel taller than ``max_expanded_height``.
+            self._scroll: Optional[QScrollArea] = QScrollArea(self)
+            self._scroll.setWidgetResizable(True)
+            self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self._scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self._scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            self._scroll.setMaximumHeight(self._max_expanded_height)
+            self._scroll.setWidget(self._content)
+            outer.addWidget(self._scroll)
+            self._scroll.setVisible(self._expanded)
+        else:
+            self._scroll = None
+            outer.addWidget(self._content)
+            self._content.setVisible(self._expanded)
 
     def setContentLayout(self, layout) -> None:  # noqa: N802 - Qt-style
         """Replace the content layout with a caller-provided layout."""
@@ -238,7 +262,10 @@ class CollapsibleGroupBox(QWidget):
         self._toggle.setArrowType(
             Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
         )
-        self._content.setVisible(self._expanded)
+        if self._scroll is not None:
+            self._scroll.setVisible(self._expanded)
+        else:
+            self._content.setVisible(self._expanded)
         self.toggled.emit(self._expanded)
 
     def _on_toggle(self) -> None:

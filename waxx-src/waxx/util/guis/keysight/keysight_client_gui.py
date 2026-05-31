@@ -3,12 +3,18 @@
 This widget talks ONLY to ``KeysightServer`` over TCP — it never opens a
 direct VXI11 connection to the supplies.  Multiple dashboards can run
 this widget concurrently without spamming the hardware.
+
+All network I/O (discovery, snapshot polling, action RPCs) is dispatched
+to ``QThreadPool`` so the GUI thread never stalls; that keeps window
+moves smooth even when the server is missing or slow.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
-from PyQt6.QtCore import QTimer
+import time
+
+from PyQt6.QtCore import QRunnable, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -23,8 +29,37 @@ from waxx.util.guis.keysight.keysight_client import KeysightClient
 T_UPDATE_MS = 500
 FONTSIZE_PT = 14
 
+# Stay quiet for this long after construction before surfacing a
+# "server not found" message — the supervised server subprocess often
+# takes a few seconds to spool up after the dashboard launches.
+STARTUP_GRACE_S = 15.0
+
 # Per-supply over-current alert thresholds (A), keyed by ``max_current``.
 ALERT_THRESHOLDS: dict[int, float] = {500: 100, 170: 50}
+
+
+class _BgCall(QRunnable):
+    """Run ``func()`` on a thread-pool thread and report back via a callable.
+
+    ``on_done`` receives ``(result, exception)``; exactly one is non-None.
+    It is invoked from the worker thread — connect through a pyqtSignal if
+    the callback needs to touch the GUI.
+    """
+
+    def __init__(self, func: Callable[[], object],
+                 on_done: Callable[[object, Optional[BaseException]], None]) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self) -> None:  # noqa: D401 - QRunnable hook
+        try:
+            res = self._func()
+        except BaseException as exc:  # noqa: BLE001
+            self._on_done(None, exc)
+            return
+        self._on_done(res, None)
 
 
 class _StatusDecoder:
@@ -116,33 +151,51 @@ class _SupplyRow(QWidget):
         )
 
     def _on_click(self) -> None:
-        try:
-            if not self._connected:
-                self._client.reconnect(self._ip)
-            elif self._output_on is False:
-                self._client.turn_on(self._ip)
-            else:
-                # Connected + on: assume the click is to clear protection.
-                self._client.clear_protect(self._ip)
-        except Exception as exc:
-            print(f"[Keysight] RPC failed for {self._ip}: {exc}")
+        client = self._client
+        ip = self._ip
+        if not self._connected:
+            func = lambda: client.reconnect(ip)
+        elif self._output_on is False:
+            func = lambda: client.turn_on(ip)
+        else:
+            # Connected + on: assume the click is to clear protection.
+            func = lambda: client.clear_protect(ip)
+
+        def _done(result, exc):
+            if exc is not None:
+                print(f"[Keysight] RPC failed for {ip}: {exc}")
+
+        QThreadPool.globalInstance().start(_BgCall(func, _done))
 
 
 class KeysightClientWindow(QWidget):
     """Client GUI: discovers ``KeysightServer`` and renders one row per supply."""
 
+    # Cross-thread signals so the worker-thread completion handler can
+    # marshal results back onto the GUI thread.
+    _snapshot_ready = pyqtSignal(object)   # list[dict]
+    _snapshot_failed = pyqtSignal(str)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._client: Optional[KeysightClient] = None
         self._rows: dict[str, _SupplyRow] = {}
-        self._error_label = QLabel("Connecting to keysight server…")
-        self._error_label.setStyleSheet(
-            f"font-size: {FONTSIZE_PT}pt; color: #b22222; font-weight: bold;"
-        )
+        self._start_time = time.monotonic()
+        self._ever_connected = False
+        self._poll_in_flight = False
+        self._connect_in_flight = False
+        # Small, low-key status label — the dashboard's own server
+        # indicator is the loud one.  We only fill this in if a real
+        # problem persists past the startup grace window.
+        self._error_label = QLabel("")
+        self._error_label.setStyleSheet(f"font-size: {FONTSIZE_PT - 4}pt; color: gray;")
 
         self._root = QVBoxLayout(self)
         self._root.addWidget(self._error_label)
         self._error_label.hide()
+
+        self._snapshot_ready.connect(self._on_snapshot_ready)
+        self._snapshot_failed.connect(self._on_snapshot_failed)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -152,32 +205,71 @@ class KeysightClientWindow(QWidget):
 
     # ------------------------------------------------------------------ #
 
-    def _ensure_client(self) -> bool:
-        if self._client is not None:
-            return True
-        try:
-            self._client = KeysightClient(timeout_s=2.0, discovery_timeout=0.5)
-            return True
-        except Exception as exc:
-            self._show_error(f"keysight server not found: {exc}")
-            return False
+    def _ensure_client_async(self) -> None:
+        """Start a background ``KeysightClient`` construction if needed."""
+        if self._client is not None or self._connect_in_flight:
+            return
+        self._connect_in_flight = True
+
+        def _build():
+            return KeysightClient(timeout_s=2.0, discovery_timeout=0.5)
+
+        def _done(result, exc):
+            # Worker thread — bounce result to GUI thread via signal.
+            if exc is not None:
+                self._snapshot_failed.emit(f"keysight server not found: {exc}")
+            else:
+                # Stash the client; main thread will pick it up next tick.
+                self._client = result  # type: ignore[assignment]
+                self._snapshot_failed.emit("")  # clear error on GUI thread
+            # Clearing the flag from the worker thread is safe; it's just a bool.
+            self._connect_in_flight = False
+
+        QThreadPool.globalInstance().start(_BgCall(_build, _done))
 
     def _refresh(self) -> None:
-        if not self._ensure_client():
+        if self._client is None:
+            self._ensure_client_async()
             return
-        try:
-            snapshot = self._client.get_snapshot()
-        except Exception as exc:
-            # Lost server — force rediscovery on next tick.
-            self._client = None
-            self._show_error(f"keysight server unreachable: {exc}")
-            return
-        self._hide_error()
-        self._apply(snapshot)
+        if self._poll_in_flight:
+            return  # Don't pile up requests if the network is slow.
+        self._poll_in_flight = True
+        client = self._client
 
-    def _apply(self, snapshot: list[dict]) -> None:
+        def _fetch():
+            return client.get_snapshot()
+
+        def _done(result, exc):
+            if exc is not None:
+                self._snapshot_failed.emit(f"keysight server unreachable: {exc}")
+            else:
+                self._snapshot_ready.emit(result)
+
+        QThreadPool.globalInstance().start(_BgCall(_fetch, _done))
+
+    # ----- GUI-thread slots -------------------------------------------- #
+
+    def _on_snapshot_ready(self, snapshot) -> None:
+        self._poll_in_flight = False
+        self._ever_connected = True
+        self._hide_error()
+        if isinstance(snapshot, list):
+            self._apply(snapshot)
+
+    def _on_snapshot_failed(self, msg: str) -> None:
+        self._poll_in_flight = False
+        if not msg:
+            self._hide_error()
+            return
+        # Drop the client so the next tick reconnects from scratch.
+        self._client = None
+        self._maybe_show_error(msg)
+
+    def _apply(self, snapshot: list) -> None:
         # Lazily build a row per supply on first snapshot.
         for snap in snapshot:
+            if not isinstance(snap, dict):
+                continue
             ip = str(snap.get("ip"))
             row = self._rows.get(ip)
             if row is None:
@@ -186,7 +278,13 @@ class KeysightClientWindow(QWidget):
                 self._root.addLayout(row.layout)
             row.apply_snapshot(snap)
 
-    def _show_error(self, msg: str) -> None:
+    def _maybe_show_error(self, msg: str) -> None:
+        # Suppress the message during the startup grace period so the
+        # GUI doesn't shout while the server subprocess is still booting.
+        if not self._ever_connected:
+            if (time.monotonic() - self._start_time) < STARTUP_GRACE_S:
+                self._hide_error()
+                return
         self._error_label.setText(msg)
         self._error_label.show()
 

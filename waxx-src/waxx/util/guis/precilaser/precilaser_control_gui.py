@@ -7,7 +7,7 @@ import math
 import sys
 from typing import Any
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QRunnable, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -29,6 +29,25 @@ from waxx.util.guis.precilaser.precilaser_gui_client import PrecilaserGuiClient
 
 LOGGER = logging.getLogger("precilaser_gui")
 LOGGER.setLevel(logging.INFO)
+
+
+class _BgCall(QRunnable):
+    """Run a callable on QThreadPool; report via callback. Used so the GUI
+    thread never blocks on the periodic snapshot/log round-trip."""
+
+    def __init__(self, func, on_done) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            res = self._func()
+        except BaseException as exc:  # noqa: BLE001
+            self._on_done(None, exc)
+            return
+        self._on_done(res, None)
 
 
 def create_emoji_icon(emoji: str) -> QIcon:
@@ -91,6 +110,10 @@ class StatusDot(QPushButton):
 
 
 class PrecilaserControlGUI(QMainWindow):
+    # Cross-thread plumbing for the background snapshot/log fetcher.
+    _remote_state_ready = pyqtSignal(object, object)   # (snapshot, logs_payload|None)
+    _remote_state_failed = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.client: PrecilaserGuiClient | None = None
@@ -103,6 +126,8 @@ class PrecilaserControlGUI(QMainWindow):
         self._last_remote_error: str | None = None
         self._laser_enabled = False
         self._stability_enabled = False
+        self._remote_poll_in_flight = False
+        self._remote_connect_in_flight = False
 
         self.setWindowTitle("Precilaser Control")
         self.resize(1080, 760)
@@ -133,7 +158,12 @@ class PrecilaserControlGUI(QMainWindow):
         # Telemetry + Logs sit together under one dropdown for compactness.
         log_box = self._create_log_panel()
         if CollapsibleGroupBox is not None:
-            tl_wrap = CollapsibleGroupBox("Telemetry & Logs", expanded=False)
+            tl_wrap = CollapsibleGroupBox(
+                "Telemetry & Logs",
+                expanded=False,
+                scrollable=True,
+                max_expanded_height=260,
+            )
             tl_wrap.addWidget(self.telemetry_panel)
             tl_wrap.addWidget(log_box)
             dashboard_layout.addWidget(tl_wrap, 1)
@@ -146,6 +176,10 @@ class PrecilaserControlGUI(QMainWindow):
         root_layout.addLayout(dashboard_layout)
 
         self.statusBar().showMessage("Ready")
+
+        # Cross-thread completion signals from the background fetcher.
+        self._remote_state_ready.connect(self._on_remote_state_ready)
+        self._remote_state_failed.connect(self._on_remote_state_failed)
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._sync_remote_state)
@@ -534,37 +568,81 @@ class PrecilaserControlGUI(QMainWindow):
         self._sync_remote_state()
 
     def _sync_remote_state(self) -> None:
+        # All network round-trips happen on QThreadPool so the GUI thread
+        # never stalls on socket I/O — this is what keeps the dashboard
+        # smooth while moving windows.
+        if self._remote_poll_in_flight or self._remote_connect_in_flight:
+            return
+
         if self.client is None:
-            try:
-                self.client = PrecilaserGuiClient(discovery_timeout=0.1)
-                self._set_server_conn_button_state("connected")
-            except RuntimeError:
-                self._set_server_conn_button_state("searching")
-                return
-        try:
-            snapshot = self.client.get_snapshot()
+            self._remote_connect_in_flight = True
+
+            def _build():
+                return PrecilaserGuiClient(discovery_timeout=0.1)
+
+            def _build_done(result, exc):
+                self._remote_connect_in_flight = False
+                if exc is not None:
+                    self._remote_state_failed.emit(str(exc))
+                else:
+                    self.client = result
+                    # Trigger an immediate fetch on the GUI thread.
+                    self._remote_state_failed.emit("")  # clears error
+            QThreadPool.globalInstance().start(_BgCall(_build, _build_done))
+            return
+
+        self._remote_poll_in_flight = True
+        client = self.client
+        next_idx = self._next_log_index
+
+        def _fetch():
+            snap = client.get_snapshot()
+            log_count = int(snap.get("log_count", next_idx)) if isinstance(snap, dict) else next_idx
+            logs_payload = None
+            if log_count > next_idx:
+                logs_payload = client.get_logs_since(next_idx)
+            return (snap, logs_payload)
+
+        def _done(result, exc):
+            if exc is not None:
+                self._remote_state_failed.emit(str(exc))
+            else:
+                snap, logs_payload = result
+                self._remote_state_ready.emit(snap, logs_payload)
+
+        QThreadPool.globalInstance().start(_BgCall(_fetch, _done))
+
+    # ---- GUI-thread completion slots --------------------------------- #
+
+    def _on_remote_state_ready(self, snapshot, logs_payload) -> None:
+        self._remote_poll_in_flight = False
+        self._set_server_conn_button_state("connected")
+        self._apply_snapshot(snapshot)
+        if logs_payload is not None:
+            for msg in logs_payload.get("messages", []):
+                self._append_log(str(msg))
+            self._next_log_index = int(
+                logs_payload.get("next_index", self._next_log_index)
+            )
+        self._last_remote_error = None
+
+    def _on_remote_state_failed(self, err: str) -> None:
+        self._remote_poll_in_flight = False
+        if not err:
+            # Connect succeeded; let the next tick fetch the snapshot.
             self._set_server_conn_button_state("connected")
-            self._apply_snapshot(snapshot)
-            log_count = int(snapshot.get("log_count", self._next_log_index))
-            self._sync_logs(log_count)
-            self._last_remote_error = None
-        except Exception as exc:
-            err = str(exc)
-            if err != self._last_remote_error:
-                self._append_log(f"ERROR remote sync: {err}")
-                self._last_remote_error = err
-            # Null the client so the next tick triggers full rediscovery.
-            self.client = None
-            self._set_server_conn_button_state("lost")
+            return
+        if err != self._last_remote_error:
+            self._append_log(f"ERROR remote sync: {err}")
+            self._last_remote_error = err
+        # Null the client so the next tick triggers full rediscovery.
+        self.client = None
+        self._set_server_conn_button_state("lost")
 
     def _sync_logs(self, log_count: int) -> None:
-        if log_count <= self._next_log_index:
-            return
-        payload = self.client.get_logs_since(self._next_log_index)
-        messages = payload.get("messages", [])
-        for msg in messages:
-            self._append_log(str(msg))
-        self._next_log_index = int(payload.get("next_index", self._next_log_index))
+        # Kept as a no-op for callers; log syncing now piggy-backs on
+        # the background snapshot fetch in ``_sync_remote_state``.
+        return
 
     @staticmethod
     def _fmt_value(value: Any, precision: int = 2) -> str:

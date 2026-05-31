@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QGridLayout, QGroupBox, QStatusBar, QFrame,
     QLineEdit, QCheckBox, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThread, QThreadPool, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtCore import QSize
 
@@ -143,7 +143,7 @@ class StepIndicator(QWidget):
 
         # Primary label
         self.label = QLabel(label)
-        self.label.setMinimumWidth(150)
+        self.label.setMinimumWidth(80)
         text_layout.addWidget(self.label)
 
         # Secondary status line (completed/already done timestamps)
@@ -358,6 +358,28 @@ class SerialWorker(QObject):
         self.disconnect_laser()
 
 
+class _BgCall(QRunnable):
+    """Run a callable on QThreadPool; report via callback.
+
+    Used so the GUI thread never blocks on the periodic snapshot/log
+    round-trip — without this the dashboard windows stutter when moved.
+    """
+
+    def __init__(self, func, on_done) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            res = self._func()
+        except BaseException as exc:  # noqa: BLE001
+            self._on_done(None, exc)
+            return
+        self._on_done(res, None)
+
+
 class ServerWorker(QObject):
     """Worker thread for TCP server"""
     
@@ -529,6 +551,9 @@ class SequenceWorker(QObject):
 
 
 class ALSControlGUI(QMainWindow):
+    # Cross-thread plumbing for the background snapshot/log fetcher.
+    _remote_state_ready = pyqtSignal(object, object)   # (snapshot, logs_payload|None)
+    _remote_state_failed = pyqtSignal(str)
     """Main GUI window for laser control"""
 
     request_serial_connect = pyqtSignal()
@@ -565,6 +590,8 @@ class ALSControlGUI(QMainWindow):
         self.remote_client: Optional[ALSGuiClient] = None
         self._next_log_index = 0
         self._last_remote_error: Optional[str] = None
+        self._remote_poll_in_flight = False
+        self._remote_connect_in_flight = False
         self._remote_sequence_state = SequenceState.IDLE
         self._remote_sequence_type: Optional[str] = None
         self._remote_serial_port = serial_port
@@ -622,8 +649,11 @@ class ALSControlGUI(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         self.adjustSize()
-        self.setMinimumSize(self.minimumSizeHint())
-        self.resize(self.minimumSizeHint())
+        # Allow the dock panel to shrink horizontally; the layout will
+        # still enforce a sensible vertical minimum.
+        hint = self.minimumSizeHint()
+        self.setMinimumSize(0, hint.height())
+        self.resize(hint)
         
         # Initialize worker threads
         self._init_workers()
@@ -632,6 +662,10 @@ class ALSControlGUI(QMainWindow):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._sync_remote_state)
         self.status_timer.start(500)
+
+        # Cross-thread completion signals from the background remote-state fetcher.
+        self._remote_state_ready.connect(self._on_remote_state_ready)
+        self._remote_state_failed.connect(self._on_remote_state_failed)
         
         # Timer for auto-scrolling log back to bottom after user scrolls up
         self.auto_scroll_timer = QTimer()
@@ -890,7 +924,9 @@ class ALSControlGUI(QMainWindow):
         # ── Telemetry in a collapsible dropdown ───────────────────────
         try:
             from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
-            telem_group = CollapsibleGroupBox("Telemetry", expanded=False)
+            telem_group = CollapsibleGroupBox(
+                "Telemetry", expanded=False, scrollable=True, max_expanded_height=180,
+            )
         except Exception:
             telem_group = QGroupBox("Telemetry")
             QHBoxLayout(telem_group)
@@ -914,7 +950,9 @@ class ALSControlGUI(QMainWindow):
         # ── Activity log: collapsible-only piece ─────────────────────
         try:
             from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
-            log_box = CollapsibleGroupBox("Activity Log", expanded=False)
+            log_box = CollapsibleGroupBox(
+                "Activity Log", expanded=False, scrollable=True, max_expanded_height=220,
+            )
         except Exception:
             log_box = QGroupBox("Activity Log")
             QVBoxLayout(log_box)
@@ -1103,22 +1141,78 @@ class ALSControlGUI(QMainWindow):
         self._sync_remote_state()
 
     def _sync_remote_state(self):
-        """Poll the ALS server for latest state and logs."""
+        """Poll the ALS server for state and logs without blocking the GUI.
+
+        Both the discovery handshake and the per-tick round-trip happen on
+        QThreadPool; results are marshalled back via Qt signals so window
+        drags stay smooth even when the server is slow or missing.
+        """
+        if self._remote_poll_in_flight or self._remote_connect_in_flight:
+            return
+
         if self.remote_client is None:
-            try:
-                self.remote_client = ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
-                self._set_server_conn_button_state("connected")
-            except RuntimeError:
-                self._set_server_conn_button_state("searching")
-                return
-        try:
-            snapshot = self.remote_client.get_snapshot()
-            self._set_server_conn_button_state("connected")
-            self._last_remote_error = None
+            self._remote_connect_in_flight = True
+            self._set_server_conn_button_state("searching")
+
+            def _build():
+                return ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
+
+            def _build_done(result, exc):
+                self._remote_connect_in_flight = False
+                if exc is not None:
+                    self._remote_state_failed.emit(str(exc))
+                else:
+                    self.remote_client = result
+                    # Let the next tick fetch the snapshot.
+                    self._remote_state_failed.emit("")
+            QThreadPool.globalInstance().start(_BgCall(_build, _build_done))
+            return
+
+        self._remote_poll_in_flight = True
+        client = self.remote_client
+        next_idx = self._next_log_index
+
+        def _fetch():
+            snap = client.get_snapshot()
+            log_count = (
+                int(snap.get("log_count", next_idx)) if isinstance(snap, dict) else next_idx
+            )
+            logs_payload = None
+            if log_count > next_idx:
+                logs_payload = client.get_logs_since(next_idx)
+            return (snap, logs_payload)
+
+        def _done(result, exc):
+            if exc is not None:
+                self._remote_state_failed.emit(str(exc))
+            else:
+                snap, logs_payload = result
+                self._remote_state_ready.emit(snap, logs_payload)
+
+        QThreadPool.globalInstance().start(_BgCall(_fetch, _done))
+
+    # ---- GUI-thread completion slots --------------------------------- #
+
+    def _on_remote_state_ready(self, snapshot, logs_payload) -> None:
+        self._remote_poll_in_flight = False
+        self._set_server_conn_button_state("connected")
+        self._last_remote_error = None
+        if isinstance(snapshot, dict):
             self._apply_remote_snapshot(snapshot)
-            self._sync_remote_logs(snapshot.get("log_count", self._next_log_index))
-        except Exception as exc:
-            self._handle_remote_error(exc)
+        if logs_payload is not None:
+            for message in logs_payload.get("messages", []):
+                self._append_log_message(message)
+            self._next_log_index = int(
+                logs_payload.get("next_index", self._next_log_index)
+            )
+
+    def _on_remote_state_failed(self, err: str) -> None:
+        self._remote_poll_in_flight = False
+        if not err:
+            self._set_server_conn_button_state("connected")
+            return
+        # Surface error via the existing handler (status bar + state reset).
+        self._handle_remote_error(RuntimeError(err))
 
     def _apply_remote_snapshot(self, snapshot: Dict[str, Any]) -> None:
         status_data = snapshot.get("status", {})
@@ -1231,12 +1325,9 @@ class ALSControlGUI(QMainWindow):
             )
 
     def _sync_remote_logs(self, log_count: int) -> None:
-        if self.remote_client is None or log_count <= self._next_log_index:
-            return
-        log_response = self.remote_client.get_logs_since(self._next_log_index)
-        for message in log_response.get("messages", []):
-            self._append_log_message(message)
-        self._next_log_index = int(log_response.get("next_index", self._next_log_index))
+        # Kept as a no-op shim; log syncing now piggy-backs on the
+        # background snapshot fetch in ``_sync_remote_state``.
+        return
 
     def _set_server_conn_button_state(self, state: str) -> None:
         """Update the server TCP connection button appearance.
