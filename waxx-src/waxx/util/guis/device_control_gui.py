@@ -869,7 +869,7 @@ class DeviceStateGUI(QMainWindow):
             self.status_button.setStyleSheet("background-color: orange; color: white;")
         else:  # STATES.NOT_READY
             self.status_button.setText("monitor not ready - click to restart")
-            self.status_button.setStyleSheet("background-color: red; color: white;")
+            self.status_button.setStyleSheet("background-color: #c46666; color: white;")
             
     def on_connection_failed(self):
         """Handle connection failure"""

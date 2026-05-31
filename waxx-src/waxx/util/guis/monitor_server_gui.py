@@ -123,7 +123,7 @@ class MonitorServerGUI(QWidget):
             self.status_indicator.setStyleSheet("background-color: green; color: white;")
         elif status == STATES.NOT_READY:
             self.status_indicator.setText("NOT READY")
-            self.status_indicator.setStyleSheet("background-color: red; color: white;")
+            self.status_indicator.setStyleSheet("background-color: #c46666; color: white;")
         else:
             self.status_indicator.setText("Loading...")
             self.status_indicator.setStyleSheet("background-color: orange; color: white;")

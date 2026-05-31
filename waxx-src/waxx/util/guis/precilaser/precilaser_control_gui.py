@@ -69,7 +69,7 @@ class StatusDot(QPushButton):
         self.off_text = off_text
         self.is_on = False
         self.setEnabled(False)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(22)
         self._update_color()
 
     def set_status(self, is_on: bool):
@@ -86,7 +86,7 @@ class StatusDot(QPushButton):
         self.setText(f"{self.label_text}: {state_text}")
         self.setStyleSheet(
             f"background-color: {color.name()}; color: #ffffff; border-radius: 10px; "
-            f"padding: 8px 10px; font-weight: 700; text-align: left;"
+            f"padding: 4px 10px; font-weight: 700; text-align: left;"
         )
 
 
@@ -111,32 +111,37 @@ class PrecilaserControlGUI(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(18, 18, 18, 18)
-        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
 
-        dashboard_layout = QHBoxLayout()
-        dashboard_layout.setSpacing(12)
+        dashboard_layout = QVBoxLayout()
+        dashboard_layout.setSpacing(8)
 
-        left_column = QVBoxLayout()
-        left_column.setSpacing(12)
+        # All boxes/dropdowns vertically stacked so the panel can compress
+        # horizontally to almost any width.
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+        except Exception:
+            CollapsibleGroupBox = None  # type: ignore
+
         self.status_panel = self._create_status_panel()
         self.telemetry_panel = self._create_telemetry_panel()
-        left_column.addWidget(self.status_panel)
-        left_column.addWidget(self.telemetry_panel)
-        left_column.addStretch()
-        left_panel_width = max(
-            self.status_panel.minimumSizeHint().width(),
-            self.telemetry_panel.minimumSizeHint().width(),
-        )
-        self.status_panel.setFixedWidth(left_panel_width)
-        self.telemetry_panel.setFixedWidth(left_panel_width)
-        dashboard_layout.addLayout(left_column)
+        # Laser indicators are now always visible (not buried in a dropdown).
+        dashboard_layout.addWidget(self.status_panel)
+        # Controls always visible.
+        dashboard_layout.addWidget(self._create_control_panel())
+        # Telemetry + Logs sit together under one dropdown for compactness.
+        log_box = self._create_log_panel()
+        if CollapsibleGroupBox is not None:
+            tl_wrap = CollapsibleGroupBox("Telemetry & Logs", expanded=False)
+            tl_wrap.addWidget(self.telemetry_panel)
+            tl_wrap.addWidget(log_box)
+            dashboard_layout.addWidget(tl_wrap, 1)
+        else:
+            dashboard_layout.addWidget(self.telemetry_panel)
+            dashboard_layout.addWidget(log_box, 1)
 
-        right_column = QVBoxLayout()
-        right_column.setSpacing(12)
-        right_column.addWidget(self._create_control_panel())
-        right_column.addWidget(self._create_log_panel(), 1)
-        dashboard_layout.addLayout(right_column, 1)
+        dashboard_layout.addStretch()
 
         root_layout.addLayout(dashboard_layout)
 
@@ -173,8 +178,8 @@ class PrecilaserControlGUI(QMainWindow):
                 background: #295c67;
                 color: #ffffff;
                 border: none;
-                border-radius: 8px;
-                padding: 8px 12px;
+                border-radius: 6px;
+                padding: 3px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -206,49 +211,52 @@ class PrecilaserControlGUI(QMainWindow):
     def _create_control_panel(self) -> QGroupBox:
         box = QGroupBox("Controls")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
 
-        self.laser_toggle_button = QPushButton("Enable Laser")
-        self.laser_toggle_button.clicked.connect(self._toggle_laser_enable)
-        layout.addWidget(self.laser_toggle_button)
-        self._update_laser_button()
+        # Laser enable/disable is handled by clicking the Laser Enable
+        # status dot in the status panel (no separate button needed).
 
-        current_box = QGroupBox("Working Current")
-        current_box_layout = QVBoxLayout(current_box)
-        current_box_layout.setContentsMargins(10, 6, 10, 6)
-        current_box_layout.setSpacing(4)
-
-        header_row = QHBoxLayout()
-        header_row.addStretch()
+        # Working-current block: a tight in-line column (no nested
+        # QGroupBox) so the prominent value isn't pushed down by an extra
+        # margin/padding ring.
+        current_header_row = QHBoxLayout()
+        current_header_row.setContentsMargins(0, 0, 0, 0)
+        current_header_row.setSpacing(6)
+        current_title = QLabel("Working Current")
+        current_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #5b6670;")
+        current_header_row.addWidget(current_title)
+        current_header_row.addStretch()
         self.current_edit_checkbox = QCheckBox("Edit")
         self.current_edit_checkbox.setChecked(False)
         self.current_edit_checkbox.stateChanged.connect(self._on_current_edit_toggled)
-        header_row.addWidget(self.current_edit_checkbox)
-        current_box_layout.addLayout(header_row)
+        current_header_row.addWidget(self.current_edit_checkbox)
+        layout.addLayout(current_header_row)
 
         self.current_display_label = QLabel("-- A")
         self.current_display_label.setStyleSheet(
-            "font-size: 36px; font-weight: 800; color: #295c67;"
+            "font-size: 36px; font-weight: 800; color: #295c67; padding: 0px; margin: 0px;"
         )
-        self.current_display_label.setMinimumHeight(52)
+        self.current_display_label.setContentsMargins(0, 0, 0, 0)
+        self.current_display_label.setMinimumHeight(0)
         self.current_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        current_box_layout.addWidget(self.current_display_label)
+        layout.addWidget(self.current_display_label)
 
         self.current_input = QLineEdit()
         self.current_input.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #295c67;"
+            "font-size: 26px; font-weight: 700; color: #295c67; padding: 2px;"
         )
-        self.current_input.setMinimumHeight(44)
+        self.current_input.setMinimumHeight(0)
         self.current_input.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.current_input.setPlaceholderText("A")
         self.current_input.returnPressed.connect(self._submit_working_current)
-        current_box_layout.addWidget(self.current_input)
+        layout.addWidget(self.current_input)
 
         self.current_submit_hint = QLabel("ENTER to submit")
         self.current_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c;")
         self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        current_box_layout.addWidget(self.current_submit_hint)
+        layout.addWidget(self.current_submit_hint)
 
-        layout.addWidget(current_box)
         self._update_current_edit_mode()
 
         seq_row = QHBoxLayout()
@@ -275,25 +283,34 @@ class PrecilaserControlGUI(QMainWindow):
     def _create_status_panel(self) -> QGroupBox:
         box = QGroupBox("Status Indicators")
         layout = QVBoxLayout(box)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
 
+        # Server / serial buttons kept as orphan widgets (so existing
+        # callbacks and setText() calls still work) but not added to the
+        # layout - the dashboard server panel header already shows server
+        # reachability and the COM-port LED.
         self.server_conn_button = QPushButton("Server: searching\u2026")
         self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.server_conn_button.clicked.connect(self._retry_server_connection)
-        layout.addWidget(self.server_conn_button)
+        self.server_conn_button.setVisible(False)
 
         self.connection_state_value = QLabel("DISCONNECTED")
         self.connection_state_value.setStyleSheet("font-size: 14px; font-weight: 700;")
-        layout.addWidget(self.connection_state_value)
+        self.connection_state_value.setVisible(False)
 
         self.serial_connect_button = QPushButton("Connect Serial")
         self.serial_connect_button.clicked.connect(self._toggle_serial_connection)
-        layout.addWidget(self.serial_connect_button)
+        self.serial_connect_button.setVisible(False)
         self._update_connection_button("DISCONNECTED")
 
         self.pd_ok_dot = StatusDot("PD OK")
         self.temp_ok_dot = StatusDot("Temperature OK")
-        self.laser_enable_dot = StatusDot("Laser Enable")
+        self.laser_enable_dot = StatusDot(
+            "Laser Enable", on_text="ON (click to disable)", off_text="OFF (click to enable)"
+        )
+        self.laser_enable_dot.setEnabled(True)
+        self.laser_enable_dot.clicked.connect(self._toggle_laser_enable)
         self.stability_dot = StatusDot(
             "Power Stability",
             on_color="#2b6de0",
@@ -403,25 +420,18 @@ class PrecilaserControlGUI(QMainWindow):
         if is_connected:
             self.serial_connect_button.setText("Disconnect Serial")
             self.serial_connect_button.setStyleSheet(
-                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
             )
         else:
             self.serial_connect_button.setText("Connect Serial")
             self.serial_connect_button.setStyleSheet(
-                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
             )
 
     def _update_laser_button(self) -> None:
-        if self._laser_enabled:
-            self.laser_toggle_button.setText("Disable Laser")
-            self.laser_toggle_button.setStyleSheet(
-                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
-            )
-        else:
-            self.laser_toggle_button.setText("Enable Laser")
-            self.laser_toggle_button.setStyleSheet(
-                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
-            )
+        # The toggle button has been replaced by the clickable Laser Enable
+        # status dot; this is kept as a no-op so existing call sites stay valid.
+        return
 
     def _toggle_laser_enable(self) -> None:
         self._set_laser_enable(not self._laser_enabled)
@@ -507,13 +517,13 @@ class PrecilaserControlGUI(QMainWindow):
         """
         if state == "connected" and self.client is not None:
             text = f"Server: {self.client.host}:{self.client.port}"
-            style = "background-color: #2ba363; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #2ba363; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         elif state == "lost":
             text = "Server: lost \u2014 click to retry"
-            style = "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         else:
             text = "Server: searching\u2026"
-            style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         self.server_conn_button.setText(text)
         self.server_conn_button.setStyleSheet(style)
 

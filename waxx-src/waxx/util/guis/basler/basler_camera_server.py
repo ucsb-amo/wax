@@ -255,6 +255,47 @@ class _ManagedCamera:
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
+    def get_trigger_mode(self) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                return {"ok": True, "result": str(self._camera.TriggerMode.GetValue())}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def set_trigger_mode(self, value: str) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                # Stop grabbing while changing trigger configuration; pylon
+                # requires this for the change to take effect cleanly.
+                was_grabbing = bool(self._camera.IsGrabbing())
+                if was_grabbing:
+                    self._camera.StopGrabbing()
+                self._camera.TriggerMode.SetValue(str(value))
+                if was_grabbing:
+                    self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                return {"ok": True}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def get_trigger_mode_options(self) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                node = self._camera.TriggerMode
+                # GenApi enum: use GetSymbolics() for available values.
+                try:
+                    options = [str(s) for s in node.GetSymbolics()]
+                except Exception:
+                    options = ["Off", "On"]
+                return {"ok": True, "result": options}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
     def info_dict(self) -> dict:
         return {"serial": self.serial, "model": self.model, "is_open": self._is_open, "user_id": self.user_id}
 
@@ -421,17 +462,21 @@ class BaslerCameraServer(WaxxServer):
                 return {"ok": False, "error": str(exc)}
 
         handlers = {
-            "GET_FRAME":          mc.get_frame,
-            "GET_GAIN":           mc.get_gain,
-            "GET_EXPOSURE":       mc.get_exposure,
-            "GET_GAIN_RANGE":     mc.get_gain_range,
-            "GET_EXPOSURE_RANGE": mc.get_exposure_range,
+            "GET_FRAME":               mc.get_frame,
+            "GET_GAIN":                mc.get_gain,
+            "GET_EXPOSURE":            mc.get_exposure,
+            "GET_GAIN_RANGE":          mc.get_gain_range,
+            "GET_EXPOSURE_RANGE":      mc.get_exposure_range,
+            "GET_TRIGGER_MODE":        mc.get_trigger_mode,
+            "GET_TRIGGER_MODE_OPTIONS": mc.get_trigger_mode_options,
         }
 
         if name == "SET_GAIN":
             return mc.set_gain(cmd.get("value", 0.0))
         if name == "SET_EXPOSURE":
             return mc.set_exposure(cmd.get("value", 0.0))
+        if name == "SET_TRIGGER_MODE":
+            return mc.set_trigger_mode(cmd.get("value", "Off"))
 
         handler = handlers.get(name)
         if handler is None:

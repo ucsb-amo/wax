@@ -83,7 +83,7 @@ class StatusDot(QPushButton):
         self.is_on = False
         self.setObjectName("StatusDotButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(22)
         self._update_color()
 
     def set_status(self, is_on: bool):
@@ -587,32 +587,22 @@ class ALSControlGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
         
-        dashboard_layout = QHBoxLayout()
-        dashboard_layout.setSpacing(16)
+        dashboard_layout = QVBoxLayout()
+        dashboard_layout.setSpacing(8)
 
-        left_column = QVBoxLayout()
-        left_column.setSpacing(16)
+        # Vertically stacked to match the Precilaser GUI layout: the
+        # panel can compress horizontally to almost any width because
+        # status, controls, and measurements stack instead of competing
+        # for horizontal room.
         self.status_panel = self._create_status_panel()
         self.control_panel = self._create_control_panel()
-        left_panel_width = max(
-            self.status_panel.minimumSizeHint().width(),
-            self.control_panel.minimumSizeHint().width(),
-        )
-        self.status_panel.setFixedWidth(left_panel_width)
-        self.control_panel.setFixedWidth(left_panel_width)
-        left_column.addWidget(self.status_panel)
-        left_column.addWidget(self.control_panel)
-        left_column.addStretch()
-        dashboard_layout.addLayout(left_column, 2)
-
-        right_column = QVBoxLayout()
-        right_column.setSpacing(16)
-        right_column.addWidget(self._create_measurements_panel())
-        right_column.addStretch()
-        dashboard_layout.addLayout(right_column, 3)
+        dashboard_layout.addWidget(self.status_panel)
+        dashboard_layout.addWidget(self.control_panel)
+        dashboard_layout.addWidget(self._create_measurements_panel(), 1)
+        dashboard_layout.addStretch()
 
         main_layout.addLayout(dashboard_layout)
         
@@ -681,8 +671,8 @@ class ALSControlGUI(QMainWindow):
                 background: #295c67;
                 color: #ffffff;
                 border: none;
-                border-radius: 10px;
-                padding: 10px 14px;
+                border-radius: 8px;
+                padding: 4px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -774,35 +764,31 @@ class ALSControlGUI(QMainWindow):
         """Create status display panel"""
         group = QGroupBox("System")
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        connection_card = QFrame()
-        connection_card.setObjectName("ConnectionCard")
-        connection_layout = QVBoxLayout(connection_card)
-        connection_layout.setContentsMargins(12, 8, 12, 8)
-        connection_layout.setSpacing(6)
-
+        # Connection buttons kept as orphan widgets so existing setText /
+        # setEnabled / setStyleSheet calls still work, but hidden from the
+        # layout - the dashboard server panel already shows server reachability
+        # and the COM-port LED, so duplicating them inside the GUI is noise.
         self.server_conn_button = QPushButton("Server: searching\u2026")
         self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.server_conn_button.clicked.connect(self._retry_server_connection)
-        connection_layout.addWidget(self.server_conn_button)
+        self.server_conn_button.setVisible(False)
 
         self.connect_button = QPushButton(f"{self._remote_serial_port} Disconnected")
-        self.connect_button.setMinimumWidth(180)
-        self.connect_button.setMaximumWidth(220)
         self.connect_button.setStyleSheet(
-            "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+            "background-color: #d03f37; color: #ffffff; border-radius: 10px;"
+            " padding: 10px 14px; font-weight: 700;"
         )
         self.connect_button.clicked.connect(self._toggle_connection)
-        connection_layout.addWidget(self.connect_button)
-        layout.addWidget(connection_card)
+        self.connect_button.setVisible(False)
 
         indicators_panel = QFrame()
         indicators_panel.setObjectName("IndicatorPanel")
         indicators_layout = QVBoxLayout(indicators_panel)
-        indicators_layout.setContentsMargins(10, 10, 10, 10)
-        indicators_layout.setSpacing(6)
+        indicators_layout.setContentsMargins(6, 6, 6, 6)
+        indicators_layout.setSpacing(4)
 
         indicators_title = QLabel("Laser Indicators")
         indicators_title.setObjectName("CardEyebrow")
@@ -819,18 +805,24 @@ class ALSControlGUI(QMainWindow):
         indicators_layout.addWidget(self.second_stage_status_dot)
 
         layout.addWidget(indicators_panel)
-        
+
         return group
 
     def _create_measurements_panel(self) -> QGroupBox:
-        """Create the right-side power and telemetry panel."""
+        """Create the right-side power and telemetry panel.
+
+        Power setpoint and optical-output cards are stacked vertically so
+        the panel survives horizontal compression.  Telemetry lives in its
+        own QGroupBox; activity log is the only collapsible piece.
+        """
         group = QGroupBox("Readout")
         layout = QVBoxLayout(group)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
-        power_row = QHBoxLayout()
-        power_row.setSpacing(10)
+        # ── Power readouts side-by-side (compact) ────────────────────
+        power_col = QHBoxLayout()
+        power_col.setSpacing(8)
 
         power_box = QFrame()
         power_box.setObjectName("PowerCard")
@@ -851,17 +843,17 @@ class ALSControlGUI(QMainWindow):
 
         self.power_setpoint_label = QLabel("0%")
         self.power_setpoint_label.setStyleSheet(
-            "font-size: 42px; font-weight: 800; color: #295c67; text-align: center;"
+            "font-size: 22px; font-weight: 800; color: #295c67; text-align: center;"
         )
-        self.power_setpoint_label.setMinimumHeight(58)
+        self.power_setpoint_label.setMinimumHeight(0)
         self.power_setpoint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_setpoint_label)
 
         self.power_input_field = PowerInputField(on_focus_out=self._on_power_input_focus_out)
         self.power_input_field.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #295c67; text-align: center;"
+            "font-size: 16px; font-weight: 700; color: #295c67; text-align: center;"
         )
-        self.power_input_field.setMinimumHeight(44)
+        self.power_input_field.setMinimumHeight(0)
         self.power_input_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_input_field.returnPressed.connect(self._on_power_input_submit)
         power_layout.addWidget(self.power_input_field)
@@ -872,7 +864,7 @@ class ALSControlGUI(QMainWindow):
         power_layout.addWidget(self.power_submit_hint)
 
         self._update_power_edit_mode()
-        power_row.addWidget(power_box, 1)
+        power_col.addWidget(power_box)
 
         optical_box = QFrame()
         optical_box.setObjectName("PowerCard")
@@ -886,35 +878,46 @@ class ALSControlGUI(QMainWindow):
 
         self.optical_power_label = QLabel("0 W")
         self.optical_power_label.setStyleSheet(
-            "font-size: 42px; font-weight: 800; color: #c26b2d; text-align: center;"
+            "font-size: 22px; font-weight: 800; color: #c26b2d; text-align: center;"
         )
-        self.optical_power_label.setMinimumHeight(58)
+        self.optical_power_label.setMinimumHeight(0)
         self.optical_power_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         optical_layout.addWidget(self.optical_power_label)
-        optical_layout.addStretch()
-        power_row.addWidget(optical_box, 1)
+        power_col.addWidget(optical_box)
 
-        layout.addLayout(power_row)
+        layout.addLayout(power_col)
 
-        telemetry_title = QLabel("Telemetry")
-        telemetry_title.setObjectName("CardEyebrow")
-        layout.addWidget(telemetry_title)
-
-        telemetry_row = QHBoxLayout()
-        telemetry_row.setSpacing(12)
+        # ── Telemetry in a collapsible dropdown ───────────────────────
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+            telem_group = CollapsibleGroupBox("Telemetry", expanded=False)
+        except Exception:
+            telem_group = QGroupBox("Telemetry")
+            QHBoxLayout(telem_group)
+        telem_inner = QHBoxLayout()
+        telem_inner.setContentsMargins(8, 8, 8, 8)
+        telem_inner.setSpacing(8)
         temp_card, self.temp_label = self._create_metric_card(
             "🌡", "Temperatures", "Actual / Setpoint", "0.0 / 0.0 °C"
         )
-        telemetry_row.addWidget(temp_card)
+        telem_inner.addWidget(temp_card)
         current_card, self.current_label = self._create_metric_card(
             "⚡", "Currents", "IMON-PA / LMON", "0.00 / 0.00 A"
         )
-        telemetry_row.addWidget(current_card)
-        layout.addLayout(telemetry_row)
+        telem_inner.addWidget(current_card)
+        if hasattr(telem_group, "setContentLayout"):
+            telem_group.setContentLayout(telem_inner)
+        else:
+            telem_group.layout().addLayout(telem_inner)
+        layout.addWidget(telem_group)
 
-        log_title = QLabel("Activity Log")
-        log_title.setObjectName("CardEyebrow")
-        layout.addWidget(log_title)
+        # ── Activity log: collapsible-only piece ─────────────────────
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+            log_box = CollapsibleGroupBox("Activity Log", expanded=False)
+        except Exception:
+            log_box = QGroupBox("Activity Log")
+            QVBoxLayout(log_box)
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
@@ -922,17 +925,21 @@ class ALSControlGUI(QMainWindow):
         log_font = self.log_output.font()
         log_font.setPointSize(9)
         self.log_output.setFont(log_font)
-        layout.addWidget(self.log_output, 1)
+        self.log_output.setMinimumHeight(80)
+        if hasattr(log_box, "addWidget"):
+            log_box.addWidget(self.log_output)
+        else:
+            log_box.layout().addWidget(self.log_output)
+        layout.addWidget(log_box, 1)
 
         return group
     
     def _create_control_panel(self) -> QGroupBox:
         """Create control panel with startup/shutdown buttons"""
         group = QGroupBox("Controls")
-        group.setMaximumWidth(280)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         self.startup_button = QPushButton("Startup")
         self.startup_button.clicked.connect(self._start_startup)

@@ -19,6 +19,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -354,6 +355,9 @@ class BaslerCameraWidget(QFrame):
 
         self._state_file = self._make_state_path()
         self._saved_norm_reference: Optional[float] = None
+        self._saved_gain: Optional[float] = None
+        self._saved_exposure: Optional[float] = None
+        self._saved_trigger_mode: Optional[str] = None
         self._load_state()
 
         self.last_image: Optional[np.ndarray] = None
@@ -387,6 +391,9 @@ class BaslerCameraWidget(QFrame):
                 x1, y1, x2, y2 = data["rect"]
                 self.current_rect = QRect(x1, y1, x2 - x1, y2 - y1)
             self._saved_norm_reference = data.get("norm_reference")
+            self._saved_gain = data.get("gain")
+            self._saved_exposure = data.get("exposure")
+            self._saved_trigger_mode = data.get("trigger_mode")
         except Exception:
             pass
 
@@ -398,6 +405,12 @@ class BaslerCameraWidget(QFrame):
             data["rect"] = [x, y, x + self.current_rect.width(), y + self.current_rect.height()]
         if self.counts_panel.norm_reference is not None:
             data["norm_reference"] = self.counts_panel.norm_reference
+        if self._saved_gain is not None:
+            data["gain"] = self._saved_gain
+        if self._saved_exposure is not None:
+            data["exposure"] = self._saved_exposure
+        if self._saved_trigger_mode is not None:
+            data["trigger_mode"] = self._saved_trigger_mode
         try:
             with open(self._state_file, "w") as f:
                 json.dump(data, f)
@@ -436,9 +449,9 @@ class BaslerCameraWidget(QFrame):
         self._title_label.setObjectName("camTitle")
         name_block.addWidget(self._title_label)
 
-        sub_label = QLabel(f"{self.client.model}  •  S/N {self.client.serial}  •  @ {self.client.hostname}")
-        sub_label.setObjectName("camSub")
-        name_block.addWidget(sub_label)
+        # Note: model / S/N / host info is shown in the surrounding
+        # QDockWidget's title-bar (see ``BaslerCamerasMainWindow``), so we
+        # deliberately omit the sub-label here to avoid duplication.
 
         hdr_layout.addLayout(name_block)
         hdr_layout.addStretch()
@@ -478,6 +491,14 @@ class BaslerCameraWidget(QFrame):
         self.exposure_spinbox.setFixedWidth(82)
         self.exposure_spinbox.valueChanged.connect(self._on_exposure_changed)
         tbar.addWidget(self.exposure_spinbox)
+
+        tbar.addWidget(_tsep())
+        tbar.addWidget(_tlabel("Trig"))
+        self.trigger_combo = QComboBox()
+        self.trigger_combo.setEnabled(False)
+        self.trigger_combo.setFixedWidth(72)
+        self.trigger_combo.currentTextChanged.connect(self._on_trigger_mode_changed)
+        tbar.addWidget(self.trigger_combo)
 
         tbar.addWidget(_tsep())
 
@@ -540,6 +561,18 @@ class BaslerCameraWidget(QFrame):
         _opt_btn.setMenu(self._opt_menu)
         _opt_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         tbar.addWidget(_opt_btn)
+
+        # ---- Save Defaults --------------------------------------------
+        # Snapshot the current ROI / gain / exposure / trigger to the
+        # per-camera state file so the next time the camera is opened it
+        # comes up with these values.
+        self.save_defaults_btn = QPushButton("Save Defaults")
+        self.save_defaults_btn.setToolTip(
+            "Save the current ROI, gain, exposure, and trigger mode as the\n"
+            "default values for this camera (used when re-opening it)."
+        )
+        self.save_defaults_btn.clicked.connect(self._on_save_defaults)
+        tbar.addWidget(self.save_defaults_btn)
 
         tbar.addStretch()
 
@@ -639,18 +672,44 @@ class BaslerCameraWidget(QFrame):
             pass
         self.gain_spinbox.setEnabled(False)
         self.exposure_spinbox.setEnabled(False)
+        self.trigger_combo.setEnabled(False)
         self.open_btn.setText("Open")
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText("camera closed")
         self._status_dot.setStyleSheet(_led_style(_LED_CLOSED))
 
     def _refresh_settings(self) -> None:
-        """Query the server for gain/exposure values and update spinboxes."""
+        """Query the server for gain/exposure/trigger and update widgets.
+
+        If the per-camera state file has saved defaults for gain, exposure
+        or trigger_mode, push those to the camera *before* reading back so
+        each camera comes up with its remembered configuration.
+        """
         try:
             gr = self.client.get_gain_range()
             er = self.client.get_exposure_range()
+            # Push persisted defaults first (silently).
+            if self._saved_gain is not None:
+                try:
+                    self.client.set_gain(float(self._saved_gain))
+                except Exception:
+                    pass
+            if self._saved_exposure is not None:
+                try:
+                    self.client.set_exposure(float(self._saved_exposure))
+                except Exception:
+                    pass
+            if self._saved_trigger_mode is not None:
+                try:
+                    self.client.set_trigger_mode(str(self._saved_trigger_mode))
+                except Exception:
+                    pass
+
             g = self.client.get_gain()
             e = self.client.get_exposure()
+            tm = self.client.get_trigger_mode()
+            tmo = self.client.get_trigger_mode_options()
+
             if gr.get("ok"):
                 self.gain_spinbox.blockSignals(True)
                 self.gain_spinbox.setRange(*gr["result"])
@@ -663,12 +722,32 @@ class BaslerCameraWidget(QFrame):
                 self.gain_spinbox.blockSignals(True)
                 self.gain_spinbox.setValue(g["result"])
                 self.gain_spinbox.blockSignals(False)
+                self._saved_gain = float(g["result"])
             if e.get("ok"):
                 self.exposure_spinbox.blockSignals(True)
                 self.exposure_spinbox.setValue(e["result"])
                 self.exposure_spinbox.blockSignals(False)
+                self._saved_exposure = float(e["result"])
+            # Populate trigger combo from the camera's allowed values.
+            if tmo.get("ok"):
+                opts = list(tmo["result"])
+                self.trigger_combo.blockSignals(True)
+                self.trigger_combo.clear()
+                self.trigger_combo.addItems(opts)
+                self.trigger_combo.blockSignals(False)
+            if tm.get("ok"):
+                self.trigger_combo.blockSignals(True)
+                idx = self.trigger_combo.findText(str(tm["result"]))
+                if idx >= 0:
+                    self.trigger_combo.setCurrentIndex(idx)
+                self.trigger_combo.blockSignals(False)
+                self._saved_trigger_mode = str(tm["result"])
+
             self.gain_spinbox.setEnabled(True)
             self.exposure_spinbox.setEnabled(True)
+            self.trigger_combo.setEnabled(True)
+            # Persist any newly-discovered defaults.
+            self._save_state()
         except Exception as exc:
             print(f"[BaslerWidget] Could not read camera settings: {exc}")
 
@@ -682,14 +761,31 @@ class BaslerCameraWidget(QFrame):
     def _on_gain_changed(self, value: float) -> None:
         try:
             self.client.set_gain(value)
+            self._saved_gain = float(value)
+            self._save_state()
         except Exception as exc:
             print(f"[BaslerWidget] set_gain error: {exc}")
 
     def _on_exposure_changed(self, value: float) -> None:
         try:
             self.client.set_exposure(value)
+            self._saved_exposure = float(value)
+            self._save_state()
         except Exception as exc:
             print(f"[BaslerWidget] set_exposure error: {exc}")
+
+    def _on_trigger_mode_changed(self, value: str) -> None:
+        if not value:
+            return
+        try:
+            resp = self.client.set_trigger_mode(value)
+            if resp.get("ok"):
+                self._saved_trigger_mode = str(value)
+                self._save_state()
+            else:
+                print(f"[BaslerWidget] set_trigger_mode failed: {resp.get('error')}")
+        except Exception as exc:
+            print(f"[BaslerWidget] set_trigger_mode error: {exc}")
 
     def _on_normalize_toggled(self, checked: bool) -> None:
         if checked:
@@ -713,6 +809,51 @@ class BaslerCameraWidget(QFrame):
             total = self._splitter.width()
             third = max(total // 3, 200)
             self._splitter.setSizes([total - third, third])
+            # ROI is required for pixel counts to be meaningful; warn the
+            # user if one hasn't been drawn yet.
+            self._check_roi_for_counts()
+
+    def _has_valid_roi(self) -> bool:
+        r = self.current_rect
+        return bool(r and r.width() > 0 and r.height() > 0)
+
+    def _check_roi_for_counts(self) -> None:
+        """When the counts panel is opened, make sure an ROI exists.
+
+        If no ROI rectangle is set we set the plot title to an explicit
+        instruction so it's obvious why no counts are appearing.  As soon
+        as the user draws an ROI the title is restored.
+        """
+        if self._has_valid_roi():
+            self.counts_panel.plot_widget.setTitle("Summed Pixel Counts vs Time")
+        else:
+            self.counts_panel.plot_widget.setTitle(
+                "No ROI set \u2014 drag on the image to define one"
+            )
+
+    def _on_save_defaults(self) -> None:
+        """Snapshot current settings to disk as this camera's defaults."""
+        # Pull live values out of the spinboxes/combo so we save exactly
+        # what the user sees, even if the camera is currently closed.
+        if self.gain_spinbox.isEnabled():
+            self._saved_gain = float(self.gain_spinbox.value())
+        if self.exposure_spinbox.isEnabled():
+            self._saved_exposure = float(self.exposure_spinbox.value())
+        if self.trigger_combo.isEnabled() and self.trigger_combo.currentText():
+            self._saved_trigger_mode = self.trigger_combo.currentText()
+        self._save_state()
+
+        # Give the user feedback with a brief button-text flash.
+        original = self.save_defaults_btn.text()
+        self.save_defaults_btn.setText("Saved \u2713")
+        self.save_defaults_btn.setEnabled(False)
+        QTimer.singleShot(
+            1200,
+            lambda: (
+                self.save_defaults_btn.setText(original),
+                self.save_defaults_btn.setEnabled(True),
+            ),
+        )
 
     def _on_auto_rescale_toggled(self, checked: bool) -> None:
         self.counts_panel.auto_rescale = checked
@@ -848,6 +989,10 @@ class BaslerCameraWidget(QFrame):
             y2 = max(self.rect_start.y(), self.rect_end.y())
             self.current_rect = QRect(x1, y1, x2 - x1, y2 - y1)
             self._save_state()
+            # If the counts panel is open, refresh the title now that we
+            # have a valid ROI (clears the "No ROI set..." instruction).
+            if self.counts_panel.isVisible():
+                self._check_roi_for_counts()
 
     # ------------------------------------------------------------------ #
 

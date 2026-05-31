@@ -22,7 +22,7 @@ from collections import deque
 from datetime import datetime
 
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from waxx.util.guis.HMR_magnetometer.hmr_magnetometer_client import HMRClient
 
@@ -143,23 +143,39 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
 
-        # --- toolbar ---
-        top = QtWidgets.QHBoxLayout()
-        top.setSpacing(10)
-        top.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter)
-        root.addLayout(top)
+        # --- controls collapsed into a QMenuBar with dropdowns ---
+        menubar = QtWidgets.QMenuBar(self)
+        # Force the menubar to render inside the central widget (helps when
+        # the GUI is embedded as a child widget rather than a top-level
+        # window where the OS would steal the bar).
+        menubar.setNativeMenuBar(False)
+        self.setMenuBar(menubar)
 
-        time_group = QtWidgets.QGroupBox("Time")
-        time_group.setStyleSheet(
-            "QGroupBox { border: 1px solid #cfd6df; border-radius: 8px; margin-top: 8px; font-weight: 700; }"
-            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; color: #506070; }"
-        )
-        time_layout = QtWidgets.QGridLayout(time_group)
-        time_layout.setContentsMargins(10, 10, 10, 8)
-        time_layout.setHorizontalSpacing(8)
-        time_layout.setVerticalSpacing(6)
+        def _spin_action(menu, label_text, spinbox):
+            row = QtWidgets.QWidget(menu)
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 2, 8, 2)
+            row_layout.setSpacing(6)
+            lbl = QtWidgets.QLabel(label_text, row)
+            row_layout.addWidget(lbl)
+            row_layout.addWidget(spinbox)
+            wa = QtWidgets.QWidgetAction(menu)
+            wa.setDefaultWidget(row)
+            menu.addAction(wa)
+            return wa
 
-        time_layout.addWidget(QtWidgets.QLabel("Window (s):"), 0, 0)
+        def _label_action(menu, qlabel):
+            wa = QtWidgets.QWidgetAction(menu)
+            wrap = QtWidgets.QWidget(menu)
+            wl = QtWidgets.QHBoxLayout(wrap)
+            wl.setContentsMargins(8, 2, 8, 2)
+            wl.addWidget(qlabel)
+            wa.setDefaultWidget(wrap)
+            menu.addAction(wa)
+            return wa
+
+        # --- Time menu ---
+        time_menu = menubar.addMenu("Time")
         self.window_spin = QtWidgets.QDoubleSpinBox()
         self.window_spin.setRange(0.1, 1e6)
         self.window_spin.setDecimals(2)
@@ -167,9 +183,8 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.window_spin.setSingleStep(5.0)
         self.window_spin.setMaximumWidth(92)
         self.window_spin.valueChanged.connect(self._on_window_changed)
-        time_layout.addWidget(self.window_spin, 0, 1)
+        _spin_action(time_menu, "Window (s):", self.window_spin)
 
-        time_layout.addWidget(QtWidgets.QLabel("Statistics (s):"), 1, 0)
         self.stats_spin = QtWidgets.QDoubleSpinBox()
         self.stats_spin.setRange(0.1, 1e6)
         self.stats_spin.setDecimals(2)
@@ -177,128 +192,74 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.stats_spin.setSingleStep(5.0)
         self.stats_spin.setMaximumWidth(92)
         self.stats_spin.valueChanged.connect(self._on_stats_window_changed)
-        time_layout.addWidget(self.stats_spin, 1, 1)
-        top.addWidget(time_group, 1)
+        _spin_action(time_menu, "Statistics (s):", self.stats_spin)
 
-        action_group = QtWidgets.QGroupBox("Run & Data")
-        action_group.setStyleSheet(
-            "QGroupBox { border: 1px solid #cfd6df; border-radius: 8px; margin-top: 8px; font-weight: 700; }"
-            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; color: #506070; }"
-        )
-        action_col = QtWidgets.QVBoxLayout(action_group)
-        action_col.setContentsMargins(10, 10, 10, 8)
-        action_col.setSpacing(4)
+        # --- Run & Data menu ---
+        run_menu = menubar.addMenu("Run && Data")
+        # toggle_button kept as the public handle but is now a QAction.
+        # QAction supports setText() so existing call sites still work; the
+        # only signal-name change is .clicked -> .triggered (handled here).
+        self.toggle_button = QtGui.QAction("Start", self)
+        self.toggle_button.triggered.connect(self.toggle_monitor)
+        run_menu.addAction(self.toggle_button)
 
-        action_layout = QtWidgets.QHBoxLayout()
-        action_layout.setSpacing(6)
+        clear_action = QtGui.QAction("Clear", self)
+        clear_action.triggered.connect(self.clear_data)
+        run_menu.addAction(clear_action)
 
-        self.toggle_button = QtWidgets.QPushButton("Start")
-        self.toggle_button.clicked.connect(self.toggle_monitor)
-        action_layout.addWidget(self.toggle_button)
+        save_action = QtGui.QAction("Save CSV", self)
+        save_action.triggered.connect(self.save_log)
+        run_menu.addAction(save_action)
 
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.clicked.connect(self.clear_data)
-        action_layout.addWidget(clear_btn)
+        log_action = QtGui.QAction("Open Log…", self)
+        log_action.triggered.connect(self._open_log_dialog)
+        run_menu.addAction(log_action)
 
-        save_btn = QtWidgets.QPushButton("Save CSV")
-        save_btn.clicked.connect(self.save_log)
-        action_layout.addWidget(save_btn)
-
-        log_btn = QtWidgets.QPushButton("Open Log")
-        log_btn.clicked.connect(self._open_log_dialog)
-        action_layout.addWidget(log_btn)
-
+        run_menu.addSeparator()
         self.latest_log_preview_label = QtWidgets.QLabel("last log: --")
         self.latest_log_preview_label.setStyleSheet("color: #6f7a87; font-size: 11px;")
-        self.latest_log_preview_label.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        self.latest_log_preview_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Ignored,
-            QtWidgets.QSizePolicy.Policy.Preferred,
-        )
-        action_col.addLayout(action_layout)
-        action_col.addWidget(self.latest_log_preview_label)
-        top.addWidget(action_group, 1)
+        _label_action(run_menu, self.latest_log_preview_label)
 
-        ref_group = QtWidgets.QGroupBox("Reference")
-        ref_group_layout = QtWidgets.QVBoxLayout(ref_group)
-        ref_group_layout.setContentsMargins(8, 12, 8, 8)
-        ref_group_layout.setSpacing(6)
+        # --- Reference menu ---
+        ref_menu = menubar.addMenu("Reference")
+        ref_set = QtGui.QAction("Set", self)
+        ref_set.triggered.connect(self._set_reference)
+        ref_menu.addAction(ref_set)
 
-        ref_group_layout.addSpacing(2)
+        ref_load = QtGui.QAction("Load…", self)
+        ref_load.triggered.connect(self._open_load_reference_dialog)
+        ref_menu.addAction(ref_load)
 
-        ref_row = QtWidgets.QHBoxLayout()
-        ref_row.setSpacing(4)
-        ref_group_layout.addLayout(ref_row)
+        ref_clear = QtGui.QAction("Clear", self)
+        ref_clear.triggered.connect(self._clear_reference)
+        ref_menu.addAction(ref_clear)
 
-        ref_btn = QtWidgets.QPushButton("Set")
-        ref_btn.clicked.connect(self._set_reference)
-        ref_btn.setFixedHeight(24)
-        ref_btn.setMinimumWidth(48)
-        ref_row.addWidget(ref_btn)
-
-        load_ref_btn = QtWidgets.QPushButton("Load")
-        load_ref_btn.clicked.connect(self._open_load_reference_dialog)
-        load_ref_btn.setFixedHeight(24)
-        load_ref_btn.setMinimumWidth(48)
-        ref_row.addWidget(load_ref_btn)
-
-        clear_ref_btn = QtWidgets.QPushButton("Clear")
-        clear_ref_btn.clicked.connect(self._clear_reference)
-        clear_ref_btn.setFixedHeight(24)
-        clear_ref_btn.setMinimumWidth(48)
-        ref_row.addWidget(clear_ref_btn)
-
+        ref_menu.addSeparator()
         self.reference_info_label = QtWidgets.QLabel("loaded reference: --")
         self.reference_info_label.setStyleSheet("color: #6f7a87; font-size: 11px;")
-        self.reference_info_label.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter
-        )
-        ref_group_layout.addWidget(self.reference_info_label)
+        _label_action(ref_menu, self.reference_info_label)
 
-        top.addWidget(ref_group, 1)
+        # --- Serial menu ---
+        serial_menu = menubar.addMenu("Serial")
+        restart_action = QtGui.QAction("⟳ Restart serial connection", self)
+        restart_action.triggered.connect(self._restart_serial)
+        serial_menu.addAction(restart_action)
 
-        right_controls = QtWidgets.QVBoxLayout()
-        right_controls.setContentsMargins(0, 0, 0, 0)
-        right_controls.setSpacing(6)
+        # --- Settings (top-level button) ---
+        settings_action = QtGui.QAction("⚙ Settings…", self)
+        settings_action.triggered.connect(self.open_settings_window)
+        menubar.addAction(settings_action)
 
-        settings_btn = QtWidgets.QPushButton("⚙")
-        settings_btn.clicked.connect(self.open_settings_window)
-        settings_btn.setFixedSize(34, 30)
-        settings_btn.setStyleSheet(
-            "QPushButton { background: #ffffff; border: 1px solid #bcc7d6; border-radius: 7px; padding: 0; font-weight: 700; }"
-            "QPushButton:hover { background: #eef3ff; border-color: #8aa2ff; }"
-        )
-        right_controls.addWidget(settings_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
-
+        # Hidden back-compat widgets (server/serial buttons referenced
+        # elsewhere by name; status is shown via dashboard header).
         self.server_conn_button = QtWidgets.QPushButton("Server: searching\u2026")
-        self.server_conn_button.setFixedHeight(28)
         self.server_conn_button.clicked.connect(self._retry_server_connection)
         self._update_server_conn_button("searching")
-        right_controls.addWidget(self.server_conn_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        self.server_conn_button.setVisible(False)
 
         self.serial_button = QtWidgets.QPushButton("Serial: ?")
-        self.serial_button.setFixedHeight(28)
-        self.serial_button.setStyleSheet(
-            "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; border-radius: 7px; padding: 2px 10px; }"
-            "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
-        )
         self.serial_button.clicked.connect(self._toggle_serial_connection)
-        right_controls.addWidget(self.serial_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
-
-        restart_serial_btn = QtWidgets.QPushButton("⟳ Restart")
-        restart_serial_btn.setFixedHeight(26)
-        restart_serial_btn.setToolTip("Force-restart the serial connection on the server")
-        restart_serial_btn.setStyleSheet(
-            "QPushButton { background: #f5f0e8; border: 1px solid #d4bc8a; color: #5a4317; border-radius: 7px; padding: 2px 8px; font-size: 11px; }"
-            "QPushButton:hover { background: #ede3ce; border-color: #c4a060; }"
-        )
-        restart_serial_btn.clicked.connect(self._restart_serial)
-        right_controls.addWidget(restart_serial_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
-        right_controls.addStretch(1)
-
-        top.addLayout(right_controls)
+        self.serial_button.setVisible(False)
 
         # --- plots + left readout cards (one row per channel) ---
         rows = QtWidgets.QVBoxLayout()
@@ -319,7 +280,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             rows.addLayout(row, stretch=1)
 
             card = QtWidgets.QGroupBox(ylabel.replace(" (G)", ""))
-            card.setFixedWidth(READOUT_PANEL_WIDTH)
+            card.setMinimumWidth(140)
+            card.setMaximumWidth(READOUT_PANEL_WIDTH)
+            card.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Preferred,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
             card.setStyleSheet(
                 f"QGroupBox {{ border: 1px solid {color}; border-radius: 8px; margin-top: 8px; font-weight: 700; }}"
                 f"QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; color: {color}; }}"
@@ -349,6 +315,38 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             mean_label = add_stat_row("Mean", "G", 1)
             std_label = add_stat_row("σ", "uG", 2)
             delta_label = add_stat_row("Δ<sub>ref</sub>", "mG", 3)
+
+            # When the card is small, hide the Mean and σ rows but keep
+            # the primary Value row AND the Δ_ref row visible — the
+            # delta is the most useful at-a-glance number alongside the
+            # current value.
+            _aux_widgets = []
+            for r in (1, 2):
+                for c in range(3):
+                    item = card_layout.itemAtPosition(r, c)
+                    if item is not None and item.widget() is not None:
+                        _aux_widgets.append(item.widget())
+
+            def _make_filter(card_ref, aux):
+                from PyQt6.QtCore import QEvent, QObject  # noqa: PLC0415
+
+                class _Collapser(QObject):
+                    THRESH = 110  # px
+
+                    def eventFilter(self, obj, ev):  # noqa: N802
+                        if ev.type() == QEvent.Type.Resize and obj is card_ref:
+                            show = card_ref.height() >= self.THRESH
+                            for w in aux:
+                                if w.isVisible() != show:
+                                    w.setVisible(show)
+                        return False
+
+                f = _Collapser(card_ref)
+                card_ref.installEventFilter(f)
+                # Keep a reference so it isn't garbage-collected.
+                card_ref._collapser_filter = f
+
+            _make_filter(card, _aux_widgets)
 
             row.addWidget(card, stretch=0)
 
@@ -387,16 +385,8 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         x_label_row = QtWidgets.QHBoxLayout()
         x_label_row.setSpacing(8)
+        # "Seconds ago" axis caption removed for vertical compactness.
         root.addLayout(x_label_row)
-
-        left_spacer = QtWidgets.QWidget()
-        left_spacer.setFixedWidth(READOUT_PANEL_WIDTH)
-        x_label_row.addWidget(left_spacer)
-
-        x_label = QtWidgets.QLabel("Seconds ago")
-        x_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        x_label.setStyleSheet("color: #4c596a; font-weight: 600;")
-        x_label_row.addWidget(x_label, stretch=1)
 
         self._reset_display()
 

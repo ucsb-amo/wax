@@ -179,6 +179,15 @@ class BaslerCameraClient:
     def get_exposure_range(self) -> dict:
         return self._req({"cmd": "GET_EXPOSURE_RANGE"})
 
+    def get_trigger_mode(self) -> dict:
+        return self._req({"cmd": "GET_TRIGGER_MODE"})
+
+    def set_trigger_mode(self, value: str) -> dict:
+        return self._req({"cmd": "SET_TRIGGER_MODE", "value": str(value)})
+
+    def get_trigger_mode_options(self) -> dict:
+        return self._req({"cmd": "GET_TRIGGER_MODE_OPTIONS"})
+
 
 # ---------------------------------------------------------------------------
 # Discovery helper
