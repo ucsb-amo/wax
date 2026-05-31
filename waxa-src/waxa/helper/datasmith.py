@@ -1,5 +1,57 @@
 import numpy as np
 
+def key_from_attribute(obj, value, first_match_only=True, check_duplicates=False):
+    """
+    Returns the attribute name (key) of `obj` whose value exactly matches `value`.
+    
+    Handles numpy arrays, scalars, and other types. Returns None if no match found.
+    
+    Args:
+        obj: Object to search through
+        value: The value to match (any data type)
+        first_match_only: If True, return on first match (faster). 
+                         If False, check for duplicates.
+        check_duplicates: If True, raise ValueError if multiple attributes match.
+                         Ignored if first_match_only=True.
+        
+    Returns:
+        str: The attribute name, or None if no exact match found
+        
+    Raises:
+        ValueError: If check_duplicates=True and multiple attributes match
+    """
+    matches = [] if check_duplicates else None
+    
+    for key, val in vars(obj).items():
+        if key.startswith('_'):  # Skip private attributes
+            continue
+            
+        try:
+            # Handle numpy arrays
+            if isinstance(val, np.ndarray) and isinstance(value, np.ndarray):
+                if np.array_equal(val, value):
+                    if first_match_only:
+                        return key
+                    elif check_duplicates:
+                        matches.append(key)
+                    else:
+                        return key
+            # Handle scalars and other types
+            elif val == value:
+                if first_match_only:
+                    return key
+                elif check_duplicates:
+                    matches.append(key)
+                else:
+                    return key
+        except (ValueError, TypeError):
+            pass
+    
+    if check_duplicates and matches and len(matches) > 1:
+        raise ValueError(f"Multiple attributes match: {matches}")
+    
+    return matches[0] if (check_duplicates and matches) else None
+
 def remove_infnan(*arrays):
     """
     Accepts any number of numpy arrays, finds indices with NaN or Inf,

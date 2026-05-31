@@ -2,8 +2,9 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 
 import numpy as np
-from waxa import atomdata
+import numpy.typing as npt
 from waxa.helper import xlabels_1d
+from waxa.helper.datasmith import key_from_attribute
 import inspect
 import re
 def _normalize_name(name):
@@ -30,6 +31,35 @@ UNIT_MAP_FROM_COMMENT = {
     "unitless":  ("", 1.0),
 }
 
+def errorplot(ad, mean=None, yerr=None, y=None,
+              ymult = 1., yunit = None):
+
+    unit, mult, xvarname = detect_unit(ad, xvar_idx=0)
+
+    fig, axs = plt.subplots(1,1, figsize=(4, 3), layout='constrained')
+    axs = np.atleast_1d(axs)
+
+    if mean is not None:
+        if yerr is None:
+            yerr = np.zeros_like(mean)
+        axs[0].errorbar(
+            ad.avg.xvars[0] * mult,
+            mean * ymult,
+            yerr=yerr * ymult,
+            fmt='o-',lw=1,ms=4)
+
+    if y is not None:
+        axs[0].scatter(ad.xvars[0] * mult,
+                    y * ymult,
+                    s=10, zorder=5, alpha=0.25)
+
+    key = key_from_attribute(ad, y)
+    axs[0].set_xlabel(f"{xvarname} ({unit})")
+    ylabel = f"{key} ({yunit})" if yunit is not None else f"{key}"
+    axs[0].set_ylabel(ylabel)
+    axs[0].set_title(f"run {ad.run_info.run_id}")
+
+    return fig, axs
 
 def get_param(params_obj, param_name):
     param_name = _normalize_name(param_name)
@@ -128,7 +158,7 @@ def guess_unit(name, values):
 
 
 def detect_unit(
-    ad: atomdata | None = None,
+    ad: "atomdata | None" = None,
     xvar_idx=0,
     xvarunit="",
     xvarmult=1.0,
@@ -170,7 +200,7 @@ def detect_unit(
 
     return final_unit, final_mult, xvarname
 
-def plot_mixOD(ad:atomdata,
+def plot_mixOD(ad,
                ndarray=[],
                xvar_idx=0,
                xvarformat="1.2f",
@@ -182,6 +212,9 @@ def plot_mixOD(ad:atomdata,
                aspect='auto',
                swap_axes=False):
     # Extract necessary information
+
+    from waxa import atomdata
+    ad: atomdata
     
     xvarnames = ad.xvarnames
     xvars = ad.xvars
@@ -319,7 +352,7 @@ def plot_mixOD(ad:atomdata,
     # Show the plot
     fig.tight_layout()
 
-def plot_sum_od_fits(ad:atomdata,axis=0,
+def plot_sum_od_fits(ad,axis=0,
                     xvarformat='3.3g',
                     xvarmult=1.,
                     figsize=[]):
@@ -342,10 +375,11 @@ def plot_sum_od_fits(ad:atomdata,axis=0,
 
     if figsize:
         fig, ax = plt.subplots(Nr,Ns,
-                               figsize=figsize,layout='tight')
+                               figsize=figsize,
+                               layout='constrained')
     else:
         fig, ax = plt.subplots(Nr,Ns,
-                           layout='tight')
+                           layout='constrained')
 
     if isinstance(ax, Axes):
         ax = [ax]
@@ -390,7 +424,7 @@ def plot_sum_od_fits(ad:atomdata,axis=0,
     fig.suptitle(f"Run ID: {ad.run_info.run_id}\nsum_od_{label}")
     fig.supxlabel(ad.xvarnames[0])
 
-def plot_fit_residuals(ad:atomdata,axis=0,
+def plot_fit_residuals(ad,axis=0,
                        xvarformat='1.3g',
                         xvarmult=1.,
                         figsize=[]):

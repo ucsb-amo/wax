@@ -3,6 +3,9 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import logging.handlers
+import os
+import pathlib
 import signal
 import socket
 import threading
@@ -12,10 +15,14 @@ from enum import Enum
 from typing import Optional
 
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
+from waxx.util.notifications import send_email
+from waxx.util.comms_server.waxx_server import WaxxServer
 
 
 LOGGER = logging.getLogger("als_laser_server")
 LOGGER.setLevel(logging.INFO)
+
+ALS_STARTUP_NOTIFICATION_RECIPIENT = "herberthearsall@gmail.com"
 
 
 class ConnectionState(Enum):
@@ -80,7 +87,7 @@ class _LockedLaserProxy:
         return _locked_call
 
 
-class ALSLaserServer:
+class ALSLaserServer(WaxxServer):
     STARTUP_STEPS = [
         (1, "Turn Power On", "step_1_turn_laser_power_on"),
         (2, "Turn Interlock On", "step_2_turn_interlock_on"),
@@ -100,12 +107,14 @@ class ALSLaserServer:
     def __init__(
         self,
         host: str = "0.0.0.0",
-        port: int = 5557,
+        port: int = 0,
         serial_port: str = "COM6",
         poll_interval_s: float = 1.0,
         max_log_entries: int = 2000,
         auto_connect: bool = True,
+        state_file: Optional[str] = None,
     ):
+        WaxxServer.__init__(self, "als_laser", port)
         self.host = host
         self.port = int(port)
         self.serial_port = serial_port
@@ -141,6 +150,16 @@ class ALSLaserServer:
         self._log_offset = 0
         self._cleanup_registered = False
 
+        self._state_file = (
+            pathlib.Path(state_file)
+            if state_file
+            else pathlib.Path.home() / ".als_server_state.json"
+        )
+        self._warmup_started_epoch: Optional[float] = None
+        self._last_completed_step: Optional[int] = None
+        self._start_from_step: int = 1
+        self._resume_warmup_seconds: Optional[float] = None
+
         self.log_handler = LogBufferHandler(self)
         self.log_handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -149,6 +168,18 @@ class ALSLaserServer:
     def start(self) -> None:
         if self.running:
             return
+        # Pre-bind and start listening so the TCP server is ready before the
+        # beacon fires and before we attempt the COM connection.  This lets the
+        # GUI connect and display server status even while connect_laser() is
+        # still running (or has failed).
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _sock.bind((self.host, 0))
+        _sock.listen(16)
+        self.server_socket = _sock
+        self.port = _sock.getsockname()[1]
+        self._waxx_port = self.port
+        self._start_beacon()
         self.running = True
         LOGGER.addHandler(self.log_handler)
         self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -159,12 +190,28 @@ class ALSLaserServer:
             atexit.register(self._cleanup_on_exit)
             self._cleanup_registered = True
         if self.auto_connect:
-            try:
-                self.connect_laser()
-            except Exception as exc:
-                LOGGER.exception("Initial serial connection failed: %s", exc)
+            threading.Thread(target=self._initial_connect, daemon=True).start()
+
+    def _initial_connect(self) -> None:
+        """Connect to the serial port in a background thread.
+
+        Called once from start() so that the TCP server is already accepting
+        connections (and the GUI can poll status) while the COM port is being
+        opened.  After a successful connection, checks for a saved sequence
+        state and resumes it if one exists.
+        """
+        try:
+            self.connect_laser()
+        except Exception as exc:
+            LOGGER.exception("Initial serial connection failed: %s", exc)
+            return
+        try:
+            self._check_and_resume_sequence()
+        except Exception as exc:
+            LOGGER.exception("Failed to resume saved sequence state: %s", exc)
 
     def stop(self) -> None:
+        self._stop_beacon()
         self.running = False
         self.interrupt_sequence()
         if self.server_socket is not None:
@@ -192,6 +239,90 @@ class ALSLaserServer:
                 self.disconnect_laser()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Sequence state persistence                                           #
+    # ------------------------------------------------------------------ #
+
+    def _save_sequence_state(self) -> None:
+        """Persist current sequence progress to disk so a restart can resume."""
+        with self._state_lock:
+            state = {
+                "sequence_type": self.sequence_type,
+                "sequence_state": self.sequence_state.value,
+                "sequence_started_epoch": self.sequence_started_epoch,
+                "last_completed_step": self._last_completed_step,
+                "warmup_started_epoch": self._warmup_started_epoch,
+            }
+        try:
+            self._state_file.write_text(json.dumps(state))
+        except Exception as exc:
+            LOGGER.warning("Failed to save sequence state: %s", exc)
+
+    def _clear_sequence_state(self) -> None:
+        """Remove persisted sequence state after completion or user-initiated interruption."""
+        with self._state_lock:
+            self._warmup_started_epoch = None
+            self._last_completed_step = None
+        try:
+            if self._state_file.exists():
+                self._state_file.unlink()
+        except Exception as exc:
+            LOGGER.warning("Failed to clear sequence state: %s", exc)
+
+    def _load_sequence_state(self) -> Optional[dict]:
+        """Load persisted sequence state from disk, if any."""
+        try:
+            if self._state_file.exists():
+                return json.loads(self._state_file.read_text())
+        except Exception as exc:
+            LOGGER.warning("Failed to load sequence state: %s", exc)
+        return None
+
+    def _check_and_resume_sequence(self) -> None:
+        """After connecting, resume a STARTUP sequence interrupted by a server restart.
+
+        Steps 1-5 and 7 are idempotent (they skip themselves when the hardware
+        is already in the right state).  Only step 6 (timed warm-up hold) needs
+        special handling: the elapsed time is subtracted from the remaining hold
+        duration so the full 30-minute warm-up is not repeated.
+        """
+        saved = self._load_sequence_state()
+        if saved is None:
+            return
+        if saved.get("sequence_state") != "RUNNING":
+            return
+        if saved.get("sequence_type") != "STARTUP":
+            return
+
+        last_completed = saved.get("last_completed_step") or 0
+        warmup_started_epoch = saved.get("warmup_started_epoch")
+
+        LOGGER.info(
+            "Found saved STARTUP sequence state (last completed step: %s); attempting resume.",
+            last_completed,
+        )
+
+        start_from_step: int = (last_completed + 1) if last_completed else 1
+        warmup_seconds_override: Optional[float] = None
+
+        if warmup_started_epoch is not None:
+            elapsed = time.time() - float(warmup_started_epoch)
+            default_warmup = 30.0 * 60.0  # matches ALSLaserStartupController default
+            remaining = default_warmup - elapsed
+            if remaining <= 0:
+                LOGGER.info("Warm-up period already elapsed; resuming from step 7.")
+                start_from_step = 7
+            else:
+                LOGGER.info(
+                    "Resuming warm-up with %.1f s remaining (%.1f min).",
+                    remaining,
+                    remaining / 60.0,
+                )
+                start_from_step = 6
+                warmup_seconds_override = remaining
+
+        self._start_sequence("STARTUP", start_from_step=start_from_step, warmup_seconds_override=warmup_seconds_override)
 
     def append_log_entry(self, message: str) -> None:
         with self._log_lock:
@@ -235,9 +366,10 @@ class ALSLaserServer:
 
     def _accept_loop(self) -> None:
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
+            if self.server_socket is None:
+                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(16)
             self.server_socket.settimeout(1.0)
             LOGGER.info("ALS server listening on %s:%s", self.host, self.port)
@@ -502,7 +634,7 @@ class ALSLaserServer:
     def start_shutdown_sequence(self) -> bool:
         return self._start_sequence("SHUTDOWN")
 
-    def _start_sequence(self, sequence_type: str) -> bool:
+    def _start_sequence(self, sequence_type: str, start_from_step: int = 1, warmup_seconds_override: Optional[float] = None) -> bool:
         with self._state_lock:
             if self.laser is None or self.status.connection_state != ConnectionState.CONNECTED:
                 LOGGER.warning("Cannot start %s sequence while laser is disconnected", sequence_type.lower())
@@ -516,15 +648,31 @@ class ALSLaserServer:
             self.current_step_number = None
             self.current_step_started_epoch = None
             self._interrupt_requested = False
+            self._last_completed_step = (start_from_step - 1) if start_from_step > 1 else None
+            self._warmup_started_epoch = None
+            self._start_from_step = start_from_step
+            self._resume_warmup_seconds = warmup_seconds_override
             self.startup_step_states = ["not_done"] * len(self.STARTUP_STEPS)
             self.shutdown_step_states = ["not_done"] * len(self.SHUTDOWN_STEPS)
             self.startup_step_notes = [""] * len(self.STARTUP_STEPS)
             self.shutdown_step_notes = [""] * len(self.SHUTDOWN_STEPS)
+            # Mark skipped steps as already done so the GUI shows them correctly
+            for i in range(start_from_step - 1):
+                if sequence_type == "STARTUP":
+                    self.startup_step_states[i] = "done"
+                    self.startup_step_notes[i] = "completed before restart"
+                else:
+                    self.shutdown_step_states[i] = "done"
+                    self.shutdown_step_notes[i] = "completed before restart"
 
+        self._save_sequence_state()
         target = self._run_startup_sequence if sequence_type == "STARTUP" else self._run_shutdown_sequence
         self.sequence_thread = threading.Thread(target=target, daemon=True)
         self.sequence_thread.start()
-        LOGGER.info("%s sequence requested", sequence_type.title())
+        if start_from_step > 1:
+            LOGGER.info("%s sequence resumed from step %s", sequence_type.title(), start_from_step)
+        else:
+            LOGGER.info("%s sequence requested", sequence_type.title())
         return True
 
     def interrupt_sequence(self) -> None:
@@ -543,27 +691,52 @@ class ALSLaserServer:
         self._run_sequence(sequence_type="SHUTDOWN", steps=self.SHUTDOWN_STEPS)
 
     def _run_sequence(self, sequence_type: str, steps: list[tuple[int, str, str]]) -> None:
+        start_from_step = self._start_from_step
+        warmup_seconds_override = self._resume_warmup_seconds
         try:
             if self.laser is None:
                 raise RuntimeError("Laser not connected")
-            startup_controller = ALSLaserStartupController(
-                self._sequence_laser,
+            controller_kwargs: dict = dict(
                 interrogate_callback=self._on_sequence_interrogated_state,
                 should_interrupt=self._is_interrupt_requested,
             )
+            if warmup_seconds_override is not None:
+                controller_kwargs["warmup_seconds"] = warmup_seconds_override
+            startup_controller = ALSLaserStartupController(
+                self._sequence_laser,
+                **controller_kwargs,
+            )
             for step_num, step_name, method_name in steps:
+                # Skip steps that were already completed before this restart
+                if step_num < start_from_step:
+                    continue
+
+                interrupted = False
                 with self._state_lock:
                     if self._interrupt_requested:
                         LOGGER.warning("%s sequence interrupted", sequence_type.title())
                         self.sequence_state = SequenceState.INTERRUPTED
                         self.current_step_number = None
                         self.current_step_started_epoch = None
-                        return
-                    self.current_step_number = step_num
-                    self.current_step_started_epoch = time.time()
-                    self._current_step_already_done = False
-                    self._set_step_state(sequence_type, step_num - 1, "doing")
+                        interrupted = True
+                    else:
+                        self.current_step_number = step_num
+                        self.current_step_started_epoch = time.time()
+                        self._current_step_already_done = False
+                        self._set_step_state(sequence_type, step_num - 1, "doing")
+                if interrupted:
+                    self._clear_sequence_state()
+                    return
+
                 LOGGER.info("%s step %s: %s", sequence_type.title(), step_num, step_name)
+
+                # Before the warm-up hold, persist the start time so a restart
+                # can compute the remaining duration instead of restarting from zero.
+                if sequence_type == "STARTUP" and method_name == "step_6_warm_up_at_80_percent":
+                    with self._state_lock:
+                        self._warmup_started_epoch = time.time()
+                    self._save_sequence_state()
+
                 getattr(startup_controller, method_name)()
                 self.poll_status()
                 with self._state_lock:
@@ -574,23 +747,35 @@ class ALSLaserServer:
                     else:
                         self._set_step_note(sequence_type, step_num - 1, f"completed at {timestamp}")
                     self._current_step_already_done = False
+                    self._last_completed_step = step_num
+                    # Warm-up done — clear the epoch so stale state isn't picked up
+                    if method_name == "step_6_warm_up_at_80_percent":
+                        self._warmup_started_epoch = None
+                self._save_sequence_state()
+
             with self._state_lock:
                 self.sequence_state = SequenceState.COMPLETED
                 self.current_step_number = None
                 self.current_step_started_epoch = None
+            self._clear_sequence_state()
             LOGGER.info("%s sequence completed", sequence_type.title())
+            if sequence_type == "STARTUP":
+                self._send_startup_done_notification()
         except InterruptedError:
             LOGGER.warning("%s sequence interrupted", sequence_type.title())
             with self._state_lock:
                 self.sequence_state = SequenceState.INTERRUPTED
                 self.current_step_number = None
                 self.current_step_started_epoch = None
+            # User explicitly interrupted — clear persisted state
+            self._clear_sequence_state()
         except Exception as exc:
             LOGGER.exception("%s sequence failed: %s", sequence_type.title(), exc)
             with self._state_lock:
                 self.sequence_state = SequenceState.INTERRUPTED
                 self.current_step_number = None
                 self.current_step_started_epoch = None
+            # Keep state file intact so the sequence can be resumed after a restart
         finally:
             if self.sequence_state != SequenceState.RUNNING:
                 pass
@@ -635,9 +820,33 @@ class ALSLaserServer:
         else:
             self.shutdown_step_notes[index] = note
 
+    def _send_startup_done_notification(self) -> None:
+        subject = f"ALS startup done on {socket.gethostname()}"
+        body = "ALS startup sequence completed successfully; laser is ramped on."
+        try:
+            send_email(ALS_STARTUP_NOTIFICATION_RECIPIENT, subject, body)
+            LOGGER.info(
+                "Startup notification sent to %s: %s",
+                ALS_STARTUP_NOTIFICATION_RECIPIENT,
+                subject,
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to send ALS startup notification: %s", exc)
 
-def main(host: str = "0.0.0.0", port: int = 5557, serial_port: str = "COM6") -> None:
+
+def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6", log_path: str | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
+    if log_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        _fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logging.getLogger().addHandler(_fh)
+        LOGGER.info("Logging to file: %s", log_path)
     server = ALSLaserServer(host=host, port=port, serial_port=serial_port)
     server.start()
 

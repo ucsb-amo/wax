@@ -21,6 +21,8 @@ import numpy as np
 import json
 import socket
 
+from waxx.util.comms_server.waxx_client import WaxxClient
+
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 50000
 
@@ -37,18 +39,25 @@ def _request(command: str, host: str, port: int, timeout: float) -> dict:
                 break
     return json.loads(b"".join(chunks).decode("utf-8").strip())
 
+class HMRDummy():
+    """Fallback dummy client that returns zeros for all field values."""
 
-class HMRClient:
-    """Client for the HMR2300 magnetometer TCP server.
+    def get_field_magnitude(self, timeout: float = 5.) -> float:
+        return float(0.)
 
-    Args:
-        host: Server hostname or IP address.
-        port: TCP port the server is listening on.
-    """
+    def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
+        return np.zeros(4, dtype=float)
 
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
+    def get_reference_field_array_with_metadata(self, date=None, timeout: float = 2.0):
+        field_vec = np.zeros(4, dtype=float)
+        metadata = {"timestamp_s": 0.0, "datetime_iso": ""}
+        return field_vec, metadata
+
+class HMRClient(WaxxClient):
+    """Client for the HMR2300 magnetometer TCP server."""
+
+    def __init__(self, discovery_timeout: float = 3.0):
+        super().__init__("magnetometer", discovery_timeout=discovery_timeout)
 
     def _request(self, command: str, timeout: float) -> dict:
         return _request(command, self.host, self.port, timeout)
@@ -141,6 +150,8 @@ class HMRClient:
                 if attempt == max_attempts - 1:
                     print(f"Reading magnetometer failed after {max_attempts} attempts: {e}")
                     return float(0.)
+                # Attempt to find the server at a new IP/port before retrying.
+                self._rediscover(timeout=1.0)
 
     def get_reference_field_array(self, date=None, timeout: float = 2.0) -> np.ndarray:
         """Return [Bx, By, Bz, Btot] from the newest reference at or before *date*.

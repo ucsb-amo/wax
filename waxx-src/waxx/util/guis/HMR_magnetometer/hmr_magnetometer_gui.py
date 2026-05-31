@@ -11,6 +11,7 @@ Usage::
 
 import argparse
 import csv
+import logging
 import math
 import os
 import queue
@@ -34,6 +35,8 @@ STATS_WINDOW = 200
 DEFAULT_STATS_WINDOW_S = 10.0
 READOUT_PANEL_WIDTH = 300
 
+logger = logging.getLogger(__name__)
+
 class FixedPrecisionAxisItem(pg.AxisItem):
     def __init__(self, orientation, decimals=4, **kwargs):
         super().__init__(orientation=orientation, **kwargs)
@@ -46,8 +49,6 @@ class FixedPrecisionAxisItem(pg.AxisItem):
 class MagnetometerGUI(QtWidgets.QMainWindow):
     def __init__(
         self,
-        server_host: str = DEFAULT_SERVER_HOST,
-        server_port: int = DEFAULT_SERVER_PORT,
         reference_csv_path=None,
     ):
         super().__init__()
@@ -73,9 +74,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.mag_buffer = deque(maxlen=PLOT_BUFFER_MAXLEN)
 
         # Settings
-        self.server_host = server_host
-        self.server_port = server_port
-        self.client = HMRClient(host=server_host, port=server_port)
+        try:
+            self.client: HMRClient | None = HMRClient()
+        except RuntimeError:
+            self.client = None
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.window_s = DEFAULT_TIME_WINDOW
         self.stats_window_s = DEFAULT_STATS_WINDOW_S
@@ -269,6 +271,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             "QPushButton:hover { background: #eef3ff; border-color: #8aa2ff; }"
         )
         right_controls.addWidget(settings_btn, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        self.server_conn_button = QtWidgets.QPushButton("Server: searching\u2026")
+        self.server_conn_button.setFixedHeight(28)
+        self.server_conn_button.clicked.connect(self._retry_server_connection)
+        self._update_server_conn_button("searching")
+        right_controls.addWidget(self.server_conn_button, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
 
         self.serial_button = QtWidgets.QPushButton("Serial: ?")
         self.serial_button.setFixedHeight(28)
@@ -854,6 +862,13 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         if self.running or (self.worker_thread and self.worker_thread.is_alive()):
             return
 
+        if self.client is None:
+            try:
+                self.client = HMRClient(discovery_timeout=0.1)
+            except RuntimeError:
+                self._set_status("Server not found — retrying...")
+                return
+
         self._sync_settings()
         self.stop_event.clear()
         self._reset_display()
@@ -862,10 +877,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         try:
             self.client._ping(timeout=2.0)
         except Exception as exc:
+            host = self.client.host
+            port = self.client.port
             QtWidgets.QMessageBox.critical(
                 self,
                 "Connection Error",
-                f"Cannot reach server at {self.server_host}:{self.server_port}\n\n{exc}",
+                f"Cannot reach server at {host}:{port}\n\n{exc}",
             )
             self._set_status("Connection failed")
             return
@@ -879,7 +896,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         )
         self.worker_thread.start()
         self.toggle_button.setText("Stop")
-        self._set_status(f"Connected to {self.server_host}:{self.server_port}")
+        self._set_status(f"Connected to {self.client.host}:{self.client.port}")
 
     def stop_monitor(self):
         self.running = False
@@ -917,6 +934,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 if self.stop_event.is_set() or session_id != self.session_id:
                     return
                 consec_errors += 1
+                logger.warning("Server poll error #%d: %s", consec_errors, exc)
                 self.data_queue.put({
                     "session_id": session_id,
                     "warning": f"Server poll error ({consec_errors}): {exc}",
@@ -971,6 +989,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 self._update_plot()
 
         except Exception as exc:
+            logger.warning("_process_queue: unhandled exception: %s", exc)
             self._set_status(f"GUI error: {exc}")
 
     # ------------------------------------------------------------------
@@ -1179,13 +1198,66 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.log_dialog = None
         self.log_text = None
 
+    def _update_server_conn_button(self, state: str) -> None:
+        """Update the server TCP connection button appearance.
+
+        state: 'searching' | 'connected' | 'lost'
+        """
+        if state == "connected" and self.client is not None:
+            text = f"Server: {self.client.host}:{self.client.port}"
+            style = (
+                "QPushButton { background: #e9f7ef; border: 1px solid #95d3ab; color: #2f6a45; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #dcf0e5; border-color: #77c594; }"
+            )
+        elif state == "lost":
+            text = "Server: lost \u2014 retry"
+            style = (
+                "QPushButton { background: #fbeeee; border: 1px solid #e6abab; color: #8b4040; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #f7dfdf; border-color: #d88f8f; }"
+            )
+        else:
+            text = "Server: searching\u2026"
+            style = (
+                "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+                "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+            )
+        self.server_conn_button.setText(text)
+        self.server_conn_button.setStyleSheet(style)
+
+    def _retry_server_connection(self) -> None:
+        """Force immediate server rediscovery when the user clicks the connection button."""
+        self.client = None
+        self._update_server_conn_button("searching")
+        self._refresh_serial_status()
+
     def _refresh_serial_status(self):
         if self.serial_button is None:
             return
+        if self.client is None:
+            try:
+                self.client = HMRClient(discovery_timeout=0.1)
+                self._update_server_conn_button("connected")
+                # Successfully connected — try to start monitor if not running.
+                if not self.running:
+                    self.start_monitor()
+            except RuntimeError:
+                self._update_server_conn_button("searching")
+                self.serial_connected = None
+                self.serial_button.setText("Serial: ?")
+                self.serial_button.setStyleSheet(
+                    "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+                    "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
+                )
+                return
         try:
             result = self.client._get_serial_status(timeout=1.5)
             connected = bool(result.get("connected", False))
         except Exception:
+            logger.debug("_refresh_serial_status: serial status query failed", exc_info=True)
+            # Drop the client so the next tick re-discovers via beacon
+            # (handles server restart at a new port).
+            self.client = None
+            self._update_server_conn_button("lost")
             self.serial_connected = None
             self.serial_button.setText("Serial: ?")
             self.serial_button.setStyleSheet(
@@ -1193,6 +1265,11 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
             )
             return
+
+        self._update_server_conn_button("connected")
+        # Server is reachable — restart the monitor if it stopped due to errors.
+        if not self.running:
+            self.start_monitor()
 
         self.serial_connected = connected
         if connected:

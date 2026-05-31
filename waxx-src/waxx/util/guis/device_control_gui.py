@@ -177,14 +177,13 @@ class DDSWidget(DeviceWidget):
             self.has_unsaved_changes = False
             self.update_default_button_state()
         else:
-            # Reset to default values
+            # Reset to default values — mark as pending until Enter is pressed
             if hasattr(self.dds_frame_obj, self.device_name):
                 dds = vars(self.dds_frame_obj)[self.device_name]
                 self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
                 # self.state_button.setChecked(dds.sw_state)
                 self.vpd_spinbox.setValue(dds.v_pd)
-                self.on_update_clicked()
         
     def on_state_button_toggled(self, checked):
         if checked:
@@ -426,10 +425,10 @@ class DACWidget(DeviceWidget):
             self.has_unsaved_changes = False
             self.update_default_button_state()
         else:
+            # Reset to default value — mark as pending until Enter is pressed
             if hasattr(self.dac_frame_obj, self.device_name):
                 dac = vars(self.dac_frame_obj)[self.device_name]
                 self.voltage_spinbox.setValue(dac.v)
-                self.on_update_clicked()
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
@@ -570,27 +569,50 @@ class MonitorStatusChecker(QThread):
     status_updated = pyqtSignal(int)
     connection_failed = pyqtSignal()
 
-    def __init__(self,server_addr):
+    def __init__(self):
         super().__init__()
-        
-        # Setup monitor client
-        self.monitor_client = MonitorClient(*server_addr)
+        self.monitor_client: MonitorClient | None = None
         self.status_checker = None
         self.running = True
         self.retry_connection = False
 
     def run(self):
         while self.running:
+            if self.monitor_client is None:
+                try:
+                    self.monitor_client = MonitorClient(discovery_timeout=0.5)
+                except RuntimeError:
+                    from waxx.util.comms_server.waxx_client import _registry
+                    with _registry._lock:
+                        known = dict(_registry._cache)
+                    print(f"[DeviceGUI] Monitor discovery failed. Beacon cache: {known or '(empty — no beacons received)'}")
+                    self.connection_failed.emit()
+                    time.sleep(2.0)
+                    continue
             try:
                 status = self.monitor_client.check_status()
                 if status is not None:
                     self.status_updated.emit(int(status))
-                time.sleep(0.5)
+                    time.sleep(0.5)
+                else:
+                    # send_message() swallows exceptions and returns None on
+                    # failure — treat this as a lost connection and force
+                    # re-discovery on the next iteration.
+                    print("[DeviceGUI] check_status returned None — forcing rediscovery")
+                    self.monitor_client = None
+                    self.connection_failed.emit()
+                    time.sleep(2.0)
             except Exception as e:
-                print(f"Connection error: {e}")
+                from waxx.util.comms_server.waxx_client import _registry
+                with _registry._lock:
+                    known = dict(_registry._cache)
+                print(f"[DeviceGUI] Connection error: {e}")
+                print(f"[DeviceGUI] Beacon cache at failure time: {known or '(empty)'}")
+                # Reset client so the next iteration re-runs service discovery.
+                # This handles server restarts (new dynamic port) cleanly.
+                self.monitor_client = None
                 self.connection_failed.emit()
-                # Automatically retry after 0.25 seconds
-                time.sleep(0.25)
+                time.sleep(2.0)
             
     def stop(self):
         self.running = False
@@ -602,8 +624,6 @@ class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management"""
     
     def __init__(self,
-                  monitor_server_ip,
-                  monitor_server_port,
                   device_state_json_path,
                   server_talk: server_talk,
                   dds_frame,
@@ -616,7 +636,6 @@ class DeviceStateGUI(QMainWindow):
         self.dds_frame_obj = dds_frame
         self.dac_frame_obj = dac_frame
 
-        self.server_addr = (monitor_server_ip, monitor_server_port)
         self.connection_failed = False
 
         self.server_talk = server_talk
@@ -810,7 +829,7 @@ class DeviceStateGUI(QMainWindow):
         
     def setup_status_checker(self):
         """Setup the status checker thread"""
-        self.status_checker = MonitorStatusChecker(self.server_addr)
+        self.status_checker = MonitorStatusChecker()
         self.status_checker.status_updated.connect(self.update_status_button)
         self.status_checker.connection_failed.connect(self.on_connection_failed)
         self.status_checker.start()

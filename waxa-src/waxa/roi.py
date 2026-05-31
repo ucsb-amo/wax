@@ -51,7 +51,9 @@ class ROI():
                  printouts=True,
                  server_talk=None,
                  current_file_path=None,
-                 current_saved_roi=None):
+                 current_saved_roi=None,
+                 images=None,
+                 imaging_type=None):
         
         if server_talk == None:
             self.server_talk = st()
@@ -64,6 +66,8 @@ class ROI():
         self.run_id = run_id
         self._current_file_path = current_file_path
         self._current_saved_roi = current_saved_roi
+        self._images = images
+        self._imaging_type = imaging_type
         self.load_roi(roi_id,
                       use_saved=use_saved_roi,
                       lite=lite,
@@ -85,7 +89,7 @@ class ROI():
         return cropOD
 
     def load_roi(self,roi_id=None,use_saved=True,lite=False,
-                 printouts=True):
+                 printouts=True,display_ods=None):
         """Loads an ROI according to the provided roi_id.
 
         Args:
@@ -100,6 +104,10 @@ class ROI():
 
             use_saved (bool): If False, ignores saved ROI and forces creation of
             a new one.
+            display_ods (np.ndarray or None): Pre-computed OD images shaped
+            (N_shots, H, W) to pass to the ROI selection GUI. When provided,
+            the GUI shows these ODs directly without re-reading from disk or
+            recomputing from raw camera images.
         """
         
         # Check for ROI saved in the current data file.
@@ -111,10 +119,10 @@ class ROI():
             elif saved_roi_bool:
                 if printouts: print("Saved ROI was found, but is being overridden.")
                 if printouts: print("Specify the new ROI.")
-                self.select_roi()
+                self.select_roi(display_ods=display_ods)
             else:
                 if printouts: print("Specify the new ROI.")
-                self.select_roi()
+                self.select_roi(display_ods=display_ods)
         else:
             if saved_roi_bool:
                 if printouts: print("Saved ROI was found, but is being overridden.")
@@ -128,14 +136,14 @@ class ROI():
                 if printouts: print(f"Using ROI loaded from run {roi_id}.")
             else:
                 if printouts: print(f"Specify the new ROI.")
-                self.select_roi()
+                self.select_roi(display_ods=display_ods)
 
         if isinstance(roi_id,str):
             if printouts: print("ROI specified by string. Referencing roi.xslx spreadsheet (PotassiumData)...")
             roi_exists = self.read_roi_from_excel(roi_id,printouts=printouts)
             if not roi_exists:
                 if printouts: print(f"Creating ROI for key {roi_id}.")
-                self.select_roi()
+                self.select_roi(display_ods=display_ods)
                 self._update_excel()
 
         if self.check_for_blank_roi():
@@ -145,7 +153,10 @@ class ROI():
             self.roiy = [0,py]
 
     def save_roi_h5(self, lite=False, printouts=False):
-        fpath, _ = self.server_talk.get_data_file(self.run_id,lite=lite)
+        if self._current_file_path is not None:
+            fpath = self._current_file_path
+        else:
+            fpath, _ = self.server_talk.get_data_file(self.run_id, lite=lite)
         with h5py.File(fpath,'r+') as f:
             f.attrs['roix'] = self.roix
             f.attrs['roiy'] = self.roiy
@@ -169,7 +180,11 @@ class ROI():
 
         Returns:
             px, py: The image dimensions (rows, columns).
-        """        
+        """
+        # Fast path: use the images array already loaded by atomdata.
+        if self._images is not None:
+            py, px = self._images.shape[-2:]
+            return px, py
         # Reuse the already-resolved file path when available to avoid
         # re-triggering network drive checks.
         if self._current_file_path is not None:
@@ -257,7 +272,7 @@ class ROI():
         """        
         return np.all(np.array([*self.roix,*self.roiy]) == -1)
     
-    def select_roi(self, run_id=[]):
+    def select_roi(self, run_id=[], display_ods=None):
         """Brings up the GUI to select a new ROI rectangle. The user should
         click and drag (LMB) in order to select a rectangle, then hit Enter to
         submit their selection. RMB clears the rectangle, and Escape/the X
@@ -267,15 +282,24 @@ class ROI():
         Args:
             run_id (int, optional): The run_id to use for displaying ODs during
             ROI selection.
+            display_ods (np.ndarray or None): Pre-computed OD images shaped
+            (N_shots, H, W). When provided, the GUI displays these directly
+            without opening the h5 file.
         """        
         if run_id == []:
             run_id = self.run_id
         file_path = self._current_file_path if run_id == self.run_id else None
+        # Use pre-loaded images/ODs if available for this run (avoids h5 open).
+        images = self._images if run_id == self.run_id else None
+        imaging_type = self._imaging_type if run_id == self.run_id else None
         update_bool, roix, roiy = roi_creator(
             run_id,
             self.key,
             self.server_talk,
             file_path=file_path,
+            images=images,
+            imaging_type=imaging_type,
+            precomputed_ods=display_ods,
         ).get_roi_rectangle()
         if update_bool:
             self.roix, self.roiy = roix, roiy
@@ -1075,25 +1099,42 @@ class _RoiSelectorDialog(QDialog):
 class roi_creator():
     window_name = 'recrop'
 
-    def __init__(self, run_id, key, server_talk, file_path=None):
+    def __init__(self, run_id, key, server_talk, file_path=None,
+                 images=None, imaging_type=None, precomputed_ods=None):
 
         self.key = key
         self.run_id = run_id
         self.server_talk = server_talk
-
-        if file_path is None:
-            filepath, _ = server_talk.get_data_file(run_id)
-        else:
-            filepath = file_path
-
-        self.h5_file = h5py.File(filepath, 'r')
-        self.images = self.h5_file['data']['images']
-        self.N_img = self.images.shape[0] // 3
-        try:
-            self.analysis_type = self.h5_file['run_info']['imaging_type'][()]
-        except Exception:
-            self.analysis_type = img_types.ABSORPTION
         self._od_cache = {}
+
+        if precomputed_ods is not None:
+            # Fast path: caller has already computed ODs — skip h5 open entirely.
+            self.h5_file = None
+            self._precomputed_ods = precomputed_ods
+            self.images = None
+            self.N_img = precomputed_ods.shape[0]
+            self.analysis_type = imaging_type if imaging_type is not None else img_types.ABSORPTION
+        elif images is not None:
+            # Fast path: caller has already loaded the raw camera images.
+            self.h5_file = None
+            self._precomputed_ods = None
+            self.images = images
+            self.N_img = images.shape[0] // 3
+            self.analysis_type = imaging_type if imaging_type is not None else img_types.ABSORPTION
+        else:
+            # Fallback: open the h5 file from disk.
+            self._precomputed_ods = None
+            if file_path is None:
+                filepath, _ = server_talk.get_data_file(run_id)
+            else:
+                filepath = file_path
+            self.h5_file = h5py.File(filepath, 'r')
+            self.images = self.h5_file['data']['images']
+            self.N_img = self.images.shape[0] // 3
+            try:
+                self.analysis_type = self.h5_file['run_info']['imaging_type'][()]
+            except Exception:
+                self.analysis_type = img_types.ABSORPTION
 
         self.image = self.get_od(0)
 
@@ -1150,19 +1191,22 @@ class roi_creator():
         return cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
 
     def get_od(self, idx):
-        """Computes the idx'th OD for display in the ROI selection GUI.
+        """Returns the idx'th OD for display in the ROI selection GUI.
 
         Args:
             idx (int): the index of the OD to display
 
         Returns:
             np.ndarray: the OD to display.
-        """        
+        """
         if idx not in self._od_cache:
-            pwa = self.images[3 * idx]
-            pwoa = self.images[3 * idx + 1]
-            dark = self.images[3 * idx + 2]
-            self._od_cache[idx] = compute_OD(pwa, pwoa, dark, self.analysis_type)
+            if self._precomputed_ods is not None:
+                self._od_cache[idx] = self._precomputed_ods[idx]
+            else:
+                pwa = self.images[3 * idx]
+                pwoa = self.images[3 * idx + 1]
+                dark = self.images[3 * idx + 2]
+                self._od_cache[idx] = compute_OD(pwa, pwoa, dark, self.analysis_type)
         return self._od_cache[idx]
 
     def _clamp_roi_to_shape(self, roix, roiy, image_shape):
@@ -1273,6 +1317,7 @@ class roi_creator():
             # Now enter modal exec with proper focus.
             dialog.exec()
         finally:
-            self.h5_file.close()
+            if self.h5_file is not None:
+                self.h5_file.close()
 
         return dialog.result_update_bool, dialog.result_roix, dialog.result_roiy

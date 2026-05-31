@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from artiq.language.core import kernel, kernel_from_string, delay, now_mu
+from artiq.language import TBool
 from artiq.coredevice.core import Core
 
 # from waxx.control.artiq import DDS, DAC_CH, TTL_OUT, TTL_IN
@@ -27,7 +28,7 @@ class Monitor:
     Detects changes in device state configuration and updates hardware devices.
     """
      
-    def __init__(self, expt, monitor_server_ip, device_state_json_path):
+    def __init__(self, expt, device_state_json_path):
         """
         Initialize the device state updater.
         
@@ -47,7 +48,9 @@ class Monitor:
 
         self.expt = expt
 
-        self._monitor_client = MonitorClient(monitor_server_ip)
+        self._monitor_client = MonitorClient()
+
+        self._schema_changed = False
 
     def update_device_states(self):
         self.generator.generate()
@@ -57,6 +60,12 @@ class Monitor:
 
     def signal_ready(self):
         self._monitor_client.send_ready()
+
+    def schema_changed(self) -> TBool:
+        """Return True (and reset the flag) if JSON device keys changed since init."""
+        result = self._schema_changed
+        self._schema_changed = False
+        return result
 
     def init_monitor(self):
 
@@ -197,6 +206,20 @@ class Monitor:
 
         self.clear_update_lists()
 
+        # Detect schema changes: new keys in JSON not known to device dicts
+        # (happens when _id files are edited and JSON is regenerated)
+        unknown_dds = set(current_config.get('dds', {}).keys()) - set(self.dds_dict.keys())
+        unknown_dac = set(current_config.get('dac', {}).keys()) - set(self.dac_dict.keys())
+        unknown_ttl = set(current_config.get('ttl', {}).keys()) - set(self.ttl_dict.keys())
+        if unknown_dds or unknown_dac or unknown_ttl:
+            print(f"[Monitor] JSON has new device keys not known to running monitor — "
+                  f"DDS: {unknown_dds}, DAC: {unknown_dac}, TTL: {unknown_ttl}. "
+                  f"Signaling restart.")
+            self._schema_changed = True
+            self.last_config_data = current_config
+            return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates,
+                    self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
+
         if self.last_config_data is None:
             self.last_config_data = current_config
             if verbose:
@@ -275,12 +298,14 @@ class Monitor:
                 self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
 
     @kernel
-    def sync_change_list(self,verbose=True):
+    def sync_change_list(self, verbose=True) -> TBool:
         """
         Synchronize kernel variables with the non-kernel update lists.
+        Returns True if a schema change (new device keys) was detected.
         """
         (self.dds_frequency_amplitude_updates, self.dds_vpd_updates, \
           self.dds_sw_state_updates, self.ttl_updates, self.dac_updates) = self.detect_changes(verbose=verbose)
+        return self.schema_changed()
 
     @kernel
     def apply_updates(self):
@@ -337,7 +362,10 @@ class Monitor:
         self.signal_ready()
         while True:
             self.core.wait_until_mu(now_mu())
-            self.sync_change_list(verbose=verbose)
+            keys_changed = self.sync_change_list(verbose=verbose)
             self.core.break_realtime()
+            if keys_changed:
+                self.signal_end()
+                break
             self.apply_updates()
             delay(T_MONITOR_UPDATE_INTERVAL)

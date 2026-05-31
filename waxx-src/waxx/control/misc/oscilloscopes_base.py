@@ -102,15 +102,13 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
                 recv = list(recv_rtn[data_start:-1])
             recv_all += recv
 
-        # try:
         v = self.convert_to_voltage(recv_all, preamble)
-        t = self.waveform_time_axis(preamble)
-        if len(t) == len(v):
-            return np.array([t,v])
-        else:
-            raise ValueError("Voltage data was not the right length -- was the scope ready?")
-        # except Exception as e:
-        #     print(e)
+        # Build time axis from the actual number of voltage points received, not
+        # from preamble[0] (point_num), to avoid length mismatches caused by
+        # the ::2 stride, off-by-one byte trimming, or multi-chunk rounding.
+        _, _, _, interval, trdl, tdiv, _, _ = preamble
+        t = float(trdl) - (float(tdiv) * self.grid / 2) + np.arange(len(v)) * interval
+        return np.array([t, v])
     
     def get_waveform_preamble(self):
         """The query returns the parameters of the source using by the command 

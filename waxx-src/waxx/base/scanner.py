@@ -5,8 +5,10 @@ from waxa.base import xvar
 from waxa.data import RunInfo
 from waxa.dummy.camera_params import CameraParams
 
-from artiq.language.core import kernel_from_string, now_mu
-from artiq.experiment import delay
+from artiq.language.core import kernel_from_string, now_mu, delay
+from artiq.experiment import RTIOUnderflow
+
+from waxx.util.artiq.async_print import aprint
 
 RPC_DELAY = 10.e-3
 
@@ -128,7 +130,7 @@ class Scanner():
         """
 
     @kernel
-    def scan(self):
+    def scan(self, raise_underflow=False):
         """
         Runs the scan_kernel function for each value of the xvars specified.
         
@@ -144,10 +146,11 @@ class Scanner():
         self.pre_scan()
 
         scanning = True
+        aborted_bool = False
 
         while scanning:
 
-            self._check_data_file_exists()
+            aborted_bool = self._check_for_abort_signal()
             
             self.core.wait_until_mu(now_mu())
             self.update_params_from_xvars()
@@ -164,7 +167,13 @@ class Scanner():
             self.core.break_realtime()
 
             # overloaded by user per experiment
-            self.scan_kernel()
+            try:
+                self.scan_kernel()
+            except RTIOUnderflow as e:
+                if raise_underflow:
+                    raise e
+                aborted_bool = True
+                self.core.break_realtime()
 
             # overloaded in kexp.Base
             self.cleanup_scan_kernel()
@@ -177,6 +186,12 @@ class Scanner():
             self.update_scan_xvar_counters()
 
             self.core.break_realtime()
+
+            if aborted_bool:
+                scanning = False
+
+        if aborted_bool:
+            self._send_abort_to_server()
 
         self.post_scan()
 

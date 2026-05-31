@@ -60,8 +60,8 @@ class DAC_CH():
         v0 = v_start
         vf = v_end
         dt = t/n
-        A = -2*(vf-v0)**3/t**3
-        B =  3*(vf-v0)**2/t**2
+        A = -2*(vf-v0)/t**3
+        B =  3*(vf-v0)/t**2
         Adt3 = A * dt**3
         Bdt2 = B * dt**2
         for i in range(n):

@@ -83,20 +83,22 @@ class BaslerUSB(pylon.InstantCamera):
         Nimg = int(N_img)
         self.StartGrabbingMax(Nimg, pylon.GrabStrategy_LatestImages)
         count = 0
-        while self.IsGrabbing():
-            if check_interrupt_method():
-                break
-            grab = self.RetrieveResult(int(this_timeout*1000), pylon.TimeoutHandling_ThrowException)
-            if grab.GrabSucceeded():
-                this_timeout = TIMEOUT_RUN
-                print(f'gotem (img {count+1}/{Nimg})')
-                img = np.uint8(grab.GetArray())
-                img_t = grab.TimeStamp
-                output_queue.put((img,img_t,count))
-                count += 1
-            if count >= Nimg:
-                break
-        self.StopGrabbing()
+        try:
+            while self.IsGrabbing():
+                if check_interrupt_method():
+                    break
+                grab = self.RetrieveResult(int(this_timeout*1000), pylon.TimeoutHandling_ThrowException)
+                if grab.GrabSucceeded():
+                    this_timeout = TIMEOUT_RUN
+                    print(f'gotem (img {count+1}/{Nimg})')
+                    img = np.uint8(grab.GetArray())
+                    img_t = grab.TimeStamp
+                    output_queue.put((img,img_t,count))
+                    count += 1
+                if count >= Nimg:
+                    break
+        finally:
+            self.StopGrabbing()
 
     def stop_grab(self):
         try:

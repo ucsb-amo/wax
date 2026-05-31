@@ -15,8 +15,8 @@ class MonitorUDPServer(UdpServer):
 
     reset_signal = pyqtSignal()
 
-    def __init__(self, host, port):
-        super().__init__(host,port)
+    def __init__(self):
+        super().__init__(host="0.0.0.0", port=0, server_id="monitor")
 
         self.status = Status()
         self._print_connections_bool = False
@@ -34,13 +34,8 @@ class MonitorUDPServer(UdpServer):
 
 class MonitorServerGUI(QWidget):
     def __init__(self,
-                monitor_server_ip, 
-                monitor_server_port,
                 monitor_expt_path):
         super().__init__()
-
-        self.server_ip = monitor_server_ip
-        self.server_port = monitor_server_port
 
         self.setWindowTitle("Monitor Server")
         eye_icon = self._create_eye_icon()
@@ -93,7 +88,7 @@ class MonitorServerGUI(QWidget):
     def setup_udp_server(self):
         self.server_thread = QThread()
         
-        self.udp_server = MonitorUDPServer(self.server_ip, self.server_port)
+        self.udp_server = MonitorUDPServer()
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
@@ -118,7 +113,7 @@ class MonitorServerGUI(QWidget):
     def restart_monitor(self):
         if self.monitor_manager.isRunning():
             self.monitor_manager.terminate()
-            time.sleep(0.125)
+            self.monitor_manager.wait(500)  # wait up to 500 ms for thread to actually finish
         self.monitor_manager.start()
         self.set_status(STATES.LOADING)
 
@@ -148,7 +143,7 @@ class MonitorServerGUI(QWidget):
         print(f"Message received: {message}")
         if "run complete" in message:
             print("Run complete message received. Restarting monitor.")
-            self.monitor_manager.start()
+            self.restart_monitor()
             self.set_status(STATES.LOADING)
         elif "monitor ready" in message:
             print("Monitor ready message received.")

@@ -18,6 +18,7 @@ Usage:
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import re
@@ -26,19 +27,58 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 import serial
 import serial.tools.list_ports
+
+from waxx.util.comms_server.waxx_server import WaxxServer
 
 DEFAULT_SERIAL_PORT = "COM33"
 DEFAULT_BAUD = 9600
 DEFAULT_DEVICE_ID = "00"
 DEFAULT_POLL_INTERVAL = 0.12
 DEFAULT_SERVER_HOST = "0.0.0.0"
-DEFAULT_SERVER_PORT = 50000
+DEFAULT_SERVER_PORT = 0
 MAX_HISTORY = 10000
 SENSOR_COUNTS_PER_GAUSS = 15000.0
 MAX_STUCK_SAME_VALUES = 20
+
+logger = logging.getLogger(__name__)
+
+_LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _configure_logging(log_path: str | None = None) -> None:
+    """Attach a StreamHandler and (optionally) a RotatingFileHandler to the
+    root logger.  Safe to call multiple times — handlers are only added once."""
+    root = logging.getLogger()
+    if root.handlers:
+        return  # already configured (e.g. called by a parent process)
+    root.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.DEBUG)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    if log_path:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            fh = RotatingFileHandler(
+                log_path,
+                maxBytes=5 * 1024 * 1024,  # 5 MB per file
+                backupCount=5,
+                encoding="utf-8",
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+            logger.info("Logging to file: %s", log_path)
+        except Exception as exc:
+            logger.warning("Could not open log file %r: %s", log_path, exc)
 
 class HMR2300Reader:
     def __init__(self, port, baud=DEFAULT_BAUD, device_id=DEFAULT_DEVICE_ID, timeout=1.0):
@@ -62,8 +102,11 @@ class HMR2300Reader:
         self.resync()
 
     def close(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception as exc:
+                logger.debug("HMR2300Reader.close: error closing serial port: %s", exc)
         self.ser = None
 
     def resync(self):
@@ -108,7 +151,7 @@ class HMR2300Reader:
         raise ValueError(f"Could not parse sensor reply: {last_reply!r}")
 
 
-class MagnetometerServer:
+class MagnetometerServer(WaxxServer):
     """Headless server: reads HMR2300 and serves field data over TCP."""
 
     def __init__(
@@ -121,12 +164,13 @@ class MagnetometerServer:
         server_port=DEFAULT_SERVER_PORT,
         reference_csv_path=None,
     ):
+        WaxxServer.__init__(self, "magnetometer", server_port)
         self.serial_port = serial_port
         self.baud = baud
         self.device_id = device_id
         self.poll_interval = poll_interval
         self.server_host = server_host
-        self.server_port = server_port
+        self.server_port = server_port  # may be 0 until run() binds
         self.reference_csv_path = reference_csv_path
 
         self.reader = None
@@ -141,11 +185,34 @@ class MagnetometerServer:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def run(self):
+    def run(self, log_path: str | None = None):
+        # Default log file sits next to this script.
+        if log_path is None:
+            log_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "hmr_magnetometer_server.log",
+            )
+        _configure_logging(log_path)
+
         if self.reference_csv_path:
             self._ensure_reference_csv()
 
-        print(f"[INFO] Opening {self.serial_port} at {self.baud} baud (device ID: {self.device_id!r})")
+        # Bind and start listening before attempting the COM connection so that
+        # the GUI can connect and display server status even while the serial
+        # port is being opened (or has failed).
+        _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _srv.bind((self.server_host, self.server_port))
+        _srv.listen(16)
+        self.server_port = _srv.getsockname()[1]
+        self._waxx_port = self.server_port
+        self._start_beacon()
+        logger.info("Starting TCP server on %s:%d", self.server_host, self.server_port)
+
+        read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        read_thread.start()
+
+        logger.info("Opening %s at %d baud (device ID: %r)", self.serial_port, self.baud, self.device_id)
         self.reader = HMR2300Reader(
             port=self.serial_port,
             baud=self.baud,
@@ -154,33 +221,29 @@ class MagnetometerServer:
         try:
             self.reader.open()
             self.reader.setup()
-            print(f"[INFO] Sensor ready. Polling every {self.poll_interval:.3f} s.")
+            logger.info("Sensor ready. Polling every %.3f s.", self.poll_interval)
         except Exception as exc:
             self.reader = None
-            print(
-                f"[ERROR] COM port connection failed "
-                f"({type(exc).__name__}: {exc}) — "
-                f"TCP server starting without serial. "
-                f"Use SERIAL_RECONNECT or RESTART_SERIAL to retry."
+            logger.error(
+                "COM port connection failed (%s: %s) — "
+                "TCP server starting without serial. "
+                "Use SERIAL_RECONNECT or RESTART_SERIAL to retry.",
+                type(exc).__name__, exc,
             )
-
-        read_thread = threading.Thread(target=self._read_loop, daemon=True)
-        read_thread.start()
-
-        print(f"[INFO] Starting TCP server on {self.server_host}:{self.server_port}")
         try:
-            self._server_loop()
+            self._server_loop(_srv)
         finally:
             self.stop_event.set()
             read_thread.join(timeout=2.0)
 
     def shutdown(self):
+        self._stop_beacon()
         self.stop_event.set()
         if self.reader is not None:
             try:
                 self.reader.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("shutdown: error closing reader: %s", exc)
             self.reader = None
 
     # ------------------------------------------------------------------
@@ -199,16 +262,16 @@ class MagnetometerServer:
 
             # --- ensure serial is open (retry forever, never crash) ---
             if not self._is_serial_connected():
-                print(f"[INFO] Serial not connected, attempting reconnect on {self.serial_port}.")
+                logger.info("Serial not connected, attempting reconnect on %s.", self.serial_port)
                 try:
                     self._reconnect()
                     last_values = None
                     same_count = 0
-                    print("[INFO] Sensor reconnected.")
+                    logger.info("Sensor reconnected.")
                 except Exception as exc:
                     if self.stop_event.is_set():
                         break
-                    print(f"[WARN] Reconnect failed ({type(exc).__name__}: {exc}) — retrying in 5 s.")
+                    logger.warning("Reconnect failed (%s: %s) — retrying in 5 s.", type(exc).__name__, exc)
                     self.stop_event.wait(5.0)
                     continue
 
@@ -243,13 +306,13 @@ class MagnetometerServer:
                     break
                 if not self.serial_should_be_connected:
                     continue
-                print(f"[WARN] Read error ({type(exc).__name__}: {exc}) — resetting serial for reconnect.")
+                logger.warning("Read error (%s: %s) — resetting serial for reconnect.", type(exc).__name__, exc)
                 with self.serial_lock:
                     if self.reader is not None:
                         try:
                             self.reader.close()
-                        except Exception:
-                            pass
+                        except Exception as close_exc:
+                            logger.debug("_read_loop: error closing reader after read failure: %s", close_exc)
                         self.reader = None
                 last_values = None
                 same_count = 0
@@ -265,14 +328,14 @@ class MagnetometerServer:
         with self.serial_lock:
             if self.reader is not None:
                 try:
-                    print(f"[INFO] Disconnecting serial device on {self.serial_port}.")
+                    logger.info("Disconnecting serial device on %s.", self.serial_port)
                     self.reader.close()
-                    print("[INFO] Serial device disconnected.")
-                except Exception:
-                    pass
+                    logger.info("Serial device disconnected.")
+                except Exception as exc:
+                    logger.debug("_reconnect: close before reconnect failed: %s", exc)
                 self.reader = None
 
-            print(f"[INFO] Reconnecting serial device on {self.serial_port}.")
+            logger.info("Reconnecting serial device on %s.", self.serial_port)
             time.sleep(0.2)
             if self.stop_event.is_set():
                 raise RuntimeError("Server stopping")
@@ -283,17 +346,17 @@ class MagnetometerServer:
             )
             self.reader.open()
             self.reader.setup()
-            print("[INFO] Serial device reconnected and configured.")
+            logger.info("Serial device reconnected and configured.")
 
     def _disconnect_serial(self):
         with self.serial_lock:
             if self.reader is not None:
                 try:
-                    print(f"[INFO] Manually disconnecting serial device on {self.serial_port}.")
+                    logger.info("Manually disconnecting serial device on %s.", self.serial_port)
                     self.reader.close()
-                    print("[INFO] Serial device disconnected by operator.")
-                except Exception:
-                    pass
+                    logger.info("Serial device disconnected by operator.")
+                except Exception as exc:
+                    logger.warning("_disconnect_serial: close failed: %s", exc)
                 self.reader = None
 
     def _is_serial_connected(self):
@@ -308,10 +371,12 @@ class MagnetometerServer:
     # TCP server loop (main thread)
     # ------------------------------------------------------------------
 
-    def _server_loop(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+    def _server_loop(self, srv: socket.socket = None):
+        if srv is None:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.server_host, self.server_port))
+        with srv:
             srv.listen(16)
             srv.settimeout(1.0)
             print(f"[INFO] Listening on {self.server_host}:{self.server_port}")
@@ -321,7 +386,8 @@ class MagnetometerServer:
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
-                except OSError:
+                except OSError as exc:
+                    logger.warning("_server_loop: accept() raised OSError — shutting down TCP loop: %s", exc)
                     break
                 threading.Thread(
                     target=self._handle_client,
@@ -335,11 +401,12 @@ class MagnetometerServer:
                 raw = conn.recv(4096).decode("utf-8", errors="replace").strip()
                 reply = self._dispatch(raw)
             except Exception as exc:
+                logger.warning("_handle_client: error handling request from %s: %s", addr, exc)
                 reply = {"ok": False, "error": str(exc)}
             try:
                 conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("_handle_client: failed to send reply to %s: %s", addr, exc)
 
     def _dispatch(self, command: str) -> dict:
         if command == "PING":
@@ -489,7 +556,8 @@ class MagnetometerServer:
                         by = float(row["By"])
                         bz = float(row["Bz"])
                         btot = float(row["Btot"])
-                    except (KeyError, TypeError, ValueError):
+                    except (KeyError, TypeError, ValueError) as exc:
+                        logger.debug("Skipping malformed reference CSV row (%s: %s): %s", type(exc).__name__, exc, row)
                         continue
                     if t_row <= t_query and (best is None or t_row > best["timestamp_s"]):
                         best = {

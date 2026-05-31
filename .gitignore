@@ -7,3 +7,5 @@
 *.gif
 *.DS_Store
 _build
+*.log
+*.log

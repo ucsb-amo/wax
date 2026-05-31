@@ -7,6 +7,14 @@ from waxa.config.img_types import img_types as img
 from waxa.data.server_talk import server_talk as st
 from waxa.atomdata_base import atomdata_base, atom_number_apd, unpack_group
 
+# Type-checking-only imports so IDEs can offer richer autocompletion against
+# the experiment-specific subclasses (kexp's ExptParams / DataVault) when
+# kexp is installed. NEVER executed at runtime — waxa has no kexp dependency.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from kexp.config.expt_params import ExptParams as _KexpExptParams  # type: ignore[import-not-found]
+    from kexp.config.data_vault import DataVault as _KexpDataVault  # type: ignore[import-not-found]
+
 
 class atomdata(atomdata_base):
     """User-facing atomdata class with analysis-focused methods.
@@ -14,6 +22,13 @@ class atomdata(atomdata_base):
     Heavy data loading, repeat handling, shuffling, slicing, and transpose
     machinery lives in atomdata_base.
     """
+
+    # Class-level annotations are inherited by instances and let Pylance
+    # surface kexp's params/data attributes for `ad = atomdata(...)`.
+    if TYPE_CHECKING:
+        params: "_KexpExptParams"
+        p: "_KexpExptParams"
+        data: "_KexpDataVault"
 
     def __init__(
         self,
@@ -75,17 +90,72 @@ class atomdata(atomdata_base):
     ### Analysis methods
 
     def _initial_analysis(self, transpose_idx, avg_repeats):
+        if not getattr(self, '_has_images', True):
+            # No camera images were captured for this run; skip all
+            # image-based analysis and set image-derived attrs to None.
+            self.img_atoms = None
+            self.img_light = None
+            self.img_dark  = None
+            self.od_raw    = None
+            self.od        = None
+            self.sum_od_x  = None
+            self.sum_od_y  = None
+            self.integrated_od = None
+            self.atom_number   = None
+            self.cloudfit_x    = None
+            self.cloudfit_y    = None
+            self._refresh_repeat_statistics()
+            return
+        import time as _time
+        t0 = _time.perf_counter()
+
+        t_stage = _time.perf_counter()
         self._sort_images()
+        self._timing['initial_analysis_sort_images_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         if transpose_idx:
             self._analysis_tags.transposed = True
             self.transpose_data(transpose_idx=False, reanalyze=False)
+        self._timing['initial_analysis_transpose_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         self.compute_raw_ods()
+        self._timing['initial_analysis_compute_raw_ods_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         if avg_repeats:
             self.avg_repeats(reanalyze=False)
+        self._timing['initial_analysis_avg_repeats_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         self.analyze_ods()
+        self._timing['initial_analysis_analyze_ods_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         self._refresh_repeat_statistics()
+        self._timing['initial_analysis_refresh_repeat_stats_s'] = _time.perf_counter() - t_stage
+
+        self._timing['initial_analysis_total_s'] = _time.perf_counter() - t0
+
+        if self._timing_enabled:
+            print(
+                "[atomdata timing] initial_analysis total={:.3f}s | sort_images={:.3f}s | "
+                "transpose={:.3f}s | compute_raw_ods={:.3f}s | avg_repeats={:.3f}s | "
+                "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s".format(
+                    self._timing['initial_analysis_total_s'],
+                    self._timing['initial_analysis_sort_images_s'],
+                    self._timing['initial_analysis_transpose_s'],
+                    self._timing['initial_analysis_compute_raw_ods_s'],
+                    self._timing['initial_analysis_avg_repeats_s'],
+                    self._timing['initial_analysis_analyze_ods_s'],
+                    self._timing['initial_analysis_refresh_repeat_stats_s'],
+                )
+            )
 
     def analyze(self):
+        if not getattr(self, '_has_images', True):
+            return
         self.compute_raw_ods()
         self.analyze_ods()
         self._refresh_repeat_statistics()
@@ -101,30 +171,55 @@ class atomdata(atomdata_base):
 
     def analyze_ods(self):
         """Crop ODs, build projections, fit Gaussians, and map fit results."""
+        import time as _time
+        t0 = _time.perf_counter()
+
+        t_stage = _time.perf_counter()
         self.od = self.roi.crop(self.od_raw)
+        self._timing['analyze_ods_roi_crop_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         self.sum_od_x = np.sum(self.od, self.od.ndim - 2)
         self.sum_od_y = np.sum(self.od, self.od.ndim - 1)
+        self._timing['analyze_ods_sum_projections_s'] = _time.perf_counter() - t_stage
 
         self.axis_camera_px_x = np.arange(self.sum_od_x.shape[-1])
         self.axis_camera_px_y = np.arange(self.sum_od_y.shape[-1])
-
         self.axis_camera_x = self.camera_params.pixel_size_m * self.axis_camera_px_x
         self.axis_camera_y = self.camera_params.pixel_size_m * self.axis_camera_px_y
-
         self.axis_x = self.axis_camera_x / self.camera_params.magnification
         self.axis_y = self.axis_camera_y / self.camera_params.magnification
 
+        t_stage = _time.perf_counter()
         self.cloudfit_x = fit_gaussian_sum_dist(self.sum_od_x, self.camera_params)
+        self._timing['analyze_ods_fit_x_s'] = _time.perf_counter() - t_stage
+
+        t_stage = _time.perf_counter()
         self.cloudfit_y = fit_gaussian_sum_dist(self.sum_od_y, self.camera_params)
+        self._timing['analyze_ods_fit_y_s'] = _time.perf_counter() - t_stage
 
+        t_stage = _time.perf_counter()
         self._remap_fit_results()
-
         self.compute_apd_atom_number()
-
         if self._analysis_tags.imaging_type == img.ABSORPTION:
             self.compute_atom_number()
-
         self.integrated_od = np.sum(np.sum(self.od, -2), -1)
+        self._timing['analyze_ods_postfit_s'] = _time.perf_counter() - t_stage
+
+        self._timing['analyze_ods_total_s'] = _time.perf_counter() - t0
+
+        if self._timing_enabled:
+            print(
+                "[atomdata timing] analyze_ods total={:.3f}s | roi_crop={:.3f}s | "
+                "sum_projections={:.3f}s | fit_x={:.3f}s | fit_y={:.3f}s | postfit={:.3f}s".format(
+                    self._timing['analyze_ods_total_s'],
+                    self._timing['analyze_ods_roi_crop_s'],
+                    self._timing['analyze_ods_sum_projections_s'],
+                    self._timing['analyze_ods_fit_x_s'],
+                    self._timing['analyze_ods_fit_y_s'],
+                    self._timing['analyze_ods_postfit_s'],
+                )
+            )
 
     def compute_apd_atom_number(self):
         if 'post_shot_absorption' in self.data.keys:

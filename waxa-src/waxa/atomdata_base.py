@@ -14,6 +14,20 @@ from waxa.data.run_info import RunInfo
 from waxa.config.expt_params import ExptParams
 from waxa.dummy.camera_params import CameraParams
 from waxa.config.img_types import img_types as img
+
+# Type-checking-only imports so that IDEs (Pylance/Pyright) can offer richer
+# autocompletion for the experiment-specific subclasses when they are
+# installed alongside waxa. These imports are NEVER executed at runtime, so
+# waxa retains zero runtime dependency on kexp. If kexp is not installed,
+# the static analyzer simply leaves these names unresolved (no runtime
+# effect) and falls back to inferred types.
+from typing import TYPE_CHECKING, Union
+if TYPE_CHECKING:
+    from waxa.config.expt_params import ExptParams as _WaxaExptParams
+    from kexp.config.expt_params import ExptParams as _KexpExptParams  # type: ignore[import-not-found]
+    from kexp.config.data_vault import DataVault as _KexpDataVault  # type: ignore[import-not-found]
+    _ExptParamsHint = Union[_KexpExptParams, _WaxaExptParams]
+    _DataVaultHint = _KexpDataVault
     
 class ScopeTraceArray():
     def __init__(self, scope_key, ch, t, v):
@@ -319,7 +333,13 @@ class atomdata_base():
     '''
     Use to store and do basic analysis on data for every experiment.
     '''
-    
+
+    # Class-level annotation purely for IDE autocompletion. Resolves to
+    # kexp.config.data_vault.DataVault when kexp is installed, otherwise the
+    # name remains unresolved (no runtime effect — see TYPE_CHECKING block).
+    if TYPE_CHECKING:
+        data: "_DataVaultHint"
+
     def __init__(self,
                 idx=0,
                 roi_id=None,
@@ -366,6 +386,15 @@ class atomdata_base():
         self._timing_enabled = True
         self._timing = {}
 
+        # for syntax highlighting, overloaded later. The type annotations
+        # below let IDEs surface kexp's ExptParams / DataVault attributes
+        # when kexp is installed (see TYPE_CHECKING block at top of file);
+        # otherwise they fall back to the waxa base classes.
+        self.params: "_ExptParamsHint" = ExptParams()
+        self.p: "_ExptParamsHint" = self.params
+        self.camera_params = CameraParams()
+        self.run_info = RunInfo()
+
         self.avg = None
         self.std = None
         self.sem = None
@@ -388,13 +417,18 @@ class atomdata_base():
         self._ds = DataSaver()
         self._dealer = self._init_dealer()
         self._analysis_tags = analysis_tags(roi_id,self.run_info.imaging_type)
-        self.roi = ROI(run_id = self.run_info.run_id,
-                       roi_id = roi_id,
-                       use_saved_roi = not skip_saved_roi,
-                       lite = self._lite,
-                       server_talk=self.server_talk,
-                       current_file_path=self._data_file_path,
-                       current_saved_roi=self._saved_roi_from_file)
+        if self._has_images:
+            self.roi = ROI(run_id = self.run_info.run_id,
+                           roi_id = roi_id,
+                           use_saved_roi = not skip_saved_roi,
+                           lite = self._lite,
+                           server_talk=self.server_talk,
+                           current_file_path=self._data_file_path,
+                           current_saved_roi=self._saved_roi_from_file,
+                           images=self.images,
+                           imaging_type=self.run_info.imaging_type)
+        else:
+            self.roi = None
         self._timing['init_setup_helpers_roi_s'] = time.perf_counter() - t_stage
 
         t_stage = time.perf_counter()
@@ -459,7 +493,8 @@ class atomdata_base():
             self.analyze_ods()
             self._refresh_repeat_statistics()
         else:
-            self.roi.load_roi(roi_id, use_saved)
+            od_flat = self.od_raw.reshape(-1, *self.od_raw.shape[-2:])
+            self.roi.load_roi(roi_id, use_saved, display_ods=od_flat)
             self.analyze_ods()
             self._refresh_repeat_statistics()
 
@@ -660,6 +695,7 @@ class atomdata_base():
             self.atom_number_apd = atom_number_apd(number_up, number_down)
 
     def _sort_images(self):
+        print(self.images.shape)
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
         self.img_atoms = imgs_tuple[0]
         self.img_light = imgs_tuple[1]
@@ -727,20 +763,20 @@ class atomdata_base():
             atomdata: The sliced atomdata object.
         """
 
-        ad = self.__class__(self.run_info.run_id,
-                       avg_repeats=self._analysis_tags.averaged,
-                       roi_id=self.run_info.run_id)
+        # Fix #1: copy from self in memory — no disk reload.
+        ad = self._copy_self_for_slice()
 
         # Normalize which_shot_idx early so the rest of the logic uses ndarrays.
         which_shot_idx = ensure_ndarray(which_shot_idx, enforce_1d=True)
 
-        # Detect whether any axis carries repeated xvar values.
+        # Fix #3: derive repeat info from self (already loaded) rather than
+        # re-deriving on the freshly created ad.
         _has_repeats = False
         _repeat_axis = -1
         _n_repeats = 1
         if not self._analysis_tags.averaged:
             try:
-                _repeat_axis, _n_repeats = ad._get_repeat_axis_info()
+                _repeat_axis, _n_repeats = self._get_repeat_axis_info()
                 _has_repeats = True
             except ValueError:
                 pass
@@ -758,16 +794,16 @@ class atomdata_base():
             elif not ignore_repeats:
                 # Single-axis scan: expand the selection to include all repeats
                 # for every selected index value (supports list inputs).
+                # Fix #4: avoid allocating an O(N×M) comparison matrix by
+                # iterating over the (typically small) set of selected values.
                 xvals = np.asarray(ad.xvars[0])
                 selected_vals = xvals[which_shot_idx]
                 if np.issubdtype(xvals.dtype, np.number):
-                    mask = np.any(
-                        np.isclose(
-                            xvals[:, None].astype(float),
-                            np.asarray(selected_vals, dtype=float)[None, :],
-                        ),
-                        axis=1,
-                    )
+                    xvals_float = xvals.astype(float)
+                    selected_float = np.asarray(selected_vals, dtype=float)
+                    mask = np.zeros(len(xvals), dtype=bool)
+                    for val in selected_float:
+                        mask |= np.isclose(xvals_float, val)
                 else:
                     mask = np.isin(xvals, selected_vals)
                 which_shot_idx = np.where(mask)[0]
@@ -786,34 +822,26 @@ class atomdata_base():
         vars(ad.params)[ad.xvarnames[which_xvar_idx]] = ad.xvars[which_xvar_idx][which_shot_idx]
 
         def remap_sort_idx_to_sequential(x):
-            """
-            Relabels the elements of x to sequential integers in the same order
-            as np.sort(x) starting from 0, ignoring any -1s (which are treated as padding).
-            The same number of padding -1s are added to the end of the array after remapping.
-            """
+            # Fix #5: vectorized via searchsorted instead of a dict + list-comp loop.
             x = np.asarray(x)
-            # Find non-padding elements
             valid_mask = x != -1
             valid_vals = x[valid_mask]
-            unique_sorted = np.sort(np.unique(valid_vals))
-            mapping = {val: i for i, val in enumerate(unique_sorted)}
-            remapped = np.array([mapping[val] for val in valid_vals])
-            # Pad with -1s to match original length
-            n_pad = len(x) - len(remapped)
-            if n_pad > 0:
-                remapped = np.concatenate([remapped, -1 * np.ones(n_pad, dtype=int)])
-            return remapped
+            unique_sorted = np.unique(valid_vals)
+            new_indices = np.searchsorted(unique_sorted, valid_vals)
+            result = np.full(len(x), -1, dtype=int)
+            result[valid_mask] = new_indices
+            return result
 
-        def grab_these_sort_idx(indices,which_xvar_idx=0):
-            """
-            Grabs the sort_idx elements corresponding to the indices in
-            which_shot_idx, and returns them as a new array padded with -1s
-            so that the returned array has the same length as the original sort_idx array.
-            """
-            taken = ad.sort_idx[which_xvar_idx][indices]
-            n_pad = len(ad.sort_idx[which_xvar_idx]) - len(taken)
+        def grab_these_sort_idx(indices, which_xvar_idx=0):
+            src = ad.sort_idx[which_xvar_idx]
+            taken = src[indices]
+            n_pad = len(src) - len(taken)
             if n_pad > 0:
-                taken = np.concatenate([taken, -1 * np.ones(n_pad, dtype=ad.sort_idx[which_xvar_idx].dtype)])
+                # Fix #7: pre-allocate instead of concatenate.
+                result = np.empty(len(src), dtype=src.dtype)
+                result[:len(taken)] = taken
+                result[len(taken):] = -1
+                return result
             return taken
 
         # remove the xvars, xvarnames, and xvardims entry for that xvar
@@ -862,24 +890,171 @@ class atomdata_base():
             if ad.Nvars < self.Nvars and sliced_array.shape[which_xvar_idx] == 1:
                 sliced_array = np.squeeze(sliced_array, axis=which_xvar_idx)
             return sliced_array
-        nd_keys = ['img_atoms','img_light','img_dark',
-                'img_timestamp_atoms','img_timestamp_light','img_timestamp_dark']
-        for k in nd_keys:
-            vars(ad)[k] = slice_ndarray(vars(ad)[k])
-        for k in self.data.keys:
-            vars(ad.data)[k] = slice_ndarray(vars(self.data)[k])
-        if hasattr(self,'scope_data'):
+
+        # Fix #6: use getattr/setattr (avoids repeated vars() dict lookups).
+        # Slice raw image arrays.
+        for k in ('img_atoms', 'img_light', 'img_dark',
+                  'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark'):
+            arr = getattr(ad, k, None)
+            if arr is not None:
+                setattr(ad, k, slice_ndarray(arr))
+
+        # Slice DataVault — read from ad so reassign_repeats rearrangements are respected.
+        for k in ad.data.keys:
+            setattr(ad.data, k, slice_ndarray(getattr(ad.data, k)))
+
+        # Slice scope_data — read from ad for the same reason.
+        if ad.scope_data:
             for k in ad.scope_data.keys():
                 for ch in ad.scope_data[k].keys():
-                    ad.scope_data[k][ch].t = slice_ndarray(self.scope_data[k][ch].t)
-                    ad.scope_data[k][ch].v = slice_ndarray(self.scope_data[k][ch].v)
+                    ad.scope_data[k][ch].t = slice_ndarray(ad.scope_data[k][ch].t)
+                    ad.scope_data[k][ch].v = slice_ndarray(ad.scope_data[k][ch].v)
+
+        # Fix #2: skip analyze() by slicing the already-computed analysis arrays
+        # directly.  After reassign_repeats (if called) ad already holds fresh
+        # analysis arrays; otherwise they mirror self.  Either way slicing is
+        # equivalent to running analyze() on the sliced images and is much faster.
+        for attr in (
+            'od_raw', 'od', 'sum_od_x', 'sum_od_y',
+            'integrated_od', 'atom_number', 'atom_number_density',
+            'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'cloudfit_x', 'cloudfit_y',
+            'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
+            'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
+            'fit_area_x', 'fit_area_y',
+        ):
+            arr = getattr(ad, attr, None)
+            if arr is not None:
+                try:
+                    setattr(ad, attr, slice_ndarray(arr))
+                except Exception:
+                    pass
+
+        # atom_number_apd stores scan-shaped arrays inside a custom container.
+        if getattr(ad, 'atom_number_apd', None) is not None:
+            apd = ad.atom_number_apd
+            ad.atom_number_apd = atom_number_apd(
+                slice_ndarray(apd.n_up),
+                slice_ndarray(apd.n_down),
+            )
 
         ad.params.N_img = np.prod(ad.xvardims)
         ad.params.N_shots = int(ad.params.N_shots / sliced_xvardim)
         ad.params.N_shots_with_repeats = int(ad.params.N_shots_with_repeats / sliced_xvardim)
 
-        ad.analyze()
         ad._refresh_repeat_statistics()
+
+        return ad
+
+    def _copy_self_for_slice(self):
+        """Create a lightweight in-memory copy for slice_atomdata.
+
+        Copies metadata and array references from self without triggering a full
+        reload from disk.  Mutable bookkeeping attributes (params, xvars,
+        sort_idx, …) are deep-copied so the original is not affected; large
+        array-valued attributes are copied by reference and sliced by the caller.
+        """
+        from copy import deepcopy
+
+        ad = object.__new__(self.__class__)
+
+        # Metadata — deep-copied so mutations in the slice are independent.
+        ad.params = deepcopy(self.params)
+        ad.p = ad.params
+        ad.camera_params = deepcopy(self.camera_params)
+        ad.run_info = deepcopy(self.run_info)
+        ad.roi = deepcopy(self.roi)
+        ad._analysis_tags = analysis_tags(
+            self._analysis_tags.roi_id, self._analysis_tags.imaging_type
+        )
+        ad._analysis_tags.xvars_shuffled = self._analysis_tags.xvars_shuffled
+        ad._analysis_tags.transposed = self._analysis_tags.transposed
+        ad._analysis_tags.averaged = self._analysis_tags.averaged
+        ad._analysis_tags.repeats_reassigned = self._analysis_tags.repeats_reassigned
+
+        # Scan bookkeeping — deep-copied for independent mutation.
+        ad.xvarnames = deepcopy(self.xvarnames)
+        ad.xvars = [np.array(x, copy=True) for x in self.xvars]
+        ad.Nvars = self.Nvars
+        ad.xvardims = self.xvardims.copy()
+        ad.sort_idx = (
+            self.sort_idx.copy()
+            if isinstance(self.sort_idx, np.ndarray)
+            else np.array([])
+        )
+        ad.sort_N = (
+            self.sort_N.copy()
+            if isinstance(self.sort_N, np.ndarray)
+            else np.array([])
+        )
+
+        # Infrastructure / lightweight scalars — shallow copy.
+        ad._lite = self._lite
+        ad._ds = self._ds
+        ad.server_talk = self.server_talk
+        ad._dealer = self._dealer
+        ad._timing_enabled = False
+        ad._timing = {}
+        ad.avg = None
+        ad.std = None
+        ad.sem = None
+        ad._repeat_sem_source = None
+        ad._repeat_sem_divisor = None
+        ad._repeat_zero_proxy = None
+        ad._repeat_lazy_stat_context = None
+        ad._data_file_path = self._data_file_path
+        ad._saved_roi_from_file = self._saved_roi_from_file
+        ad._has_images = getattr(self, '_has_images', True)
+
+        for attr in (
+            'experiment_code', 'atom_cross_section',
+            'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
+            'axis_camera_px_x', 'axis_camera_px_y',
+        ):
+            if hasattr(self, attr):
+                setattr(ad, attr, getattr(self, attr))
+
+        # Raw images — shallow references; caller will slice.
+        for attr in (
+            'images', 'image_timestamps',
+            'img_atoms', 'img_light', 'img_dark',
+            'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark',
+        ):
+            if hasattr(self, attr):
+                setattr(ad, attr, getattr(self, attr))
+
+        # DataVault — shallow copies of arrays; caller will slice.
+        ad.data = _RepeatDataVault()
+        ad.data.keys = list(self.data.keys)
+        for k in self.data.keys:
+            setattr(ad.data, k, getattr(self.data, k))
+
+        # Scope data — new ScopeTraceArray wrappers around the same underlying
+        # arrays; caller will update .t and .v after slicing.
+        if hasattr(self, 'scope_data'):
+            ad.scope_data = {
+                sk: {
+                    ch: ScopeTraceArray(sk, ch, tr.t, tr.v)
+                    for ch, tr in ch_dict.items()
+                }
+                for sk, ch_dict in self.scope_data.items()
+            }
+        else:
+            ad.scope_data = {}
+
+        # Pre-computed analysis results — shallow refs; caller will slice.
+        for attr in (
+            'od_raw', 'od', 'sum_od_x', 'sum_od_y',
+            'integrated_od', 'atom_number', 'atom_number_density',
+            'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'cloudfit_x', 'cloudfit_y',
+            'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
+            'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
+            'fit_area_x', 'fit_area_y',
+            'atom_number_apd',
+        ):
+            if hasattr(self, attr):
+                setattr(ad, attr, getattr(self, attr))
 
         return ad
 
@@ -997,17 +1172,7 @@ class atomdata_base():
             ad_out.data.keys.append(key)
 
         if hasattr(self, 'scope_data'):
-            ad_out.scope_data = dict()
-            for scope_key in self.scope_data.keys():
-                ad_out.scope_data[scope_key] = dict()
-                for ch, trace in self.scope_data[scope_key].items():
-                    t = trace.t
-                    v = trace.v
-                    if self._is_scan_shaped_numeric_array(t):
-                        t = reduce_op(t)
-                    if self._is_scan_shaped_numeric_array(v):
-                        v = reduce_op(v)
-                    ad_out.scope_data[scope_key][ch] = ScopeTraceArray(scope_key, ch, t, v)
+            ad_out.scope_data = self.scope_data
 
         return ad_out
 
@@ -1062,22 +1227,28 @@ class atomdata_base():
             ad_std.data.keys.append(key)
 
         if hasattr(self, 'scope_data'):
-            ad_avg.scope_data = dict()
-            ad_std.scope_data = dict()
-            for scope_key in self.scope_data.keys():
-                ad_avg.scope_data[scope_key] = dict()
-                ad_std.scope_data[scope_key] = dict()
-                for ch, trace in self.scope_data[scope_key].items():
-                    t_mean = trace.t
-                    v_mean = trace.v
-                    t_std = trace.t
-                    v_std = trace.v
-                    if self._is_scan_shaped_numeric_array(trace.t):
-                        t_mean, t_std = self._reduce_repeat_ndarray_mean_std(trace.t, xvar_idx, n_repeats)
-                    if self._is_scan_shaped_numeric_array(trace.v):
-                        v_mean, v_std = self._reduce_repeat_ndarray_mean_std(trace.v, xvar_idx, n_repeats)
-                    ad_avg.scope_data[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_mean, v_mean)
-                    ad_std.scope_data[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_std, v_std)
+            avg_scope = {}
+            std_scope = {}
+            for scope_key, channel_dict in self.scope_data.items():
+                avg_scope[scope_key] = {}
+                std_scope[scope_key] = {}
+                for ch, trace in channel_dict.items():
+                    t = trace.t
+                    v = trace.v
+                    if self._is_scan_shaped_numeric_array(t):
+                        t_avg, t_std = self._reduce_repeat_ndarray_mean_std(t, xvar_idx, n_repeats)
+                    else:
+                        t_avg = t
+                        t_std = t
+                    if self._is_scan_shaped_numeric_array(v):
+                        v_avg, v_std = self._reduce_repeat_ndarray_mean_std(v, xvar_idx, n_repeats)
+                    else:
+                        v_avg = v
+                        v_std = v
+                    avg_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_avg, v_avg)
+                    std_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_std, v_std)
+            ad_avg.scope_data = avg_scope
+            ad_std.scope_data = std_scope
 
         return ad_avg, ad_std
 
@@ -1223,23 +1394,27 @@ class atomdata_base():
             )
 
         for key in self.data.keys:
-            vars(self.data)[key] = self._reassign_repeat_ndarray(vars(self.data)[key],
-                                                                 source_xvar_idx,
-                                                                 xvar_idx,
-                                                                 n_repeats,
-                                                                 old_xvardims)
+            value = vars(self.data)[key]
+            if self._is_scan_shaped_numeric_array(value):
+                vars(self.data)[key] = self._reassign_repeat_ndarray(value,
+                                                                     source_xvar_idx,
+                                                                     xvar_idx,
+                                                                     n_repeats,
+                                                                     old_xvardims)
 
         if hasattr(self,'scope_data'):
             for scope_key in self.scope_data.keys():
                 for ch in self.scope_data[scope_key].keys():
                     for ax in ['t', 'v']:
-                        vars(self.scope_data[scope_key][ch])[ax] = self._reassign_repeat_ndarray(
-                            vars(self.scope_data[scope_key][ch])[ax],
-                            source_xvar_idx,
-                            xvar_idx,
-                            n_repeats,
-                            old_xvardims
-                        )
+                        value = vars(self.scope_data[scope_key][ch])[ax]
+                        if self._is_scan_shaped_numeric_array(value):
+                            vars(self.scope_data[scope_key][ch])[ax] = self._reassign_repeat_ndarray(
+                                value,
+                                source_xvar_idx,
+                                xvar_idx,
+                                n_repeats,
+                                old_xvardims
+                            )
 
         self.xvars[source_xvar_idx] = self._get_unique_repeated_xvar(source_xvar_idx, n_repeats)
         self.xvars[xvar_idx] = np.repeat(np.asarray(self.xvars[xvar_idx]), n_repeats)
@@ -1255,16 +1430,10 @@ class atomdata_base():
         self.sort_idx = np.array([])
         self.sort_N = np.array([])
         self._dealer = self._init_dealer()
-        self.images = self._dealer.stack_linear_data_ndarray(self.img_atoms,
-                                                             self.img_light,
-                                                             self.img_dark)
-        self.image_timestamps = self._dealer.stack_linear_data_ndarray(self.img_timestamp_atoms,
-                                                                       self.img_timestamp_light,
-                                                                       self.img_timestamp_dark)
-        self._dealer.images = self.images
-        self._dealer.image_timestamps = self.image_timestamps
-
-        self._sort_images()
+        # img_atoms/light/dark are already in (*new_xvardims, H, W) form after
+        # _reassign_repeat_ndarray — no need to re-stack and re-deal.
+        # self.images is left stale; unshuffle/reshuffle after reassign_repeats
+        # is not supported.
         self.analyze()
         self._analysis_tags.repeats_reassigned = True
 
@@ -1332,7 +1501,7 @@ class atomdata_base():
                 self.xvars[xvar_idx] = np.unique(self.xvars[xvar_idx])
                 vars(self.params)[self.xvarnames[xvar_idx]] = self.xvars[xvar_idx]
                 self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
-            self.params.N_repeats = np.ones(len(self.xvars),dtype=int)
+            self.params.N_repeats = 1
         
             if reanalyze:
                 # don't unshuffle xvars again -- that will be confusing
@@ -1517,7 +1686,7 @@ class atomdata_base():
         # figure out dimensions of each xvar
         self.xvardims = np.zeros(self.Nvars,dtype=int)
         for i in range(self.Nvars):
-            if type(xvars[i]) == np.int64:
+            if np.ndim(xvars[i]) == 0:
                 raise ValueError(f'Run {self.run_info.run_id} did not have a scanned parameter.')
             self.xvardims[i] = np.int32(len(xvars[i]))
 
@@ -1526,7 +1695,8 @@ class atomdata_base():
     ## Unshuffling
 
     def _shuff(self, reshuffle_bool):
-        self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
+        if getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0:
+            self.images = self._dealer.unscramble_images(reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self, reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self.params, reshuffle=reshuffle_bool)
         self._dealer._unshuffle_struct(self.data,
@@ -1541,7 +1711,9 @@ class atomdata_base():
             raise ValueError("Cannot reshuffle after repeats have been reassigned.")
         if self._analysis_tags.xvars_shuffled == False:
             self._shuff(reshuffle_bool=True)
-            self._sort_images()
+            _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+            if _has_images:
+                self._sort_images()
             self.analyze()
             self._analysis_tags.xvars_shuffled = True
         else:
@@ -1551,7 +1723,9 @@ class atomdata_base():
         if self._analysis_tags.xvars_shuffled == True:
             self._shuff(reshuffle_bool=False)
             if reanalyze:
-                self._sort_images()
+                _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+                if _has_images:
+                    self._sort_images()
                 self.analyze()
             self._analysis_tags.xvars_shuffled = False
         else:
@@ -1639,13 +1813,29 @@ class atomdata_base():
             unpack_group(f,'params',self.params)
             unpack_group(f,'camera_params',self.camera_params)
             unpack_group(f,'run_info',self.run_info)
+
+            # N_repeats must always be an int. HDF5 may store it as a
+            # 0-d array, a 1-element array, or a list — normalise here.
+            _nr = self.params.N_repeats
+            if hasattr(_nr, '__len__'):
+                _nr = int(np.asarray(_nr).flat[0])
+            self.params.N_repeats = int(_nr)
             timing['h5_unpack_headers_s'] = time.perf_counter() - t_stage
 
             print(self.run_info.run_id)
 
             t_stage = time.perf_counter()
-            self.images = f['data']['images'][()]
-            self.image_timestamps = f['data']['image_timestamps'][()]
+            # has_images=False means no camera images were captured (e.g.
+            # save_data=True but setup_camera=False).  Old files that pre-date
+            # this attribute always have images, so we default to whether the
+            # 'images' dataset actually exists in the file.
+            self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
+            if self._has_images:
+                self.images = f['data']['images'][()]
+                self.image_timestamps = f['data']['image_timestamps'][()]
+            else:
+                self.images = np.array([])
+                self.image_timestamps = np.array([])
             self.xvarnames = f.attrs['xvarnames'][()]
             self.xvars = self._unpack_xvars()
             timing['h5_read_core_arrays_s'] = time.perf_counter() - t_stage
@@ -1662,7 +1852,7 @@ class atomdata_base():
 
             t_stage = time.perf_counter()
             all_keys = list(f['data'].keys())
-            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data']]
+            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data', 'timestamp_shot_end']]
 
             for k in filtered_keys:
                 data_k = f['data'][k][()]
@@ -1671,6 +1861,13 @@ class atomdata_base():
                 vars(self.data)[k] = data_k
                 self.data.keys.append(k)
             timing['h5_read_datavault_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
+            if 'timestamp_shot_end' in all_keys:
+                self.timestamp_shot_end = f['data']['timestamp_shot_end'][()]
+            else:
+                self.timestamp_shot_end = np.array([])
+            timing['h5_read_timestamp_shot_end_s'] = time.perf_counter() - t_stage
 
             t_stage = time.perf_counter()
             try:

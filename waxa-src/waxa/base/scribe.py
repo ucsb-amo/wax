@@ -52,6 +52,25 @@ class Scribe():
                     raise ValueError("Timed out waiting for data to be available.")        
                 
     def wait_for_camera_ready(self,timeout=-1.) -> bool:
+        # New path: delegate to the ZMQ client when available.
+        if getattr(self, 'live_od_client', None) is not None:
+            cam_timeout = timeout if timeout > 0. else 60.0
+            self.live_od_client.wait_cam_ready(timeout=cam_timeout)
+            print('Acknowledged camera ready signal.')
+            return True
+
+        # Legacy path: the old CameraMother file-watching mechanism has been
+        # removed; camera_ready is no longer written to HDF5. Polling here
+        # would block for the full timeout (45 s) and then crash. Fail fast
+        # instead with a clear diagnostic.
+        raise RuntimeError(
+            "wait_for_camera_ready: no LiveOD server connection (live_od_client "
+            "is not set) but setup_camera=True. The legacy HDF5-polling path is "
+            "no longer supported (CameraMother file-watching was removed). Either "
+            "ensure the LiveOD server window is running on the control PC, or "
+            "pass setup_camera=False / suppress_live_od=True to Base.__init__."
+        )
+        # --- legacy code kept for reference (unreachable) ---
         count = 1
         t0 = time.time()
         waiting = True
@@ -100,6 +119,11 @@ class Scribe():
     def remove_incomplete_data(self,delete_data_bool=True):
         # msg = "Something went wrong."
         if delete_data_bool:
+            # File may already have been deleted by the server (e.g. via
+            # _finalize_reset_run) before CameraBaby's grab loop timed out
+            # and called dishonorable_death.  If so, there is nothing to do.
+            if not getattr(self, 'data_filepath', None) or not os.path.exists(self.data_filepath):
+                return
             msg = "Destroying incomplete data."
             count = 0
             while True:
@@ -121,25 +145,68 @@ class Scribe():
                 if not self._check_data_file_exists(raise_error=False):
                     break
 
+    # def _check_data_file_exists(self, raise_error=True) -> bool:
+    #     """
+    #     Checks if the data file exists if saving data is enabled. Raises an
+    #     error if not found.
+    #     """
+    #     if hasattr(self, 'run_info'):
+    #         filepath = getattr(self.run_info, 'filepath', None)
+    #         if isinstance(filepath, list):
+    #             # If filepath is a list, check all paths
+    #             paths = filepath
+    #         else:
+    #             paths = [filepath]
+    #         for path in paths:
+    #             if isinstance(path, np.ndarray):
+    #                 path = path.item() if path.size == 1 else None
+    #             if path and not os.path.exists(path):
+    #                 if raise_error:
+    #                     if hasattr(self,'monitor'):
+    #                         self.monitor.update_device_states()
+    #                         self.monitor.signal_end()
+    #                     raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
+    #                 else:
+    #                     return False
+    #         return True
+        
+    def _check_for_abort_signal(self, raise_error=True) -> bool:
+        """Override: use ZMQ poll to check for a reset request instead of
+        checking whether the data file still exists on disk.
+
+        Falls back to the parent (file-based) check when no live_od_client
+        is attached (e.g. suppress_live_od=True runs, or no liveOD server).
+        """
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            reset = _client.poll_reset()
+            if reset and raise_error:
+                if hasattr(self,'monitor'):
+                    self.monitor.update_device_states()
+                    self.monitor.signal_end()
+                _client.abort_run()
+                raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
+            return reset
+        else:
+            return False
+        
     def _check_data_file_exists(self, raise_error=True) -> bool:
+        return self._check_for_abort_signal(raise_error)
+
+    def _send_abort_to_server(self):
+        """Notify the liveOD server that the run has been aborted due to
+        an RTIOUnderflow.  Called as an RPC from the scan kernel after the
+        current scan loop iteration completes.
+
+        Raises RuntimeError after notifying the server so that the caller
+        (scan()) propagates the exception out of run(), preventing analyze()
+        from executing and the experiment from sending a spurious END_RUN.
         """
-        Checks if the data file exists if saving data is enabled. Raises an
-        error if not found.
-        """
-        if hasattr(self, 'run_info'):
-            filepath = getattr(self.run_info, 'filepath', None)
-            if isinstance(filepath, list):
-                # If filepath is a list, check all paths
-                paths = filepath
-            else:
-                paths = [filepath]
-            for path in paths:
-                if path and not os.path.exists(path):
-                    if raise_error:
-                        if hasattr(self,'monitor'):
-                            self.monitor.update_device_states()
-                            self.monitor.signal_end()
-                        raise RuntimeError(f"Data file for run ID {self.run_info.run_id} not found.")
-                    else:
-                        return False
-            return True
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            if hasattr(self, 'monitor'):
+                self.monitor.update_device_states()
+                self.monitor.signal_end()
+            _client.abort_run()
+        print(f'[Scanner] RTIOUnderflow: run {self.run_info.run_id} aborted.')
+        raise RuntimeError(f'RTIOUnderflow: run {self.run_info.run_id} aborted.')

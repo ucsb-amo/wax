@@ -1,10 +1,13 @@
 import numpy as np
 import os
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from joblib import Parallel, delayed
 from waxa.fitting import GaussianFit
 
-# Module-level worker function for thread pool mapping.
+# Minimum number of fits to justify spawning a process pool.
+# Below this threshold the pool startup cost exceeds the parallelism gain.
+N_PROC_THRESHOLD = 64
+
+# Module-level worker function (must be importable by loky workers).
 def _fit_one_worker(this_sum_dist, xaxis):
     try:
         fit = GaussianFit(xaxis, this_sum_dist, print_errors=False)
@@ -41,25 +44,22 @@ def fit_gaussian_sum_dist(sum_dist: np.ndarray, camera_params) -> list[GaussianF
 
     error_count = 0
     total = sum_dist_list.shape[0]
-    
-    # Create a worker function with xaxis bound via partial
-    worker = partial(_fit_one_worker, xaxis=xaxis)
 
-    # Fit each summed OD independently. For larger batches, use ThreadPoolExecutor;
-    # for smaller batches, use serial to avoid scheduling overhead.
-    use_parallel = total >= 8
-
-    if use_parallel:
-        max_workers = min(max(os.cpu_count() or 1, 1), total)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            results = list(pool.map(worker, sum_dist_list))
+    # For large batches use joblib's loky backend (true parallelism, and unlike
+    # ProcessPoolExecutor it works correctly in Jupyter/IPython on Windows).
+    # For small batches the process-pool startup cost exceeds the gain.
+    if total >= N_PROC_THRESHOLD:
+        n_workers = min(os.cpu_count() or 1, total)
+        results = Parallel(n_jobs=n_workers, backend='loky')(
+            delayed(_fit_one_worker)(arr, xaxis) for arr in sum_dist_list
+        )
         for i, fit in enumerate(results):
             if fit is None:
                 error_count += 1
             fits[i] = fit
     else:
         for i in range(total):
-            fit = worker(sum_dist_list[i])
+            fit = _fit_one_worker(sum_dist_list[i], xaxis)
             if fit is None:
                 error_count += 1
             fits[i] = fit

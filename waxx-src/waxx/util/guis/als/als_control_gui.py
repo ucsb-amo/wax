@@ -783,19 +783,10 @@ class ALSControlGUI(QMainWindow):
         connection_layout.setContentsMargins(12, 8, 12, 8)
         connection_layout.setSpacing(6)
 
-        connection_header_layout = QHBoxLayout()
-        connection_header_layout.setSpacing(8)
-
-        connection_title = QLabel("TCP")
-        connection_title.setObjectName("CardEyebrow")
-        connection_header_layout.addWidget(connection_title)
-        connection_header_layout.addStretch()
-
-        self.connection_port_label = QLabel(f"{self.ip}:{self.port}")
-        self.connection_port_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #1f2a30;")
-        connection_header_layout.addWidget(self.connection_port_label)
-
-        connection_layout.addLayout(connection_header_layout)
+        self.server_conn_button = QPushButton("Server: searching\u2026")
+        self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.server_conn_button.clicked.connect(self._retry_server_connection)
+        connection_layout.addWidget(self.server_conn_button)
 
         self.connect_button = QPushButton(f"{self._remote_serial_port} Disconnected")
         self.connect_button.setMinimumWidth(180)
@@ -1004,7 +995,13 @@ class ALSControlGUI(QMainWindow):
     
     def _init_workers(self):
         """Initialize remote ALS server client and fetch initial state."""
-        self.remote_client = ALSGuiClient(host=self.ip, port=self.port, timeout_s=0.75)
+        try:
+            self.remote_client = ALSGuiClient(timeout_s=0.75)
+            self._set_server_conn_button_state("connected")
+        except RuntimeError:
+            self.remote_client = None
+            self._set_server_conn_button_state("searching")
+            return
         QTimer.singleShot(0, self._sync_remote_state)
     
     def _toggle_connection(self):
@@ -1101,9 +1098,15 @@ class ALSControlGUI(QMainWindow):
     def _sync_remote_state(self):
         """Poll the ALS server for latest state and logs."""
         if self.remote_client is None:
-            return
+            try:
+                self.remote_client = ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
+                self._set_server_conn_button_state("connected")
+            except RuntimeError:
+                self._set_server_conn_button_state("searching")
+                return
         try:
             snapshot = self.remote_client.get_snapshot()
+            self._set_server_conn_button_state("connected")
             self._last_remote_error = None
             self._apply_remote_snapshot(snapshot)
             self._sync_remote_logs(snapshot.get("log_count", self._next_log_index))
@@ -1228,11 +1231,37 @@ class ALSControlGUI(QMainWindow):
             self._append_log_message(message)
         self._next_log_index = int(log_response.get("next_index", self._next_log_index))
 
+    def _set_server_conn_button_state(self, state: str) -> None:
+        """Update the server TCP connection button appearance.
+
+        state: 'searching' | 'connected' | 'lost'
+        """
+        if state == "connected" and self.remote_client is not None:
+            text = f"Server: {self.remote_client.host}:{self.remote_client.port}"
+            style = "background-color: #2ba363; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+        elif state == "lost":
+            text = "Server: lost \u2014 click to retry"
+            style = "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+        else:
+            text = "Server: searching\u2026"
+            style = "background-color: #8c959e; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+        self.server_conn_button.setText(text)
+        self.server_conn_button.setStyleSheet(style)
+
+    def _retry_server_connection(self) -> None:
+        """Force immediate server rediscovery when the user clicks the connection button."""
+        self.remote_client = None
+        self._set_server_conn_button_state("searching")
+        self._sync_remote_state()
+
     def _handle_remote_error(self, exc: Exception) -> None:
         error_text = str(exc)
         if error_text != self._last_remote_error:
             self.statusBar().showMessage(f"Server communication error: {error_text}")
             self._last_remote_error = error_text
+        # Null the client so _sync_remote_state will attempt full rediscovery next tick.
+        self.remote_client = None
+        self._set_server_conn_button_state("lost")
         self.status = LaserStatus(connected=False, connection_state=ConnectionState.ERROR)
         self._on_connection_state_changed(ConnectionState.ERROR)
         self._update_display()
