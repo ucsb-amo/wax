@@ -143,7 +143,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
     
-    def read_sweep(self,channels):
+    def read_sweep(self,channels) -> bool:
         channels = np.atleast_1d(channels)
         self._scopedata._scope_trace_taken = True
 
@@ -158,9 +158,9 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
                     (t,v) = self.scope.read_sweep(ch)
                     data.append([t,v])
                 except Exception as e:
-                    # aprint(e)
-                    pass
+                    print(f"[SiglentScope read_sweep] ch={ch} failed: {e}")
         self._data.append(np.array(data))
+        return True
 
 class TektronixScope_TBS1104(GenericWaxxScope):
     def __init__(self,device_id="",label="",arm=True,
