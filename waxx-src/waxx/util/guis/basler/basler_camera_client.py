@@ -44,6 +44,12 @@ class BaslerServerConnection(WaxxClient):
     this connection do not interleave messages.
     """
 
+    # Default ZMQ timeouts (ms).  Control RPCs (OPEN/CLOSE/SET_*) can be
+    # slow; frame fetches should fail fast so a single missed trigger does
+    # not stall the GUI for seconds.
+    DEFAULT_RCVTIMEO_MS = 4000
+    DEFAULT_SNDTIMEO_MS = 4000
+
     def __init__(self, server_id: str, discovery_timeout: float = 3.0) -> None:
         super().__init__(server_id, discovery_timeout=discovery_timeout)
         self._ctx: Optional[zmq.Context] = None
@@ -52,20 +58,34 @@ class BaslerServerConnection(WaxxClient):
 
     # ------------------------------------------------------------------ #
 
-    def _connect(self) -> None:
+    @property
+    def ctx(self) -> zmq.Context:
         if self._ctx is None:
             self._ctx = zmq.Context()
+        return self._ctx
+
+    def make_socket(self, rcvtimeo_ms: int = DEFAULT_RCVTIMEO_MS,
+                    sndtimeo_ms: int = DEFAULT_SNDTIMEO_MS) -> zmq.Socket:
+        """Create a fresh REQ socket connected to this server.
+
+        Used by ``BaslerCameraClient`` to obtain a dedicated per-camera
+        frame socket so that ``GET_FRAME`` traffic does not serialise
+        behind other cameras' RPCs on the shared control socket.
+        """
+        sock = self.ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, int(rcvtimeo_ms))
+        sock.setsockopt(zmq.SNDTIMEO, int(sndtimeo_ms))
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(f"tcp://{self.host}:{self.port}")
+        return sock
+
+    def _connect(self) -> None:
         if self._sock is not None:
             try:
                 self._sock.close(linger=0)
             except Exception:
                 pass
-        sock = self._ctx.socket(zmq.REQ)
-        sock.setsockopt(zmq.RCVTIMEO, 4000)
-        sock.setsockopt(zmq.SNDTIMEO, 4000)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(f"tcp://{self.host}:{self.port}")
-        self._sock = sock
+        self._sock = self.make_socket()
 
     def _request(self, cmd: dict) -> dict:
         """Send *cmd* and return the reply dict.  Retries once with rediscovery."""
@@ -132,6 +152,14 @@ class BaslerCameraClient:
         self.serial = serial
         self.model = model
         self.user_id = user_id
+        # Dedicated frame socket — created lazily on first ``get_frame()``
+        # call.  Using a per-camera socket keeps GET_FRAME traffic off the
+        # shared control socket so multiple cameras on the same server do
+        # not serialise behind each other, and a stalled trigger on one
+        # camera does not delay control RPCs on another.
+        self._frame_sock: Optional[zmq.Socket] = None
+        self._frame_lock = threading.Lock()
+        self._frame_rcvtimeo_ms: int = 400
 
     @property
     def display_name(self) -> str:
@@ -156,10 +184,71 @@ class BaslerCameraClient:
         return self._req({"cmd": "OPEN_CAMERA"})
 
     def close(self) -> dict:
+        # Tear down the dedicated frame socket when the camera is closed
+        # so we do not leak FDs and the next open() reconnects cleanly.
+        with self._frame_lock:
+            if self._frame_sock is not None:
+                try:
+                    self._frame_sock.close(linger=0)
+                except Exception:
+                    pass
+                self._frame_sock = None
         return self._req({"cmd": "CLOSE_CAMERA"})
 
+    def set_frame_timeout_ms(self, timeout_ms: int) -> None:
+        """Adjust the RCVTIMEO of the dedicated frame socket (re-created
+        on next ``get_frame()`` call).
+        """
+        self._frame_rcvtimeo_ms = int(timeout_ms)
+        with self._frame_lock:
+            if self._frame_sock is not None:
+                try:
+                    self._frame_sock.close(linger=0)
+                except Exception:
+                    pass
+                self._frame_sock = None
+
     def get_frame(self) -> dict:
-        return self._req({"cmd": "GET_FRAME"})
+        """Fetch one frame on a dedicated per-camera socket.
+
+        Uses a short RCVTIMEO so a missed trigger costs ~``_frame_rcvtimeo_ms``
+        rather than blocking for the control-socket timeout.  Does NOT touch
+        the shared control socket / lock.
+        """
+        cmd = {"cmd": "GET_FRAME", "serial": self.serial}
+        with self._frame_lock:
+            if self._frame_sock is None:
+                self._frame_sock = self.connection.make_socket(
+                    rcvtimeo_ms=self._frame_rcvtimeo_ms,
+                    sndtimeo_ms=1000,
+                )
+            for attempt in range(2):
+                try:
+                    self._frame_sock.send(pickle.dumps(cmd))
+                    return pickle.loads(self._frame_sock.recv())
+                except zmq.Again:
+                    # Recreate the REQ socket (REQ state machine breaks on
+                    # timeout) and either retry once or return a timeout error.
+                    try:
+                        self._frame_sock.close(linger=0)
+                    except Exception:
+                        pass
+                    self._frame_sock = self.connection.make_socket(
+                        rcvtimeo_ms=self._frame_rcvtimeo_ms,
+                        sndtimeo_ms=1000,
+                    )
+                    if attempt == 0:
+                        continue
+                    return {"ok": False, "error": "frame timeout"}
+                except Exception as exc:
+                    try:
+                        self._frame_sock.close(linger=0)
+                    except Exception:
+                        pass
+                    self._frame_sock = None
+                    if attempt == 0:
+                        continue
+                    return {"ok": False, "error": str(exc)}
 
     def get_gain(self) -> dict:
         return self._req({"cmd": "GET_GAIN"})

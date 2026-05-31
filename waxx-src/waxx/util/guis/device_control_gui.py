@@ -582,10 +582,8 @@ class MonitorStatusChecker(QThread):
                 try:
                     self.monitor_client = MonitorClient(discovery_timeout=0.5)
                 except RuntimeError:
-                    from waxx.util.comms_server.waxx_client import _registry
-                    with _registry._lock:
-                        known = dict(_registry._cache)
-                    print(f"[DeviceGUI] Monitor discovery failed. Beacon cache: {known or '(empty — no beacons received)'}")
+                    # Discovery failed: surface via signal only (red
+                    # indicator); do not spam stdout.
                     self.connection_failed.emit()
                     time.sleep(2.0)
                     continue
@@ -598,16 +596,10 @@ class MonitorStatusChecker(QThread):
                     # send_message() swallows exceptions and returns None on
                     # failure — treat this as a lost connection and force
                     # re-discovery on the next iteration.
-                    print("[DeviceGUI] check_status returned None — forcing rediscovery")
                     self.monitor_client = None
                     self.connection_failed.emit()
                     time.sleep(2.0)
-            except Exception as e:
-                from waxx.util.comms_server.waxx_client import _registry
-                with _registry._lock:
-                    known = dict(_registry._cache)
-                print(f"[DeviceGUI] Connection error: {e}")
-                print(f"[DeviceGUI] Beacon cache at failure time: {known or '(empty)'}")
+            except Exception:
                 # Reset client so the next iteration re-runs service discovery.
                 # This handles server restarts (new dynamic port) cleanly.
                 self.monitor_client = None
@@ -875,7 +867,7 @@ class DeviceStateGUI(QMainWindow):
         """Handle connection failure"""
         self.connection_failed = True
         self.status_button.setText("Server connection failed")
-        self.status_button.setStyleSheet("background-color: gray; color: white;")
+        self.status_button.setStyleSheet("background-color: #b22222; color: white;")
         
     def on_instant_apply_toggled(self, checked):
         """Handle instant apply button toggle and update color and text"""

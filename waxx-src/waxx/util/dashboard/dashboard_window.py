@@ -522,6 +522,7 @@ class DashboardMainWindow(QMainWindow):
         except Exception as exc:
             _LOG.warning("Failed to restore layout, falling back to defaults: %r", exc)
         # Inner page windows have their own dock arrangement.
+        page_states: dict[str, object] = {}
         for page, inner in self._page_windows.items():
             if inner is self:
                 continue
@@ -529,8 +530,18 @@ class DashboardMainWindow(QMainWindow):
                 ps = self._settings.value(self._layout_key(f"page_state/{page}"))
                 if ps is not None:
                     inner.restoreState(ps)
+                    page_states[page] = ps
             except Exception as exc:
                 _LOG.warning("Failed to restore page %r layout: %r", page, exc)
+        # Capture the just-restored layout as the "last loaded" snapshot so
+        # that ``Snap to Default`` brings the user back to what was on screen
+        # at startup (overridden later by any ``Load Layout...`` action).
+        if geo is not None or state is not None or page_states:
+            self._last_loaded_layout = {
+                "geometry": geo,
+                "state": state,
+                "page_states": page_states,
+            }
 
     def _save_layout(self) -> None:
         try:
@@ -560,7 +571,31 @@ class DashboardMainWindow(QMainWindow):
         QMessageBox.information(self, "Reset layout", "Layout cleared. Restart the dashboard to apply.")
 
     def _snap_default_layout(self) -> None:
-        """Re-apply the original placement spec live, no restart needed."""
+        """Snap back to the last loaded layout.
+
+        "Last loaded" means either the layout restored from QSettings at
+        startup, or the most recent ``Load Layout...`` file the user
+        applied.  If neither exists (first-ever run), fall back to the
+        original placement spec.
+        """
+        snap = getattr(self, "_last_loaded_layout", None)
+        if snap:
+            try:
+                geo = snap.get("geometry")
+                state = snap.get("state")
+                if geo is not None:
+                    self.restoreGeometry(geo)
+                if state is not None:
+                    self.restoreState(state)
+                for page, ps in (snap.get("page_states") or {}).items():
+                    inner = self._page_windows.get(page)
+                    if inner is not None and inner is not self and ps is not None:
+                        inner.restoreState(ps)
+                self.statusBar().showMessage("Snapped to last loaded layout", 3000)
+                return
+            except Exception as exc:
+                _LOG.warning("Snap to last loaded layout failed, using default spec: %r", exc)
+        # Fall back: re-apply the original placement spec live.
         for panel in self._panels:
             try:
                 panel.setFloating(False)
@@ -631,6 +666,12 @@ class DashboardMainWindow(QMainWindow):
             # Also persist to QSettings so it survives a restart.
             self._settings.setValue(self._layout_key("geometry"), geom)
             self._settings.setValue(self._layout_key("state"), state)
+            # Remember this as the new "snap to default" target.
+            self._last_loaded_layout = {
+                "geometry": geom,
+                "state": state,
+                "page_states": {},
+            }
             self.statusBar().showMessage(f"Layout loaded from {path}", 5000)
         except Exception as exc:
             _LOG.exception("Load layout failed")

@@ -383,7 +383,12 @@ class BaslerCamerasMainWindow(QMainWindow):
                 widget._do_close()
             except Exception:
                 pass
+        # Best-effort: ask the discovery worker to quit, but never block
+        # the GUI shutdown waiting for it.  The underlying UDP recv may
+        # be uninterruptible until its timeout elapses.
         if self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(2000)
+            try:
+                self._worker.quit()
+            except Exception:
+                pass
         super().closeEvent(event)

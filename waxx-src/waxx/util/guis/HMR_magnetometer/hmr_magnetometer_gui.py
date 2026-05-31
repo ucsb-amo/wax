@@ -863,18 +863,16 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.stop_event.clear()
         self._reset_display()
 
-        # Quick connectivity check before starting the worker thread
+        # Quick connectivity check before starting the worker thread.
+        # Failures must NOT pop up a dialog (the panel may be hidden in the
+        # dashboard); just log to status and bail so the user can retry.
         try:
             self.client._ping(timeout=2.0)
         except Exception as exc:
-            host = self.client.host
-            port = self.client.port
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Connection Error",
-                f"Cannot reach server at {host}:{port}\n\n{exc}",
-            )
-            self._set_status("Connection failed")
+            host = getattr(self.client, "host", "?")
+            port = getattr(self.client, "port", "?")
+            self._set_status(f"Connection failed: cannot reach {host}:{port} ({exc})")
+            self.client = None
             return
 
         self.running = True
@@ -908,6 +906,8 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         while not self.stop_event.is_set() and session_id == self.session_id:
             try:
+                if self.client is None:
+                    raise RuntimeError("client not connected")
                 result = self.client._get_since(last_t, timeout=3.0)
                 if not result.get("ok"):
                     raise RuntimeError(result.get("error", "Server returned error"))

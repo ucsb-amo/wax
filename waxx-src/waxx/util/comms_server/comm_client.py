@@ -32,10 +32,9 @@ class CommClient(WaxxClient):
                     if self._rediscover(timeout=2.0):
                         self.server_address = (self.host, self.port)
                     continue
-                if "[WinError 10061]" in str(e):
-                    print("Connection refused [WinError 10061]: Unable to reach the server")
-                else:
-                    print(e)
+                # Final failure: do not print/popup.  Callers detect the
+                # failure via a ``None`` return and surface it as a red
+                # status indicator in the GUI.
             finally:
                 self.sock.close()
         
