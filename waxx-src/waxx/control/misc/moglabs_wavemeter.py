@@ -146,14 +146,54 @@ class WavemeterClient():
         """Get frequency in Hz. Returns 0.0 if error occurs."""
         return self.fzw.get_frequency(self.ch)
 
-    def lock_status(self, robust=True) -> bool:
+    def lock_status(self, frequency_shift=0., robust=True) -> bool:
         if robust:
             ok = self.check_exposure()
             ok = ok & self.check_exposure()
         self._f = self.get_frequency()
 
-        if abs(self._f - self.target_freq) < self.locked_tolerance:
+        f_target = self.target_freq + frequency_shift
+
+        if abs(self._f - f_target) < self.locked_tolerance:
             return True
         else:
             aprint(f'laser {self.key} unlocked')
             return False
+        
+class DummyWavemeterController():
+    def check_ch(self) -> int:
+        return 0
+    
+    def set_channel(self, ch):
+        pass
+    
+    def select_channel(self, ch):
+        pass
+    
+    def get_frequency(self, ch) -> float:
+        return 0.0
+    
+    def get_saturation(self, ch) -> float:
+        return 50.0
+    
+    def get_exposure(self, ch) -> float:
+        return 0.05
+    
+    def set_averaging_time(self, ch, t_s=0.):
+        pass
+    
+    def set_units(self):
+        pass
+
+class DummyWavemeterClient():
+    def check_exposure(self) -> bool:
+        return True
+    
+    def check_saturation(self) -> bool:
+        return True
+    
+    def get_frequency(self) -> float:
+        return 0.
+    
+    def lock_status(self) -> bool:
+        return False
