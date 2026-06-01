@@ -854,27 +854,17 @@ class ALSControlGUI(QMainWindow):
         self.connect_button.clicked.connect(self._toggle_connection)
         self.connect_button.setVisible(False)
 
-        indicators_panel = QFrame()
-        indicators_panel.setObjectName("IndicatorPanel")
-        indicators_layout = QVBoxLayout(indicators_panel)
-        indicators_layout.setContentsMargins(6, 6, 6, 6)
-        indicators_layout.setSpacing(4)
-
-        indicators_title = QLabel("Laser Indicators")
-        indicators_title.setObjectName("CardEyebrow")
-        indicators_layout.addWidget(indicators_title)
-
+        # Status dots live directly in the System group — no inner
+        # "Laser Indicators" frame/title wrapper, to save vertical space.
         self.power_status_dot = StatusDot("Power")
         self.power_status_dot.clicked.connect(self._toggle_power_status)
-        indicators_layout.addWidget(self.power_status_dot)
+        layout.addWidget(self.power_status_dot)
         self.interlock_status_dot = StatusDot("Interlock")
         self.interlock_status_dot.clicked.connect(self._toggle_interlock_status)
-        indicators_layout.addWidget(self.interlock_status_dot)
+        layout.addWidget(self.interlock_status_dot)
         self.second_stage_status_dot = StatusDot("2nd Stage")
         self.second_stage_status_dot.clicked.connect(self._toggle_second_stage_status)
-        indicators_layout.addWidget(self.second_stage_status_dot)
-
-        layout.addWidget(indicators_panel)
+        layout.addWidget(self.second_stage_status_dot)
 
         return group
 
@@ -894,25 +884,29 @@ class ALSControlGUI(QMainWindow):
         power_col = QHBoxLayout()
         power_col.setSpacing(8)
 
-        power_box = QGroupBox("Power Setpoint")
+        power_box = QGroupBox("Power")
         power_layout = QVBoxLayout(power_box)
         power_layout.setContentsMargins(10, 8, 10, 8)
         power_layout.setSpacing(6)
 
-        edit_row = QHBoxLayout()
-        edit_row.setContentsMargins(0, 0, 0, 0)
-        edit_row.addStretch()
-        self.power_edit_checkbox = QCheckBox("Edit")
+        # Edit checkbox lives on the QGroupBox title strip itself — not
+        # as a separate header row inside — to save vertical space.
+        self.power_edit_checkbox = QCheckBox("Edit", power_box)
         self.power_edit_checkbox.setChecked(False)
         self.power_edit_checkbox.stateChanged.connect(self._on_power_edit_toggled)
-        edit_row.addWidget(self.power_edit_checkbox)
-        power_layout.addLayout(edit_row)
+        self.power_edit_checkbox.setStyleSheet("background: transparent;")
+        self._power_edit_anchor = power_box
+        # Position is updated on first show + resize via an event filter.
+        power_box.installEventFilter(self)
 
         self.power_setpoint_label = QLabel("0%")
         self.power_setpoint_label.setStyleSheet(
             "font-size: 26px; font-weight: 800; color: #5fb6c8;"
         )
         self.power_setpoint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Stretch above keeps the readout vertically centered when the
+        # box grows (e.g. when neighbouring panels are hidden).
+        power_layout.addStretch()
         power_layout.addWidget(self.power_setpoint_label)
 
         self.power_input_field = PowerInputField(on_focus_out=self._on_power_input_focus_out)
@@ -928,6 +922,8 @@ class ALSControlGUI(QMainWindow):
         self.power_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.power_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_submit_hint)
+        # Trailing stretch matches the leading one to centre the column.
+        power_layout.addStretch()
 
         self._update_power_edit_mode()
         power_col.addWidget(power_box, 1)
@@ -942,6 +938,7 @@ class ALSControlGUI(QMainWindow):
             "font-size: 26px; font-weight: 800; color: #e8a87c;"
         )
         self.optical_power_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        optical_layout.addStretch()
         optical_layout.addWidget(self.optical_power_label)
         optical_layout.addStretch()
         power_col.addWidget(optical_box, 1)
@@ -973,6 +970,7 @@ class ALSControlGUI(QMainWindow):
         else:
             telem_group.layout().addLayout(telem_inner)
         layout.addWidget(telem_group)
+        self.telem_group = telem_group
 
         # ── Activity log: collapsible ────────────────────────────────
         try:
@@ -996,6 +994,7 @@ class ALSControlGUI(QMainWindow):
         else:
             log_box.layout().addWidget(self.log_output)
         layout.addWidget(log_box, 1)
+        self.log_box = log_box
 
         return container
     
@@ -1641,3 +1640,21 @@ class ALSControlGUI(QMainWindow):
         self.sequence_progress_window.close()
         
         event.accept()
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        # Re-anchor the Power-box Edit checkbox to the top-right of the
+        # group box title strip after every resize / show, so removing the
+        # in-box "Edit" header row doesn't lose the control.
+        from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        anchor = getattr(self, "_power_edit_anchor", None)
+        cb = getattr(self, "power_edit_checkbox", None)
+        if anchor is not None and cb is not None and obj is anchor and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Move,
+        ):
+            cb.adjustSize()
+            margin = 12
+            x = anchor.width() - cb.width() - margin
+            y = 0  # sits on the group-box title line
+            cb.move(max(0, x), y)
+            cb.raise_()
+        return super().eventFilter(obj, event)

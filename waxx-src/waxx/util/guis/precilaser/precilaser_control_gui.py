@@ -153,8 +153,12 @@ class PrecilaserControlGUI(QMainWindow):
         self.telemetry_panel = self._create_telemetry_panel()
         # Laser indicators are now always visible (not buried in a dropdown).
         dashboard_layout.addWidget(self.status_panel)
-        # Controls always visible.
-        dashboard_layout.addWidget(self._create_control_panel())
+        # Current (editable) and Controls (buttons) live side-by-side as
+        # always-visible groups — mirrors the ALS panel structure.
+        self.current_panel = self._create_current_panel()
+        dashboard_layout.addWidget(self.current_panel)
+        self.control_panel = self._create_control_panel()
+        dashboard_layout.addWidget(self.control_panel)
         # Telemetry and Logs sit under separate collapsible dropdowns so
         # each can be expanded independently — matches the ALS panel.
         log_box = self._create_log_panel()
@@ -167,6 +171,7 @@ class PrecilaserControlGUI(QMainWindow):
             )
             telem_wrap.addWidget(self.telemetry_panel)
             dashboard_layout.addWidget(telem_wrap)
+            self.telem_wrap = telem_wrap
 
             log_wrap = CollapsibleGroupBox(
                 "Logs",
@@ -176,9 +181,12 @@ class PrecilaserControlGUI(QMainWindow):
             )
             log_wrap.addWidget(log_box)
             dashboard_layout.addWidget(log_wrap, 1)
+            self.log_wrap = log_wrap
         else:
             dashboard_layout.addWidget(self.telemetry_panel)
             dashboard_layout.addWidget(log_box, 1)
+            self.telem_wrap = self.telemetry_panel
+            self.log_wrap = log_box
 
         dashboard_layout.addStretch()
 
@@ -285,31 +293,22 @@ class PrecilaserControlGUI(QMainWindow):
             """
         )
 
-    def _create_control_panel(self) -> QGroupBox:
-        box = QGroupBox("Controls")
+    def _create_current_panel(self) -> QGroupBox:
+        """Editable working-current display.  Edit checkbox sits on the
+        QGroupBox title strip itself — not inside the box — to save
+        vertical space.  Mirrors the ALS "Power" group.
+        """
+        box = QGroupBox("Current")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
 
-        # Laser enable/disable is handled by clicking the Laser Enable
-        # status dot in the status panel (no separate button needed).
-
-        # Working-current block: a tight in-line column (no nested
-        # QGroupBox) so the prominent value isn't pushed down by an extra
-        # margin/padding ring.
-        current_header_row = QHBoxLayout()
-        current_header_row.setContentsMargins(0, 0, 0, 0)
-        current_header_row.setSpacing(6)
-        current_title = QLabel("Working Current")
-        current_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #8a949a;"
-                                     " letter-spacing: 0.08em; text-transform: uppercase;")
-        current_header_row.addWidget(current_title)
-        current_header_row.addStretch()
-        self.current_edit_checkbox = QCheckBox("Edit")
+        self.current_edit_checkbox = QCheckBox("Edit", box)
         self.current_edit_checkbox.setChecked(False)
         self.current_edit_checkbox.stateChanged.connect(self._on_current_edit_toggled)
-        current_header_row.addWidget(self.current_edit_checkbox)
-        layout.addLayout(current_header_row)
+        self.current_edit_checkbox.setStyleSheet("background: transparent;")
+        self._current_edit_anchor = box
+        box.installEventFilter(self)
 
         self.current_display_label = QLabel("-- A")
         self.current_display_label.setStyleSheet(
@@ -318,6 +317,8 @@ class PrecilaserControlGUI(QMainWindow):
         self.current_display_label.setContentsMargins(0, 0, 0, 0)
         self.current_display_label.setMinimumHeight(0)
         self.current_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Keep the big readout vertically centred when the box grows.
+        layout.addStretch()
         layout.addWidget(self.current_display_label)
 
         self.current_input = QLineEdit()
@@ -334,8 +335,19 @@ class PrecilaserControlGUI(QMainWindow):
         self.current_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.current_submit_hint)
+        layout.addStretch()
 
         self._update_current_edit_mode()
+        return box
+
+    def _create_control_panel(self) -> QGroupBox:
+        box = QGroupBox("Controls")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+
+        # Laser enable/disable is handled by clicking the Laser Enable
+        # status dot in the status panel (no separate button needed).
 
         seq_row = QHBoxLayout()
         self.startup_button = QPushButton("Start Turn On")
@@ -352,9 +364,12 @@ class PrecilaserControlGUI(QMainWindow):
         self.interrupt_button.hide()
         layout.addLayout(seq_row)
 
-        self.sequence_state_value = QLabel("Sequence: IDLE")
-        self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
-        layout.addWidget(self.sequence_state_value)
+        # The sequence-state label now lives in the Logs dropdown so the
+        # always-visible Controls box stays compact; create it here only
+        # if the log panel hasn't already been built.
+        if not hasattr(self, "sequence_state_value"):
+            self.sequence_state_value = QLabel("Sequence: IDLE")
+            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
 
         return box
 
@@ -474,6 +489,12 @@ class PrecilaserControlGUI(QMainWindow):
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
+        # Sequence-state line lives here so it sits with the logs rather
+        # than pushing down the always-visible Controls box.
+        if not hasattr(self, "sequence_state_value"):
+            self.sequence_state_value = QLabel("Sequence: IDLE")
+            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
+        layout.addWidget(self.sequence_state_value)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
@@ -752,6 +773,23 @@ class PrecilaserControlGUI(QMainWindow):
     def closeEvent(self, event):
         self.status_timer.stop()
         return super().closeEvent(event)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        # Re-anchor the Current-box Edit checkbox to the top-right of the
+        # group box title strip after every resize / show.
+        from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        anchor = getattr(self, "_current_edit_anchor", None)
+        cb = getattr(self, "current_edit_checkbox", None)
+        if anchor is not None and cb is not None and obj is anchor and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Move,
+        ):
+            cb.adjustSize()
+            margin = 12
+            x = anchor.width() - cb.width() - margin
+            y = 0
+            cb.move(max(0, x), y)
+            cb.raise_()
+        return super().eventFilter(obj, event)
 
 
 

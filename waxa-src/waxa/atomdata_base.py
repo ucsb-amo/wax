@@ -505,31 +505,181 @@ class atomdata_base():
     def save_roi_h5(self,printouts=False):
         self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
 
-    def create_lite_copy(self, roi_id=None, use_saved_roi=True):
+    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
         """Creates a lite (ROI-cropped) copy of this run's data file.
 
-        By default uses the ROI already loaded in this atomdata instance. The
-        current ROI is saved to the h5 file first so that create_lite_copy
-        can read it back automatically.
+        Fast path: builds the lite HDF5 file directly from the arrays already
+        loaded in this atomdata instance (``self.images``,
+        ``self.image_timestamps``, ``self.data.*``, ``self.params``, etc.),
+        avoiding a second read of the original file. Only the heavy passthrough
+        sections that atomdata doesn't keep in a re-writable form (the
+        ``scope_data`` subgroup and source-text attrs like ``expt_file`` /
+        ``params_file`` / ``base_class_*``) are copied verbatim from the source
+        file with cheap, targeted ``h5py`` copies.
 
         Parameters
         ----------
         roi_id : None, int, or str
-            Override the ROI source. If None (default), uses the ROI currently
-            stored in this atomdata instance. If an int, interpreted as a run
-            ID whose saved ROI will be used. If a str, looks up the key in
-            roi.xlsx.
+            If None (default), uses the ROI currently loaded in this atomdata
+            instance. If an int/str, a temporary ROI is loaded for cropping
+            (``self.roi`` is not mutated) and used for the fast in-memory path.
         use_saved_roi : bool
-            Passed through to server_talk.create_lite_copy. Has no effect when
-            roi_id is None, since the current ROI is written to the file first.
+            Passed through to ROI lookup when ``roi_id`` is given, and to the
+            legacy disk-based fallback when ``force_reread=True``.
+        force_reread : bool
+            When True, skip the in-memory fast path and always rebuild the
+            lite file by re-reading the source HDF5 (legacy behaviour via
+            ``server_talk.create_lite_copy``).
         """
+        # Legacy disk-based path — only used when explicitly requested.
+        if force_reread:
+            if roi_id is None:
+                self.roi.save_roi_h5(lite=self._lite, printouts=False)
+                use_saved_roi = True
+            self.server_talk.create_lite_copy(
+                self.run_info.run_id,
+                roi_id=roi_id,
+                use_saved_roi=use_saved_roi,
+            )
+            return
+
+        # ---- guards: in-memory arrays must still match on-disk layout ----
+        if self._lite:
+            raise RuntimeError(
+                "save_lite_copy: this atomdata was loaded from a lite file "
+                "(already cropped); nothing to do."
+            )
+        tags = self._analysis_tags
+        if getattr(tags, 'averaged', False) \
+                or getattr(tags, 'transposed', False) \
+                or getattr(tags, 'repeats_reassigned', False):
+            raise RuntimeError(
+                "save_lite_copy: cannot save while the in-memory data has been "
+                "transformed (averaged / transposed / repeats reassigned). "
+                "Reload the run fresh or pass force_reread=True."
+            )
+        if not getattr(self, '_has_images', True):
+            raise RuntimeError(
+                "save_lite_copy: run has no images; lite copy is not meaningful."
+            )
+
+        import os as _os
+
+        # ---- compute destination path ----
+        lite_path, lite_folder = self._ds._data_path(self.run_info, lite=True)
+        _os.makedirs(lite_folder, exist_ok=True)
+
+        # ---- produce unshuffled local copies without mutating self.* ----
+        # If the in-memory arrays are currently shuffled, run the dealer
+        # unshuffle helpers on local copies. The dealer's unscramble_images()
+        # and _unscramble_timestamps() reassign the dealer's own attributes,
+        # so we save/restore them around the call.
+        if tags.xvars_shuffled:
+            _saved_imgs = self._dealer.images
+            _saved_ts = self._dealer.image_timestamps
+            try:
+                self._dealer.images = self.images
+                self._dealer.image_timestamps = self.image_timestamps
+                images_ush = self._dealer.unscramble_images(reshuffle=False)
+                ts_ush = self._dealer._unscramble_timestamps(reshuffle=False)
+            finally:
+                self._dealer.images = _saved_imgs
+                self._dealer.image_timestamps = _saved_ts
+        else:
+            images_ush = self.images
+            ts_ush = self.image_timestamps
+
+        # Crop images to ROI. ROI.crop operates on the last two axes, so it
+        # vectorises naturally over any leading shape. When roi_id is given,
+        # construct a temporary ROI so self.roi is not mutated.
         if roi_id is None:
-            self.roi.save_roi_h5(lite=self._lite, printouts=False)
-            use_saved_roi = True
-        self.server_talk.create_lite_copy(
-            self.run_info.run_id,
+            crop_roi = self.roi
+        else:
+            crop_roi = ROI(
+                run_id=self.run_info.run_id,
+                roi_id=roi_id,
+                use_saved_roi=use_saved_roi,
+                lite=False,
+                printouts=False,
+                server_talk=self.server_talk,
+                current_file_path=self._data_file_path,
+                current_saved_roi=self._saved_roi_from_file,
+                images=self.images,
+                imaging_type=self.run_info.imaging_type,
+            )
+        cropped_images = crop_roi.crop(images_ush)
+        px = int(np.diff(crop_roi.roix)[0])
+        py = int(np.diff(crop_roi.roiy)[0])
+
+        # ---- write the lite HDF5 file ----
+        with h5py.File(self._data_file_path, 'r') as f_src, \
+                h5py.File(lite_path, 'w') as f_lite:
+
+            # data group
+            data_grp = f_lite.create_group('data')
+            data_grp.create_dataset('images', data=cropped_images)
+            data_grp.create_dataset('image_timestamps', data=ts_ush)
+
+            # DataVault keys — already in memory, unshuffle on the fly.
+            n_xvars = len(self.xvarnames)
+            for key in self.data.keys:
+                val = vars(self.data)[key]
+                if not isinstance(val, np.ndarray):
+                    val = np.asarray(val)
+                if tags.xvars_shuffled:
+                    ndims_per_shot = max(0, val.ndim - n_xvars)
+                    val = self._dealer._unshuffle_ndarray(
+                        val, exclude_dims=ndims_per_shot, reshuffle=False,
+                    )
+                data_grp.create_dataset(key, data=val)
+
+            # sort metadata (kept in shuffled-order form in the file)
+            if isinstance(self.sort_idx, np.ndarray) and self.sort_idx.size > 0:
+                data_grp.create_dataset('sort_idx', data=self.sort_idx)
+                data_grp.create_dataset('sort_N', data=self.sort_N)
+
+            # per-shot end timestamps if present
+            ts_end = getattr(self, 'timestamp_shot_end', None)
+            if isinstance(ts_end, np.ndarray) and ts_end.size > 0:
+                data_grp.create_dataset('timestamp_shot_end', data=ts_end)
+
+            # scope_data subgroup — copy verbatim from the source file.
+            if 'data' in f_src and 'scope_data' in f_src['data']:
+                f_src.copy(f_src['data']['scope_data'], data_grp, 'scope_data')
+
+            # params / camera_params / run_info groups — rebuild from in-memory
+            # objects via the existing DataSaver helper.
+            self._ds._class_attr_to_dataset(
+                f_lite.create_group('params'), self.params,
+            )
+            self._ds._class_attr_to_dataset(
+                f_lite.create_group('camera_params'), self.camera_params,
+            )
+            self._ds._class_attr_to_dataset(
+                f_lite.create_group('run_info'), self.run_info,
+            )
+
+            # File-level attrs: copy everything from source, then override
+            # ROI / has_images / run_complete to reflect the lite layout.
+            for k in f_src.attrs.keys():
+                try:
+                    f_lite.attrs[k] = f_src.attrs[k]
+                except Exception:
+                    pass
+            f_lite.attrs['roix'] = [0, px]
+            f_lite.attrs['roiy'] = [0, py]
+            f_lite.attrs['has_images'] = True
+            f_lite.attrs['run_complete'] = True
+
+        print(f'Lite version of run {self.run_info.run_id} saved at {lite_path}.')
+
+    # Alias: create_lite_copy and save_lite_copy do the same thing.
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+        """Alias for :meth:`save_lite_copy`."""
+        return self.save_lite_copy(
             roi_id=roi_id,
             use_saved_roi=use_saved_roi,
+            force_reread=force_reread,
         )
 
     ### Analysis
