@@ -894,7 +894,23 @@ class ALSControlGUI(QMainWindow):
         self.power_edit_checkbox = QCheckBox("Edit", power_box)
         self.power_edit_checkbox.setChecked(False)
         self.power_edit_checkbox.stateChanged.connect(self._on_power_edit_toggled)
-        self.power_edit_checkbox.setStyleSheet("background: transparent;")
+        # Style as a pill-shaped toggle button so it reads as clickable
+        # rather than a passive form control.
+        self.power_edit_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_edit_checkbox.setStyleSheet(
+            "QCheckBox {"
+            " background: #3d6b78; color: #f1f3f4;"
+            " border: 1px solid #4f8896; border-radius: 9px;"
+            " padding: 2px 10px; font-weight: 700; font-size: 11px;"
+            " letter-spacing: 0.04em;"
+            "}"
+            "QCheckBox:hover { background: #4d8294; border-color: #6aa3b3; }"
+            "QCheckBox:checked {"
+            " background: #c87a3d; border-color: #e8a87c; color: #fff;"
+            "}"
+            "QCheckBox:checked:hover { background: #d68a4d; }"
+            "QCheckBox::indicator { width: 0px; height: 0px; margin: 0; }"
+        )
         self._power_edit_anchor = power_box
         # Position is updated on first show + resize via an event filter.
         power_box.installEventFilter(self)

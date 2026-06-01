@@ -1933,11 +1933,29 @@ class atomdata_base():
                 timing['fallback_full_load_s'] = time.perf_counter() - t_stage
 
                 t_stage = time.perf_counter()
-                self.server_talk.create_lite_copy(
-                    self.run_info.run_id,
-                    roi_id=roi_id,
-                    use_saved_roi=(roi_id is None),
-                )
+                # Build the minimal helper state save_lite_copy() needs.
+                # __init__ will re-create these after _load_data returns;
+                # that's fine — they're cheap.
+                self._ds = DataSaver()
+                self._dealer = self._init_dealer()
+                self._analysis_tags = analysis_tags(roi_id, self.run_info.imaging_type)
+                if getattr(self, '_has_images', True):
+                    self.roi = ROI(
+                        run_id=self.run_info.run_id,
+                        roi_id=roi_id,
+                        use_saved_roi=True,
+                        lite=False,
+                        printouts=False,
+                        server_talk=self.server_talk,
+                        current_file_path=self._data_file_path,
+                        current_saved_roi=self._saved_roi_from_file,
+                        images=self.images,
+                        imaging_type=self.run_info.imaging_type,
+                    )
+                # Fast in-memory lite-copy build using whatever roi_id the
+                # user passed to atomdata(). When roi_id is None this uses
+                # the saved/selected ROI loaded into self.roi above.
+                self.save_lite_copy()
                 timing['fallback_create_lite_copy_s'] = time.perf_counter() - t_stage
 
                 t_stage = time.perf_counter()
