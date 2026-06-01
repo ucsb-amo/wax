@@ -1,6 +1,7 @@
 import numpy as np
 import datetime
 import h5py
+import os
 import time
 
 from waxa.image_processing.compute_ODs import compute_OD
@@ -414,7 +415,7 @@ class atomdata_base():
 
         ### Helper objects
         t_stage = time.perf_counter()
-        self._ds = DataSaver()
+        self._ds = DataSaver(data_dir=self._regular_data_dir(), server_talk=self.server_talk)
         self._dealer = self._init_dealer()
         self._analysis_tags = analysis_tags(roi_id,self.run_info.imaging_type)
         if self._has_images:
@@ -1891,6 +1892,19 @@ class atomdata_base():
 
     ### Setup
 
+    def _regular_data_dir(self):
+        """Return the non-lite data directory from server_talk.
+
+        ``server_talk.data_dir`` toggles between the regular and ``_lite``
+        directory as a side effect of file lookups, so derive the regular
+        path explicitly rather than reading whatever state happens to be
+        current.
+        """
+        st_dir = self.server_talk.data_dir
+        if getattr(self.server_talk, '_lite', False):
+            st_dir = os.path.dirname(st_dir)
+        return st_dir
+
     def _init_dealer(self) -> Dealer:
         dealer = Dealer()
         dealer.params = self.params
@@ -1936,7 +1950,7 @@ class atomdata_base():
                 # Build the minimal helper state save_lite_copy() needs.
                 # __init__ will re-create these after _load_data returns;
                 # that's fine — they're cheap.
-                self._ds = DataSaver()
+                self._ds = DataSaver(data_dir=self._regular_data_dir(), server_talk=self.server_talk)
                 self._dealer = self._init_dealer()
                 self._analysis_tags = analysis_tags(roi_id, self.run_info.imaging_type)
                 if getattr(self, '_has_images', True):
