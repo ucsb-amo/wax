@@ -282,7 +282,20 @@ class BaslerCameraClient:
 # Discovery helper
 # ---------------------------------------------------------------------------
 
-def discover_all_basler_cameras(collect_for: float = 3.0) -> list[BaslerCameraClient]:
+# Module-level cache used to deduplicate routine discovery log lines.
+# ``_LAST_DISCOVERY_FINGERPRINT`` records the sorted server-id list from the
+# previous call so we only emit an INFO line when the topology actually
+# changes; periodic re-scans every 15 s would otherwise flood the dashboard
+# log with identical "Discovered N camera(s)" lines.
+_LAST_DISCOVERY_FINGERPRINT: tuple[tuple[str, ...], int] | None = None
+_LAST_NO_SERVERS_WARNED: bool = False
+_LAST_CONTACT_FAILURES: set[str] = set()
+
+
+def discover_all_basler_cameras(
+    collect_for: float = 3.0,
+    quiet: bool = False,
+) -> list[BaslerCameraClient]:
     """Find all running ``basler_server:*`` instances and list their cameras.
 
     Waits ``collect_for`` seconds for UDP beacons to arrive, then contacts
@@ -290,18 +303,38 @@ def discover_all_basler_cameras(collect_for: float = 3.0) -> list[BaslerCameraCl
     ``BaslerCameraClient`` per (server, camera) pair, in server-discovery order.
 
     Servers that cannot be reached within the ZMQ timeout are silently skipped
-    (a warning is logged).
+    (a warning is logged the first time a given server fails).
+
+    Set ``quiet=True`` for routine periodic polls — status-quo results then
+    log at DEBUG instead of INFO/WARNING.  Genuine changes (new server, lost
+    server, new failure) are always surfaced at the higher level.
     """
+    global _LAST_DISCOVERY_FINGERPRINT, _LAST_NO_SERVERS_WARNED, _LAST_CONTACT_FAILURES
+
     servers = discover_prefix(BASLER_SERVER_PREFIX, collect_for=collect_for)
     if not servers:
-        logger.warning(
-            "[BaslerClient] No '%s*' servers found after %.1f s scan.",
-            BASLER_SERVER_PREFIX,
-            collect_for,
-        )
+        # Only WARN the first time we transition into "no servers"; while
+        # the condition persists, drop to DEBUG so periodic rescans don't
+        # flood the log.
+        if not _LAST_NO_SERVERS_WARNED:
+            logger.warning(
+                "[BaslerClient] No '%s*' servers found after %.1f s scan.",
+                BASLER_SERVER_PREFIX,
+                collect_for,
+            )
+            _LAST_NO_SERVERS_WARNED = True
+        else:
+            logger.debug(
+                "[BaslerClient] Still no '%s*' servers found after %.1f s scan.",
+                BASLER_SERVER_PREFIX,
+                collect_for,
+            )
+        _LAST_DISCOVERY_FINGERPRINT = ((), 0)
         return []
+    _LAST_NO_SERVERS_WARNED = False
 
     clients: list[BaslerCameraClient] = []
+    current_failures: set[str] = set()
     for sid in sorted(servers):
         try:
             conn = BaslerServerConnection(sid, discovery_timeout=1.0)
@@ -315,9 +348,21 @@ def discover_all_basler_cameras(collect_for: float = 3.0) -> list[BaslerCameraCl
                     )
                 )
         except Exception as exc:
-            logger.warning("[BaslerClient] Could not contact server %s: %s", sid, exc)
+            current_failures.add(sid)
+            # Only WARN on a server we haven't already complained about;
+            # repeated failures from the same server drop to DEBUG.
+            if sid not in _LAST_CONTACT_FAILURES:
+                logger.warning("[BaslerClient] Could not contact server %s: %s", sid, exc)
+            else:
+                logger.debug("[BaslerClient] Could not contact server %s: %s", sid, exc)
+    _LAST_CONTACT_FAILURES = current_failures
 
-    logger.info(
+    fingerprint = (tuple(sorted(servers)), len(clients))
+    changed = fingerprint != _LAST_DISCOVERY_FINGERPRINT
+    _LAST_DISCOVERY_FINGERPRINT = fingerprint
+    level = logging.INFO if (changed and not quiet) else logging.DEBUG
+    logger.log(
+        level,
         "[BaslerClient] Discovered %d camera(s) across %d server(s).",
         len(clients),
         len(servers),

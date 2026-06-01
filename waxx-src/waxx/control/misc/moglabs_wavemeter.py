@@ -200,5 +200,5 @@ class DummyWavemeterClient():
     def get_frequency(self) -> float:
         return 0.
     
-    def lock_status(self) -> bool:
-        return False
+    def lock_status(self) -> float:
+        return 0.

@@ -213,14 +213,14 @@ def _apply_dark_theme(app: QApplication) -> None:
     app.setPalette(palette)
     app.setStyleSheet(
         "QToolTip { color: #ddd; background-color: #2b2b2b; border: 1px solid #555; }"
-        " QDockWidget { border: 1px solid #5a5a5a; }"
+        " QDockWidget { border: 2px solid #7a7a7a; }"
         " QDockWidget::title { background: #2b2b2b; color: #ddd; padding: 2px;"
         " border-bottom: 1px solid #5a5a5a; }"
         # Persistent body border on every panel: targeted by object name so
         # the QSS specificity stays high enough that re-layouts don't drop it.
-        " QFrame#PanelBodyFrame { border: 1px solid #5a5a5a; border-radius: 3px;"
+        " QFrame#PanelBodyFrame { border: 2px solid #7a7a7a; border-radius: 4px;"
         " background: transparent; }"
-        " QMainWindow::separator { background: #555; width: 2px; height: 2px; }"
+        " QMainWindow::separator { background: #555; width: 3px; height: 3px; }"
         " QMainWindow::separator:hover { background: #888; }"
         " QTabBar::tab { background: #3a3a3a; color: #ddd; padding: 4px 10px;"
         " border: 1px solid #2a2a2a; }"
@@ -734,16 +734,64 @@ class DashboardMainWindow(QMainWindow):
 
     def closeEvent(self, ev):  # noqa: N802 - Qt-style
         self._save_layout()
-        # Stop any registered server subprocesses first so they get a
-        # chance to release COM ports, network sockets, etc. cleanly.
-        for sid, sup in list(self._supervisors.items()):
-            stop = getattr(sup, "stop", None)
-            if not callable(stop):
+        # Stop registered server subprocesses in parallel so the GUI
+        # thread doesn't block for ``N * graceful_stop_timeout`` seconds
+        # while each headless server times out one-by-one.
+        #
+        # Strategy:
+        #   1. Issue ``terminate()`` to *every* supervisor up front.
+        #   2. Wait up to ~500 ms total for any cooperative exits.
+        #   3. Hard-kill anything still alive (fast).
+        #
+        # ``QProcess.terminate()`` on Windows is a no-op for headless
+        # Python console apps (no top-level windows to receive
+        # ``WM_CLOSE``), so step 1 effectively buys ~0 cooperative exits
+        # today.  We still do it in case a future server installs a real
+        # SIGTERM handler.
+        sups = list(self._supervisors.items())
+
+        # Step 1: fan out terminate() requests.
+        for sid, sup in sups:
+            req = getattr(sup, "request_terminate", None)
+            if callable(req):
+                try:
+                    req()
+                except Exception:
+                    _LOG.exception("request_terminate() failed for id=%s", sid)
                 continue
+            # Fallback for older supervisors without the fast path.
+            stop = getattr(sup, "stop", None)
+            if callable(stop):
+                try:
+                    stop()  # non-blocking
+                except Exception:
+                    _LOG.exception("supervisor stop() failed for id=%s", sid)
+
+        # Step 2: short collective grace window.
+        from PyQt6.QtCore import QDeadlineTimer  # noqa: PLC0415
+
+        deadline = QDeadlineTimer(500)  # ms total across all supervisors
+        for sid, sup in sups:
+            wait = getattr(sup, "wait_for_finished", None)
+            if not callable(wait):
+                continue
+            remaining = deadline.remainingTime()
+            if remaining <= 0:
+                break
             try:
-                stop()
+                wait(remaining)
             except Exception:
-                _LOG.exception("supervisor stop() failed for id=%s", sid)
+                _LOG.exception("wait_for_finished() failed for id=%s", sid)
+
+        # Step 3: hard-kill survivors in parallel.
+        for sid, sup in sups:
+            killer = getattr(sup, "force_kill", None)
+            if callable(killer):
+                try:
+                    killer(wait_ms=200)
+                except Exception:
+                    _LOG.exception("force_kill() failed for id=%s", sid)
+
         # Give panels a chance to clean up.
         for panel in self._panels:
             body = panel.body_widget()

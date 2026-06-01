@@ -155,18 +155,27 @@ class PrecilaserControlGUI(QMainWindow):
         dashboard_layout.addWidget(self.status_panel)
         # Controls always visible.
         dashboard_layout.addWidget(self._create_control_panel())
-        # Telemetry + Logs sit together under one dropdown for compactness.
+        # Telemetry and Logs sit under separate collapsible dropdowns so
+        # each can be expanded independently — matches the ALS panel.
         log_box = self._create_log_panel()
         if CollapsibleGroupBox is not None:
-            tl_wrap = CollapsibleGroupBox(
-                "Telemetry & Logs",
+            telem_wrap = CollapsibleGroupBox(
+                "Telemetry",
                 expanded=False,
                 scrollable=True,
-                max_expanded_height=260,
+                max_expanded_height=240,
             )
-            tl_wrap.addWidget(self.telemetry_panel)
-            tl_wrap.addWidget(log_box)
-            dashboard_layout.addWidget(tl_wrap, 1)
+            telem_wrap.addWidget(self.telemetry_panel)
+            dashboard_layout.addWidget(telem_wrap)
+
+            log_wrap = CollapsibleGroupBox(
+                "Logs",
+                expanded=False,
+                scrollable=True,
+                max_expanded_height=220,
+            )
+            log_wrap.addWidget(log_box)
+            dashboard_layout.addWidget(log_wrap, 1)
         else:
             dashboard_layout.addWidget(self.telemetry_panel)
             dashboard_layout.addWidget(log_box, 1)
@@ -186,58 +195,92 @@ class PrecilaserControlGUI(QMainWindow):
         self.status_timer.start(500)
 
     def _apply_theme(self):
+        # Dark theme matched to the kexp dashboard chrome (#2b2b2b).
+        # See als_control_gui._apply_theme for the matching palette.
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #f7f3ed;
-                color: #1f2a30;
-                font-family: Segoe UI;
+                background: transparent;
+                color: #d8d8d8;
+                font-family: 'Segoe UI';
             }
             QGroupBox {
-                border: 1px solid #d8cfc0;
-                border-radius: 12px;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
                 margin-top: 12px;
-                padding-top: 12px;
-                background: #fffaf2;
-                font-size: 13px;
+                padding: 10px 8px 8px 8px;
+                background: #323232;
+                font-size: 12px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 14px;
+                subcontrol-position: top left;
+                left: 12px;
                 padding: 0 6px;
-                color: #5b6670;
+                color: #9aa3a8;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.04em;
             }
             QPushButton {
-                background: #295c67;
-                color: #ffffff;
-                border: none;
+                background: #3d6b78;
+                color: #f1f3f4;
+                border: 1px solid #4f8896;
                 border-radius: 6px;
-                padding: 3px 10px;
+                padding: 4px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #347381;
+                background: #4d8294;
+                border-color: #6aa3b3;
+            }
+            QPushButton:pressed {
+                background: #355b66;
             }
             QPushButton:disabled {
-                background: #b7c1c4;
-                color: #edf1f2;
+                background: #2f3a3d;
+                color: #6a7479;
+                border-color: #3a4347;
             }
             QLineEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 8px;
-                padding: 7px;
-                font-size: 14px;
+                background: #2a2a2a;
+                color: #e0e0e0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-size: 13px;
+                selection-background-color: #4d8294;
+            }
+            QLineEdit:focus { border: 1px solid #6aa3b3; }
+            QCheckBox {
+                spacing: 6px;
+                color: #aab1b5;
+                font-weight: 500;
+            }
+            QCheckBox::indicator {
+                width: 13px; height: 13px;
+                border: 1px solid #6a6a6a;
+                border-radius: 3px;
+                background: #2a2a2a;
+            }
+            QCheckBox::indicator:checked {
+                background: #4d8294;
+                border-color: #6aa3b3;
             }
             QPlainTextEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 10px;
-                padding: 8px;
-                color: #2b3136;
+                background: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                padding: 6px;
+                color: #c8c8c8;
                 font-family: Consolas;
-                font-size: 12px;
+                font-size: 11px;
+                selection-background-color: #4d8294;
+            }
+            QStatusBar {
+                background: transparent;
+                color: #8a949a;
             }
             """
         )
@@ -258,7 +301,8 @@ class PrecilaserControlGUI(QMainWindow):
         current_header_row.setContentsMargins(0, 0, 0, 0)
         current_header_row.setSpacing(6)
         current_title = QLabel("Working Current")
-        current_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #5b6670;")
+        current_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #8a949a;"
+                                     " letter-spacing: 0.08em; text-transform: uppercase;")
         current_header_row.addWidget(current_title)
         current_header_row.addStretch()
         self.current_edit_checkbox = QCheckBox("Edit")
@@ -269,7 +313,7 @@ class PrecilaserControlGUI(QMainWindow):
 
         self.current_display_label = QLabel("-- A")
         self.current_display_label.setStyleSheet(
-            "font-size: 36px; font-weight: 800; color: #295c67; padding: 0px; margin: 0px;"
+            "font-size: 36px; font-weight: 800; color: #5fb6c8; padding: 0px; margin: 0px;"
         )
         self.current_display_label.setContentsMargins(0, 0, 0, 0)
         self.current_display_label.setMinimumHeight(0)
@@ -278,7 +322,7 @@ class PrecilaserControlGUI(QMainWindow):
 
         self.current_input = QLineEdit()
         self.current_input.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #295c67; padding: 2px;"
+            "font-size: 26px; font-weight: 700; color: #5fb6c8; padding: 2px;"
         )
         self.current_input.setMinimumHeight(0)
         self.current_input.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -287,7 +331,7 @@ class PrecilaserControlGUI(QMainWindow):
         layout.addWidget(self.current_input)
 
         self.current_submit_hint = QLabel("ENTER to submit")
-        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c;")
+        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.current_submit_hint)
 
@@ -362,9 +406,12 @@ class PrecilaserControlGUI(QMainWindow):
 
         return box
 
-    def _create_telemetry_panel(self) -> QGroupBox:
-        box = QGroupBox("Telemetry")
+    def _create_telemetry_panel(self) -> QWidget:
+        # No outer QGroupBox title — the CollapsibleGroupBox wrapper
+        # already provides the "Telemetry" label.
+        box = QWidget()
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
         top_row = QHBoxLayout()
@@ -421,9 +468,12 @@ class PrecilaserControlGUI(QMainWindow):
 
         return box
 
-    def _create_log_panel(self) -> QGroupBox:
-        box = QGroupBox("Logs")
+    def _create_log_panel(self) -> QWidget:
+        # No outer QGroupBox title — the CollapsibleGroupBox wrapper
+        # provides the "Logs" label.
+        box = QWidget()
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)

@@ -148,7 +148,7 @@ class StepIndicator(QWidget):
 
         # Secondary status line (completed/already done timestamps)
         self.note_label = QLabel("")
-        self.note_label.setStyleSheet("color: #5b6670; font-size: 11px;")
+        self.note_label.setStyleSheet("color: #8a949a; font-size: 11px;")
         self.note_label.setVisible(False)
         text_layout.addWidget(self.note_label)
 
@@ -673,91 +673,127 @@ class ALSControlGUI(QMainWindow):
         self.auto_scroll_timer.timeout.connect(self._auto_scroll_log)
 
     def _apply_theme(self):
-        """Apply a warm instrument-panel theme."""
+        """Dark, dashboard-native theme.
+
+        The panel is meant to live inside the kexp dashboard (dark
+        ``#2b2b2b`` chrome).  Keep the window background transparent so
+        the dock body shows through, then layer slightly-lighter cards
+        and group boxes on top for depth.  Accents (teal for setpoints,
+        amber for measured output) carry over from the original warm
+        theme so the visual language stays consistent.
+        """
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #f6f1e8;
-                color: #1f2a30;
-                font-family: Segoe UI;
+                background: transparent;
+                color: #d8d8d8;
+                font-family: 'Segoe UI';
             }
             QGroupBox {
-                border: 1px solid #d8cfc0;
-                border-radius: 16px;
-                margin-top: 14px;
-                padding-top: 14px;
-                background: #fffaf2;
-                font-size: 13px;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 10px 8px 8px 8px;
+                background: #323232;
+                font-size: 12px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 14px;
+                subcontrol-position: top left;
+                left: 12px;
                 padding: 0 6px;
-                color: #5b6670;
+                color: #9aa3a8;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.04em;
             }
             QFrame#ConnectionCard, QFrame#PowerCard, QFrame#MetricCard, QFrame#IndicatorPanel {
-                background: #fbf7f0;
-                border: 1px solid #ddd3c3;
-                border-radius: 14px;
+                background: #3a3a3a;
+                border: 1px solid #4f4f4f;
+                border-radius: 8px;
             }
             QPushButton {
-                background: #295c67;
-                color: #ffffff;
-                border: none;
-                border-radius: 8px;
-                padding: 4px 10px;
+                background: #3d6b78;
+                color: #f1f3f4;
+                border: 1px solid #4f8896;
+                border-radius: 6px;
+                padding: 5px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #347381;
+                background: #4d8294;
+                border-color: #6aa3b3;
+            }
+            QPushButton:pressed {
+                background: #355b66;
             }
             QPushButton:disabled {
-                background: #b7c1c4;
-                color: #edf1f2;
+                background: #2f3a3d;
+                color: #6a7479;
+                border-color: #3a4347;
             }
             QLineEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 10px;
-                padding: 8px;
+                background: #2a2a2a;
+                color: #e0e0e0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 5px 8px;
+                selection-background-color: #4d8294;
             }
+            QLineEdit:focus { border: 1px solid #6aa3b3; }
             QCheckBox {
                 spacing: 6px;
-                color: #5b6670;
+                color: #aab1b5;
+                font-weight: 500;
+            }
+            QCheckBox::indicator {
+                width: 13px; height: 13px;
+                border: 1px solid #6a6a6a;
+                border-radius: 3px;
+                background: #2a2a2a;
+            }
+            QCheckBox::indicator:checked {
+                background: #4d8294;
+                border-color: #6aa3b3;
             }
             QLabel#CardEyebrow {
-                color: #7c847c;
-                font-size: 11px;
+                color: #8a949a;
+                font-size: 10px;
                 font-weight: 600;
-                letter-spacing: 0.08em;
+                letter-spacing: 0.10em;
                 text-transform: uppercase;
             }
             QLabel#PowerOutputLabel {
-                color: #c26b2d;
+                color: #e8a87c;
                 font-size: 24px;
                 font-weight: 700;
             }
             QLabel#MetricIcon {
-                font-size: 20px;
+                font-size: 18px;
             }
             QLabel#MetricValue {
-                font-size: 22px;
+                font-size: 20px;
                 font-weight: 700;
-                color: #1f2a30;
+                color: #e6e6e6;
             }
             QLabel#MetricLabel {
-                color: #6f777e;
-                font-size: 11px;
+                color: #8a949a;
+                font-size: 10px;
             }
             QPlainTextEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 12px;
-                padding: 8px;
-                color: #2b3136;
+                background: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                padding: 6px;
+                color: #c8c8c8;
                 font-family: Consolas;
-                font-size: 12px;
+                font-size: 11px;
+                selection-background-color: #4d8294;
+            }
+            QStatusBar {
+                background: transparent;
+                color: #8a949a;
             }
             """
         )
@@ -842,82 +878,73 @@ class ALSControlGUI(QMainWindow):
 
         return group
 
-    def _create_measurements_panel(self) -> QGroupBox:
-        """Create the right-side power and telemetry panel.
+    def _create_measurements_panel(self) -> QWidget:
+        """Create the right-side power and telemetry block.
 
-        Power setpoint and optical-output cards are stacked vertically so
-        the panel survives horizontal compression.  Telemetry lives in its
-        own QGroupBox; activity log is the only collapsible piece.
+        No outer "Readout" wrapper — each piece (Power Setpoint, Optical
+        Output, Telemetry, Activity Log) is its own ``QGroupBox`` so the
+        visual treatment matches the Precilaser panel.
         """
-        group = QGroupBox("Readout")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
-        # ── Power readouts side-by-side (compact) ────────────────────
+        # ── Power readouts side-by-side, each in its own group box ───
         power_col = QHBoxLayout()
         power_col.setSpacing(8)
 
-        power_box = QFrame()
-        power_box.setObjectName("PowerCard")
+        power_box = QGroupBox("Power Setpoint")
         power_layout = QVBoxLayout(power_box)
-        power_layout.setContentsMargins(14, 10, 14, 10)
-        power_layout.setSpacing(8)
+        power_layout.setContentsMargins(10, 8, 10, 8)
+        power_layout.setSpacing(6)
 
-        header_layout = QHBoxLayout()
-        power_label = QLabel("Power Setpoint")
-        power_label.setObjectName("CardEyebrow")
-        header_layout.addWidget(power_label)
+        edit_row = QHBoxLayout()
+        edit_row.setContentsMargins(0, 0, 0, 0)
+        edit_row.addStretch()
         self.power_edit_checkbox = QCheckBox("Edit")
         self.power_edit_checkbox.setChecked(False)
         self.power_edit_checkbox.stateChanged.connect(self._on_power_edit_toggled)
-        header_layout.addWidget(self.power_edit_checkbox)
-        header_layout.addStretch()
-        power_layout.addLayout(header_layout)
+        edit_row.addWidget(self.power_edit_checkbox)
+        power_layout.addLayout(edit_row)
 
         self.power_setpoint_label = QLabel("0%")
         self.power_setpoint_label.setStyleSheet(
-            "font-size: 22px; font-weight: 800; color: #295c67; text-align: center;"
+            "font-size: 26px; font-weight: 800; color: #5fb6c8;"
         )
-        self.power_setpoint_label.setMinimumHeight(0)
         self.power_setpoint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_setpoint_label)
 
         self.power_input_field = PowerInputField(on_focus_out=self._on_power_input_focus_out)
         self.power_input_field.setStyleSheet(
-            "font-size: 16px; font-weight: 700; color: #295c67; text-align: center;"
+            "font-size: 18px; font-weight: 700; color: #5fb6c8; background: #2a2a2a;"
+            " border: 1px solid #555; border-radius: 6px; padding: 4px;"
         )
-        self.power_input_field.setMinimumHeight(0)
         self.power_input_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_input_field.returnPressed.connect(self._on_power_input_submit)
         power_layout.addWidget(self.power_input_field)
 
         self.power_submit_hint = QLabel("ENTER to submit")
-        self.power_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c; text-align: center;")
+        self.power_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.power_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_submit_hint)
 
         self._update_power_edit_mode()
-        power_col.addWidget(power_box)
+        power_col.addWidget(power_box, 1)
 
-        optical_box = QFrame()
-        optical_box.setObjectName("PowerCard")
+        optical_box = QGroupBox("Optical Output")
         optical_layout = QVBoxLayout(optical_box)
-        optical_layout.setContentsMargins(14, 10, 14, 10)
-        optical_layout.setSpacing(8)
-
-        optical_eyebrow = QLabel("Optical Output")
-        optical_eyebrow.setObjectName("CardEyebrow")
-        optical_layout.addWidget(optical_eyebrow)
+        optical_layout.setContentsMargins(10, 8, 10, 8)
+        optical_layout.setSpacing(6)
 
         self.optical_power_label = QLabel("0 W")
         self.optical_power_label.setStyleSheet(
-            "font-size: 22px; font-weight: 800; color: #c26b2d; text-align: center;"
+            "font-size: 26px; font-weight: 800; color: #e8a87c;"
         )
-        self.optical_power_label.setMinimumHeight(0)
         self.optical_power_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         optical_layout.addWidget(self.optical_power_label)
-        power_col.addWidget(optical_box)
+        optical_layout.addStretch()
+        power_col.addWidget(optical_box, 1)
 
         layout.addLayout(power_col)
 
@@ -947,7 +974,7 @@ class ALSControlGUI(QMainWindow):
             telem_group.layout().addLayout(telem_inner)
         layout.addWidget(telem_group)
 
-        # ── Activity log: collapsible-only piece ─────────────────────
+        # ── Activity log: collapsible ────────────────────────────────
         try:
             from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
             log_box = CollapsibleGroupBox(
@@ -970,7 +997,7 @@ class ALSControlGUI(QMainWindow):
             log_box.layout().addWidget(self.log_output)
         layout.addWidget(log_box, 1)
 
-        return group
+        return container
     
     def _create_control_panel(self) -> QGroupBox:
         """Create control panel with startup/shutdown buttons"""

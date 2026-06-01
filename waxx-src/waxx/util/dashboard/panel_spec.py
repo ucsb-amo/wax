@@ -69,6 +69,14 @@ class PanelSpec:
     default_placement: Placement = "dock"
     tab_group: str = "main"
     preferred_min_size: tuple[int, int] = (320, 200)
+    icon: Optional[str] = None
+    """Single-character emoji shown immediately before the panel title.
+
+    Mirrors the per-app emojis used in the standalone (independent-window)
+    versions of the GUIs (e.g. \U0001f52b for ALS, \U0001f480 for Precilaser).
+    Keep it to a single grapheme so the header stays compact.  ``None``
+    renders no icon at all.
+    """
 
 
 @dataclass

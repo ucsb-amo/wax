@@ -34,6 +34,7 @@ class _PanelDockBase(QDockWidget):
         *,
         com_label: Optional[str] = None,
         is_server: bool = False,
+        icon: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(label, parent)
@@ -54,8 +55,20 @@ class _PanelDockBase(QDockWidget):
         self._body_slot = QFrame(self)
         self._body_slot.setObjectName("PanelBodyFrame")
         self._body_slot.setFrameShape(QFrame.Shape.NoFrame)
+        # Visibly distinct border so panels are easy to tell apart even
+        # when several are docked side-by-side.  Bumped to 2 px and a
+        # lighter colour from the original 1 px / #5a5a5a.
+        # Border wraps left/right/bottom only — the header bar paints the
+        # top and side borders so that the title bar visually sits inside
+        # the same frame as the body.
         self._body_slot.setStyleSheet(
-            "QFrame#PanelBodyFrame { border: 1px solid #5a5a5a; border-radius: 3px;"
+            "QFrame#PanelBodyFrame {"
+            " border-left: 2px solid #7a7a7a;"
+            " border-right: 2px solid #7a7a7a;"
+            " border-bottom: 2px solid #7a7a7a;"
+            " border-top: none;"
+            " border-bottom-left-radius: 4px;"
+            " border-bottom-right-radius: 4px;"
             " background: transparent; }"
         )
         self._body_slot.setMinimumSize(0, 0)
@@ -68,7 +81,9 @@ class _PanelDockBase(QDockWidget):
 
         # Custom title bar widget hosts the LED + buttons.  Qt still draws
         # its built-in float/close icons on the right side.
-        self._header = PanelHeaderBar(label, is_server=is_server, com_label=com_label)
+        self._header = PanelHeaderBar(
+            label, is_server=is_server, com_label=com_label, icon=icon,
+        )
         self.setTitleBarWidget(self._header)
         self._body_widget: Optional[QWidget] = None
 
@@ -133,12 +148,14 @@ class ServerPanel(_PanelDockBase):
         body_factory: Optional[Callable[[], QWidget]],
         *,
         com_label: Optional[str] = None,
+        icon: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(
             panel_id, label, body_factory,
             com_label=com_label,
             is_server=True,
+            icon=icon,
             parent=parent,
         )
 
@@ -153,12 +170,14 @@ class ClientPanel(_PanelDockBase):
         body_factory: Optional[Callable[[], QWidget]],
         *,
         com_label: Optional[str] = None,
+        icon: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(
             panel_id, label, body_factory,
             com_label=com_label,
             is_server=False,
+            icon=icon,
             parent=parent,
         )
 

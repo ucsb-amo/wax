@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -85,23 +85,48 @@ class PanelHeaderBar(QWidget):
         *,
         is_server: bool = True,
         com_label: Optional[str] = None,
+        icon: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setObjectName("PanelHeaderBar")
-        # Dark, compact title bar styling.
+        # QWidget needs WA_StyledBackground for QSS borders to render.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Dark, compact title bar styling.  The top/left/right borders
+        # match the body frame so the header reads as part of the same
+        # bordered panel.
         self.setStyleSheet(
             "QWidget#PanelHeaderBar { background-color: #2b2b2b;"
-            " border-bottom: 1px solid #1a1a1a; }"
+            " border-top: 2px solid #7a7a7a;"
+            " border-left: 2px solid #7a7a7a;"
+            " border-right: 2px solid #7a7a7a;"
+            " border-bottom: 1px solid #1a1a1a;"
+            " border-top-left-radius: 4px;"
+            " border-top-right-radius: 4px; }"
             "QWidget#PanelHeaderBar QLabel { color: #e0e0e0; }"
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 1, 4, 1)
+        # Top/bottom margins must be >= the border width (2 px) so child
+        # widgets don't paint over the top border.
+        layout.setContentsMargins(8, 3, 6, 3)
         layout.setSpacing(4)
 
-        # LED + title.
+        # Icon + LED + title.  The per-panel emoji comes first so users
+        # can spot a panel at a glance, and the supervisor LED sits just
+        # to its right (between the icon and the title) so it reads as
+        # part of the panel's identity rather than a stray dot.
+        self._icon_label: Optional[QLabel] = None
+        if icon:
+            self._icon_label = QLabel(icon, self)
+            self._icon_label.setStyleSheet(
+                "QLabel { font-family: 'Segoe UI Emoji', 'Apple Color Emoji',"
+                " 'Noto Color Emoji', sans-serif; font-size: 13px;"
+                " padding: 0 2px 0 0; }"
+            )
+            layout.addWidget(self._icon_label)
+
         self._led: Optional[_LedDot] = None
         if is_server:
             self._led = _LedDot(self)

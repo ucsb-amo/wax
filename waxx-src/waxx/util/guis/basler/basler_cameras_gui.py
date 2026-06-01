@@ -76,13 +76,17 @@ class _DiscoveryWorker(QThread):
         serial_filter: Optional[list[str]],
         collect_for: float,
         parent: Optional[QObject] = None,
+        quiet: bool = False,
     ) -> None:
         super().__init__(parent)
         self.serial_filter = serial_filter
         self.collect_for = collect_for
+        self.quiet = quiet
 
     def run(self) -> None:
-        clients = discover_all_basler_cameras(collect_for=self.collect_for)
+        clients = discover_all_basler_cameras(
+            collect_for=self.collect_for, quiet=self.quiet,
+        )
         if self.serial_filter:
             clients = [c for c in clients if c.serial in self.serial_filter]
         self.cameras_found.emit(clients)
@@ -360,7 +364,11 @@ class BaslerCamerasMainWindow(QMainWindow):
             return
         # Use a short collect window for periodic polls so we don't waste
         # time blocking on UDP receives when nothing new is on the network.
-        self._worker = _DiscoveryWorker(self.serial_filter, 1.5, self)
+        # ``quiet=True`` keeps unchanged-state results out of the log; only
+        # genuine topology changes still surface at INFO.
+        self._worker = _DiscoveryWorker(
+            self.serial_filter, 1.5, self, quiet=True,
+        )
         self._worker.cameras_found.connect(self._on_cameras_found)
         self._worker.start()
 
@@ -383,12 +391,25 @@ class BaslerCamerasMainWindow(QMainWindow):
                 widget._do_close()
             except Exception:
                 pass
-        # Best-effort: ask the discovery worker to quit, but never block
-        # the GUI shutdown waiting for it.  The underlying UDP recv may
-        # be uninterruptible until its timeout elapses.
+        # Ask the discovery worker to quit and wait briefly for it to
+        # actually exit.  Without this Qt destroys the QThread Python
+        # wrapper while the underlying OS thread is still blocked inside
+        # a UDP recv, which prints "QThread: Destroyed while thread is
+        # still running" on stderr.  The worker's UDP collect window is
+        # at most ~3 s, so a 3.5 s wait reliably catches it.
         if self._worker.isRunning():
             try:
                 self._worker.quit()
+                self._worker.wait(3500)
             except Exception:
                 pass
         super().closeEvent(event)
+
+    def cleanup(self) -> None:  # called by the dashboard close path
+        """Tear down threads/timers so the embedded GUI can be destroyed.
+
+        The dashboard does not deliver Qt closeEvents to embedded GUIs, so
+        the same shutdown work the standalone ``closeEvent`` would do is
+        exposed here for the panel wrapper to call.
+        """
+        self.closeEvent(None)

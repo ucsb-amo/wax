@@ -180,6 +180,15 @@ class MagnetometerServer(WaxxServer):
         self.serial_lock = threading.Lock()
         self.serial_should_be_connected = True
         self.history = deque(maxlen=MAX_HISTORY)
+        # Signature (exc type name, exc str) of the most recent reconnect
+        # failure.  Used to suppress identical repeating warnings — only the
+        # first occurrence (and any change) is logged at WARNING; the rest
+        # drop to DEBUG so we don't fill the dashboard log.
+        self._last_reconnect_failure_sig: tuple[str, str] | None = None
+        self._reconnect_failure_streak = 0
+        # Set True once we've successfully opened the port at least once;
+        # used to keep the very first connection attempt visible.
+        self._serial_was_ever_connected = False
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -262,17 +271,48 @@ class MagnetometerServer(WaxxServer):
 
             # --- ensure serial is open (retry forever, never crash) ---
             if not self._is_serial_connected():
-                logger.info("Serial not connected, attempting reconnect on %s.", self.serial_port)
+                first_try = self._last_reconnect_failure_sig is None
+                # Only announce the attempt itself the first time (or after
+                # a streak break).  Subsequent silent retries every few
+                # seconds would otherwise spam the dashboard log.
+                if first_try:
+                    logger.info("Serial not connected, attempting reconnect on %s.", self.serial_port)
+                else:
+                    logger.debug("Serial not connected, attempting reconnect on %s.", self.serial_port)
                 try:
-                    self._reconnect()
+                    self._reconnect(quiet=not first_try)
                     last_values = None
                     same_count = 0
                     logger.info("Sensor reconnected.")
+                    self._last_reconnect_failure_sig = None
+                    self._reconnect_failure_streak = 0
                 except Exception as exc:
                     if self.stop_event.is_set():
                         break
-                    logger.warning("Reconnect failed (%s: %s) — retrying in 5 s.", type(exc).__name__, exc)
-                    self.stop_event.wait(5.0)
+                    sig = (type(exc).__name__, str(exc))
+                    if sig != self._last_reconnect_failure_sig:
+                        logger.warning(
+                            "Reconnect failed (%s: %s) — will keep retrying quietly.",
+                            sig[0], sig[1],
+                        )
+                        self._last_reconnect_failure_sig = sig
+                        self._reconnect_failure_streak = 1
+                    else:
+                        self._reconnect_failure_streak += 1
+                        # Periodically remind at INFO so the log shows the
+                        # condition is still active without flooding it.
+                        if self._reconnect_failure_streak % 60 == 0:
+                            logger.info(
+                                "Reconnect still failing (%s) after %d attempts.",
+                                sig[0], self._reconnect_failure_streak,
+                            )
+                        else:
+                            logger.debug(
+                                "Reconnect failed (%s: %s).", sig[0], sig[1],
+                            )
+                    # Back off: 5 s, then grow to a 30 s cap.
+                    wait_s = min(5.0 + 0.5 * self._reconnect_failure_streak, 30.0)
+                    self.stop_event.wait(wait_s)
                     continue
 
             # --- read one sample ---
@@ -322,20 +362,28 @@ class MagnetometerServer(WaxxServer):
             if self.stop_event.wait(self.poll_interval):
                 break
 
-    def _reconnect(self):
+    def _reconnect(self, quiet: bool = False):
+        """(Re)open the serial port.
+
+        ``quiet`` demotes the routine open/close chatter to DEBUG.  The
+        auto-retry loop sets it once the first failure has been announced
+        so subsequent retries don't repeat the same four log lines every
+        few seconds.
+        """
+        log_open = logger.debug if quiet else logger.info
         if self.stop_event.is_set():
             raise RuntimeError("Server stopping")
         with self.serial_lock:
             if self.reader is not None:
                 try:
-                    logger.info("Disconnecting serial device on %s.", self.serial_port)
+                    log_open("Disconnecting serial device on %s.", self.serial_port)
                     self.reader.close()
-                    logger.info("Serial device disconnected.")
+                    log_open("Serial device disconnected.")
                 except Exception as exc:
                     logger.debug("_reconnect: close before reconnect failed: %s", exc)
                 self.reader = None
 
-            logger.info("Reconnecting serial device on %s.", self.serial_port)
+            log_open("Reconnecting serial device on %s.", self.serial_port)
             time.sleep(0.2)
             if self.stop_event.is_set():
                 raise RuntimeError("Server stopping")
@@ -346,7 +394,8 @@ class MagnetometerServer(WaxxServer):
             )
             self.reader.open()
             self.reader.setup()
-            logger.info("Serial device reconnected and configured.")
+            log_open("Serial device reconnected and configured.")
+            self._serial_was_ever_connected = True
 
     def _disconnect_serial(self):
         with self.serial_lock:

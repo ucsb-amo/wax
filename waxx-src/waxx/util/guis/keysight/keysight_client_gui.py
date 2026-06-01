@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +34,12 @@ FONTSIZE_PT = 14
 # "server not found" message — the supervised server subprocess often
 # takes a few seconds to spool up after the dashboard launches.
 STARTUP_GRACE_S = 15.0
+
+# When the server is unreachable, throttle reconnect attempts so we
+# don't spawn a discovery thread every 500 ms while it's down.
+# Polling stays at ``T_UPDATE_MS`` once connected; this only governs
+# how often we *try* to (re)build the client.
+RECONNECT_INTERVAL_S = 3.0
 
 # Per-supply over-current alert thresholds (A), keyed by ``max_current``.
 ALERT_THRESHOLDS: dict[int, float] = {500: 100, 170: 50}
@@ -184,11 +191,20 @@ class KeysightClientWindow(QWidget):
         self._ever_connected = False
         self._poll_in_flight = False
         self._connect_in_flight = False
+        # Last time we *attempted* a reconnect.  Used to back off so we
+        # don't spawn a discovery thread on every 500 ms tick while the
+        # server is down.  ``-inf`` so the first tick always tries.
+        self._last_reconnect_attempt = float("-inf")
         # Small, low-key status label — the dashboard's own server
         # indicator is the loud one.  We only fill this in if a real
         # problem persists past the startup grace window.
         self._error_label = QLabel("")
         self._error_label.setStyleSheet(f"font-size: {FONTSIZE_PT - 4}pt; color: gray;")
+        self._error_label.setWordWrap(True)
+        self._error_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self._error_label.setMinimumWidth(0)
 
         self._root = QVBoxLayout(self)
         self._root.addWidget(self._error_label)
@@ -209,6 +225,13 @@ class KeysightClientWindow(QWidget):
         """Start a background ``KeysightClient`` construction if needed."""
         if self._client is not None or self._connect_in_flight:
             return
+        # Throttle reconnects: once we've tried and failed, wait
+        # ``RECONNECT_INTERVAL_S`` before trying again.  The poll timer
+        # keeps ticking at ``T_UPDATE_MS`` but most ticks return early.
+        now = time.monotonic()
+        if (now - self._last_reconnect_attempt) < RECONNECT_INTERVAL_S:
+            return
+        self._last_reconnect_attempt = now
         self._connect_in_flight = True
 
         def _build():
@@ -279,12 +302,12 @@ class KeysightClientWindow(QWidget):
             row.apply_snapshot(snap)
 
     def _maybe_show_error(self, msg: str) -> None:
-        # Suppress the message during the startup grace period so the
-        # GUI doesn't shout while the server subprocess is still booting.
+        # Stay silent until we've actually been connected at least once.
+        # The dashboard's server-status LED is the loud indicator; this
+        # in-panel label is only useful to flag a *new* disconnect.
         if not self._ever_connected:
-            if (time.monotonic() - self._start_time) < STARTUP_GRACE_S:
-                self._hide_error()
-                return
+            self._hide_error()
+            return
         self._error_label.setText(msg)
         self._error_label.show()
 

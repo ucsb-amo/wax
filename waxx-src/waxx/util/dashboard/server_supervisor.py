@@ -20,6 +20,7 @@ import atexit
 import enum
 import logging
 import socket
+import sys
 import time
 import weakref
 from typing import Optional
@@ -28,6 +29,32 @@ from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSig
 
 
 _LOG = logging.getLogger("waxx.dashboard.supervisor")
+
+_IS_WINDOWS = sys.platform.startswith("win")
+# Windows CreateProcess flag — child gets its own process group so we can
+# send it CTRL_BREAK_EVENT for cooperative shutdown without affecting the
+# dashboard's own console.
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def _send_ctrl_break(pid: int) -> bool:
+    """Send ``CTRL_BREAK_EVENT`` to a Windows process group.
+
+    Returns True on success.  No-op (returns False) off Windows.
+    """
+    if not _IS_WINDOWS or pid <= 0:
+        return False
+    try:
+        import ctypes  # noqa: PLC0415
+        CTRL_BREAK_EVENT = 1
+        kernel32 = ctypes.windll.kernel32
+        ok = bool(kernel32.GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, int(pid)))
+        if not ok:
+            _LOG.debug("GenerateConsoleCtrlEvent failed err=%s", ctypes.get_last_error())
+        return ok
+    except Exception as exc:  # pragma: no cover
+        _LOG.debug("_send_ctrl_break(%s) raised: %r", pid, exc)
+        return False
 
 
 class SupervisorState(enum.Enum):
@@ -44,12 +71,29 @@ _ALL_SUPERVISORS: "weakref.WeakSet[ServerSupervisor]" = weakref.WeakSet()
 
 
 def _atexit_kill_all() -> None:
-    """Make sure no supervised child outlives the dashboard."""
-    for sup in list(_ALL_SUPERVISORS):
+    """Make sure no supervised child outlives the dashboard.
+
+    Fast path: fan out terminate, short collective wait, then kill any
+    survivors.  Same shape as ``DashboardMainWindow.closeEvent`` to keep
+    shutdown bounded to ~1 s even with many supervisors.
+    """
+    sups = list(_ALL_SUPERVISORS)
+    for sup in sups:
         try:
-            sup.stop(blocking=True)
+            sup.request_terminate()
         except Exception as exc:  # pragma: no cover
-            _LOG.warning("atexit cleanup failed for %s: %r", getattr(sup, "server_id", "?"), exc)
+            _LOG.warning("atexit terminate failed for %s: %r", getattr(sup, "server_id", "?"), exc)
+    # Short collective grace window across all supervisors.
+    for sup in sups:
+        try:
+            sup.wait_for_finished(200)
+        except Exception:  # pragma: no cover
+            pass
+    for sup in sups:
+        try:
+            sup.force_kill(wait_ms=200)
+        except Exception as exc:  # pragma: no cover
+            _LOG.warning("atexit kill failed for %s: %r", getattr(sup, "server_id", "?"), exc)
 
 
 atexit.register(_atexit_kill_all)
@@ -181,20 +225,38 @@ class ServerSupervisor(QObject):
 
         If *blocking* is True the call waits up to ``graceful_stop_timeout_s``
         for the child to exit before returning.  Always idempotent.
+
+        ``QProcess.terminate()`` on Windows posts ``WM_CLOSE`` to top-level
+        windows.  Our servers are headless Python console apps with no
+        such window, so terminate is a no-op and we always end up
+        killing.  To keep dashboard close snappy we still call terminate
+        (in case a future server installs a real signal handler) but use
+        a much shorter wait before falling through to kill().
         """
         self._stop_requested = True
         if self._proc is None or not self.is_alive():
             self._set_state(SupervisorState.IDLE)
             return
         self._set_state(SupervisorState.STOPPING)
-        try:
-            self._proc.terminate()
-        except Exception as exc:
-            _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+        sent_break = False
+        if _IS_WINDOWS:
+            try:
+                pid = int(self._proc.processId())
+            except Exception:
+                pid = 0
+            sent_break = _send_ctrl_break(pid)
+        if not sent_break:
+            try:
+                self._proc.terminate()
+            except Exception as exc:
+                _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
         if blocking:
-            timeout_ms = int(self.graceful_stop_timeout_s * 1000)
-            if not self._proc.waitForFinished(timeout_ms):
-                _LOG.warning("%s: terminate() timed out, killing", self.server_id)
+            # Short grace window for cooperative shutdown, then kill.
+            # The previous 5 s timeout multiplied by N supervisors froze
+            # the dashboard for ~30 s when the user closed the window.
+            grace_ms = min(int(self.graceful_stop_timeout_s * 1000), 500)
+            if not self._proc.waitForFinished(grace_ms):
+                _LOG.info("%s: terminate() not honored, killing", self.server_id)
                 try:
                     self._proc.kill()
                     self._proc.waitForFinished(1000)
@@ -203,9 +265,62 @@ class ServerSupervisor(QObject):
         else:
             # Schedule a kill if terminate didn't take effect in time.
             QTimer.singleShot(
-                int(self.graceful_stop_timeout_s * 1000),
+                500,
                 self._force_kill_if_alive,
             )
+
+    # ------------------------------------------------------------------ #
+    # Fast shutdown helpers used by the dashboard close path so the GUI
+    # thread doesn't block for ``N_supervisors * graceful_stop_timeout_s``
+    # seconds when the user closes the window.
+    # ------------------------------------------------------------------ #
+
+    def request_terminate(self) -> None:
+        """Ask the child to exit cleanly without waiting.  Idempotent.
+
+        On Windows we send ``CTRL_BREAK_EVENT`` to the child's process
+        group (the child was spawned with ``CREATE_NEW_PROCESS_GROUP``);
+        Python turns that into ``SIGBREAK`` → ``KeyboardInterrupt``, so a
+        normal server loop unwinds with a 0 exit code instead of being
+        hard-killed.  We also call ``terminate()`` as a fallback in case
+        a future server installs a real top-level window handler.
+        """
+        self._stop_requested = True
+        if self._proc is None or not self.is_alive():
+            self._set_state(SupervisorState.IDLE)
+            return
+        self._set_state(SupervisorState.STOPPING)
+        sent_break = False
+        if _IS_WINDOWS:
+            try:
+                pid = int(self._proc.processId())
+            except Exception:
+                pid = 0
+            sent_break = _send_ctrl_break(pid)
+        if not sent_break:
+            try:
+                self._proc.terminate()
+            except Exception as exc:
+                _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+
+    def force_kill(self, *, wait_ms: int = 500) -> None:
+        """Hard-kill the child if it's still alive, then wait briefly."""
+        if self._proc is None or not self.is_alive():
+            return
+        try:
+            self._proc.kill()
+            self._proc.waitForFinished(wait_ms)
+        except Exception as exc:
+            _LOG.error("%s: kill() raised: %r", self.server_id, exc)
+
+    def wait_for_finished(self, timeout_ms: int) -> bool:
+        """Wait for the subprocess to exit; ``True`` if it did."""
+        if self._proc is None or not self.is_alive():
+            return True
+        try:
+            return bool(self._proc.waitForFinished(int(timeout_ms)))
+        except Exception:
+            return not self.is_alive()
 
     def restart(self) -> None:
         """Stop and then start again."""
@@ -229,6 +344,19 @@ class ServerSupervisor(QObject):
             proc.setProcessEnvironment(env)
         # We want stdout and stderr separated for log-level tagging.
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        # On Windows put the child in its own process group so the
+        # supervisor can send it CTRL_BREAK_EVENT for cooperative
+        # shutdown without also signalling the dashboard's console.
+        if _IS_WINDOWS:
+            try:
+                def _add_new_group(args):  # noqa: ANN001 - Qt callback type
+                    args.flags |= _CREATE_NEW_PROCESS_GROUP
+                proc.setCreateProcessArgumentsModifier(_add_new_group)
+            except Exception as exc:  # pragma: no cover - PyQt API guard
+                _LOG.debug(
+                    "%s: setCreateProcessArgumentsModifier unavailable: %r",
+                    self.server_id, exc,
+                )
         proc.readyReadStandardOutput.connect(self._drain_stdout)
         proc.readyReadStandardError.connect(self._drain_stderr)
         proc.errorOccurred.connect(self._on_error)
