@@ -1811,8 +1811,8 @@ class atomdata_base():
         linarray = np.reshape(ndarray,np.size(ndarray))
         vals = [vars(y)[attr] for y in linarray]
         out = np.reshape(vals,ndarray.shape+(-1,))
-        if out.ndim == 2 and out.shape[-1] == 1:
-            out = out.flatten()
+        if out.shape[-1] == 1:
+            out = np.reshape(out, ndarray.shape)
         return out
 
     def _map(self,ndarray,func):
@@ -1955,7 +1955,15 @@ class atomdata_base():
                 # Fast in-memory lite-copy build using whatever roi_id the
                 # user passed to atomdata(). When roi_id is None this uses
                 # the saved/selected ROI loaded into self.roi above.
-                self.save_lite_copy()
+                # self._lite is still True from __init__ (the user asked for
+                # lite); flip it temporarily so save_lite_copy() sees the
+                # full uncropped data we just loaded.
+                _saved_lite_flag = self._lite
+                self._lite = False
+                try:
+                    self.save_lite_copy()
+                finally:
+                    self._lite = _saved_lite_flag
                 timing['fallback_create_lite_copy_s'] = time.perf_counter() - t_stage
 
                 t_stage = time.perf_counter()

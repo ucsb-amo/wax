@@ -158,12 +158,10 @@ class WavemeterClient():
         self._f = self.get_frequency()
 
         f_target = self.target_freq + frequency_shift
-        if abs(self._f - f_target) < self.locked_tolerance:
-            return 1.
-        else:
+        if abs(self._f - f_target) > self.locked_tolerance:
             aprint(f'laser {self.key} unlocked:')
             aprint(f'target = {f_target/1.e12:1.6f}, meas = {self._f/1.e12:1.6f}, diff = {(self._f - f_target)/1.e6:1.1f}')
-            return 0.
+        return self._f
         
 class DummyWavemeterController():
     def check_ch(self) -> int:
