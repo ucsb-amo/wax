@@ -367,6 +367,9 @@ class DashboardMainWindow(QMainWindow):
         # Optional registry of ServerSupervisors so we can stop them
         # gracefully (which releases COM ports etc.) on window close.
         self._supervisors: dict[str, object] = {}
+        # Subset of ``self._supervisors`` whose specs declared a COM port.
+        # These are shut down first at close time with a blocking modal.
+        self._com_ids: set[str] = set()
 
         # View menu + (no toolbar - tools live in the menu bar now).
         self._build_menu()
@@ -734,6 +737,68 @@ class DashboardMainWindow(QMainWindow):
 
     def closeEvent(self, ev):  # noqa: N802 - Qt-style
         self._save_layout()
+
+        # Phase 0: COM-priority shutdown.  Any supervisor whose spec
+        # declared a COM port is shut down FIRST and the dashboard close
+        # is blocked behind a modal dialog until each one has either
+        # exited cleanly (so the OS releases the serial port) or the user
+        # explicitly force-kills / cancels.
+        com_sup_entries: list[tuple[str, str, object]] = []
+        for sid in sorted(self._com_ids):
+            sup = self._supervisors.get(sid)
+            if sup is None:
+                continue
+            # Best-effort label + COM port; fall back to the supervisor id.
+            label = getattr(sup, "server_id", sid)
+            com_port = ""
+            spec = getattr(sup, "spec", None)
+            if spec is not None:
+                label = getattr(spec, "label", label)
+                com_port = getattr(spec, "com_label", "") or ""
+            is_running = getattr(sup, "is_running", None) or getattr(sup, "is_alive", None)
+            try:
+                alive = bool(is_running()) if callable(is_running) else False
+            except Exception:
+                alive = False
+            if not alive:
+                continue
+            com_sup_entries.append((label, com_port, sup))
+
+        if com_sup_entries:
+            # Stop the crash-restart loop fighting our clean shutdown.
+            for _label, _com, sup in com_sup_entries:
+                suppress = getattr(sup, "suppress_restart", None)
+                if callable(suppress):
+                    try:
+                        suppress()
+                    except Exception:
+                        pass
+                req = getattr(sup, "request_terminate", None)
+                if callable(req):
+                    try:
+                        req()
+                    except Exception:
+                        _LOG.exception(
+                            "request_terminate() failed during COM shutdown for id=%s",
+                            getattr(sup, "server_id", "?"),
+                        )
+
+            try:
+                from waxx.util.dashboard.com_shutdown_dialog import (  # noqa: PLC0415
+                    ComShutdownDialog,
+                    RESULT_USER_CANCELLED,
+                )
+                dlg = ComShutdownDialog(com_sup_entries, parent=self)
+                dlg.exec()
+                if dlg.result_reason() == RESULT_USER_CANCELLED:
+                    # User aborted close — keep dashboard open.  Servers
+                    # that already received CTRL_BREAK will have stopped;
+                    # the user can restart them from each panel header.
+                    ev.ignore()
+                    return
+            except Exception:
+                _LOG.exception("ComShutdownDialog failed; falling back to fast shutdown")
+
         # Stop registered server subprocesses in parallel so the GUI
         # thread doesn't block for ``N * graceful_stop_timeout`` seconds
         # while each headless server times out one-by-one.
@@ -803,14 +868,23 @@ class DashboardMainWindow(QMainWindow):
                     _LOG.exception("cleanup() failed for panel %s", panel.panel_id)
         super().closeEvent(ev)
 
-    def register_supervisors(self, supervisors: dict[str, object]) -> None:
+    def register_supervisors(
+        self,
+        supervisors: dict[str, object],
+        com_ids: "set[str] | None" = None,
+    ) -> None:
         """Register ``ServerSupervisor`` instances so they are stopped
         gracefully when the dashboard window is closed.
 
         Pass a mapping of ``server_id -> supervisor``.  Any object with a
-        ``.stop()`` method is accepted.
+        ``.stop()`` method is accepted.  ``com_ids`` lists the subset whose
+        specs declared a ``com_label``; those supervisors are shut down
+        first (with a blocking modal dialog) on window close so the serial
+        ports release cleanly.
         """
         self._supervisors.update(supervisors)
+        if com_ids:
+            self._com_ids.update(com_ids)
 
 
 __all__ = ["DashboardMainWindow"]

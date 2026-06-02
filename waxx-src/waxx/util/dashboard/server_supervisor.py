@@ -147,6 +147,7 @@ class ServerSupervisor(QObject):
         restart_on_crash: bool = False,
         snapshot_host: Optional[str] = None,
         snapshot_port: Optional[int] = None,
+        requires_data_dir: bool = True,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -158,12 +159,20 @@ class ServerSupervisor(QObject):
         self.restart_on_crash = bool(restart_on_crash)
         self.snapshot_host = snapshot_host
         self.snapshot_port = snapshot_port
+        self.requires_data_dir = bool(requires_data_dir)
 
         self._state = SupervisorState.IDLE
         self._proc: Optional[QProcess] = None
         self._restart_history: list[float] = []
         self._stop_requested = False
         self._line_buffer: dict[str, str] = {"stdout": "", "stderr": ""}
+        # Throttle: last (reason, bat_path) tuple emitted for a data-dir
+        # pre-spawn failure.  Suppresses log spam on repeated Start clicks
+        # until the underlying reason changes.
+        self._last_data_dir_fail: Optional[tuple[str, Optional[str]]] = None
+        # Set by ``suppress_restart()`` during dashboard close so the
+        # crash-restart loop doesn't fight a clean shutdown.
+        self._restart_suppressed = False
 
         _ALL_SUPERVISORS.add(self)
 
@@ -210,8 +219,59 @@ class ServerSupervisor(QObject):
         if self.check_port_external():
             return
 
+        if not self._precheck_data_dir():
+            return
+
         self._stop_requested = False
         self._spawn()
+
+    def _precheck_data_dir(self) -> bool:
+        """Return False (and emit one log line) if DATA_DIR is unreachable.
+
+        Servers marked ``requires_data_dir=False`` always pass.  Failures
+        are throttled per ``(reason, bat_path)`` tuple so repeated Start
+        clicks don't spam the dashboard log.
+        """
+        if not self.requires_data_dir:
+            return True
+        try:
+            from waxx.util.dashboard import data_dir_guard  # noqa: PLC0415
+        except Exception:
+            return True
+        if not data_dir_guard.is_configured():
+            return True
+        status = data_dir_guard.ensure_data_dir(log=_LOG)
+        if status.ok:
+            self._last_data_dir_fail = None
+            return True
+        key = (status.reason, status.bat_path)
+        if self._last_data_dir_fail != key:
+            self._last_data_dir_fail = key
+            if status.reason == "bat_missing":
+                msg = (
+                    f"DATA_DIR unreachable; map-network-drives bat not found "
+                    f"at {status.bat_path!s} — cannot start"
+                )
+            elif status.reason == "remap_failed":
+                msg = (
+                    f"DATA_DIR still missing after running {status.bat_path!s} "
+                    f"— cannot start"
+                )
+            elif status.reason == "data_dir_unset":
+                msg = "DATA_DIR is not configured — cannot start"
+            else:
+                msg = f"DATA_DIR unreachable ({status.reason}) — cannot start"
+            _LOG.error("%s: %s", self.server_id, msg)
+            try:
+                self.log_line.emit(f"[ERR] {msg}")
+            except Exception:
+                pass
+        # Stay in IDLE rather than FAILED: FAILED is sticky and would force
+        # the user to call reset_and_start().  We want subsequent Start
+        # clicks to retry the precheck (cheap; throttle prevents log spam),
+        # so re-mapping the share and clicking Start "just works".
+        self._set_state(SupervisorState.IDLE)
+        return False
 
     def reset_and_start(self) -> None:
         """Clear failure state and try again from scratch."""
@@ -322,6 +382,18 @@ class ServerSupervisor(QObject):
         except Exception:
             return not self.is_alive()
 
+    def suppress_restart(self) -> None:
+        """Disable crash-restart for the remainder of this supervisor's life.
+
+        Called by the dashboard's close path so a clean ``CTRL_BREAK``
+        shutdown isn't fought by the restart-on-crash loop.
+        """
+        self._restart_suppressed = True
+
+    def is_running(self) -> bool:
+        """Alias for :meth:`is_alive` used by the dashboard close dialog."""
+        return self.is_alive()
+
     def restart(self) -> None:
         """Stop and then start again."""
         self.stop()
@@ -416,6 +488,9 @@ class ServerSupervisor(QObject):
         self._set_state(SupervisorState.IDLE)
 
     def _maybe_auto_restart(self) -> None:
+        if self._restart_suppressed:
+            _LOG.info("%s: auto-restart suppressed (shutdown in progress)", self.server_id)
+            return
         # Trim history to the rolling window.
         cutoff = time.monotonic() - self.RESTART_WINDOW_S
         self._restart_history = [t for t in self._restart_history if t >= cutoff]

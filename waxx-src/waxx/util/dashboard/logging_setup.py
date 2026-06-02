@@ -133,6 +133,42 @@ def _resolve_log_dir(kind: str) -> Path:
     return fallback
 
 
+class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """``RotatingFileHandler`` that survives Windows file-locking races.
+
+    On Windows, if any other process or another open handle (e.g. a stale
+    faulthandler file) still holds the active log file when rollover
+    triggers, ``os.rename`` raises ``PermissionError [WinError 32]`` and
+    the entire ``emit()`` call crashes the calling thread.  We catch that
+    here, write one warning to stderr, and continue logging into the
+    current file — losing rotation for this cycle is far better than
+    crashing the dashboard.
+    """
+
+    _rollover_warned: bool = False
+
+    def doRollover(self):  # noqa: N802 - stdlib API
+        try:
+            super().doRollover()
+        except (PermissionError, OSError) as exc:
+            if not _SafeRotatingFileHandler._rollover_warned:
+                _SafeRotatingFileHandler._rollover_warned = True
+                try:
+                    sys.stderr.write(
+                        f"logging_setup: log rotation skipped for {self.baseFilename!r} "
+                        f"({exc!r}); will keep writing to the current file.\n"
+                    )
+                except Exception:
+                    pass
+            # Re-open the stream if super() closed it before failing,
+            # otherwise subsequent emits will raise ValueError.
+            try:
+                if self.stream is None or getattr(self.stream, "closed", False):
+                    self.stream = self._open()
+            except Exception:
+                self.stream = None
+
+
 def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
     """Attach a rotating file handler + console handler to the root logger.
 
@@ -153,7 +189,7 @@ def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
             except Exception:
                 continue
 
-    file_handler = logging.handlers.RotatingFileHandler(
+    file_handler = _SafeRotatingFileHandler(
         filename=str(log_path),
         maxBytes=5 * 1024 * 1024,
         backupCount=5,
@@ -176,11 +212,15 @@ def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
         console.setLevel(level)
         root.addHandler(console)
 
-    # faulthandler: write native tracebacks to the same file.  Keep the file
-    # handle alive in a module-level global - faulthandler does NOT keep its
-    # own reference.
+    # faulthandler: write native tracebacks to a sibling ``.fault`` file,
+    # NOT the rotating log itself.  If we share the file handle with the
+    # ``RotatingFileHandler``, Windows refuses ``os.rename`` at rollover
+    # time (PermissionError WinError 32) because faulthandler still has
+    # the file open.  Keep the file handle alive in a module-level global
+    # — faulthandler does NOT keep its own reference.
     try:
-        _FAULTHANDLER_FILE = open(log_path, "a", encoding="utf-8", buffering=1)
+        fault_path = log_path.parent / (log_path.name + ".fault")
+        _FAULTHANDLER_FILE = open(fault_path, "a", encoding="utf-8", buffering=1)
         faulthandler.enable(file=_FAULTHANDLER_FILE, all_threads=True)
     except Exception as exc:
         _BOOT_WARNINGS.append(f"logging_setup: faulthandler.enable failed ({exc!r})")

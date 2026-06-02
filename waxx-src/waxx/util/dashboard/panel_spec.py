@@ -126,6 +126,11 @@ class ServerSpec(PanelSpec):
     Useful for headless servers whose state is already shown by another
     panel (e.g. the device-state monitor is surfaced inside the Device
     Control GUI, so a second dock tile is redundant)."""
+    requires_data_dir: bool = True
+    """If True (default), the supervisor refuses to spawn this server when
+    :func:`waxx.util.dashboard.data_dir_guard.ensure_data_dir` reports the
+    shared data directory is unreachable.  Set False for the rare server
+    that does not need DATA_DIR at all (e.g. a pure network-relay shim)."""
 
 
 @dataclass

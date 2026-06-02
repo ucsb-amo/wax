@@ -131,6 +131,19 @@ class server_talk():
 
     def check_for_mapped_data_dir(self):
         self.set_data_dir()
+        # If the dashboard configured the shared guard, defer to it so the
+        # same throttling / logging / bat-missing handling applies to every
+        # data-dir access (servers, GUIs, notebooks running under the
+        # dashboard).  When the guard is not configured (e.g. a standalone
+        # analysis script imported atomdata directly), fall back to the
+        # original inline behavior so no consumer regresses.
+        try:
+            from waxx.util.dashboard import data_dir_guard  # noqa: PLC0415
+            if data_dir_guard.is_configured():
+                status = data_dir_guard.ensure_data_dir(self.data_dir)
+                return bool(status.ok)
+        except Exception:
+            pass
         if not os.path.exists(self.data_dir):
             if sys.platform == "win32":
                 print(f"Data dir ({self.data_dir}) not found. Attempting to re-map network drives.")
