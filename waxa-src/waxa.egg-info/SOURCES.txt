@@ -3,6 +3,7 @@ setup.py
 waxa/__init__.py
 waxa/atomdata.py
 waxa/atomdata_base.py
+waxa/atomdata_vault.py
 waxa/roi.py
 waxa.egg-info/PKG-INFO
 waxa.egg-info/SOURCES.txt
