@@ -349,6 +349,7 @@ class atomdata_base():
                 skip_saved_roi = False,
                 transpose_idx = [],
                 avg_repeats = False,
+                no_images = False,
                 server_talk = st()):
         '''
         Returns the atomdata stored in the `idx`th newest file at `path`.
@@ -378,6 +379,7 @@ class atomdata_base():
         '''
 
         self._lite = lite
+        self._no_images = no_images
         # When loading lite data, ignore any passed roi_id since lite files
         # are already pre-cropped to a specific ROI at creation time.
         if lite:
@@ -410,7 +412,7 @@ class atomdata_base():
 
         t_init = time.perf_counter()
         t_stage = time.perf_counter()
-        self._load_data(idx, path, lite=lite, roi_id=roi_id)
+        self._load_data(idx, path, lite=lite, roi_id=roi_id, no_images=no_images)
         self._timing['init_load_data_s'] = time.perf_counter() - t_stage
 
         ### Helper objects
@@ -644,9 +646,19 @@ class atomdata_base():
             if isinstance(ts_end, np.ndarray) and ts_end.size > 0:
                 data_grp.create_dataset('timestamp_shot_end', data=ts_end)
 
-            # scope_data subgroup — copy verbatim from the source file.
+            # scope_data subgroup — copy from source, downcast float64 → float32
+            # and apply gzip compression to reduce lite file size.
             if 'data' in f_src and 'scope_data' in f_src['data']:
-                f_src.copy(f_src['data']['scope_data'], data_grp, 'scope_data')
+                scope_grp = data_grp.create_group('scope_data')
+                for scope_label, scope_item in f_src['data']['scope_data'].items():
+                    this_scope = scope_grp.create_group(scope_label)
+                    for ch_key in scope_item.keys():
+                        arr = scope_item[ch_key][()]
+                        if arr.dtype == np.float64:
+                            arr = arr.astype(np.float32)
+                        this_scope.create_dataset(
+                            ch_key, data=arr, compression='gzip', compression_opts=4
+                        )
 
             # params / camera_params / run_info groups — rebuild from in-memory
             # objects via the existing DataSaver helper.
@@ -1928,7 +1940,7 @@ class atomdata_base():
         dealer.N_xvars = len(self.xvardims)
         return dealer
 
-    def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True):
+    def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True, no_images=False):
         t_load_total = time.perf_counter()
         timing = {}
 
@@ -2020,6 +2032,8 @@ class atomdata_base():
             # this attribute always have images, so we default to whether the
             # 'images' dataset actually exists in the file.
             self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
+            if no_images:
+                self._has_images = False
             if self._has_images:
                 self.images = f['data']['images'][()]
                 self.image_timestamps = f['data']['image_timestamps'][()]

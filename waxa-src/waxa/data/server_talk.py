@@ -451,7 +451,21 @@ class server_talk():
                 dkeys = f_src['data'].keys()
                 f_lite.create_group('data')
                 for key in dkeys:
-                    if key != 'images':
+                    if key == 'images':
+                        continue
+                    if key == 'scope_data':
+                        # Downcast float64 → float32 and apply compression.
+                        scope_grp = f_lite['data'].create_group('scope_data')
+                        for scope_label, scope_item in f_src['data']['scope_data'].items():
+                            this_scope = scope_grp.create_group(scope_label)
+                            for ch_key in scope_item.keys():
+                                arr = scope_item[ch_key][()]
+                                if arr.dtype == np.float64:
+                                    arr = arr.astype(np.float32)
+                                this_scope.create_dataset(
+                                    ch_key, data=arr, compression='gzip', compression_opts=4
+                                )
+                    else:
                         f_src.copy(f_src['data'][key],f_lite['data'],key)
 
                 # copy over attributes

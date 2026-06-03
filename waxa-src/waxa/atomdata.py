@@ -39,6 +39,7 @@ class atomdata(atomdata_base):
         skip_saved_roi=False,
         transpose_idx=[],
         avg_repeats=False,
+        no_images=False,
         server_talk=st(),
     ):
         super().__init__(
@@ -49,6 +50,7 @@ class atomdata(atomdata_base):
             skip_saved_roi=skip_saved_roi,
             transpose_idx=transpose_idx,
             avg_repeats=avg_repeats,
+            no_images=no_images,
             server_talk=server_talk,
         )
 
