@@ -21,8 +21,8 @@ class server_talk():
                  on_data_dir_disconnected_bat_path=""):
         
         self.data_dir = data_dir
-        self.run_id_path = os.path.join(data_dir,run_id_relpath)
-        self.roi_csv_path = os.path.join(data_dir,roi_spreadsheet_replath)
+        self.run_id_path = os.path.join(data_dir, run_id_relpath) if data_dir is not None else None
+        self.roi_csv_path = os.path.join(data_dir, roi_spreadsheet_replath) if data_dir is not None else None
 
         if first_data_folder_date == "":
             first_data_folder_date = datetime(2023,6,22)
