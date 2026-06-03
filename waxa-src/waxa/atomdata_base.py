@@ -459,6 +459,9 @@ class atomdata_base():
 
     ###
     def recrop(self,roi_id=None,use_saved=False):
+        if not getattr(self, '_has_images', True):
+            print("no images in dataset, no roi to crop")
+            return
         """Selects a new ROI and re-runs the analysis. Uses the same logic as
         kexp.ROI.load_roi.
 
@@ -503,9 +506,15 @@ class atomdata_base():
 
     ### ROI management
     def save_roi_excel(self,key=""):
+        if not getattr(self, '_has_images', True):
+            print("no images in dataset, no roi to save")
+            return
         self.roi.save_roi_excel(key)
 
     def save_roi_h5(self,printouts=False):
+        if not getattr(self, '_has_images', True):
+            print("no images in dataset, no roi to save")
+            return
         self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
 
     def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
@@ -561,11 +570,6 @@ class atomdata_base():
                 "transformed (averaged / transposed / repeats reassigned). "
                 "Reload the run fresh or pass force_reread=True."
             )
-        if not getattr(self, '_has_images', True):
-            raise RuntimeError(
-                "save_lite_copy: run has no images; lite copy is not meaningful."
-            )
-
         import os as _os
 
         # ---- compute destination path ----
@@ -577,42 +581,45 @@ class atomdata_base():
         # unshuffle helpers on local copies. The dealer's unscramble_images()
         # and _unscramble_timestamps() reassign the dealer's own attributes,
         # so we save/restore them around the call.
-        if tags.xvars_shuffled:
-            _saved_imgs = self._dealer.images
-            _saved_ts = self._dealer.image_timestamps
-            try:
-                self._dealer.images = self.images
-                self._dealer.image_timestamps = self.image_timestamps
-                images_ush = self._dealer.unscramble_images(reshuffle=False)
-                ts_ush = self._dealer._unscramble_timestamps(reshuffle=False)
-            finally:
-                self._dealer.images = _saved_imgs
-                self._dealer.image_timestamps = _saved_ts
-        else:
-            images_ush = self.images
-            ts_ush = self.image_timestamps
+        has_images = getattr(self, '_has_images', True)
 
-        # Crop images to ROI. ROI.crop operates on the last two axes, so it
-        # vectorises naturally over any leading shape. When roi_id is given,
-        # construct a temporary ROI so self.roi is not mutated.
-        if roi_id is None:
-            crop_roi = self.roi
-        else:
-            crop_roi = ROI(
-                run_id=self.run_info.run_id,
-                roi_id=roi_id,
-                use_saved_roi=use_saved_roi,
-                lite=False,
-                printouts=False,
-                server_talk=self.server_talk,
-                current_file_path=self._data_file_path,
-                current_saved_roi=self._saved_roi_from_file,
-                images=self.images,
-                imaging_type=self.run_info.imaging_type,
-            )
-        cropped_images = crop_roi.crop(images_ush)
-        px = int(np.diff(crop_roi.roix)[0])
-        py = int(np.diff(crop_roi.roiy)[0])
+        if has_images:
+            if tags.xvars_shuffled:
+                _saved_imgs = self._dealer.images
+                _saved_ts = self._dealer.image_timestamps
+                try:
+                    self._dealer.images = self.images
+                    self._dealer.image_timestamps = self.image_timestamps
+                    images_ush = self._dealer.unscramble_images(reshuffle=False)
+                    ts_ush = self._dealer._unscramble_timestamps(reshuffle=False)
+                finally:
+                    self._dealer.images = _saved_imgs
+                    self._dealer.image_timestamps = _saved_ts
+            else:
+                images_ush = self.images
+                ts_ush = self.image_timestamps
+
+            # Crop images to ROI. ROI.crop operates on the last two axes, so it
+            # vectorises naturally over any leading shape. When roi_id is given,
+            # construct a temporary ROI so self.roi is not mutated.
+            if roi_id is None:
+                crop_roi = self.roi
+            else:
+                crop_roi = ROI(
+                    run_id=self.run_info.run_id,
+                    roi_id=roi_id,
+                    use_saved_roi=use_saved_roi,
+                    lite=False,
+                    printouts=False,
+                    server_talk=self.server_talk,
+                    current_file_path=self._data_file_path,
+                    current_saved_roi=self._saved_roi_from_file,
+                    images=self.images,
+                    imaging_type=self.run_info.imaging_type,
+                )
+            cropped_images = crop_roi.crop(images_ush)
+            px = int(np.diff(crop_roi.roix)[0])
+            py = int(np.diff(crop_roi.roiy)[0])
 
         # ---- write the lite HDF5 file ----
         with h5py.File(self._data_file_path, 'r') as f_src, \
@@ -620,8 +627,9 @@ class atomdata_base():
 
             # data group
             data_grp = f_lite.create_group('data')
-            data_grp.create_dataset('images', data=cropped_images)
-            data_grp.create_dataset('image_timestamps', data=ts_ush)
+            if has_images:
+                data_grp.create_dataset('images', data=cropped_images)
+                data_grp.create_dataset('image_timestamps', data=ts_ush)
 
             # DataVault keys — already in memory, unshuffle on the fly.
             n_xvars = len(self.xvarnames)
@@ -679,9 +687,10 @@ class atomdata_base():
                     f_lite.attrs[k] = f_src.attrs[k]
                 except Exception:
                     pass
-            f_lite.attrs['roix'] = [0, px]
-            f_lite.attrs['roiy'] = [0, py]
-            f_lite.attrs['has_images'] = True
+            if has_images:
+                f_lite.attrs['roix'] = [0, px]
+                f_lite.attrs['roiy'] = [0, py]
+            f_lite.attrs['has_images'] = has_images
             f_lite.attrs['run_complete'] = True
 
         print(f'Lite version of run {self.run_info.run_id} saved at {lite_path}.')
