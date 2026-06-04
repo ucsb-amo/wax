@@ -185,7 +185,7 @@ class _RepeatLazyStatAtomdataProxy():
         self.xvardims[xvar_idx] = len(self.xvars[xvar_idx])
 
         param_overrides = {
-            'N_repeats': np.ones(self.Nvars, dtype=int)
+            'N_repeats': 1
         }
         for idx, key in enumerate(self.xvarnames):
             param_overrides[key] = self.xvars[idx]
@@ -2026,10 +2026,13 @@ class atomdata_base():
             unpack_group(f,'run_info',self.run_info)
 
             # N_repeats must always be an int. HDF5 may store it as a
-            # 0-d array, a 1-element array, or a list — normalise here.
+            # 0-d array, a 1-element array, a multi-element array, or a
+            # list — normalise here. Multi-element arrays are reduced by
+            # taking the product (e.g. [2, 3] → 6).
             _nr = self.params.N_repeats
             if hasattr(_nr, '__len__'):
-                _nr = int(np.asarray(_nr).flat[0])
+                _nr_arr = np.asarray(_nr).ravel()
+                _nr = int(np.prod(_nr_arr)) if _nr_arr.size > 1 else int(_nr_arr[0])
             self.params.N_repeats = int(_nr)
             timing['h5_unpack_headers_s'] = time.perf_counter() - t_stage
 
