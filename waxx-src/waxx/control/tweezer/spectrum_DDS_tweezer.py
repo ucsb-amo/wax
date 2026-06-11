@@ -825,4 +825,8 @@ class TweezerController():
     def trigger(self):
         self.awg_trg_ttl.pulse(1.e-6)
 
+    def close(self):
+        # self.card.stop()
+        self.card.close(self.card._handle)
+
     
