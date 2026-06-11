@@ -1156,9 +1156,13 @@ class ALSControlGUI(QMainWindow):
         if self._sequence_thread_is_running():
             self.statusBar().showMessage("A sequence is already running")
             return
-        self.remote_client.run_startup_sequence()
         self.statusBar().showMessage("Startup sequence requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("run_startup_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.run_startup_sequence, _done))
     
     def _start_shutdown(self):
         """Request remote shutdown sequence."""
@@ -1170,17 +1174,25 @@ class ALSControlGUI(QMainWindow):
         if self._sequence_thread_is_running():
             self.statusBar().showMessage("A sequence is already running")
             return
-        self.remote_client.run_shutdown_sequence()
         self.statusBar().showMessage("Shutdown sequence requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("run_shutdown_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.run_shutdown_sequence, _done))
     
     def _interrupt_sequence(self):
         """Interrupt current remote sequence."""
         if self.remote_client is None:
             return
-        self.remote_client.interrupt_sequence()
         self.statusBar().showMessage("Sequence interrupt requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("interrupt_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.interrupt_sequence, _done))
 
     def _sync_remote_state(self):
         """Poll the ALS server for state and logs without blocking the GUI.
