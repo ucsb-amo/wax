@@ -40,9 +40,12 @@ class HeadlessMonitorServer(QObject):
         self._timer.timeout.connect(self._check_status)
         self._timer.start()
 
-        # Auto-start the monitor experiment on launch.
-        self.monitor_manager.start()
-        self._set_status(STATES.LOADING)
+        # Do NOT auto-start the monitor experiment on launch.  Starting
+        # automatically would interrupt any experiment already running on
+        # the hardware when the dashboard is (re)started.  The monitor
+        # can be started manually from the Device Control panel, or it
+        # will be triggered automatically when the previous experiment
+        # finishes (via the UDP reset signal).
 
     def _setup_udp_server(self) -> None:
         self.server_thread = QThread()

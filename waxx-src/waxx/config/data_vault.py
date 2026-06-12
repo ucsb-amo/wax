@@ -2,7 +2,7 @@ import numpy as np
 import copy
 from artiq.language import delay, now_mu, kernel, TTuple, TBool
 
-from waxa.config.data_vault import DataContainer as DataContainerWaxa, DataVaultWaxa
+from waxa.config.data_vault import DataContainer as DataContainerWaxa
 
 class DataContainer(DataContainerWaxa):
     def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt):

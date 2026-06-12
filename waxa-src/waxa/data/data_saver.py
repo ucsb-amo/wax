@@ -669,6 +669,9 @@ class DataSaver():
         for scope_info in payload.get("scope_data", []):
             label = str(scope_info["label"])
             data = np.asarray(scope_info["data"])
+            if data.ndim < 3 or data.size == 0:
+                print(f"[DataSaver] WARNING: skipping scope '{label}' — data has unexpected shape {data.shape}")
+                continue
             if sort_idx_raw:
                 data = self._unshuffle_single_array(
                     data, sort_idx_raw, sort_N_raw, exclude_dims=3

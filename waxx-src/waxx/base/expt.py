@@ -275,10 +275,13 @@ class Expt(Dealer, Scanner, Scribe):
                 except Exception as _e:
                     print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} — scope data will be empty for this run.")
                     reshaped = None
-                scope_data_list.append({
-                    'label': str(scope.label),
-                    'data': reshaped,
-                })
+                if reshaped is None or not isinstance(reshaped, np.ndarray) or reshaped.ndim < 3 or reshaped.size == 0:
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) — omitting from payload.")
+                else:
+                    scope_data_list.append({
+                        'label': str(scope.label),
+                        'data': reshaped,
+                    })
 
         # DataVault
         dv = {}

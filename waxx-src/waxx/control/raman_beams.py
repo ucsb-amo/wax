@@ -1,7 +1,7 @@
 import numpy as np
 from numpy import int64, int32
 
-from artiq.coredevice.ad9910 import _AD9910_REG_FTW
+from artiq.coredevice.ad9910 import _AD9910_REG_FTW, _AD9910_REG_PROFILE0
 from artiq.coredevice import ad9910
 from artiq.coredevice import spi2 as spi
 from artiq.coredevice import urukul
@@ -438,6 +438,38 @@ class RamanBeamPair():
         self.dds1._ftw = self._new_ftw1
         # self.dds1.update_phase_at_set()
 
+    @kernel(flags={"fast-math"})
+    def set_frequency_fast_dumb(self,
+                                frequency_transition):
+        asf0 = self.dds0._asf
+        asf1 = self.dds1._asf
+
+        pow0 = 0
+        pow1 = 0
+
+        self.state_splitting_to_ao_frequency(frequency_transition)
+        f0 = self._dummy[DDS0_IDX]
+        f1 = self._dummy[DDS1_IDX]
+        ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
+        ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
+        
+        at_mu(now_mu() & ~7)
+        
+        with parallel:
+                self.dds0.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
+                                (asf0 << 16) | (pow0 & 0xffff), ftw0)
+                self.dds1.dds_device.write64(_AD9910_REG_PROFILE0 + 7,
+                                (asf1 << 16) | (pow1 & 0xffff), ftw1)
+        with parallel:
+            with sequential:
+                delay_mu(int64(self.dds0.dds_device.sync_data.io_update_delay))
+                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+            with sequential:
+                delay_mu(int64(self.dds1.dds_device.sync_data.io_update_delay))
+                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+    
+        at_mu(now_mu() & ~7)
+        
     @kernel(flags={"fast-math"})
     def set_frequency_fast(self,
                  frequency_transition,

@@ -357,7 +357,8 @@ class RunScanner:
 
                 xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
                 experiment_name, experiment_filepath = self._read_experiment_info(f)
-                xvardims = self._read_xvardims(f, xvarnames)
+                # Read xvar arrays once; derive both dims and detail summaries from them.
+                xvardims, xvar_details = self._read_xvardims_and_details(f, xvarnames)
                 n_repeats = _read_n_repeats_value(f)
 
                 if "data" in f:
@@ -393,6 +394,7 @@ class RunScanner:
                     filepath=filepath,
                     xvarnames=xvarnames,
                     xvardims=xvardims,
+                    xvar_details=xvar_details,
                     data_container_keys=data_container_keys,
                     has_scope_data=has_scope_data,
                     n_repeats=n_repeats,
@@ -412,16 +414,21 @@ class RunScanner:
         fallback_str = _decode_str(fallback)
         return fallback_str, fallback_str
 
-    def _read_xvardims(self, h5file, xvarnames):
+    def _read_xvardims_and_details(self, h5file, xvarnames):
+        """Return (xvardims, xvar_details) by reading each xvar array once."""
+        dims = []
+        details = []
         if "params" in h5file:
-            dims = []
             for name in xvarnames:
                 if name in h5file["params"]:
                     values = np.asarray(h5file["params"][name][()]).reshape(-1)
                     dims.append(int(values.size))
-            return tuple(dims)
+                    details.append(_summarize_xvar_values(name, values))
+        return tuple(dims), details
 
-        return tuple()
+    def _read_xvardims(self, h5file, xvarnames):
+        dims, _ = self._read_xvardims_and_details(h5file, xvarnames)
+        return dims
 
     def _read_run_id(self, h5file, filepath):
         run_id_attr = h5file.attrs.get("run_id", None)
@@ -485,6 +492,96 @@ class ScanWorker(QThread):
             self.scan_error.emit(str(exc))
 
 
+def _summarize_xvar_values(name: str, values) -> dict:
+    """Summarize a single xvar array into a detail dict.
+
+    This is a module-level function so that both the scan path
+    (RunScanner._read_summary) and the async fallback
+    (XvarDetailLoader) can call it without duplicating logic.
+    """
+    array = np.asarray(values)
+    if array.size == 0:
+        unit, _, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=array)
+        return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA", "preview": "-"}
+
+    flat = array.reshape(-1)
+    n = int(flat.size)
+    unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=flat)
+    unit = unit or ""
+
+    def decimals_from_spacing(scaled_values):
+        finite = np.asarray(scaled_values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size < 2:
+            return 6
+
+        unique_sorted = np.unique(np.sort(finite))
+        if unique_sorted.size < 2:
+            return 6
+
+        diffs = np.diff(unique_sorted)
+        positive = diffs[diffs > 0]
+        if positive.size == 0:
+            return 6
+
+        step = float(np.min(positive))
+        decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
+        # Keep one guard digit so adjacent values remain distinguishable
+        # after floating-point conversion and formatting.
+        return max(0, min(10, decimals + 1))
+
+    def format_numeric_value(value, decimals):
+        scaled = float(value) * multiplier
+        if not np.isfinite(scaled):
+            return "NA"
+        if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
+            return f"{scaled:.6g}"
+        return f"{scaled:.{decimals}f}"
+
+    def unique_preserve_order(items):
+        unique_items = []
+        for item in items:
+            if any(item == existing for existing in unique_items):
+                continue
+            unique_items.append(item)
+        return unique_items
+
+    def format_preview_text(items, formatter=str):
+        if not items:
+            return "-"
+
+        formatted = [formatter(item) for item in items]
+        if len(formatted) <= 6:
+            return ", ".join(formatted)
+        return ", ".join([*formatted[:3], "...", *formatted[-3:]])
+
+    if np.issubdtype(flat.dtype, np.number):
+        min_val = float(np.nanmin(flat))
+        max_val = float(np.nanmax(flat))
+        scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
+        decimals = decimals_from_spacing(scaled_vals)
+        preview_values = unique_preserve_order(np.asarray(flat).tolist())
+        return {
+            "name": name,
+            "unit": unit,
+            "n": n,
+            "min": format_numeric_value(min_val, decimals),
+            "max": format_numeric_value(max_val, decimals),
+            "preview": format_preview_text(preview_values, lambda value: format_numeric_value(value, decimals)),
+        }
+
+    as_text = [_decode_str(item) for item in flat]
+    preview_values = unique_preserve_order(as_text)
+    return {
+        "name": name,
+        "unit": unit,
+        "n": n,
+        "min": min(as_text),
+        "max": max(as_text),
+        "preview": format_preview_text(preview_values),
+    }
+
+
 class XvarDetailLoader(QThread):
     details_ready = pyqtSignal(list)
     details_error = pyqtSignal(str)
@@ -504,99 +601,21 @@ class XvarDetailLoader(QThread):
 
                 params_group = f["params"]
                 for name in self.xvarnames:
+                    if self.isInterruptionRequested():
+                        return
+
                     if name not in params_group:
                         details.append({"name": name, "unit": "", "n": 0, "min": "NA", "max": "NA"})
                         continue
 
                     values = params_group[name][()]
-                    details.append(self._summarize_values(name, values))
+                    details.append(_summarize_xvar_values(name, values))
 
-            self.details_ready.emit(details)
+            if not self.isInterruptionRequested():
+                self.details_ready.emit(details)
         except Exception as exc:
-            self.details_error.emit(str(exc))
-
-    def _summarize_values(self, name: str, values):
-        array = np.asarray(values)
-        if array.size == 0:
-            unit, _, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=array)
-            return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA", "preview": "-"}
-
-        flat = array.reshape(-1)
-        n = int(flat.size)
-        unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=flat)
-        unit = unit or ""
-
-        def decimals_from_spacing(scaled_values):
-            finite = np.asarray(scaled_values, dtype=np.float64)
-            finite = finite[np.isfinite(finite)]
-            if finite.size < 2:
-                return 6
-
-            unique_sorted = np.unique(np.sort(finite))
-            if unique_sorted.size < 2:
-                return 6
-
-            diffs = np.diff(unique_sorted)
-            positive = diffs[diffs > 0]
-            if positive.size == 0:
-                return 6
-
-            step = float(np.min(positive))
-            decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
-            # Keep one guard digit so adjacent values remain distinguishable
-            # after floating-point conversion and formatting.
-            return max(0, min(10, decimals + 1))
-
-        def format_numeric_value(value, decimals):
-            scaled = float(value) * multiplier
-            if not np.isfinite(scaled):
-                return "NA"
-            if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
-                return f"{scaled:.6g}"
-            return f"{scaled:.{decimals}f}"
-
-        def unique_preserve_order(items):
-            unique_items = []
-            for item in items:
-                if any(item == existing for existing in unique_items):
-                    continue
-                unique_items.append(item)
-            return unique_items
-
-        def format_preview_text(items, formatter=str):
-            if not items:
-                return "-"
-
-            formatted = [formatter(item) for item in items]
-            if len(formatted) <= 6:
-                return ", ".join(formatted)
-            return ", ".join([*formatted[:3], "...", *formatted[-3:]])
-
-        if np.issubdtype(flat.dtype, np.number):
-            min_val = float(np.nanmin(flat))
-            max_val = float(np.nanmax(flat))
-            scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
-            decimals = decimals_from_spacing(scaled_vals)
-            preview_values = unique_preserve_order(np.asarray(flat).tolist())
-            return {
-                "name": name,
-                "unit": unit,
-                "n": n,
-                "min": format_numeric_value(min_val, decimals),
-                "max": format_numeric_value(max_val, decimals),
-                "preview": format_preview_text(preview_values, lambda value: format_numeric_value(value, decimals)),
-            }
-
-        as_text = [_decode_str(item) for item in flat]
-        preview_values = unique_preserve_order(as_text)
-        return {
-            "name": name,
-            "unit": unit,
-            "n": n,
-            "min": min(as_text),
-            "max": max(as_text),
-            "preview": format_preview_text(preview_values),
-        }
+            if not self.isInterruptionRequested():
+                self.details_error.emit(str(exc))
 
 
 class ParamSearchLoader(QThread):

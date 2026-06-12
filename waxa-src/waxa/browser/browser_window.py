@@ -801,6 +801,7 @@ class DataBrowserWindow(QMainWindow):
         self.data_dir = saved_dir if (saved_dir and os.path.isdir(saved_dir)) else data_dir
         self._scan_worker = None
         self._xvar_loader = None
+        self._running_xvar_loaders: set = set()
         self._param_search_loader = None
         self._lite_worker = None
         self._run_id_lookup_worker = None
@@ -1970,8 +1971,14 @@ class DataBrowserWindow(QMainWindow):
 
         if self._xvar_loader is not None and self._xvar_loader.isRunning():
             # Keep UI responsive on rapid row changes; stale loader results are
-            # ignored via detail request ids.
-            self._xvar_loader.quit()
+            # ignored via detail request ids.  Move the old loader into a
+            # retention set so Python doesn't GC it while the C++ thread is
+            # still running (PyQt6 segfault).  It is removed from the set via
+            # its finished signal once the thread actually exits.
+            old_loader = self._xvar_loader
+            self._running_xvar_loaders.add(old_loader)
+            old_loader.finished.connect(lambda l=old_loader: self._running_xvar_loaders.discard(l))
+            old_loader.requestInterruption()
 
         self.detail_pane.clear_details()
         self._set_activity_busy("Loading run details…")

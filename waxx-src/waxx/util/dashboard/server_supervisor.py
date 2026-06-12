@@ -31,10 +31,16 @@ from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSig
 _LOG = logging.getLogger("waxx.dashboard.supervisor")
 
 _IS_WINDOWS = sys.platform.startswith("win")
-# Windows CreateProcess flag — child gets its own process group so we can
+# Windows CreateProcess flags.
+# CREATE_NEW_PROCESS_GROUP — child gets its own process group so we can
 # send it CTRL_BREAK_EVENT for cooperative shutdown without affecting the
 # dashboard's own console.
+# CREATE_NO_WINDOW — prevents the headless Python child from inheriting (or
+# allocating) the dashboard's console.  Without this, QProcess.terminate()
+# posts WM_CLOSE to the shared console window, which terminates every
+# process attached to that console — including the dashboard itself.
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
 
 
 def _send_ctrl_break(pid: int) -> bool:
@@ -422,7 +428,7 @@ class ServerSupervisor(QObject):
         if _IS_WINDOWS:
             try:
                 def _add_new_group(args):  # noqa: ANN001 - Qt callback type
-                    args.flags |= _CREATE_NEW_PROCESS_GROUP
+                    args.flags |= _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW
                 proc.setCreateProcessArgumentsModifier(_add_new_group)
             except Exception as exc:  # pragma: no cover - PyQt API guard
                 _LOG.debug(

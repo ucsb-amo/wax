@@ -6,7 +6,7 @@ from .run_summary import RunSummary
 
 
 class MetadataCache:
-    VERSION = 1
+    VERSION = 2
     FILENAME = ".waxa_browser_cache.json"
 
     def __init__(self, data_dir: str):
