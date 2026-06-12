@@ -95,6 +95,10 @@ class _ServerTile(QFrame):
             self._restart_btn.clicked.connect(supervisor.restart)
             try:
                 supervisor.state_changed.connect(self._on_state)
+                # Sync to current state in case the supervisor already
+                # transitioned (e.g. autostart fired before the panel was
+                # realized and the tiles were constructed).
+                self._on_state(supervisor.state)
             except Exception:
                 _LOG.exception("could not connect state_changed for %s", server_id)
         else:
