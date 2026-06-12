@@ -722,14 +722,26 @@ class DashboardMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _realize_all_bodies(self) -> None:
-        n = 0
-        for panel in self._panels:
-            try:
-                panel.realize_body()
-                n += 1
-            except Exception:
-                _LOG.exception("Unexpected error realizing panel %s", panel.panel_id)
-        self.statusBar().showMessage(f"Ready - {n} panel(s) loaded", 5000)
+        # Stagger panel realization so the event loop stays alive between
+        # factories.  Heavy factories (device_control, camera widgets) that
+        # do module imports or file I/O run on the main thread, so spacing
+        # them 60 ms apart keeps the window responsive and avoids the
+        # appearance of a complete freeze during startup.
+        self._realize_pending = len(self._panels)
+        self._realize_done = 0
+        for i, panel in enumerate(self._panels):
+            QTimer.singleShot(i * 60, lambda p=panel: self._realize_one_body(p))
+
+    def _realize_one_body(self, panel) -> None:
+        try:
+            panel.realize_body()
+        except Exception:
+            _LOG.exception("Unexpected error realizing panel %s", panel.panel_id)
+        self._realize_done = getattr(self, '_realize_done', 0) + 1
+        pending = getattr(self, '_realize_pending', 0)
+        if self._realize_done >= pending:
+            self.statusBar().showMessage(
+                f"Ready - {self._realize_done} panel(s) loaded", 5000)
 
     # ------------------------------------------------------------------
     # Close event

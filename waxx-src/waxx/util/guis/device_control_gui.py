@@ -564,6 +564,65 @@ class TTLWidget(DeviceWidget):
             self.state_button.setStyleSheet("")
 
 
+class _ConfigReloadWorker(QThread):
+    """Reads the config JSON in a background thread."""
+
+    loaded = pyqtSignal(dict)
+    failed = pyqtSignal(str)  # "not_found" | "json_error:<msg>" | "error:<msg>"
+
+    def __init__(self, config_file, parent=None):
+        super().__init__(parent)
+        self._config_file = config_file
+
+    def run(self):
+        try:
+            with open(self._config_file, 'r') as f:
+                data = json.load(f)
+            self.loaded.emit(data)
+        except FileNotFoundError:
+            self.failed.emit("not_found")
+        except json.JSONDecodeError as e:
+            self.failed.emit(f"json_error:{e}")
+        except Exception as e:
+            self.failed.emit(f"error:{e}")
+
+
+class _SaveWorker(QThread):
+    """Writes config JSON in a background thread."""
+
+    save_failed = pyqtSignal(str)
+
+    def __init__(self, config_file, data, parent=None):
+        super().__init__(parent)
+        self._config_file = config_file
+        self._data = data
+
+    def run(self):
+        try:
+            with open(self._config_file, 'w') as f:
+                json.dump(self._data, f, indent=2)
+        except Exception as e:
+            self.save_failed.emit(str(e))
+
+
+class _ResetWorker(QThread):
+    """Sends reset message to monitor server off the GUI thread."""
+
+    succeeded = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, monitor_client, parent=None):
+        super().__init__(parent)
+        self._client = monitor_client
+
+    def run(self):
+        try:
+            self._client.send_reset()
+            self.succeeded.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class MonitorStatusChecker(QThread):
     """Thread that periodically checks the monitor server status"""
     status_updated = pyqtSignal(int)
@@ -844,12 +903,28 @@ class DeviceStateGUI(QMainWindow):
                 QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    self.status_checker.monitor_client.send_reset()
-                    QMessageBox.information(self, "Reset Sent", "Reset message sent to server.")
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to send reset message: {e}")
+                client = getattr(self.status_checker, 'monitor_client', None)
+                if client is None:
+                    QMessageBox.warning(self, "Not Connected",
+                        "Monitor client is not yet connected.")
+                    return
+                self.status_button.setText("Sending reset…")
+                self.status_button.setEnabled(False)
+                worker = _ResetWorker(client, self)
+                worker.succeeded.connect(self._on_reset_succeeded)
+                worker.failed.connect(self._on_reset_failed)
+                worker.finished.connect(worker.deleteLater)
+                worker.start()
+                self._reset_worker = worker
                 
+    def _on_reset_succeeded(self) -> None:
+        self.status_button.setEnabled(True)
+        QMessageBox.information(self, "Reset Sent", "Reset message sent to server.")
+
+    def _on_reset_failed(self, msg: str) -> None:
+        self.status_button.setEnabled(True)
+        QMessageBox.critical(self, "Error", f"Failed to send reset message: {msg}")
+
     def update_status_button(self, status):
         """Update the status button based on the server status"""
         self.connection_failed = False
@@ -896,33 +971,55 @@ class DeviceStateGUI(QMainWindow):
                 widget.setup_step_sizes()
         
     def load_config(self):
-        """Load configuration from JSON file"""
-        map_attempts = 0
-        decode_attempts = 0
+        """Trigger an async config load from the JSON file.
 
-        while True:
-            try:
-                with open(self.config_file, 'r') as f:
-                    new_config = json.load(f)
-                if new_config != self.config_data:
-                    self.config_data = new_config
-                    self.update_device_widgets()
-                return
-            except FileNotFoundError:
-                if map_attempts < 3:
-                    map_attempts += 1
-                    self.server_talk.check_for_mapped_data_dir()
-                    continue
-                QMessageBox.critical(self, "Error", f"Configuration file not found: {self.config_file}")
-                return
-            except json.JSONDecodeError as e:
-                decode_attempts += 1
-                if decode_attempts >= 10:
-                    QMessageBox.critical(self, "Error", f"Invalid JSON in configuration file: {e}")
-                    return
-            
+        Starts a background worker so the main thread is never blocked
+        by file I/O or network-drive access.
+        """
+        if getattr(self, '_reload_in_progress', False):
+            return
+        self._reload_in_progress = True
+        worker = _ConfigReloadWorker(self.config_file, self)
+        worker.loaded.connect(self._on_config_loaded)
+        worker.failed.connect(self._on_config_load_failed)
+        worker.finished.connect(lambda: setattr(self, '_reload_in_progress', False))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self._reload_worker = worker  # keep alive until finished
+
+    def _on_config_loaded(self, new_config: dict) -> None:
+        """Apply freshly loaded config on the main thread."""
+        self._map_retry_count = 0
+        self._decode_fail_count = 0
+        if new_config != self.config_data:
+            self.config_data = new_config
+            self.update_device_widgets()
+
+    def _on_config_load_failed(self, reason: str) -> None:
+        """Handle background config load failures without blocking."""
+        if reason == "not_found":
+            retry_count = getattr(self, '_map_retry_count', 0)
+            if retry_count < 3:
+                self._map_retry_count = retry_count + 1
+                # Retry after a short delay; if the drive needs mapping the
+                # ServerSupervisor / data_dir_guard handles that elsewhere.
+                QTimer.singleShot(2000, self.load_config)
+            else:
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Configuration file not found: {self.config_file}")
+        elif reason.startswith("json_error:"):
+            count = getattr(self, '_decode_fail_count', 0) + 1
+            self._decode_fail_count = count
+            if count >= 10:
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Invalid JSON in configuration file: {reason[len('json_error:'):]}")
+        # Other transient errors (permissions, etc.) are silently ignored;
+        # the 1-second timer will retry automatically.
+
     def check_config_changes(self):
-        """Check for changes in the config file"""
+        """Check for changes in the config file (called by 1-second timer)."""
         self.load_config()
         
     def update_device_widgets(self):
@@ -1056,9 +1153,24 @@ class DeviceStateGUI(QMainWindow):
         self.save_config()
         
     def save_config(self):
-        """Save current configuration to JSON file"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config_data, f, indent=2)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
+        """Save current configuration to JSON file (non-blocking).
+
+        Debounced: rapid successive calls collapse into one write.
+        """
+        if not hasattr(self, '_save_debounce_timer'):
+            self._save_debounce_timer = QTimer(self)
+            self._save_debounce_timer.setSingleShot(True)
+            self._save_debounce_timer.timeout.connect(self._do_save)
+        self._save_debounce_timer.start(150)  # ms; coalesces rapid changes
+
+    def _do_save(self):
+        """Perform the actual file write in a background thread."""
+        import copy  # noqa: PLC0415
+        data_snapshot = copy.deepcopy(self.config_data)
+        worker = _SaveWorker(self.config_file, data_snapshot, self)
+        worker.save_failed.connect(
+            lambda msg: QMessageBox.critical(
+                self, "Error", f"Failed to save configuration: {msg}"))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self._save_worker = worker  # keep alive until finished
