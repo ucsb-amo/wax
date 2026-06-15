@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import pickle
 import threading
+import uuid
 from typing import Optional
 
 import zmq
@@ -152,6 +153,11 @@ class BaslerCameraClient:
         self.serial = serial
         self.model = model
         self.user_id = user_id
+        # Stable per-handle identifier sent with OPEN/CLOSE so the server
+        # can ref-count concurrent clients on the same physical camera.
+        # The server keeps the device open as long as at least one client
+        # holds it; only the last close() actually stops grabbing.
+        self._client_id: str = uuid.uuid4().hex
         # Dedicated frame socket — created lazily on first ``get_frame()``
         # call.  Using a per-camera socket keeps GET_FRAME traffic off the
         # shared control socket so multiple cameras on the same server do
@@ -181,7 +187,7 @@ class BaslerCameraClient:
         return self.connection._request(cmd)
 
     def open(self) -> dict:
-        return self._req({"cmd": "OPEN_CAMERA"})
+        return self._req({"cmd": "OPEN_CAMERA", "client_id": self._client_id})
 
     def close(self) -> dict:
         # Tear down the dedicated frame socket when the camera is closed
@@ -193,7 +199,7 @@ class BaslerCameraClient:
                 except Exception:
                     pass
                 self._frame_sock = None
-        return self._req({"cmd": "CLOSE_CAMERA"})
+        return self._req({"cmd": "CLOSE_CAMERA", "client_id": self._client_id})
 
     def set_frame_timeout_ms(self, timeout_ms: int) -> None:
         """Adjust the RCVTIMEO of the dedicated frame socket (re-created

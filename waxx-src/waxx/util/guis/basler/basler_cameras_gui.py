@@ -18,10 +18,15 @@ Usage::
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal, QObject
+
+_STATE_DIR = os.path.join(os.path.expanduser("~"), ".waxx")
+_LAYOUT_FILE = os.path.join(_STATE_DIR, "basler_cameras_layout.json")
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -228,6 +233,11 @@ class BaslerCamerasMainWindow(QMainWindow):
         self._worker.cameras_found.connect(self._on_cameras_found)
         self._worker.start()
 
+        # Restore window geometry (size/position).  Dock layout is restored
+        # in _on_cameras_found once the docks exist.
+        self._restore_geometry()
+        self._layout_restored = False
+
         # ---- Periodic re-scan so newly-spawned camera servers appear
         #      without the user needing to click "Refresh".  The worker
         #      checks ``isRunning()`` itself, so we just kick it.
@@ -235,6 +245,59 @@ class BaslerCamerasMainWindow(QMainWindow):
         self._rescan_timer.setInterval(15_000)  # 15 s
         self._rescan_timer.timeout.connect(self._on_periodic_rescan)
         self._rescan_timer.start()
+
+    # ------------------------------------------------------------------ #
+    # Discovery
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Layout persistence
+    # ------------------------------------------------------------------ #
+
+    def _save_layout(self) -> None:
+        """Persist window geometry and dock arrangement to ``~/.waxx/``."""
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            data = {
+                "geometry": self.saveGeometry().toBase64().data().decode(),
+                "state": self.saveState().toBase64().data().decode(),
+            }
+            with open(_LAYOUT_FILE, "w") as fh:
+                json.dump(data, fh)
+        except Exception:
+            pass
+
+    def _restore_geometry(self) -> None:
+        """Restore window size/position from the saved layout file."""
+        try:
+            if not os.path.exists(_LAYOUT_FILE):
+                return
+            with open(_LAYOUT_FILE) as fh:
+                data = json.load(fh)
+            if "geometry" in data:
+                self.restoreGeometry(
+                    QByteArray.fromBase64(data["geometry"].encode())
+                )
+        except Exception:
+            pass
+
+    def _restore_dock_state(self) -> None:
+        """Restore dock layout (positions/tabs) from the saved layout file.
+
+        Must be called *after* the camera docks have been created so Qt
+        can match dock object-names to the saved positions.
+        """
+        try:
+            if not os.path.exists(_LAYOUT_FILE):
+                return
+            with open(_LAYOUT_FILE) as fh:
+                data = json.load(fh)
+            if "state" in data:
+                self.restoreState(
+                    QByteArray.fromBase64(data["state"].encode())
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Discovery
@@ -262,6 +325,12 @@ class BaslerCamerasMainWindow(QMainWindow):
         if self.auto_open:
             for client in new_clients:
                 self._add_camera_tile(client)
+
+        # Restore dock layout once on the first discovery round so all docks
+        # that were open last time exist before restoreState() runs.
+        if not self._layout_restored:
+            self._layout_restored = True
+            QTimer.singleShot(0, self._restore_dock_state)
 
     # ------------------------------------------------------------------ #
     # Tile management
@@ -382,6 +451,7 @@ class BaslerCamerasMainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def closeEvent(self, event) -> None:
+        self._save_layout()
         try:
             self._rescan_timer.stop()
         except Exception:

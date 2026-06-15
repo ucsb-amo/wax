@@ -1280,7 +1280,7 @@ class atomdata_base():
         ad_out.xvardims[xvar_idx] = len(ad_out.xvars[xvar_idx])
         for idx, key in enumerate(ad_out.xvarnames):
             vars(ad_out.params)[key] = ad_out.xvars[idx]
-        ad_out.params.N_repeats = np.ones(ad_out.Nvars, dtype=int)
+        ad_out.params.N_repeats = 1
 
         ad_out.sort_idx = np.array([])
         ad_out.sort_N = np.array([])

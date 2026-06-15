@@ -805,7 +805,11 @@ class TweezerController():
         self.dds[tweezer_idx].set_amp(amp,trigger)
     
     def reset_awg(self):
-        self.dds.reset()
+        try:
+            self.dds.reset()
+            self.close()
+        except Exception as e:
+            print(e)
 
     def compute_tweezer_phases(self,amplitudes):
         phases = np.zeros([len(amplitudes)])
@@ -826,7 +830,7 @@ class TweezerController():
         self.awg_trg_ttl.pulse(1.e-6)
 
     def close(self):
-        # self.card.stop()
+        self.card.stop()
         self.card.close(self.card._handle)
 
     

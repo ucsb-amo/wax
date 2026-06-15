@@ -272,6 +272,10 @@ class CountsPanel(QWidget):
                 self.viewer.norm_action.blockSignals(True)
                 self.viewer.norm_action.setChecked(True)
                 self.viewer.norm_action.blockSignals(False)
+                try:
+                    self.viewer._save_state()
+                except Exception:
+                    pass
             self.update_plot()
 
     def clear_normalization(self) -> None:
@@ -281,6 +285,10 @@ class CountsPanel(QWidget):
             self.viewer.norm_action.blockSignals(True)
             self.viewer.norm_action.setChecked(False)
             self.viewer.norm_action.blockSignals(False)
+            try:
+                self.viewer._save_state()
+            except Exception:
+                pass
         self.update_plot()
 
     def add_count(self, count: float) -> None:
@@ -828,6 +836,7 @@ class BaslerCameraWidget(QFrame):
         w.wait(200)
 
     def _do_close(self) -> None:
+        self._save_state()
         self.poll_timer.stop()
         self._stop_frame_worker()
         # Run the blocking close() on the thread pool so the GUI does not
@@ -958,6 +967,7 @@ class BaslerCameraWidget(QFrame):
             self.counts_panel.norm_reference = None
             self.counts_panel.normalize = False
         self.counts_panel.update_plot()
+        self._save_state()
 
     # keep a legacy alias so any code that used norm_btn still works
     @property

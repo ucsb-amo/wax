@@ -21,7 +21,7 @@ from waxx.util.artiq.async_print import aprint
 
 RPC_DELAY = 10.e-3
 
-class Expt(Dealer, Scanner, Scribe):
+class Expt(Scanner, Dealer, Scribe):
     def __init__(self,
                  setup_camera=True,
                  save_data=True,
@@ -32,7 +32,7 @@ class Expt(Dealer, Scanner, Scribe):
             print("Warning: The argument 'absorption_image' is depreciated -- change it out for 'imaging_type'")
             print("Defaulting to absorption imaging.")
 
-        Scanner.__init__(self)
+        # Scanner.__init__(self)
         super().__init__()
 
         self.setup_camera = setup_camera

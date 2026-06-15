@@ -292,12 +292,12 @@ class ServerSupervisor(QObject):
         If *blocking* is True the call waits up to ``graceful_stop_timeout_s``
         for the child to exit before returning.  Always idempotent.
 
-        ``QProcess.terminate()`` on Windows posts ``WM_CLOSE`` to top-level
-        windows.  Our servers are headless Python console apps with no
-        such window, so terminate is a no-op and we always end up
-        killing.  To keep dashboard close snappy we still call terminate
-        (in case a future server installs a real signal handler) but use
-        a much shorter wait before falling through to kill().
+        On Windows the preferred stop mechanism is ``CTRL_BREAK_EVENT``
+        sent to the child's process group (requires ``CREATE_NEW_PROCESS_GROUP``
+        to have been applied at spawn time).  If that path is unavailable
+        we fall back to ``kill()`` (``TerminateProcess``) rather than
+        ``terminate()`` because ``terminate()`` posts ``WM_CLOSE`` which
+        can propagate to a shared console window and kill the dashboard.
         """
         self._stop_requested = True
         if self._proc is None or not self.is_alive():
@@ -312,10 +312,24 @@ class ServerSupervisor(QObject):
                 pid = 0
             sent_break = _send_ctrl_break(pid)
         if not sent_break:
-            try:
-                self._proc.terminate()
-            except Exception as exc:
-                _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+            if _IS_WINDOWS:
+                # On Windows, QProcess.terminate() posts WM_CLOSE to the
+                # process's console window.  If CREATE_NO_WINDOW was not
+                # applied (e.g. setCreateProcessArgumentsModifier silently
+                # failed in this PyQt6 build), the child shares the
+                # dashboard's console and WM_CLOSE would kill the whole
+                # dashboard.  Use kill() (TerminateProcess) instead — it is
+                # process-local and never affects the caller.
+                _LOG.info("%s: CTRL_BREAK unavailable, using kill()", self.server_id)
+                try:
+                    self._proc.kill()
+                except Exception as exc:
+                    _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
+            else:
+                try:
+                    self._proc.terminate()
+                except Exception as exc:
+                    _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
         if blocking:
             # Short grace window for cooperative shutdown, then kill.
             # The previous 5 s timeout multiplied by N supervisors froze
@@ -348,8 +362,9 @@ class ServerSupervisor(QObject):
         group (the child was spawned with ``CREATE_NEW_PROCESS_GROUP``);
         Python turns that into ``SIGBREAK`` → ``KeyboardInterrupt``, so a
         normal server loop unwinds with a 0 exit code instead of being
-        hard-killed.  We also call ``terminate()`` as a fallback in case
-        a future server installs a real top-level window handler.
+        hard-killed.  If CTRL_BREAK is unavailable we fall back to
+        ``kill()`` rather than ``terminate()`` to avoid ``WM_CLOSE``
+        reaching a shared console window.
         """
         self._stop_requested = True
         if self._proc is None or not self.is_alive():
@@ -364,10 +379,19 @@ class ServerSupervisor(QObject):
                 pid = 0
             sent_break = _send_ctrl_break(pid)
         if not sent_break:
-            try:
-                self._proc.terminate()
-            except Exception as exc:
-                _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+            if _IS_WINDOWS:
+                # Same rationale as in stop(): avoid terminate() on Windows
+                # to prevent WM_CLOSE reaching a shared console window.
+                _LOG.info("%s: CTRL_BREAK unavailable, using kill()", self.server_id)
+                try:
+                    self._proc.kill()
+                except Exception as exc:
+                    _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
+            else:
+                try:
+                    self._proc.terminate()
+                except Exception as exc:
+                    _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
 
     def force_kill(self, *, wait_ms: int = 500) -> None:
         """Hard-kill the child if it's still alive, then wait briefly."""

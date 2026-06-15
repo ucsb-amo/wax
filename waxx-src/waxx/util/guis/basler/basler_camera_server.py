@@ -75,6 +75,12 @@ class _ManagedCamera:
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_timestamp: float = 0.0
         self._is_open: bool = False
+        # Set of client_ids currently holding this camera open.  The
+        # physical device stays open as long as the set is non-empty;
+        # close() only tears it down when the last client lets go (or
+        # when called with force=True, e.g. server shutdown / operator
+        # override on the local GUI).
+        self._clients: set[str] = set()
 
         self._grab_stop = threading.Event()
         self._grab_thread: Optional[threading.Thread] = None
@@ -87,9 +93,16 @@ class _ManagedCamera:
     def is_open(self) -> bool:
         return self._is_open
 
-    def open(self) -> None:
+    def open(self, client_id: str) -> None:
         with self._lock:
+            self._clients.add(client_id)
             if self._is_open:
+                # Camera already streaming for another client; this new
+                # client just shares it.  Nothing else to do.
+                logger.info(
+                    "[BaslerServer] Camera %s shared (now %d client(s))",
+                    self.serial, len(self._clients),
+                )
                 return
             # Re-enumerate to get a fresh DeviceInfo (handles re-plug).
             tl = pylon.TlFactory.GetInstance()
@@ -124,7 +137,22 @@ class _ManagedCamera:
         self._grab_thread.start()
         logger.info("[BaslerServer] Opened camera %s (%s)", self.serial, self.model)
 
-    def close(self) -> None:
+    def close(self, client_id: str, force: bool = False) -> None:
+        with self._lock:
+            self._clients.discard(client_id)
+            if not self._is_open:
+                return
+            if self._clients and not force:
+                logger.info(
+                    "[BaslerServer] Camera %s still held by %d client(s); leaving open",
+                    self.serial, len(self._clients),
+                )
+                return
+            if force:
+                # Operator / shutdown override: drop any remaining holders
+                # so a subsequent open() does a fresh device acquisition.
+                self._clients.clear()
+        # Tear down outside the lock so the grab thread can exit cleanly.
         self._grab_stop.set()
         if self._grab_thread is not None:
             self._grab_thread.join(timeout=3.0)
@@ -404,7 +432,7 @@ class BaslerCameraServer(WaxxServer):
             for mc in self._cameras.values():
                 if mc.is_open:
                     try:
-                        mc.close()
+                        mc.close("__shutdown__", force=True)
                     except Exception:
                         pass
             rep_socket.close()
@@ -448,15 +476,17 @@ class BaslerCameraServer(WaxxServer):
         mc = self._cameras[serial]
 
         if name == "OPEN_CAMERA":
+            client_id = cmd.get("client_id") or f"anon:{id(cmd)}"
             try:
-                mc.open()
+                mc.open(client_id)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
         if name == "CLOSE_CAMERA":
+            client_id = cmd.get("client_id") or f"anon:{id(cmd)}"
             try:
-                mc.close()
+                mc.close(client_id)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}

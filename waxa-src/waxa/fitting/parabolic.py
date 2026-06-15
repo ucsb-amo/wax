@@ -15,8 +15,8 @@ class KinematicFit(Fit):
             self.popt, pcov = self._fit(self.xdata,self.ydata)
         except Exception as e:
             print(e)
-            self.popt = [np.NaN]*3
-            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.NaN)
+            self.popt = [np.nan]*3
+            self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.nan)
 
         x0, v0, a = self.popt
         self.x0 = x0
