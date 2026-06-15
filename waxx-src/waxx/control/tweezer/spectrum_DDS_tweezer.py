@@ -831,6 +831,6 @@ class TweezerController():
 
     def close(self):
         self.card.stop()
-        self.card.close(self.card._handle)
+        # self.card.close(self.card._handle)
 
     
