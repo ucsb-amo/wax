@@ -13,6 +13,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
+import collections
 import cv2
 import numpy as np
 import pyqtgraph as pg
@@ -239,8 +240,11 @@ class CountsPanel(QWidget):
         self.vb2.addItem(self.norm_line)
         self.norm_line.hide()
 
-        self.timestamps: list[float] = []
-        self.counts: list[float] = []
+        # Capped at ~30 min of data at 20 fps; prevents unbounded O(n)
+        # linear scan in update_plot() after long runs.
+        _MAX_COUNTS = 36_000
+        self.timestamps: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
+        self.counts: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
         self.start_time: Optional[datetime] = None
 
         self.fixed_interval: bool = True
@@ -338,8 +342,8 @@ class CountsPanel(QWidget):
             self.norm_ref_line.hide()
 
     def clear_data(self) -> None:
-        self.timestamps = []
-        self.counts = []
+        self.timestamps = collections.deque(maxlen=self.timestamps.maxlen)
+        self.counts = collections.deque(maxlen=self.counts.maxlen)
         self.start_time = None
         self.update_plot()
 

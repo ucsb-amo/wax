@@ -278,6 +278,7 @@ class DashboardMainWindow(QMainWindow):
             except Exception:
                 pass
         self.setDockNestingEnabled(True)
+        self.setAnimated(False)  # disable dock-snap animations for snappier drag/drop
         self.setObjectName(f"DashboardMainWindow::{kind}")
 
         # Initial status bar message; replaced after we know how many panels loaded.
@@ -345,6 +346,7 @@ class DashboardMainWindow(QMainWindow):
                 inner = QMainWindow(self)
                 inner.setObjectName(f"DashboardPageWindow::{kind}::{page}")
                 inner.setDockNestingEnabled(True)
+                inner.setAnimated(False)  # match outer window: no snap animations
                 # Inner needs a (hidden) central widget so docks anchor sanely.
                 center = QWidget(inner)
                 center.setMinimumSize(0, 0)

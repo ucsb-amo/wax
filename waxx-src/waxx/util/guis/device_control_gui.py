@@ -20,6 +20,10 @@ import time
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
 from waxa.data.server_talk import server_talk
+from waxa.browser.browser_window import (
+    parse_name_search_terms,
+    name_matches_all_terms,
+)
 
 PX_WIDTH_PER_COLUMN = 100
 STATE_BUTTON_ON_COLOR = "green"
@@ -43,6 +47,12 @@ class DeviceWidget(QWidget):
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         raise NotImplementedError
+
+    def set_search_highlight(self, matched: bool) -> None:
+        """Highlight the device label in light blue when matched by search."""
+        lbl = getattr(self, "device_label", None)
+        if lbl is not None:
+            lbl.setStyleSheet("QLineEdit { background-color: #1a4f72; color: #e8e8e8; }" if matched else "")
 
 class DDSWidget(DeviceWidget):
     """Widget for controlling DDS devices"""
@@ -388,11 +398,11 @@ class DACWidget(DeviceWidget):
     def setup_ui(self):
         layout = QVBoxLayout()
 
-        label = QLineEdit(self.device_name)
-        label.setCursorPosition(0)
-        label.setReadOnly(True)
-        label.setToolTip(self.device_name)
-        layout.addWidget(label)
+        self.device_label = QLineEdit(self.device_name)
+        self.device_label.setCursorPosition(0)
+        self.device_label.setReadOnly(True)
+        self.device_label.setToolTip(self.device_name)
+        layout.addWidget(self.device_label)
         
         # Voltage control
         voltage_layout = QHBoxLayout()
@@ -793,9 +803,18 @@ class DeviceStateGUI(QMainWindow):
         self.instant_apply_button.setMaximumHeight(20)
         self.instant_apply_button.toggled.connect(self.on_instant_apply_toggled)
         dds_step_layout.addWidget(self.instant_apply_button)
-        
+
+        # Search bar inline at the right of the step-settings row.
+        self.dds_search_bar = QLineEdit()
+        self.dds_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
+        self.dds_search_bar.setClearButtonEnabled(True)
+        self.dds_search_bar.setMaximumHeight(20)
+        self.dds_search_bar.textChanged.connect(self._apply_dds_search)
+        dds_step_layout.addSpacing(10)
+        dds_step_layout.addWidget(self.dds_search_bar)
+
         dds_tab_layout.addLayout(dds_step_layout)
-        
+
         # DDS devices grid layout
         self.dds_layout = QGridLayout()
         dds_tab_layout.addLayout(self.dds_layout)
@@ -833,10 +852,18 @@ class DeviceStateGUI(QMainWindow):
         self.dac_voltage_step_spinbox.setSuffix(" V")
         self.dac_voltage_step_spinbox.setMaximumHeight(20)
         dac_step_layout.addWidget(self.dac_voltage_step_spinbox)
-        
-        dac_step_layout.addStretch()
+
+        # Search bar inline at the right of the step-settings row.
+        self.dac_search_bar = QLineEdit()
+        self.dac_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
+        self.dac_search_bar.setClearButtonEnabled(True)
+        self.dac_search_bar.setMaximumHeight(20)
+        self.dac_search_bar.textChanged.connect(self._apply_dac_search)
+        dac_step_layout.addSpacing(10)
+        dac_step_layout.addWidget(self.dac_search_bar)
+
         dac_tab_layout.addLayout(dac_step_layout)
-        
+
         # DAC devices grid layout
         self.dac_layout = QGridLayout()
         dac_tab_layout.addLayout(self.dac_layout)
@@ -846,8 +873,28 @@ class DeviceStateGUI(QMainWindow):
         self.dac_voltage_step_spinbox.valueChanged.connect(self.on_dac_step_size_changed)
         
         # Setup TTL tab
+        ttl_tab_layout = QVBoxLayout()
+
+        # TTL channel search bar
+        self.ttl_search_bar = QLineEdit()
+        self.ttl_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
+        self.ttl_search_bar.setClearButtonEnabled(True)
+        self.ttl_search_bar.textChanged.connect(self._apply_ttl_search)
+        ttl_tab_layout.addWidget(self.ttl_search_bar)
+
         self.ttl_layout = QGridLayout()
-        self.ttl_tab.setLayout(self.ttl_layout)
+        ttl_tab_layout.addLayout(self.ttl_layout)
+        self.ttl_tab.setLayout(ttl_tab_layout)
+
+        # Ctrl+F focuses the search bar of the active tab.
+        # Must be on the central widget (not self) so the shortcut fires when
+        # DeviceStateGUI is embedded inside a dashboard panel (the QMainWindow
+        # itself is hidden by embed_main_window; shortcuts on hidden widgets
+        # do not fire).
+        from PyQt6.QtGui import QKeySequence, QShortcut  # noqa: PLC0415
+        _ctrlf = QShortcut(QKeySequence("Ctrl+F"), central_widget)
+        _ctrlf.setContext(Qt.ShortcutContext.WindowShortcut)
+        _ctrlf.activated.connect(self._focus_active_search_bar)
 
     def _set_window_icon(self):
         """Set a game-controller emoji icon for the window and taskbar."""
@@ -969,7 +1016,37 @@ class DeviceStateGUI(QMainWindow):
         for widget_key, widget in self.device_widgets.items():
             if widget_key.startswith("dds."):
                 widget.setup_step_sizes()
-        
+
+    # ------------------------------------------------------------------
+    # Channel search
+    # ------------------------------------------------------------------
+
+    def _focus_active_search_bar(self) -> None:
+        """Ctrl+F: focus the search bar of the currently visible tab."""
+        bars = [self.dds_search_bar, self.dac_search_bar, self.ttl_search_bar]
+        bar = bars[self.tab_widget.currentIndex()]
+        bar.setFocus()
+        bar.selectAll()
+
+    def _apply_search(self, query: str, device_prefix: str) -> None:
+        """Highlight device labels that match *query* for the given prefix (dds/dac/ttl)."""
+        terms = parse_name_search_terms(query)
+        prefix = device_prefix + "."
+        for key, widget in self.device_widgets.items():
+            if not key.startswith(prefix):
+                continue
+            device_name = key[len(prefix):]
+            widget.set_search_highlight(bool(terms) and name_matches_all_terms(device_name, terms))
+
+    def _apply_dds_search(self, query: str) -> None:
+        self._apply_search(query, "dds")
+
+    def _apply_dac_search(self, query: str) -> None:
+        self._apply_search(query, "dac")
+
+    def _apply_ttl_search(self, query: str) -> None:
+        self._apply_search(query, "ttl")
+
     def load_config(self):
         """Trigger an async config load from the JSON file.
 
@@ -1109,7 +1186,12 @@ class DeviceStateGUI(QMainWindow):
                     self.ttl_layout.addWidget(widget, row_idx, col_idx)
         
         self.adjust_window_width()
-            
+
+        # Re-apply active searches so highlights survive config reloads.
+        self._apply_dds_search(self.dds_search_bar.text())
+        self._apply_dac_search(self.dac_search_bar.text())
+        self._apply_ttl_search(self.ttl_search_bar.text())
+
     def closeEvent(self, event):
         """Handle window close event"""
         if self.status_checker:

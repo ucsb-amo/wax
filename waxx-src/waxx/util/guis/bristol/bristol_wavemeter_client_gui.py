@@ -6,6 +6,7 @@ to avoid duplicating the shared f\u2080 / \u0394 widget.
 """
 from __future__ import annotations
 
+import collections
 import sys
 import threading
 import time
@@ -46,8 +47,10 @@ class BristolDetuningWidget(QWidget):
         super().__init__()
         self._client: BristolWavemeterGuiClient | None = None
         self._connecting = False
-        self._times: list[float] = []
-        self._detunings_ghz: list[float] = []
+        # Bounded to _MAX_HISTORY_S worth of data; deque auto-evicts oldest
+        # so the O(n) pop(0) trim loop is no longer needed.
+        self._times: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
+        self._detunings_ghz: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
         self._start_time = time.time()
         self._setup_ui()
         self._timer = QTimer(self)
@@ -203,15 +206,10 @@ class BristolDetuningWidget(QWidget):
         self._times.append(t)
         self._detunings_ghz.append(det)
 
-        cutoff = t - _MAX_HISTORY_S
-        while self._times and self._times[0] < cutoff:
-            self._times.pop(0)
-            self._detunings_ghz.pop(0)
-
-        self._curve.setData(self._times, self._detunings_ghz)
+        self._curve.setData(list(self._times), list(self._detunings_ghz))
 
         N = self._n_spin.value()
-        recent = [v for v in self._detunings_ghz[-N:] if not np.isnan(v)]
+        recent = [v for v in list(self._detunings_ghz)[-N:] if not np.isnan(v)]
         if recent:
             avg = float(np.mean(recent))
             std = float(np.std(recent, ddof=1)) if len(recent) > 1 else 0.0
@@ -227,7 +225,7 @@ class BristolDetuningWidget(QWidget):
     def _clear(self) -> None:
         self._times.clear()
         self._detunings_ghz.clear()
-        self._start_time = time.time()
+        self._start_time = time.time()  # reset so deque maxlen stays consistent
         self._curve.clear()
         self._plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
         self._avg_lbl.setText("avg: \u2014")

@@ -20,6 +20,7 @@ import numpy as np
 
 import json
 import socket
+import time
 
 from waxx.util.comms_server.waxx_client import WaxxClient
 
@@ -144,7 +145,15 @@ class HMRClient(WaxxClient):
             try:
                 result = self._get_field(timeout=per_try_timeout)
                 if not result.get("ok"):
-                    raise RuntimeError(result.get("error", "Server returned error"))
+                    error_msg = result.get("error", "Server returned error")
+                    if "No data available yet" in error_msg:
+                        if attempt < max_attempts - 1:
+                            time.sleep(0.5)
+                            continue
+                        else:
+                            print(f"Reading magnetometer failed after {max_attempts} attempts: {error_msg}")
+                            return float(0.)
+                    raise RuntimeError(error_msg)
                 return float(result["Btot"])
             except (socket.timeout, socket.error) as e:
                 if attempt == max_attempts - 1:

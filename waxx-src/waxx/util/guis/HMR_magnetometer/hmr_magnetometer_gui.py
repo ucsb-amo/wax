@@ -61,7 +61,14 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.worker_thread = None
         self.stop_event = threading.Event()
         self.data_queue: queue.Queue = queue.Queue()
-        self.log_data = []
+        # Parallel deques for log data — ~24 h at 10 Hz, using flat floats
+        # instead of dicts to avoid Python object overhead (~18x smaller).
+        _LOG_MAXLEN = 864_000
+        self.log_t: deque = deque(maxlen=_LOG_MAXLEN)
+        self.log_x: deque = deque(maxlen=_LOG_MAXLEN)
+        self.log_y: deque = deque(maxlen=_LOG_MAXLEN)
+        self.log_z: deque = deque(maxlen=_LOG_MAXLEN)
+        self.log_btot: deque = deque(maxlen=_LOG_MAXLEN)
         self.session_id = 0
         self.internal_ylim_update = False
         self.manual_ylim: dict = {}
@@ -74,6 +81,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.mag_buffer = deque(maxlen=PLOT_BUFFER_MAXLEN)
 
         # Settings
+        self.server_host = DEFAULT_SERVER_HOST
         try:
             self.client: HMRClient | None = HMRClient()
         except RuntimeError:
@@ -965,8 +973,11 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 btot = item["Btot"]
                 t    = item["t"]
 
-                self.log_data.append({"timestamp_s": t, "x_G": x, "y_G": y,
-                                      "z_G": z, "btot_G": btot})
+                self.log_t.append(t)
+                self.log_x.append(x)
+                self.log_y.append(y)
+                self.log_z.append(z)
+                self.log_btot.append(btot)
                 self.time_buffer.append(t)
                 self.x_buffer.append(x)
                 self.y_buffer.append(y)
@@ -1092,9 +1103,9 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 break
 
         for buf in (self.time_buffer, self.x_buffer, self.y_buffer, self.z_buffer,
-                    self.mag_buffer):
+                    self.mag_buffer, self.log_t, self.log_x, self.log_y, self.log_z,
+                    self.log_btot):
             buf.clear()
-        self.log_data.clear()
 
         self.internal_ylim_update = True
         for key, p in self.plot_items.items():
@@ -1117,7 +1128,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self._set_status("Data cleared")
 
     def save_log(self):
-        if not self.log_data:
+        if not self.log_t:
             QtWidgets.QMessageBox.warning(self, "No Data", "No data to save.")
             return
 
@@ -1133,8 +1144,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
-                for row in self.log_data:
-                    writer.writerow({k: row[k] for k in fields})
+                for t, x, y, z, b in zip(
+                    self.log_t, self.log_x, self.log_y, self.log_z, self.log_btot
+                ):
+                    writer.writerow({"timestamp_s": t, "x_G": x, "y_G": y, "z_G": z, "btot_G": b})
             self._set_status(f"Saved: {path}")
             QtWidgets.QMessageBox.information(self, "Saved", f"Log saved to:\n{path}")
         except Exception as exc:
