@@ -194,11 +194,16 @@ class MonitorServerGUI(QWidget):
             self.monitor_manager.start()
 
     def restart_monitor(self):
-        if self.monitor_manager.isRunning():
-            self.monitor_manager.terminate()
-            self.monitor_manager.wait(500)  # wait up to 500 ms for thread to actually finish
-        self.monitor_manager.start()
-        self.set_status(STATES.LOADING)
+        if getattr(self, "_restarting", False):
+            return
+        self._restarting = True
+        try:
+            if self.monitor_manager.isRunning():
+                self.monitor_manager.stop()
+            self.monitor_manager.start()
+            self.set_status(STATES.LOADING)
+        finally:
+            self._restarting = False
 
     def set_status(self, status):
         if status == STATES.READY:
@@ -237,6 +242,5 @@ class MonitorServerGUI(QWidget):
         self.udp_server.stop()
         self.server_thread.quit()
         self.server_thread.wait()
-        self.monitor_manager.terminate()
-        self.monitor_manager.wait()
+        self.monitor_manager.stop()
         event.accept()

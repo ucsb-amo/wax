@@ -58,11 +58,16 @@ class HeadlessMonitorServer(QObject):
         self.server_thread.start()
 
     def _restart_monitor(self) -> None:
-        if self.monitor_manager.isRunning():
-            self.monitor_manager.terminate()
-            self.monitor_manager.wait(500)
-        self.monitor_manager.start()
-        self._set_status(STATES.LOADING)
+        if getattr(self, "_restarting", False):
+            return
+        self._restarting = True
+        try:
+            if self.monitor_manager.isRunning():
+                self.monitor_manager.stop()
+            self.monitor_manager.start()
+            self._set_status(STATES.LOADING)
+        finally:
+            self._restarting = False
 
     def _set_status(self, status) -> None:
         self.status.state = status
@@ -91,8 +96,7 @@ class HeadlessMonitorServer(QObject):
         self.server_thread.quit()
         self.server_thread.wait()
         try:
-            self.monitor_manager.terminate()
-            self.monitor_manager.wait()
+            self.monitor_manager.stop()
         except Exception:
             pass
 
