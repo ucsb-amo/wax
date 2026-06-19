@@ -69,6 +69,7 @@ class DDSWidget(DeviceWidget):
         self.device_label = None  # Will store reference to label for tooltip update
         # Store previous values for undo functionality
         self.prev_freq = None
+        self.prev_freq_unit = None
         self.prev_amp = None
         self.prev_vpd = None
         self.prev_sw_state = None
@@ -169,7 +170,11 @@ class DDSWidget(DeviceWidget):
     def on_default_undo_clicked(self):
         """Handle default/undo button click"""
         if self.has_unsaved_changes:
-            # Undo: restore previous values
+            # Undo: restore previous values. Restore the frequency unit first so
+            # the spinbox range matches the stored value's unit before writing it
+            # (otherwise an MHz value gets clamped into a Γ-ranged spinbox).
+            if self.prev_freq_unit is not None:
+                self.freq_unit_combo.setCurrentText(self.prev_freq_unit)
             with QSignalBlocker(self.freq_spinbox):
                 self.freq_spinbox.setValue(self.prev_freq)
             with QSignalBlocker(self.amp_spinbox):
@@ -190,6 +195,14 @@ class DDSWidget(DeviceWidget):
         else:
             # Reset to default values — mark as pending until Enter is pressed
             if hasattr(self.dds_frame_obj, self.device_name):
+                # Snapshot the pre-default state so undo restores exactly what
+                # was on screen (including the current frequency unit) before
+                # "default" switched the unit and wrote the default value.
+                self.prev_freq_unit = self.freq_unit_combo.currentText()
+                self.prev_freq = self.freq_spinbox.value()
+                self.prev_amp = self.amp_spinbox.value()
+                self.prev_vpd = self.vpd_spinbox.value()
+                self.prev_sw_state = self.state_button.isChecked()
                 dds = vars(self.dds_frame_obj)[self.device_name]
                 # If this channel is defined by detuning (has a transition),
                 # show the default in Γ units; otherwise show it in MHz.
@@ -327,6 +340,7 @@ class DDSWidget(DeviceWidget):
         """Handle update button click (triggered by editingFinished)"""
         # Store current values as previous for next undo
         self.prev_freq = self.freq_spinbox.value()
+        self.prev_freq_unit = self.freq_unit_combo.currentText()
         self.prev_amp = self.amp_spinbox.value()
         self.prev_vpd = self.vpd_spinbox.value()
         self.prev_sw_state = self.state_button.isChecked()
@@ -398,6 +412,7 @@ class DDSWidget(DeviceWidget):
             
             # Store as previous values for undo
             self.prev_freq = self.freq_spinbox.value()
+            self.prev_freq_unit = self.freq_unit_combo.currentText()
             self.prev_amp = self.amp_spinbox.value()
             self.prev_vpd = self.vpd_spinbox.value()
             

@@ -106,6 +106,10 @@ class BaslerServerConnection(WaxxClient):
                     )
                 except Exception:
                     if attempt == 0:
+                        # The server may have restarted on a new ephemeral
+                        # port; refresh the address before reconnecting so we
+                        # don't keep dialing the dead one.
+                        self._rediscover(timeout=2.0)
                         self._connect()
                         continue
                     raise
@@ -158,6 +162,14 @@ class BaslerCameraClient:
         # The server keeps the device open as long as at least one client
         # holds it; only the last close() actually stops grabbing.
         self._client_id: str = uuid.uuid4().hex
+        # Tracks whether this handle currently holds the camera open on the
+        # server.  Set by ``open()`` / cleared by ``close()``.  Used to decide
+        # whether to transparently re-send OPEN after a server restart.
+        self._is_open: bool = False
+        # The connection's ``reconnect_generation`` value last acted upon.
+        # When the connection rediscovers the server at a new address this
+        # diverges, signalling that we must re-establish server-side state.
+        self._seen_reconnect_generation: int = connection.reconnect_generation
         # Dedicated frame socket — created lazily on first ``get_frame()``
         # call.  Using a per-camera socket keeps GET_FRAME traffic off the
         # shared control socket so multiple cameras on the same server do
@@ -187,9 +199,18 @@ class BaslerCameraClient:
         return self.connection._request(cmd)
 
     def open(self) -> dict:
-        return self._req({"cmd": "OPEN_CAMERA", "client_id": self._client_id})
+        resp = self._req({"cmd": "OPEN_CAMERA", "client_id": self._client_id})
+        if not isinstance(resp, dict) or resp.get("ok", True):
+            # Treat a missing "ok" as success (legacy replies); only an
+            # explicit failure leaves us in the closed state.
+            self._is_open = True
+        # Whatever the connection's address is now, consider it the baseline
+        # so we don't immediately try to "re-open" on the next frame.
+        self._seen_reconnect_generation = self.connection.reconnect_generation
+        return resp
 
     def close(self) -> dict:
+        self._is_open = False
         # Tear down the dedicated frame socket when the camera is closed
         # so we do not leak FDs and the next open() reconnects cleanly.
         with self._frame_lock:
@@ -200,6 +221,38 @@ class BaslerCameraClient:
                     pass
                 self._frame_sock = None
         return self._req({"cmd": "CLOSE_CAMERA", "client_id": self._client_id})
+
+    def _maybe_reopen_after_reconnect(self) -> bool:
+        """Re-establish camera state after the server restarted.
+
+        A restarted ``BaslerCameraServer`` binds a new ephemeral port and
+        loses all open-camera state.  Once the connection has rediscovered
+        the new address (``reconnect_generation`` advanced), re-send OPEN so
+        the fresh server starts grabbing again.  No-op unless this handle was
+        previously opened.  Returns ``True`` if a reopen was attempted.
+        """
+        gen = self.connection.reconnect_generation
+        if gen == self._seen_reconnect_generation:
+            return False
+        self._seen_reconnect_generation = gen
+        if not self._is_open:
+            return False
+        # Drop the stale frame socket so the next fetch reconnects fresh.
+        with self._frame_lock:
+            if self._frame_sock is not None:
+                try:
+                    self._frame_sock.close(linger=0)
+                except Exception:
+                    pass
+                self._frame_sock = None
+        try:
+            self._req({"cmd": "OPEN_CAMERA", "client_id": self._client_id})
+        except Exception:
+            # The server may not be reachable yet; leave _is_open set so a
+            # later frame attempt retries the reopen.
+            self._seen_reconnect_generation = gen - 1
+            return False
+        return True
 
     def set_frame_timeout_ms(self, timeout_ms: int) -> None:
         """Adjust the RCVTIMEO of the dedicated frame socket (re-created
@@ -221,6 +274,9 @@ class BaslerCameraClient:
         rather than blocking for the control-socket timeout.  Does NOT touch
         the shared control socket / lock.
         """
+        # If the server restarted, re-open the camera on the new address
+        # before fetching so the fresh server is actually grabbing.
+        self._maybe_reopen_after_reconnect()
         cmd = {"cmd": "GET_FRAME", "serial": self.serial}
         with self._frame_lock:
             if self._frame_sock is None:
@@ -239,6 +295,11 @@ class BaslerCameraClient:
                         self._frame_sock.close(linger=0)
                     except Exception:
                         pass
+                    # A persistent miss may mean the server moved (restarted
+                    # on a new port).  Refresh the address so the rebuilt
+                    # socket dials the live server, not the dead one.
+                    if attempt == 0:
+                        self.connection._rediscover(timeout=1.0)
                     self._frame_sock = self.connection.make_socket(
                         rcvtimeo_ms=self._frame_rcvtimeo_ms,
                         sndtimeo_ms=1000,
@@ -282,6 +343,30 @@ class BaslerCameraClient:
 
     def get_trigger_mode_options(self) -> dict:
         return self._req({"cmd": "GET_TRIGGER_MODE_OPTIONS"})
+
+    def set_defaults(self, gain=None, exposure=None, trigger_mode=None,
+                     roi=None, norm_reference=None) -> dict:
+        """Persist this camera's open-time defaults on the server.
+
+        Only non-None values are sent.  gain/exposure/trigger_mode are applied
+        to the hardware on the next open; roi and norm_reference are opaque
+        client display values the server stores and echoes back.
+        """
+        cmd: dict = {"cmd": "SET_DEFAULTS"}
+        if gain is not None:
+            cmd["gain"] = float(gain)
+        if exposure is not None:
+            cmd["exposure"] = float(exposure)
+        if trigger_mode is not None:
+            cmd["trigger_mode"] = str(trigger_mode)
+        if roi is not None:
+            cmd["roi"] = [int(v) for v in roi]
+        if norm_reference is not None:
+            cmd["norm_reference"] = float(norm_reference)
+        return self._req(cmd)
+
+    def get_defaults(self) -> dict:
+        return self._req({"cmd": "GET_DEFAULTS"})
 
 
 # ---------------------------------------------------------------------------
