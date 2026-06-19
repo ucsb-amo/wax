@@ -332,9 +332,19 @@ class ParamSearchDialog(QDialog):
     def set_loading_state(self, run: RunSummary):
         self._remember_selection_for_active_mode()
         self.set_run(run)
+        self._records_by_mode = {mode: [] for mode in PARAM_SEARCH_MODES}
         self.status_label.setText("Loading values…")
         self.results_table.setRowCount(0)
         self.detail_value.setPlainText("Loading values…")
+
+    def append_records(self, mode: str, records: list):
+        """Add records for one mode group; refreshes the table if that mode is active."""
+        self._records_by_mode[mode] = list(records)
+        n = len(records)
+        self.status_label.setText(f"{mode}: {n} entries loaded")
+        if mode == self._active_mode:
+            preferred_name = self._preferred_name_by_mode.get(self._active_mode)
+            self._apply_filter(preferred_name=preferred_name)
 
     def set_error_message(self, message: str):
         self.status_label.setText("Load failed")
@@ -2527,12 +2537,18 @@ class DataBrowserWindow(QMainWindow):
                 return
 
         LOGGER.info("Param search load started: run_id=%s", target_run_id)
+        # Cancel any in-flight loader so it stops competing for I/O
+        if self._param_search_loader is not None and self._param_search_loader.isRunning():
+            self._param_search_loader.requestInterruption()
         dialog.set_loading_state(run)
         self._set_activity_busy("Loading params…")
         self._param_search_request_id += 1
         current_request_id = self._param_search_request_id
         self._param_search_loading_run_id = target_run_id
         self._param_search_loader = ParamSearchLoader(run.filepath)
+        self._param_search_loader.partial_records_ready.connect(
+            lambda mode, records, req_id=current_request_id: self._on_param_search_partial_records_guarded(mode, records, req_id)
+        )
         self._param_search_loader.records_ready.connect(
             lambda records, rid=run.run_id, req_id=current_request_id: self._on_param_search_records_ready_guarded(rid, records, req_id)
         )
@@ -2567,6 +2583,12 @@ class DataBrowserWindow(QMainWindow):
         self.settings.setValue("paramSearchMode", dialog._active_mode)
         self.status_label.setText(f"Loaded params for run {run_id}")
         self._set_activity_idle()
+
+    def _on_param_search_partial_records_guarded(self, mode: str, records: list, request_id: int):
+        if request_id != self._param_search_request_id:
+            return
+        dialog = self._ensure_param_search_dialog()
+        dialog.append_records(mode, records)
 
     def _on_param_search_records_ready_guarded(self, run_id: int, records: dict, request_id: int):
         if request_id != self._param_search_request_id:

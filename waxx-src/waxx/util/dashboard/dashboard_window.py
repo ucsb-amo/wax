@@ -575,6 +575,29 @@ class DashboardMainWindow(QMainWindow):
         self._settings.remove(self._layout_key("state"))
         QMessageBox.information(self, "Reset layout", "Layout cleared. Restart the dashboard to apply.")
 
+    def _apply_layout_snapshot(self, snap: dict) -> bool:
+        """Apply a previously captured layout snapshot.
+
+        Returns ``True`` if the snapshot was applied successfully.
+        """
+        if not snap:
+            return False
+        try:
+            geo = snap.get("geometry")
+            state = snap.get("state")
+            if geo is not None:
+                self.restoreGeometry(geo)
+            if state is not None:
+                self.restoreState(state)
+            for page, ps in (snap.get("page_states") or {}).items():
+                inner = self._page_windows.get(page)
+                if inner is not None and inner is not self and ps is not None:
+                    inner.restoreState(ps)
+            return True
+        except Exception as exc:
+            _LOG.warning("Failed to apply layout snapshot: %r", exc)
+            return False
+
     def _snap_default_layout(self) -> None:
         """Snap back to the last loaded layout.
 
@@ -584,22 +607,9 @@ class DashboardMainWindow(QMainWindow):
         original placement spec.
         """
         snap = getattr(self, "_last_loaded_layout", None)
-        if snap:
-            try:
-                geo = snap.get("geometry")
-                state = snap.get("state")
-                if geo is not None:
-                    self.restoreGeometry(geo)
-                if state is not None:
-                    self.restoreState(state)
-                for page, ps in (snap.get("page_states") or {}).items():
-                    inner = self._page_windows.get(page)
-                    if inner is not None and inner is not self and ps is not None:
-                        inner.restoreState(ps)
-                self.statusBar().showMessage("Snapped to last loaded layout", 3000)
-                return
-            except Exception as exc:
-                _LOG.warning("Snap to last loaded layout failed, using default spec: %r", exc)
+        if snap and self._apply_layout_snapshot(snap):
+            self.statusBar().showMessage("Snapped to last loaded layout", 3000)
+            return
         # Fall back: re-apply the original placement spec live.
         for panel in self._panels:
             try:
@@ -742,6 +752,14 @@ class DashboardMainWindow(QMainWindow):
         self._realize_done = getattr(self, '_realize_done', 0) + 1
         pending = getattr(self, '_realize_pending', 0)
         if self._realize_done >= pending:
+            # Re-apply the layout captured at startup.  The initial
+            # restoreState() in __init__ runs before panel bodies exist, so
+            # realizing the bodies resizes/re-docks panels and clobbers the
+            # restored arrangement.  Now that every body is realized, apply
+            # the snapshot once more so the saved layout actually sticks.
+            snap = getattr(self, "_last_loaded_layout", None)
+            if snap:
+                self._apply_layout_snapshot(snap)
             self.statusBar().showMessage(
                 f"Ready - {self._realize_done} panel(s) loaded", 5000)
 

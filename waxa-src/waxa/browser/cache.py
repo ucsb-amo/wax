@@ -71,3 +71,8 @@ class MetadataCache:
         except Exception:
             return
         self._dirty = False
+
+    def save_if_dirty(self):
+        """Save only when dirty. Call periodically during long scans to persist partial results."""
+        if self._dirty:
+            self.save()

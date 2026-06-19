@@ -313,7 +313,7 @@ class CountsPanel(QWidget):
         if self.fixed_interval:
             start = next((i for i, t in enumerate(t_ago) if t >= -self.time_window), 0)
             pt = t_ago[start:]
-            pc = self.counts[start:]
+            pc = list(self.counts)[start:]
             self.plot_item.enableAutoRange(axis="x", enable=False)
             self.plot_item.setXRange(-self.time_window, 0, padding=0)
         else:

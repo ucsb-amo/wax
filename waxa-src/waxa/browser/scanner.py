@@ -1,11 +1,15 @@
 import glob
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
+
+_SCAN_WORKERS = 8  # parallel HDF5 reader threads
 
 from .cache import MetadataCache
 from ..plotting.plotting_1d import detect_unit
@@ -285,12 +289,16 @@ class RunScanner:
         self.date_to = date_to
         self._lite_runs_by_date = {}
         self._cache = MetadataCache(data_dir)
+        self._cache_lock = threading.Lock()
+        self._lite_lock = threading.Lock()
 
     def scan(self):
         if not self.data_dir or not os.path.isdir(self.data_dir):
             return
 
+        uncached = []  # (filepath, stat_result) pairs not yet in cache
         try:
+            # --- Fast pass: yield cached summaries immediately (preserves order) ---
             for folder in self._iter_date_folders():
                 for filepath in self._iter_hdf5_files(folder):
                     try:
@@ -307,9 +315,28 @@ class RunScanner:
                         yield cached_summary
                         continue
 
-                    summary = self._read_summary(filepath)
+                    uncached.append((filepath, stat_result))
+
+            # --- Parallel pass: read uncached files with a thread pool ---
+            pending_puts = 0
+            with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as executor:
+                future_to_stat = {
+                    executor.submit(self._read_summary, fp): (fp, sr)
+                    for fp, sr in uncached
+                }
+                for future in as_completed(future_to_stat):
+                    fp, sr = future_to_stat[future]
+                    try:
+                        summary = future.result()
+                    except Exception:
+                        continue
                     if summary is not None:
-                        self._cache.put(summary, stat_result)
+                        with self._cache_lock:
+                            self._cache.put(summary, sr)
+                            pending_puts += 1
+                            if pending_puts >= 100:
+                                self._cache.save_if_dirty()
+                                pending_puts = 0
                         yield summary
         finally:
             self._cache.save()
@@ -346,8 +373,13 @@ class RunScanner:
     def _read_summary(self, filepath):
         try:
             with h5py.File(filepath, "r") as f:
-                if not _is_completed_run(f):
+                xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
+
+                # Single-pass: validate completion and collect dims+details together.
+                xvar_result = self._read_and_validate_xvars(f, xvarnames)
+                if xvar_result is None:
                     return None
+                xvardims, xvar_details = xvar_result
 
                 run_id = self._read_run_id(f, filepath)
                 run_date_str = _decode_str(
@@ -355,10 +387,7 @@ class RunScanner:
                 )
                 run_datetime_str = _decode_str(f.attrs.get("run_datetime_str", ""))
 
-                xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
                 experiment_name, experiment_filepath = self._read_experiment_info(f)
-                # Read xvar arrays once; derive both dims and detail summaries from them.
-                xvardims, xvar_details = self._read_xvardims_and_details(f, xvarnames)
                 n_repeats = _read_n_repeats_value(f)
 
                 if "data" in f:
@@ -414,17 +443,32 @@ class RunScanner:
         fallback_str = _decode_str(fallback)
         return fallback_str, fallback_str
 
-    def _read_xvardims_and_details(self, h5file, xvarnames):
-        """Return (xvardims, xvar_details) by reading each xvar array once."""
+    def _read_and_validate_xvars(self, h5file, xvarnames):
+        """Single-pass: validate run completion, return (xvardims, xvar_details) or None if incomplete."""
+        filtered = [name for name in xvarnames if str(name).strip()]
+        if not filtered:
+            return (), []
+        if "params" not in h5file:
+            return None
         dims = []
         details = []
-        if "params" in h5file:
-            for name in xvarnames:
-                if name in h5file["params"]:
-                    values = np.asarray(h5file["params"][name][()]).reshape(-1)
-                    dims.append(int(values.size))
-                    details.append(_summarize_xvar_values(name, values))
+        for name in filtered:
+            if name not in h5file["params"]:
+                return None
+            values = np.asarray(h5file["params"][name][()])
+            if values.ndim == 0:
+                return None
+            flat = values.reshape(-1)
+            dims.append(int(flat.size))
+            details.append(_summarize_xvar_values(name, flat))
         return tuple(dims), details
+
+    def _read_xvardims_and_details(self, h5file, xvarnames):
+        """Kept for external callers; delegates to _read_and_validate_xvars."""
+        result = self._read_and_validate_xvars(h5file, xvarnames)
+        if result is None:
+            return (), []
+        return result
 
     def _read_xvardims(self, h5file, xvarnames):
         dims, _ = self._read_xvardims_and_details(h5file, xvarnames)
@@ -439,9 +483,10 @@ class RunScanner:
         return int(run_id_attr)
 
     def _has_lite_copy(self, run_id: int, run_date_str: str):
-        if run_date_str not in self._lite_runs_by_date:
-            self._lite_runs_by_date[run_date_str] = self._index_lite_runs_for_date(run_date_str)
-        return run_id in self._lite_runs_by_date[run_date_str]
+        with self._lite_lock:
+            if run_date_str not in self._lite_runs_by_date:
+                self._lite_runs_by_date[run_date_str] = self._index_lite_runs_for_date(run_date_str)
+            return run_id in self._lite_runs_by_date[run_date_str]
 
     def _index_lite_runs_for_date(self, run_date_str: str):
         lite_day_dir = os.path.join(self.data_dir, "_lite", run_date_str)
@@ -464,7 +509,7 @@ class ScanWorker(QThread):
     scan_done = pyqtSignal(int)
     scan_error = pyqtSignal(str)
 
-    def __init__(self, scanner: RunScanner, batch_size: int = 64):
+    def __init__(self, scanner: RunScanner, batch_size: int = 256):
         super().__init__()
         self.scanner = scanner
         self._stop_requested = False
@@ -620,6 +665,7 @@ class XvarDetailLoader(QThread):
 
 class ParamSearchLoader(QThread):
     records_ready = pyqtSignal(dict)
+    partial_records_ready = pyqtSignal(str, list)  # (mode, records) — emitted per group as soon as ready
     load_error = pyqtSignal(str)
 
     def __init__(self, filepath: str):
@@ -630,8 +676,18 @@ class ParamSearchLoader(QThread):
         records = {mode: [] for mode in PARAM_SEARCH_MODES}
         try:
             with h5py.File(self.filepath, "r") as f:
+                if self.isInterruptionRequested():
+                    return
                 records["params"] = self._load_group_records(f, "params")
+                self.partial_records_ready.emit("params", records["params"])
+
+                if self.isInterruptionRequested():
+                    return
                 records["camera_params"] = self._load_group_records(f, "camera_params")
+                self.partial_records_ready.emit("camera_params", records["camera_params"])
+
+                if self.isInterruptionRequested():
+                    return
                 records["data"] = self._load_data_records(f)
             self.records_ready.emit(records)
         except Exception as exc:

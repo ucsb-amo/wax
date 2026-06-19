@@ -43,23 +43,91 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
 
 
-def _send_ctrl_break(pid: int) -> bool:
-    """Send ``CTRL_BREAK_EVENT`` to a Windows process group.
+def _kill_pid_tree(pid: int) -> bool:
+    """Forcibly terminate a process *and its child tree* by PID (Windows).
 
-    Returns True on success.  No-op (returns False) off Windows.
+    Scoped strictly to ``pid`` and its descendants via ``taskkill /T`` — it
+    can never reach sibling servers or the dashboard, unlike a console
+    ``CTRL_BREAK_EVENT`` which fans out to every process sharing the
+    console.  Returns True if the kill command was issued.  No-op (returns
+    False) off Windows.
     """
     if not _IS_WINDOWS or pid <= 0:
         return False
     try:
-        import ctypes  # noqa: PLC0415
-        CTRL_BREAK_EVENT = 1
-        kernel32 = ctypes.windll.kernel32
-        ok = bool(kernel32.GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, int(pid)))
-        if not ok:
-            _LOG.debug("GenerateConsoleCtrlEvent failed err=%s", ctypes.get_last_error())
-        return ok
+        import subprocess  # noqa: PLC0415
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            creationflags=_CREATE_NO_WINDOW,
+            capture_output=True,
+            timeout=5,
+        )
+        return True
     except Exception as exc:  # pragma: no cover
-        _LOG.debug("_send_ctrl_break(%s) raised: %r", pid, exc)
+        _LOG.debug("_kill_pid_tree(%s) raised: %r", pid, exc)
+        return False
+
+
+# Keep strong module-level references to the installed console-control
+# handler and its ctypes prototype.  A handler that gets garbage-collected
+# while still registered crashes the process when the OS next invokes it.
+_CONSOLE_GUARD_INSTALLED = False
+_CONSOLE_GUARD_CB = None  # type: ignore[var-annotated]
+
+
+def install_console_signal_guard() -> bool:
+    """Make the dashboard process immune to CTRL_C / CTRL_BREAK.
+
+    The dashboard runs as a console app (``python.exe``) and shares its
+    console with the server subprocesses it spawns.  When a supervisor
+    sends ``CTRL_BREAK_EVENT`` to a child to shut it down gracefully, that
+    console signal can leak back to the dashboard's own process group and
+    kill the whole GUI.  Installing a console-control handler that reports
+    CTRL_C / CTRL_BREAK as *handled* suppresses the default terminating
+    behaviour, so stopping/restarting a single server can never take down
+    the dashboard.
+
+    Other control events (CLOSE / LOGOFF / SHUTDOWN) are left unhandled so
+    normal window-close shutdown still works.
+
+    Returns True if the guard is installed (or was already installed).
+    No-op (returns False) off Windows.
+    """
+    global _CONSOLE_GUARD_INSTALLED, _CONSOLE_GUARD_CB
+    if not _IS_WINDOWS:
+        return False
+    if _CONSOLE_GUARD_INSTALLED:
+        return True
+    try:
+        import ctypes  # noqa: PLC0415
+        from ctypes import wintypes  # noqa: PLC0415
+
+        CTRL_C_EVENT = 0
+        CTRL_BREAK_EVENT = 1
+
+        handler_proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def _handler(ctrl_type):  # noqa: ANN001 - ctypes callback
+            # Return True (handled) for Ctrl+C / Ctrl+Break so Windows does
+            # not run the default handler that would terminate us.  Let all
+            # other events fall through to the default handler.
+            return ctrl_type in (CTRL_C_EVENT, CTRL_BREAK_EVENT)
+
+        cb = handler_proto(_handler)
+        kernel32 = ctypes.windll.kernel32
+        ok = bool(kernel32.SetConsoleCtrlHandler(cb, True))
+        if not ok:
+            _LOG.debug(
+                "SetConsoleCtrlHandler failed err=%s", ctypes.get_last_error()
+            )
+            return False
+        # Hold references so the callback is never collected while live.
+        _CONSOLE_GUARD_CB = cb
+        _CONSOLE_GUARD_INSTALLED = True
+        _LOG.info("console signal guard installed (CTRL_C/CTRL_BREAK ignored)")
+        return True
+    except Exception as exc:  # pragma: no cover
+        _LOG.debug("install_console_signal_guard raised: %r", exc)
         return False
 
 
@@ -292,44 +360,30 @@ class ServerSupervisor(QObject):
         If *blocking* is True the call waits up to ``graceful_stop_timeout_s``
         for the child to exit before returning.  Always idempotent.
 
-        On Windows the preferred stop mechanism is ``CTRL_BREAK_EVENT``
-        sent to the child's process group (requires ``CREATE_NEW_PROCESS_GROUP``
-        to have been applied at spawn time).  If that path is unavailable
-        we fall back to ``kill()`` (``TerminateProcess``) rather than
-        ``terminate()`` because ``terminate()`` posts ``WM_CLOSE`` which
-        can propagate to a shared console window and kill the dashboard.
+        Termination is scoped strictly to this server's own PID (and its
+        descendants).  We deliberately do **not** use a console
+        ``CTRL_BREAK_EVENT`` here: that signal is delivered to every process
+        attached to the dashboard's console, so it would stop *all* servers
+        (and, without the console guard, the dashboard) when the user only
+        asked to stop one.  ``taskkill /PID <pid> /T /F`` (with a
+        ``QProcess.kill()`` fallback) affects only the targeted server.
         """
         self._stop_requested = True
         if self._proc is None or not self.is_alive():
             self._set_state(SupervisorState.IDLE)
             return
         self._set_state(SupervisorState.STOPPING)
-        sent_break = False
-        if _IS_WINDOWS:
+        try:
+            pid = int(self._proc.processId())
+        except Exception:
+            pid = 0
+        if not _kill_pid_tree(pid):
+            # Fallback: process-local TerminateProcess via QProcess.kill().
+            # Never affects sibling servers or the dashboard.
             try:
-                pid = int(self._proc.processId())
-            except Exception:
-                pid = 0
-            sent_break = _send_ctrl_break(pid)
-        if not sent_break:
-            if _IS_WINDOWS:
-                # On Windows, QProcess.terminate() posts WM_CLOSE to the
-                # process's console window.  If CREATE_NO_WINDOW was not
-                # applied (e.g. setCreateProcessArgumentsModifier silently
-                # failed in this PyQt6 build), the child shares the
-                # dashboard's console and WM_CLOSE would kill the whole
-                # dashboard.  Use kill() (TerminateProcess) instead — it is
-                # process-local and never affects the caller.
-                _LOG.info("%s: CTRL_BREAK unavailable, using kill()", self.server_id)
-                try:
-                    self._proc.kill()
-                except Exception as exc:
-                    _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
-            else:
-                try:
-                    self._proc.terminate()
-                except Exception as exc:
-                    _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+                self._proc.kill()
+            except Exception as exc:
+                _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
         if blocking:
             # Short grace window for cooperative shutdown, then kill.
             # The previous 5 s timeout multiplied by N supervisors froze
@@ -356,42 +410,27 @@ class ServerSupervisor(QObject):
     # ------------------------------------------------------------------ #
 
     def request_terminate(self) -> None:
-        """Ask the child to exit cleanly without waiting.  Idempotent.
+        """Ask the child to exit without waiting.  Idempotent.
 
-        On Windows we send ``CTRL_BREAK_EVENT`` to the child's process
-        group (the child was spawned with ``CREATE_NEW_PROCESS_GROUP``);
-        Python turns that into ``SIGBREAK`` → ``KeyboardInterrupt``, so a
-        normal server loop unwinds with a 0 exit code instead of being
-        hard-killed.  If CTRL_BREAK is unavailable we fall back to
-        ``kill()`` rather than ``terminate()`` to avoid ``WM_CLOSE``
-        reaching a shared console window.
+        Scoped strictly to this server's own PID tree (``taskkill /T /F``
+        with a ``QProcess.kill()`` fallback).  We avoid console
+        ``CTRL_BREAK_EVENT`` because it is delivered to every process on the
+        dashboard's console, which would take down sibling servers too.
         """
         self._stop_requested = True
         if self._proc is None or not self.is_alive():
             self._set_state(SupervisorState.IDLE)
             return
         self._set_state(SupervisorState.STOPPING)
-        sent_break = False
-        if _IS_WINDOWS:
+        try:
+            pid = int(self._proc.processId())
+        except Exception:
+            pid = 0
+        if not _kill_pid_tree(pid):
             try:
-                pid = int(self._proc.processId())
-            except Exception:
-                pid = 0
-            sent_break = _send_ctrl_break(pid)
-        if not sent_break:
-            if _IS_WINDOWS:
-                # Same rationale as in stop(): avoid terminate() on Windows
-                # to prevent WM_CLOSE reaching a shared console window.
-                _LOG.info("%s: CTRL_BREAK unavailable, using kill()", self.server_id)
-                try:
-                    self._proc.kill()
-                except Exception as exc:
-                    _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
-            else:
-                try:
-                    self._proc.terminate()
-                except Exception as exc:
-                    _LOG.warning("%s: terminate() raised: %r", self.server_id, exc)
+                self._proc.kill()
+            except Exception as exc:
+                _LOG.warning("%s: kill() raised: %r", self.server_id, exc)
 
     def force_kill(self, *, wait_ms: int = 500) -> None:
         """Hard-kill the child if it's still alive, then wait briefly."""
@@ -425,11 +464,25 @@ class ServerSupervisor(QObject):
         return self.is_alive()
 
     def restart(self) -> None:
-        """Stop and then start again."""
-        self.stop()
-        # Schedule a start after the current stop completes.  Re-checked in
-        # _on_finished so we don't double-spawn.
-        self._restart_pending = True  # type: ignore[attr-defined]
+        """Stop the subprocess, wait for it to fully exit, then start again.
+
+        Deterministic and synchronous: the blocking stop waits for the
+        targeted process (and its tree) to die before respawning, so a
+        restart can never race a still-running instance or leave two copies
+        contending for the same port / COM device.
+        """
+        # Cancel any event-driven restart bookkeeping so we don't double-spawn
+        # via the _on_finished path while we drive the restart explicitly.
+        self._restart_pending = False  # type: ignore[attr-defined]
+        if self._proc is not None and self.is_alive():
+            # Blocking stop kills the PID tree and waits for the exit to be
+            # reaped (QProcess.finished fires during waitForFinished).
+            self.stop(blocking=True)
+            try:
+                self._proc.waitForFinished(2000)
+            except Exception:
+                pass
+        self.start()
 
     # ------------------------------------------------------------------
     # Internals

@@ -190,10 +190,21 @@ class DDSWidget(DeviceWidget):
             # Reset to default values — mark as pending until Enter is pressed
             if hasattr(self.dds_frame_obj, self.device_name):
                 dds = vars(self.dds_frame_obj)[self.device_name]
-                self.freq_spinbox.setValue(dds.frequency/1.e6)
+                # If this channel is defined by detuning (has a transition),
+                # show the default in Γ units; otherwise show it in MHz.
+                if getattr(dds, "transition", "None") != "None":
+                    self.freq_unit_combo.setCurrentText("Γ")
+                    self.freq_spinbox.setValue(dds.frequency_to_detuning(dds.frequency))
+                else:
+                    self.freq_unit_combo.setCurrentText("MHz")
+                    self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
                 # self.state_button.setChecked(dds.sw_state)
                 self.vpd_spinbox.setValue(dds.v_pd)
+                # Stage the change: show "undo" and require Enter to confirm,
+                # even if a value happens to equal the current one.
+                self.has_unsaved_changes = True
+                self.update_default_button_state()
         
     def on_state_button_toggled(self, checked):
         if checked:
@@ -439,6 +450,10 @@ class DACWidget(DeviceWidget):
             if hasattr(self.dac_frame_obj, self.device_name):
                 dac = vars(self.dac_frame_obj)[self.device_name]
                 self.voltage_spinbox.setValue(dac.v)
+                # Stage the change: show "undo" and require Enter to confirm,
+                # even if the value happens to equal the current one.
+                self.has_unsaved_changes = True
+                self.update_default_button_state()
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
@@ -733,6 +748,20 @@ class DeviceStateGUI(QMainWindow):
         self.tab_widget = QTabWidget()
         central_widget_layout.addWidget(self.tab_widget)
         central_widget.setLayout(central_widget_layout)
+
+        # Shared search bar placed inline with the tab bar (corner widget).
+        # Content is preserved when switching tabs; filtering is re-applied
+        # whenever the text changes OR the active tab changes.
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
+        self.search_bar.setClearButtonEnabled(True)
+        self.search_bar.setMinimumWidth(220)
+        self.search_bar.setMaximumHeight(22)
+        self.search_bar.textChanged.connect(self._apply_active_search)
+        self.tab_widget.setCornerWidget(self.search_bar, Qt.Corner.TopRightCorner)
+        self.tab_widget.currentChanged.connect(
+            lambda _: self._apply_active_search(self.search_bar.text())
+        )
         
         # Create tabs
         self.dds_tab = QWidget()
@@ -804,15 +833,6 @@ class DeviceStateGUI(QMainWindow):
         self.instant_apply_button.toggled.connect(self.on_instant_apply_toggled)
         dds_step_layout.addWidget(self.instant_apply_button)
 
-        # Search bar inline at the right of the step-settings row.
-        self.dds_search_bar = QLineEdit()
-        self.dds_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
-        self.dds_search_bar.setClearButtonEnabled(True)
-        self.dds_search_bar.setMaximumHeight(20)
-        self.dds_search_bar.textChanged.connect(self._apply_dds_search)
-        dds_step_layout.addSpacing(10)
-        dds_step_layout.addWidget(self.dds_search_bar)
-
         dds_tab_layout.addLayout(dds_step_layout)
 
         # DDS devices grid layout
@@ -853,15 +873,6 @@ class DeviceStateGUI(QMainWindow):
         self.dac_voltage_step_spinbox.setMaximumHeight(20)
         dac_step_layout.addWidget(self.dac_voltage_step_spinbox)
 
-        # Search bar inline at the right of the step-settings row.
-        self.dac_search_bar = QLineEdit()
-        self.dac_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
-        self.dac_search_bar.setClearButtonEnabled(True)
-        self.dac_search_bar.setMaximumHeight(20)
-        self.dac_search_bar.textChanged.connect(self._apply_dac_search)
-        dac_step_layout.addSpacing(10)
-        dac_step_layout.addWidget(self.dac_search_bar)
-
         dac_tab_layout.addLayout(dac_step_layout)
 
         # DAC devices grid layout
@@ -875,18 +886,11 @@ class DeviceStateGUI(QMainWindow):
         # Setup TTL tab
         ttl_tab_layout = QVBoxLayout()
 
-        # TTL channel search bar
-        self.ttl_search_bar = QLineEdit()
-        self.ttl_search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
-        self.ttl_search_bar.setClearButtonEnabled(True)
-        self.ttl_search_bar.textChanged.connect(self._apply_ttl_search)
-        ttl_tab_layout.addWidget(self.ttl_search_bar)
-
         self.ttl_layout = QGridLayout()
         ttl_tab_layout.addLayout(self.ttl_layout)
         self.ttl_tab.setLayout(ttl_tab_layout)
 
-        # Ctrl+F focuses the search bar of the active tab.
+        # Ctrl+F focuses the shared search bar.
         # Must be on the central widget (not self) so the shortcut fires when
         # DeviceStateGUI is embedded inside a dashboard panel (the QMainWindow
         # itself is hidden by embed_main_window; shortcuts on hidden widgets
@@ -895,6 +899,28 @@ class DeviceStateGUI(QMainWindow):
         _ctrlf = QShortcut(QKeySequence("Ctrl+F"), central_widget)
         _ctrlf.setContext(Qt.ShortcutContext.WindowShortcut)
         _ctrlf.activated.connect(self._focus_active_search_bar)
+
+        # Ctrl+Tab / Ctrl+Shift+Tab cycle between the DDS/DAC/TTL tabs.
+        # Bound on the central widget with WindowShortcut context (same reason
+        # as Ctrl+F above) so they fire when the panel is docked, floated, or
+        # popped out of the dashboard. Explicit shortcuts are needed because
+        # QTabWidget's built-in Ctrl+Tab handling only works while the tab bar
+        # itself has focus, which it rarely does inside an embedded panel.
+        _next_tab = QShortcut(QKeySequence("Ctrl+Tab"), central_widget)
+        _next_tab.setContext(Qt.ShortcutContext.WindowShortcut)
+        _next_tab.activated.connect(lambda: self._cycle_tab(1))
+        _prev_tab = QShortcut(QKeySequence("Ctrl+Shift+Tab"), central_widget)
+        _prev_tab.setContext(Qt.ShortcutContext.WindowShortcut)
+        _prev_tab.activated.connect(lambda: self._cycle_tab(-1))
+
+    def _cycle_tab(self, step: int) -> None:
+        """Advance the active tab by *step* (wraps around)."""
+        count = self.tab_widget.count()
+        if count == 0:
+            return
+        self.tab_widget.setCurrentIndex(
+            (self.tab_widget.currentIndex() + step) % count
+        )
 
     def _set_window_icon(self):
         """Set a game-controller emoji icon for the window and taskbar."""
@@ -1022,11 +1048,9 @@ class DeviceStateGUI(QMainWindow):
     # ------------------------------------------------------------------
 
     def _focus_active_search_bar(self) -> None:
-        """Ctrl+F: focus the search bar of the currently visible tab."""
-        bars = [self.dds_search_bar, self.dac_search_bar, self.ttl_search_bar]
-        bar = bars[self.tab_widget.currentIndex()]
-        bar.setFocus()
-        bar.selectAll()
+        """Ctrl+F: focus the shared search bar and select all text."""
+        self.search_bar.setFocus()
+        self.search_bar.selectAll()
 
     def _apply_search(self, query: str, device_prefix: str) -> None:
         """Highlight device labels that match *query* for the given prefix (dds/dac/ttl)."""
@@ -1038,14 +1062,12 @@ class DeviceStateGUI(QMainWindow):
             device_name = key[len(prefix):]
             widget.set_search_highlight(bool(terms) and name_matches_all_terms(device_name, terms))
 
-    def _apply_dds_search(self, query: str) -> None:
-        self._apply_search(query, "dds")
-
-    def _apply_dac_search(self, query: str) -> None:
-        self._apply_search(query, "dac")
-
-    def _apply_ttl_search(self, query: str) -> None:
-        self._apply_search(query, "ttl")
+    def _apply_active_search(self, query: str) -> None:
+        """Apply *query* to the currently visible tab's devices only."""
+        prefixes = ["dds", "dac", "ttl"]
+        idx = self.tab_widget.currentIndex()
+        if 0 <= idx < len(prefixes):
+            self._apply_search(query, prefixes[idx])
 
     def load_config(self):
         """Trigger an async config load from the JSON file.
@@ -1187,10 +1209,8 @@ class DeviceStateGUI(QMainWindow):
         
         self.adjust_window_width()
 
-        # Re-apply active searches so highlights survive config reloads.
-        self._apply_dds_search(self.dds_search_bar.text())
-        self._apply_dac_search(self.dac_search_bar.text())
-        self._apply_ttl_search(self.ttl_search_bar.text())
+        # Re-apply active search so highlights survive config reloads.
+        self._apply_active_search(self.search_bar.text())
 
     def closeEvent(self, event):
         """Handle window close event"""
