@@ -19,6 +19,8 @@ from PyQt6.QtCore import QObject, QTimer, QCoreApplication
 from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.guis.monitor_server_gui import MonitorUDPServer, Status
 from waxx.util.comms_server.comm_server import STATES
+from waxx.util.comms_server.hardware_id import monitor_server_id
+from waxx.util.comms_server.waxx_client import discover
 from PyQt6.QtCore import QThread
 
 
@@ -103,6 +105,21 @@ class HeadlessMonitorServer(QObject):
 
 def run(monitor_expt_path: str, config_file_path: str | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # Refuse to start a second monitor server for the same hardware: if a beacon
+    # for our hardware-scoped id is already on the subnet, two servers would
+    # compete for signals / ports / broadcasts.
+    server_id = monitor_server_id()
+    existing = discover(server_id, timeout=1.5)
+    if existing is not None:
+        ip, port = existing
+        log.error(
+            "A monitor server for '%s' is already running at %s:%d. "
+            "Refusing to start a second server for the same hardware.",
+            server_id, ip, port,
+        )
+        return 1
+
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
     server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path)
 

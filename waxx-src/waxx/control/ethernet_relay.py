@@ -1,5 +1,8 @@
+import logging
 import socket
 import time
+
+logger = logging.getLogger("waxx.control.ethernet_relay")
 
 class Relay_Controller:
 	def __init__(self, combus, kwargs = {}):
@@ -274,16 +277,55 @@ class Relay_Controller:
 		return self.process_control_command_return(self.send_command(command, 32))
 
 class EthernetRelay():
+	# Connection hardening: bounded retry against transient socket failures
+	# (e.g. ConnectionRefusedError / "the target actively refused it",
+	# timeouts and resets) before giving up and re-raising.
+	CONNECT_RETRIES = 5
+	CONNECT_BACKOFF_S = (0.2, 0.5, 1.0, 2.0, 3.0)
+	CONNECT_TIMEOUT_S = 10.
+
 	def __init__(self, relay_ip, port):
 		self.__addr = (relay_ip,port)
 		self.__socket = None
 		self.__board = None
 
-	def connect(self):
-		self.__socket = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-		self.__board = Relay_Controller(self.__socket)
-		self.__socket.connect(self.__addr)
-		self.__socket.settimeout(10.)
+	def connect(self, retries=None, backoff=None):
+		if retries is None:
+			retries = self.CONNECT_RETRIES
+		if backoff is None:
+			backoff = self.CONNECT_BACKOFF_S
+
+		for attempt in range(1, retries + 2):
+			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			sock.settimeout(self.CONNECT_TIMEOUT_S)
+			try:
+				sock.connect(self.__addr)
+			except (ConnectionRefusedError, socket.timeout, OSError) as exc:
+				try:
+					sock.close()
+				except OSError:
+					pass
+				if attempt <= retries:
+					delay = backoff[min(attempt - 1, len(backoff) - 1)]
+					logger.warning(
+						"Relay connect attempt %d/%d to %s failed: %r; retrying in %.2fs",
+						attempt, retries + 1, self.__addr, exc, delay,
+					)
+					time.sleep(delay)
+					continue
+				logger.error(
+					"Relay connect failed after %d attempts to %s: %r",
+					retries + 1, self.__addr, exc,
+				)
+				raise
+			self.__socket = sock
+			self.__board = Relay_Controller(self.__socket)
+			if attempt > 1:
+				logger.info(
+					"Relay connect succeeded on attempt %d to %s",
+					attempt, self.__addr,
+				)
+			return
 
 	def close(self):
 		if self.__socket:

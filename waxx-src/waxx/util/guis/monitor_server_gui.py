@@ -8,6 +8,8 @@ from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.comms_server.comm_server import UdpServer, STATES, ReadyBit
 from waxx.util.comms_server.state_broadcast import StateBroadcaster
+from waxx.util.comms_server.hardware_id import monitor_server_id
+from waxx.util.comms_server.waxx_client import discover
 from waxx.util.device_state.state_file_io import read_state, apply_delta
 
 class Status:
@@ -32,7 +34,7 @@ class MonitorUDPServer(UdpServer):
     reset_signal = pyqtSignal()
 
     def __init__(self, config_file_path=None):
-        super().__init__(host="0.0.0.0", port=0, server_id="monitor")
+        super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = Status()
         self._print_connections_bool = False
@@ -119,6 +121,23 @@ class MonitorServerGUI(QWidget):
         super().__init__()
 
         self.config_file_path = config_file_path
+
+        # Refuse to start a second monitor server for the same hardware.
+        server_id = monitor_server_id()
+        existing = discover(server_id, timeout=1.5)
+        if existing is not None:
+            ip, port = existing
+            QMessageBox.critical(
+                self,
+                "Monitor server already running",
+                f"A monitor server for '{server_id}' is already running at "
+                f"{ip}:{port}.\n\nRefusing to start a second server for the same "
+                "hardware.",
+            )
+            self._aborted = True
+            QTimer.singleShot(0, self.close)
+            return
+        self._aborted = False
 
         self.setWindowTitle("Monitor Server")
         eye_icon = self._create_eye_icon()
