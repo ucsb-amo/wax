@@ -26,8 +26,9 @@ log = logging.getLogger(__name__)
 
 
 class HeadlessMonitorServer(QObject):
-    def __init__(self, monitor_expt_path: str):
+    def __init__(self, monitor_expt_path: str, config_file_path: str | None = None):
         super().__init__()
+        self.config_file_path = config_file_path
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
         self.status = Status()
@@ -49,7 +50,7 @@ class HeadlessMonitorServer(QObject):
 
     def _setup_udp_server(self) -> None:
         self.server_thread = QThread()
-        self.udp_server = MonitorUDPServer()
+        self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path)
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.message_received.connect(self._handle_message)
@@ -96,10 +97,10 @@ class HeadlessMonitorServer(QObject):
             pass
 
 
-def run(monitor_expt_path: str) -> int:
+def run(monitor_expt_path: str, config_file_path: str | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
-    server = HeadlessMonitorServer(monitor_expt_path)
+    server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path)
 
     def _on_quit():
         server.shutdown()

@@ -82,6 +82,7 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         # Settings
         self.server_host = DEFAULT_SERVER_HOST
+        self.server_port = DEFAULT_SERVER_PORT
         try:
             self.client: HMRClient | None = HMRClient()
         except RuntimeError:
@@ -139,10 +140,18 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.setStyleSheet(
             "QMainWindow { background-color: #f3f5f7; }"
             "QLabel { color: #20262e; }"
-            "QPushButton { background: #ffffff; border: 1px solid #c7cfd9; border-radius: 6px; padding: 5px 10px; }"
-            "QPushButton:hover { background: #eef3ff; border-color: #8aa2ff; }"
-            "QGroupBox { border: 1px solid #cfd6df; border-radius: 8px; margin-top: 8px; font-weight: 600; }"
-            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; }"
+            "QPushButton { background: #ffffff; border: 1px solid #c7cfd9; color: #20262e; border-radius: 6px; padding: 5px 10px; }"
+            "QPushButton:hover { background: #eef3ff; border-color: #8aa2ff; color: #20262e; }"
+            "QGroupBox { border: 1px solid #cfd6df; border-radius: 8px; margin-top: 8px; font-weight: 600; color: #20262e; }"
+            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; top: 1px; padding: 0 4px 0 4px; color: #20262e; }"
+            "QSpinBox { background: #ffffff; color: #20262e; border: 1px solid #c7cfd9; border-radius: 4px; }"
+            "QDoubleSpinBox { background: #ffffff; color: #20262e; border: 1px solid #c7cfd9; border-radius: 4px; }"
+            "QLineEdit { background: #ffffff; color: #20262e; border: 1px solid #c7cfd9; border-radius: 4px; }"
+            "QComboBox { background: #ffffff; color: #20262e; border: 1px solid #c7cfd9; border-radius: 4px; }"
+            "QMenuBar { background: #f3f5f7; color: #20262e; }"
+            "QMenuBar::item:selected { background: #e2e8f0; color: #20262e; }"
+            "QMenu { background: #ffffff; color: #20262e; border: 1px solid #c7cfd9; }"
+            "QMenu::item:selected { background: #eef3ff; color: #20262e; }"
         )
 
         central = QtWidgets.QWidget(self)

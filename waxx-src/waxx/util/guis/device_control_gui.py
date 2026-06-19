@@ -1,6 +1,7 @@
 import sys
 import json
 import os
+import threading
 import importlib.util
 from pathlib import Path
 from typing import Dict, Any
@@ -19,7 +20,7 @@ import time
 
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
-from waxa.data.server_talk import server_talk
+from waxx.util.comms_server.state_broadcast import StateListener
 from waxa.browser.browser_window import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -205,6 +206,8 @@ class DDSWidget(DeviceWidget):
                 # even if a value happens to equal the current one.
                 self.has_unsaved_changes = True
                 self.update_default_button_state()
+                self.freq_spinbox.setFocus()
+                self.freq_spinbox.selectAll()
         
     def on_state_button_toggled(self, checked):
         if checked:
@@ -361,15 +364,34 @@ class DDSWidget(DeviceWidget):
         config["sw_state"] = int(self.state_button.isChecked())
             
         return config
-        
+
+    def _freq_hz_to_display(self, freq_hz: float) -> float:
+        """Convert a frequency in Hz to the value shown in the freq spinbox.
+
+        Honors the current unit selection: returns detuning (Γ) when the unit
+        combo is set to "Γ", otherwise MHz.  This prevents writing an MHz value
+        into a Γ-ranged spinbox (range [-100, 100]), which would otherwise
+        clamp the display to the max and get "stuck" there.
+        """
+        if self.freq_unit_combo.currentText() == "Γ" and self.dds_frame_obj:
+            try:
+                uru_idx = self.device_config["urukul_idx"]
+                ch = self.device_config["ch"]
+                dds_obj = self.dds_frame_obj.dds_array[uru_idx][ch]
+                return dds_obj.frequency_to_detuning(freq_hz)
+            except Exception:
+                pass
+        return freq_hz / 1e6
+
     def update_from_config(self, config: Dict[str, Any]):
         """Update widget values from configuration"""
         self.device_config = config
         self.has_unsaved_changes = False
         self.highlight_unsaved()
         with QSignalBlocker(self.freq_spinbox), QSignalBlocker(self.amp_spinbox), QSignalBlocker(self.vpd_spinbox):
-            # Update main spinbox values
-            self.freq_spinbox.setValue(config["frequency"] / 1e6)
+            # Update main spinbox values (respecting the current MHz/Γ unit so
+            # a Γ-mode spinbox is never fed an out-of-range MHz value).
+            self.freq_spinbox.setValue(self._freq_hz_to_display(config["frequency"]))
             self.amp_spinbox.setValue(config["amplitude"])
             if "v_pd" in config:
                 self.vpd_spinbox.setValue(config["v_pd"])
@@ -454,6 +476,8 @@ class DACWidget(DeviceWidget):
                 # even if the value happens to equal the current one.
                 self.has_unsaved_changes = True
                 self.update_default_button_state()
+                self.voltage_spinbox.setFocus()
+                self.voltage_spinbox.selectAll()
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
@@ -589,45 +613,90 @@ class TTLWidget(DeviceWidget):
             self.state_button.setStyleSheet("")
 
 
-class _ConfigReloadWorker(QThread):
-    """Reads the config JSON in a background thread."""
+class _UpdateSender(QThread):
+    """Sends per-device deltas to the monitor server off the GUI thread.
 
-    loaded = pyqtSignal(dict)
-    failed = pyqtSignal(str)  # "not_found" | "json_error:<msg>" | "error:<msg>"
+    Edits are coalesced *last-wins per device*: while a send is queued, newer
+    changes to the same device merge into the pending payload, so rapid spins
+    of a single spinbox collapse to one network round-trip carrying the latest
+    value.  The server is the sole writer of the JSON, so this never races with
+    other clients.
+    """
 
-    def __init__(self, config_file, parent=None):
+    ack = pyqtSignal(str, str, dict)        # device_type, device_name, ack
+    send_failed = pyqtSignal(str, str)      # device_type, device_name
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._config_file = config_file
+        self._cond = threading.Condition()
+        self._pending: Dict[tuple, Dict[str, Any]] = {}
+        self._running = True
+        self._client: MonitorClient | None = None
+
+    def enqueue(self, device_type: str, device_name: str, changes: Dict[str, Any]) -> None:
+        with self._cond:
+            key = (device_type, device_name)
+            if key in self._pending:
+                self._pending[key].update(changes)
+            else:
+                self._pending[key] = dict(changes)
+            self._cond.notify()
+
+    def run(self):
+        while True:
+            with self._cond:
+                while self._running and not self._pending:
+                    self._cond.wait(0.5)
+                if not self._running:
+                    return
+                key = next(iter(self._pending))
+                changes = self._pending.pop(key)
+            dtype, name = key
+            if self._client is None:
+                try:
+                    self._client = MonitorClient(discovery_timeout=0.5)
+                except Exception:
+                    self.send_failed.emit(dtype, name)
+                    continue
+            ack = self._client.send_update(dtype, name, changes)
+            if ack is None:
+                # Lost connection — force rediscovery next time.
+                self._client = None
+                self.send_failed.emit(dtype, name)
+            elif ack.get("status") == "ok":
+                self.ack.emit(dtype, name, ack)
+            else:
+                self.send_failed.emit(dtype, name)
+
+    def stop(self):
+        with self._cond:
+            self._running = False
+            self._cond.notify_all()
+
+
+class _StateRequestWorker(QThread):
+    """Fetches the full device-state snapshot from the server (get_state)."""
+
+    state_loaded = pyqtSignal(dict)   # {"version": int, "config": dict}
+    state_failed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
     def run(self):
         try:
-            with open(self._config_file, 'r') as f:
-                data = json.load(f)
-            self.loaded.emit(data)
-        except FileNotFoundError:
-            self.failed.emit("not_found")
-        except json.JSONDecodeError as e:
-            self.failed.emit(f"json_error:{e}")
-        except Exception as e:
-            self.failed.emit(f"error:{e}")
-
-
-class _SaveWorker(QThread):
-    """Writes config JSON in a background thread."""
-
-    save_failed = pyqtSignal(str)
-
-    def __init__(self, config_file, data, parent=None):
-        super().__init__(parent)
-        self._config_file = config_file
-        self._data = data
-
-    def run(self):
-        try:
-            with open(self._config_file, 'w') as f:
-                json.dump(self._data, f, indent=2)
-        except Exception as e:
-            self.save_failed.emit(str(e))
+            client = MonitorClient(discovery_timeout=0.5)
+        except Exception:
+            self.state_failed.emit()
+            return
+        state = client.get_state()
+        if state and state.get("status") == "ok":
+            self.state_loaded.emit({
+                "version": state.get("version"),
+                "config": state.get("config", {}) or {},
+            })
+        else:
+            self.state_failed.emit()
 
 
 class _ResetWorker(QThread):
@@ -700,12 +769,9 @@ class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management"""
     
     def __init__(self,
-                  device_state_json_path,
-                  server_talk: server_talk,
-                  dds_frame,
-                  dac_frame):
+                  dds_frame=None,
+                  dac_frame=None):
         super().__init__()
-        self.config_file = device_state_json_path
         self.config_data = {}
         self.device_widgets = {}
         
@@ -714,11 +780,18 @@ class DeviceStateGUI(QMainWindow):
 
         self.connection_failed = False
 
-        self.server_talk = server_talk
+        # Server-pushed state tracking.  ``_version`` is the last device-state
+        # version we have applied; ``_pending`` maps (device_type, device_name)
+        # to the timestamp of a local edit awaiting the server's echo (used to
+        # avoid clobbering an in-flight edit with an incoming broadcast).
+        self._version = None
+        self._pending: Dict[tuple, float] = {}
 
         self.setup_ui()
-        self.load_config()
-        self.setup_timer()
+        self._setup_update_sender()
+        self._setup_state_listener()
+        self.request_state()        # initial async snapshot load
+        self.setup_timer()          # periodic safety reconcile
         self.setup_status_checker()
         self.running = False
         
@@ -946,10 +1019,28 @@ class DeviceStateGUI(QMainWindow):
             app.setWindowIcon(icon)
 
     def setup_timer(self):
-        """Setup timer for periodic config file checking"""
+        """Periodic safety reconcile against the server.
+
+        UDP broadcasts are the primary update path; this slow timer just
+        catches any missed datagram by re-fetching the snapshot.  It runs at
+        a relaxed cadence so it never causes UI churn.
+        """
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_config_changes)
-        self.timer.start(1000)  # Check every 1 second
+        self.timer.start(5000)  # reconcile every 5 seconds
+
+    def _setup_update_sender(self):
+        """Start the background sender that pushes deltas to the server."""
+        self._update_sender = _UpdateSender(self)
+        self._update_sender.ack.connect(self._on_update_ack)
+        self._update_sender.send_failed.connect(self._on_update_failed)
+        self._update_sender.start()
+
+    def _setup_state_listener(self):
+        """Start the UDP listener that receives server state broadcasts."""
+        self._state_listener = StateListener(parent=self)
+        self._state_listener.state_received.connect(self._on_state_broadcast)
+        self._state_listener.start()
         
     def setup_status_checker(self):
         """Setup the status checker thread"""
@@ -992,7 +1083,6 @@ class DeviceStateGUI(QMainWindow):
                 
     def _on_reset_succeeded(self) -> None:
         self.status_button.setEnabled(True)
-        QMessageBox.information(self, "Reset Sent", "Reset message sent to server.")
 
     def _on_reset_failed(self, msg: str) -> None:
         self.status_button.setEnabled(True)
@@ -1069,57 +1159,121 @@ class DeviceStateGUI(QMainWindow):
         if 0 <= idx < len(prefixes):
             self._apply_search(query, prefixes[idx])
 
-    def load_config(self):
-        """Trigger an async config load from the JSON file.
-
-        Starts a background worker so the main thread is never blocked
-        by file I/O or network-drive access.
-        """
-        if getattr(self, '_reload_in_progress', False):
+    def request_state(self):
+        """Fetch the full device-state snapshot from the server (async)."""
+        if getattr(self, '_state_req_in_progress', False):
             return
-        self._reload_in_progress = True
-        worker = _ConfigReloadWorker(self.config_file, self)
-        worker.loaded.connect(self._on_config_loaded)
-        worker.failed.connect(self._on_config_load_failed)
-        worker.finished.connect(lambda: setattr(self, '_reload_in_progress', False))
+        self._state_req_in_progress = True
+        worker = _StateRequestWorker(self)
+        worker.state_loaded.connect(self._on_state_loaded)
+        worker.state_failed.connect(self._on_state_failed)
+        worker.finished.connect(lambda: setattr(self, '_state_req_in_progress', False))
         worker.finished.connect(worker.deleteLater)
         worker.start()
-        self._reload_worker = worker  # keep alive until finished
+        self._state_req_worker = worker  # keep alive until finished
 
-    def _on_config_loaded(self, new_config: dict) -> None:
-        """Apply freshly loaded config on the main thread."""
-        self._map_retry_count = 0
-        self._decode_fail_count = 0
-        if new_config != self.config_data:
+    def _on_state_loaded(self, state: dict) -> None:
+        """Apply a freshly fetched snapshot on the main thread."""
+        self._version = state.get("version")
+        new_config = state.get("config", {}) or {}
+        if not self.device_widgets:
+            # First load → build everything.
             self.config_data = new_config
             self.update_device_widgets()
+        else:
+            # Reconcile incrementally so we never clobber busy widgets.
+            self._reconcile_config(new_config)
 
-    def _on_config_load_failed(self, reason: str) -> None:
-        """Handle background config load failures without blocking."""
-        if reason == "not_found":
-            retry_count = getattr(self, '_map_retry_count', 0)
-            if retry_count < 3:
-                self._map_retry_count = retry_count + 1
-                # Retry after a short delay; if the drive needs mapping the
-                # ServerSupervisor / data_dir_guard handles that elsewhere.
-                QTimer.singleShot(2000, self.load_config)
-            else:
-                QMessageBox.critical(
-                    self, "Error",
-                    f"Configuration file not found: {self.config_file}")
-        elif reason.startswith("json_error:"):
-            count = getattr(self, '_decode_fail_count', 0) + 1
-            self._decode_fail_count = count
-            if count >= 10:
-                QMessageBox.critical(
-                    self, "Error",
-                    f"Invalid JSON in configuration file: {reason[len('json_error:'):]}")
-        # Other transient errors (permissions, etc.) are silently ignored;
-        # the 1-second timer will retry automatically.
+    def _on_state_failed(self) -> None:
+        """Snapshot fetch failed — surface as a connection problem."""
+        self.on_connection_failed()
+
+    def _device_keys(self, config: dict) -> set:
+        keys = set()
+        for dtype in ("dds", "dac", "ttl"):
+            for name in config.get(dtype, {}):
+                keys.add(f"{dtype}.{name}")
+        return keys
+
+    def _reconcile_config(self, new_config: dict) -> None:
+        """Update widgets to match *new_config*, skipping busy widgets."""
+        if self._device_keys(new_config) != self._device_keys(self.config_data):
+            # Device set changed (rare) → full rebuild.
+            self.config_data = new_config
+            self.update_device_widgets()
+            return
+        for dtype in ("dds", "dac", "ttl"):
+            section = self.config_data.setdefault(dtype, {})
+            for name, cfg in new_config.get(dtype, {}).items():
+                if cfg == section.get(name):
+                    continue
+                section[name] = cfg
+                key = (dtype, name)
+                widget = self.device_widgets.get(f"{dtype}.{name}")
+                if widget is not None and not self._widget_busy(widget, key):
+                    widget.update_from_config(cfg)
+
+    def _on_state_broadcast(self, payload: dict) -> None:
+        """Handle a UDP ``state_update`` pushed by the server."""
+        if payload.get("type") != "state_update":
+            return
+        version = payload.get("version")
+        if version is None:
+            return
+        if self._version is not None and version <= self._version:
+            # Already applied (covers the echo of our own update).
+            return
+        expected = None if self._version is None else self._version + 1
+        if expected is not None and version != expected:
+            # Missed one or more broadcasts → full resync over TCP.
+            self.request_state()
+            return
+        self._version = version
+        dtype = payload.get("device_type")
+        name = payload.get("device_name")
+        changes = payload.get("changes", {}) or {}
+        self._apply_single_change(dtype, name, changes)
+
+    def _apply_single_change(self, dtype: str, name: str, changes: dict) -> None:
+        section = self.config_data.setdefault(dtype, {})
+        dev = section.setdefault(name, {})
+        dev.update(changes)
+        widget = self.device_widgets.get(f"{dtype}.{name}")
+        if widget is None:
+            # Unknown device → rebuild so a widget gets created.
+            self.update_device_widgets()
+            return
+        if self._widget_busy(widget, (dtype, name)):
+            return
+        widget.update_from_config(dev)
+
+    @staticmethod
+    def _is_descendant(child, parent) -> bool:
+        w = child
+        while w is not None:
+            if w is parent:
+                return True
+            w = w.parentWidget()
+        return False
+
+    def _widget_busy(self, widget, key: tuple) -> bool:
+        """True if a widget should not be overwritten by an incoming update."""
+        ts = self._pending.get(key)
+        if ts is not None:
+            if time.time() - ts < 5.0:
+                return True
+            # Stale pending (ack/echo never arrived) → stop blocking updates.
+            self._pending.pop(key, None)
+        if getattr(widget, "has_unsaved_changes", False):
+            return True
+        fw = QApplication.focusWidget()
+        if fw is not None and self._is_descendant(fw, widget):
+            return True
+        return False
 
     def check_config_changes(self):
-        """Check for changes in the config file (called by 1-second timer)."""
-        self.load_config()
+        """Safety reconcile (called by the slow timer)."""
+        self.request_state()
         
     def update_device_widgets(self):
         """Update device widgets based on current configuration"""
@@ -1217,6 +1371,14 @@ class DeviceStateGUI(QMainWindow):
         if self.status_checker:
             self.status_checker.stop()
             self.status_checker.wait()
+        listener = getattr(self, "_state_listener", None)
+        if listener is not None:
+            listener.stop()
+            listener.wait()
+        sender = getattr(self, "_update_sender", None)
+        if sender is not None:
+            sender.stop()
+            sender.wait()
         event.accept()
                     
         # Adjust window width based on the number of columns
@@ -1242,37 +1404,32 @@ class DeviceStateGUI(QMainWindow):
                     child.widget().deleteLater()
                     
     def on_device_value_changed(self, device_type: str, device_name: str, updated_config: Dict[str, Any]):
-        """Handle device value changes"""
-        # Determine device type and update config
-        if device_name in self.config_data.get("dds", {}) and device_type=="dds":
-            self.config_data["dds"][device_name].update(updated_config)
-        elif device_name in self.config_data.get("dac", {}) and device_type=="dac":
-            self.config_data["dac"][device_name].update(updated_config)
-        elif device_name in self.config_data.get("ttl", {}) and device_type=="ttl":
-            self.config_data["ttl"][device_name].update(updated_config)
-            
-        # Save updated config to file
-        self.save_config()
-        
-    def save_config(self):
-        """Save current configuration to JSON file (non-blocking).
+        """Handle a local device edit: update optimistically and push to server."""
+        # Optimistic local update so the UI stays responsive even if the
+        # network round-trip is slow.
+        section = self.config_data.setdefault(device_type, {})
+        if device_name in section:
+            section[device_name].update(updated_config)
+        else:
+            section[device_name] = dict(updated_config)
 
-        Debounced: rapid successive calls collapse into one write.
+        # Mark this device as having an in-flight edit so an incoming broadcast
+        # (including our own echo) does not clobber the spinbox mid-interaction.
+        self._pending[(device_type, device_name)] = time.time()
+
+        # Hand off to the background sender (coalesces rapid same-device edits).
+        self._update_sender.enqueue(device_type, device_name, updated_config)
+
+    def _on_update_ack(self, device_type: str, device_name: str, ack: dict) -> None:
+        """Server accepted our delta."""
+        self._version = ack.get("version", self._version)
+        self._pending.pop((device_type, device_name), None)
+
+    def _on_update_failed(self, device_type: str, device_name: str) -> None:
+        """Server unreachable / rejected our delta.
+
+        Keep the optimistic local value (so the user's intent is preserved on
+        screen) and flag the connection problem with a red status indicator.
         """
-        if not hasattr(self, '_save_debounce_timer'):
-            self._save_debounce_timer = QTimer(self)
-            self._save_debounce_timer.setSingleShot(True)
-            self._save_debounce_timer.timeout.connect(self._do_save)
-        self._save_debounce_timer.start(150)  # ms; coalesces rapid changes
-
-    def _do_save(self):
-        """Perform the actual file write in a background thread."""
-        import copy  # noqa: PLC0415
-        data_snapshot = copy.deepcopy(self.config_data)
-        worker = _SaveWorker(self.config_file, data_snapshot, self)
-        worker.save_failed.connect(
-            lambda msg: QMessageBox.critical(
-                self, "Error", f"Failed to save configuration: {msg}"))
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-        self._save_worker = worker  # keep alive until finished
+        self._pending.pop((device_type, device_name), None)
+        self.on_connection_failed()
