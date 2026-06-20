@@ -246,6 +246,18 @@ class DDS():
          self.update_phase_at_set()
 
    @kernel
+   def set_frequency_mu(self, ftw):
+      pm = 0
+      if self.phase_mode == 0:
+         pm = ad9910.PHASE_MODE_TRACKING
+      if self.phase_mode == 1:
+         pm = ad9910.PHASE_MODE_CONTINUOUS
+
+      self.dds_device.set_mu(ftw=ftw, pow_=self._pow, asf=self._asf,
+                             phase_mode=pm,
+                             ref_time_mu=self.t_phase_origin_mu)
+
+   @kernel
    def reset_phase(self):
       self._t_last_change_mu = now_mu()
       self._phase_t_last_set = 0
@@ -341,27 +353,6 @@ class DDS():
       delay(1*ms)
       self.dds_device.init(blind=blind)
       delay(1*ms)
-
-   @kernel
-   def write_frequency_register_mu(self, ftw):
-      """
-      Directly writes the frequency tuning word (FTW) to the DDS register. This
-      is a low-level operation that bypasses the usual frequency setting
-      methods, and should be used with caution. 
-      
-      Does not pulse the IO update pin, so the new frequency will not take
-      effect until the next scheduled IO update. This method is intended for
-      advanced users who need precise control over the timing of frequency
-      changes and are familiar with the internal workings of the AD9910 DDS.
-      """
-      # ftw = self.ftw
-      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG, 8,
-      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
-      # self.dds_device.bus.write((ad9910._AD9910_REG_PROFILE0 + 7) << 24)
-      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG | spi.SPI_END, 32,
-      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
-      # self.dds_device.bus.write(ftw)
-      # don't use rn, corrupts SPI transaction
 
    def read_db(self,ddb):
       '''read out info from ddb. ftw_per_hz comes from artiq.frontend.moninj, line 206-207'''
