@@ -1,11 +1,7 @@
 import socket
 
-from waxx.util.comms_server.waxx_client import WaxxClient, discover_prefix
-from waxx.util.comms_server.hardware_id import (
-    MONITOR_BASE_ID,
-    get_hardware_id,
-    monitor_server_id,
-)
+from waxx.util.comms_server.waxx_client import WaxxClient
+from waxx.util.comms_server.hardware_id import MONITOR_BASE_ID, resolve_scoped_server_id
 
 class CommClient(WaxxClient):
     """
@@ -63,35 +59,14 @@ class CommClient(WaxxClient):
 
 class MonitorClient(CommClient):
     def __init__(self, discovery_timeout: float = 3.0):
-        if get_hardware_id() is not None:
-            # Hardware id resolvable from this machine's device db -> connect
-            # only to the monitor server controlling that exact hardware.
-            super().__init__(monitor_server_id(), discovery_timeout=discovery_timeout)
-            return
-
-        # No hardware id available (env var 'db' unset/unreadable).  Fall back to
-        # discovering any monitor server on the subnet and connect only if there
-        # is exactly one — otherwise the choice would be ambiguous.
-        servers = discover_prefix(
-            MONITOR_BASE_ID, collect_for=min(discovery_timeout, 1.5)
+        # Connect only to the monitor server controlling this machine's hardware
+        # (matched via core_addr from env var 'db').  When no hardware id is
+        # available, resolve_scoped_server_id falls back to the unique monitor
+        # server on the subnet, or raises if the choice is ambiguous.
+        super().__init__(
+            resolve_scoped_server_id(MONITOR_BASE_ID),
+            discovery_timeout=discovery_timeout,
         )
-        if len(servers) == 1:
-            ((server_id, _addr),) = servers.items()
-            super().__init__(server_id, discovery_timeout=discovery_timeout)
-        elif len(servers) == 0:
-            raise RuntimeError(
-                "[MonitorClient] No monitor server discovered on the subnet and "
-                "no hardware id available (env var 'db' is unset). Start a monitor "
-                "server, or set 'db' to this branch's device_db.py."
-            )
-        else:
-            ids = ", ".join(sorted(servers))
-            raise RuntimeError(
-                "[MonitorClient] Multiple monitor servers found on the subnet "
-                f"({ids}) but this machine has no hardware id to pick the right "
-                "one. Set env var 'db' to this branch's device_db.py so the "
-                "client can match its core_addr."
-            )
 
     def send_end(self):
         self.send_message("run complete")
