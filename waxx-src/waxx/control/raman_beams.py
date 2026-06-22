@@ -234,12 +234,14 @@ class RamanBeamPair():
             self.dds0.dds_device.set_cfr1(
                 ram_enable=1,
                 ram_destination=ad9910.RAM_DEST_POW,
-                osk_enable=1
+                osk_enable=1,
+                manual_osk_external=1
             )
             self.dds1.dds_device.set_cfr1(
                 ram_enable=1,
                 ram_destination=ad9910.RAM_DEST_POW,
-                osk_enable=1
+                osk_enable=1,
+                manual_osk_external=1
             )
 
         with parallel:
@@ -379,29 +381,9 @@ class RamanBeamPair():
 
     @kernel
     def _restore_default_profile_mode(self):
-        # with parallel:
-        #     self.dds0.dds_device.set_cfr2(
-        #         sync_validation_disable=1
-        #     )
-        #     self.dds1.dds_device.set_cfr2(
-        #         sync_validation_disable=1
-        #     )
-
         with parallel:
-            self.dds0.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,
-                ram_enable=0,
-                ram_destination=0
-            )
-            self.dds1.dds_device.set_cfr1(
-                phase_autoclear=1,
-                internal_profile=0,
-                ram_enable=0,
-                ram_destination=0
-            )
-
-        self.io_update()
+            self.dds0._restore_default_profile_mode()
+            self.dds1._restore_default_profile_mode()
 
     @kernel
     def clean_up_fast_frequency_update(self):
@@ -414,7 +396,7 @@ class RamanBeamPair():
         self._restore_default_profile_mode()
 
     @kernel
-    def io_update(self):
+    def io_update(self) -> np.int64:
         at_mu(now_mu() & ~7)
 
         dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
@@ -427,7 +409,8 @@ class RamanBeamPair():
             with sequential:
                 delay_mu(dt1)
                 self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-    
+
+        t = now_mu()
         at_mu(now_mu() & ~7)
 
         self.dds0.frequency = self._new_f0
@@ -437,6 +420,8 @@ class RamanBeamPair():
         self.dds1.frequency = self._new_f1
         self.dds1._ftw = self._new_ftw1
         # self.dds1.update_phase_at_set()
+
+        return t
 
     @kernel(flags={"fast-math"})
     def set_frequency_fast_dumb(self,
@@ -450,8 +435,8 @@ class RamanBeamPair():
         self.state_splitting_to_ao_frequency(frequency_transition)
         f0 = self._dummy[DDS0_IDX]
         f1 = self._dummy[DDS1_IDX]
-        ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
-        ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
+        ftw0 = int32(round(self.dds0.dds_device.ftw_per_hz * f0))
+        ftw1 = int32(round(self.dds1.dds_device.ftw_per_hz * f1))
         
         at_mu(now_mu() & ~7)
         
@@ -471,25 +456,16 @@ class RamanBeamPair():
         at_mu(now_mu() & ~7)
         
     @kernel(flags={"fast-math"})
-    def set_frequency_fast(self,
-                 frequency_transition,
-                 do_io_update=True):
-        
-        self.dds0._last_ftw = self.dds0._ftw    
+    def _write_ftw_fast(self, ftw0, ftw1, do_io_update=True):
+        # Shared hot path for fast FTW updates of both DDSes. Programs the exact
+        # integer FTW words (no SI round-trip) via the staged SPI path.
+        self.dds0._last_ftw = self.dds0._ftw
         self.dds1._last_ftw = self.dds1._ftw
 
-        self.frequency_transition = frequency_transition
-
-        self.state_splitting_to_ao_frequency(frequency_transition)
-        f0 = self._dummy[DDS0_IDX]
-        f1 = self._dummy[DDS1_IDX]
-        ftw0 = int32(self.dds0.dds_device.ftw_per_hz * f0)
-        ftw1 = int32(self.dds1.dds_device.ftw_per_hz * f1)
-
-        self._new_f0 = f0
-        self._new_f1 = f1
         self._new_ftw0 = ftw0
         self._new_ftw1 = ftw1
+        self._new_f0 = self.dds0.dds_device.ftw_to_frequency(ftw0)
+        self._new_f1 = self.dds1.dds_device.ftw_to_frequency(ftw1)
 
         at_mu(now_mu() & ~7)
 
@@ -530,9 +506,30 @@ class RamanBeamPair():
                     )
                     self.dds1.dds_device.bus.write(ftw1)
             self._fast_freq_stage_valid = np.int32(0)
-            
+
         if do_io_update:
             self.io_update()
+
+    @kernel(flags={"fast-math"})
+    def set_ftw_fast(self, ftw0, ftw1, do_io_update=True):
+        # Program exact FTW words on both DDSes with no SI round-trip,
+        # so callers can guarantee bit-exact frequencies (e.g. returning to a saved word).
+        self._write_ftw_fast(ftw0, ftw1, do_io_update)
+
+    @kernel(flags={"fast-math"})
+    def set_frequency_fast(self,
+                 frequency_transition,
+                 do_io_update=True):
+
+        self.frequency_transition = frequency_transition
+
+        self.state_splitting_to_ao_frequency(frequency_transition)
+        f0 = self._dummy[DDS0_IDX]
+        f1 = self._dummy[DDS1_IDX]
+        ftw0 = int32(round(self.dds0.dds_device.ftw_per_hz * f0))
+        ftw1 = int32(round(self.dds1.dds_device.ftw_per_hz * f1))
+
+        self._write_ftw_fast(ftw0, ftw1, do_io_update)
 
     @kernel(flags={"fast-math"})
     def set(self,

@@ -218,9 +218,11 @@ class DDS():
       if freq_changed:
          self.frequency = frequency if frequency >= 0. else self.frequency
          self._ftw = self.dds_device.frequency_to_ftw(self.frequency)
+         self.frequency = self.dds_device.ftw_to_frequency(self._ftw)
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
          self._asf = self.dds_device.amplitude_to_asf(self.amplitude)
+         self.amplitude = self.dds_device.asf_to_amplitude(self._asf)
       if self.dac_control_bool and vpd_changed:
          self.v_pd = v_pd if v_pd >= 0. else self.v_pd
       if phase_origin_changed:
@@ -228,16 +230,16 @@ class DDS():
       if phase_changed:
          self.phase_offset = phase if phase >= 0. else self.phase_offset
          self._pow = self.dds_device.turns_to_pow(self.phase_offset/TWOPI)
+         self.phase_offset = self.dds_device.pow_to_turns(self._pow) * TWOPI
 
       # Set DDS and DAC as needed
       if self.dac_control_bool and (vpd_changed or init):
          self.update_dac_setpoint(self.v_pd)
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
-         
-         self.dds_device.set(frequency=self.frequency,
-                                    amplitude=self.amplitude, 
-                                    phase=self.phase_offset/TWOPI,
-                                    ref_time_mu=self.t_phase_origin_mu)
+         self.dds_device.set_mu(ftw=self._ftw,
+                                pow_=self._pow,
+                                asf=self._asf,
+                                ref_time_mu=self.t_phase_origin_mu)
          # if self.phase_mode == PHASE_MODE_TRACKING:
          #    self._t_phase_mu = now_mu()
          #    self._phase_at_t = self.get_phase(self._t_phase_mu)
