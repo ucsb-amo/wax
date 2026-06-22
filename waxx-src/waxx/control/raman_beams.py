@@ -223,8 +223,8 @@ class RamanBeamPair():
         ram_word0 = int32((self.dds0._pow << 16))  # ASF bits ignored in RAM_DEST_POW mode
         ram_word1 = int32((self.dds1._pow << 16))
 
-        dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
-        dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
+        # dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
+        # dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
 
         with parallel:
             self.dds0.dds_device.set_cfr2(asf_profile_enable=0)
