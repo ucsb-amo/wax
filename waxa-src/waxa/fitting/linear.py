@@ -12,7 +12,7 @@ class LinearFit(Fit):
             popt = self._fit(self.xdata,self.ydata)
         except Exception as e:
             print(e)
-            popt = [np.NaN] * 2
+            popt = [np.nan] * 2
             self.y_fitdata = np.zeros(self.ydata.shape); self.y_fitdata.fill(np.NaN)
         self.popt = popt
         self.slope = popt[0]
