@@ -249,11 +249,12 @@ class DDS():
    def set_frequency_mu(self, ftw):
       pm = 0
       if self.phase_mode == 0:
-         pm = ad9910.PHASE_MODE_TRACKING
-      if self.phase_mode == 1:
          pm = ad9910.PHASE_MODE_CONTINUOUS
+      if self.phase_mode == 1:
+         pm = ad9910.PHASE_MODE_TRACKING
 
-      self.dds_device.set_mu(ftw=ftw, pow_=self._pow, asf=self._asf,
+      self._ftw = ftw
+      self.dds_device.set_mu(ftw=self._ftw, pow_=self._pow, asf=self._asf,
                              phase_mode=pm,
                              ref_time_mu=self.t_phase_origin_mu)
 
@@ -361,4 +362,55 @@ class DDS():
       spi_dev = ddb[self.cpld_name]["arguments"]["spi_device"]
       self.bus_channel = ddb[spi_dev]["arguments"]["channel"]
    
-   
+   @kernel
+   def clear_phase_accumulator(self):
+      self.dds_device.set_cfr1(phase_autoclear=1)
+      at_mu(now_mu() & ~7)
+      delay_mu(int64(self.dds_device.sync_data.io_update_delay))
+      self.dds_device.io_update.pulse_mu(8)
+      at_mu(now_mu() & ~7)
+      self.dds_device.set_cfr1(phase_autoclear=0)
+
+   @kernel
+   def _configure_ffua_profile(self):
+         # In fast mode, source frequency from the FTW register and keep POW constant from RAM.
+         # Use the ASF register for amplitude so RAM profile setup does not clobber the active
+         # single-tone profile amplitude on shared-profile Urukul cards.
+         # Only dds0 is driven in fast mode; dds1 stays at its fixed single-tone frequency.
+         ram_word0 = int32((self._pow << 16))  # ASF bits ignored in RAM_DEST_POW mode
+
+         self.dds_device.set_cfr2(asf_profile_enable=0)
+         self.dds_device.set_cfr1(
+               ram_enable=1,
+               ram_destination=ad9910.RAM_DEST_POW,
+               osk_enable=1,
+               manual_osk_external=1
+         )
+
+         self.dds_device.set_profile_ram(
+               start=0, end=0, step=1, profile=urukul.DEFAULT_PROFILE,
+               mode=ad9910.RAM_MODE_DIRECTSWITCH
+         )
+
+         self.dds_device.write_ram([ram_word0])
+
+         self.dds_device.set_mu(ftw=self._ftw, asf=self._asf,
+                              ram_destination=ad9910.RAM_DEST_POW,
+                              phase_mode=0)
+         
+
+   @kernel
+   def _restore_default_profile_mode(self):
+      self.dds_device.set_cfr2(asf_profile_enable=1)
+      self.dds_device.set_cfr1()
+
+      self.dds_device.set_mu(ftw=self._ftw,
+                             pow_=self._pow,
+                             asf=self._asf)
+
+   @kernel
+   def io_update(self):
+      at_mu(now_mu() & ~7)
+      delay_mu(np.int64(self.dds_device.sync_data.io_update_delay))
+      self.dds_device.cpld.io_update.pulse_mu(8)
+      at_mu(now_mu() & ~7)
