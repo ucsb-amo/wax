@@ -282,6 +282,57 @@ class DataSaver():
     # Server-side methods (called by LiveODServer, not the experiment)
     # ------------------------------------------------------------------
 
+    def reserve_run_id_and_path(self, payload: dict):
+        """Atomically reserve a unique run_id and return ``(run_id, filepath)``.
+
+        The claim is made by creating the HDF5 file in exclusive mode (``'x'``
+        — create, fail if exists).  Because exclusive creation is atomic on the
+        (shared) filesystem, two liveOD servers driving different hardware but
+        writing to the same data drive can never obtain the same run_id: only
+        one ``'x'`` create wins, and the loser retries with the next id.
+
+        The starting candidate is seeded from ``max(counter, on-disk max)``, so
+        the run_id counter file acts only as a fast monotonic floor (preventing
+        id reuse after a reset deletes an in-progress file) while the filesystem
+        is the true source of truth.  The reserved file is a minimal stub;
+        ``create_data_file_from_payload`` fills in the full datasets afterwards.
+        """
+        st = self.server_talk
+        st.check_for_mapped_data_dir()
+
+        try:
+            counter = int(st.get_run_id())
+        except Exception:
+            counter = 0
+        fs_max = st.get_latest_run_id_any()
+        candidate = max(counter, (fs_max + 1) if fs_max is not None else 0, 1)
+
+        class _RunInfoProxy:
+            pass
+        ri = _RunInfoProxy()
+        ri.run_date_str = str(payload.get("run_date_str", ""))
+        ri.run_datetime_str = str(payload.get("run_datetime_str", ""))
+        ri.expt_class = str(payload.get("expt_class", "expt"))
+
+        while True:
+            ri.run_id = candidate
+            fpath, folder = self._data_path(ri)
+            os.makedirs(folder, exist_ok=True)
+            try:
+                with h5py.File(fpath, "x") as f:
+                    f.attrs["run_complete"] = False
+                break
+            except (FileExistsError, OSError):
+                if os.path.exists(fpath):
+                    # Another run already claimed this id — try the next one.
+                    candidate += 1
+                    continue
+                raise
+
+        # Advance the monotonic floor to the next id.
+        st.set_run_id(candidate + 1)
+        return candidate, fpath
+
     def compute_data_filepath_from_payload(self, payload: dict, run_id: int) -> str:
         """Return the HDF5 file path for a run without creating the file.
 
@@ -325,13 +376,13 @@ class DataSaver():
         ri.experiment_filepath = ""
 
         # ------ path computation & folder creation --------------------
-        pwd = os.getcwd()
+        # NB: _data_path returns absolute paths, so we must NOT os.chdir here.
+        # This method runs on a background thread and os.chdir is process-global
+        # — it would race with the main thread's working directory.
         self.server_talk.check_for_mapped_data_dir()
-        os.chdir(self._data_dir)
 
         fpath, folder = self._data_path(ri)
-        if not os.path.exists(folder):
-            os.mkdir(folder)
+        os.makedirs(folder, exist_ok=True)
 
         capture_images = bool(payload.get("capture_images", False))
 
@@ -398,7 +449,6 @@ class DataSaver():
                 pass
 
         f.close()
-        os.chdir(pwd)
         return fpath
 
     def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None):
@@ -421,9 +471,8 @@ class DataSaver():
         capture_images = bool(payload.get("capture_images", False))
         expt_filepath = str(payload.get("expt_filepath", ""))
 
-        pwd = os.getcwd()
-        os.chdir(self._data_dir)
-
+        # filepath is absolute; do not os.chdir (process-global, races with the
+        # file-creation background thread).
         with h5py.File(filepath, "r+") as f:
             # --- unshuffle images if the run was shuffled ---
             if capture_images and sort_idx_raw:
@@ -522,7 +571,6 @@ class DataSaver():
             f.attrs["run_complete"] = True
 
         print("[DataSaver] Parameters saved, data closed.")
-        os.chdir(pwd)
 
     # ------------------------------------------------------------------
     # Private helpers shared by server-side methods

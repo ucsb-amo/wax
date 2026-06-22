@@ -322,7 +322,7 @@ class server_talk():
 
         for date_dir in self._iter_date_dirs_desc(lite=lite):
             max_seen = -1
-            found_path = None
+            matches = []
             try:
                 for file_entry in os.scandir(date_dir):
                     if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
@@ -334,12 +334,18 @@ class server_talk():
                     if file_run_id > max_seen:
                         max_seen = file_run_id
                     if file_entry.name.startswith(prefix):
-                        found_path = file_entry.path
+                        matches.append(file_entry.path)
             except OSError:
                 continue
 
-            if found_path is not None:
-                return found_path
+            if matches:
+                if len(matches) > 1:
+                    print(
+                        f"[server_talk] WARNING: run ID {run_id} maps to "
+                        f"{len(matches)} data files: {matches}. Loading "
+                        f"{matches[0]}. This indicates a run_id collision."
+                    )
+                return matches[0]
             # All run IDs in this folder are older than the target — stop searching.
             if max_seen >= 0 and max_seen < run_id:
                 break
@@ -421,6 +427,33 @@ class server_talk():
             rid += 1
             with open(self.run_id_path, 'w') as f:
                 f.write(f"{rid}")
+
+    def get_latest_run_id_any(self):
+        """Return the highest run_id across ALL hdf5 data files, including
+        runs still in progress (``run_complete=False``).
+
+        Unlike ``get_latest_data_file`` (which only considers completed runs),
+        this scans every data file so a run_id reservation can avoid colliding
+        with an in-progress run started by another server.  Returns ``None``
+        when no data files exist.
+        """
+        self.check_for_mapped_data_dir()
+        for date_dir in self._iter_date_dirs_desc():
+            for path in self._iter_hdf5_files_desc(date_dir):
+                # _iter_hdf5_files_desc yields the highest run_id first and
+                # date dirs are newest-first, so the first hit is the global
+                # maximum.
+                return self.run_id_from_filepath(path)
+        return None
+
+    def set_run_id(self, value):
+        """Overwrite the run_id counter file with ``value`` (the next run_id to
+        be used).  Used by the reservation path to advance the monotonic floor
+        after atomically claiming an id."""
+        self.set_data_dir()
+        with self._run_id_lock:
+            with open(self.run_id_path, 'w') as f:
+                f.write(f"{int(value)}")
 
     def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True):
         from waxa.data import RunInfo, DataSaver
