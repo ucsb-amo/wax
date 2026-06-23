@@ -21,6 +21,8 @@ class DAC_CH():
 
     @kernel
     def set(self,v=dv,load_dac=True):
+        if self.ch < 0:
+            return
         if v != dv:
             if v > self.max_v:
                 self.v = 0.
@@ -43,10 +45,14 @@ class DAC_CH():
         
     @kernel
     def load(self):
+        if self.ch < 0:
+            return
         self.dac_device.load()
 
     @kernel(flags={"fast-math"})
     def linear_ramp(self,t,v_start,v_end,n):
+        if self.ch < 0:
+            return
         v0 = v_start
         vf = v_end
         delta_v = (vf-v0)/(n-1)
@@ -57,6 +63,8 @@ class DAC_CH():
 
     @kernel(flags={"fast-math"})
     def cubic_ramp(self,t,v_start,v_end,n):
+        if self.ch < 0:
+            return
         v0 = v_start
         vf = v_end
         dt = t/n

@@ -9,6 +9,7 @@ import artiq.coredevice.urukul as urukul
 from artiq.coredevice import spi2 as spi
 
 from waxx.util.artiq.async_print import aprint
+from waxx.control.artiq.DAC_CH import DAC_CH
 
 T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
 # T_AD9910_PIPELINE_LATENCY_MU = np.int64(107)
@@ -16,6 +17,7 @@ T_AD9910_PIPELINE_LATENCY_MU = np.int64(91)
 
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
+V_PD_PLACEHOLDER = -11.  # sentinel for "no stored v_pd" in _last_v_pd
 di2 = 2
 
 PHASE_MODE_TRACKING = 1
@@ -39,6 +41,7 @@ class DDS():
       self.transition = 'None'
       self.double_pass = True
       self.v_pd = v_pd
+      self._last_v_pd = V_PD_PLACEHOLDER  # set by off(), cleared by on() / update_dac_setpoint()
       self.phase_mode = 0
       self.dac_ch = DAC_CH_DEFAULT
       self.key = ""
@@ -57,6 +60,13 @@ class DDS():
          self.dac_device = ad53xx.AD53xx
          
       self.dac_control_bool = self.dac_ch != DAC_CH_DEFAULT
+
+      # Every DDS carries a DAC_CH object.  For channels without DAC control
+      # this is a dummy (ch=-1) whose kernel methods are all no-ops, so the
+      # ARTIQ compiler sees a uniform attribute type across every DDS instance.
+      # dds_assign() in dds_id.py replaces this with the real DAC_CH when a
+      # DAC channel is specified.
+      self.dac_ch_obj = DAC_CH(ch=-1, dac_device=self.dac_device)
 
       self._t_att_xfer_mu = np.int64(1592) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.10qxjvv6p35q
       self._t_set_xfer_mu = np.int64(1248) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.e1ucbs8kjf4z
@@ -223,8 +233,6 @@ class DDS():
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
          self._asf = self.dds_device.amplitude_to_asf(self.amplitude)
          self.amplitude = self.dds_device.asf_to_amplitude(self._asf)
-      if self.dac_control_bool and vpd_changed:
-         self.v_pd = v_pd if v_pd >= 0. else self.v_pd
       if phase_origin_changed:
          self.t_phase_origin_mu = t_phase_origin_mu - dt_phase_origin_shift_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
@@ -233,8 +241,8 @@ class DDS():
          self.phase_offset = self.dds_device.pow_to_turns(self._pow) * TWOPI
 
       # Set DDS and DAC as needed
-      if self.dac_control_bool and (vpd_changed or init):
-         self.update_dac_setpoint(self.v_pd)
+      if vpd_changed or init:
+         self.update_dac_setpoint(v_pd)
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
          self.dds_device.set_mu(ftw=self._ftw,
                                 pow_=self._pow,
@@ -294,11 +302,8 @@ class DDS():
    def update_dac_setpoint(self, v_pd=-0.1, dac_load = True):
 
       self.v_pd = v_pd if v_pd >= 0. else self.v_pd
-      v_pd = self.v_pd
-
-      self.dac_device.write_dac(channel=self.dac_ch, voltage=v_pd)
-      if dac_load:
-         self.dac_device.load()
+      self._last_v_pd = V_PD_PLACEHOLDER  # a manual setpoint update supersedes any stored last_v_pd
+      self.dac_ch_obj.set(v=self.v_pd, load_dac=dac_load)
 
    def get_devices(self,expt):
       self.dds_device = expt.get_device(self.name)
@@ -306,21 +311,20 @@ class DDS():
 
    @kernel
    def off(self, dac_update = True, dac_load = True):
-      self.update_dac_bool()
       self.dds_device.sw.off()
-      if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=0.)
-         if dac_load:
-            self.dac_device.load()
+      if dac_update:
+         self._last_v_pd = self.v_pd  # remember setpoint so on() can restore it
+         self.v_pd = 0.
+         self.dac_ch_obj.set(v=0., load_dac=dac_load)
       self.sw_state = 0
 
    @kernel
    def on(self, dac_update = True, dac_load=True):
-      self.update_dac_bool()
-      if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=self.v_pd)
-         if dac_load:
-            self.dac_device.load()
+      if dac_update:
+         if self._last_v_pd >= 0.:
+            self.v_pd = self._last_v_pd
+            self._last_v_pd = V_PD_PLACEHOLDER
+         self.dac_ch_obj.set(v=self.v_pd, load_dac=dac_load)
       self.dds_device.sw.on()
       self.sw_state = 1
 
