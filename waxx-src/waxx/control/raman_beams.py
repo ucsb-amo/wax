@@ -5,7 +5,7 @@ from artiq.coredevice.ad9910 import _AD9910_REG_FTW, _AD9910_REG_PROFILE0
 from artiq.coredevice import ad9910
 from artiq.coredevice import spi2 as spi
 from artiq.coredevice import urukul
-from artiq.experiment import TArray, TFloat, TTuple, parallel
+from artiq.experiment import TArray, TFloat, TTuple, parallel, TInt64
 from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
 from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU, T_AD9910_PIPELINE_LATENCY_MU
@@ -16,6 +16,7 @@ from waxx.util.artiq.async_print import aprint
 dv = -0.1
 dv_array = np.array([-0.1])
 di = 0
+di64 = np.int64(0)
 
 TWOPI = 2*np.pi
 
@@ -89,6 +90,9 @@ class RamanBeamPair():
         self._fast_freq_addr_pending1 = np.int32(0)
         self._aggressive_config_pending0 = np.int32(0)
         self._aggressive_config_pending1 = np.int32(0)
+
+        self._phi0_mu = np.int64(0)
+        self._phi1_mu = np.int64(0)
 
     @kernel
     def get_t(self):
@@ -396,7 +400,7 @@ class RamanBeamPair():
         self._restore_default_profile_mode()
 
     @kernel
-    def io_update(self) -> np.int64:
+    def io_update(self) -> TTuple([TInt64, TInt64]):
         at_mu(now_mu() & ~7)
 
         dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
@@ -406,11 +410,11 @@ class RamanBeamPair():
             with sequential:
                 delay_mu(dt0)
                 self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+                
             with sequential:
                 delay_mu(dt1)
                 self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-
-        t = now_mu()
+                
         at_mu(now_mu() & ~7)
 
         self.dds0.frequency = self._new_f0
@@ -421,7 +425,11 @@ class RamanBeamPair():
         self.dds1._ftw = self._new_ftw1
         # self.dds1.update_phase_at_set()
 
-        return t
+        # add in time for 1 SYNC_CLK period of AD9910 until update is applied
+        dt0 = dt0 + int64(4)
+        dt1 = dt1 + int64(4)
+
+        return dt0, dt1
 
     @kernel(flags={"fast-math"})
     def set_frequency_fast_dumb(self,
@@ -639,55 +647,89 @@ class RamanBeamPair():
         self.dds0.on()
         self.dds1.on()
     
-    @kernel(flags={"fast-math"})
-    def get_phase(self,
-               t_mu=np.int64(-1),
-               t_mu_origin=np.int64(-1),
-               frequency_transition=dv,
-               relative_phase=dv) -> int32:
-        """
-        Get the current relative phase of the Raman beams at time t_mu relative
-        to t_mu_origin. Defined as phi_0 - phi_1 (where phi_i is the phase of ddsi).
+    # @kernel(flags={"fast-math"})
+    # def get_phase(self,
+    #            t_mu=np.int64(-1),
+    #            t_mu_origin=np.int64(-1),
+    #            frequency_transition=dv,
+    #            relative_phase=dv) -> int32:
+        # """
+        # Get the current relative phase of the Raman beams at time t_mu relative
+        # to t_mu_origin. Defined as phi_0 - phi_1 (where phi_i is the phase of ddsi).
         
-        Accounts for the fact that the AOMs are double-passed, such
-        that the phase accumulated by each beam is twice that expected from the
-        oscillator frequency.
+        # Accounts for the fact that the AOMs are double-passed, such
+        # that the phase accumulated by each beam is twice that expected from the
+        # oscillator frequency.
 
-        Args:
-            t_mu (int, optional): The time at which to get the phase in machine units.
-            t_mu_origin (int, optional): The time origin for the phase calculation in machine units.
-            frequency_transition (float, optional): The two-photon transition frequency (Hz).
-                If negative or unchanged, uses the current AO values.
-            relative_phase (float, optional): The relative phase between the Raman beams (radians).
-                If negative or unchanged, uses the current relative phase.
+        # Args:
+        #     t_mu (int, optional): The time at which to get the phase in machine units.
+        #     t_mu_origin (int, optional): The time origin for the phase calculation in machine units.
+        #     frequency_transition (float, optional): The two-photon transition frequency (Hz).
+        #         If negative or unchanged, uses the current AO values.
+        #     relative_phase (float, optional): The relative phase between the Raman beams (radians).
+        #         If negative or unchanged, uses the current relative phase.
 
-        Returns:
-            A tuple containing the phase of each Raman beam (p0, p1) at time t_mu relative to t_mu_origin.
-        """
-        if self.phase_mode == 1:
-            # aprint(self.frequency_transition - frequency_transition, self.frequency_transition, frequency_transition)
-            if frequency_transition == dv or frequency_transition == self.frequency_transition:
-                f0 = self._frequency_array[DDS0_IDX]
-                f1 = self._frequency_array[DDS1_IDX]
-            else:
-                self.state_splitting_to_ao_frequency(frequency_transition)
-                f0 = self._dummy[DDS0_IDX]
-                f1 = self._dummy[DDS1_IDX]
-            relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
+        # Returns:
+        #     A tuple containing the phase of each Raman beam (p0, p1) at time t_mu relative to t_mu_origin.
+        # """
+        # if self.phase_mode == 1:
+        #     # aprint(self.frequency_transition - frequency_transition, self.frequency_transition, frequency_transition)
+        #     if frequency_transition == dv or frequency_transition == self.frequency_transition:
+        #         f0 = self._frequency_array[DDS0_IDX]
+        #         f1 = self._frequency_array[DDS1_IDX]
+        #     else:
+        #         self.state_splitting_to_ao_frequency(frequency_transition)
+        #         f0 = self._dummy[DDS0_IDX]
+        #         f1 = self._dummy[DDS1_IDX]
+        #     relative_phase = relative_phase if relative_phase >= 0. else self.relative_phase
         
-            # aprint(frequency_transition,f0,f1,relative_phase)
-            p0 = self.dds0.get_phase(t_mu,
-                                    t_mu_origin,
-                                    ftw=self.dds0.dds_device.frequency_to_ftw(f0),
-                                    pow=self.dds0.dds_device.turns_to_pow(self.global_phase/TWOPI))
-            p1 = self.dds1.get_phase(t_mu,
-                                    t_mu_origin,
-                                    ftw=self.dds1.dds_device.frequency_to_ftw(f1),
-                                    pow=self.dds1.dds_device.turns_to_pow((self.global_phase+relative_phase)/TWOPI))
+        #     # aprint(frequency_transition,f0,f1,relative_phase)
+        #     p0 = self.dds0.get_phase(t_mu,
+        #                             t_mu_origin,
+        #                             ftw=self.dds0.dds_device.frequency_to_ftw(f0),
+        #                             pow=self.dds0.dds_device.turns_to_pow(self.global_phase/TWOPI))
+        #     p1 = self.dds1.get_phase(t_mu,
+        #                             t_mu_origin,
+        #                             ftw=self.dds1.dds_device.frequency_to_ftw(f1),
+        #                             pow=self.dds1.dds_device.turns_to_pow((self.global_phase+relative_phase)/TWOPI))
+        # else:
+        #     p0 = self.dds0.get_phase()
+        #     p1 = self.dds1.get_phase()
+
+        # return (2*(p0-p1)) & int32(0xffff)
+
+    @kernel
+    def io_update_and_phase_update(self,
+                                t_pulse_mu,
+                                t_last_update_mu,
+                                t_io_update_delay_mu=di64):
+        dT = t_pulse_mu - t_last_update_mu
+        if t_io_update_delay_mu != di64:
+            dt_io = t_io_update_delay_mu
         else:
-            p0 = self.dds0.get_phase()
-            p1 = self.dds1.get_phase()
-        return (2*(p0-p1)) & int32(0xffff)
+            dt_io = T_AD9910_PIPELINE_LATENCY_MU
+
+        at_mu(t_pulse_mu - int64(16) - dt_io)
+        dt0, dt1 = self.io_update()
+
+        self.dds0._last_ftw
+
+        spmu = self._sysclk_per_mu
+
+        self._phi0_mu += self.dds0._last_ftw * (dT - int64(16) + dt0) * spmu >> 16
+        self._phi0_mu += self.dds0._ftw * (int64(16) - dt0) * spmu >> 16
+        
+        self._phi1_mu += self.dds1._last_ftw * (dT - int64(16) + dt1) * spmu >> 16
+        self._phi1_mu += self.dds1._ftw * (int64(16) - dt1) * spmu >> 16
+        
+        a0 = self.dds0.aom_order
+        a1 = self.dds1.aom_order
+
+        phase_tracker = self.pow_to_phase(2*np.int32(a0*self._phi0_mu - a1*self._phi1_mu))
+
+        at_mu(t_pulse_mu)
+
+        return phase_tracker
     
     @portable(flags={"fast-math"})
     def pow_to_phase(self, pow) -> TFloat:
