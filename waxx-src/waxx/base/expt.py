@@ -114,10 +114,15 @@ class Expt(Scanner, Dealer, Scribe):
             if response['run_id']:
                 print(f"Run ID: {self.run_info.run_id}")
         else:
-            if self.run_info.save_data:
+            if self.run_info.save_data and self.setup_camera:
                 raise RuntimeError(
                     "No liveOD server connection found. "
                     "Start the liveOD GUI before running experiments."
+                )
+            elif self.run_info.save_data:
+                print(
+                    "[LiveOD] WARNING: No liveOD server connection — "
+                    "data will not be saved (setup_camera=False)."
                 )
 
     @kernel
