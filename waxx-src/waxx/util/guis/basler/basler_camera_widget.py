@@ -214,6 +214,16 @@ class CountsPanel(QWidget):
         self.plot_widget.setContentsMargins(0, 0, 0, 0)
         self.plot_widget.setLabel("bottom", "seconds ago")
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
+        # Never let the QGraphicsView add a horizontal scrollbar — the x-axis
+        # should always scale to fit the available panel width, not scroll.
+        self.plot_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.plot_widget.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Allow the panel to shrink to any width the splitter allocates.
+        self.plot_widget.setMinimumWidth(1)
         layout.addWidget(self.plot_widget)
 
         self.plot_item = self.plot_widget.getPlotItem()
