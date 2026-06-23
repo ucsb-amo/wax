@@ -269,7 +269,6 @@ class Monitor:
                 continue
             if old_ttl.get(device_name, {}).get('ttl_state') != new_config.get('ttl_state'):
                 kernel_index = self.ttl_dict.get(device_name, -1)
-                update_index = self.ttl_updates.index(DEFAULT_UPDATE_BOOL) # get next update from start of list
                 update_index = self.ttl_updates.index(DEFAULT_UPDATE_INT) # get next update from start of list
                 self.ttl_updates[update_index] = (kernel_index, new_config['ttl_state'])
                 changes_detected = True
