@@ -34,6 +34,7 @@ class RunInfo():
         self.imaging_type = img.ABSORPTION
         
         self.save_data = int(save_data)
+        self.save_on_underflow = 0
 
         if expt_obj is not None:
             self.expt_class = expt_obj.__class__.__name__

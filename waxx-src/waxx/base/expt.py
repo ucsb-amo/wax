@@ -267,6 +267,7 @@ class Expt(Scanner, Dealer, Scribe):
             },
             'N_shots_with_repeats': int(getattr(self.params, 'N_shots_with_repeats', 1)),
             'N_pwa_per_shot': int(getattr(self.params, 'N_pwa_per_shot', 1)),
+            'save_on_underflow': int(getattr(self.run_info, 'save_on_underflow', 0)),
         }
 
     def _serialize_end_payload(self, expt_filepath: str) -> dict:

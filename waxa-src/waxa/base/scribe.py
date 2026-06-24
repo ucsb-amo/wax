@@ -25,16 +25,29 @@ class Scribe():
                                 check_period=CHECK_PERIOD,
                                 timeout=DEFAULT_TIMEOUT,
                                 check_interrupt_method=nothing):
-        """Blocks until the file at self.datapath is available.
+        """Blocks until the file at self.datapath is available and fully populated.
+
+        The file is created as an empty stub by reserve_run_id_and_path() and
+        then populated (including the 'data' group) by
+        create_data_file_from_payload() on a background thread.  Returning as
+        soon as the file is *openable* would race with that background write and
+        let SaveWorker try to access self._f['data'] before the group exists.
+        We therefore also wait until the 'data' group is present in the file.
         """
-        close = False
         t0 = time.time()
         count = 0
         while True:
             try:
                 if check_interrupt_method():
                     break
-                f = h5py.File(self.data_filepath,openmode)
+                f = h5py.File(self.data_filepath, openmode)
+                # Guard against the file being an empty stub created by
+                # reserve_run_id_and_path() before create_data_file_from_payload()
+                # has finished writing the 'data' group.
+                if 'data' not in f:
+                    f.close()
+                    time.sleep(check_period)
+                    continue
                 return f
             except Exception as e:
                 if "Unable to" in str(e) or "Invalid file name" in str(e) or "cannot access" in str(e):
@@ -198,10 +211,26 @@ class Scribe():
         an RTIOUnderflow.  Called as an RPC from the scan kernel after the
         current scan loop iteration completes.
 
-        Raises RuntimeError after notifying the server so that the caller
-        (scan()) propagates the exception out of run(), preventing analyze()
-        from executing and the experiment from sending a spurious END_RUN.
+        If ``run_info.save_on_underflow`` is set, pads any partially-captured
+        scope data to the full shot count and returns normally so that
+        ``post_scan()`` and ``analyze()`` execute as usual — ``end_wax()`` then
+        handles ``cleanup_scanned()``, monitor cleanup, and sending the final
+        END_RUN payload to the server.
+
+        Otherwise (default), sends ABORT_RUN to the server and raises
+        RuntimeError to prevent ``analyze()`` from executing.
         """
+        save_on_underflow = bool(getattr(self.run_info, 'save_on_underflow', False))
+
+        if save_on_underflow and self.run_info.save_data:
+            # Pad scope data so reshape_data() sees the full (*xvardims,...) shape
+            if hasattr(self, 'scope_data') and self.scope_data._scope_trace_taken:
+                n_shots = int(getattr(self.params, 'N_shots_with_repeats', 1))
+                self.scope_data.pad_to_n_shots(n_shots)
+            print(f'[Scanner] RTIOUnderflow on run {self.run_info.run_id}: '
+                  f'save_on_underflow=True — proceeding to analyze() to save partial data.')
+            return  # let post_scan() -> run() -> analyze() -> end_wax() handle saving
+
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
             if hasattr(self, 'monitor'):

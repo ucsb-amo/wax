@@ -44,7 +44,12 @@ class ScopeData:
     @kernel
     def arm(self):
         self.arm_rpc()
-    
+
+    def pad_to_n_shots(self, n_shots: int):
+        """Pad all scopes to n_shots entries for save_on_underflow partial saves."""
+        for scope in self.scopes:
+            scope.pad_to_n_shots(n_shots)
+
 class GenericWaxxScope():
     def __init__(self,device_id="",label="",arm=True,
                  scope_data=ScopeData()):
@@ -129,7 +134,22 @@ class GenericWaxxScope():
     
     def arm(self):
         self.scope.arm()
-    
+
+    def pad_to_n_shots(self, n_shots: int):
+        """Pad _data to n_shots entries with zeros for save_on_underflow partial saves.
+
+        If no traces have been captured (empty _data), does nothing — the
+        existing empty-_data guard in reshape_data() handles that case.
+        If k captures exist where 0 < k < n_shots, appends zero-filled copies
+        of _data[0] until len(_data) == n_shots.
+        """
+        n_captured = len(self._data)
+        if n_captured == 0 or n_captured >= n_shots:
+            return
+        zero_entry = np.zeros_like(np.asarray(self._data[0]))
+        while len(self._data) < n_shots:
+            self._data.append(zero_entry.copy())
+
 class SiglentScope_SDS2104X(GenericWaxxScope):
     def __init__(self,device_id="",label="",arm=True,
                  scope_data=ScopeData()):

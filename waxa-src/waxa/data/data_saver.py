@@ -371,6 +371,7 @@ class DataSaver():
         ri.expt_class = str(payload.get("expt_class", "expt"))
         ri.imaging_type = int(payload.get("imaging_type", 0))
         ri.save_data = int(payload.get("save_data_flag", 1))
+        ri.save_on_underflow = int(payload.get("save_on_underflow", 0))
         ri.filepath = []
         ri.xvarnames = list(payload.get("xvarnames", []))
         ri.experiment_filepath = ""
