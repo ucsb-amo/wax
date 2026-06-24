@@ -104,7 +104,58 @@ class MonitorUDPServer(UdpServer):
             "device_name": name,
             "changes": changes,
         })
+        # Keep linked DDS v_pd and DAC voltage in sync in both directions.
+        self._propagate_linked_vpd(dtype, name, changes)
         return json.dumps({"status": "ok", "version": version})
+
+    def _propagate_linked_vpd(self, dtype: str, name: str, changes: dict) -> None:
+        """Cross-propagate v_pd <-> voltage for DDS/DAC pairs sharing a channel.
+
+        The link is stored as ``dac_ch_key`` in every DDS config entry that has
+        DAC control (written by ``generate_state_file.Generator``).  When either
+        side changes the voltage the other side is updated atomically and a
+        broadcast is sent so GUI widgets on both tabs stay in sync.
+        """
+        try:
+            cfg = read_state(self.config_file_path)
+        except Exception:
+            return
+
+        if dtype == "dds" and "v_pd" in changes:
+            dac_key = cfg.get("dds", {}).get(name, {}).get("dac_ch_key", "")
+            if not dac_key:
+                return
+            linked = {"voltage": changes["v_pd"]}
+            try:
+                apply_delta(self.config_file_path, "dac", dac_key, linked)
+            except Exception:
+                return
+            self._version += 1
+            self._broadcaster.send({
+                "type": "state_update",
+                "version": self._version,
+                "device_type": "dac",
+                "device_name": dac_key,
+                "changes": linked,
+            })
+
+        elif dtype == "dac" and "voltage" in changes:
+            for dds_name, dds_cfg in cfg.get("dds", {}).items():
+                if dds_cfg.get("dac_ch_key", "") != name:
+                    continue
+                linked = {"v_pd": changes["voltage"]}
+                try:
+                    apply_delta(self.config_file_path, "dds", dds_name, linked)
+                except Exception:
+                    continue
+                self._version += 1
+                self._broadcaster.send({
+                    "type": "state_update",
+                    "version": self._version,
+                    "device_type": "dds",
+                    "device_name": dds_name,
+                    "changes": linked,
+                })
 
     def stop(self):
         try:

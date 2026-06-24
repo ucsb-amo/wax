@@ -9,9 +9,10 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
-    QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget
+    QCheckBox, QComboBox, QLineEdit, QGroupBox, QMessageBox, QStackedWidget,
+    QSizePolicy
 )
-from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker
+from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker, QEvent
 from PyQt6.QtGui import QFont, QIcon, QPainter, QPixmap
 
 from PyQt6.QtCore import Qt
@@ -31,6 +32,161 @@ STATE_BUTTON_ON_COLOR = "green"
 DEFAULT_BUTTON_COLOR = "#363636FF"  # Dark gray
 UNDO_BUTTON_COLOR = "orange"
 
+# --- Compact / responsive mode -------------------------------------------
+COMPACT_PX_WIDTH_PER_COLUMN = 44   # narrower per-column budget when compact
+COMPACT_HYSTERESIS_PX = 60         # extra room required to leave compact mode
+HOVER_DWELL_MS = 300               # hover time before the settings popup opens
+POPUP_HIDE_GRACE_MS = 300          # delay before the popup hides after leaving
+SEARCH_OUTLINE_STYLE = "border: 2px solid #4da6ff;"  # search highlight (compact)
+DAC_NONZERO_NAME_COLOR = "#5a5a5a"  # brighter gray when |voltage| > 0
+
+
+class ScrollableButton(QLineEdit):
+    """A compact, button-like control whose (possibly long) name text scrolls
+    horizontally by dragging instead of forcing the column wider.
+
+    Implemented as a read-only, frameless ``QLineEdit`` (which scrolls long
+    text natively) that behaves like a button: it emits ``clicked`` on a
+    press-release that did not drag, and optionally supports a checkable
+    on/off state via ``toggled``.
+    """
+
+    clicked = pyqtSignal()
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, text: str = "", checkable: bool = False, parent=None):
+        super().__init__(text, parent)
+        self.setReadOnly(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursorPosition(0)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        # Allow the button to shrink well below its text width so long names
+        # scroll rather than widening the column.
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._checkable = checkable
+        self._checked = False
+        self._press_pos = None
+        self._dragged = False
+        self.set_button_style()
+
+    # --- button-like API --------------------------------------------------
+    def isCheckable(self) -> bool:
+        return self._checkable
+
+    def setCheckable(self, value: bool) -> None:
+        self._checkable = bool(value)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, value: bool) -> None:
+        value = bool(value)
+        if value != self._checked:
+            self._checked = value
+            self.toggled.emit(value)
+
+    def toggle(self) -> None:
+        self.setChecked(not self._checked)
+
+    def set_button_style(self, background: str = None, outline: bool = False, padding: str = "0px 1px") -> None:
+        """Compose the tight button look: minimal padding, optional background
+        colour and an optional search-highlight outline.
+        
+        Parameters
+        ----------
+        background : str, optional
+            Background color name or hex value.
+        outline : bool
+            If True, apply search-highlight outline style.
+        padding : str
+            CSS padding string (e.g. "0px 0px" for zero padding, "0px 1px" for minimal).
+        """
+        border = SEARCH_OUTLINE_STYLE if outline else "border: 1px solid #5a5a5a;"
+        bg = f"background-color: {background};" if background else ""
+        self.setStyleSheet(
+            f"QLineEdit {{ border-radius: 3px; padding: {padding}; "
+            f"{border} {bg} }}"
+        )
+
+    # --- click vs. drag detection -----------------------------------------
+    def mousePressEvent(self, event):
+        self._press_pos = event.position()
+        self._dragged = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is not None:
+            delta = event.position() - self._press_pos
+            if abs(delta.x()) + abs(delta.y()) > 4:
+                self._dragged = True
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        # Only toggle and emit clicked on left-click; right-click is handled separately.
+        if (self._press_pos is not None and not self._dragged and 
+            event.button() == Qt.MouseButton.LeftButton):
+            if self._checkable:
+                self.toggle()
+            self.clicked.emit()
+        self._press_pos = None
+        self.setCursorPosition(0)
+
+
+class SettingsPopup(QWidget):
+    """Frameless hover/right-click popup that hosts a compact device widget's
+    detailed controls. One instance is created per compact device widget.
+
+    The widget's ``controls_container`` is re-parented into this popup while
+    compact mode is active, so there is never any duplicated state.
+    """
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("SettingsPopup")
+        self.setStyleSheet(
+            "QWidget#SettingsPopup { background-color: #2b2b2b; "
+            "border: 1px solid #5a5a5a; border-radius: 4px; }"
+        )
+        self._vbox = QVBoxLayout(self)
+        self._vbox.setContentsMargins(6, 6, 6, 6)
+        self._vbox.setSpacing(4)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def host(self, content: QWidget) -> None:
+        """Re-parent *content* into this popup and show it."""
+        self._vbox.addWidget(content)
+        content.setVisible(True)
+
+    def take(self, content: QWidget) -> None:
+        """Release *content* from this popup's layout (caller re-parents it)."""
+        self._vbox.removeWidget(content)
+
+    def show_below(self, anchor: QWidget) -> None:
+        self._hide_timer.stop()
+        self.adjustSize()
+        self.move(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        self.show()
+        self.raise_()
+
+    def schedule_hide(self) -> None:
+        self._hide_timer.start(POPUP_HIDE_GRACE_MS)
+
+    def cancel_hide(self) -> None:
+        self._hide_timer.stop()
+
+    def enterEvent(self, event):  # noqa: N802 (Qt API)
+        self.cancel_hide()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):  # noqa: N802 (Qt API)
+        self.schedule_hide()
+        super().leaveEvent(event)
+
+
 class DeviceWidget(QWidget):
     """Base class for device control widgets"""
     value_changed = pyqtSignal(str, str, dict)
@@ -40,6 +196,15 @@ class DeviceWidget(QWidget):
         self.device_name = device_name
         self.device_config = device_config
         self.setFont(QFont("Arial", 9))
+
+        # --- compact-mode state (populated by subclasses in setup_ui) ---
+        self._compact = False
+        self._search_matched = False
+        self.name_button = None            # compact name/on-off button
+        self.controls_container = None     # detailed controls (move to popup)
+        self._controls_home_layout = None  # inline layout owning the container
+        self._popup = None                 # lazily created SettingsPopup
+        self._dwell_timer = None           # hover dwell -> open popup
         
     def get_updated_config(self) -> Dict[str, Any]:
         """Return the updated configuration for this device"""
@@ -50,10 +215,70 @@ class DeviceWidget(QWidget):
         raise NotImplementedError
 
     def set_search_highlight(self, matched: bool) -> None:
-        """Highlight the device label in light blue when matched by search."""
-        lbl = getattr(self, "device_label", None)
-        if lbl is not None:
-            lbl.setStyleSheet("QLineEdit { background-color: #1a4f72; color: #e8e8e8; }" if matched else "")
+        """Highlight the matched device.
+
+        In expanded mode the device-name label gets a light-blue background.
+        In compact mode the name button gets a blue *outline* instead, so the
+        state-indicating background colour (green on / DAC gray) stays visible.
+        """
+        self._search_matched = matched
+        if self._compact:
+            self._refresh_compact_style()
+        else:
+            lbl = getattr(self, "device_label", None)
+            if lbl is not None:
+                lbl.setStyleSheet("QLineEdit { background-color: #1a4f72; color: #e8e8e8; }" if matched else "")
+
+    # --- compact-mode shared helpers -------------------------------------
+
+    def set_compact(self, compact: bool) -> None:
+        """Switch this widget between expanded and compact layouts.
+
+        Default implementation only records the flag; subclasses override to
+        actually rearrange their widgets.
+        """
+        self._compact = compact
+
+    def _refresh_compact_style(self) -> None:
+        """Recompose the compact button style (state colour + search outline).
+
+        Overridden by subclasses that have a compact name button.
+        """
+
+    def _ensure_popup(self) -> "SettingsPopup":
+        if self._popup is None:
+            self._popup = SettingsPopup()
+        return self._popup
+
+    def _wire_name_button_triggers(self) -> None:
+        """Open the settings popup on 300 ms hover dwell or right-click."""
+        if self.name_button is None:
+            return
+        self.name_button.installEventFilter(self)
+        self._dwell_timer = QTimer(self)
+        self._dwell_timer.setSingleShot(True)
+        self._dwell_timer.timeout.connect(self._open_settings_popup)
+
+    def _open_settings_popup(self) -> None:
+        if not self._compact or self.controls_container is None:
+            return
+        self._ensure_popup().show_below(self.name_button)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if obj is self.name_button and self._compact:
+            et = event.type()
+            if et == QEvent.Type.Enter:
+                if self._dwell_timer is not None:
+                    self._dwell_timer.start(HOVER_DWELL_MS)
+            elif et == QEvent.Type.Leave:
+                if self._dwell_timer is not None:
+                    self._dwell_timer.stop()
+                if self._popup is not None and self._popup.isVisible():
+                    self._popup.schedule_hide()
+            elif et == QEvent.Type.ContextMenu:
+                self._open_settings_popup()
+                return True
+        return super().eventFilter(obj, event)
 
 class DDSWidget(DeviceWidget):
     """Widget for controlling DDS devices"""
@@ -77,13 +302,30 @@ class DDSWidget(DeviceWidget):
         
     def setup_ui(self):
         layout = QVBoxLayout()
-        
+        layout.setContentsMargins(2, 2, 2, 2)  # Add 2px padding around widget
+        layout.setSpacing(2)
+
+        # Compact name / on-off button (hidden in expanded mode).  A
+        # ScrollableButton so a long name scrolls instead of widening the column.
+        self.name_button = ScrollableButton(self.device_name)
+        self.name_button.setToolTip(self.device_name)
+        self.name_button.setVisible(False)
+        self.name_button.clicked.connect(self._on_name_button_clicked)
+        layout.addWidget(self.name_button)
+
         self.device_label = QLineEdit(self.device_name)
         self.device_label.setCursorPosition(0)
         self.device_label.setReadOnly(True)
         self.device_label.setToolTip(self.device_name)
         layout.addWidget(self.device_label)
-        
+
+        # All detailed controls live in a container so they can be moved into a
+        # hover/right-click popup in compact mode.
+        self.controls_container = QWidget()
+        controls_layout = QVBoxLayout(self.controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(2)
+
         # Frequency controls
         freq_layout = QHBoxLayout()
         # freq_layout.addWidget(QLabel("Frequency:"))
@@ -107,7 +349,7 @@ class DDSWidget(DeviceWidget):
         
         freq_layout.addWidget(self.freq_unit_combo)
             
-        layout.addLayout(freq_layout)
+        controls_layout.addLayout(freq_layout)
         
         # Amplitude controls
         amp_layout = QHBoxLayout()
@@ -144,7 +386,7 @@ class DDSWidget(DeviceWidget):
             self.amp_unit_combo.setCurrentIndex(1)
         self.amp_unit_combo.currentTextChanged.connect(self.on_amp_unit_changed)
         amp_layout.addWidget(self.amp_unit_combo)
-        layout.addLayout(amp_layout)
+        controls_layout.addLayout(amp_layout)
         
         # Update button
 
@@ -160,12 +402,50 @@ class DDSWidget(DeviceWidget):
         self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
         state_button_row.addWidget(self.default_button)
 
-        layout.addLayout(state_button_row)
+        controls_layout.addLayout(state_button_row)
+
+        # Inline home for the controls container (expanded mode).
+        self._controls_home_layout = layout
+        layout.addWidget(self.controls_container)
         
         self.setLayout(layout)
         self.update_from_config(self.device_config)
 
         self.on_amp_unit_changed(start_unit)
+        self._wire_name_button_triggers()
+
+    def _on_name_button_clicked(self):
+        """Compact-mode left click toggles the DDS sw state."""
+        self.state_button.toggle()
+
+    def set_compact(self, compact: bool) -> None:
+        self._compact = compact
+        if compact:
+            self.device_label.setVisible(False)
+            self._controls_home_layout.removeWidget(self.controls_container)
+            self._ensure_popup().host(self.controls_container)
+            self.name_button.setVisible(True)
+            self._refresh_compact_style()
+        else:
+            if self._popup is not None:
+                self._popup.hide()
+                self._popup.take(self.controls_container)
+            self._controls_home_layout.addWidget(self.controls_container)
+            self.controls_container.setVisible(True)
+            self.name_button.setVisible(False)
+            self.device_label.setVisible(True)
+            self.device_label.setStyleSheet(
+                "QLineEdit { background-color: #1a4f72; color: #e8e8e8; }"
+                if self._search_matched else ""
+            )
+
+    def _refresh_compact_style(self) -> None:
+        if self.name_button is None:
+            return
+        self.name_button.setText(self.device_name)
+        self.name_button.setCursorPosition(0)
+        bg = STATE_BUTTON_ON_COLOR if self.state_button.isChecked() else None
+        self.name_button.set_button_style(bg, outline=self._search_matched)
     
     def on_default_undo_clicked(self):
         """Handle default/undo button click"""
@@ -229,6 +509,7 @@ class DDSWidget(DeviceWidget):
         else:
             self.state_button.setText("Off")
             self.state_button.setStyleSheet("")
+        self._refresh_compact_style()
         self.on_update_clicked()
         
     def on_instant_apply_toggled(self, checked):
@@ -428,6 +709,7 @@ class DDSWidget(DeviceWidget):
         else:
             self.state_button.setText("Off")
             self.state_button.setStyleSheet("")
+        self._refresh_compact_style()
 
 class DACWidget(DeviceWidget):
     """Widget for controlling DAC devices"""
@@ -445,13 +727,29 @@ class DACWidget(DeviceWidget):
     
     def setup_ui(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)  # Add 2px padding around widget
+        layout.setSpacing(2)
+
+        # Compact name button (hidden in expanded mode).  A ScrollableButton so
+        # a long name scrolls instead of widening the column.
+        self.name_button = ScrollableButton(self.device_name)
+        self.name_button.setToolTip(self.device_name)
+        self.name_button.setVisible(False)
+        self.name_button.clicked.connect(self._on_name_button_clicked)
+        layout.addWidget(self.name_button)
 
         self.device_label = QLineEdit(self.device_name)
         self.device_label.setCursorPosition(0)
         self.device_label.setReadOnly(True)
         self.device_label.setToolTip(self.device_name)
         layout.addWidget(self.device_label)
-        
+
+        # Detailed controls live in a container so they can move to a popup.
+        self.controls_container = QWidget()
+        controls_layout = QVBoxLayout(self.controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(2)
+
         # Voltage control
         voltage_layout = QHBoxLayout()
         # voltage_layout.addWidget(QLabel("Voltage:"))
@@ -470,9 +768,47 @@ class DACWidget(DeviceWidget):
         self.default_button.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR}")
         voltage_layout.addWidget(self.default_button)
         
-        layout.addLayout(voltage_layout)
+        controls_layout.addLayout(voltage_layout)
+
+        self._controls_home_layout = layout
+        layout.addWidget(self.controls_container)
         
         self.setLayout(layout)
+        self._refresh_compact_style()
+        self._wire_name_button_triggers()
+
+    def _on_name_button_clicked(self):
+        """Compact-mode left click opens the voltage settings popup."""
+        self._open_settings_popup()
+
+    def set_compact(self, compact: bool) -> None:
+        self._compact = compact
+        if compact:
+            self.device_label.setVisible(False)
+            self._controls_home_layout.removeWidget(self.controls_container)
+            self._ensure_popup().host(self.controls_container)
+            self.name_button.setVisible(True)
+            self._refresh_compact_style()
+        else:
+            if self._popup is not None:
+                self._popup.hide()
+                self._popup.take(self.controls_container)
+            self._controls_home_layout.addWidget(self.controls_container)
+            self.controls_container.setVisible(True)
+            self.name_button.setVisible(False)
+            self.device_label.setVisible(True)
+            self.device_label.setStyleSheet(
+                "QLineEdit { background-color: #1a4f72; color: #e8e8e8; }"
+                if self._search_matched else ""
+            )
+
+    def _refresh_compact_style(self) -> None:
+        if self.name_button is None:
+            return
+        self.name_button.setText(self.device_name)
+        self.name_button.setCursorPosition(0)
+        bg = DAC_NONZERO_NAME_COLOR if abs(self.voltage_spinbox.value()) > 1e-9 else None
+        self.name_button.set_button_style(bg, outline=self._search_matched)
 
     def on_default_undo_clicked(self):
         """Handle default/undo button click"""
@@ -547,6 +883,7 @@ class DACWidget(DeviceWidget):
             self.prev_voltage = self.voltage_spinbox.value()
             # Update step size from shared controller
             self.setup_step_sizes()
+        self._refresh_compact_style()
 
 
 class TTLWidget(DeviceWidget):
@@ -559,6 +896,8 @@ class TTLWidget(DeviceWidget):
     
     def setup_ui(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 4, 0, 4)  # Padding above label and below button to group them
+        layout.setSpacing(-2)  # Negative spacing to bring button closer to label
 
         self.device_label = QLineEdit(self.device_name)
         self.device_label.setCursorPosition(0)
@@ -568,10 +907,10 @@ class TTLWidget(DeviceWidget):
         
         # State control
         state_layout = QHBoxLayout()
+        state_layout.setContentsMargins(0, 0, 0, 0)
         # state_layout.addWidget(QLabel("State:"))
         
-        self.state_button = QPushButton("Off")
-        self.state_button.setCheckable(True)
+        self.state_button = ScrollableButton("Off", checkable=True)
         self.state_button.toggled.connect(self.on_state_button_toggled)
         state_layout.addWidget(self.state_button)
         
@@ -581,18 +920,50 @@ class TTLWidget(DeviceWidget):
         self.update_from_config(self.device_config)
 
     def on_state_button_toggled(self, checked):
-        if checked:
-            self.state_button.setText("On")
-            self.state_button.setStyleSheet("background-color: lightgreen")
-        else:
-            self.state_button.setText("Off")
-            self.state_button.setStyleSheet("")
+        self.state_button.setText(self.device_name if self._compact else ("On" if checked else "Off"))
+        # Match DDS OFF color styling: use empty stylesheet for off state
+        if not self._compact:
+            if checked:
+                self.state_button.setStyleSheet(f"background-color: {STATE_BUTTON_ON_COLOR}")
+            else:
+                self.state_button.setStyleSheet("")
+        self._refresh_compact_style()
         self.on_update_clicked()
+
+    def set_compact(self, compact: bool) -> None:
+        self._compact = compact
+        if compact:
+            self.device_label.setVisible(False)
+        else:
+            self.device_label.setVisible(True)
+            self.device_label.setStyleSheet(
+                "QLineEdit { background-color: #1a4f72; color: #e8e8e8; }"
+                if self._search_matched else ""
+            )
+        self.state_button.setText(
+            self.device_name if compact
+            else ("On" if self.state_button.isChecked() else "Off")
+        )
+        self._refresh_compact_style()
+
+    def _refresh_compact_style(self) -> None:
+        """Compose state colour (green on) + search outline on the button.
+
+        The TTL state button *is* the compact name button, so search highlight
+        is drawn as an outline only while compact.  Use minimal/negative padding
+        to allow the button to fill the grid cell without wasting space.
+        TTL on/off colors match DDS: green when on, no background when off.
+        """
+        bg = STATE_BUTTON_ON_COLOR if self.state_button.isChecked() else None
+        outline = self._compact and self._search_matched
+        self.state_button.set_button_style(bg, outline=outline, padding="-1px 0px")
+        self.state_button.setCursorPosition(0)
         
     def set_tooltip(self, ch: int):
         """Set tooltip to show device name and channel"""
         if self.device_label:
             self.device_label.setToolTip(f"{self.device_name}\nttl{ch}")
+        self.state_button.setToolTip(f"{self.device_name}\nttl{ch}")
         
     def on_update_clicked(self):
         """Handle update button click"""
@@ -620,12 +991,11 @@ class TTLWidget(DeviceWidget):
         self.device_config = config
         with QSignalBlocker(self.state_button):
             self.state_button.setChecked(bool(config["ttl_state"]))
-        if config["ttl_state"]:
-            self.state_button.setText("On")
-            self.state_button.setStyleSheet("background-color: lightgreen")
-        else:
-            self.state_button.setText("Off")
-            self.state_button.setStyleSheet("")
+        self.state_button.setText(
+            self.device_name if self._compact
+            else ("On" if config["ttl_state"] else "Off")
+        )
+        self._refresh_compact_style()
 
 
 class _UpdateSender(QThread):
@@ -802,6 +1172,12 @@ class DeviceStateGUI(QMainWindow):
         self._version = None
         self._pending: Dict[tuple, float] = {}
 
+        # Compact layout is suppressed; always expanded (never auto-collapse).
+        self._compact_mode = False
+        self._compact_override = False  # Force expanded mode always
+        self._in_recompute = False
+        self._scroll_viewport = None  # discovered on first showEvent
+
         self.setup_ui()
         self._setup_update_sender()
         self._setup_state_listener()
@@ -830,7 +1206,12 @@ class DeviceStateGUI(QMainWindow):
         self.status_button.setFont(font)
         self.status_button.setMinimumHeight(25)
         # self.status_button.setFixedWidth(1000)
-        central_widget_layout.addWidget(self.status_button)
+
+        # Compact-mode toggle is suppressed; always expanded.
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.addWidget(self.status_button, 1)
+        central_widget_layout.addLayout(status_row)
         
         # Create tab widget
         self.tab_widget = QTabWidget()
@@ -862,6 +1243,8 @@ class DeviceStateGUI(QMainWindow):
 
         # Setup DDS tab with step size controls at top
         dds_tab_layout = QVBoxLayout()
+        dds_tab_layout.setContentsMargins(8, 8, 8, 8)  # Increased padding around the tab
+        dds_tab_layout.setSpacing(12)  # Increased space between step controls and device grid
         
         # Step size controls panel for DDS
         dds_step_layout = QHBoxLayout()
@@ -923,9 +1306,14 @@ class DeviceStateGUI(QMainWindow):
 
         dds_tab_layout.addLayout(dds_step_layout)
 
-        # DDS devices grid layout
+        # DDS devices grid layout (wrapped in container for border)
+        self.dds_container = QWidget()
         self.dds_layout = QGridLayout()
-        dds_tab_layout.addLayout(self.dds_layout)
+        self.dds_layout.setHorizontalSpacing(2)
+        self.dds_layout.setContentsMargins(8, 8, 8, 8)  # Increased internal padding
+        self.dds_container.setLayout(self.dds_layout)
+        self.dds_container.setStyleSheet("border: 1px solid #555; border-radius: 4px;")
+        dds_tab_layout.addWidget(self.dds_container)
         self.dds_tab.setLayout(dds_tab_layout)
         
         # Connect DDS step size controls to update all DDS widgets
@@ -935,6 +1323,8 @@ class DeviceStateGUI(QMainWindow):
         
         # Setup DAC tab with step size controls at top
         dac_tab_layout = QVBoxLayout()
+        dac_tab_layout.setContentsMargins(8, 8, 8, 8)  # Increased padding around the tab
+        dac_tab_layout.setSpacing(12)  # Increased space between step controls and device grid
         
         # Step size controls panel for DAC
         dac_step_layout = QHBoxLayout()
@@ -963,9 +1353,14 @@ class DeviceStateGUI(QMainWindow):
 
         dac_tab_layout.addLayout(dac_step_layout)
 
-        # DAC devices grid layout
+        # DAC devices grid layout (wrapped in container for border)
+        self.dac_container = QWidget()
         self.dac_layout = QGridLayout()
-        dac_tab_layout.addLayout(self.dac_layout)
+        self.dac_layout.setHorizontalSpacing(2)
+        self.dac_layout.setContentsMargins(8, 8, 8, 8)  # Increased internal padding
+        self.dac_container.setLayout(self.dac_layout)
+        self.dac_container.setStyleSheet("border: 1px solid #555; border-radius: 4px;")
+        dac_tab_layout.addWidget(self.dac_container)
         self.dac_tab.setLayout(dac_tab_layout)
         
         # Connect DAC step size controls to update all DAC widgets
@@ -973,9 +1368,18 @@ class DeviceStateGUI(QMainWindow):
         
         # Setup TTL tab
         ttl_tab_layout = QVBoxLayout()
+        ttl_tab_layout.setContentsMargins(8, 8, 8, 8)  # Increased padding around the tab
+        ttl_tab_layout.setSpacing(12)  # Increased space for consistency with other tabs
 
+        # TTL devices grid layout (wrapped in container for border)
+        self.ttl_container = QWidget()
         self.ttl_layout = QGridLayout()
-        ttl_tab_layout.addLayout(self.ttl_layout)
+        self.ttl_layout.setHorizontalSpacing(1)
+        self.ttl_layout.setVerticalSpacing(0)  # No vertical padding between rows
+        self.ttl_layout.setContentsMargins(8, 8, 8, 8)  # Increased internal padding
+        self.ttl_container.setLayout(self.ttl_layout)
+        self.ttl_container.setStyleSheet("border: 1px solid #555; border-radius: 4px;")
+        ttl_tab_layout.addWidget(self.ttl_container)
         self.ttl_tab.setLayout(ttl_tab_layout)
 
         # Ctrl+F focuses the shared search bar.
@@ -1375,11 +1779,18 @@ class DeviceStateGUI(QMainWindow):
             for col_idx, col_widgets in enumerate(widget_grid):
                 for row_idx, widget in enumerate(col_widgets):
                     self.ttl_layout.addWidget(widget, row_idx, col_idx)
-        
+
+        # Apply the current compact mode to every freshly built widget.
+        for widget in self.device_widgets.values():
+            widget.set_compact(self._compact_mode)
+
         self.adjust_window_width()
 
         # Re-apply active search so highlights survive config reloads.
         self._apply_active_search(self.search_bar.text())
+
+        # Re-evaluate compact mode now that the column count is known.
+        self._recompute_compact()
 
     def closeEvent(self, event):
         """Handle window close event"""
@@ -1406,9 +1817,104 @@ class DeviceStateGUI(QMainWindow):
             max_columns = max(max_columns, layout.columnCount())
         
         if max_columns > 0:
+            px = COMPACT_PX_WIDTH_PER_COLUMN if self._compact_mode else PX_WIDTH_PER_COLUMN
             # Add a buffer column for aesthetics
-            new_width = (max_columns + 1) * PX_WIDTH_PER_COLUMN
+            new_width = (max_columns + 1) * px
             self.resize(new_width, self.height())
+
+    # --- compact / responsive mode --------------------------------------
+
+    def _expanded_required_width(self) -> int:
+        """Pixel width the expanded layout needs for its widest tab."""
+        max_columns = 1
+        for layout in [self.dds_layout, self.dac_layout, self.ttl_layout]:
+            max_columns = max(max_columns, layout.columnCount())
+        return max_columns * PX_WIDTH_PER_COLUMN
+
+    def _available_width(self) -> int:
+        """Width available to the layout.
+
+        When embedded in a dashboard the GUI lives inside a ``QScrollArea``;
+        we measure the *viewport* width so we can collapse BEFORE the inner
+        widget would overflow and trigger horizontal scrollbars.
+        """
+        from PyQt6.QtWidgets import QScrollArea  # noqa: PLC0415
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QScrollArea):
+                return w.viewport().width()
+            w = w.parentWidget()
+        cw = self.centralWidget()
+        return cw.width() if cw is not None else self.width()
+
+    def _recompute_compact(self):
+        """Decide compact vs expanded from override or available width."""
+        if self._in_recompute:
+            return
+        if self._compact_override is not None:
+            target = self._compact_override
+        else:
+            avail = self._available_width()
+            if avail <= 0:
+                return
+            required = self._expanded_required_width()
+            if self._compact_mode:
+                # Leave compact only once there is comfortably enough room.
+                target = not (avail >= required + COMPACT_HYSTERESIS_PX)
+            else:
+                target = avail < required
+        if target != self._compact_mode:
+            self.set_compact_mode(target)
+
+    def set_compact_mode(self, compact: bool):
+        """Switch every device widget into/out of compact layout."""
+        self._in_recompute = True
+        try:
+            self._compact_mode = compact
+            for widget in self.device_widgets.values():
+                widget.set_compact(compact)
+            # Tighten column spacing in compact mode; restore to normal in expanded.
+            # TTL channels use tighter spacing even in expanded mode (1 instead of 2).
+            if compact:
+                spacing = 0
+            else:
+                spacing = 2
+            self.dds_layout.setHorizontalSpacing(spacing * 2)  # Double the spacing
+            self.dac_layout.setHorizontalSpacing(spacing * 2)  # Double the spacing
+            self.ttl_layout.setHorizontalSpacing((spacing * 2) if compact else 2)  # Double the spacing
+            self.ttl_layout.setVerticalSpacing(0)  # Keep TTL vertical spacing tight always
+            # Show box outline only in expanded view
+            border_style = "border: none;" if compact else "border: 1px solid #555; border-radius: 4px;"
+            self.dds_container.setStyleSheet(border_style)
+            self.dac_container.setStyleSheet(border_style)
+            self.ttl_container.setStyleSheet(border_style)
+            self.adjust_window_width()
+        finally:
+            self._in_recompute = False
+
+    def showEvent(self, event):  # noqa: N802 (Qt API)
+        super().showEvent(event)
+        # Discover the enclosing scroll viewport (embedded case) once and watch
+        # it for resizes so we collapse based on the available viewport width.
+        if self._scroll_viewport is None:
+            from PyQt6.QtWidgets import QScrollArea  # noqa: PLC0415
+            w = self.parentWidget()
+            while w is not None:
+                if isinstance(w, QScrollArea):
+                    self._scroll_viewport = w.viewport()
+                    self._scroll_viewport.installEventFilter(self)
+                    break
+                w = w.parentWidget()
+        self._recompute_compact()
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        self._recompute_compact()
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if obj is self._scroll_viewport and event.type() == QEvent.Type.Resize:
+            self._recompute_compact()
+        return super().eventFilter(obj, event)
         
     def clear_layouts(self):
         """Clear all device widgets from layouts"""
