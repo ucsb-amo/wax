@@ -231,16 +231,21 @@ class Expt(Scanner, Dealer, Scribe):
                 'external': bool(dc._external_data_bool),
             }
 
-        if isinstance(self.images, np.ndarray) and self.images.ndim > 1:
-            images_shape = tuple(self.images.shape)
-            images_dtype = str(self.images.dtype)
+        if self.setup_camera:
+            if isinstance(self.images, np.ndarray) and self.images.ndim > 1:
+                images_shape = tuple(self.images.shape)
+                images_dtype = str(self.images.dtype)
+            else:
+                images_shape = (0,)
+                images_dtype = 'uint16'
+
+            if isinstance(self.image_timestamps, np.ndarray) and self.image_timestamps.ndim > 0:
+                ts_shape = tuple(self.image_timestamps.shape)
+            else:
+                ts_shape = (0,)
         else:
             images_shape = (0,)
             images_dtype = 'uint16'
-
-        if isinstance(self.image_timestamps, np.ndarray) and self.image_timestamps.ndim > 0:
-            ts_shape = tuple(self.image_timestamps.shape)
-        else:
             ts_shape = (0,)
 
         return {

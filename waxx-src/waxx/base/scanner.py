@@ -462,6 +462,7 @@ class Scanner():
 
         N_img = images_per_shot * N_img # 3 images per value of independent variable (xvar)
 
-        msg += f" {N_img} total images expected."
+        if self.setup_camera:
+            msg += f" {N_img} total images expected."
         print(msg)
         return N_img
