@@ -709,18 +709,21 @@ class RamanBeamPair():
         else:
             dt_io = T_AD9910_PIPELINE_LATENCY_MU
 
-        at_mu(t_pulse_mu - int64(16) - dt_io)
+        T_PRETRIGGER_CHANGE_MU = int64(16)
+        T = T_PRETRIGGER_CHANGE_MU
+
+        at_mu(t_pulse_mu - T - dt_io)
         dt0, dt1 = self.io_update()
 
         self.dds0._last_ftw
 
         spmu = self._sysclk_per_mu
 
-        self._phi0_mu += self.dds0._last_ftw * (dT - int64(16) + dt0) * spmu >> 16
-        self._phi0_mu += self.dds0._ftw * (int64(16) - dt0) * spmu >> 16
+        self._phi0_mu += self.dds0._last_ftw * (dT - T + dt0) * spmu >> 16
+        self._phi0_mu += self.dds0._ftw * (T - dt0) * spmu >> 16
         
-        self._phi1_mu += self.dds1._last_ftw * (dT - int64(16) + dt1) * spmu >> 16
-        self._phi1_mu += self.dds1._ftw * (int64(16) - dt1) * spmu >> 16
+        self._phi1_mu += self.dds1._last_ftw * (dT - T + dt1) * spmu >> 16
+        self._phi1_mu += self.dds1._ftw * (T - dt1) * spmu >> 16
         
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
