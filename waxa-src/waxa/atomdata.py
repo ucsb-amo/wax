@@ -39,6 +39,7 @@ class atomdata(atomdata_base):
         skip_saved_roi=False,
         transpose_idx=[],
         avg_repeats=False,
+        no_images=False,
         server_talk=st(),
     ):
         super().__init__(
@@ -49,6 +50,7 @@ class atomdata(atomdata_base):
             skip_saved_roi=skip_saved_roi,
             transpose_idx=transpose_idx,
             avg_repeats=avg_repeats,
+            no_images=no_images,
             server_talk=server_talk,
         )
 
@@ -61,6 +63,20 @@ class atomdata(atomdata_base):
 
     def save_roi_h5(self, printouts=False):
         return super().save_roi_h5(printouts=printouts)
+
+    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+        return super().save_lite_copy(
+            roi_id=roi_id,
+            use_saved_roi=use_saved_roi,
+            force_reread=force_reread,
+        )
+
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+        return super().create_lite_copy(
+            roi_id=roi_id,
+            use_saved_roi=use_saved_roi,
+            force_reread=force_reread,
+        )
 
     def unshuffle(self, reanalyze=True):
         return super().unshuffle(reanalyze=reanalyze)

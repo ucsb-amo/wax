@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QGridLayout, QGroupBox, QStatusBar, QFrame,
     QLineEdit, QCheckBox, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThread, QThreadPool, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtCore import QSize
 
@@ -83,7 +83,7 @@ class StatusDot(QPushButton):
         self.is_on = False
         self.setObjectName("StatusDotButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(22)
         self._update_color()
 
     def set_status(self, is_on: bool):
@@ -143,12 +143,12 @@ class StepIndicator(QWidget):
 
         # Primary label
         self.label = QLabel(label)
-        self.label.setMinimumWidth(150)
+        self.label.setMinimumWidth(80)
         text_layout.addWidget(self.label)
 
         # Secondary status line (completed/already done timestamps)
         self.note_label = QLabel("")
-        self.note_label.setStyleSheet("color: #5b6670; font-size: 11px;")
+        self.note_label.setStyleSheet("color: #8a949a; font-size: 11px;")
         self.note_label.setVisible(False)
         text_layout.addWidget(self.note_label)
 
@@ -358,6 +358,28 @@ class SerialWorker(QObject):
         self.disconnect_laser()
 
 
+class _BgCall(QRunnable):
+    """Run a callable on QThreadPool; report via callback.
+
+    Used so the GUI thread never blocks on the periodic snapshot/log
+    round-trip — without this the dashboard windows stutter when moved.
+    """
+
+    def __init__(self, func, on_done) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            res = self._func()
+        except BaseException as exc:  # noqa: BLE001
+            self._on_done(None, exc)
+            return
+        self._on_done(res, None)
+
+
 class ServerWorker(QObject):
     """Worker thread for TCP server"""
     
@@ -529,6 +551,9 @@ class SequenceWorker(QObject):
 
 
 class ALSControlGUI(QMainWindow):
+    # Cross-thread plumbing for the background snapshot/log fetcher.
+    _remote_state_ready = pyqtSignal(object, object)   # (snapshot, logs_payload|None)
+    _remote_state_failed = pyqtSignal(str)
     """Main GUI window for laser control"""
 
     request_serial_connect = pyqtSignal()
@@ -565,6 +590,8 @@ class ALSControlGUI(QMainWindow):
         self.remote_client: Optional[ALSGuiClient] = None
         self._next_log_index = 0
         self._last_remote_error: Optional[str] = None
+        self._remote_poll_in_flight = False
+        self._remote_connect_in_flight = False
         self._remote_sequence_state = SequenceState.IDLE
         self._remote_sequence_type: Optional[str] = None
         self._remote_serial_port = serial_port
@@ -587,32 +614,22 @@ class ALSControlGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
         
-        dashboard_layout = QHBoxLayout()
-        dashboard_layout.setSpacing(16)
+        dashboard_layout = QVBoxLayout()
+        dashboard_layout.setSpacing(8)
 
-        left_column = QVBoxLayout()
-        left_column.setSpacing(16)
+        # Vertically stacked to match the Precilaser GUI layout: the
+        # panel can compress horizontally to almost any width because
+        # status, controls, and measurements stack instead of competing
+        # for horizontal room.
         self.status_panel = self._create_status_panel()
         self.control_panel = self._create_control_panel()
-        left_panel_width = max(
-            self.status_panel.minimumSizeHint().width(),
-            self.control_panel.minimumSizeHint().width(),
-        )
-        self.status_panel.setFixedWidth(left_panel_width)
-        self.control_panel.setFixedWidth(left_panel_width)
-        left_column.addWidget(self.status_panel)
-        left_column.addWidget(self.control_panel)
-        left_column.addStretch()
-        dashboard_layout.addLayout(left_column, 2)
-
-        right_column = QVBoxLayout()
-        right_column.setSpacing(16)
-        right_column.addWidget(self._create_measurements_panel())
-        right_column.addStretch()
-        dashboard_layout.addLayout(right_column, 3)
+        dashboard_layout.addWidget(self.status_panel)
+        dashboard_layout.addWidget(self.control_panel)
+        dashboard_layout.addWidget(self._create_measurements_panel(), 1)
+        dashboard_layout.addStretch()
 
         main_layout.addLayout(dashboard_layout)
         
@@ -632,8 +649,11 @@ class ALSControlGUI(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         self.adjustSize()
-        self.setMinimumSize(self.minimumSizeHint())
-        self.resize(self.minimumSizeHint())
+        # Allow the dock panel to shrink horizontally; the layout will
+        # still enforce a sensible vertical minimum.
+        hint = self.minimumSizeHint()
+        self.setMinimumSize(0, hint.height())
+        self.resize(hint)
         
         # Initialize worker threads
         self._init_workers()
@@ -642,6 +662,10 @@ class ALSControlGUI(QMainWindow):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._sync_remote_state)
         self.status_timer.start(500)
+
+        # Cross-thread completion signals from the background remote-state fetcher.
+        self._remote_state_ready.connect(self._on_remote_state_ready)
+        self._remote_state_failed.connect(self._on_remote_state_failed)
         
         # Timer for auto-scrolling log back to bottom after user scrolls up
         self.auto_scroll_timer = QTimer()
@@ -649,91 +673,127 @@ class ALSControlGUI(QMainWindow):
         self.auto_scroll_timer.timeout.connect(self._auto_scroll_log)
 
     def _apply_theme(self):
-        """Apply a warm instrument-panel theme."""
+        """Dark, dashboard-native theme.
+
+        The panel is meant to live inside the kexp dashboard (dark
+        ``#2b2b2b`` chrome).  Keep the window background transparent so
+        the dock body shows through, then layer slightly-lighter cards
+        and group boxes on top for depth.  Accents (teal for setpoints,
+        amber for measured output) carry over from the original warm
+        theme so the visual language stays consistent.
+        """
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #f6f1e8;
-                color: #1f2a30;
-                font-family: Segoe UI;
+                background: transparent;
+                color: #d8d8d8;
+                font-family: 'Segoe UI';
             }
             QGroupBox {
-                border: 1px solid #d8cfc0;
-                border-radius: 16px;
-                margin-top: 14px;
-                padding-top: 14px;
-                background: #fffaf2;
-                font-size: 13px;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 10px 8px 8px 8px;
+                background: #323232;
+                font-size: 12px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 14px;
+                subcontrol-position: top left;
+                left: 12px;
                 padding: 0 6px;
-                color: #5b6670;
+                color: #9aa3a8;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.04em;
             }
             QFrame#ConnectionCard, QFrame#PowerCard, QFrame#MetricCard, QFrame#IndicatorPanel {
-                background: #fbf7f0;
-                border: 1px solid #ddd3c3;
-                border-radius: 14px;
+                background: #3a3a3a;
+                border: 1px solid #4f4f4f;
+                border-radius: 8px;
             }
             QPushButton {
-                background: #295c67;
-                color: #ffffff;
-                border: none;
-                border-radius: 10px;
-                padding: 10px 14px;
+                background: #3d6b78;
+                color: #f1f3f4;
+                border: 1px solid #4f8896;
+                border-radius: 6px;
+                padding: 5px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #347381;
+                background: #4d8294;
+                border-color: #6aa3b3;
+            }
+            QPushButton:pressed {
+                background: #355b66;
             }
             QPushButton:disabled {
-                background: #b7c1c4;
-                color: #edf1f2;
+                background: #2f3a3d;
+                color: #6a7479;
+                border-color: #3a4347;
             }
             QLineEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 10px;
-                padding: 8px;
+                background: #2a2a2a;
+                color: #e0e0e0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 5px 8px;
+                selection-background-color: #4d8294;
             }
+            QLineEdit:focus { border: 1px solid #6aa3b3; }
             QCheckBox {
                 spacing: 6px;
-                color: #5b6670;
+                color: #aab1b5;
+                font-weight: 500;
+            }
+            QCheckBox::indicator {
+                width: 13px; height: 13px;
+                border: 1px solid #6a6a6a;
+                border-radius: 3px;
+                background: #2a2a2a;
+            }
+            QCheckBox::indicator:checked {
+                background: #4d8294;
+                border-color: #6aa3b3;
             }
             QLabel#CardEyebrow {
-                color: #7c847c;
-                font-size: 11px;
+                color: #8a949a;
+                font-size: 10px;
                 font-weight: 600;
-                letter-spacing: 0.08em;
+                letter-spacing: 0.10em;
                 text-transform: uppercase;
             }
             QLabel#PowerOutputLabel {
-                color: #c26b2d;
+                color: #e8a87c;
                 font-size: 24px;
                 font-weight: 700;
             }
             QLabel#MetricIcon {
-                font-size: 20px;
+                font-size: 18px;
             }
             QLabel#MetricValue {
-                font-size: 22px;
+                font-size: 20px;
                 font-weight: 700;
-                color: #1f2a30;
+                color: #e6e6e6;
             }
             QLabel#MetricLabel {
-                color: #6f777e;
-                font-size: 11px;
+                color: #8a949a;
+                font-size: 10px;
             }
             QPlainTextEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 12px;
-                padding: 8px;
-                color: #2b3136;
+                background: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                padding: 6px;
+                color: #c8c8c8;
                 font-family: Consolas;
-                font-size: 12px;
+                font-size: 11px;
+                selection-background-color: #4d8294;
+            }
+            QStatusBar {
+                background: transparent;
+                color: #8a949a;
             }
             """
         )
@@ -774,147 +834,169 @@ class ALSControlGUI(QMainWindow):
         """Create status display panel"""
         group = QGroupBox("System")
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        connection_card = QFrame()
-        connection_card.setObjectName("ConnectionCard")
-        connection_layout = QVBoxLayout(connection_card)
-        connection_layout.setContentsMargins(12, 8, 12, 8)
-        connection_layout.setSpacing(6)
-
+        # Connection buttons kept as orphan widgets so existing setText /
+        # setEnabled / setStyleSheet calls still work, but hidden from the
+        # layout - the dashboard server panel already shows server reachability
+        # and the COM-port LED, so duplicating them inside the GUI is noise.
         self.server_conn_button = QPushButton("Server: searching\u2026")
         self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.server_conn_button.clicked.connect(self._retry_server_connection)
-        connection_layout.addWidget(self.server_conn_button)
+        self.server_conn_button.setVisible(False)
 
         self.connect_button = QPushButton(f"{self._remote_serial_port} Disconnected")
-        self.connect_button.setMinimumWidth(180)
-        self.connect_button.setMaximumWidth(220)
         self.connect_button.setStyleSheet(
-            "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+            "background-color: #d03f37; color: #ffffff; border-radius: 10px;"
+            " padding: 10px 14px; font-weight: 700;"
         )
         self.connect_button.clicked.connect(self._toggle_connection)
-        connection_layout.addWidget(self.connect_button)
-        layout.addWidget(connection_card)
+        self.connect_button.setVisible(False)
 
-        indicators_panel = QFrame()
-        indicators_panel.setObjectName("IndicatorPanel")
-        indicators_layout = QVBoxLayout(indicators_panel)
-        indicators_layout.setContentsMargins(10, 10, 10, 10)
-        indicators_layout.setSpacing(6)
-
-        indicators_title = QLabel("Laser Indicators")
-        indicators_title.setObjectName("CardEyebrow")
-        indicators_layout.addWidget(indicators_title)
-
+        # Status dots live directly in the System group — no inner
+        # "Laser Indicators" frame/title wrapper, to save vertical space.
         self.power_status_dot = StatusDot("Power")
         self.power_status_dot.clicked.connect(self._toggle_power_status)
-        indicators_layout.addWidget(self.power_status_dot)
+        layout.addWidget(self.power_status_dot)
         self.interlock_status_dot = StatusDot("Interlock")
         self.interlock_status_dot.clicked.connect(self._toggle_interlock_status)
-        indicators_layout.addWidget(self.interlock_status_dot)
+        layout.addWidget(self.interlock_status_dot)
         self.second_stage_status_dot = StatusDot("2nd Stage")
         self.second_stage_status_dot.clicked.connect(self._toggle_second_stage_status)
-        indicators_layout.addWidget(self.second_stage_status_dot)
+        layout.addWidget(self.second_stage_status_dot)
 
-        layout.addWidget(indicators_panel)
-        
         return group
 
-    def _create_measurements_panel(self) -> QGroupBox:
-        """Create the right-side power and telemetry panel."""
-        group = QGroupBox("Readout")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+    def _create_measurements_panel(self) -> QWidget:
+        """Create the right-side power and telemetry block.
 
-        power_row = QHBoxLayout()
-        power_row.setSpacing(10)
+        No outer "Readout" wrapper — each piece (Power Setpoint, Optical
+        Output, Telemetry, Activity Log) is its own ``QGroupBox`` so the
+        visual treatment matches the Precilaser panel.
+        """
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
-        power_box = QFrame()
-        power_box.setObjectName("PowerCard")
+        # ── Power readouts side-by-side, each in its own group box ───
+        power_col = QHBoxLayout()
+        power_col.setSpacing(8)
+
+        power_box = QGroupBox("Power")
         power_layout = QVBoxLayout(power_box)
-        power_layout.setContentsMargins(14, 10, 14, 10)
-        power_layout.setSpacing(8)
+        power_layout.setContentsMargins(10, 8, 10, 8)
+        power_layout.setSpacing(6)
 
-        header_layout = QHBoxLayout()
-        power_label = QLabel("Power Setpoint")
-        power_label.setObjectName("CardEyebrow")
-        header_layout.addWidget(power_label)
-        self.power_edit_checkbox = QCheckBox("Edit")
+        # Edit checkbox lives on the QGroupBox title strip itself — not
+        # as a separate header row inside — to save vertical space.
+        self.power_edit_checkbox = QCheckBox("Edit", power_box)
         self.power_edit_checkbox.setChecked(False)
         self.power_edit_checkbox.stateChanged.connect(self._on_power_edit_toggled)
-        header_layout.addWidget(self.power_edit_checkbox)
-        header_layout.addStretch()
-        power_layout.addLayout(header_layout)
+        # Style as a pill-shaped toggle button so it reads as clickable
+        # rather than a passive form control.
+        self.power_edit_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_edit_checkbox.setStyleSheet(
+            "QCheckBox {"
+            " background: #3d6b78; color: #f1f3f4;"
+            " border: 1px solid #4f8896; border-radius: 9px;"
+            " padding: 2px 10px; font-weight: 700; font-size: 11px;"
+            " letter-spacing: 0.04em;"
+            "}"
+            "QCheckBox:hover { background: #4d8294; border-color: #6aa3b3; }"
+            "QCheckBox:checked {"
+            " background: #c87a3d; border-color: #e8a87c; color: #fff;"
+            "}"
+            "QCheckBox:checked:hover { background: #d68a4d; }"
+            "QCheckBox::indicator { width: 0px; height: 0px; margin: 0; }"
+        )
+        self._power_edit_anchor = power_box
+        # Position is updated on first show + resize via an event filter.
+        power_box.installEventFilter(self)
 
         self.power_setpoint_label = QLabel("0%")
         self.power_setpoint_label.setStyleSheet(
-            "font-size: 42px; font-weight: 800; color: #295c67; text-align: center;"
+            "font-size: 26px; font-weight: 800; color: #5fb6c8;"
         )
-        self.power_setpoint_label.setMinimumHeight(58)
         self.power_setpoint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Stretch above keeps the readout vertically centered when the
+        # box grows (e.g. when neighbouring panels are hidden).
+        power_layout.addStretch()
         power_layout.addWidget(self.power_setpoint_label)
 
         self.power_input_field = PowerInputField(on_focus_out=self._on_power_input_focus_out)
         self.power_input_field.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #295c67; text-align: center;"
+            "font-size: 18px; font-weight: 700; color: #5fb6c8; background: #2a2a2a;"
+            " border: 1px solid #555; border-radius: 6px; padding: 4px;"
         )
-        self.power_input_field.setMinimumHeight(44)
         self.power_input_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_input_field.returnPressed.connect(self._on_power_input_submit)
         power_layout.addWidget(self.power_input_field)
 
         self.power_submit_hint = QLabel("ENTER to submit")
-        self.power_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c; text-align: center;")
+        self.power_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.power_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_submit_hint)
+        # Trailing stretch matches the leading one to centre the column.
+        power_layout.addStretch()
 
         self._update_power_edit_mode()
-        power_row.addWidget(power_box, 1)
+        power_col.addWidget(power_box, 1)
 
-        optical_box = QFrame()
-        optical_box.setObjectName("PowerCard")
+        optical_box = QGroupBox("Optical Output")
         optical_layout = QVBoxLayout(optical_box)
-        optical_layout.setContentsMargins(14, 10, 14, 10)
-        optical_layout.setSpacing(8)
-
-        optical_eyebrow = QLabel("Optical Output")
-        optical_eyebrow.setObjectName("CardEyebrow")
-        optical_layout.addWidget(optical_eyebrow)
+        optical_layout.setContentsMargins(10, 8, 10, 8)
+        optical_layout.setSpacing(6)
 
         self.optical_power_label = QLabel("0 W")
         self.optical_power_label.setStyleSheet(
-            "font-size: 42px; font-weight: 800; color: #c26b2d; text-align: center;"
+            "font-size: 26px; font-weight: 800; color: #e8a87c;"
         )
-        self.optical_power_label.setMinimumHeight(58)
         self.optical_power_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        optical_layout.addStretch()
         optical_layout.addWidget(self.optical_power_label)
         optical_layout.addStretch()
-        power_row.addWidget(optical_box, 1)
+        power_col.addWidget(optical_box, 1)
 
-        layout.addLayout(power_row)
+        layout.addLayout(power_col)
 
-        telemetry_title = QLabel("Telemetry")
-        telemetry_title.setObjectName("CardEyebrow")
-        layout.addWidget(telemetry_title)
-
-        telemetry_row = QHBoxLayout()
-        telemetry_row.setSpacing(12)
+        # ── Telemetry in a collapsible dropdown ───────────────────────
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+            telem_group = CollapsibleGroupBox(
+                "Telemetry", expanded=False, scrollable=True, max_expanded_height=180,
+            )
+        except Exception:
+            telem_group = QGroupBox("Telemetry")
+            QHBoxLayout(telem_group)
+        telem_inner = QHBoxLayout()
+        telem_inner.setContentsMargins(8, 8, 8, 8)
+        telem_inner.setSpacing(8)
         temp_card, self.temp_label = self._create_metric_card(
             "🌡", "Temperatures", "Actual / Setpoint", "0.0 / 0.0 °C"
         )
-        telemetry_row.addWidget(temp_card)
+        telem_inner.addWidget(temp_card)
         current_card, self.current_label = self._create_metric_card(
             "⚡", "Currents", "IMON-PA / LMON", "0.00 / 0.00 A"
         )
-        telemetry_row.addWidget(current_card)
-        layout.addLayout(telemetry_row)
+        telem_inner.addWidget(current_card)
+        if hasattr(telem_group, "setContentLayout"):
+            telem_group.setContentLayout(telem_inner)
+        else:
+            telem_group.layout().addLayout(telem_inner)
+        layout.addWidget(telem_group)
+        self.telem_group = telem_group
 
-        log_title = QLabel("Activity Log")
-        log_title.setObjectName("CardEyebrow")
-        layout.addWidget(log_title)
+        # ── Activity log: collapsible ────────────────────────────────
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+            log_box = CollapsibleGroupBox(
+                "Activity Log", expanded=False, scrollable=True, max_expanded_height=220,
+            )
+        except Exception:
+            log_box = QGroupBox("Activity Log")
+            QVBoxLayout(log_box)
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
@@ -922,17 +1004,22 @@ class ALSControlGUI(QMainWindow):
         log_font = self.log_output.font()
         log_font.setPointSize(9)
         self.log_output.setFont(log_font)
-        layout.addWidget(self.log_output, 1)
+        self.log_output.setMinimumHeight(80)
+        if hasattr(log_box, "addWidget"):
+            log_box.addWidget(self.log_output)
+        else:
+            log_box.layout().addWidget(self.log_output)
+        layout.addWidget(log_box, 1)
+        self.log_box = log_box
 
-        return group
+        return container
     
     def _create_control_panel(self) -> QGroupBox:
         """Create control panel with startup/shutdown buttons"""
         group = QGroupBox("Controls")
-        group.setMaximumWidth(280)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         self.startup_button = QPushButton("Startup")
         self.startup_button.clicked.connect(self._start_startup)
@@ -1069,9 +1156,13 @@ class ALSControlGUI(QMainWindow):
         if self._sequence_thread_is_running():
             self.statusBar().showMessage("A sequence is already running")
             return
-        self.remote_client.run_startup_sequence()
         self.statusBar().showMessage("Startup sequence requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("run_startup_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.run_startup_sequence, _done))
     
     def _start_shutdown(self):
         """Request remote shutdown sequence."""
@@ -1083,35 +1174,99 @@ class ALSControlGUI(QMainWindow):
         if self._sequence_thread_is_running():
             self.statusBar().showMessage("A sequence is already running")
             return
-        self.remote_client.run_shutdown_sequence()
         self.statusBar().showMessage("Shutdown sequence requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("run_shutdown_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.run_shutdown_sequence, _done))
     
     def _interrupt_sequence(self):
         """Interrupt current remote sequence."""
         if self.remote_client is None:
             return
-        self.remote_client.interrupt_sequence()
         self.statusBar().showMessage("Sequence interrupt requested")
-        self._sync_remote_state()
+        client = self.remote_client
+        def _done(result, exc):
+            if exc is not None:
+                LOGGER.warning("interrupt_sequence remote call failed: %r", exc)
+            self._sync_remote_state()
+        QThreadPool.globalInstance().start(_BgCall(client.interrupt_sequence, _done))
 
     def _sync_remote_state(self):
-        """Poll the ALS server for latest state and logs."""
+        """Poll the ALS server for state and logs without blocking the GUI.
+
+        Both the discovery handshake and the per-tick round-trip happen on
+        QThreadPool; results are marshalled back via Qt signals so window
+        drags stay smooth even when the server is slow or missing.
+        """
+        if self._remote_poll_in_flight or self._remote_connect_in_flight:
+            return
+
         if self.remote_client is None:
-            try:
-                self.remote_client = ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
-                self._set_server_conn_button_state("connected")
-            except RuntimeError:
-                self._set_server_conn_button_state("searching")
-                return
-        try:
-            snapshot = self.remote_client.get_snapshot()
-            self._set_server_conn_button_state("connected")
-            self._last_remote_error = None
+            self._remote_connect_in_flight = True
+            self._set_server_conn_button_state("searching")
+
+            def _build():
+                return ALSGuiClient(discovery_timeout=0.1, timeout_s=0.75)
+
+            def _build_done(result, exc):
+                self._remote_connect_in_flight = False
+                if exc is not None:
+                    self._remote_state_failed.emit(str(exc))
+                else:
+                    self.remote_client = result
+                    # Let the next tick fetch the snapshot.
+                    self._remote_state_failed.emit("")
+            QThreadPool.globalInstance().start(_BgCall(_build, _build_done))
+            return
+
+        self._remote_poll_in_flight = True
+        client = self.remote_client
+        next_idx = self._next_log_index
+
+        def _fetch():
+            snap = client.get_snapshot()
+            log_count = (
+                int(snap.get("log_count", next_idx)) if isinstance(snap, dict) else next_idx
+            )
+            logs_payload = None
+            if log_count > next_idx:
+                logs_payload = client.get_logs_since(next_idx)
+            return (snap, logs_payload)
+
+        def _done(result, exc):
+            if exc is not None:
+                self._remote_state_failed.emit(str(exc))
+            else:
+                snap, logs_payload = result
+                self._remote_state_ready.emit(snap, logs_payload)
+
+        QThreadPool.globalInstance().start(_BgCall(_fetch, _done))
+
+    # ---- GUI-thread completion slots --------------------------------- #
+
+    def _on_remote_state_ready(self, snapshot, logs_payload) -> None:
+        self._remote_poll_in_flight = False
+        self._set_server_conn_button_state("connected")
+        self._last_remote_error = None
+        if isinstance(snapshot, dict):
             self._apply_remote_snapshot(snapshot)
-            self._sync_remote_logs(snapshot.get("log_count", self._next_log_index))
-        except Exception as exc:
-            self._handle_remote_error(exc)
+        if logs_payload is not None:
+            for message in logs_payload.get("messages", []):
+                self._append_log_message(message)
+            self._next_log_index = int(
+                logs_payload.get("next_index", self._next_log_index)
+            )
+
+    def _on_remote_state_failed(self, err: str) -> None:
+        self._remote_poll_in_flight = False
+        if not err:
+            self._set_server_conn_button_state("connected")
+            return
+        # Surface error via the existing handler (status bar + state reset).
+        self._handle_remote_error(RuntimeError(err))
 
     def _apply_remote_snapshot(self, snapshot: Dict[str, Any]) -> None:
         status_data = snapshot.get("status", {})
@@ -1224,12 +1379,9 @@ class ALSControlGUI(QMainWindow):
             )
 
     def _sync_remote_logs(self, log_count: int) -> None:
-        if self.remote_client is None or log_count <= self._next_log_index:
-            return
-        log_response = self.remote_client.get_logs_since(self._next_log_index)
-        for message in log_response.get("messages", []):
-            self._append_log_message(message)
-        self._next_log_index = int(log_response.get("next_index", self._next_log_index))
+        # Kept as a no-op shim; log syncing now piggy-backs on the
+        # background snapshot fetch in ``_sync_remote_state``.
+        return
 
     def _set_server_conn_button_state(self, state: str) -> None:
         """Update the server TCP connection button appearance.
@@ -1516,3 +1668,21 @@ class ALSControlGUI(QMainWindow):
         self.sequence_progress_window.close()
         
         event.accept()
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        # Re-anchor the Power-box Edit checkbox to the top-right of the
+        # group box title strip after every resize / show, so removing the
+        # in-box "Edit" header row doesn't lose the control.
+        from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        anchor = getattr(self, "_power_edit_anchor", None)
+        cb = getattr(self, "power_edit_checkbox", None)
+        if anchor is not None and cb is not None and obj is anchor and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Move,
+        ):
+            cb.adjustSize()
+            margin = 12
+            x = anchor.width() - cb.width() - margin
+            y = 0  # sits on the group-box title line
+            cb.move(max(0, x), y)
+            cb.raise_()
+        return super().eventFilter(obj, event)

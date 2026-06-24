@@ -124,9 +124,30 @@ class BristolDetuningDisplay(QWidget):
     def update_frequency(self, freq_thz: float | None) -> None:
         if freq_thz is not None:
             det = (freq_thz - self.f0_thz) * 1e3
-            self._det_lbl.setText(f"Δ = {det:+.4f} GHz")
+            self._det_lbl.setText(f"Δ = {det:+.3f} GHz")
         else:
             self._det_lbl.setText("Δ = — GHz")
+
+    def update_detuning(
+        self,
+        mean_ghz: float | None,
+        std_mhz: float | None = None,
+    ) -> None:
+        """Set the detuning label directly with mean ± σ.
+
+        Used by clients that already compute a running average and want
+        a one-line "Δ = X ± Y MHz" readout in place of the per-sample
+        display.  ``mean_ghz`` is in GHz; ``std_mhz`` in MHz.
+        """
+        if mean_ghz is None or not (mean_ghz == mean_ghz):  # NaN guard
+            self._det_lbl.setText("Δ = — GHz")
+            return
+        if std_mhz is None or not (std_mhz == std_mhz):
+            self._det_lbl.setText(f"Δ = {mean_ghz:+.3f} GHz")
+        else:
+            self._det_lbl.setText(
+                f"Δ = {mean_ghz:+.3f} GHz ± {std_mhz:.2f} MHz"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +281,7 @@ class BristolServerGUI(QMainWindow):
 
         if freq is not None:
             det = (freq - self._f0_spin.value()) * 1e3
-            self._det_lbl.setText(f"Δ = {det:+.4f} GHz")
+            self._det_lbl.setText(f"Δ = {det:+.3f} GHz")
         else:
             self._det_lbl.setText("Δ = — GHz")
 

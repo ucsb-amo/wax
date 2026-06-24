@@ -1,10 +1,15 @@
-"""BaslerCamerasMainWindow — dock-based GUI for discovered Basler cameras.
+"""BaslerCamerasMainWindow - dock-based GUI for discovered Basler cameras.
 
-Each camera gets a ``QDockWidget`` with a built-in title-bar close (✕) button.
-Docks are movable, floatable, and can be tabified by dragging.
+Each camera gets a ``QDockWidget`` whose title-bar carries the full camera
+identification (user_id, model, S/N, host) plus a built-in close (X)
+button.  Docks are movable, floatable, and can be tabified by dragging
+them on top of each other or split side-by-side.
 
-The window starts empty with a central "＋ Add Camera" placeholder.  Discovery
-runs in the background so the Add Camera dialog is populated immediately.
+The window starts with a central "Add Camera" placeholder.  Discovery
+runs in the background so the Add Camera dialog is populated as soon as
+servers respond.  Double-clicking a row in the Add Camera dialog
+immediately accepts that row, so adding a single camera is a one-click
+gesture.
 
 Usage::
 
@@ -13,10 +18,15 @@ Usage::
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal, QObject
+
+_STATE_DIR = os.path.join(os.path.expanduser("~"), ".waxx")
+_LAYOUT_FILE = os.path.join(_STATE_DIR, "basler_cameras_layout.json")
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -46,7 +56,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class _CameraDock(QDockWidget):
-    """QDockWidget that emits ``closed(serial)`` when its ✕ is clicked."""
+    """QDockWidget that emits ``closed(serial)`` when its X is clicked."""
 
     closed = pyqtSignal(str)
 
@@ -71,13 +81,17 @@ class _DiscoveryWorker(QThread):
         serial_filter: Optional[list[str]],
         collect_for: float,
         parent: Optional[QObject] = None,
+        quiet: bool = False,
     ) -> None:
         super().__init__(parent)
         self.serial_filter = serial_filter
         self.collect_for = collect_for
+        self.quiet = quiet
 
     def run(self) -> None:
-        clients = discover_all_basler_cameras(collect_for=self.collect_for)
+        clients = discover_all_basler_cameras(
+            collect_for=self.collect_for, quiet=self.quiet,
+        )
         if self.serial_filter:
             clients = [c for c in clients if c.serial in self.serial_filter]
         self.cameras_found.emit(clients)
@@ -88,7 +102,11 @@ class _DiscoveryWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class _AddCameraDialog(QDialog):
-    """Multi-select list of cameras not currently shown."""
+    """Multi-select list of cameras not currently shown.
+
+    Double-clicking a row accepts the dialog with that single row
+    selected, which is the fast path for adding one camera at a time.
+    """
 
     def __init__(
         self,
@@ -104,14 +122,15 @@ class _AddCameraDialog(QDialog):
         if not available:
             layout.addWidget(QLabel("No additional cameras found on the network."))
         else:
-            layout.addWidget(QLabel("Select cameras to add:"))
+            layout.addWidget(QLabel("Select cameras to add (double-click a row to add immediately):"))
             self._list = QListWidget()
             self._list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
             for client in available:
-                sub = f"{client.model}  ·  S/N {client.serial}  ·  @{client.hostname}"
+                sub = f"{client.model}  \u00b7  S/N {client.serial}  \u00b7  @{client.hostname}"
                 item = QListWidgetItem(f"{client.display_name}\n{sub}")
                 item.setData(Qt.ItemDataRole.UserRole, client)
                 self._list.addItem(item)
+            self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
             layout.addWidget(self._list)
 
         buttons = QDialogButtonBox(
@@ -120,6 +139,14 @@ class _AddCameraDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _on_item_double_clicked(self, item: QListWidgetItem) -> None:
+        # Make sure the double-clicked row is part of the current selection,
+        # then accept.  This turns double-click into a one-shot "add this
+        # camera" gesture even when the user hasn't ticked it first.
+        if not item.isSelected():
+            item.setSelected(True)
+        self.accept()
 
     def selected_clients(self) -> list[BaslerCameraClient]:
         if not hasattr(self, "_list"):
@@ -160,11 +187,15 @@ class BaslerCamerasMainWindow(QMainWindow):
         self.setMinimumSize(700, 500)
         self.resize(1300, 780)
         self.setStyleSheet(DARK_STYLESHEET)
+        # Allow tabified docks, side-by-side splits, and grouped dragging
+        # so users can freely rearrange cameras.
         self.setDockOptions(
-            QMainWindow.DockOption.AllowTabbedDocks |
-            QMainWindow.DockOption.AnimatedDocks
+            QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AllowTabbedDocks
+            | QMainWindow.DockOption.AnimatedDocks
+            | QMainWindow.DockOption.GroupedDragging
         )
-        self.setAnimated(False)  # skip animation during dock drag for better responsiveness
+        self.setAnimated(False)  # snappier dock drag/drop
 
         # ---- Toolbar ---------------------------------------------------
         tb = QToolBar("Controls", self)
@@ -172,10 +203,10 @@ class BaslerCamerasMainWindow(QMainWindow):
         tb.setFloatable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
 
-        self._refresh_action = tb.addAction("⟳  Refresh")
+        self._refresh_action = tb.addAction("\u27f3  Refresh")
         self._refresh_action.triggered.connect(self._on_refresh)
         tb.addSeparator()
-        self._add_cam_action = tb.addAction("＋  Add Camera")
+        self._add_cam_action = tb.addAction("\uff0b  Add Camera")
         self._add_cam_action.triggered.connect(self._on_add_camera)
 
         # ---- Central placeholder (shown when no docks are open) --------
@@ -188,19 +219,85 @@ class BaslerCamerasMainWindow(QMainWindow):
         ph_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ph_layout.addWidget(ph_lbl)
 
-        ph_btn = QPushButton("＋  Add Camera")
+        ph_btn = QPushButton("\uff0b  Add Camera")
         ph_btn.setFixedSize(160, 40)
         ph_btn.clicked.connect(self._on_add_camera)
         ph_layout.addWidget(ph_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.setCentralWidget(self._placeholder)
 
-        self.statusBar().showMessage("Scanning for Basler servers…")
+        self.statusBar().showMessage("Scanning for Basler servers\u2026")
 
         # ---- Start background discovery --------------------------------
         self._worker = _DiscoveryWorker(serial_filter, collect_for, self)
         self._worker.cameras_found.connect(self._on_cameras_found)
         self._worker.start()
+
+        # Restore window geometry (size/position).  Dock layout is restored
+        # in _on_cameras_found once the docks exist.
+        self._restore_geometry()
+        self._layout_restored = False
+
+        # ---- Periodic re-scan so newly-spawned camera servers appear
+        #      without the user needing to click "Refresh".  The worker
+        #      checks ``isRunning()`` itself, so we just kick it.
+        self._rescan_timer = QTimer(self)
+        self._rescan_timer.setInterval(15_000)  # 15 s
+        self._rescan_timer.timeout.connect(self._on_periodic_rescan)
+        self._rescan_timer.start()
+
+    # ------------------------------------------------------------------ #
+    # Discovery
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Layout persistence
+    # ------------------------------------------------------------------ #
+
+    def _save_layout(self) -> None:
+        """Persist window geometry and dock arrangement to ``~/.waxx/``."""
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            data = {
+                "geometry": self.saveGeometry().toBase64().data().decode(),
+                "state": self.saveState().toBase64().data().decode(),
+            }
+            with open(_LAYOUT_FILE, "w") as fh:
+                json.dump(data, fh)
+        except Exception:
+            pass
+
+    def _restore_geometry(self) -> None:
+        """Restore window size/position from the saved layout file."""
+        try:
+            if not os.path.exists(_LAYOUT_FILE):
+                return
+            with open(_LAYOUT_FILE) as fh:
+                data = json.load(fh)
+            if "geometry" in data:
+                self.restoreGeometry(
+                    QByteArray.fromBase64(data["geometry"].encode())
+                )
+        except Exception:
+            pass
+
+    def _restore_dock_state(self) -> None:
+        """Restore dock layout (positions/tabs) from the saved layout file.
+
+        Must be called *after* the camera docks have been created so Qt
+        can match dock object-names to the saved positions.
+        """
+        try:
+            if not os.path.exists(_LAYOUT_FILE):
+                return
+            with open(_LAYOUT_FILE) as fh:
+                data = json.load(fh)
+            if "state" in data:
+                self.restoreState(
+                    QByteArray.fromBase64(data["state"].encode())
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Discovery
@@ -208,27 +305,45 @@ class BaslerCamerasMainWindow(QMainWindow):
 
     def _on_cameras_found(self, clients: list[BaslerCameraClient]) -> None:
         existing = {c.serial for c in self._all_clients}
+        new_clients: list[BaslerCameraClient] = []
         for c in clients:
             if c.serial not in existing:
                 self._all_clients.append(c)
                 existing.add(c.serial)
+                new_clients.append(c)
 
-        n = len(clients)
-        if n:
+        n_total = len(self._all_clients)
+        if new_clients:
+            n_new = len(new_clients)
             self.statusBar().showMessage(
-                f"Found {n} camera{'s' if n != 1 else ''} on network. "
-                "Use \u201c\uff0b Add Camera\u201d to display."
+                f"Discovered {n_new} new camera{'s' if n_new != 1 else ''} "
+                f"({n_total} total).  Use \u201c\uff0b Add Camera\u201d to display."
             )
-        else:
+        elif n_total == 0:
             self.statusBar().showMessage("No cameras found on network.")
 
         if self.auto_open:
-            for client in clients:
+            for client in new_clients:
                 self._add_camera_tile(client)
+
+        # Restore dock layout once on the first discovery round so all docks
+        # that were open last time exist before restoreState() runs.
+        if not self._layout_restored:
+            self._layout_restored = True
+            QTimer.singleShot(0, self._restore_dock_state)
 
     # ------------------------------------------------------------------ #
     # Tile management
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _dock_title(client: BaslerCameraClient) -> str:
+        name = client.user_id if client.user_id else client.display_name
+        return (
+            f"{name}  \u00b7  {client.model}"
+            f"  \u00b7  S/N {client.serial}"
+            f"  \u00b7  @{client.hostname}"
+        )
 
     def _add_camera_tile(self, client: BaslerCameraClient) -> None:
         if client.serial in self._camera_widgets:
@@ -238,12 +353,14 @@ class BaslerCamerasMainWindow(QMainWindow):
         widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         widget.setMinimumSize(420, 360)
 
-        dock = _CameraDock(client.serial, client.display_name, self)
+        dock = _CameraDock(client.serial, self._dock_title(client), self)
+        dock.setObjectName(f"basler_dock_{client.serial}")
         dock.setWidget(widget)
+        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         dock.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetMovable |
-            QDockWidget.DockWidgetFeature.DockWidgetFloatable |
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
         dock.closed.connect(self._on_dock_closed)
 
@@ -251,7 +368,7 @@ class BaslerCamerasMainWindow(QMainWindow):
         if not self._camera_widgets:
             self._placeholder.hide()
 
-        # Tile: expand horizontally up to 3, then tabify.
+        # Tile: expand horizontally up to 3, then tabify the rest.
         if self._first_dock is None:
             self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
             self._first_dock = dock
@@ -300,8 +417,27 @@ class BaslerCamerasMainWindow(QMainWindow):
     def _on_refresh(self) -> None:
         if self._worker.isRunning():
             return
-        self.statusBar().showMessage("Re-scanning for Basler servers…")
+        self.statusBar().showMessage("Re-scanning for Basler servers\u2026")
         self._worker = _DiscoveryWorker(self.serial_filter, 3.0, self)
+        self._worker.cameras_found.connect(self._on_cameras_found)
+        self._worker.start()
+
+    def _on_periodic_rescan(self) -> None:
+        """Quietly poll for newly-spawned camera servers in the background.
+
+        Does not change the status-bar message unless new cameras are found
+        (that update happens inside :meth:`_on_cameras_found`).  If the
+        previous worker is still running, this call is a no-op.
+        """
+        if self._worker.isRunning():
+            return
+        # Use a short collect window for periodic polls so we don't waste
+        # time blocking on UDP receives when nothing new is on the network.
+        # ``quiet=True`` keeps unchanged-state results out of the log; only
+        # genuine topology changes still surface at INFO.
+        self._worker = _DiscoveryWorker(
+            self.serial_filter, 1.5, self, quiet=True,
+        )
         self._worker.cameras_found.connect(self._on_cameras_found)
         self._worker.start()
 
@@ -315,12 +451,35 @@ class BaslerCamerasMainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def closeEvent(self, event) -> None:
+        self._save_layout()
+        try:
+            self._rescan_timer.stop()
+        except Exception:
+            pass
         for widget in self._camera_widgets.values():
             try:
                 widget._do_close()
             except Exception:
                 pass
+        # Ask the discovery worker to quit and wait briefly for it to
+        # actually exit.  Without this Qt destroys the QThread Python
+        # wrapper while the underlying OS thread is still blocked inside
+        # a UDP recv, which prints "QThread: Destroyed while thread is
+        # still running" on stderr.  The worker's UDP collect window is
+        # at most ~3 s, so a 3.5 s wait reliably catches it.
         if self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(2000)
+            try:
+                self._worker.quit()
+                self._worker.wait(3500)
+            except Exception:
+                pass
         super().closeEvent(event)
+
+    def cleanup(self) -> None:  # called by the dashboard close path
+        """Tear down threads/timers so the embedded GUI can be destroyed.
+
+        The dashboard does not deliver Qt closeEvents to embedded GUIs, so
+        the same shutdown work the standalone ``closeEvent`` would do is
+        exposed here for the panel wrapper to call.
+        """
+        self.closeEvent(None)

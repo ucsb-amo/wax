@@ -55,6 +55,11 @@ class BristolWavemeterServer(WaxxServer):
         self._poll_thread: Optional[threading.Thread] = None
         self._stopped = False
 
+        # Log dedup / backoff state (touched only by the poll thread)
+        self._consecutive_connect_failures = 0
+        self._consecutive_poll_failures = 0
+        self._connected_logged_once = False
+
     # ------------------------------------------------------------------
     # Public state accessors (safe to call from any thread)
     # ------------------------------------------------------------------
@@ -117,9 +122,20 @@ class BristolWavemeterServer(WaxxServer):
                 self._wavemeter = wm
                 self._reading["connected"] = True
                 self._error = None
-            LOGGER.info("Connected to wavemeter at %s", self.wavemeter_host)
+            # Only log "Connected" once per successful reconnect cycle to
+            # avoid spamming the log when the device is flapping.
+            if self._consecutive_connect_failures > 0 or not self._connected_logged_once:
+                LOGGER.info("Connected to wavemeter at %s", self.wavemeter_host)
+                self._connected_logged_once = True
+            self._consecutive_connect_failures = 0
         except Exception as exc:
-            LOGGER.warning("Failed to connect to wavemeter: %s", exc)
+            self._consecutive_connect_failures += 1
+            # First failure -> WARNING; subsequent -> DEBUG.
+            log_fn = LOGGER.warning if self._consecutive_connect_failures == 1 else LOGGER.debug
+            log_fn(
+                "Failed to connect to wavemeter (#%d): %s",
+                self._consecutive_connect_failures, exc,
+            )
             with self._lock:
                 self._wavemeter = None
                 self._reading["connected"] = False
@@ -155,16 +171,38 @@ class BristolWavemeterServer(WaxxServer):
                         self._reading["timestamp"] = time.time()
                         self._reading["connected"] = True
                         self._error = None
+                    self._consecutive_poll_failures = 0
                 except Exception as exc:
-                    LOGGER.warning("Poll error: %s — reconnecting", exc)
+                    self._consecutive_poll_failures += 1
+                    # First failure WARN, subsequent DEBUG -- avoids
+                    # log spam when the device is flapping.
+                    log_fn = (
+                        LOGGER.warning
+                        if self._consecutive_poll_failures == 1
+                        else LOGGER.debug
+                    )
+                    log_fn(
+                        "Poll error (#%d): %s -- reconnecting",
+                        self._consecutive_poll_failures, exc,
+                    )
                     with self._lock:
                         self._reading["connected"] = False
                         self._error = str(exc)
                     self._disconnect_wavemeter()
-                    time.sleep(2.0)
+                    # Exponential backoff capped at 30 s.
+                    backoff = min(
+                        30.0,
+                        2.0 * (2 ** min(self._consecutive_poll_failures - 1, 4)),
+                    )
+                    time.sleep(backoff)
                     self._connect_wavemeter()
             else:
-                time.sleep(2.0)
+                # No live connection -- back off based on connect failures.
+                backoff = min(
+                    30.0,
+                    2.0 * (2 ** min(self._consecutive_connect_failures, 4)),
+                )
+                time.sleep(backoff)
                 self._connect_wavemeter()
             time.sleep(self.poll_interval_s)
 

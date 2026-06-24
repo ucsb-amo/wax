@@ -21,7 +21,7 @@ from waxx.util.artiq.async_print import aprint
 
 RPC_DELAY = 10.e-3
 
-class Expt(Dealer, Scanner, Scribe):
+class Expt(Scanner, Dealer, Scribe):
     def __init__(self,
                  setup_camera=True,
                  save_data=True,
@@ -32,7 +32,7 @@ class Expt(Dealer, Scanner, Scribe):
             print("Warning: The argument 'absorption_image' is depreciated -- change it out for 'imaging_type'")
             print("Defaulting to absorption imaging.")
 
-        Scanner.__init__(self)
+        # Scanner.__init__(self)
         super().__init__()
 
         self.setup_camera = setup_camera
@@ -114,10 +114,15 @@ class Expt(Dealer, Scanner, Scribe):
             if response['run_id']:
                 print(f"Run ID: {self.run_info.run_id}")
         else:
-            if self.run_info.save_data:
+            if self.run_info.save_data and self.setup_camera:
                 raise RuntimeError(
                     "No liveOD server connection found. "
                     "Start the liveOD GUI before running experiments."
+                )
+            elif self.run_info.save_data:
+                print(
+                    "[LiveOD] WARNING: No liveOD server connection — "
+                    "data will not be saved (setup_camera=False)."
                 )
 
     @kernel
@@ -262,6 +267,7 @@ class Expt(Dealer, Scanner, Scribe):
             },
             'N_shots_with_repeats': int(getattr(self.params, 'N_shots_with_repeats', 1)),
             'N_pwa_per_shot': int(getattr(self.params, 'N_pwa_per_shot', 1)),
+            'save_on_underflow': int(getattr(self.run_info, 'save_on_underflow', 0)),
         }
 
     def _serialize_end_payload(self, expt_filepath: str) -> dict:
@@ -275,10 +281,13 @@ class Expt(Dealer, Scanner, Scribe):
                 except Exception as _e:
                     print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} — scope data will be empty for this run.")
                     reshaped = None
-                scope_data_list.append({
-                    'label': str(scope.label),
-                    'data': reshaped,
-                })
+                if reshaped is None or not isinstance(reshaped, np.ndarray) or reshaped.ndim < 3 or reshaped.size == 0:
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) — omitting from payload.")
+                else:
+                    scope_data_list.append({
+                        'label': str(scope.label),
+                        'data': reshaped,
+                    })
 
         # DataVault
         dv = {}

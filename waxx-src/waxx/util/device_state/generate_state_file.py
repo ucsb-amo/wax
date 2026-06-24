@@ -72,16 +72,23 @@ class Generator():
         dds_list = getattr(self.dds, 'dds_list', [])
         for dds_device in dds_list:
             if isinstance(dds_device, DDS):
+                dac_ch_obj = getattr(dds_device, 'dac_ch_obj', None)
+                from waxx.control.artiq.DAC_CH import DAC_CH
+                real_dac = isinstance(dac_ch_obj, DAC_CH) and dac_ch_obj.ch >= 0
                 devices[dds_device.key] = {
                     'frequency': getattr(dds_device, 'frequency', 0.0),
                     'amplitude': getattr(dds_device, 'amplitude', 0.0),
-                    'v_pd': getattr(dds_device, 'v_pd', 0.0),  # voltage photodiode setpoint
+                    # Read v_pd from the linked DAC_CH object so both stay in sync.
+                    'v_pd': (dac_ch_obj.v if real_dac else getattr(dds_device, 'v_pd', 0.0)),
                     'urukul_idx': getattr(dds_device, 'urukul_idx', 0),
                     'ch': getattr(dds_device, 'ch', 0),
                     'sw_state': getattr(dds_device, 'sw_state', 0),  # Hardware switch state (0/1)
                     'transition': getattr(dds_device, 'transition', 'None'),
                     'aom_order': getattr(dds_device, 'aom_order', 0),
-                    'dac_ch': getattr(dds_device, 'dac_ch', -1)
+                    'dac_ch': getattr(dds_device, 'dac_ch', -1),
+                    # Key of the linked DAC_CH (empty string when no DAC control).
+                    # Used by the monitor server to cross-propagate v_pd <-> voltage.
+                    'dac_ch_key': (dac_ch_obj.key if real_dac else ""),
                 }
         
         return devices

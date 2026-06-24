@@ -1,11 +1,15 @@
 import glob
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
+
+_SCAN_WORKERS = 8  # parallel HDF5 reader threads
 
 from .cache import MetadataCache
 from ..plotting.plotting_1d import detect_unit
@@ -285,12 +289,16 @@ class RunScanner:
         self.date_to = date_to
         self._lite_runs_by_date = {}
         self._cache = MetadataCache(data_dir)
+        self._cache_lock = threading.Lock()
+        self._lite_lock = threading.Lock()
 
     def scan(self):
         if not self.data_dir or not os.path.isdir(self.data_dir):
             return
 
+        uncached = []  # (filepath, stat_result) pairs not yet in cache
         try:
+            # --- Fast pass: yield cached summaries immediately (preserves order) ---
             for folder in self._iter_date_folders():
                 for filepath in self._iter_hdf5_files(folder):
                     try:
@@ -307,9 +315,28 @@ class RunScanner:
                         yield cached_summary
                         continue
 
-                    summary = self._read_summary(filepath)
+                    uncached.append((filepath, stat_result))
+
+            # --- Parallel pass: read uncached files with a thread pool ---
+            pending_puts = 0
+            with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as executor:
+                future_to_stat = {
+                    executor.submit(self._read_summary, fp): (fp, sr)
+                    for fp, sr in uncached
+                }
+                for future in as_completed(future_to_stat):
+                    fp, sr = future_to_stat[future]
+                    try:
+                        summary = future.result()
+                    except Exception:
+                        continue
                     if summary is not None:
-                        self._cache.put(summary, stat_result)
+                        with self._cache_lock:
+                            self._cache.put(summary, sr)
+                            pending_puts += 1
+                            if pending_puts >= 100:
+                                self._cache.save_if_dirty()
+                                pending_puts = 0
                         yield summary
         finally:
             self._cache.save()
@@ -346,8 +373,13 @@ class RunScanner:
     def _read_summary(self, filepath):
         try:
             with h5py.File(filepath, "r") as f:
-                if not _is_completed_run(f):
+                xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
+
+                # Single-pass: validate completion and collect dims+details together.
+                xvar_result = self._read_and_validate_xvars(f, xvarnames)
+                if xvar_result is None:
                     return None
+                xvardims, xvar_details = xvar_result
 
                 run_id = self._read_run_id(f, filepath)
                 run_date_str = _decode_str(
@@ -355,9 +387,7 @@ class RunScanner:
                 )
                 run_datetime_str = _decode_str(f.attrs.get("run_datetime_str", ""))
 
-                xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
                 experiment_name, experiment_filepath = self._read_experiment_info(f)
-                xvardims = self._read_xvardims(f, xvarnames)
                 n_repeats = _read_n_repeats_value(f)
 
                 if "data" in f:
@@ -393,6 +423,7 @@ class RunScanner:
                     filepath=filepath,
                     xvarnames=xvarnames,
                     xvardims=xvardims,
+                    xvar_details=xvar_details,
                     data_container_keys=data_container_keys,
                     has_scope_data=has_scope_data,
                     n_repeats=n_repeats,
@@ -412,16 +443,36 @@ class RunScanner:
         fallback_str = _decode_str(fallback)
         return fallback_str, fallback_str
 
-    def _read_xvardims(self, h5file, xvarnames):
-        if "params" in h5file:
-            dims = []
-            for name in xvarnames:
-                if name in h5file["params"]:
-                    values = np.asarray(h5file["params"][name][()]).reshape(-1)
-                    dims.append(int(values.size))
-            return tuple(dims)
+    def _read_and_validate_xvars(self, h5file, xvarnames):
+        """Single-pass: validate run completion, return (xvardims, xvar_details) or None if incomplete."""
+        filtered = [name for name in xvarnames if str(name).strip()]
+        if not filtered:
+            return (), []
+        if "params" not in h5file:
+            return None
+        dims = []
+        details = []
+        for name in filtered:
+            if name not in h5file["params"]:
+                return None
+            values = np.asarray(h5file["params"][name][()])
+            if values.ndim == 0:
+                return None
+            flat = values.reshape(-1)
+            dims.append(int(flat.size))
+            details.append(_summarize_xvar_values(name, flat))
+        return tuple(dims), details
 
-        return tuple()
+    def _read_xvardims_and_details(self, h5file, xvarnames):
+        """Kept for external callers; delegates to _read_and_validate_xvars."""
+        result = self._read_and_validate_xvars(h5file, xvarnames)
+        if result is None:
+            return (), []
+        return result
+
+    def _read_xvardims(self, h5file, xvarnames):
+        dims, _ = self._read_xvardims_and_details(h5file, xvarnames)
+        return dims
 
     def _read_run_id(self, h5file, filepath):
         run_id_attr = h5file.attrs.get("run_id", None)
@@ -432,9 +483,10 @@ class RunScanner:
         return int(run_id_attr)
 
     def _has_lite_copy(self, run_id: int, run_date_str: str):
-        if run_date_str not in self._lite_runs_by_date:
-            self._lite_runs_by_date[run_date_str] = self._index_lite_runs_for_date(run_date_str)
-        return run_id in self._lite_runs_by_date[run_date_str]
+        with self._lite_lock:
+            if run_date_str not in self._lite_runs_by_date:
+                self._lite_runs_by_date[run_date_str] = self._index_lite_runs_for_date(run_date_str)
+            return run_id in self._lite_runs_by_date[run_date_str]
 
     def _index_lite_runs_for_date(self, run_date_str: str):
         lite_day_dir = os.path.join(self.data_dir, "_lite", run_date_str)
@@ -457,7 +509,7 @@ class ScanWorker(QThread):
     scan_done = pyqtSignal(int)
     scan_error = pyqtSignal(str)
 
-    def __init__(self, scanner: RunScanner, batch_size: int = 64):
+    def __init__(self, scanner: RunScanner, batch_size: int = 256):
         super().__init__()
         self.scanner = scanner
         self._stop_requested = False
@@ -485,6 +537,96 @@ class ScanWorker(QThread):
             self.scan_error.emit(str(exc))
 
 
+def _summarize_xvar_values(name: str, values) -> dict:
+    """Summarize a single xvar array into a detail dict.
+
+    This is a module-level function so that both the scan path
+    (RunScanner._read_summary) and the async fallback
+    (XvarDetailLoader) can call it without duplicating logic.
+    """
+    array = np.asarray(values)
+    if array.size == 0:
+        unit, _, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=array)
+        return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA", "preview": "-"}
+
+    flat = array.reshape(-1)
+    n = int(flat.size)
+    unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=flat)
+    unit = unit or ""
+
+    def decimals_from_spacing(scaled_values):
+        finite = np.asarray(scaled_values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size < 2:
+            return 6
+
+        unique_sorted = np.unique(np.sort(finite))
+        if unique_sorted.size < 2:
+            return 6
+
+        diffs = np.diff(unique_sorted)
+        positive = diffs[diffs > 0]
+        if positive.size == 0:
+            return 6
+
+        step = float(np.min(positive))
+        decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
+        # Keep one guard digit so adjacent values remain distinguishable
+        # after floating-point conversion and formatting.
+        return max(0, min(10, decimals + 1))
+
+    def format_numeric_value(value, decimals):
+        scaled = float(value) * multiplier
+        if not np.isfinite(scaled):
+            return "NA"
+        if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
+            return f"{scaled:.6g}"
+        return f"{scaled:.{decimals}f}"
+
+    def unique_preserve_order(items):
+        unique_items = []
+        for item in items:
+            if any(item == existing for existing in unique_items):
+                continue
+            unique_items.append(item)
+        return unique_items
+
+    def format_preview_text(items, formatter=str):
+        if not items:
+            return "-"
+
+        formatted = [formatter(item) for item in items]
+        if len(formatted) <= 6:
+            return ", ".join(formatted)
+        return ", ".join([*formatted[:3], "...", *formatted[-3:]])
+
+    if np.issubdtype(flat.dtype, np.number):
+        min_val = float(np.nanmin(flat))
+        max_val = float(np.nanmax(flat))
+        scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
+        decimals = decimals_from_spacing(scaled_vals)
+        preview_values = unique_preserve_order(np.asarray(flat).tolist())
+        return {
+            "name": name,
+            "unit": unit,
+            "n": n,
+            "min": format_numeric_value(min_val, decimals),
+            "max": format_numeric_value(max_val, decimals),
+            "preview": format_preview_text(preview_values, lambda value: format_numeric_value(value, decimals)),
+        }
+
+    as_text = [_decode_str(item) for item in flat]
+    preview_values = unique_preserve_order(as_text)
+    return {
+        "name": name,
+        "unit": unit,
+        "n": n,
+        "min": min(as_text),
+        "max": max(as_text),
+        "preview": format_preview_text(preview_values),
+    }
+
+
 class XvarDetailLoader(QThread):
     details_ready = pyqtSignal(list)
     details_error = pyqtSignal(str)
@@ -504,103 +646,26 @@ class XvarDetailLoader(QThread):
 
                 params_group = f["params"]
                 for name in self.xvarnames:
+                    if self.isInterruptionRequested():
+                        return
+
                     if name not in params_group:
                         details.append({"name": name, "unit": "", "n": 0, "min": "NA", "max": "NA"})
                         continue
 
                     values = params_group[name][()]
-                    details.append(self._summarize_values(name, values))
+                    details.append(_summarize_xvar_values(name, values))
 
-            self.details_ready.emit(details)
+            if not self.isInterruptionRequested():
+                self.details_ready.emit(details)
         except Exception as exc:
-            self.details_error.emit(str(exc))
-
-    def _summarize_values(self, name: str, values):
-        array = np.asarray(values)
-        if array.size == 0:
-            unit, _, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=array)
-            return {"name": name, "unit": unit or "", "n": 0, "min": "NA", "max": "NA", "preview": "-"}
-
-        flat = array.reshape(-1)
-        n = int(flat.size)
-        unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=flat)
-        unit = unit or ""
-
-        def decimals_from_spacing(scaled_values):
-            finite = np.asarray(scaled_values, dtype=np.float64)
-            finite = finite[np.isfinite(finite)]
-            if finite.size < 2:
-                return 6
-
-            unique_sorted = np.unique(np.sort(finite))
-            if unique_sorted.size < 2:
-                return 6
-
-            diffs = np.diff(unique_sorted)
-            positive = diffs[diffs > 0]
-            if positive.size == 0:
-                return 6
-
-            step = float(np.min(positive))
-            decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
-            # Keep one guard digit so adjacent values remain distinguishable
-            # after floating-point conversion and formatting.
-            return max(0, min(10, decimals + 1))
-
-        def format_numeric_value(value, decimals):
-            scaled = float(value) * multiplier
-            if not np.isfinite(scaled):
-                return "NA"
-            if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
-                return f"{scaled:.6g}"
-            return f"{scaled:.{decimals}f}"
-
-        def unique_preserve_order(items):
-            unique_items = []
-            for item in items:
-                if any(item == existing for existing in unique_items):
-                    continue
-                unique_items.append(item)
-            return unique_items
-
-        def format_preview_text(items, formatter=str):
-            if not items:
-                return "-"
-
-            formatted = [formatter(item) for item in items]
-            if len(formatted) <= 6:
-                return ", ".join(formatted)
-            return ", ".join([*formatted[:3], "...", *formatted[-3:]])
-
-        if np.issubdtype(flat.dtype, np.number):
-            min_val = float(np.nanmin(flat))
-            max_val = float(np.nanmax(flat))
-            scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
-            decimals = decimals_from_spacing(scaled_vals)
-            preview_values = unique_preserve_order(np.asarray(flat).tolist())
-            return {
-                "name": name,
-                "unit": unit,
-                "n": n,
-                "min": format_numeric_value(min_val, decimals),
-                "max": format_numeric_value(max_val, decimals),
-                "preview": format_preview_text(preview_values, lambda value: format_numeric_value(value, decimals)),
-            }
-
-        as_text = [_decode_str(item) for item in flat]
-        preview_values = unique_preserve_order(as_text)
-        return {
-            "name": name,
-            "unit": unit,
-            "n": n,
-            "min": min(as_text),
-            "max": max(as_text),
-            "preview": format_preview_text(preview_values),
-        }
+            if not self.isInterruptionRequested():
+                self.details_error.emit(str(exc))
 
 
 class ParamSearchLoader(QThread):
     records_ready = pyqtSignal(dict)
+    partial_records_ready = pyqtSignal(str, list)  # (mode, records) — emitted per group as soon as ready
     load_error = pyqtSignal(str)
 
     def __init__(self, filepath: str):
@@ -611,8 +676,18 @@ class ParamSearchLoader(QThread):
         records = {mode: [] for mode in PARAM_SEARCH_MODES}
         try:
             with h5py.File(self.filepath, "r") as f:
+                if self.isInterruptionRequested():
+                    return
                 records["params"] = self._load_group_records(f, "params")
+                self.partial_records_ready.emit("params", records["params"])
+
+                if self.isInterruptionRequested():
+                    return
                 records["camera_params"] = self._load_group_records(f, "camera_params")
+                self.partial_records_ready.emit("camera_params", records["camera_params"])
+
+                if self.isInterruptionRequested():
+                    return
                 records["data"] = self._load_data_records(f)
             self.records_ready.emit(records)
         except Exception as exc:

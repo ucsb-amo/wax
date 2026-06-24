@@ -1,5 +1,4 @@
-from artiq.experiment import delay, kernel
-from artiq.language.core import at_mu
+from artiq.language.core import at_mu, delay_mu, delay, kernel
 from artiq.coredevice.ttl import TTLOut, TTLInOut
 import artiq.experiment
 import numpy as np
@@ -38,6 +37,15 @@ class TTL_OUT(TTL):
         self.ttl_device.on()
         delay(t)
         self.ttl_device.off()
+
+    @kernel
+    def pulse_mu(self,t_mu,compensate_timeline=True):
+        t = np.int64(t_mu)
+        self.ttl_device.on()
+        delay_mu(t)
+        self.ttl_device.off()
+        if compensate_timeline:
+            delay_mu(-t)
     
     @kernel
     def set_state(self,state=-1):

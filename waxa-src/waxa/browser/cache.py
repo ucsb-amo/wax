@@ -6,7 +6,7 @@ from .run_summary import RunSummary
 
 
 class MetadataCache:
-    VERSION = 1
+    VERSION = 2
     FILENAME = ".waxa_browser_cache.json"
 
     def __init__(self, data_dir: str):
@@ -71,3 +71,8 @@ class MetadataCache:
         except Exception:
             return
         self._dirty = False
+
+    def save_if_dirty(self):
+        """Save only when dirty. Call periodically during long scans to persist partial results."""
+        if self._dirty:
+            self.save()

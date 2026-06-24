@@ -9,13 +9,15 @@ import artiq.coredevice.urukul as urukul
 from artiq.coredevice import spi2 as spi
 
 from waxx.util.artiq.async_print import aprint
+from waxx.control.artiq.DAC_CH import DAC_CH
 
 T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU = np.int64(2030 - 688)
 # T_AD9910_PIPELINE_LATENCY_MU = np.int64(107)
-T_AD9910_PIPELINE_LATENCY_MU = np.int64(108)
+T_AD9910_PIPELINE_LATENCY_MU = np.int64(91)
 
 T_TRACKING_PHASE_LAG_MU = 1960
 DAC_CH_DEFAULT = -1
+V_PD_PLACEHOLDER = -11.  # sentinel for "no stored v_pd" in _last_v_pd
 di2 = 2
 
 PHASE_MODE_TRACKING = 1
@@ -39,6 +41,7 @@ class DDS():
       self.transition = 'None'
       self.double_pass = True
       self.v_pd = v_pd
+      self._last_v_pd = V_PD_PLACEHOLDER  # set by off(), cleared by on() / update_dac_setpoint()
       self.phase_mode = 0
       self.dac_ch = DAC_CH_DEFAULT
       self.key = ""
@@ -57,6 +60,13 @@ class DDS():
          self.dac_device = ad53xx.AD53xx
          
       self.dac_control_bool = self.dac_ch != DAC_CH_DEFAULT
+
+      # Every DDS carries a DAC_CH object.  For channels without DAC control
+      # this is a dummy (ch=-1) whose kernel methods are all no-ops, so the
+      # ARTIQ compiler sees a uniform attribute type across every DDS instance.
+      # dds_assign() in dds_id.py replaces this with the real DAC_CH when a
+      # DAC channel is specified.
+      self.dac_ch_obj = DAC_CH(ch=-1, dac_device=self.dac_device)
 
       self._t_att_xfer_mu = np.int64(1592) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.10qxjvv6p35q
       self._t_set_xfer_mu = np.int64(1248) # see https://docs.google.com/document/d/1V6nzPmvfU4wNXW1t9-mRdsaplHDKBebknPJM_UCvvwk/edit#heading=h.e1ucbs8kjf4z
@@ -218,32 +228,45 @@ class DDS():
       if freq_changed:
          self.frequency = frequency if frequency >= 0. else self.frequency
          self._ftw = self.dds_device.frequency_to_ftw(self.frequency)
+         self.frequency = self.dds_device.ftw_to_frequency(self._ftw)
       if amp_changed:
          self.amplitude = amplitude if amplitude >= 0. else self.amplitude
          self._asf = self.dds_device.amplitude_to_asf(self.amplitude)
-      if self.dac_control_bool and vpd_changed:
-         self.v_pd = v_pd if v_pd >= 0. else self.v_pd
+         self.amplitude = self.dds_device.asf_to_amplitude(self._asf)
       if phase_origin_changed:
          self.t_phase_origin_mu = t_phase_origin_mu - dt_phase_origin_shift_mu if t_phase_origin_mu > 0 else self.t_phase_origin_mu
       if phase_changed:
          self.phase_offset = phase if phase >= 0. else self.phase_offset
          self._pow = self.dds_device.turns_to_pow(self.phase_offset/TWOPI)
+         self.phase_offset = self.dds_device.pow_to_turns(self._pow) * TWOPI
 
       # Set DDS and DAC as needed
-      if self.dac_control_bool and (vpd_changed or init):
-         self.update_dac_setpoint(self.v_pd)
+      if vpd_changed or init:
+         self.update_dac_setpoint(v_pd)
       if freq_changed or amp_changed or phase_origin_changed or phase_changed or init:
-         
-         self.dds_device.set(frequency=self.frequency,
-                                    amplitude=self.amplitude, 
-                                    phase=self.phase_offset/TWOPI,
-                                    ref_time_mu=self.t_phase_origin_mu)
+         self.dds_device.set_mu(ftw=self._ftw,
+                                pow_=self._pow,
+                                asf=self._asf,
+                                ref_time_mu=self.t_phase_origin_mu)
          # if self.phase_mode == PHASE_MODE_TRACKING:
          #    self._t_phase_mu = now_mu()
          #    self._phase_at_t = self.get_phase(self._t_phase_mu)
 
          # else:
          self.update_phase_at_set()
+
+   @kernel
+   def set_frequency_mu(self, ftw):
+      pm = 0
+      if self.phase_mode == 0:
+         pm = ad9910.PHASE_MODE_CONTINUOUS
+      if self.phase_mode == 1:
+         pm = ad9910.PHASE_MODE_TRACKING
+
+      self._ftw = ftw
+      self.dds_device.set_mu(ftw=self._ftw, pow_=self._pow, asf=self._asf,
+                             phase_mode=pm,
+                             ref_time_mu=self.t_phase_origin_mu)
 
    @kernel
    def reset_phase(self):
@@ -279,11 +302,8 @@ class DDS():
    def update_dac_setpoint(self, v_pd=-0.1, dac_load = True):
 
       self.v_pd = v_pd if v_pd >= 0. else self.v_pd
-      v_pd = self.v_pd
-
-      self.dac_device.write_dac(channel=self.dac_ch, voltage=v_pd)
-      if dac_load:
-         self.dac_device.load()
+      self._last_v_pd = V_PD_PLACEHOLDER  # a manual setpoint update supersedes any stored last_v_pd
+      self.dac_ch_obj.set(v=self.v_pd, load_dac=dac_load)
 
    def get_devices(self,expt):
       self.dds_device = expt.get_device(self.name)
@@ -291,21 +311,20 @@ class DDS():
 
    @kernel
    def off(self, dac_update = True, dac_load = True):
-      self.update_dac_bool()
       self.dds_device.sw.off()
-      if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=0.)
-         if dac_load:
-            self.dac_device.load()
+      if dac_update:
+         self._last_v_pd = self.v_pd  # remember setpoint so on() can restore it
+         self.v_pd = 0.
+         self.dac_ch_obj.set(v=0., load_dac=dac_load)
       self.sw_state = 0
 
    @kernel
    def on(self, dac_update = True, dac_load=True):
-      self.update_dac_bool()
-      if self.dac_control_bool and dac_update:
-         self.dac_device.write_dac(channel=self.dac_ch,voltage=self.v_pd)
-         if dac_load:
-            self.dac_device.load()
+      if dac_update:
+         if self._last_v_pd >= 0.:
+            self.v_pd = self._last_v_pd
+            self._last_v_pd = V_PD_PLACEHOLDER
+         self.dac_ch_obj.set(v=self.v_pd, load_dac=dac_load)
       self.dds_device.sw.on()
       self.sw_state = 1
 
@@ -342,27 +361,6 @@ class DDS():
       self.dds_device.init(blind=blind)
       delay(1*ms)
 
-   @kernel
-   def write_frequency_register_mu(self, ftw):
-      """
-      Directly writes the frequency tuning word (FTW) to the DDS register. This
-      is a low-level operation that bypasses the usual frequency setting
-      methods, and should be used with caution. 
-      
-      Does not pulse the IO update pin, so the new frequency will not take
-      effect until the next scheduled IO update. This method is intended for
-      advanced users who need precise control over the timing of frequency
-      changes and are familiar with the internal workings of the AD9910 DDS.
-      """
-      # ftw = self.ftw
-      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG, 8,
-      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
-      # self.dds_device.bus.write((ad9910._AD9910_REG_PROFILE0 + 7) << 24)
-      # self.dds_device.bus.set_config_mu(urukul.SPI_CONFIG | spi.SPI_END, 32,
-      #                          urukul.SPIT_DDS_WR, self.dds_device.chip_select)
-      # self.dds_device.bus.write(ftw)
-      # don't use rn, corrupts SPI transaction
-
    def read_db(self,ddb):
       '''read out info from ddb. ftw_per_hz comes from artiq.frontend.moninj, line 206-207'''
       v = ddb[self.name]
@@ -370,4 +368,55 @@ class DDS():
       spi_dev = ddb[self.cpld_name]["arguments"]["spi_device"]
       self.bus_channel = ddb[spi_dev]["arguments"]["channel"]
    
-   
+   @kernel
+   def clear_phase_accumulator(self):
+      self.dds_device.set_cfr1(phase_autoclear=1)
+      at_mu(now_mu() & ~7)
+      delay_mu(int64(self.dds_device.sync_data.io_update_delay))
+      self.dds_device.io_update.pulse_mu(8)
+      at_mu(now_mu() & ~7)
+      self.dds_device.set_cfr1(phase_autoclear=0)
+
+   @kernel
+   def _configure_ffua_profile(self):
+         # In fast mode, source frequency from the FTW register and keep POW constant from RAM.
+         # Use the ASF register for amplitude so RAM profile setup does not clobber the active
+         # single-tone profile amplitude on shared-profile Urukul cards.
+         # Only dds0 is driven in fast mode; dds1 stays at its fixed single-tone frequency.
+         ram_word0 = int32((self._pow << 16))  # ASF bits ignored in RAM_DEST_POW mode
+
+         self.dds_device.set_cfr2(asf_profile_enable=0)
+         self.dds_device.set_cfr1(
+               ram_enable=1,
+               ram_destination=ad9910.RAM_DEST_POW,
+               osk_enable=1,
+               manual_osk_external=1
+         )
+
+         self.dds_device.set_profile_ram(
+               start=0, end=0, step=1, profile=urukul.DEFAULT_PROFILE,
+               mode=ad9910.RAM_MODE_DIRECTSWITCH
+         )
+
+         self.dds_device.write_ram([ram_word0])
+
+         self.dds_device.set_mu(ftw=self._ftw, asf=self._asf,
+                              ram_destination=ad9910.RAM_DEST_POW,
+                              phase_mode=0)
+         
+
+   @kernel
+   def _restore_default_profile_mode(self):
+      self.dds_device.set_cfr2(asf_profile_enable=1)
+      self.dds_device.set_cfr1()
+
+      self.dds_device.set_mu(ftw=self._ftw,
+                             pow_=self._pow,
+                             asf=self._asf)
+
+   @kernel
+   def io_update(self):
+      at_mu(now_mu() & ~7)
+      delay_mu(np.int64(self.dds_device.sync_data.io_update_delay))
+      self.dds_device.cpld.io_update.pulse_mu(8)
+      at_mu(now_mu() & ~7)

@@ -13,12 +13,14 @@ import os
 from datetime import datetime
 from typing import Optional
 
+import collections
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtCore import QPoint, QRect, QRunnable, Qt, QThread, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -212,6 +214,16 @@ class CountsPanel(QWidget):
         self.plot_widget.setContentsMargins(0, 0, 0, 0)
         self.plot_widget.setLabel("bottom", "seconds ago")
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
+        # Never let the QGraphicsView add a horizontal scrollbar — the x-axis
+        # should always scale to fit the available panel width, not scroll.
+        self.plot_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.plot_widget.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Allow the panel to shrink to any width the splitter allocates.
+        self.plot_widget.setMinimumWidth(1)
         layout.addWidget(self.plot_widget)
 
         self.plot_item = self.plot_widget.getPlotItem()
@@ -238,8 +250,11 @@ class CountsPanel(QWidget):
         self.vb2.addItem(self.norm_line)
         self.norm_line.hide()
 
-        self.timestamps: list[float] = []
-        self.counts: list[float] = []
+        # Capped at ~30 min of data at 20 fps; prevents unbounded O(n)
+        # linear scan in update_plot() after long runs.
+        _MAX_COUNTS = 36_000
+        self.timestamps: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
+        self.counts: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
         self.start_time: Optional[datetime] = None
 
         self.fixed_interval: bool = True
@@ -271,6 +286,10 @@ class CountsPanel(QWidget):
                 self.viewer.norm_action.blockSignals(True)
                 self.viewer.norm_action.setChecked(True)
                 self.viewer.norm_action.blockSignals(False)
+                try:
+                    self.viewer._save_state()
+                except Exception:
+                    pass
             self.update_plot()
 
     def clear_normalization(self) -> None:
@@ -280,6 +299,10 @@ class CountsPanel(QWidget):
             self.viewer.norm_action.blockSignals(True)
             self.viewer.norm_action.setChecked(False)
             self.viewer.norm_action.blockSignals(False)
+            try:
+                self.viewer._save_state()
+            except Exception:
+                pass
         self.update_plot()
 
     def add_count(self, count: float) -> None:
@@ -300,7 +323,7 @@ class CountsPanel(QWidget):
         if self.fixed_interval:
             start = next((i for i, t in enumerate(t_ago) if t >= -self.time_window), 0)
             pt = t_ago[start:]
-            pc = self.counts[start:]
+            pc = list(self.counts)[start:]
             self.plot_item.enableAutoRange(axis="x", enable=False)
             self.plot_item.setXRange(-self.time_window, 0, padding=0)
         else:
@@ -309,28 +332,42 @@ class CountsPanel(QWidget):
             self.plot_item.enableAutoRange(axis="x", enable=True)
 
         self.main_curve.setData(pt, pc)
-        self.plot_item.enableAutoRange(axis="y", enable=self.auto_rescale)
 
         if self.normalize and pc:
             if self.norm_reference is None:
                 self.norm_reference = float(np.mean(pc))
             ref = self.norm_reference
+            # Pin the left (raw) y-range, then mirror it exactly onto the right
+            # (normalised) axis divided by ``ref`` so the right axis "1.0"
+            # gridline lines up with the raw reference level / green reference
+            # line.  Using independent autorange + different padding on the two
+            # viewboxes is what made "1" drift off the reference before.
+            if self.auto_rescale:
+                lo, hi = float(min(pc)), float(max(pc))
+                span = (hi - lo) or abs(hi) or 1.0
+                pad = 0.05 * span
+                lo_v, hi_v = lo - pad, hi + pad
+            else:
+                lo_v, hi_v = self.plot_item.vb.viewRange()[1]
+            self.plot_item.enableAutoRange(axis="y", enable=False)
+            self.plot_item.setYRange(lo_v, hi_v, padding=0)
             if ref != 0:
-                self.vb2.setYRange(min(pc) / ref, max(pc) / ref, padding=0.1)
+                self.vb2.setYRange(lo_v / ref, hi_v / ref, padding=0)
             self.plot_item.showAxis("right")
             self.plot_item.getAxis("right").setLabel("Normalised")
-            self.norm_ref_line.setValue(self.norm_reference)
+            self.norm_ref_line.setValue(ref)
             if self.show_norm_reference_line:
                 self.norm_ref_line.show()
             else:
                 self.norm_ref_line.hide()
         else:
+            self.plot_item.enableAutoRange(axis="y", enable=self.auto_rescale)
             self.plot_item.hideAxis("right")
             self.norm_ref_line.hide()
 
     def clear_data(self) -> None:
-        self.timestamps = []
-        self.counts = []
+        self.timestamps = collections.deque(maxlen=self.timestamps.maxlen)
+        self.counts = collections.deque(maxlen=self.counts.maxlen)
         self.start_time = None
         self.update_plot()
 
@@ -338,6 +375,190 @@ class CountsPanel(QWidget):
 # ---------------------------------------------------------------------------
 # Per-camera widget
 # ---------------------------------------------------------------------------
+
+
+class _FrameWorker(QThread):
+    """Background thread that pulls frames from a camera client.
+
+    Emits ``frame_ready(frame_dict)`` for each successful read.  All ZMQ
+    I/O stays off the GUI thread so a stalled trigger or unreachable
+    server never freezes the dashboard.  The thread polls a ``QThread``
+    stop flag between iterations so it tears down promptly.
+    """
+
+    frame_ready = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    reconnected = pyqtSignal()
+
+    def __init__(self, client: BaslerCameraClient, parent=None) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._stop = False
+        # Throttle between successful frames (ms).  Failures slow the loop
+        # so we do not hammer an unreachable server.
+        self._idle_ms = 30
+        self._error_backoff_ms = 250
+        # Snapshot the connection's reconnect counter so we can detect when
+        # the server restarts on a new address mid-stream.
+        try:
+            self._last_reconnect_gen = client.connection.reconnect_generation
+        except Exception:
+            self._last_reconnect_gen = 0
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _check_reconnect(self) -> None:
+        """Emit ``reconnected`` when the client has followed the server to a
+        new address since the last frame (server restart)."""
+        try:
+            gen = self._client.connection.reconnect_generation
+        except Exception:
+            return
+        if gen != self._last_reconnect_gen:
+            self._last_reconnect_gen = gen
+            self.reconnected.emit()
+
+    def run(self) -> None:
+        while not self._stop:
+            try:
+                data = self._client.get_frame()
+            except Exception as exc:
+                self.error.emit(str(exc))
+                self.msleep(self._error_backoff_ms)
+                continue
+            self._check_reconnect()
+            if not data.get("ok"):
+                # Short-timeout misses (e.g. waiting for hardware trigger)
+                # land here; just retry without spamming the GUI thread.
+                self.msleep(self._error_backoff_ms)
+                continue
+            self.frame_ready.emit(data)
+            # Yield briefly so the GUI thread can paint and so we do not
+            # saturate the CPU when the camera is free-running fast.
+            self.msleep(self._idle_ms)
+
+
+class _SettingsWorker(QThread):
+    """One-shot worker that gathers gain/exposure/trigger from the server.
+
+    Runs ``_refresh_settings`` logic off the GUI thread.  The server is
+    authoritative for gain/exposure/trigger (it applies the persisted defaults
+    on open), so this worker only *reads* the live values and ranges, plus the
+    stored defaults dict (for ROI / normalization).  The widget applies them in
+    the GUI thread.
+    """
+
+    done = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        client: BaslerCameraClient,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        payload: dict = {}
+        try:
+            payload["gain_range"] = self._client.get_gain_range()
+            payload["exp_range"] = self._client.get_exposure_range()
+            payload["gain"] = self._client.get_gain()
+            payload["exposure"] = self._client.get_exposure()
+            payload["trigger_mode"] = self._client.get_trigger_mode()
+            payload["trigger_opts"] = self._client.get_trigger_mode_options()
+            payload["defaults"] = self._client.get_defaults()
+            payload["ok"] = True
+        except Exception as exc:
+            payload["ok"] = False
+            payload["error"] = str(exc)
+        self.done.emit(payload)
+
+
+class _OpenWorker(QThread):
+    """One-shot worker that calls ``client.open()`` off the GUI thread."""
+
+    done = pyqtSignal(dict)
+
+    def __init__(self, client: BaslerCameraClient, parent=None) -> None:
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            resp = self._client.open()
+            self.done.emit(resp if isinstance(resp, dict) else {"ok": False, "error": "bad reply"})
+        except Exception as exc:
+            self.done.emit({"ok": False, "error": str(exc)})
+
+
+class _DefaultsWorker(QThread):
+    """One-shot worker that persists camera defaults to the server."""
+
+    done = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        client: BaslerCameraClient,
+        gain: Optional[float],
+        exposure: Optional[float],
+        trigger_mode: Optional[str],
+        roi: Optional[list],
+        norm_reference: Optional[float],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._gain = gain
+        self._exposure = exposure
+        self._trigger_mode = trigger_mode
+        self._roi = roi
+        self._norm_reference = norm_reference
+
+    def run(self) -> None:
+        try:
+            resp = self._client.set_defaults(
+                gain=self._gain,
+                exposure=self._exposure,
+                trigger_mode=self._trigger_mode,
+                roi=self._roi,
+                norm_reference=self._norm_reference,
+            )
+            self.done.emit(resp if isinstance(resp, dict) else {"ok": False, "error": "bad reply"})
+        except Exception as exc:
+            self.done.emit({"ok": False, "error": str(exc)})
+
+
+def _thread_alive(thread) -> bool:
+    """Return True only if *thread* exists, its C++ object is alive, and running.
+
+    A ``QThread`` whose ``finished`` signal already triggered ``deleteLater``
+    leaves a dangling Python reference whose underlying C/C++ object is gone;
+    calling ``isRunning()`` on it raises ``RuntimeError``.  Treat that (and a
+    ``None`` reference) as "not alive".
+    """
+    if thread is None:
+        return False
+    try:
+        return thread.isRunning()
+    except RuntimeError:
+        return False
+
+
+class _FireAndForget(QRunnable):
+    """Run *fn* on the global thread pool, swallow any exception."""
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self._fn()
+        except Exception:
+            pass
+
 
 class BaslerCameraWidget(QFrame):
     """Live camera viewer widget backed by a remote ``BaslerCameraClient``.
@@ -354,6 +575,9 @@ class BaslerCameraWidget(QFrame):
 
         self._state_file = self._make_state_path()
         self._saved_norm_reference: Optional[float] = None
+        self._saved_gain: Optional[float] = None
+        self._saved_exposure: Optional[float] = None
+        self._saved_trigger_mode: Optional[str] = None
         self._load_state()
 
         self.last_image: Optional[np.ndarray] = None
@@ -366,6 +590,16 @@ class BaslerCameraWidget(QFrame):
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._update_frame)
+        # Background frame puller (created on open, torn down on close).
+        self._frame_worker: Optional[_FrameWorker] = None
+        self._settings_worker: Optional[_SettingsWorker] = None
+        self._open_worker: Optional[_OpenWorker] = None
+        self._defaults_worker: Optional[_DefaultsWorker] = None
+        # Tighten the frame socket timeout so missed triggers are cheap.
+        try:
+            self.client.set_frame_timeout_ms(400)
+        except Exception:
+            pass
 
         self._build_ui()
 
@@ -387,6 +621,9 @@ class BaslerCameraWidget(QFrame):
                 x1, y1, x2, y2 = data["rect"]
                 self.current_rect = QRect(x1, y1, x2 - x1, y2 - y1)
             self._saved_norm_reference = data.get("norm_reference")
+            self._saved_gain = data.get("gain")
+            self._saved_exposure = data.get("exposure")
+            self._saved_trigger_mode = data.get("trigger_mode")
         except Exception:
             pass
 
@@ -398,6 +635,12 @@ class BaslerCameraWidget(QFrame):
             data["rect"] = [x, y, x + self.current_rect.width(), y + self.current_rect.height()]
         if self.counts_panel.norm_reference is not None:
             data["norm_reference"] = self.counts_panel.norm_reference
+        if self._saved_gain is not None:
+            data["gain"] = self._saved_gain
+        if self._saved_exposure is not None:
+            data["exposure"] = self._saved_exposure
+        if self._saved_trigger_mode is not None:
+            data["trigger_mode"] = self._saved_trigger_mode
         try:
             with open(self._state_file, "w") as f:
                 json.dump(data, f)
@@ -436,9 +679,9 @@ class BaslerCameraWidget(QFrame):
         self._title_label.setObjectName("camTitle")
         name_block.addWidget(self._title_label)
 
-        sub_label = QLabel(f"{self.client.model}  •  S/N {self.client.serial}  •  @ {self.client.hostname}")
-        sub_label.setObjectName("camSub")
-        name_block.addWidget(sub_label)
+        # Note: model / S/N / host info is shown in the surrounding
+        # QDockWidget's title-bar (see ``BaslerCamerasMainWindow``), so we
+        # deliberately omit the sub-label here to avoid duplication.
 
         hdr_layout.addLayout(name_block)
         hdr_layout.addStretch()
@@ -478,6 +721,14 @@ class BaslerCameraWidget(QFrame):
         self.exposure_spinbox.setFixedWidth(82)
         self.exposure_spinbox.valueChanged.connect(self._on_exposure_changed)
         tbar.addWidget(self.exposure_spinbox)
+
+        tbar.addWidget(_tsep())
+        tbar.addWidget(_tlabel("Trig"))
+        self.trigger_combo = QComboBox()
+        self.trigger_combo.setEnabled(False)
+        self.trigger_combo.setFixedWidth(72)
+        self.trigger_combo.currentTextChanged.connect(self._on_trigger_mode_changed)
+        tbar.addWidget(self.trigger_combo)
 
         tbar.addWidget(_tsep())
 
@@ -540,6 +791,18 @@ class BaslerCameraWidget(QFrame):
         _opt_btn.setMenu(self._opt_menu)
         _opt_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         tbar.addWidget(_opt_btn)
+
+        # ---- Save Defaults --------------------------------------------
+        # Snapshot the current ROI / gain / exposure / trigger to the
+        # per-camera state file so the next time the camera is opened it
+        # comes up with these values.
+        self.save_defaults_btn = QPushButton("Save Defaults")
+        self.save_defaults_btn.setToolTip(
+            "Save the current ROI, gain, exposure, and trigger mode as the\n"
+            "default values for this camera (used when re-opening it)."
+        )
+        self.save_defaults_btn.clicked.connect(self._on_save_defaults)
+        tbar.addWidget(self.save_defaults_btn)
 
         tbar.addStretch()
 
@@ -609,68 +872,168 @@ class BaslerCameraWidget(QFrame):
         self.open_btn.setText("…")
         self.open_btn.setEnabled(False)
         self._status_dot.setStyleSheet(_led_style(_LED_OPENING))
-        try:
-            resp = self.client.open()
-            if not resp.get("ok", False):
-                self._set_error(resp.get("error", "Failed to open"))
-                self.open_btn.setChecked(False)
-                self.open_btn.setText("Open")
-                self.open_btn.setEnabled(True)
-                self._status_dot.setStyleSheet(_led_style(_LED_ERROR))
-                return
-            self._refresh_settings()
-            self.open_btn.setText("Close")
-            self.open_btn.setEnabled(True)
-            self.image_label.setText("")
-            self._status_dot.setStyleSheet(_led_style(_LED_OPEN))
-            self.poll_timer.start(30)
-        except Exception as exc:
-            self._set_error(str(exc))
+        # Run the blocking ``client.open()`` + settings refresh on a
+        # background QThread so the GUI stays responsive even when the
+        # server is slow or unreachable.
+        worker = _OpenWorker(self.client, self)
+        worker.done.connect(self._on_open_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._clear_worker("_open_worker", w))
+        worker.start()
+        self._open_worker = worker
+
+    def _on_open_done(self, result: dict) -> None:
+        if not result.get("ok"):
+            self._set_error(result.get("error", "Failed to open"))
+            self.open_btn.blockSignals(True)
             self.open_btn.setChecked(False)
+            self.open_btn.blockSignals(False)
             self.open_btn.setText("Open")
             self.open_btn.setEnabled(True)
             self._status_dot.setStyleSheet(_led_style(_LED_ERROR))
+            return
+        # Camera is open on the server; kick off async settings refresh
+        # and start the frame worker immediately so the user sees frames.
+        self.open_btn.setText("Close")
+        self.open_btn.setEnabled(True)
+        self.image_label.setText("")
+        self._status_dot.setStyleSheet(_led_style(_LED_OPEN))
+        self._refresh_settings()
+        self._start_frame_worker()
+
+    def _start_frame_worker(self) -> None:
+        if _thread_alive(self._frame_worker):
+            return
+        worker = _FrameWorker(self.client, self)
+        worker.frame_ready.connect(self._on_frame_ready)
+        worker.error.connect(self._on_frame_error)
+        worker.reconnected.connect(self._on_reconnected)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._clear_worker("_frame_worker", w))
+        self._frame_worker = worker
+        worker.start()
+
+    def _stop_frame_worker(self) -> None:
+        w = self._frame_worker
+        self._frame_worker = None
+        if w is None:
+            return
+        w.stop()
+        # Best-effort, never block the GUI thread waiting on the network.
+        w.wait(200)
+
+    def _clear_worker(self, attr: str, worker) -> None:
+        """Null out a stored worker reference once its thread has finished.
+
+        Connected to each worker's ``finished`` signal (alongside
+        ``deleteLater``) so we never probe a worker whose underlying C/C++
+        object has been destroyed.  Guarded so a late ``finished`` from an
+        already-replaced worker does not clobber its successor.
+        """
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
 
     def _do_close(self) -> None:
+        self._save_state()
         self.poll_timer.stop()
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self._stop_frame_worker()
+        # Run the blocking close() on the thread pool so the GUI does not
+        # freeze if the server is unreachable.
+        client = self.client
+        QThreadPool.globalInstance().start(_FireAndForget(lambda: client.close()))
         self.gain_spinbox.setEnabled(False)
         self.exposure_spinbox.setEnabled(False)
+        self.trigger_combo.setEnabled(False)
         self.open_btn.setText("Open")
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText("camera closed")
         self._status_dot.setStyleSheet(_led_style(_LED_CLOSED))
 
     def _refresh_settings(self) -> None:
-        """Query the server for gain/exposure values and update spinboxes."""
-        try:
-            gr = self.client.get_gain_range()
-            er = self.client.get_exposure_range()
-            g = self.client.get_gain()
-            e = self.client.get_exposure()
-            if gr.get("ok"):
-                self.gain_spinbox.blockSignals(True)
-                self.gain_spinbox.setRange(*gr["result"])
-                self.gain_spinbox.blockSignals(False)
-            if er.get("ok"):
-                self.exposure_spinbox.blockSignals(True)
-                self.exposure_spinbox.setRange(*er["result"])
-                self.exposure_spinbox.blockSignals(False)
-            if g.get("ok"):
-                self.gain_spinbox.blockSignals(True)
-                self.gain_spinbox.setValue(g["result"])
-                self.gain_spinbox.blockSignals(False)
-            if e.get("ok"):
-                self.exposure_spinbox.blockSignals(True)
-                self.exposure_spinbox.setValue(e["result"])
-                self.exposure_spinbox.blockSignals(False)
-            self.gain_spinbox.setEnabled(True)
-            self.exposure_spinbox.setEnabled(True)
-        except Exception as exc:
-            print(f"[BaslerWidget] Could not read camera settings: {exc}")
+        """Kick off an async refresh of gain/exposure/trigger settings.
+
+        Spinboxes stay disabled until the worker reports back so the user
+        cannot interact with stale values.  All ZMQ I/O happens off the
+        GUI thread.
+        """
+        # If a previous refresh is still in flight, drop it.
+        if _thread_alive(self._settings_worker):
+            try:
+                self._settings_worker.done.disconnect()
+            except Exception:
+                pass
+        self.gain_spinbox.setEnabled(False)
+        self.exposure_spinbox.setEnabled(False)
+        self.trigger_combo.setEnabled(False)
+        worker = _SettingsWorker(self.client, self)
+        worker.done.connect(self._on_settings_ready)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._clear_worker("_settings_worker", w))
+        self._settings_worker = worker
+        worker.start()
+
+    def _on_settings_ready(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            print(f"[BaslerWidget] Could not read camera settings: {payload.get('error')}")
+            return
+        gr = payload.get("gain_range", {})
+        er = payload.get("exp_range", {})
+        g = payload.get("gain", {})
+        e = payload.get("exposure", {})
+        tm = payload.get("trigger_mode", {})
+        tmo = payload.get("trigger_opts", {})
+        if gr.get("ok"):
+            self.gain_spinbox.blockSignals(True)
+            self.gain_spinbox.setRange(*gr["result"])
+            self.gain_spinbox.blockSignals(False)
+        if er.get("ok"):
+            self.exposure_spinbox.blockSignals(True)
+            self.exposure_spinbox.setRange(*er["result"])
+            self.exposure_spinbox.blockSignals(False)
+        if g.get("ok"):
+            self.gain_spinbox.blockSignals(True)
+            self.gain_spinbox.setValue(g["result"])
+            self.gain_spinbox.blockSignals(False)
+            self._saved_gain = float(g["result"])
+        if e.get("ok"):
+            self.exposure_spinbox.blockSignals(True)
+            self.exposure_spinbox.setValue(e["result"])
+            self.exposure_spinbox.blockSignals(False)
+            self._saved_exposure = float(e["result"])
+        if tmo.get("ok"):
+            opts = list(tmo["result"])
+            self.trigger_combo.blockSignals(True)
+            self.trigger_combo.clear()
+            self.trigger_combo.addItems(opts)
+            self.trigger_combo.blockSignals(False)
+        if tm.get("ok"):
+            self.trigger_combo.blockSignals(True)
+            idx = self.trigger_combo.findText(str(tm["result"]))
+            if idx >= 0:
+                self.trigger_combo.setCurrentIndex(idx)
+            self.trigger_combo.blockSignals(False)
+            self._saved_trigger_mode = str(tm["result"])
+        self.gain_spinbox.setEnabled(True)
+        self.exposure_spinbox.setEnabled(True)
+        self.trigger_combo.setEnabled(True)
+        # Apply stored ROI / normalization defaults (server-persisted, opaque
+        # to the hardware).  Only set them when present so we don't clobber a
+        # ROI the user just drew this session.
+        d = payload.get("defaults", {})
+        defaults = d.get("defaults", {}) if isinstance(d, dict) else {}
+        roi = defaults.get("roi")
+        if roi and len(roi) == 4 and self.current_rect is None:
+            x1, y1, x2, y2 = roi
+            self.current_rect = QRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+        nref = defaults.get("norm_reference")
+        if nref is not None and self.counts_panel.norm_reference is None:
+            self.counts_panel.norm_reference = float(nref)
+            self.counts_panel.normalize = True
+            self.counts_panel.update_plot()
+            self.norm_action.blockSignals(True)
+            self.norm_action.setChecked(True)
+            self.norm_action.blockSignals(False)
+        self._save_state()
 
     def _set_error(self, msg: str) -> None:
         self.image_label.setText(f"Error: {msg}")
@@ -680,16 +1043,30 @@ class BaslerCameraWidget(QFrame):
     # ------------------------------------------------------------------ #
 
     def _on_gain_changed(self, value: float) -> None:
-        try:
-            self.client.set_gain(value)
-        except Exception as exc:
-            print(f"[BaslerWidget] set_gain error: {exc}")
+        self._saved_gain = float(value)
+        self._save_state()
+        client = self.client
+        QThreadPool.globalInstance().start(
+            _FireAndForget(lambda: client.set_gain(value))
+        )
 
     def _on_exposure_changed(self, value: float) -> None:
-        try:
-            self.client.set_exposure(value)
-        except Exception as exc:
-            print(f"[BaslerWidget] set_exposure error: {exc}")
+        self._saved_exposure = float(value)
+        self._save_state()
+        client = self.client
+        QThreadPool.globalInstance().start(
+            _FireAndForget(lambda: client.set_exposure(value))
+        )
+
+    def _on_trigger_mode_changed(self, value: str) -> None:
+        if not value:
+            return
+        self._saved_trigger_mode = str(value)
+        self._save_state()
+        client = self.client
+        QThreadPool.globalInstance().start(
+            _FireAndForget(lambda: client.set_trigger_mode(value))
+        )
 
     def _on_normalize_toggled(self, checked: bool) -> None:
         if checked:
@@ -700,6 +1077,7 @@ class BaslerCameraWidget(QFrame):
             self.counts_panel.norm_reference = None
             self.counts_panel.normalize = False
         self.counts_panel.update_plot()
+        self._save_state()
 
     # keep a legacy alias so any code that used norm_btn still works
     @property
@@ -713,6 +1091,92 @@ class BaslerCameraWidget(QFrame):
             total = self._splitter.width()
             third = max(total // 3, 200)
             self._splitter.setSizes([total - third, third])
+            # ROI is required for pixel counts to be meaningful; warn the
+            # user if one hasn't been drawn yet.
+            self._check_roi_for_counts()
+
+    def _has_valid_roi(self) -> bool:
+        r = self.current_rect
+        return bool(r and r.width() > 0 and r.height() > 0)
+
+    def _check_roi_for_counts(self) -> None:
+        """When the counts panel is opened, make sure an ROI exists.
+
+        If no ROI rectangle is set we set the plot title to an explicit
+        instruction so it's obvious why no counts are appearing.  As soon
+        as the user draws an ROI the title is restored.
+        """
+        if self._has_valid_roi():
+            self.counts_panel.plot_widget.setTitle("Summed Pixel Counts vs Time")
+        else:
+            self.counts_panel.plot_widget.setTitle(
+                "No ROI set \u2014 drag on the image to define one"
+            )
+
+    def _on_save_defaults(self) -> None:
+        """Persist current settings to the SERVER as this camera's defaults.
+
+        Gain/exposure/trigger are applied to the hardware on every open; the
+        ROI and normalization reference are stored alongside and restored in
+        the GUI when the camera is next opened.  The "Saved" confirmation only
+        appears once the server acknowledges.
+        """
+        gain = float(self.gain_spinbox.value()) if self.gain_spinbox.isEnabled() else None
+        exposure = float(self.exposure_spinbox.value()) if self.exposure_spinbox.isEnabled() else None
+        trigger = (
+            self.trigger_combo.currentText()
+            if self.trigger_combo.isEnabled() and self.trigger_combo.currentText()
+            else None
+        )
+        roi = None
+        r = self.current_rect
+        if r and r.width() > 0 and r.height() > 0:
+            roi = [r.x(), r.y(), r.x() + r.width(), r.y() + r.height()]
+        norm = self.counts_panel.norm_reference
+
+        if gain is None and exposure is None and trigger is None and roi is None and norm is None:
+            self._flash_save_button("Open camera first")
+            return
+
+        # Mirror the values locally too (gain/exposure/trigger/ROI/norm) so the
+        # local state file stays consistent even before the next open.
+        if gain is not None:
+            self._saved_gain = gain
+        if exposure is not None:
+            self._saved_exposure = exposure
+        if trigger is not None:
+            self._saved_trigger_mode = trigger
+        self._save_state()
+
+        if _thread_alive(self._defaults_worker):
+            return
+        self.save_defaults_btn.setEnabled(False)
+        self.save_defaults_btn.setText("Saving\u2026")
+        worker = _DefaultsWorker(self.client, gain, exposure, trigger, roi, norm, self)
+        worker.done.connect(self._on_defaults_saved)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._clear_worker("_defaults_worker", w))
+        self._defaults_worker = worker
+        worker.start()
+
+    def _on_defaults_saved(self, payload: dict) -> None:
+        if payload.get("ok"):
+            self._flash_save_button("Saved \u2713")
+        else:
+            print(f"[BaslerWidget] Could not save defaults: {payload.get('error')}")
+            self._flash_save_button("Save failed")
+
+    def _flash_save_button(self, text: str) -> None:
+        """Briefly show *text* on the Save Defaults button, then restore it."""
+        self.save_defaults_btn.setText(text)
+        self.save_defaults_btn.setEnabled(False)
+        QTimer.singleShot(
+            1200,
+            lambda: (
+                self.save_defaults_btn.setText("Save Defaults"),
+                self.save_defaults_btn.setEnabled(True),
+            ),
+        )
 
     def _on_auto_rescale_toggled(self, checked: bool) -> None:
         self.counts_panel.auto_rescale = checked
@@ -735,13 +1199,31 @@ class BaslerCameraWidget(QFrame):
     # ------------------------------------------------------------------ #
 
     def _update_frame(self) -> None:
+        # Legacy entry point for the old QTimer-driven poll path.  The new
+        # design pulls frames in ``_FrameWorker`` and delivers them via
+        # ``_on_frame_ready``; this stub is kept for safety in case any
+        # external code or signal still triggers the timer.
+        return
+
+    def _on_frame_ready(self, data: dict) -> None:
         try:
-            data = self.client.get_frame()
+            self._render_frame(data)
         except Exception as exc:
-            print(f"[BaslerWidget] get_frame error: {exc}")
-            return
-        if not data.get("ok"):
-            return
+            print(f"[BaslerWidget] render error: {exc}")
+
+    def _on_frame_error(self, msg: str) -> None:
+        # Treat as transient: keep the last frame on screen but flag the
+        # status LED so the user can see the camera stopped responding.
+        self._status_dot.setStyleSheet(_led_style(_LED_ERROR))
+
+    def _on_reconnected(self) -> None:
+        # The server restarted on a new address; the client has transparently
+        # re-opened the camera.  Re-push saved gain/exposure/trigger (the
+        # fresh server starts from defaults) and restore the OPEN status LED.
+        self._status_dot.setStyleSheet(_led_style(_LED_OPEN))
+        self._refresh_settings()
+
+    def _render_frame(self, data: dict) -> None:
 
         frame: np.ndarray = data["frame"]
         self.last_image = frame
@@ -848,6 +1330,10 @@ class BaslerCameraWidget(QFrame):
             y2 = max(self.rect_start.y(), self.rect_end.y())
             self.current_rect = QRect(x1, y1, x2 - x1, y2 - y1)
             self._save_state()
+            # If the counts panel is open, refresh the title now that we
+            # have a valid ROI (clears the "No ROI set..." instruction).
+            if self.counts_panel.isVisible():
+                self._check_roi_for_counts()
 
     # ------------------------------------------------------------------ #
 

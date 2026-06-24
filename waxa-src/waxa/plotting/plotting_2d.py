@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+dv = -1.532053
 
 def plot_image_grid(ad,
                     ndarray = [],
@@ -77,8 +78,8 @@ def mixOD_grid(ad,
                 xvarformat="1.2g",
                 xvar0format="",
                 xvar1format="",
-                xvar0mult=1.,
-                xvar1mult=1.,
+                xvar0mult=dv,
+                xvar1mult=dv,
                 xvar0unit='',
                 xvar1unit='',
                 max_od=0.,
@@ -98,10 +99,17 @@ def mixOD_grid(ad,
         
     if max_od == 0.:
         max_od = np.max(od)
-        
+
     xvarnames = ad.xvarnames
     xvars = ad.xvars
 
+    # Auto-detect unit scaling unless explicitly overridden by function args
+    from waxa.plotting import detect_unit
+    if xvar0unit == '' and xvar0mult == dv:
+        xvar0unit, xvar0mult, _ = detect_unit(ad, 0)
+    if xvar1unit == '' and xvar1mult == dv:
+        xvar1unit, xvar1mult, _ = detect_unit(ad, 1)
+    
     # Get dimensions
     n_1, n_2, px, py = od.shape
 

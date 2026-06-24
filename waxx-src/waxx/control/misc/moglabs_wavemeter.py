@@ -41,9 +41,14 @@ class WavemeterController(MOGDevice):
 
     def set_channel(self, ch):
         try:
-            last_ch = self.check_ch()
-            if last_ch != ch:
-                self._set_channel(ch)
+            self._set_channel(ch)
+            for attempt in range(3):
+                time.sleep(0.075)
+                last_ch = self.check_ch()
+                if last_ch == ch:
+                    break
+            else:
+                aprint(f'Failed to set channel to {ch}, got {last_ch}')
         except:
             aprint('Failed to set channel')
         
@@ -153,13 +158,10 @@ class WavemeterClient():
         self._f = self.get_frequency()
 
         f_target = self.target_freq + frequency_shift
-
-        aprint(f'target = {f_target/1.e12:1.6f}, meas = {self._f/1.e12:1.6f}, diff = {(self._f - f_target)/1.e6:1.1f}')
-        if abs(self._f - f_target) < self.locked_tolerance:
-            return 1.
-        else:
-            aprint(f'laser {self.key} unlocked')
-            return 0.
+        if abs(self._f - f_target) > self.locked_tolerance:
+            aprint(f'laser {self.key} unlocked:')
+            aprint(f'target = {f_target/1.e12:1.6f}, meas = {self._f/1.e12:1.6f}, diff = {(self._f - f_target)/1.e6:1.1f}')
+        return self._f
         
 class DummyWavemeterController():
     def check_ch(self) -> int:
@@ -196,5 +198,5 @@ class DummyWavemeterClient():
     def get_frequency(self) -> float:
         return 0.
     
-    def lock_status(self) -> bool:
-        return False
+    def lock_status(self) -> float:
+        return 0.

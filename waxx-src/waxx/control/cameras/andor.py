@@ -49,7 +49,14 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         self._internal_output_queue = Queue()
 
     def Close(self):
-        self.setup_shutter(mode="closed")
+        # Wrap shutter close in try/except so a failed shutter command never
+        # blocks the underlying SDK close() — otherwise the device stays
+        # half-open and the next Open() fails until the process is restarted.
+        try:
+            self.setup_shutter(mode="closed")
+        except Exception as e:
+            print(f"[AndorEMCCD] setup_shutter('closed') failed: {e}. "
+                  f"Proceeding with SDK close anyway.")
         self.close()
 
     def Open(self):

@@ -51,6 +51,10 @@ class Scanner():
 
     def logspace(self,start,end,n):
         return np.logspace(np.log10(start),np.log10(end),int(n))
+    
+    def powspace(self,start,end,n,power=3):
+        u = np.linspace(0, 1, n)
+        return (start + (end - start) * (1 - (1 - u) ** power))
 
     def xvar(self,key,values):
         """Adds an xvar to the experiment.

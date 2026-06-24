@@ -6,6 +6,7 @@ to avoid duplicating the shared f\u2080 / \u0394 widget.
 """
 from __future__ import annotations
 
+import collections
 import sys
 import threading
 import time
@@ -16,6 +17,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -28,7 +30,7 @@ from PyQt6.QtWidgets import (
 from waxx.util.guis.bristol.bristol_wavemeter_client import BristolWavemeterGuiClient
 from waxx.util.guis.bristol.bristol_wavemeter_server_gui import (
     DARK_STYLESHEET,
-    BristolDetuningDisplay,
+    _F0_DEFAULT_THZ,
     _make_sine_icon,
     apply_dark_palette,
 )
@@ -45,8 +47,10 @@ class BristolDetuningWidget(QWidget):
         super().__init__()
         self._client: BristolWavemeterGuiClient | None = None
         self._connecting = False
-        self._times: list[float] = []
-        self._detunings_ghz: list[float] = []
+        # Bounded to _MAX_HISTORY_S worth of data; deque auto-evicts oldest
+        # so the O(n) pop(0) trim loop is no longer needed.
+        self._times: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
+        self._detunings_ghz: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
         self._start_time = time.time()
         self._setup_ui()
         self._timer = QTimer(self)
@@ -80,37 +84,72 @@ class BristolDetuningWidget(QWidget):
         root.setSpacing(4)
         root.setContentsMargins(8, 6, 8, 6)
 
-        # top control bar
+        # ── Row 1: live frequency + status + f₀ reference spinbox ────
+        # All on one row so the panel can stay narrow; the (taller)
+        # detuning readout drops below on its own line.
         top = QHBoxLayout()
-        top.setSpacing(6)
+        top.setSpacing(8)
 
         self._wm_lbl = QLabel("f = \u2014 THz")
         self._wm_lbl.setFont(QFont("Monospace", 10, QFont.Weight.Bold))
         self._wm_lbl.setStyleSheet("color: #44aaff;")
         top.addWidget(self._wm_lbl)
 
-        top.addStretch()
+        self._status_lbl = QLabel("\u25cf")
+        self._status_lbl.setStyleSheet("color: #555555; font-size: 10px;")
+        top.addWidget(self._status_lbl)
 
+        top.addStretch(1)
+
+        f0_lbl = QLabel("f\u2080:")
+        f0_lbl.setStyleSheet("color: #888888; font-size: 11px;")
+        top.addWidget(f0_lbl)
+
+        self._f0_spin = QDoubleSpinBox()
+        self._f0_spin.setDecimals(6)
+        self._f0_spin.setRange(100.0, 1000.0)
+        self._f0_spin.setValue(_F0_DEFAULT_THZ)
+        self._f0_spin.setSingleStep(0.001)
+        self._f0_spin.setSuffix(" THz")
+        self._f0_spin.setFont(QFont("Monospace", 10))
+        self._f0_spin.setFixedWidth(150)
+        top.addWidget(self._f0_spin)
+
+        root.addLayout(top)
+
+        # ── Row 2: detuning readout on its own line (large) ──────────
+        self._det_lbl = QLabel("\u0394 = \u2014 GHz")
+        self._det_lbl.setFont(QFont("Monospace", 13, QFont.Weight.Bold))
+        self._det_lbl.setStyleSheet("color: #ff6464;")
+        self._det_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self._det_lbl)
+
+        # ── Collapsible plot + averaging controls ────────────────────
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+            plot_box = CollapsibleGroupBox("Plot", expanded=False)
+        except Exception:
+            plot_box = QWidget()
+            QVBoxLayout(plot_box)
+
+        ctl_row = QHBoxLayout()
+        ctl_row.setSpacing(6)
         n_lbl = QLabel("N:")
         n_lbl.setStyleSheet("color: #888888; font-size: 10px;")
-        top.addWidget(n_lbl)
+        ctl_row.addWidget(n_lbl)
         self._n_spin = QSpinBox()
         self._n_spin.setRange(5, 1000)
         self._n_spin.setValue(100)
         self._n_spin.setFixedWidth(70)
         self._n_spin.setFont(QFont("Monospace", 10))
-        top.addWidget(self._n_spin)
-
+        ctl_row.addWidget(self._n_spin)
         clear_btn = QPushButton("Clear")
-        clear_btn.setFixedHeight(26)
+        clear_btn.setFixedHeight(22)
         clear_btn.clicked.connect(self._clear)
-        top.addWidget(clear_btn)
-
-        self._status_lbl = QLabel("\u25cf")
-        self._status_lbl.setStyleSheet("color: #555555; font-size: 10px;")
-        top.addWidget(self._status_lbl)
-
-        root.addLayout(top)
+        ctl_row.addWidget(clear_btn)
+        ctl_row.addStretch(1)
+        ctl_wrap = QWidget()
+        ctl_wrap.setLayout(ctl_row)
 
         self._plot = pg.PlotWidget()
         self._plot.setLabel("left", "\u0394f", units="GHz")
@@ -118,16 +157,20 @@ class BristolDetuningWidget(QWidget):
         self._plot.getAxis("left").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._plot.getAxis("bottom").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._curve = self._plot.plot(pen=pg.mkPen("#ffaa00", width=1.5))
-        root.addWidget(self._plot, 1)
+        self._plot.setMinimumHeight(180)
 
-        self._avg_lbl = QLabel("avg: \u2014")
-        self._avg_lbl.setFont(QFont("Monospace", 11, QFont.Weight.Bold))
-        self._avg_lbl.setStyleSheet("color: #ff8888;")
-        self._avg_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        root.addWidget(self._avg_lbl)
+        if hasattr(plot_box, "addWidget"):
+            plot_box.addWidget(ctl_wrap)
+            plot_box.addWidget(self._plot)
+        else:
+            plot_box.layout().addWidget(ctl_wrap)
+            plot_box.layout().addWidget(self._plot)
 
-        self._det_display = BristolDetuningDisplay()
-        root.addWidget(self._det_display)
+        root.addWidget(plot_box, 1)
+
+        # Hidden average label kept for back-compat with old _clear() code path.
+        self._avg_lbl = QLabel("")
+        self._avg_lbl.setVisible(False)
 
     def _update(self) -> None:
         if self._client is None:
@@ -155,33 +198,34 @@ class BristolDetuningWidget(QWidget):
             self._status_lbl.setText("\u25cf")
             self._status_lbl.setStyleSheet("color: #e74c3c; font-size: 10px;")
 
-        self._det_display.update_frequency(freq_thz)
+        # NOTE: detuning label is updated below from the running-average
+        # block as "Δ = mean ± σ".
 
-        f0 = self._det_display.f0_thz
+        f0 = self._f0_spin.value()
         det = (freq_thz - f0) * 1e3 if freq_thz is not None else float("nan")
         self._times.append(t)
         self._detunings_ghz.append(det)
 
-        cutoff = t - _MAX_HISTORY_S
-        while self._times and self._times[0] < cutoff:
-            self._times.pop(0)
-            self._detunings_ghz.pop(0)
-
-        self._curve.setData(self._times, self._detunings_ghz)
+        self._curve.setData(list(self._times), list(self._detunings_ghz))
 
         N = self._n_spin.value()
-        recent = [v for v in self._detunings_ghz[-N:] if not np.isnan(v)]
+        recent = [v for v in list(self._detunings_ghz)[-N:] if not np.isnan(v)]
         if recent:
-            avg = np.mean(recent)
-            std = np.std(recent, ddof=1) if len(recent) > 1 else 0.0
-            self._avg_lbl.setText(f"\u0394\u0304={avg:+.4f} GHz  \u03c3={std*1e3:.2f} MHz")
+            avg = float(np.mean(recent))
+            std = float(np.std(recent, ddof=1)) if len(recent) > 1 else 0.0
+            std_mhz = std * 1e3
+            self._det_lbl.setText(
+                f"\u0394 = {avg:+.3f} GHz \u00b1 {std_mhz:.2f} MHz"
+            )
+            self._avg_lbl.setText(f"\u0394\u0304={avg:+.3f} GHz  \u03c3={std_mhz:.2f} MHz")
         else:
+            self._det_lbl.setText("\u0394 = \u2014 GHz")
             self._avg_lbl.setText("avg: \u2014")
 
     def _clear(self) -> None:
         self._times.clear()
         self._detunings_ghz.clear()
-        self._start_time = time.time()
+        self._start_time = time.time()  # reset so deque maxlen stays consistent
         self._curve.clear()
         self._plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
         self._avg_lbl.setText("avg: \u2014")
@@ -193,7 +237,7 @@ class BristolClientWindow(QMainWindow):
         self.setWindowTitle("Bristol Wavemeter — Detuning")
         self.setWindowIcon(_make_sine_icon())
         self.setStyleSheet(DARK_STYLESHEET)
-        self.setMinimumSize(500, 380)
+        self.setMinimumSize(320, 200)
         self.setCentralWidget(BristolDetuningWidget())
 
 

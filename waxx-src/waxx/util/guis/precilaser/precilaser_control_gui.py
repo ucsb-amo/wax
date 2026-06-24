@@ -7,7 +7,7 @@ import math
 import sys
 from typing import Any
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QRunnable, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -29,6 +29,25 @@ from waxx.util.guis.precilaser.precilaser_gui_client import PrecilaserGuiClient
 
 LOGGER = logging.getLogger("precilaser_gui")
 LOGGER.setLevel(logging.INFO)
+
+
+class _BgCall(QRunnable):
+    """Run a callable on QThreadPool; report via callback. Used so the GUI
+    thread never blocks on the periodic snapshot/log round-trip."""
+
+    def __init__(self, func, on_done) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            res = self._func()
+        except BaseException as exc:  # noqa: BLE001
+            self._on_done(None, exc)
+            return
+        self._on_done(res, None)
 
 
 def create_emoji_icon(emoji: str) -> QIcon:
@@ -69,7 +88,7 @@ class StatusDot(QPushButton):
         self.off_text = off_text
         self.is_on = False
         self.setEnabled(False)
-        self.setMinimumHeight(34)
+        self.setMinimumHeight(22)
         self._update_color()
 
     def set_status(self, is_on: bool):
@@ -86,11 +105,15 @@ class StatusDot(QPushButton):
         self.setText(f"{self.label_text}: {state_text}")
         self.setStyleSheet(
             f"background-color: {color.name()}; color: #ffffff; border-radius: 10px; "
-            f"padding: 8px 10px; font-weight: 700; text-align: left;"
+            f"padding: 4px 10px; font-weight: 700; text-align: left;"
         )
 
 
 class PrecilaserControlGUI(QMainWindow):
+    # Cross-thread plumbing for the background snapshot/log fetcher.
+    _remote_state_ready = pyqtSignal(object, object)   # (snapshot, logs_payload|None)
+    _remote_state_failed = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.client: PrecilaserGuiClient | None = None
@@ -103,6 +126,8 @@ class PrecilaserControlGUI(QMainWindow):
         self._last_remote_error: str | None = None
         self._laser_enabled = False
         self._stability_enabled = False
+        self._remote_poll_in_flight = False
+        self._remote_connect_in_flight = False
 
         self.setWindowTitle("Precilaser Control")
         self.resize(1080, 760)
@@ -111,145 +136,234 @@ class PrecilaserControlGUI(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(18, 18, 18, 18)
-        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
 
-        dashboard_layout = QHBoxLayout()
-        dashboard_layout.setSpacing(12)
+        dashboard_layout = QVBoxLayout()
+        dashboard_layout.setSpacing(8)
 
-        left_column = QVBoxLayout()
-        left_column.setSpacing(12)
+        # All boxes/dropdowns vertically stacked so the panel can compress
+        # horizontally to almost any width.
+        try:
+            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
+        except Exception:
+            CollapsibleGroupBox = None  # type: ignore
+
         self.status_panel = self._create_status_panel()
         self.telemetry_panel = self._create_telemetry_panel()
-        left_column.addWidget(self.status_panel)
-        left_column.addWidget(self.telemetry_panel)
-        left_column.addStretch()
-        left_panel_width = max(
-            self.status_panel.minimumSizeHint().width(),
-            self.telemetry_panel.minimumSizeHint().width(),
-        )
-        self.status_panel.setFixedWidth(left_panel_width)
-        self.telemetry_panel.setFixedWidth(left_panel_width)
-        dashboard_layout.addLayout(left_column)
+        # Laser indicators are now always visible (not buried in a dropdown).
+        dashboard_layout.addWidget(self.status_panel)
+        # Current (editable) and Controls (buttons) live side-by-side as
+        # always-visible groups — mirrors the ALS panel structure.
+        self.current_panel = self._create_current_panel()
+        dashboard_layout.addWidget(self.current_panel)
+        self.control_panel = self._create_control_panel()
+        dashboard_layout.addWidget(self.control_panel)
+        # Telemetry and Logs sit under separate collapsible dropdowns so
+        # each can be expanded independently — matches the ALS panel.
+        log_box = self._create_log_panel()
+        if CollapsibleGroupBox is not None:
+            telem_wrap = CollapsibleGroupBox(
+                "Telemetry",
+                expanded=False,
+                scrollable=True,
+                max_expanded_height=240,
+            )
+            telem_wrap.addWidget(self.telemetry_panel)
+            dashboard_layout.addWidget(telem_wrap)
+            self.telem_wrap = telem_wrap
 
-        right_column = QVBoxLayout()
-        right_column.setSpacing(12)
-        right_column.addWidget(self._create_control_panel())
-        right_column.addWidget(self._create_log_panel(), 1)
-        dashboard_layout.addLayout(right_column, 1)
+            log_wrap = CollapsibleGroupBox(
+                "Logs",
+                expanded=False,
+                scrollable=True,
+                max_expanded_height=220,
+            )
+            log_wrap.addWidget(log_box)
+            dashboard_layout.addWidget(log_wrap, 1)
+            self.log_wrap = log_wrap
+        else:
+            dashboard_layout.addWidget(self.telemetry_panel)
+            dashboard_layout.addWidget(log_box, 1)
+            self.telem_wrap = self.telemetry_panel
+            self.log_wrap = log_box
+
+        dashboard_layout.addStretch()
 
         root_layout.addLayout(dashboard_layout)
 
         self.statusBar().showMessage("Ready")
+
+        # Cross-thread completion signals from the background fetcher.
+        self._remote_state_ready.connect(self._on_remote_state_ready)
+        self._remote_state_failed.connect(self._on_remote_state_failed)
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._sync_remote_state)
         self.status_timer.start(500)
 
     def _apply_theme(self):
+        # Dark theme matched to the kexp dashboard chrome (#2b2b2b).
+        # See als_control_gui._apply_theme for the matching palette.
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background: #f7f3ed;
-                color: #1f2a30;
-                font-family: Segoe UI;
+                background: transparent;
+                color: #d8d8d8;
+                font-family: 'Segoe UI';
             }
             QGroupBox {
-                border: 1px solid #d8cfc0;
-                border-radius: 12px;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
                 margin-top: 12px;
-                padding-top: 12px;
-                background: #fffaf2;
-                font-size: 13px;
+                padding: 10px 8px 8px 8px;
+                background: #323232;
+                font-size: 12px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 14px;
+                subcontrol-position: top left;
+                left: 12px;
                 padding: 0 6px;
-                color: #5b6670;
+                color: #9aa3a8;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.04em;
             }
             QPushButton {
-                background: #295c67;
-                color: #ffffff;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 12px;
+                background: #3d6b78;
+                color: #f1f3f4;
+                border: 1px solid #4f8896;
+                border-radius: 6px;
+                padding: 4px 10px;
                 font-weight: 600;
             }
             QPushButton:hover {
-                background: #347381;
+                background: #4d8294;
+                border-color: #6aa3b3;
+            }
+            QPushButton:pressed {
+                background: #355b66;
             }
             QPushButton:disabled {
-                background: #b7c1c4;
-                color: #edf1f2;
+                background: #2f3a3d;
+                color: #6a7479;
+                border-color: #3a4347;
             }
             QLineEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 8px;
-                padding: 7px;
-                font-size: 14px;
+                background: #2a2a2a;
+                color: #e0e0e0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-size: 13px;
+                selection-background-color: #4d8294;
+            }
+            QLineEdit:focus { border: 1px solid #6aa3b3; }
+            QCheckBox {
+                spacing: 6px;
+                color: #aab1b5;
+                font-weight: 500;
+            }
+            QCheckBox::indicator {
+                width: 13px; height: 13px;
+                border: 1px solid #6a6a6a;
+                border-radius: 3px;
+                background: #2a2a2a;
+            }
+            QCheckBox::indicator:checked {
+                background: #4d8294;
+                border-color: #6aa3b3;
             }
             QPlainTextEdit {
-                background: #fffdf9;
-                border: 1px solid #d4c9ba;
-                border-radius: 10px;
-                padding: 8px;
-                color: #2b3136;
+                background: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 6px;
+                padding: 6px;
+                color: #c8c8c8;
                 font-family: Consolas;
-                font-size: 12px;
+                font-size: 11px;
+                selection-background-color: #4d8294;
+            }
+            QStatusBar {
+                background: transparent;
+                color: #8a949a;
             }
             """
         )
 
-    def _create_control_panel(self) -> QGroupBox:
-        box = QGroupBox("Controls")
+    def _create_current_panel(self) -> QGroupBox:
+        """Editable working-current display.  Edit checkbox sits on the
+        QGroupBox title strip itself — not inside the box — to save
+        vertical space.  Mirrors the ALS "Power" group.
+        """
+        box = QGroupBox("Current")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
 
-        self.laser_toggle_button = QPushButton("Enable Laser")
-        self.laser_toggle_button.clicked.connect(self._toggle_laser_enable)
-        layout.addWidget(self.laser_toggle_button)
-        self._update_laser_button()
-
-        current_box = QGroupBox("Working Current")
-        current_box_layout = QVBoxLayout(current_box)
-        current_box_layout.setContentsMargins(10, 6, 10, 6)
-        current_box_layout.setSpacing(4)
-
-        header_row = QHBoxLayout()
-        header_row.addStretch()
-        self.current_edit_checkbox = QCheckBox("Edit")
+        self.current_edit_checkbox = QCheckBox("Edit", box)
         self.current_edit_checkbox.setChecked(False)
         self.current_edit_checkbox.stateChanged.connect(self._on_current_edit_toggled)
-        header_row.addWidget(self.current_edit_checkbox)
-        current_box_layout.addLayout(header_row)
+        # Style as a pill-shaped toggle button so it reads as clickable
+        # rather than a passive form control.
+        self.current_edit_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.current_edit_checkbox.setStyleSheet(
+            "QCheckBox {"
+            " background: #3d6b78; color: #f1f3f4;"
+            " border: 1px solid #4f8896; border-radius: 9px;"
+            " padding: 2px 10px; font-weight: 700; font-size: 11px;"
+            " letter-spacing: 0.04em;"
+            "}"
+            "QCheckBox:hover { background: #4d8294; border-color: #6aa3b3; }"
+            "QCheckBox:checked {"
+            " background: #c87a3d; border-color: #e8a87c; color: #fff;"
+            "}"
+            "QCheckBox:checked:hover { background: #d68a4d; }"
+            "QCheckBox::indicator { width: 0px; height: 0px; margin: 0; }"
+        )
+        self._current_edit_anchor = box
+        box.installEventFilter(self)
 
         self.current_display_label = QLabel("-- A")
         self.current_display_label.setStyleSheet(
-            "font-size: 36px; font-weight: 800; color: #295c67;"
+            "font-size: 36px; font-weight: 800; color: #5fb6c8; padding: 0px; margin: 0px;"
         )
-        self.current_display_label.setMinimumHeight(52)
+        self.current_display_label.setContentsMargins(0, 0, 0, 0)
+        self.current_display_label.setMinimumHeight(0)
         self.current_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        current_box_layout.addWidget(self.current_display_label)
+        # Keep the big readout vertically centred when the box grows.
+        layout.addStretch()
+        layout.addWidget(self.current_display_label)
 
         self.current_input = QLineEdit()
         self.current_input.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #295c67;"
+            "font-size: 26px; font-weight: 700; color: #5fb6c8; padding: 2px;"
         )
-        self.current_input.setMinimumHeight(44)
+        self.current_input.setMinimumHeight(0)
         self.current_input.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.current_input.setPlaceholderText("A")
         self.current_input.returnPressed.connect(self._submit_working_current)
-        current_box_layout.addWidget(self.current_input)
+        layout.addWidget(self.current_input)
 
         self.current_submit_hint = QLabel("ENTER to submit")
-        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #7c847c;")
+        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
         self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        current_box_layout.addWidget(self.current_submit_hint)
+        layout.addWidget(self.current_submit_hint)
+        layout.addStretch()
 
-        layout.addWidget(current_box)
         self._update_current_edit_mode()
+        return box
+
+    def _create_control_panel(self) -> QGroupBox:
+        box = QGroupBox("Controls")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+
+        # Laser enable/disable is handled by clicking the Laser Enable
+        # status dot in the status panel (no separate button needed).
 
         seq_row = QHBoxLayout()
         self.startup_button = QPushButton("Start Turn On")
@@ -266,34 +380,46 @@ class PrecilaserControlGUI(QMainWindow):
         self.interrupt_button.hide()
         layout.addLayout(seq_row)
 
-        self.sequence_state_value = QLabel("Sequence: IDLE")
-        self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
-        layout.addWidget(self.sequence_state_value)
+        # The sequence-state label now lives in the Logs dropdown so the
+        # always-visible Controls box stays compact; create it here only
+        # if the log panel hasn't already been built.
+        if not hasattr(self, "sequence_state_value"):
+            self.sequence_state_value = QLabel("Sequence: IDLE")
+            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
 
         return box
 
     def _create_status_panel(self) -> QGroupBox:
         box = QGroupBox("Status Indicators")
         layout = QVBoxLayout(box)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
 
+        # Server / serial buttons kept as orphan widgets (so existing
+        # callbacks and setText() calls still work) but not added to the
+        # layout - the dashboard server panel header already shows server
+        # reachability and the COM-port LED.
         self.server_conn_button = QPushButton("Server: searching\u2026")
         self.server_conn_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.server_conn_button.clicked.connect(self._retry_server_connection)
-        layout.addWidget(self.server_conn_button)
+        self.server_conn_button.setVisible(False)
 
         self.connection_state_value = QLabel("DISCONNECTED")
         self.connection_state_value.setStyleSheet("font-size: 14px; font-weight: 700;")
-        layout.addWidget(self.connection_state_value)
+        self.connection_state_value.setVisible(False)
 
         self.serial_connect_button = QPushButton("Connect Serial")
         self.serial_connect_button.clicked.connect(self._toggle_serial_connection)
-        layout.addWidget(self.serial_connect_button)
+        self.serial_connect_button.setVisible(False)
         self._update_connection_button("DISCONNECTED")
 
         self.pd_ok_dot = StatusDot("PD OK")
         self.temp_ok_dot = StatusDot("Temperature OK")
-        self.laser_enable_dot = StatusDot("Laser Enable")
+        self.laser_enable_dot = StatusDot(
+            "Laser Enable", on_text="ON (click to disable)", off_text="OFF (click to enable)"
+        )
+        self.laser_enable_dot.setEnabled(True)
+        self.laser_enable_dot.clicked.connect(self._toggle_laser_enable)
         self.stability_dot = StatusDot(
             "Power Stability",
             on_color="#2b6de0",
@@ -311,9 +437,12 @@ class PrecilaserControlGUI(QMainWindow):
 
         return box
 
-    def _create_telemetry_panel(self) -> QGroupBox:
-        box = QGroupBox("Telemetry")
+    def _create_telemetry_panel(self) -> QWidget:
+        # No outer QGroupBox title — the CollapsibleGroupBox wrapper
+        # already provides the "Telemetry" label.
+        box = QWidget()
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
         top_row = QHBoxLayout()
@@ -370,9 +499,18 @@ class PrecilaserControlGUI(QMainWindow):
 
         return box
 
-    def _create_log_panel(self) -> QGroupBox:
-        box = QGroupBox("Logs")
+    def _create_log_panel(self) -> QWidget:
+        # No outer QGroupBox title — the CollapsibleGroupBox wrapper
+        # provides the "Logs" label.
+        box = QWidget()
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        # Sequence-state line lives here so it sits with the logs rather
+        # than pushing down the always-visible Controls box.
+        if not hasattr(self, "sequence_state_value"):
+            self.sequence_state_value = QLabel("Sequence: IDLE")
+            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
+        layout.addWidget(self.sequence_state_value)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
@@ -403,25 +541,18 @@ class PrecilaserControlGUI(QMainWindow):
         if is_connected:
             self.serial_connect_button.setText("Disconnect Serial")
             self.serial_connect_button.setStyleSheet(
-                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
             )
         else:
             self.serial_connect_button.setText("Connect Serial")
             self.serial_connect_button.setStyleSheet(
-                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
             )
 
     def _update_laser_button(self) -> None:
-        if self._laser_enabled:
-            self.laser_toggle_button.setText("Disable Laser")
-            self.laser_toggle_button.setStyleSheet(
-                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
-            )
-        else:
-            self.laser_toggle_button.setText("Enable Laser")
-            self.laser_toggle_button.setStyleSheet(
-                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
-            )
+        # The toggle button has been replaced by the clickable Laser Enable
+        # status dot; this is kept as a no-op so existing call sites stay valid.
+        return
 
     def _toggle_laser_enable(self) -> None:
         self._set_laser_enable(not self._laser_enabled)
@@ -507,13 +638,13 @@ class PrecilaserControlGUI(QMainWindow):
         """
         if state == "connected" and self.client is not None:
             text = f"Server: {self.client.host}:{self.client.port}"
-            style = "background-color: #2ba363; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #2ba363; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         elif state == "lost":
             text = "Server: lost \u2014 click to retry"
-            style = "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         else:
             text = "Server: searching\u2026"
-            style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
+            style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         self.server_conn_button.setText(text)
         self.server_conn_button.setStyleSheet(style)
 
@@ -524,37 +655,81 @@ class PrecilaserControlGUI(QMainWindow):
         self._sync_remote_state()
 
     def _sync_remote_state(self) -> None:
+        # All network round-trips happen on QThreadPool so the GUI thread
+        # never stalls on socket I/O — this is what keeps the dashboard
+        # smooth while moving windows.
+        if self._remote_poll_in_flight or self._remote_connect_in_flight:
+            return
+
         if self.client is None:
-            try:
-                self.client = PrecilaserGuiClient(discovery_timeout=0.1)
-                self._set_server_conn_button_state("connected")
-            except RuntimeError:
-                self._set_server_conn_button_state("searching")
-                return
-        try:
-            snapshot = self.client.get_snapshot()
+            self._remote_connect_in_flight = True
+
+            def _build():
+                return PrecilaserGuiClient(discovery_timeout=0.1)
+
+            def _build_done(result, exc):
+                self._remote_connect_in_flight = False
+                if exc is not None:
+                    self._remote_state_failed.emit(str(exc))
+                else:
+                    self.client = result
+                    # Trigger an immediate fetch on the GUI thread.
+                    self._remote_state_failed.emit("")  # clears error
+            QThreadPool.globalInstance().start(_BgCall(_build, _build_done))
+            return
+
+        self._remote_poll_in_flight = True
+        client = self.client
+        next_idx = self._next_log_index
+
+        def _fetch():
+            snap = client.get_snapshot()
+            log_count = int(snap.get("log_count", next_idx)) if isinstance(snap, dict) else next_idx
+            logs_payload = None
+            if log_count > next_idx:
+                logs_payload = client.get_logs_since(next_idx)
+            return (snap, logs_payload)
+
+        def _done(result, exc):
+            if exc is not None:
+                self._remote_state_failed.emit(str(exc))
+            else:
+                snap, logs_payload = result
+                self._remote_state_ready.emit(snap, logs_payload)
+
+        QThreadPool.globalInstance().start(_BgCall(_fetch, _done))
+
+    # ---- GUI-thread completion slots --------------------------------- #
+
+    def _on_remote_state_ready(self, snapshot, logs_payload) -> None:
+        self._remote_poll_in_flight = False
+        self._set_server_conn_button_state("connected")
+        self._apply_snapshot(snapshot)
+        if logs_payload is not None:
+            for msg in logs_payload.get("messages", []):
+                self._append_log(str(msg))
+            self._next_log_index = int(
+                logs_payload.get("next_index", self._next_log_index)
+            )
+        self._last_remote_error = None
+
+    def _on_remote_state_failed(self, err: str) -> None:
+        self._remote_poll_in_flight = False
+        if not err:
+            # Connect succeeded; let the next tick fetch the snapshot.
             self._set_server_conn_button_state("connected")
-            self._apply_snapshot(snapshot)
-            log_count = int(snapshot.get("log_count", self._next_log_index))
-            self._sync_logs(log_count)
-            self._last_remote_error = None
-        except Exception as exc:
-            err = str(exc)
-            if err != self._last_remote_error:
-                self._append_log(f"ERROR remote sync: {err}")
-                self._last_remote_error = err
-            # Null the client so the next tick triggers full rediscovery.
-            self.client = None
-            self._set_server_conn_button_state("lost")
+            return
+        if err != self._last_remote_error:
+            self._append_log(f"ERROR remote sync: {err}")
+            self._last_remote_error = err
+        # Null the client so the next tick triggers full rediscovery.
+        self.client = None
+        self._set_server_conn_button_state("lost")
 
     def _sync_logs(self, log_count: int) -> None:
-        if log_count <= self._next_log_index:
-            return
-        payload = self.client.get_logs_since(self._next_log_index)
-        messages = payload.get("messages", [])
-        for msg in messages:
-            self._append_log(str(msg))
-        self._next_log_index = int(payload.get("next_index", self._next_log_index))
+        # Kept as a no-op for callers; log syncing now piggy-backs on
+        # the background snapshot fetch in ``_sync_remote_state``.
+        return
 
     @staticmethod
     def _fmt_value(value: Any, precision: int = 2) -> str:
@@ -614,6 +789,23 @@ class PrecilaserControlGUI(QMainWindow):
     def closeEvent(self, event):
         self.status_timer.stop()
         return super().closeEvent(event)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        # Re-anchor the Current-box Edit checkbox to the top-right of the
+        # group box title strip after every resize / show.
+        from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        anchor = getattr(self, "_current_edit_anchor", None)
+        cb = getattr(self, "current_edit_checkbox", None)
+        if anchor is not None and cb is not None and obj is anchor and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Move,
+        ):
+            cb.adjustSize()
+            margin = 12
+            x = anchor.width() - cb.width() - margin
+            y = 0
+            cb.move(max(0, x), y)
+            cb.raise_()
+        return super().eventFilter(obj, event)
 
 
 

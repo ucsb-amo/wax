@@ -255,7 +255,7 @@ class Monitor:
                     print(f"DDS {device_name}: V_PD changed to {new_config['v_pd']}")
 
             if old_config.get('sw_state') != new_config.get('sw_state'):
-                update_index = self.dds_sw_state_updates.index(DEFAULT_UPDATE_BOOL)
+                update_index = self.dds_sw_state_updates.index(DEFAULT_UPDATE_INT)
                 self.dds_sw_state_updates[update_index] = (kernel_index, new_config['sw_state'])
                 changes_detected = True
                 if verbose:
@@ -269,7 +269,7 @@ class Monitor:
                 continue
             if old_ttl.get(device_name, {}).get('ttl_state') != new_config.get('ttl_state'):
                 kernel_index = self.ttl_dict.get(device_name, -1)
-                update_index = self.ttl_updates.index(DEFAULT_UPDATE_BOOL) # get next update from start of list
+                update_index = self.ttl_updates.index(DEFAULT_UPDATE_INT) # get next update from start of list
                 self.ttl_updates[update_index] = (kernel_index, new_config['ttl_state'])
                 changes_detected = True
                 if verbose:

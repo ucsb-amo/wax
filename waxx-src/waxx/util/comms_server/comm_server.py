@@ -54,15 +54,31 @@ class UdpServer(QObject, WaxxServer):
                 break
             if self._print_connections_bool:
                 print(f"Connected by {addr}")
+            # Per-connection timeout so a hung/slow client can never stall the
+            # single-threaded accept loop (and thus every other client).
             try:
+                conn.settimeout(5.0)
+            except socket.error:
+                pass
+            try:
+                # Messages are newline-framed: read until "\n", reply with a
+                # newline-terminated response.  A single connection may carry
+                # one or more framed messages; EOF or timeout ends it.
+                buf = b""
                 while True:
-                    data = conn.recv(1024)
-                    if not data:
+                    try:
+                        chunk = conn.recv(4096)
+                    except socket.timeout:
                         break
-                    message = data.decode()
-                    self.on_message_received(message)
-                    reply = self.generate_reply(message)
-                    conn.sendall(reply.encode())
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        message = line.decode()
+                        self.on_message_received(message)
+                        reply = self.generate_reply(message)
+                        conn.sendall((reply + "\n").encode())
             except socket.error as e:
                 if self.running:
                     print(f"Socket error: {e}")

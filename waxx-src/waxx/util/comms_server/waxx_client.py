@@ -199,6 +199,11 @@ class WaxxClient:
                 f"Is the server running and on the 192.168.1.x subnet?"
             )
         self.host, self.port = result
+        # Bumped every time ``_rediscover`` observes a *changed* (host, port),
+        # i.e. the server restarted on a new address.  Callers can watch this
+        # counter to detect a genuine reconnect (vs. a no-op rediscovery) and
+        # rebuild sockets / re-establish server-side state accordingly.
+        self.reconnect_generation: int = 0
         logger.debug("[WaxxClient] Discovered %s @ %s:%d", server_id, self.host, self.port)
 
     def _rediscover(self, timeout: float = 2.0) -> bool:
@@ -208,11 +213,18 @@ class WaxxClient:
         restarted on a new ephemeral port the client picks up the new address
         before retrying.  Returns ``True`` if a (possibly updated) entry was
         found, ``False`` if the server is currently unreachable.
+
+        When the discovered ``(host, port)`` differs from the current one
+        (the server moved / restarted), ``reconnect_generation`` is bumped so
+        callers can detect the reconnect.
         """
         entry = _registry.discover(self._waxx_server_id, timeout=timeout)
         if entry is None:
             return False
+        if entry != (self.host, self.port):
+            self.reconnect_generation += 1
+            logger.debug("[WaxxClient] Rediscovered %s @ %s:%d (reconnect #%d)",
+                         self._waxx_server_id, entry[0], entry[1],
+                         self.reconnect_generation)
         self.host, self.port = entry
-        logger.debug("[WaxxClient] Rediscovered %s @ %s:%d",
-                     self._waxx_server_id, self.host, self.port)
         return True

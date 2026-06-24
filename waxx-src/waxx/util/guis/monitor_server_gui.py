@@ -1,41 +1,194 @@
 import socket
+import json
+import time
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
-import time
 
 from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.comms_server.comm_server import UdpServer, STATES, ReadyBit
+from waxx.util.comms_server.state_broadcast import StateBroadcaster
+from waxx.util.comms_server.hardware_id import monitor_server_id
+from waxx.util.comms_server.waxx_client import discover
+from waxx.util.device_state.state_file_io import read_state, apply_delta
 
 class Status:
     def __init__(self,state=False):
         self.state = state
 
 class MonitorUDPServer(UdpServer):
+    """TCP responder + sole writer of the device-state JSON.
+
+    Besides the legacy string commands (``status``/``reset``/``run complete``/
+    ``monitor ready``) it handles structured JSON requests from clients:
+
+    * ``{"type": "update", "device_type", "device_name", "changes"}`` — merge a
+      delta into the JSON atomically, bump the version, broadcast the change.
+    * ``{"type": "get_state"}`` — return the full snapshot + current version.
+
+    The version starts from the current epoch seconds so that a server restart
+    always yields versions higher than any value a client still holds (forcing
+    a clean resync rather than ignoring "older" updates).
+    """
 
     reset_signal = pyqtSignal()
 
-    def __init__(self):
-        super().__init__(host="0.0.0.0", port=0, server_id="monitor")
+    def __init__(self, config_file_path=None):
+        super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = Status()
         self._print_connections_bool = False
 
+        self.config_file_path = config_file_path
+        self._version = int(time.time())
+        self._broadcaster = StateBroadcaster()
+
     def on_message_received(self,message):
-        if message == 'reset':
+        m = message.strip()
+        if m.startswith("{"):
+            # Structured (JSON) requests are fully handled in generate_reply.
+            return
+        if m == 'reset':
             self.reset_signal.emit()
-        if message == 'status':
+        if m == 'status':
             return
         self.message_received.emit(message)
 
     def generate_reply(self, message):
-        reply = str(int(self.status.state))
-        return reply
+        m = message.strip()
+        if m.startswith("{"):
+            return self._handle_structured(m)
+        return str(int(self.status.state))
+
+    def _handle_structured(self, raw):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return json.dumps({"status": "error", "msg": "invalid json"})
+        mtype = obj.get("type")
+        if mtype == "get_state":
+            return self._reply_get_state()
+        if mtype == "update":
+            return self._reply_update(obj)
+        return json.dumps({"status": "error", "msg": f"unknown type {mtype}"})
+
+    def _reply_get_state(self):
+        if not self.config_file_path:
+            return json.dumps({"status": "error", "msg": "no config path"})
+        try:
+            cfg = read_state(self.config_file_path)
+        except FileNotFoundError:
+            cfg = {}
+        except Exception as e:
+            return json.dumps({"status": "error", "msg": str(e)})
+        return json.dumps({"status": "ok", "version": self._version, "config": cfg})
+
+    def _reply_update(self, obj):
+        if not self.config_file_path:
+            return json.dumps({"status": "error", "msg": "no config path"})
+        dtype = obj.get("device_type")
+        name = obj.get("device_name")
+        changes = obj.get("changes")
+        if dtype not in ("dds", "dac", "ttl") or not name or not isinstance(changes, dict):
+            return json.dumps({"status": "error", "msg": "bad update"})
+        try:
+            apply_delta(self.config_file_path, dtype, name, changes)
+        except Exception as e:
+            return json.dumps({"status": "error", "msg": str(e)})
+        self._version += 1
+        version = self._version
+        self._broadcaster.send({
+            "type": "state_update",
+            "version": version,
+            "device_type": dtype,
+            "device_name": name,
+            "changes": changes,
+        })
+        # Keep linked DDS v_pd and DAC voltage in sync in both directions.
+        self._propagate_linked_vpd(dtype, name, changes)
+        return json.dumps({"status": "ok", "version": version})
+
+    def _propagate_linked_vpd(self, dtype: str, name: str, changes: dict) -> None:
+        """Cross-propagate v_pd <-> voltage for DDS/DAC pairs sharing a channel.
+
+        The link is stored as ``dac_ch_key`` in every DDS config entry that has
+        DAC control (written by ``generate_state_file.Generator``).  When either
+        side changes the voltage the other side is updated atomically and a
+        broadcast is sent so GUI widgets on both tabs stay in sync.
+        """
+        try:
+            cfg = read_state(self.config_file_path)
+        except Exception:
+            return
+
+        if dtype == "dds" and "v_pd" in changes:
+            dac_key = cfg.get("dds", {}).get(name, {}).get("dac_ch_key", "")
+            if not dac_key:
+                return
+            linked = {"voltage": changes["v_pd"]}
+            try:
+                apply_delta(self.config_file_path, "dac", dac_key, linked)
+            except Exception:
+                return
+            self._version += 1
+            self._broadcaster.send({
+                "type": "state_update",
+                "version": self._version,
+                "device_type": "dac",
+                "device_name": dac_key,
+                "changes": linked,
+            })
+
+        elif dtype == "dac" and "voltage" in changes:
+            for dds_name, dds_cfg in cfg.get("dds", {}).items():
+                if dds_cfg.get("dac_ch_key", "") != name:
+                    continue
+                linked = {"v_pd": changes["voltage"]}
+                try:
+                    apply_delta(self.config_file_path, "dds", dds_name, linked)
+                except Exception:
+                    continue
+                self._version += 1
+                self._broadcaster.send({
+                    "type": "state_update",
+                    "version": self._version,
+                    "device_type": "dds",
+                    "device_name": dds_name,
+                    "changes": linked,
+                })
+
+    def stop(self):
+        try:
+            self._broadcaster.close()
+        except Exception:
+            pass
+        super().stop()
+
 
 class MonitorServerGUI(QWidget):
     def __init__(self,
-                monitor_expt_path):
+                monitor_expt_path,
+                config_file_path=None):
         super().__init__()
+
+        self.config_file_path = config_file_path
+
+        # Refuse to start a second monitor server for the same hardware.
+        server_id = monitor_server_id()
+        existing = discover(server_id, timeout=1.5)
+        if existing is not None:
+            ip, port = existing
+            QMessageBox.critical(
+                self,
+                "Monitor server already running",
+                f"A monitor server for '{server_id}' is already running at "
+                f"{ip}:{port}.\n\nRefusing to start a second server for the same "
+                "hardware.",
+            )
+            self._aborted = True
+            QTimer.singleShot(0, self.close)
+            return
+        self._aborted = False
 
         self.setWindowTitle("Monitor Server")
         eye_icon = self._create_eye_icon()
@@ -88,7 +241,7 @@ class MonitorServerGUI(QWidget):
     def setup_udp_server(self):
         self.server_thread = QThread()
         
-        self.udp_server = MonitorUDPServer()
+        self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
@@ -111,11 +264,16 @@ class MonitorServerGUI(QWidget):
             self.monitor_manager.start()
 
     def restart_monitor(self):
-        if self.monitor_manager.isRunning():
-            self.monitor_manager.terminate()
-            self.monitor_manager.wait(500)  # wait up to 500 ms for thread to actually finish
-        self.monitor_manager.start()
-        self.set_status(STATES.LOADING)
+        if getattr(self, "_restarting", False):
+            return
+        self._restarting = True
+        try:
+            if self.monitor_manager.isRunning():
+                self.monitor_manager.stop()
+            self.monitor_manager.start()
+            self.set_status(STATES.LOADING)
+        finally:
+            self._restarting = False
 
     def set_status(self, status):
         if status == STATES.READY:
@@ -123,7 +281,7 @@ class MonitorServerGUI(QWidget):
             self.status_indicator.setStyleSheet("background-color: green; color: white;")
         elif status == STATES.NOT_READY:
             self.status_indicator.setText("NOT READY")
-            self.status_indicator.setStyleSheet("background-color: red; color: white;")
+            self.status_indicator.setStyleSheet("background-color: #c46666; color: white;")
         else:
             self.status_indicator.setText("Loading...")
             self.status_indicator.setStyleSheet("background-color: orange; color: white;")
@@ -154,6 +312,5 @@ class MonitorServerGUI(QWidget):
         self.udp_server.stop()
         self.server_thread.quit()
         self.server_thread.wait()
-        self.monitor_manager.terminate()
-        self.monitor_manager.wait()
+        self.monitor_manager.stop()
         event.accept()

@@ -33,10 +33,17 @@ Commands sent by client → replies from server:
     {"cmd": "SET_EXPOSURE",      "serial": "12345", "value": 300.0} → {"ok": True}
     {"cmd": "GET_GAIN_RANGE",    "serial": "12345"} → {"ok": True, "result": [min, max]}
     {"cmd": "GET_EXPOSURE_RANGE","serial": "12345"} → {"ok": True, "result": [min, max]}
+
+    {"cmd": "SET_DEFAULTS", "serial": "12345", "gain": 12.0, "exposure": 300.0,
+            "trigger_mode": "Off", "roi": [x1, y1, x2, y2], "norm_reference": 1.0}
+        → {"ok": True, "defaults": {...}}   (any subset of keys; persisted by serial)
+    {"cmd": "GET_DEFAULTS", "serial": "12345"} → {"ok": True, "defaults": {...}}
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import pickle
 import socket
 import threading
@@ -52,6 +59,15 @@ from waxx.util.comms_server.waxx_server import WaxxServer
 logger = logging.getLogger(__name__)
 
 BASLER_SERVER_PREFIX = "basler_server:"
+
+# Per-camera default settings are persisted here on the *server* host, keyed by
+# camera serial, so they survive server restarts and apply on every
+# OPEN_CAMERA regardless of which client connects.  Gain/exposure/trigger are
+# applied to the hardware on open; ROI and normalization are opaque client-side
+# display values that the server only stores and echoes back.
+_DEFAULTS_FILE = os.path.join(
+    os.path.expanduser("~"), ".waxx", "basler_server_defaults.json"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,11 +86,23 @@ class _ManagedCamera:
         self.model: str = model
         self.user_id: str = user_id
 
+        # Open-time defaults for this serial: any of
+        # {"gain", "exposure", "trigger_mode", "roi", "norm_reference"}.
+        # gain/exposure/trigger_mode are applied to hardware on open(); roi and
+        # norm_reference are opaque client display values stored & echoed back.
+        self.defaults: dict = {}
+
         self._lock = threading.Lock()
         self._camera: Optional[pylon.InstantCamera] = None
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_timestamp: float = 0.0
         self._is_open: bool = False
+        # Set of client_ids currently holding this camera open.  The
+        # physical device stays open as long as the set is non-empty;
+        # close() only tears it down when the last client lets go (or
+        # when called with force=True, e.g. server shutdown / operator
+        # override on the local GUI).
+        self._clients: set[str] = set()
 
         self._grab_stop = threading.Event()
         self._grab_thread: Optional[threading.Thread] = None
@@ -87,9 +115,16 @@ class _ManagedCamera:
     def is_open(self) -> bool:
         return self._is_open
 
-    def open(self) -> None:
+    def open(self, client_id: str) -> None:
         with self._lock:
+            self._clients.add(client_id)
             if self._is_open:
+                # Camera already streaming for another client; this new
+                # client just shares it.  Nothing else to do.
+                logger.info(
+                    "[BaslerServer] Camera %s shared (now %d client(s))",
+                    self.serial, len(self._clients),
+                )
                 return
             # Re-enumerate to get a fresh DeviceInfo (handles re-plug).
             tl = pylon.TlFactory.GetInstance()
@@ -100,14 +135,22 @@ class _ManagedCamera:
             # Free-run continuous mode for live viewing.
             cam.UserSetSelector = "Default"
             cam.UserSetLoad.Execute()
-            cam.TriggerMode.SetValue("Off")
+            # Apply this camera's persisted defaults, falling back to the
+            # historical hardcoded values when no default is stored.
+            try:
+                cam.TriggerMode.SetValue(str(self.defaults.get("trigger_mode", "Off")))
+            except Exception:
+                try:
+                    cam.TriggerMode.SetValue("Off")
+                except Exception:
+                    pass
             cam.AcquisitionMode.SetValue("Continuous")
             try:
-                cam.Gain.SetValue(12.0)
+                cam.Gain.SetValue(float(self.defaults.get("gain", 12.0)))
             except Exception:
                 pass
             try:
-                cam.ExposureTime.SetValue(300.0)
+                cam.ExposureTime.SetValue(float(self.defaults.get("exposure", 300.0)))
             except Exception:
                 pass
             cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
@@ -124,7 +167,22 @@ class _ManagedCamera:
         self._grab_thread.start()
         logger.info("[BaslerServer] Opened camera %s (%s)", self.serial, self.model)
 
-    def close(self) -> None:
+    def close(self, client_id: str, force: bool = False) -> None:
+        with self._lock:
+            self._clients.discard(client_id)
+            if not self._is_open:
+                return
+            if self._clients and not force:
+                logger.info(
+                    "[BaslerServer] Camera %s still held by %d client(s); leaving open",
+                    self.serial, len(self._clients),
+                )
+                return
+            if force:
+                # Operator / shutdown override: drop any remaining holders
+                # so a subsequent open() does a fresh device acquisition.
+                self._clients.clear()
+        # Tear down outside the lock so the grab thread can exit cleanly.
         self._grab_stop.set()
         if self._grab_thread is not None:
             self._grab_thread.join(timeout=3.0)
@@ -255,6 +313,72 @@ class _ManagedCamera:
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
+    def get_trigger_mode(self) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                return {"ok": True, "result": str(self._camera.TriggerMode.GetValue())}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def set_trigger_mode(self, value: str) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                # Stop grabbing while changing trigger configuration; pylon
+                # requires this for the change to take effect cleanly.
+                was_grabbing = bool(self._camera.IsGrabbing())
+                if was_grabbing:
+                    self._camera.StopGrabbing()
+                self._camera.TriggerMode.SetValue(str(value))
+                if was_grabbing:
+                    self._camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                return {"ok": True}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def get_trigger_mode_options(self) -> dict:
+        with self._lock:
+            if not self._is_open or self._camera is None:
+                return {"ok": False, "error": "camera not open"}
+            try:
+                node = self._camera.TriggerMode
+                # GenApi enum: use GetSymbolics() for available values.
+                try:
+                    options = [str(s) for s in node.GetSymbolics()]
+                except Exception:
+                    options = ["Off", "On"]
+                return {"ok": True, "result": options}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    def set_defaults(self, gain=None, exposure=None, trigger_mode=None,
+                     roi=None, norm_reference=None) -> dict:
+        """Store this camera's open-time defaults.  Only provided keys update.
+
+        gain/exposure/trigger_mode are applied to the hardware on the next
+        ``open()``.  roi and norm_reference are opaque client display values
+        the server only persists and echoes back via ``GET_DEFAULTS``.
+        """
+        with self._lock:
+            if gain is not None:
+                self.defaults["gain"] = float(gain)
+            if exposure is not None:
+                self.defaults["exposure"] = float(exposure)
+            if trigger_mode is not None:
+                self.defaults["trigger_mode"] = str(trigger_mode)
+            if roi is not None:
+                self.defaults["roi"] = [int(v) for v in roi]
+            if norm_reference is not None:
+                self.defaults["norm_reference"] = float(norm_reference)
+            return {"ok": True, "defaults": dict(self.defaults)}
+
+    def get_defaults(self) -> dict:
+        with self._lock:
+            return {"ok": True, "defaults": dict(self.defaults)}
+
     def info_dict(self) -> dict:
         return {"serial": self.serial, "model": self.model, "is_open": self._is_open, "user_id": self.user_id}
 
@@ -297,6 +421,7 @@ class BaslerCameraServer(WaxxServer):
         WaxxServer.__init__(self, sid, port)
         self._cameras: dict[str, _ManagedCamera] = {}
         self._running = False
+        self._defaults_store: dict[str, dict] = self._load_defaults()
         self._enumerate_cameras()
 
     # ------------------------------------------------------------------ #
@@ -325,7 +450,10 @@ class BaslerCameraServer(WaxxServer):
                     mc.user_id = user_id
                     new[serial] = mc
                 else:
-                    new[serial] = _ManagedCamera(serial, model, user_id=user_id)
+                    mc = _ManagedCamera(serial, model, user_id=user_id)
+                    # Seed open-time defaults from the persisted store.
+                    mc.defaults = dict(self._defaults_store.get(serial, {}))
+                    new[serial] = mc
             self._cameras = new
             logger.info(
                 "[BaslerServer] Enumerated %d camera(s): %s",
@@ -334,6 +462,38 @@ class BaslerCameraServer(WaxxServer):
             )
         except Exception as exc:
             logger.error("[BaslerServer] Camera enumeration failed: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Defaults persistence
+    # ------------------------------------------------------------------ #
+
+    def _load_defaults(self) -> dict[str, dict]:
+        """Load the per-serial defaults map from disk on the server host."""
+        try:
+            with open(_DEFAULTS_FILE) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return {str(k): dict(v) for k, v in data.items()
+                        if isinstance(v, dict)}
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("[BaslerServer] Could not read defaults file: %s", exc)
+        return {}
+
+    def _save_defaults(self) -> None:
+        """Persist every camera's current defaults to disk, keyed by serial."""
+        store: dict[str, dict] = dict(self._defaults_store)
+        for serial, mc in self._cameras.items():
+            if mc.defaults:
+                store[serial] = dict(mc.defaults)
+        self._defaults_store = store
+        try:
+            os.makedirs(os.path.dirname(_DEFAULTS_FILE), exist_ok=True)
+            with open(_DEFAULTS_FILE, "w") as fh:
+                json.dump(store, fh, indent=2)
+        except Exception as exc:
+            logger.warning("[BaslerServer] Could not write defaults file: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Server lifecycle
@@ -363,7 +523,7 @@ class BaslerCameraServer(WaxxServer):
             for mc in self._cameras.values():
                 if mc.is_open:
                     try:
-                        mc.close()
+                        mc.close("__shutdown__", force=True)
                     except Exception:
                         pass
             rep_socket.close()
@@ -407,31 +567,50 @@ class BaslerCameraServer(WaxxServer):
         mc = self._cameras[serial]
 
         if name == "OPEN_CAMERA":
+            client_id = cmd.get("client_id") or f"anon:{id(cmd)}"
             try:
-                mc.open()
+                mc.open(client_id)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
         if name == "CLOSE_CAMERA":
+            client_id = cmd.get("client_id") or f"anon:{id(cmd)}"
             try:
-                mc.close()
+                mc.close(client_id)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
 
         handlers = {
-            "GET_FRAME":          mc.get_frame,
-            "GET_GAIN":           mc.get_gain,
-            "GET_EXPOSURE":       mc.get_exposure,
-            "GET_GAIN_RANGE":     mc.get_gain_range,
-            "GET_EXPOSURE_RANGE": mc.get_exposure_range,
+            "GET_FRAME":               mc.get_frame,
+            "GET_GAIN":                mc.get_gain,
+            "GET_EXPOSURE":            mc.get_exposure,
+            "GET_GAIN_RANGE":          mc.get_gain_range,
+            "GET_EXPOSURE_RANGE":      mc.get_exposure_range,
+            "GET_TRIGGER_MODE":        mc.get_trigger_mode,
+            "GET_TRIGGER_MODE_OPTIONS": mc.get_trigger_mode_options,
         }
 
         if name == "SET_GAIN":
             return mc.set_gain(cmd.get("value", 0.0))
         if name == "SET_EXPOSURE":
             return mc.set_exposure(cmd.get("value", 0.0))
+        if name == "SET_TRIGGER_MODE":
+            return mc.set_trigger_mode(cmd.get("value", "Off"))
+
+        if name == "SET_DEFAULTS":
+            resp = mc.set_defaults(
+                gain=cmd.get("gain"),
+                exposure=cmd.get("exposure"),
+                trigger_mode=cmd.get("trigger_mode"),
+                roi=cmd.get("roi"),
+                norm_reference=cmd.get("norm_reference"),
+            )
+            self._save_defaults()
+            return resp
+        if name == "GET_DEFAULTS":
+            return mc.get_defaults()
 
         handler = handlers.get(name)
         if handler is None:

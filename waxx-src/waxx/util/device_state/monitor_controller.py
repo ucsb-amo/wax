@@ -33,13 +33,19 @@ class Device:
     def set(self, **kwargs) -> None:
         """
         Set device parameters.
-        
+
         For DDS: frequency (Hz), amplitude (0-1), v_pd (V), sw_state (0/1)
         For DAC: voltage (V)
         For TTL: ttl_state (0/1)
+
+        The delta is sent to the monitor server (the sole writer of the JSON);
+        if nothing changed, no message is sent.  Raises on server error.
         """
+        if not kwargs:
+            return
+        self.parent_frame.controller._send_update(
+            self.parent_frame.device_type, self.name, kwargs)
         self.config.update(kwargs)
-        self.parent_frame.controller.save_config()
         
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}('{self.name}')"
@@ -143,38 +149,64 @@ class MonitorController:
     accessed and modified programmatically.
     """
     
-    def __init__(self, json_path):
+    def __init__(self, json_path=None, discovery_timeout: float = 3.0):
         """
         Initialize the MonitorController.
-        
-        Args:
-            json_path: Path to the device configuration JSON file.
-                      If not provided, looks for a default location or prompts user.
+
+        Connects to the monitor server (discovered over UDP) and pulls the
+        current device state.  No shared-drive / file access is required, so
+        this works from any lab machine.  The ``json_path`` argument is kept
+        for backward compatibility with existing callers but is no longer used
+        for I/O.
+
+        Raises:
+            RuntimeError: if the monitor server cannot be reached.
         """
-        self.json_path = Path(json_path)
+        self.json_path = json_path
         self.config_data: Dict[str, Any] = {}
-        
+        self._version = None
+
         # Create device frames
         self.dds = DeviceFrame("dds", self, DDSDevice)
         self.dac = DeviceFrame("dac", self, DACDevice)
         self.ttl = DeviceFrame("ttl", self, TTLDevice)
-        
+
+        from waxx.util.comms_server.comm_client import MonitorClient  # noqa: PLC0415
+        try:
+            self._client = MonitorClient(discovery_timeout=discovery_timeout)
+        except Exception as e:
+            raise RuntimeError(
+                "MonitorController could not reach the monitor server. "
+                "Make sure the monitor server is running on the experiment PC."
+            ) from e
+
         # Load initial configuration
         self.load_config()
-    
+
     def load_config(self) -> None:
-        """Load configuration from JSON file and populate device frames"""
-        if not self.json_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {self.json_path}")
-        
-        try:
-            with open(self.json_path, 'r') as f:
-                self.config_data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in configuration file: {e}")
-        
+        """Pull the full device state from the monitor server."""
+        state = self._client.get_state()
+        if not state or state.get("status") != "ok":
+            msg = (state or {}).get("msg", "no response")
+            raise RuntimeError(f"Failed to load device state from server: {msg}")
+        self.config_data = state.get("config", {}) or {}
+        self._version = state.get("version")
+
         # Populate device frames
         self._populate_frames()
+
+    def _send_update(self, device_type: str, device_name: str, changes: Dict[str, Any]) -> None:
+        """Send a delta to the server and block on its ack."""
+        ack = self._client.send_update(device_type, device_name, changes)
+        if ack is None:
+            raise RuntimeError(
+                f"Monitor server unreachable; '{device_name}' was not updated."
+            )
+        if ack.get("status") != "ok":
+            raise RuntimeError(
+                f"Monitor server rejected update to '{device_name}': {ack.get('msg')}"
+            )
+        self._version = ack.get("version", self._version)
     
     def _populate_frames(self) -> None:
         """Populate device frames from config data"""
@@ -213,15 +245,15 @@ class MonitorController:
                 self.ttl.add_device(device_name, device_config)
     
     def save_config(self) -> None:
-        """Save current configuration back to JSON file"""
-        try:
-            with open(self.json_path, 'w') as f:
-                json.dump(self.config_data, f, indent=2)
-        except Exception as e:
-            raise IOError(f"Failed to save configuration to {self.json_path}: {e}")
-    
+        """Deprecated: the server is the sole writer of the JSON.
+
+        Kept as a no-op for backward compatibility; per-device changes are
+        persisted by the server when :meth:`Device.set` sends a delta.
+        """
+        pass
+
     def reload_config(self) -> None:
-        """Reload configuration from JSON file (useful if file was modified externally)"""
+        """Reload configuration from the monitor server."""
         self.load_config()
     
     def get_device(self, device_type: str, device_name: str) -> Device:

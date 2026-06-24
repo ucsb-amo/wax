@@ -21,8 +21,8 @@ class server_talk():
                  on_data_dir_disconnected_bat_path=""):
         
         self.data_dir = data_dir
-        self.run_id_path = os.path.join(data_dir,run_id_relpath)
-        self.roi_csv_path = os.path.join(data_dir,roi_spreadsheet_replath)
+        self.run_id_path = os.path.join(data_dir, run_id_relpath) if data_dir is not None else None
+        self.roi_csv_path = os.path.join(data_dir, roi_spreadsheet_replath) if data_dir is not None else None
 
         if first_data_folder_date == "":
             first_data_folder_date = datetime(2023,6,22)
@@ -131,6 +131,19 @@ class server_talk():
 
     def check_for_mapped_data_dir(self):
         self.set_data_dir()
+        # If the dashboard configured the shared guard, defer to it so the
+        # same throttling / logging / bat-missing handling applies to every
+        # data-dir access (servers, GUIs, notebooks running under the
+        # dashboard).  When the guard is not configured (e.g. a standalone
+        # analysis script imported atomdata directly), fall back to the
+        # original inline behavior so no consumer regresses.
+        try:
+            from waxx.util.dashboard import data_dir_guard  # noqa: PLC0415
+            if data_dir_guard.is_configured():
+                status = data_dir_guard.ensure_data_dir(self.data_dir)
+                return bool(status.ok)
+        except Exception:
+            pass
         if not os.path.exists(self.data_dir):
             if sys.platform == "win32":
                 print(f"Data dir ({self.data_dir}) not found. Attempting to re-map network drives.")
@@ -309,7 +322,7 @@ class server_talk():
 
         for date_dir in self._iter_date_dirs_desc(lite=lite):
             max_seen = -1
-            found_path = None
+            matches = []
             try:
                 for file_entry in os.scandir(date_dir):
                     if not file_entry.is_file() or not file_entry.name.lower().endswith('.hdf5'):
@@ -321,12 +334,18 @@ class server_talk():
                     if file_run_id > max_seen:
                         max_seen = file_run_id
                     if file_entry.name.startswith(prefix):
-                        found_path = file_entry.path
+                        matches.append(file_entry.path)
             except OSError:
                 continue
 
-            if found_path is not None:
-                return found_path
+            if matches:
+                if len(matches) > 1:
+                    print(
+                        f"[server_talk] WARNING: run ID {run_id} maps to "
+                        f"{len(matches)} data files: {matches}. Loading "
+                        f"{matches[0]}. This indicates a run_id collision."
+                    )
+                return matches[0]
             # All run IDs in this folder are older than the target — stop searching.
             if max_seen >= 0 and max_seen < run_id:
                 break
@@ -409,6 +428,33 @@ class server_talk():
             with open(self.run_id_path, 'w') as f:
                 f.write(f"{rid}")
 
+    def get_latest_run_id_any(self):
+        """Return the highest run_id across ALL hdf5 data files, including
+        runs still in progress (``run_complete=False``).
+
+        Unlike ``get_latest_data_file`` (which only considers completed runs),
+        this scans every data file so a run_id reservation can avoid colliding
+        with an in-progress run started by another server.  Returns ``None``
+        when no data files exist.
+        """
+        self.check_for_mapped_data_dir()
+        for date_dir in self._iter_date_dirs_desc():
+            for path in self._iter_hdf5_files_desc(date_dir):
+                # _iter_hdf5_files_desc yields the highest run_id first and
+                # date dirs are newest-first, so the first hit is the global
+                # maximum.
+                return self.run_id_from_filepath(path)
+        return None
+
+    def set_run_id(self, value):
+        """Overwrite the run_id counter file with ``value`` (the next run_id to
+        be used).  Used by the reservation path to advance the monotonic floor
+        after atomically claiming an id."""
+        self.set_data_dir()
+        with self._run_id_lock:
+            with open(self.run_id_path, 'w') as f:
+                f.write(f"{int(value)}")
+
     def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True):
         from waxa.data import RunInfo, DataSaver
         from waxa.atomdata import unpack_group
@@ -438,7 +484,21 @@ class server_talk():
                 dkeys = f_src['data'].keys()
                 f_lite.create_group('data')
                 for key in dkeys:
-                    if key != 'images':
+                    if key == 'images':
+                        continue
+                    if key == 'scope_data':
+                        # Downcast float64 → float32 and apply compression.
+                        scope_grp = f_lite['data'].create_group('scope_data')
+                        for scope_label, scope_item in f_src['data']['scope_data'].items():
+                            this_scope = scope_grp.create_group(scope_label)
+                            for ch_key in scope_item.keys():
+                                arr = scope_item[ch_key][()]
+                                if arr.dtype == np.float64:
+                                    arr = arr.astype(np.float32)
+                                this_scope.create_dataset(
+                                    ch_key, data=arr, compression='gzip', compression_opts=4
+                                )
+                    else:
                         f_src.copy(f_src['data'][key],f_lite['data'],key)
 
                 # copy over attributes

@@ -1,6 +1,9 @@
 import numpy as np
+from typing import TYPE_CHECKING
 from waxa.base.xvar import xvar
-from waxx.config.data_vault import DataContainer, DataVault
+from waxa.config.data_vault import DataContainer, DataVault
+if TYPE_CHECKING:
+    from waxx.config.data_vault import DataContainer, DataVault  # noqa: F811
 
 class Dealer():
     def __init__(self):

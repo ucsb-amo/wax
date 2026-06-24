@@ -5,6 +5,7 @@ from artiq.experiment import kernel, portable
 from artiq.language.core import delay_mu
 
 from waxx.control.artiq.DDS import DDS
+from waxx.control.artiq.DAC_CH import DAC_CH
 from waxx.control.artiq.dummy_core import DummyCore
 from waxx.config.dac_id import dac_frame
 from waxx.config.shuttler_id import shuttler_frame
@@ -118,6 +119,17 @@ class dds_frame():
         dds0.dac_device = self._dac_frame.dac_device
         dds0.double_pass = double_pass
         dds0.update_dac_bool()
+
+        # Assign the DAC_CH object.  All DDS objects carry the same type so the
+        # ARTIQ compiler sees a uniform attribute across every instance.
+        # When dac_ch_vpd >= 0 use the real DAC_CH from the frame (it is the
+        # source of truth for the initial v_pd).  Otherwise use a dummy (ch=-1)
+        # whose kernel methods are all no-ops.
+        if dac_ch_vpd >= 0:
+            dds0.dac_ch_obj = self._dac_frame.dac_by_ch(dac_ch_vpd)
+            dds0.v_pd = dds0.dac_ch_obj.v   # seed from DAC_CH, not the 5.0 default
+        else:
+            dds0.dac_ch_obj = DAC_CH(ch=-1, dac_device=self._dac_frame.dac_device)
 
         # set the frequency according to detuning if default_detuning was specified instead of default_freq
         if default_detuning != dv and default_freq == dv:
