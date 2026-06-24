@@ -701,29 +701,27 @@ class RamanBeamPair():
     @kernel
     def io_update_and_phase_update(self,
                                 t_pulse_mu,
-                                t_last_update_mu,
-                                t_io_update_delay_mu=di64):
-        dT = t_pulse_mu - t_last_update_mu
-        if t_io_update_delay_mu != di64:
-            dt_io = t_io_update_delay_mu
-        else:
-            dt_io = T_AD9910_PIPELINE_LATENCY_MU
+                                t_last_pulse_mu):
+        dT = t_pulse_mu - t_last_pulse_mu
 
-        T_PRETRIGGER_CHANGE_MU = int64(16)
+        T_PRETRIGGER_CHANGE_MU = self.p.t_io_update_pretrigger_mu
         T = T_PRETRIGGER_CHANGE_MU
 
-        at_mu(t_pulse_mu - T - dt_io)
+        T_PIPE_MU = self.p.t_ffu_dds_pipeline_latency
+        dt = self.p.t_ffu_pipeline_latency_fudge_mu
+        
+        at_mu(t_pulse_mu - T - T_PIPE_MU)
         dt0, dt1 = self.io_update()
 
         self.dds0._last_ftw
 
         spmu = self._sysclk_per_mu
 
-        self._phi0_mu += self.dds0._last_ftw * (dT - T + dt0) * spmu >> 16
-        self._phi0_mu += self.dds0._ftw * (T - dt0) * spmu >> 16
+        self._phi0_mu += self.dds0._last_ftw * (dT - T + dt0 + dt) * spmu >> 16
+        self._phi0_mu += self.dds0._ftw * (T - dt0 - dt) * spmu >> 16
         
-        self._phi1_mu += self.dds1._last_ftw * (dT - T + dt1) * spmu >> 16
-        self._phi1_mu += self.dds1._ftw * (T - dt1) * spmu >> 16
+        self._phi1_mu += self.dds1._last_ftw * (dT - T + dt1 + dt) * spmu >> 16
+        self._phi1_mu += self.dds1._ftw * (T - dt1 - dt) * spmu >> 16
         
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
