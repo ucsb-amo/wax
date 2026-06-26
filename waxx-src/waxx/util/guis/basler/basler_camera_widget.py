@@ -197,6 +197,85 @@ def _led_style(color: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Custom compact y-axis: shows ×10^N at the top of the axis and %.2f ticks
+# ---------------------------------------------------------------------------
+
+_SUPERSCRIPT_MAP = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
+
+
+def _sup(n: int) -> str:
+    """Return *n* as a string with unicode superscript digits/minus."""
+    return str(n).translate(_SUPERSCRIPT_MAP)
+
+
+class _CompactAxisItem(pg.AxisItem):
+    """Y-axis that rescales tick labels to a shared power-of-ten multiplier.
+
+    Tick values are formatted as ``%.2f`` after dividing by 10**N.  The
+    multiplier ``\u00d710\u1d4e`` is painted at the top of the axis area so no
+    horizontal space is lost to a rotated side label.
+    """
+
+    def __init__(self, orientation: str, **kwargs) -> None:
+        super().__init__(orientation, **kwargs)
+        self.enableAutoSIPrefix(False)
+        self._disp_exp: int = 0
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        if not values:
+            return []
+        scaled = [v * scale for v in values]
+        max_abs = max(abs(v) for v in scaled) if scaled else 0.0
+        if max_abs == 0.0 or not np.isfinite(max_abs):
+            return ["0.00"] * len(values)
+        exp = int(np.floor(np.log10(max_abs)))
+        self._disp_exp = exp
+        factor = 10.0 ** exp
+        return [f"{v / factor:.2f}" for v in scaled]
+
+    def paint(self, p, opt, widget):  # type: ignore[override]
+        super().paint(p, opt, widget)
+        if self._disp_exp != 0:
+            br = self.boundingRect()
+            p.save()
+            p.setPen(pg.mkPen(color=(180, 180, 180)))
+            font = p.font()
+            font.setPointSize(8)
+            p.setFont(font)
+            p.drawText(
+                pg.QtCore.QRectF(br.x(), br.y() - 2, br.width() - 4, 18),
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop),
+                f"\u00d710{_sup(self._disp_exp)}",
+            )
+            p.restore()
+
+
+class _NormAxisItem(pg.AxisItem):
+    """Right axis for normalized counts — ticks always formatted to 2 d.p.
+    Draws a small 'norm' label at the top of the axis (same position as the
+    exponent label on the left axis) instead of a rotated side label.
+    """
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        return [f"{v * scale:.2f}" for v in values]
+
+    def paint(self, p, opt, widget):  # type: ignore[override]
+        super().paint(p, opt, widget)
+        br = self.boundingRect()
+        p.save()
+        p.setPen(pg.mkPen(color=(180, 180, 180)))
+        font = p.font()
+        font.setPointSize(8)
+        p.setFont(font)
+        p.drawText(
+            pg.QtCore.QRectF(br.x() + 4, br.y() - 2, br.width() - 4, 18),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
+            "norm",
+        )
+        p.restore()
+
+
+# ---------------------------------------------------------------------------
 # Pixel-counts-over-time panel (ported from the original mot_viewer.py)
 # ---------------------------------------------------------------------------
 
@@ -210,7 +289,7 @@ class CountsPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.plot_widget = pg.PlotWidget()
+        self.plot_widget = pg.PlotWidget(axisItems={"left": _CompactAxisItem("left"), "right": _NormAxisItem("right")})
         self.plot_widget.setContentsMargins(0, 0, 0, 0)
         self.plot_widget.setLabel("bottom", "seconds ago")
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
@@ -315,6 +394,16 @@ class CountsPanel(QWidget):
     def update_plot(self) -> None:
         if not self.timestamps:
             self.main_curve.setData([], [])
+            # Still show the saved normalization reference line so the user
+            # can see where it is before any counts have been collected.
+            if self.normalize and self.norm_reference is not None:
+                self.norm_ref_line.setValue(self.norm_reference)
+                if self.show_norm_reference_line:
+                    self.norm_ref_line.show()
+                else:
+                    self.norm_ref_line.hide()
+            else:
+                self.norm_ref_line.hide()
             return
 
         current = self.timestamps[-1]
@@ -354,7 +443,6 @@ class CountsPanel(QWidget):
             if ref != 0:
                 self.vb2.setYRange(lo_v / ref, hi_v / ref, padding=0)
             self.plot_item.showAxis("right")
-            self.plot_item.getAxis("right").setLabel("Normalised")
             self.norm_ref_line.setValue(ref)
             if self.show_norm_reference_line:
                 self.norm_ref_line.show()
@@ -578,13 +666,13 @@ class BaslerCameraWidget(QFrame):
         self._saved_gain: Optional[float] = None
         self._saved_exposure: Optional[float] = None
         self._saved_trigger_mode: Optional[str] = None
+        self.current_rect: Optional[QRect] = None
         self._load_state()
 
         self.last_image: Optional[np.ndarray] = None
         self.show_rectangle: bool = True
         self.rect_start: Optional[QPoint] = None
         self.rect_end: Optional[QPoint] = None
-        self.current_rect: Optional[QRect] = None
         self.saturation_in_box_only: bool = True
         self.max_pixel_value: int = 255
 

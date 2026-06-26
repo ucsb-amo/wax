@@ -34,6 +34,7 @@ LOGGER = logging.getLogger("keysight_server")
 LOGGER.setLevel(logging.INFO)
 
 SERVER_ID = "keysight"
+_VXI11_TIMEOUT_S = 2.0  # max seconds to wait for any VXI11 round-trip
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ class _Supply:
         with self._lock:
             try:
                 instr = vxi11.Instrument(self.ip)
+                instr.timeout = _VXI11_TIMEOUT_S
                 # Configure: live inhibit pin mode.
                 instr.write("OUTP:INH:MODE LIVE")
                 self._instr = instr
@@ -92,34 +94,42 @@ class _Supply:
 
     def poll(self) -> None:
         """Read current / output / status into the cached snapshot."""
+        # Step 1: hold the lock only long enough to get (or lazily create) the
+        # instrument reference.  All VXI11 network I/O happens outside the lock
+        # so that close() (called from stop()) is never blocked behind a
+        # potentially-hanging query.
         with self._lock:
             if self._instr is None:
                 # Try to (re)connect lazily.
                 try:
                     instr = vxi11.Instrument(self.ip)
+                    instr.timeout = _VXI11_TIMEOUT_S
                     instr.write("OUTP:INH:MODE LIVE")
                     self._instr = instr
                 except Exception as exc:
                     self._update_snapshot(connected=False, error=str(exc))
                     return
             instr = self._instr
-            try:
-                status = int(instr.ask("STAT:QUES:COND?"))
-                output_on = bool(int(instr.ask("OUTP?")))
-                current_a: Optional[float]
-                if output_on and status == 0:
-                    current_a = float(instr.ask(":MEASure:CURRent:DC?"))
-                else:
-                    current_a = None
-            except Exception as exc:
-                # Drop the broken connection so the next poll reconnects.
-                try:
-                    instr.close()
-                except Exception:
-                    pass
-                self._instr = None
-                self._update_snapshot(connected=False, error=str(exc))
-                return
+        # Step 2: do all VXI11 I/O outside the lock.
+        try:
+            status = int(instr.ask("STAT:QUES:COND?"))
+            output_on = bool(int(instr.ask("OUTP?")))
+            current_a: Optional[float]
+            if output_on and status == 0:
+                current_a = float(instr.ask(":MEASure:CURRent:DC?"))
+            else:
+                current_a = None
+        except Exception as exc:
+            # Drop the broken connection so the next poll reconnects.
+            with self._lock:
+                if self._instr is instr:  # only clear if nobody replaced it
+                    try:
+                        instr.close()
+                    except Exception:
+                        pass
+                    self._instr = None
+            self._update_snapshot(connected=False, error=str(exc))
+            return
         self._update_snapshot(
             connected=True,
             output_on=output_on,
@@ -151,19 +161,22 @@ class _Supply:
 
     def _safe_write(self, cmd: str) -> dict:
         with self._lock:
-            if self._instr is None:
-                return {"ok": False, "error": "not connected"}
-            try:
-                self._instr.write(cmd)
-                return {"ok": True, "error": None}
-            except Exception as exc:
-                try:
-                    self._instr.close()
-                except Exception:
-                    pass
-                self._instr = None
-                self._update_snapshot(connected=False, error=str(exc))
-                return {"ok": False, "error": str(exc)}
+            instr = self._instr
+        if instr is None:
+            return {"ok": False, "error": "not connected"}
+        try:
+            instr.write(cmd)
+            return {"ok": True, "error": None}
+        except Exception as exc:
+            with self._lock:
+                if self._instr is instr:
+                    try:
+                        instr.close()
+                    except Exception:
+                        pass
+                    self._instr = None
+            self._update_snapshot(connected=False, error=str(exc))
+            return {"ok": False, "error": str(exc)}
 
     def _update_snapshot(self, **kwargs) -> None:
         with self._snap_lock:
