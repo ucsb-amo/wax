@@ -162,10 +162,10 @@ class SDG6000X_CH():
 
     def sweep_rpc(self,
                   frequency_end=dv,
-                  frequency_step=2.e6,
+                  frequency_step=1.e6,
                   reset=False):
         import time
-        T = 0.025
+        T = 0.1
 
         self.fetch_state()
 
