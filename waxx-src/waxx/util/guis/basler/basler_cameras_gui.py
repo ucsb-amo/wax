@@ -199,6 +199,7 @@ class BaslerCamerasMainWindow(QMainWindow):
 
         # ---- Toolbar ---------------------------------------------------
         tb = QToolBar("Controls", self)
+        tb.setObjectName("basler_controls_toolbar")
         tb.setMovable(False)
         tb.setFloatable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
