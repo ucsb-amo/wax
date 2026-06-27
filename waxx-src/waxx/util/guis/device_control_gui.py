@@ -1060,27 +1060,50 @@ class _UpdateSender(QThread):
 
 
 class _StateRequestWorker(QThread):
-    """Fetches the full device-state snapshot from the server (get_state)."""
+    """Fetches the full device-state snapshot from the server (get_state).
+
+    An existing ``MonitorClient`` may be supplied as ``initial_client`` to
+    avoid repeated service-discovery overhead.  If none is supplied (or if the
+    call fails), a fresh client is constructed so the parent can cache it for
+    subsequent requests.  The ``_rediscover`` path inside ``send_message``
+    handles server restarts transparently — if the cached client's address
+    goes stale, it self-heals after one failed attempt.  Only if all retries
+    fail is ``state_failed`` emitted to force the parent to discard the client
+    and rebuild from scratch on the next call.
+    """
 
     state_loaded = pyqtSignal(dict)   # {"version": int, "config": dict}
     state_failed = pyqtSignal()
+    # Emitted when this worker had to create a new MonitorClient so the parent
+    # can cache it for future requests.
+    client_ready = pyqtSignal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, initial_client=None, parent=None):
         super().__init__(parent)
+        self._initial_client = initial_client
 
     def run(self):
-        try:
-            client = MonitorClient(discovery_timeout=0.5)
-        except Exception:
-            self.state_failed.emit()
-            return
+        client = self._initial_client
+        created_new = False
+        if client is None:
+            try:
+                client = MonitorClient(discovery_timeout=0.5)
+                created_new = True
+            except Exception:
+                self.state_failed.emit()
+                return
         state = client.get_state()
         if state and state.get("status") == "ok":
+            if created_new:
+                # Let the parent cache this client before state_loaded fires.
+                self.client_ready.emit(client)
             self.state_loaded.emit({
                 "version": state.get("version"),
                 "config": state.get("config", {}) or {},
             })
         else:
+            # Signal failure so the parent discards the cached client and
+            # forces a fresh discovery (+ construction) on the next request.
             self.state_failed.emit()
 
 
@@ -1171,6 +1194,10 @@ class DeviceStateGUI(QMainWindow):
         # avoid clobbering an in-flight edit with an incoming broadcast).
         self._version = None
         self._pending: Dict[tuple, float] = {}
+        # Cached MonitorClient reused across state-request calls to avoid
+        # repeated service-discovery overhead.  Cleared on failure so the next
+        # request triggers a fresh discovery (handles server restarts).
+        self._state_client: "MonitorClient | None" = None
 
         # Compact layout is suppressed; always expanded (never auto-collapse).
         self._compact_mode = False
@@ -1446,7 +1473,7 @@ class DeviceStateGUI(QMainWindow):
         """
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_config_changes)
-        self.timer.start(5000)  # reconcile every 5 seconds
+        self.timer.start(1000)  # reconcile every 1 second
 
     def _setup_update_sender(self):
         """Start the background sender that pushes deltas to the server."""
@@ -1583,9 +1610,11 @@ class DeviceStateGUI(QMainWindow):
         if getattr(self, '_state_req_in_progress', False):
             return
         self._state_req_in_progress = True
-        worker = _StateRequestWorker(self)
+        worker = _StateRequestWorker(initial_client=self._state_client, parent=self)
         worker.state_loaded.connect(self._on_state_loaded)
         worker.state_failed.connect(self._on_state_failed)
+        worker.state_failed.connect(self._on_state_client_failed)
+        worker.client_ready.connect(self._on_state_client_ready)
         worker.finished.connect(lambda: setattr(self, '_state_req_in_progress', False))
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -1606,6 +1635,20 @@ class DeviceStateGUI(QMainWindow):
     def _on_state_failed(self) -> None:
         """Snapshot fetch failed — surface as a connection problem."""
         self.on_connection_failed()
+
+    def _on_state_client_ready(self, client) -> None:
+        """Cache a MonitorClient created by a state-request worker."""
+        self._state_client = client
+
+    def _on_state_client_failed(self) -> None:
+        """Discard the cached MonitorClient so the next request rebuilds it.
+
+        ``send_message`` already attempts ``_rediscover()`` internally, so
+        transient server restarts are handled transparently without reaching
+        here.  This path fires only when all retries are exhausted, meaning
+        the server is truly unreachable and the cached address is stale.
+        """
+        self._state_client = None
 
     def _device_keys(self, config: dict) -> set:
         keys = set()
