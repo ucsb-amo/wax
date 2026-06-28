@@ -395,18 +395,19 @@ class DataSaver():
         f.attrs["xvarnames"] = list(payload.get("xvarnames", []))
         f.attrs["run_complete"] = False
 
-        # Images pre-allocation
+        # Images pre-allocation is intentionally deferred to SaveWorker.
+        # Pre-allocating a large dataset here (e.g. 300 × 1024 × 1024 × 2 B ≈ 600 MB on a NAS)
+        # was the primary cause of DataHandler's wait_for_data_available timeout: the background
+        # thread held the file open for many seconds while DataHandler timed out waiting for the
+        # 'data' group to appear.  SaveWorker now creates the images/image_timestamps datasets
+        # lazily on its first write, after the file is already usable.
+        # Store shape/dtype as HDF5 attributes so the lazy path can use them if needed.
         if capture_images:
             images_shape = tuple(payload.get("images_shape", (0,)))
             images_dtype = str(payload.get("images_dtype", "uint16"))
             ts_shape = tuple(payload.get("image_timestamps_shape", (0,)))
-            if images_shape and images_shape[0] > 0:
-                data_grp.create_dataset(
-                    "images", shape=images_shape, dtype=images_dtype
-                )
-                data_grp.create_dataset(
-                    "image_timestamps", shape=ts_shape, dtype=np.float64
-                )
+            f.attrs["images_shape"] = list(images_shape)
+            f.attrs["images_dtype"] = images_dtype
 
         # DataVault pre-allocation
         for key, info in payload.get("datavault_shapes", {}).items():

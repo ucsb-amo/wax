@@ -104,11 +104,11 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                     info+=new_info
                 else:
                     new_frames,rng=self.read_multiple_images(missing_frame=missing_frame,return_rng=True)
-                for frame in new_frames:
+                for i, frame in enumerate(new_frames):
                         if isinstance(frame,np.ndarray):
                             img_timestamp = time.time()
                             # img_timestamp = 0.
-                            output_queue.put((frame,img_timestamp,nacq))
+                            output_queue.put((frame,img_timestamp,nacq+i))
                 frames+=new_frames
                 nacq+=rng[1]-rng[0]
             frames,info=trim_frames(frames,N_img,(info if return_info else None),chunks=self.get_frame_format()=="chunks")
