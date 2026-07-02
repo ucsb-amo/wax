@@ -117,6 +117,11 @@ class AtomdataVault(atomdata_base):
         If set and more than this many run-ids are passed (and ``lite`` is
         False), automatically load them ``lite`` and emit a warning. Defaults
         to 8. Pass ``None`` to disable.
+    ignore_images : bool
+        If True, camera images are not loaded/concatenated and no ROI is
+        created. Only the non-image data (params, DataVault fields,
+        scope_data, xvars) is stitched together. Image-based analysis is
+        skipped and image-derived attributes are set to ``None``.
     """
 
     def __init__(self,
@@ -127,10 +132,12 @@ class AtomdataVault(atomdata_base):
                  sort=True,
                  merge_overlap=True,
                  drop_raw_images=False,
-                 auto_lite_threshold=8):
+                 auto_lite_threshold=8,
+                 ignore_images=False):
 
         # Lightweight book-keeping expected by inherited helpers.
         self._lite = lite
+        self._ignore_images = bool(ignore_images)
         self._timing_enabled = False
         self._timing = {}
         self.server_talk = None
@@ -203,22 +210,24 @@ class AtomdataVault(atomdata_base):
                     _first_run_id = int(item.run_info.run_id)
                     # Save the ROI so subsequent int loads (and lite-dataset
                     # creation) can look it up by run_id.
-                    if _has_subsequent_int_loads or lite:
+                    if (not self._ignore_images) and (_has_subsequent_int_loads or lite):
                         item.save_roi_h5()
             elif isinstance(item, (int, np.integer)):
                 # First int load: use caller-supplied roi_id (may open GUI once).
                 # Subsequent int loads: reuse the first run's roi_id so no
                 # additional GUI opens.
                 if _first_run_id is None:
-                    ad = atomdata(int(item), roi_id=roi_id, lite=lite)
+                    ad = atomdata(int(item), roi_id=roi_id, lite=lite,
+                                  no_images=self._ignore_images)
                     _first_run_id = int(ad.run_info.run_id)
                     # Persist the ROI so subsequent int loads (and lite-dataset
                     # creation for each run) can find it by run_id.
-                    if _has_subsequent_int_loads or lite:
+                    if (not self._ignore_images) and (_has_subsequent_int_loads or lite):
                         ad.save_roi_h5()
                 else:
                     _roi = roi_id if roi_id is not None else _first_run_id
-                    ad = atomdata(int(item), roi_id=_roi, lite=lite)
+                    ad = atomdata(int(item), roi_id=_roi, lite=lite,
+                                  no_images=self._ignore_images)
                 ads.append(ad)
             else:
                 raise TypeError(
@@ -231,6 +240,7 @@ class AtomdataVault(atomdata_base):
         self._validate_inputs(
             ads, xvarname_override,
             allow_repeat_mismatch=self._merge_overlap,
+            ignore_images=self._ignore_images,
         )
 
         # 3. Unshuffle each chunk so the per-shot arrays are in xvar order on
@@ -260,7 +270,10 @@ class AtomdataVault(atomdata_base):
         self.camera_params = copy.deepcopy(first.camera_params)
         self.run_info = copy.deepcopy(first.run_info)
         self.experiment_code = getattr(first, 'experiment_code', None)
-        self._has_images = bool(getattr(first, '_has_images', True))
+        self._has_images = (
+            False if self._ignore_images
+            else bool(getattr(first, '_has_images', True))
+        )
 
         self._warn_param_mismatches(chunks)
 
@@ -338,23 +351,38 @@ class AtomdataVault(atomdata_base):
         )
         self._analysis_tags.xvars_shuffled = False
 
-        # ROI: pass only the first chunk's images for display/selection so the
-        # GUI shows a representative frame from the first run, not all runs.
-        # The resulting roix/roiy coordinates are then applied to the full
-        # concatenated od_raw during analyze_ods.
+        # ROI: reuse the first chunk's already-resolved ROI so all runs are
+        # cropped with exactly the ROI chosen for the first run (loaded from
+        # its h5 file, or selected via the GUI at load time). This guarantees
+        # a single, consistent ROI across every run without re-opening the
+        # selection GUI. The resulting roix/roiy coordinates are applied to
+        # the full concatenated od_raw during analyze_ods.
         if self._has_images:
-            roi_source = roi_id if roi_id is not None else int(first.run_info.run_id)
-            self.roi = ROI(
-                run_id=int(first.run_info.run_id),
-                roi_id=roi_source,
-                use_saved_roi=True,
-                lite=self._lite,
-                server_talk=None,
-                current_file_path=None,
-                current_saved_roi=None,
-                images=_first_chunk_images,
-                imaging_type=self.run_info.imaging_type,
-            )
+            first_roi = getattr(first, 'roi', None)
+            if first_roi is not None:
+                self.roi = copy.deepcopy(first_roi)
+                # Point the ROI at the first chunk's frame for any later GUI
+                # display (e.g. recrop) and at the first run's id.
+                self.roi._images = _first_chunk_images
+                self.roi.run_id = int(first.run_info.run_id)
+                self.roi._current_file_path = None
+                self.roi._current_saved_roi = [self.roi.roix, self.roi.roiy]
+            else:
+                roi_source = (
+                    roi_id if roi_id is not None
+                    else int(first.run_info.run_id)
+                )
+                self.roi = ROI(
+                    run_id=int(first.run_info.run_id),
+                    roi_id=roi_source,
+                    use_saved_roi=True,
+                    lite=self._lite,
+                    server_talk=None,
+                    current_file_path=None,
+                    current_saved_roi=None,
+                    images=_first_chunk_images,
+                    imaging_type=self.run_info.imaging_type,
+                )
         else:
             self.roi = None
 
@@ -384,7 +412,7 @@ class AtomdataVault(atomdata_base):
     # ------------------------------------------------------------------
     # Validation helpers
     # ------------------------------------------------------------------
-    def _validate_inputs(self, ads, xvarname_override, allow_repeat_mismatch=False):
+    def _validate_inputs(self, ads, xvarname_override, allow_repeat_mismatch=False, ignore_images=False):
         first = ads[0]
 
         if int(getattr(first, 'Nvars', 0)) != 1:
@@ -399,7 +427,7 @@ class AtomdataVault(atomdata_base):
         first_has_images = bool(getattr(first, '_has_images', True))
         first_img_shape = (
             tuple(np.asarray(first.images).shape[1:])
-            if first_has_images else None
+            if (first_has_images and not ignore_images) else None
         )
 
         repeat_counts = {int(first.run_info.run_id): first_nrep}
@@ -430,6 +458,10 @@ class AtomdataVault(atomdata_base):
                 raise ValueError(
                     f"imaging_type mismatch on run {ad.run_info.run_id}."
                 )
+            # Image presence/shape checks are irrelevant when images are
+            # ignored entirely.
+            if ignore_images:
+                continue
             ad_has_images = bool(getattr(ad, '_has_images', True))
             if ad_has_images != first_has_images:
                 raise ValueError(
@@ -1127,6 +1159,38 @@ class AtomdataVault(atomdata_base):
         return cls.from_run_range(
             start_id, stop_id, experiment_name=experiment_name, **kwargs
         )
+
+    # ------------------------------------------------------------------
+    # ROI / recrop
+    # ------------------------------------------------------------------
+    def recrop(self, roi_id=None, use_saved=False):
+        """Select a new ROI and re-crop every concatenated run at once.
+
+        Because the vault stores the concatenated ``od_raw`` for all runs on
+        a single leading axis, cropping with one ROI naturally re-crops every
+        run identically.
+
+        Args:
+            roi_id (None, int, or str): See ``atomdata.recrop``. If None,
+                prompts the ROI selection GUI (unless a saved ROI is used).
+            use_saved (bool): If False (default), ignores any saved ROI and
+                forces selection of a new one.
+        """
+        if not getattr(self, '_has_images', True):
+            print("no images in dataset (ignore_images), no roi to crop")
+            return
+        if self._lite:
+            raise NotImplementedError(
+                "recrop is not supported on a lite AtomdataVault; the lite "
+                "runs are already cropped. Build the vault from full "
+                "(non-lite) runs to recrop all runs."
+            )
+        # od_raw is the concatenation of every run's raw ODs; selecting one
+        # ROI here and re-running analyze_ods re-crops all runs together.
+        od_flat = self.od_raw.reshape(-1, *self.od_raw.shape[-2:])
+        self.roi.load_roi(roi_id, use_saved, display_ods=od_flat)
+        self.analyze_ods()
+        self._refresh_repeat_statistics()
 
     # ------------------------------------------------------------------
     # Unsupported operations
