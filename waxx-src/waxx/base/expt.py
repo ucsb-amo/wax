@@ -71,7 +71,7 @@ class Expt(Scanner, Dealer, Scribe):
         self._shot_complete_count = 0
         self._N_shots_total = 1
 
-    def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
+    def finish_prepare_wax(self,shuffle=True,N_repeats=[],shuffle_mode='nested'):
         """
         To be called at the end of prepare. 
         
@@ -81,6 +81,13 @@ class Expt(Scanner, Dealer, Scribe):
         Shuffles xvars if specified (defaults to True). Computes the number of
         images to be taken from the imaging method and the length of the xvar
         arrays.
+
+        ``shuffle_mode`` selects how shots are ordered when ``shuffle=True``:
+          'nested' (default) — legacy per-length shuffle with nested-loop
+                               stepping.
+          'global'           — one random permutation over all grid cells
+                               (true randomization). xvar values stay natural
+                               and self.execution_order records the shot order.
 
         Computes derived parameters within ExptParams.
 
@@ -93,7 +100,7 @@ class Expt(Scanner, Dealer, Scribe):
         if hasattr(self,'monitor'):
             self.monitor.init_monitor()
 
-        self.init_xvars(shuffle,N_repeats)
+        self.init_xvars(shuffle,N_repeats,shuffle_mode=shuffle_mode)
 
         self.data.init()
 
@@ -262,6 +269,9 @@ class Expt(Scanner, Dealer, Scribe):
             'xvardims': list(self.xvardims),
             'sort_idx': [np.array(s).tolist() for s in self.sort_idx] if self.sort_idx else [],
             'sort_N': [int(n) for n in self.sort_N] if self.sort_N else [],
+            'shuffle_mode': str(getattr(self, 'shuffle_mode', 'nested')),
+            'execution_order': np.asarray(self.execution_order).tolist() if len(np.atleast_1d(self.execution_order)) else [],
+            'grid_shape': list(self.grid_shape) if getattr(self, 'grid_shape', None) else [],
             'images_shape': images_shape,
             'images_dtype': images_dtype,
             'image_timestamps_shape': ts_shape,
@@ -329,6 +339,10 @@ class Expt(Scanner, Dealer, Scribe):
             'datavault': dv,
             'sort_idx': [np.array(s).tolist() for s in self.sort_idx] if self.sort_idx else [],
             'sort_N': [int(n) for n in self.sort_N] if self.sort_N else [],
+            'shuffle_mode': str(getattr(self, 'shuffle_mode', 'nested')),
+            'execution_order': np.asarray(self.execution_order).tolist() if len(np.atleast_1d(self.execution_order)) else [],
+            'grid_shape': list(self.grid_shape) if getattr(self, 'grid_shape', None) else [],
+            'N_shots_completed': int(getattr(self, '_shot_complete_count', 0)),
             'xvardims': list(self.xvardims),
             'N_shots_with_repeats': int(getattr(self.params, 'N_shots_with_repeats', 1)),
             'N_pwa_per_shot': int(getattr(self.params, 'N_pwa_per_shot', 1)),

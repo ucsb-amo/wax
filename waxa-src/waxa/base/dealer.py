@@ -5,6 +5,17 @@ from waxa.config.data_vault import DataContainer, DataVault
 if TYPE_CHECKING:
     from waxx.config.data_vault import DataContainer, DataVault  # noqa: F811
 
+# Selects how shots are ordered during a scan.
+#   'nested' — legacy behaviour: xvar.values are permuted per-length and shots
+#              step as nested for-loops (last xvar innermost). sort_idx/sort_N
+#              record the per-length permutations for later unshuffling.
+#   'global' — true-random: xvar.values stay in natural order and one single
+#              permutation (execution_order) over all grid cells decides the
+#              order shots are taken in. See generate_global_order().
+SHUFFLE_MODE_NESTED = 'nested'
+SHUFFLE_MODE_GLOBAL = 'global'
+
+
 class Dealer():
     def __init__(self):
         self.sort_idx = []
@@ -16,6 +27,14 @@ class Dealer():
         self.N_xvars = 0
         self.images = np.array([])
         self.image_timestamps = np.array([])
+
+        # Global (true-random) ordering state. Populated by
+        # generate_global_order() when shuffle_mode == 'global'; left empty for
+        # the nested path so the presence of execution_order unambiguously
+        # signals which ordering was used.
+        self.shuffle_mode = SHUFFLE_MODE_NESTED
+        self.execution_order = np.array([], dtype=int)
+        self.grid_shape = []
 
         self.data = DataVault()
 
@@ -124,6 +143,73 @@ class Dealer():
             if elem[0] not in self.sort_N:
                 self.sort_N.append(elem[0])
                 self.sort_idx.append(elem[1])
+
+    def generate_global_order(self, sort_preshuffle=True):
+        """Generate a single random permutation over ALL grid cells (true
+        randomization), instead of the nested per-axis shuffle.
+
+        Unlike shuffle_xvars(), this leaves every xvar.values array in its
+        NATURAL (sorted) order. The randomness lives entirely in
+        self.execution_order: a permutation of range(prod(grid_shape)), where
+        grid_shape = [len(xvar.values) for xvar in scan_xvars] (after repeats).
+
+        Shot k of the scan is taken at grid index
+        np.unravel_index(execution_order[k], grid_shape). Because the scan sets
+        each xvar.counter to that grid index, the DataVault hypercube and params
+        are written in natural (grid) order on the host — no per-axis unshuffle
+        is ever needed for them. Only arrays stored linearly in execution order
+        (images, timestamps, scope traces) must be scattered back to grid order
+        at save time (see scatter_exec_axis_to_grid).
+
+        Call this once, in place of shuffle_xvars(), after repeat_xvars().
+        """
+        if sort_preshuffle:
+            for this_xvar in self.scan_xvars:
+                this_xvar.values = np.sort(this_xvar.values)
+                this_xvar.sort_idx = []
+
+        self.shuffle_mode = SHUFFLE_MODE_GLOBAL
+        self.grid_shape = [xvar.values.shape[0] for xvar in self.scan_xvars]
+        N_shots = int(np.prod(self.grid_shape)) if self.grid_shape else 1
+
+        rng = np.random.default_rng()
+        self.execution_order = rng.permutation(N_shots).astype(int)
+
+        # The per-length permutation machinery is unused in global mode; keep it
+        # empty so the ordering method is unambiguous everywhere downstream.
+        self.sort_idx = []
+        self.sort_N = []
+
+    def _set_counters_from_step(self, k):
+        """Set every xvar.counter to the grid index of the k-th shot in the
+        global (true-random) order.
+
+        Host-side (RPC) helper for the scan loop. In nested mode the counters
+        are advanced by step_scan(); in global mode they are set here from
+        execution_order.
+        """
+        k = int(k)
+        flat = int(self.execution_order[k])
+        midx = np.unravel_index(flat, tuple(self.grid_shape))
+        for xvar in self.scan_xvars:
+            xvar.counter = int(np.atleast_1d(midx)[xvar.position])
+
+    def scatter_exec_axis_to_grid(self, arr, axis=0):
+        """Reorder a linearly-stored (execution-order) array into natural grid
+        order along the given axis.
+
+        The array's `axis` must have length prod(grid_shape) (= N_shots). Shot k
+        (stored at index k) belongs at grid-flat index execution_order[k], so
+        the inverse permutation argsort(execution_order) maps grid index -> the
+        stored execution index. Used at save time for images/timestamps/scope.
+        """
+        inv = np.argsort(self.execution_order)
+        return np.take(arr, inv, axis=axis)
+
+    def gather_grid_axis_to_exec(self, arr, axis=0):
+        """Inverse of scatter_exec_axis_to_grid: reorder a grid-ordered array
+        back into execution (time) order along the given axis."""
+        return np.take(arr, self.execution_order, axis=axis)
 
     def unscramble_images(self,reshuffle=False):
 

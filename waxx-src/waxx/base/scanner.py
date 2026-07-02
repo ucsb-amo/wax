@@ -2,6 +2,7 @@ from artiq.experiment import *
 import numpy as np
 
 from waxa.base import xvar
+from waxa.base.dealer import SHUFFLE_MODE_NESTED, SHUFFLE_MODE_GLOBAL
 from waxa.data import RunInfo
 from waxa.dummy.camera_params import CameraParams
 
@@ -29,7 +30,15 @@ class Scanner():
         self.xvarnames = []
         self.scan_xvars = []
         self.Nvars = 0
-        
+
+        # Scan ordering. shuffle_mode is set authoritatively by init_xvars;
+        # _scan_step is the linear shot index used by the global order.
+        # execution_order / grid_shape are populated by generate_global_order().
+        self.shuffle_mode = SHUFFLE_MODE_NESTED
+        self._scan_step = 0
+        self.execution_order = np.array([], dtype=int)
+        self.grid_shape = []
+
         self.update_nvars()
         self.compute_new_derived = nothing
 
@@ -148,6 +157,11 @@ class Scanner():
         """
 
         self.pre_scan()
+
+        # Reset scan bookkeeping and seed the counters for the first shot.
+        # In global mode this sets the counters to execution_order[0]; in nested
+        # mode it zeroes them (nested stepping advances them at the loop bottom).
+        self._begin_scan()
 
         scanning = True
         aborted_bool = False
@@ -337,9 +351,21 @@ class Scanner():
         '''
         Advances the counters of the xvars to the next step in the scan.
 
-        Advances counters as if the xvars were looped over in nested for loops,
-        with the last xvar being the innermost loop.
+        In nested mode, advances counters as if the xvars were looped over in
+        nested for loops, with the last xvar being the innermost loop.
+
+        In global (true-random) mode, advances a single linear shot index and
+        sets the counters to the grid index of the next shot in
+        self.execution_order. Returns False once all shots have been taken.
         '''
+        if self.shuffle_mode == SHUFFLE_MODE_GLOBAL:
+            self._scan_step += 1
+            N_shots = int(np.prod(self.grid_shape)) if self.grid_shape else 1
+            if self._scan_step >= N_shots:
+                return False
+            self._set_counters_from_step(self._scan_step)
+            return True
+
         out = True
         xvars = list(reversed(self.scan_xvars))
         last_xvar_idx = self.Nvars - 1
@@ -354,6 +380,21 @@ class Scanner():
             else:
                 xvars[idx].counter += 1
         return out
+
+    def _begin_scan(self):
+        """Host-side (RPC) reset run at the start of scan().
+
+        Zeroes the linear step index and every xvar counter, then — in global
+        mode — seeds the counters with the grid index of the first shot
+        (execution_order[0]). This keeps a re-run of scan() deterministic and
+        makes the first-shot counters correct before update_params_from_xvars()
+        reads them.
+        """
+        self._scan_step = 0
+        for xvar in self.scan_xvars:
+            xvar.counter = 0
+        if self.shuffle_mode == SHUFFLE_MODE_GLOBAL and len(self.execution_order):
+            self._set_counters_from_step(0)
 
     def cleanup_scanned(self):
         """
@@ -379,7 +420,7 @@ class Scanner():
         # dummy, overloaded by kexp.image.cleanup_image_count
         pass
 
-    def init_xvars(self, shuffle=True, N_repeats=[]):
+    def init_xvars(self, shuffle=True, N_repeats=[], shuffle_mode=SHUFFLE_MODE_NESTED):
         from waxa import img_types
         if self.run_info.imaging_type == img_types.ABSORPTION:
             if self.params.N_pwa_per_shot > 1:
@@ -394,10 +435,19 @@ class Scanner():
         self.plug_in_xvars()
 
         self.repeat_xvars(N_repeats=N_repeats)
-        
-        if shuffle:
-            self.shuffle_xvars()
-        
+
+        # Select the ordering. 'global' takes shots in one random permutation of
+        # all grid cells (values stay natural); 'nested' uses the legacy
+        # per-length shuffle with nested-loop stepping. shuffle=False leaves the
+        # natural nested order.
+        if shuffle and shuffle_mode == SHUFFLE_MODE_GLOBAL:
+            self.shuffle_mode = SHUFFLE_MODE_GLOBAL
+            self.generate_global_order()
+        else:
+            self.shuffle_mode = SHUFFLE_MODE_NESTED
+            if shuffle:
+                self.shuffle_xvars()
+
         self.params.N_img = self.get_N_img()
         self.prepare_image_array()
 

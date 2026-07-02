@@ -47,7 +47,24 @@ class DataSaver():
                 f = h5py.File(fpath,'r+')
             
                     
-            if expt.sort_idx:
+            if getattr(expt, 'shuffle_mode', 'nested') == 'global' and len(np.atleast_1d(getattr(expt, 'execution_order', []))):
+                # Global (true-random) order: images/timestamps were acquired
+                # linearly in execution order. Scatter them to grid order along
+                # the shot axis. The DataVault hypercube and params were written
+                # at their true grid index during the run, so they are left as-is
+                # (see _save_data_vault, which no-ops when sort_idx is empty).
+                images = np.array(f['data']['images'])
+                timestamps = np.array(f['data']['image_timestamps'])
+                Nps = int(expt.params.N_pwa_per_shot)
+                N_shots = int(expt.params.N_shots_with_repeats)
+                per_shot = Nps + 2
+                inv = np.argsort(np.asarray(expt.execution_order, dtype=int))
+                img_shape = images.shape[1:]
+                images = images.reshape(N_shots, per_shot, *img_shape)[inv].reshape((-1,) + img_shape)
+                timestamps = timestamps.reshape(N_shots, per_shot)[inv].reshape(-1)
+                f['data']['images'][...] = images
+                f['data']['image_timestamps'][...] = timestamps
+            elif expt.sort_idx:
                 # these were read in by liveOD, so we replace the expt empty arrays
                 expt.images = np.array(f['data']['images'])
                 expt.image_timestamps = np.array(f['data']['image_timestamps'])
@@ -121,7 +138,16 @@ class DataSaver():
             self.pad_sort_idx(expt)
             data.create_dataset('sort_idx',data=expt.sort_idx)
             data.create_dataset('sort_N',data=expt.sort_N)
-        
+
+        # Global (true-random) ordering metadata.
+        f.attrs['shuffle_mode'] = str(getattr(expt, 'shuffle_mode', 'nested'))
+        if len(np.atleast_1d(getattr(expt, 'execution_order', []))):
+            data.create_dataset('execution_order',
+                                data=np.asarray(expt.execution_order, dtype=int))
+        if getattr(expt, 'grid_shape', None):
+            data.create_dataset('grid_shape',
+                                data=np.asarray(expt.grid_shape, dtype=int))
+
         # store run info as attrs
         self._class_attr_to_attr(f,expt.run_info)
         # also store run info as dataset
@@ -394,6 +420,8 @@ class DataSaver():
         f.attrs["has_images"] = capture_images
         f.attrs["xvarnames"] = list(payload.get("xvarnames", []))
         f.attrs["run_complete"] = False
+        # Record the ordering scheme so the loader/saver are unambiguous.
+        f.attrs["shuffle_mode"] = str(payload.get("shuffle_mode", "nested"))
 
         # Images pre-allocation is intentionally deferred to SaveWorker.
         # Pre-allocating a large dataset here (e.g. 300 × 1024 × 1024 × 2 B ≈ 600 MB on a NAS)
@@ -430,6 +458,16 @@ class DataSaver():
                 padded[i, : len(s)] = s
             data_grp.create_dataset("sort_idx", data=padded)
             data_grp.create_dataset("sort_N", data=np.array(sort_N_raw))
+
+        # Global (true-random) order metadata. Stored so the end-of-run save can
+        # scatter linearly-acquired arrays back to grid order, and so the loader
+        # can reconstruct partial (aborted) runs from the images already written.
+        execution_order = payload.get("execution_order", [])
+        grid_shape = payload.get("grid_shape", [])
+        if execution_order:
+            data_grp.create_dataset("execution_order", data=np.asarray(execution_order, dtype=int))
+        if grid_shape:
+            data_grp.create_dataset("grid_shape", data=np.asarray(grid_shape, dtype=int))
 
         # run_info group + attrs
         self._run_info_proxy_to_h5(f, ri)
@@ -473,19 +511,40 @@ class DataSaver():
         capture_images = bool(payload.get("capture_images", False))
         expt_filepath = str(payload.get("expt_filepath", ""))
 
+        # Global (true-random) ordering. When active, images/timestamps/scope
+        # were acquired LINEARLY in execution order and must be scattered back
+        # into grid order here; the DataVault hypercube and params were already
+        # written at their true grid index during the run, so they need no
+        # reordering. sort_idx_raw is empty in this mode.
+        shuffle_mode = str(payload.get("shuffle_mode", "nested"))
+        is_global = shuffle_mode == "global"
+        execution_order = np.asarray(payload.get("execution_order", []), dtype=int)
+        grid_shape = list(payload.get("grid_shape", []))
+
         # filepath is absolute; do not os.chdir (process-global, races with the
         # file-creation background thread).
         with h5py.File(filepath, "r+") as f:
-            # --- unshuffle images if the run was shuffled ---
-            if capture_images and sort_idx_raw:
+            # --- unshuffle / scatter images if the run was ordered ---
+            if capture_images:
                 if "images" in f["data"] and f["data"]["images"].size > 0:
                     images = f["data"]["images"][()]
                     timestamps = f["data"]["image_timestamps"][()]
-                    images_ush, timestamps_ush = self._unshuffle_images_from_payload(
-                        images, timestamps, payload
-                    )
-                    f["data"]["images"][...] = images_ush
-                    f["data"]["image_timestamps"][...] = timestamps_ush
+                    if is_global and execution_order.size:
+                        images_ush, timestamps_ush = self._scatter_images_global(
+                            images, timestamps, execution_order, payload
+                        )
+                        f["data"]["images"][...] = images_ush
+                        f["data"]["image_timestamps"][...] = timestamps_ush
+                    elif sort_idx_raw:
+                        images_ush, timestamps_ush = self._unshuffle_images_from_payload(
+                            images, timestamps, payload
+                        )
+                        f["data"]["images"][...] = images_ush
+                        f["data"]["image_timestamps"][...] = timestamps_ush
+
+            # Persist ordering metadata (idempotent; create-or-overwrite).
+            self._write_order_metadata(f, shuffle_mode, execution_order, grid_shape,
+                                       int(payload.get("N_shots_completed", 0)))
 
             # --- DataVault ---
             n_xvars = len(payload.get("xvardims", []))
@@ -512,7 +571,10 @@ class DataSaver():
                         f["data"][key][...] = this_data
 
             # --- scope data ---
-            self._save_scope_data_from_payload(f, payload, sort_idx_raw, sort_N_raw)
+            self._save_scope_data_from_payload(
+                f, payload, sort_idx_raw, sort_N_raw,
+                is_global=is_global, execution_order=execution_order,
+            )
 
             # --- final params (overwrite initial snapshot) ---
             # Unshuffle all array-valued params before writing, mirroring
@@ -558,12 +620,17 @@ class DataSaver():
             if shot_timestamps:
                 _ts = np.array(shot_timestamps, dtype=np.float64)
                 xvardims = list(payload.get("xvardims", []))
-                if xvardims and int(np.prod(xvardims)) == len(_ts):
-                    _ts = _ts.reshape(xvardims)
-                if sort_idx_raw:
-                    _ts = self._unshuffle_single_array(
-                        _ts, sort_idx_raw, sort_N_raw, exclude_dims=0
-                    )
+                if is_global and execution_order.size and int(np.prod(grid_shape or xvardims)) == len(_ts):
+                    # _ts is in execution (arrival) order; scatter to grid order.
+                    inv = np.argsort(execution_order)
+                    _ts = _ts[inv].reshape(grid_shape or xvardims)
+                else:
+                    if xvardims and int(np.prod(xvardims)) == len(_ts):
+                        _ts = _ts.reshape(xvardims)
+                    if sort_idx_raw:
+                        _ts = self._unshuffle_single_array(
+                            _ts, sort_idx_raw, sort_N_raw, exclude_dims=0
+                        )
                 grp = f["data"]
                 if "timestamp_shot_end" in grp:
                     del grp["timestamp_shot_end"]
@@ -711,10 +778,21 @@ class DataSaver():
         payload: dict,
         sort_idx_raw: list,
         sort_N_raw: list,
+        is_global: bool = False,
+        execution_order: np.ndarray = None,
     ) -> None:
-        """Save scope data from END_RUN payload into an open HDF5 file."""
+        """Save scope data from END_RUN payload into an open HDF5 file.
+
+        ``data`` arrives shaped (*grid_shape, Nch, 2, Npts) in acquisition
+        (execution) order along its leading grid axes. In nested mode we
+        per-axis unshuffle; in global mode we scatter the flattened leading
+        axes back to grid order via execution_order.
+        """
         if not payload.get("scope_data_taken", False):
             return
+        execution_order = np.asarray(execution_order if execution_order is not None else [], dtype=int)
+        grid_shape = list(payload.get("grid_shape", []))
+        n_xvars = len(payload.get("xvardims", []))
         scope_data_grp = f["data"].create_group("scope_data")
         for scope_info in payload.get("scope_data", []):
             label = str(scope_info["label"])
@@ -722,7 +800,9 @@ class DataSaver():
             if data.ndim < 3 or data.size == 0:
                 print(f"[DataSaver] WARNING: skipping scope '{label}' — data has unexpected shape {data.shape}")
                 continue
-            if sort_idx_raw:
+            if is_global and execution_order.size:
+                data = self._scatter_leading_axes_global(data, execution_order, n_xvars)
+            elif sort_idx_raw:
                 data = self._unshuffle_single_array(
                     data, sort_idx_raw, sort_N_raw, exclude_dims=3
                 )
@@ -732,3 +812,70 @@ class DataSaver():
             v = np.take(data, 1, axis=-2)
             this_scope.create_dataset("t", data=t, compression='gzip', compression_opts=4)
             this_scope.create_dataset("v", data=v, compression='gzip', compression_opts=4)
+
+    # ------------------------------------------------------------------
+    # Global (true-random) ordering helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_order_metadata(f, shuffle_mode, execution_order, grid_shape, n_shots_completed):
+        """Persist ordering metadata into an open HDF5 file (create-or-replace)."""
+        f.attrs["shuffle_mode"] = str(shuffle_mode)
+        f.attrs["N_shots_completed"] = int(n_shots_completed)
+        grp = f["data"]
+        execution_order = np.asarray(execution_order, dtype=int)
+        if execution_order.size:
+            if "execution_order" in grp:
+                del grp["execution_order"]
+            grp.create_dataset("execution_order", data=execution_order)
+        if grid_shape is not None and len(grid_shape):
+            gs = np.asarray(grid_shape, dtype=int)
+            if "grid_shape" in grp:
+                del grp["grid_shape"]
+            grp.create_dataset("grid_shape", data=gs)
+
+    @staticmethod
+    def _scatter_leading_axes_global(arr, execution_order, n_leading):
+        """Scatter an array whose first ``n_leading`` axes are grid axes stored
+        in execution order back into natural grid order.
+
+        The leading axes are flattened to a single length-N_shots axis,
+        reordered by argsort(execution_order), then restored.
+        """
+        arr = np.asarray(arr)
+        grid_shape = arr.shape[:n_leading]
+        trailing = arr.shape[n_leading:]
+        n_shots = int(np.prod(grid_shape)) if grid_shape else arr.shape[0]
+        flat = arr.reshape((n_shots,) + trailing)
+        inv = np.argsort(execution_order)
+        flat = flat[inv]
+        return flat.reshape(grid_shape + trailing)
+
+    @classmethod
+    def _scatter_images_global(cls, images, image_timestamps, execution_order, payload):
+        """Scatter linearly-acquired images/timestamps (execution order) back
+        into natural (grid) shot order.
+
+        Images arrive as (N_img, H, W) with N_img = N_shots*(Nps+2), taken in
+        execution order. Reshape to (N_shots, Nps+2, ...), scatter the shot axis
+        by argsort(execution_order), and flatten back. Far simpler than the
+        per-axis nested unshuffle because a single permutation defines the
+        entire ordering.
+        """
+        execution_order = np.asarray(execution_order, dtype=int)
+        Nps = int(payload["N_pwa_per_shot"])
+        N_shots = int(payload["N_shots_with_repeats"])
+        per_shot = Nps + 2
+        inv = np.argsort(execution_order)
+
+        img_shape = images.shape[1:]
+        N_img = images.shape[0]
+        imgs = images.reshape(N_shots, per_shot, *img_shape)
+        imgs = imgs[inv]
+        images_out = imgs.reshape((N_img,) + img_shape)
+
+        ts = image_timestamps.reshape(N_shots, per_shot)
+        ts = ts[inv]
+        ts_out = ts.reshape(N_img)
+
+        return images_out, ts_out

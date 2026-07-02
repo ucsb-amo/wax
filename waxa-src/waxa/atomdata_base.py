@@ -398,6 +398,15 @@ class atomdata_base():
         self.camera_params = CameraParams()
         self.run_info = RunInfo()
 
+        # Scan ordering, read from the data file in _load_data. 'nested' is the
+        # legacy per-axis shuffle; 'global' is the true-random single-permutation
+        # order recorded in execution_order over grid_shape.
+        self.shuffle_mode = 'nested'
+        self.execution_order = np.array([], dtype=int)
+        self.grid_shape = []
+        self._run_complete = True
+        self._n_shots_completed = None
+
         self.avg = None
         self.std = None
         self.sem = None
@@ -707,6 +716,23 @@ class atomdata_base():
     ### Analysis
 
     def _initial_analysis(self,transpose_idx,avg_repeats):
+        if not getattr(self, '_has_images', True):
+            # No camera images available (e.g. run captured no images, or
+            # images were intentionally ignored); skip all image-based
+            # analysis and set image-derived attrs to None.
+            self.img_atoms = None
+            self.img_light = None
+            self.img_dark  = None
+            self.od_raw    = None
+            self.od        = None
+            self.sum_od_x  = None
+            self.sum_od_y  = None
+            self.integrated_od = None
+            self.atom_number   = None
+            self.cloudfit_x    = None
+            self.cloudfit_y    = None
+            self._refresh_repeat_statistics()
+            return
         t0 = time.perf_counter()
 
         t_stage = time.perf_counter()
@@ -767,6 +793,8 @@ class atomdata_base():
             )
 
     def analyze(self):
+        if not getattr(self, '_has_images', True):
+            return
         t0 = time.perf_counter()
 
         t_stage = time.perf_counter()
@@ -1177,6 +1205,14 @@ class atomdata_base():
         ad._data_file_path = self._data_file_path
         ad._saved_roi_from_file = self._saved_roi_from_file
         ad._has_images = getattr(self, '_has_images', True)
+
+        # Ordering metadata: preserve the mode, but the slice changes the grid
+        # so the original execution_order no longer maps onto it — clear it.
+        ad.shuffle_mode = getattr(self, 'shuffle_mode', 'nested')
+        ad.execution_order = np.array([], dtype=int)
+        ad.grid_shape = []
+        ad._run_complete = getattr(self, '_run_complete', True)
+        ad._n_shots_completed = getattr(self, '_n_shots_completed', None)
 
         for attr in (
             'experiment_code', 'atom_cross_section',
@@ -1879,6 +1915,15 @@ class atomdata_base():
         self.xvars = self._unpack_xvars()
 
     def reshuffle(self):
+        if self.shuffle_mode == 'global':
+            raise NotImplementedError(
+                "reshuffle() is not defined for global (true-random) runs. The "
+                "shot order is a single permutation over all grid cells "
+                "(execution_order), which does not map onto a per-axis "
+                "hypercube reordering. The loaded data is already in natural "
+                "grid order. Use ad.execution_order / ad.grid_shape to inspect "
+                "the acquisition order directly."
+            )
         if self._analysis_tags.repeats_reassigned:
             raise ValueError("Cannot reshuffle after repeats have been reassigned.")
         if self._analysis_tags.xvars_shuffled == False:
@@ -1892,6 +1937,11 @@ class atomdata_base():
             print("Data is already in shuffled order.")
 
     def unshuffle(self,reanalyze=True):
+        if self.shuffle_mode == 'global':
+            # Global runs are saved and loaded in natural grid order already.
+            print("Global (true-random) runs are loaded in natural grid order; "
+                  "nothing to unshuffle.")
+            return
         if self._analysis_tags.xvars_shuffled == True:
             self._shuff(reshuffle_bool=False)
             if reanalyze:
@@ -1926,6 +1976,52 @@ class atomdata_base():
             st_dir = os.path.dirname(st_dir)
         return st_dir
 
+    @staticmethod
+    def _attr_to_str(val):
+        """Coerce an HDF5 attribute (bytes / ndarray / str) to a plain str."""
+        if isinstance(val, bytes):
+            return val.decode('utf-8', errors='replace')
+        if isinstance(val, np.ndarray):
+            val = val.item() if val.shape == () else val.tolist()
+            if isinstance(val, bytes):
+                return val.decode('utf-8', errors='replace')
+        return str(val)
+
+    def _reconstruct_partial_global(self, images, image_timestamps):
+        """Scatter the images of an INCOMPLETE global-order run into grid order.
+
+        An aborted run's HDF5 was never processed by END_RUN, so its images are
+        still stored LINEARLY in execution order and only the first
+        ``k`` shots are present. This places those shots at their true grid
+        cells (execution_order[i]) and zero-fills the shots that were never
+        taken, yielding a full grid-ordered stack the normal analysis path can
+        consume. Records the completed-shot count on self._n_shots_completed.
+        """
+        per_shot = int(self.params.N_pwa_per_shot) + 2
+        grid_shape = tuple(int(x) for x in self.grid_shape)
+        N_shots = int(np.prod(grid_shape)) if grid_shape else 0
+        if N_shots == 0 or per_shot == 0 or images.size == 0:
+            return images, image_timestamps
+
+        img_shape = images.shape[1:]
+        k = images.shape[0] // per_shot
+        k = int(min(k, N_shots, self.execution_order.size))
+
+        full = np.zeros((N_shots, per_shot) + img_shape, dtype=images.dtype)
+        full_ts = np.zeros((N_shots, per_shot), dtype=image_timestamps.dtype)
+        imgs = images[: k * per_shot].reshape(k, per_shot, *img_shape)
+        ts = image_timestamps[: k * per_shot].reshape(k, per_shot)
+        for i in range(k):
+            g = int(self.execution_order[i])
+            full[g] = imgs[i]
+            full_ts[g] = ts[i]
+
+        self._n_shots_completed = k
+        print(f"[atomdata] partial global run: reconstructed {k}/{N_shots} shots "
+              f"into grid order (remaining shots zero-filled).")
+        return (full.reshape((N_shots * per_shot,) + img_shape),
+                full_ts.reshape(N_shots * per_shot))
+
     def _init_dealer(self) -> Dealer:
         dealer = Dealer()
         dealer.params = self.params
@@ -1934,6 +2030,10 @@ class atomdata_base():
         dealer.image_timestamps = self.image_timestamps
         dealer.sort_idx = self.sort_idx
         dealer.sort_N = self.sort_N
+        # Carry the global-order state so the dealer's scatter helpers work.
+        dealer.shuffle_mode = getattr(self, 'shuffle_mode', 'nested')
+        dealer.execution_order = np.asarray(getattr(self, 'execution_order', []), dtype=int)
+        dealer.grid_shape = list(getattr(self, 'grid_shape', []))
         # reconstruct the xvar objects
         for idx in range(len(self.xvarnames)):
             this_xvar = xvar(self.xvarnames[idx],
@@ -2046,9 +2146,34 @@ class atomdata_base():
             self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
             if no_images:
                 self._has_images = False
+
+            # --- scan ordering metadata ---
+            self.shuffle_mode = self._attr_to_str(f.attrs.get('shuffle_mode', 'nested'))
+            self._run_complete = bool(f.attrs.get('run_complete', True))
+            _nsc = f.attrs.get('N_shots_completed', None)
+            self._n_shots_completed = int(_nsc) if _nsc is not None else None
+            _data_grp_keys = list(f['data'].keys())
+            if 'execution_order' in _data_grp_keys:
+                self.execution_order = np.asarray(f['data']['execution_order'][()], dtype=int)
+            else:
+                self.execution_order = np.array([], dtype=int)
+            if 'grid_shape' in _data_grp_keys:
+                self.grid_shape = list(np.asarray(f['data']['grid_shape'][()], dtype=int))
+            else:
+                self.grid_shape = []
+
             if self._has_images:
                 self.images = f['data']['images'][()]
                 self.image_timestamps = f['data']['image_timestamps'][()]
+                # Epoch reconstruction: an incomplete global run has images
+                # stored LINEARLY in execution order (END_RUN never scattered
+                # them). Scatter the completed shots into their true grid cells
+                # and zero-fill the rest so downstream analysis sees grid order.
+                if (self.shuffle_mode == 'global' and not self._run_complete
+                        and self.execution_order.size):
+                    self.images, self.image_timestamps = self._reconstruct_partial_global(
+                        self.images, self.image_timestamps
+                    )
             else:
                 self.images = np.array([])
                 self.image_timestamps = np.array([])
@@ -2068,7 +2193,7 @@ class atomdata_base():
 
             t_stage = time.perf_counter()
             all_keys = list(f['data'].keys())
-            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data', 'timestamp_shot_end']]
+            filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data', 'timestamp_shot_end', 'execution_order', 'grid_shape']]
 
             for k in filtered_keys:
                 data_k = f['data'][k][()]
