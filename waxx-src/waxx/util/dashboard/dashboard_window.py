@@ -660,6 +660,17 @@ class DashboardMainWindow(QMainWindow):
                 "state_hex": state,
             }
             path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            # Persist to QSettings so the saved layout is restored on next open.
+            geom_ba = QByteArray(bytes.fromhex(geom))
+            state_ba = QByteArray(bytes.fromhex(state))
+            self._settings.setValue(self._layout_key("geometry"), geom_ba)
+            self._settings.setValue(self._layout_key("state"), state_ba)
+            # Also set as the "snap to default" target.
+            self._last_loaded_layout = {
+                "geometry": geom_ba,
+                "state": state_ba,
+                "page_states": {},
+            }
             self.statusBar().showMessage(f"Layout saved to {path}", 5000)
         except Exception as exc:
             _LOG.exception("Save layout failed")
