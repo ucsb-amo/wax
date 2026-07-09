@@ -292,6 +292,7 @@ class DDSWidget(DeviceWidget):
         self.has_unsaved_changes = False
         self.instant_apply = False
         self.device_label = None  # Will store reference to label for tooltip update
+        self._force_update_pending = False
         # Store previous values for undo functionality
         self.prev_freq = None
         self.prev_freq_unit = None
@@ -497,6 +498,7 @@ class DDSWidget(DeviceWidget):
                 self.vpd_spinbox.setValue(dds.v_pd)
                 # Stage the change: show "undo" and require Enter to confirm,
                 # even if a value happens to equal the current one.
+                self._force_update_pending = True
                 self.has_unsaved_changes = True
                 self.update_default_button_state()
                 self.freq_spinbox.setFocus()
@@ -657,7 +659,11 @@ class DDSWidget(DeviceWidget):
 
         # Update sw state
         config["sw_state"] = int(self.state_button.isChecked())
-            
+
+        if self._force_update_pending:
+            config["force_update_counter"] = config.get("force_update_counter", 0) + 1
+            self._force_update_pending = False
+
         return config
 
     def _freq_hz_to_display(self, freq_hz: float) -> float:
@@ -721,6 +727,7 @@ class DACWidget(DeviceWidget):
         self.dac_frame_obj = dac_frame_obj
         self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
+        self._force_update_pending = False
         # Store previous value for undo functionality
         self.prev_voltage = None
         self.setup_ui()
@@ -825,6 +832,7 @@ class DACWidget(DeviceWidget):
                 self.voltage_spinbox.setValue(dac.v)
                 # Stage the change: show "undo" and require Enter to confirm,
                 # even if the value happens to equal the current one.
+                self._force_update_pending = True
                 self.has_unsaved_changes = True
                 self.update_default_button_state()
                 self.voltage_spinbox.setFocus()
@@ -870,6 +878,9 @@ class DACWidget(DeviceWidget):
         """Return the updated configuration for this DAC device"""
         config = self.device_config.copy()
         config["voltage"] = self.voltage_spinbox.value()
+        if self._force_update_pending:
+            config["force_update_counter"] = config.get("force_update_counter", 0) + 1
+            self._force_update_pending = False
         return config
         
     def update_from_config(self, config: Dict[str, Any]):

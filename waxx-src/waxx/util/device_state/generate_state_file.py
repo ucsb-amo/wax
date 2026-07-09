@@ -89,6 +89,7 @@ class Generator():
                     # Key of the linked DAC_CH (empty string when no DAC control).
                     # Used by the monitor server to cross-propagate v_pd <-> voltage.
                     'dac_ch_key': (dac_ch_obj.key if real_dac else ""),
+                    'force_update_counter': 0,
                 }
         
         return devices
@@ -112,7 +113,8 @@ class Generator():
                 devices[ttl_device.key] = {
                     'ch': getattr(ttl_device, 'ch', 0),
                     'ttl_state': ttl_state,  # Raw state value (0/1)
-                    'type': ttl_type
+                    'type': ttl_type,
+                    'force_update_counter': 0,
                 }
         
         return devices
@@ -130,7 +132,8 @@ class Generator():
                 devices[dac_device.key] = {
                     'ch': getattr(dac_device, 'ch', 0),
                     'voltage': getattr(dac_device, 'v', 0.0),
-                    'max_voltage': getattr(dac_device, 'max_v', 9.99)
+                    'max_voltage': getattr(dac_device, 'max_v', 9.99),
+                    'force_update_counter': 0,
                 }
         
         return devices
