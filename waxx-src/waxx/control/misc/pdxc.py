@@ -206,11 +206,9 @@ class PDXC_Server(WaxxServer):
     on its own daemon thread.
     """
 
-    def __init__(self, com_port: str = "COM26",
-                 server_port: int = 5580) -> None:
-        WaxxServer.__init__(self, SERVER_ID, server_port)
+    def __init__(self, com_port: str = "COM26") -> None:
+        WaxxServer.__init__(self, SERVER_ID, port=0)
         self._com_port = com_port
-        self._server_port = server_port
         self._device: Optional[PDXC] = None
         self._running = False
         self._device_lock = threading.Lock()
@@ -220,14 +218,15 @@ class PDXC_Server(WaxxServer):
         self._device = PDXC(self._com_port)
         self._device.initialize()
         self._running = True
-        self._start_beacon()
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self._server_port))
+        srv.bind(("0.0.0.0", 0))          # OS assigns a free port
         srv.listen(5)
         srv.settimeout(1.0)
-        print(f"PDXC server listening on port {self._server_port}")
+        self._waxx_port = srv.getsockname()[1]   # tell beacon the real port
+        self._start_beacon()
+        print(f"PDXC server listening on port {self._waxx_port}")
 
         try:
             while self._running:
