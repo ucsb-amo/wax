@@ -111,13 +111,13 @@ class Scanner():
         if any([fc in xvar.key for fc in forbidden_chars]):
             raise ValueError("Key contains forbidden characters.")
 
-    def adjust(self, param_key, min_val, max_val, step=None, dtype=None):
+    def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None):
         """Register a parameter for live adjustment between shots via the liveOD Adjust panel.
 
         Args:
             param_key (str): ExptParams attribute to adjust.
-            min_val (float): Minimum allowed value.
-            max_val (float): Maximum allowed value.
+            min_val (float, optional): Minimum allowed value. Defaults to current value - 0.2.
+            max_val (float, optional): Maximum allowed value. Defaults to current value + 0.2.
             step (float, optional): Spinbox step size. Defaults to (max-min)/50.
                 For dtype=int the minimum effective step is 1.
             dtype (type): float (default) or int.
@@ -127,6 +127,12 @@ class Scanner():
                 raise ValueError(f"param {param_key!r} does not already exist, so a dtype must be provided")
             raw_val = vars(self.params)[param_key]
             dtype = int if isinstance(raw_val, (int, np.integer)) else float
+        if min_val is None or max_val is None:
+            current = getattr(self.params, param_key, 0.0)
+            if min_val is None:
+                min_val = float(current) - 0.2
+            if max_val is None:
+                max_val = float(current) + 0.2
         if any(s.key == param_key for s in self._adjust_specs):
             raise ValueError(f"adjust key {param_key!r} already registered.")
         if param_key in self.xvarnames:
