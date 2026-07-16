@@ -89,11 +89,170 @@ class DataContainer(DataContainerWaxa):
         if not self._data_gotten:
             self._data_gotten = not np.all(self.shot_data == self._reference_data)  
 
+
+# --- Concrete (ndim, dtype) subclasses ---------------------------------------
+# Each defines its OWN kernel methods (do not factor up into the base). The
+# bodies are identical text, but ARTIQ type-checks each separately against the
+# subclass's concrete shot_data type. Supported: 1D/2D of float64/int32/int64.
+
+class DataContainer1D_f64(DataContainer):
+    _NDIM, _DTYPE = 1, np.float64
+
+    @kernel
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
     @kernel
     def update_to_host(self):
         """Necessary to sync up host and kernel.
         """   
         self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
+class DataContainer2D_f64(DataContainer):
+    _NDIM, _DTYPE = 2, np.float64
+
+    @kernel
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
+        for j in range(len(value)):
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
+    @kernel
+    def update_to_host(self):
+        self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
+class DataContainer1D_i32(DataContainer):
+    _NDIM, _DTYPE = 1, np.int32
+
+    @kernel
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
+    @kernel
+    def update_to_host(self):
+        self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
+class DataContainer2D_i32(DataContainer):
+    _NDIM, _DTYPE = 2, np.int32
+
+    @kernel
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
+        for j in range(len(value)):
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
+    @kernel
+    def update_to_host(self):
+        self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
+class DataContainer1D_i64(DataContainer):
+    _NDIM, _DTYPE = 1, np.int64
+
+    @kernel
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
+    @kernel
+    def update_to_host(self):
+        self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
+class DataContainer2D_i64(DataContainer):
+    _NDIM, _DTYPE = 2, np.int64
+
+    @kernel
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
+        for j in range(len(value)):
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
+    @kernel
+    def update_to_host(self):
+        self.update_from_kernel(self.shot_data)
+
+    @kernel
+    def _put_shot_data(self):
+        if self._is_sentinel:
+            return
+        self.update_to_host()
+        self._put_shot_data_to_run_data()
+
 
 class DataVault():
     
