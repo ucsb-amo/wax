@@ -222,13 +222,11 @@ class Scanner():
 
         while scanning:
 
+            self.core.wait_until_mu(now_mu())
             aborted_bool = self._check_for_abort_signal()
             
-            self.core.wait_until_mu(now_mu())
             self.update_params_from_xvars()
-            delay(RPC_DELAY)
-
-            self.core.wait_until_mu(now_mu())
+            
             self.write_host_params_to_kernel()
             delay(RPC_DELAY)
             self.core.break_realtime()
