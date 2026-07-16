@@ -95,6 +95,7 @@ class MonitorUDPServer(UdpServer):
             apply_delta(self.config_file_path, dtype, name, changes)
         except Exception as e:
             return json.dumps({"status": "error", "msg": str(e)})
+        self._log_update(dtype, name, changes)
         self._version += 1
         version = self._version
         self._broadcaster.send({
@@ -107,6 +108,27 @@ class MonitorUDPServer(UdpServer):
         # Keep linked DDS v_pd and DAC voltage in sync in both directions.
         self._propagate_linked_vpd(dtype, name, changes)
         return json.dumps({"status": "ok", "version": version})
+
+    def _log_update(self, dtype: str, name: str, changes: dict) -> None:
+        """Print a formatted confirmation of an accepted device-state update."""
+        parts = []
+        if dtype == "dds":
+            if "frequency" in changes:
+                parts.append(f"freq {changes['frequency'] / 1e6:.3f} MHz")
+            if "amplitude" in changes:
+                parts.append(f"amp {changes['amplitude']:.3f}")
+            if "v_pd" in changes:
+                parts.append(f"v_pd {changes['v_pd']:.3f} V")
+            if "sw_state" in changes:
+                parts.append("sw " + ("on" if changes["sw_state"] else "off"))
+        elif dtype == "dac":
+            if "voltage" in changes:
+                parts.append(f"{changes['voltage']:.3f} V")
+        elif dtype == "ttl":
+            if "ttl_state" in changes:
+                parts.append("on" if changes["ttl_state"] else "off")
+        if parts:
+            print(f"[{dtype.upper()}] {name} -> {', '.join(parts)}")
 
     def _propagate_linked_vpd(self, dtype: str, name: str, changes: dict) -> None:
         """Cross-propagate v_pd <-> voltage for DDS/DAC pairs sharing a channel.
