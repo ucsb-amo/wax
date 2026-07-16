@@ -211,7 +211,7 @@ class _ExposureSpinBox(QDoubleSpinBox):
     """
 
     def stepBy(self, steps: int) -> None:
-        step = max(self.value() * 0.10, 10.0)
+        step = max(round(self.value() * 0.10,-1), 10.0)
         new_val = self.value() + steps * step
         self.setValue(max(new_val, self.minimum()))
 
@@ -1380,7 +1380,6 @@ class BaslerCameraWidget(QFrame):
         if roi and len(roi) == 4:
             x1, y1, x2, y2 = roi
             self.current_rect = QRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
-            self._update_overlay()
         nref = defaults.get("norm_reference")
         if nref is not None:
             self.counts_panel.norm_reference = float(nref)
