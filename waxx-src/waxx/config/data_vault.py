@@ -113,12 +113,20 @@ class DataContainer(DataContainerWaxa):
 
 class DataContainer1D_f64(DataContainer):
     _NDIM, _DTYPE = 1, np.float64
+
     @kernel
-    def put_data(self, value, idx=0):
-        self.shot_data[idx] = value
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
@@ -128,14 +136,26 @@ class DataContainer1D_f64(DataContainer):
 
 class DataContainer2D_f64(DataContainer):
     _NDIM, _DTYPE = 2, np.float64
+
     @kernel
-    def put_data(self, value, idx=0):
-        # Element-wise row fill over the 2nd index (avoids multidim whole-row assignment).
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
         for j in range(len(value)):
-            self.shot_data[idx, j] = value[j]
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
@@ -145,12 +165,20 @@ class DataContainer2D_f64(DataContainer):
 
 class DataContainer1D_i32(DataContainer):
     _NDIM, _DTYPE = 1, np.int32
+
     @kernel
-    def put_data(self, value, idx=0):
-        self.shot_data[idx] = value
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
@@ -160,13 +188,26 @@ class DataContainer1D_i32(DataContainer):
 
 class DataContainer2D_i32(DataContainer):
     _NDIM, _DTYPE = 2, np.int32
+
     @kernel
-    def put_data(self, value, idx=0):
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
         for j in range(len(value)):
-            self.shot_data[idx, j] = value[j]
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
@@ -176,12 +217,20 @@ class DataContainer2D_i32(DataContainer):
 
 class DataContainer1D_i64(DataContainer):
     _NDIM, _DTYPE = 1, np.int64
+
     @kernel
-    def put_data(self, value, idx=0):
-        self.shot_data[idx] = value
+    def put_data(self, value, i=0):
+        self.shot_data[i] = value
+
+    @kernel
+    def put_data_1d(self, value):
+        for j in range(len(value)):
+            self.shot_data[j] = value[j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
@@ -191,13 +240,26 @@ class DataContainer1D_i64(DataContainer):
 
 class DataContainer2D_i64(DataContainer):
     _NDIM, _DTYPE = 2, np.int64
+
     @kernel
-    def put_data(self, value, idx=0):
+    def put_data(self, value, i=0, j=0):
+        self.shot_data[i, j] = value
+
+    @kernel
+    def put_data_1d(self, value, i=0):
         for j in range(len(value)):
-            self.shot_data[idx, j] = value[j]
+            self.shot_data[i, j] = value[j]
+
+    @kernel
+    def put_data_2d(self, value):
+        for i in range(len(value)):
+            for j in range(len(value[i])):
+                self.shot_data[i, j] = value[i,j]
+
     @kernel
     def update_to_host(self):
         self.update_from_kernel(self.shot_data)
+
     @kernel
     def _put_shot_data(self):
         if self._is_sentinel:
