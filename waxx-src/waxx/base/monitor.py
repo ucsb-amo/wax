@@ -52,6 +52,10 @@ class Monitor:
 
         self._schema_changed = False
 
+        # Tracks the last force_update_counter seen per device so that an
+        # incremented counter unconditionally queues all params for that device.
+        self._force_update_counters: dict = {}
+
     def update_device_states(self):
         self.generator.generate()
 
@@ -222,8 +226,11 @@ class Monitor:
 
         if self.last_config_data is None:
             self.last_config_data = current_config
+            for dtype in ('dds', 'dac', 'ttl'):
+                for name, cfg in current_config.get(dtype, {}).items():
+                    self._force_update_counters[(dtype, name)] = cfg.get('force_update_counter', 0)
             if verbose:
-                print("No changes detected (initial load).")
+                print("No changes detected (initial load.)")
             return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates, 
                     self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
 
@@ -238,7 +245,13 @@ class Monitor:
             old_config = old_dds.get(device_name, {})
             kernel_index = self.dds_dict.get(device_name, -1)
 
-            if old_config.get('frequency') != new_config.get('frequency') or \
+            new_counter = new_config.get('force_update_counter', 0)
+            last_counter = self._force_update_counters.get(('dds', device_name), 0)
+            force_this = new_counter != last_counter
+            if force_this:
+                self._force_update_counters[('dds', device_name)] = new_counter
+
+            if force_this or old_config.get('frequency') != new_config.get('frequency') or \
             old_config.get('amplitude') != new_config.get('amplitude'):
                 update_index = self.dds_frequency_amplitude_updates.index(DEFAULT_UPDATE_2FLOAT)
                 self.dds_frequency_amplitude_updates[update_index] = (
@@ -247,14 +260,14 @@ class Monitor:
                 if verbose:
                     print(f"DDS {device_name}: Frequency/Amplitude changed to {new_config['frequency']}/{new_config['amplitude']}")
 
-            if old_config.get('v_pd') != new_config.get('v_pd'):
+            if force_this or old_config.get('v_pd') != new_config.get('v_pd'):
                 update_index = self.dds_vpd_updates.index(DEFAULT_UPDATE_FLOAT)
                 self.dds_vpd_updates[update_index] = (kernel_index, new_config['v_pd'])
                 changes_detected = True
                 if verbose:
                     print(f"DDS {device_name}: V_PD changed to {new_config['v_pd']}")
 
-            if old_config.get('sw_state') != new_config.get('sw_state'):
+            if force_this or old_config.get('sw_state') != new_config.get('sw_state'):
                 update_index = self.dds_sw_state_updates.index(DEFAULT_UPDATE_INT)
                 self.dds_sw_state_updates[update_index] = (kernel_index, new_config['sw_state'])
                 changes_detected = True
@@ -267,7 +280,14 @@ class Monitor:
         for device_name, new_config in new_ttl.items():
             if device_name not in self.ttl_dict:
                 continue
-            if old_ttl.get(device_name, {}).get('ttl_state') != new_config.get('ttl_state'):
+
+            new_counter = new_config.get('force_update_counter', 0)
+            last_counter = self._force_update_counters.get(('ttl', device_name), 0)
+            force_this = new_counter != last_counter
+            if force_this:
+                self._force_update_counters[('ttl', device_name)] = new_counter
+
+            if force_this or old_ttl.get(device_name, {}).get('ttl_state') != new_config.get('ttl_state'):
                 kernel_index = self.ttl_dict.get(device_name, -1)
                 update_index = self.ttl_updates.index(DEFAULT_UPDATE_INT) # get next update from start of list
                 self.ttl_updates[update_index] = (kernel_index, new_config['ttl_state'])
@@ -281,7 +301,14 @@ class Monitor:
         for device_name, new_config in new_dac.items():
             if device_name not in self.dac_dict:
                 continue
-            if abs(old_dac.get(device_name, {}).get('voltage', 0.0) - new_config.get('voltage', 0.0)) > 1e-6:
+
+            new_counter = new_config.get('force_update_counter', 0)
+            last_counter = self._force_update_counters.get(('dac', device_name), 0)
+            force_this = new_counter != last_counter
+            if force_this:
+                self._force_update_counters[('dac', device_name)] = new_counter
+
+            if force_this or abs(old_dac.get(device_name, {}).get('voltage', 0.0) - new_config.get('voltage', 0.0)) > 1e-6:
                 kernel_index = self.dac_dict.get(device_name, -1)
                 update_index = self.dac_updates.index(DEFAULT_UPDATE_FLOAT)
                 self.dac_updates[update_index] = (kernel_index, new_config['voltage'])
