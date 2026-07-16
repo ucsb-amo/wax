@@ -906,7 +906,89 @@ class atomdata_base():
         self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section  
         self.atom_number = np.sum(np.sum(self.atom_number_density,-2),-1)
 
-    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False):
+    def _resolve_xvar_value_to_indices(self, xvar_value, which_xvar_idx, xvar_tolerance=0.05):
+        """Resolve an xvar_value specification to integer indices into self.xvars[which_xvar_idx].
+
+        Args:
+            xvar_value: One of:
+                - scalar: index of the closest xvar value; warns if at the edge of the axis.
+                - tuple (min, max): all indices whose xvar value falls in [min, max] ± tolerance.
+                - list or ndarray: for each requested value, the nearest index within tolerance.
+            which_xvar_idx (int): The xvar axis to search.
+            xvar_tolerance (float or None): Fraction of the robust mean spacing between
+                consecutive xvar values used as the absolute matching tolerance.
+                The mean is computed after discarding diffs whose absolute value exceeds
+                3× the standard deviation of all diffs (outlier removal).
+                Defaults to 0.05 (5%).
+
+        Returns:
+            np.ndarray of int: selected indices (1-D).
+        """
+        import warnings
+        xvals = np.asarray(self.xvars[which_xvar_idx])
+
+        # Robust mean spacing: discard diff outliers (|diff| > 3σ) before taking the mean.
+        diffs = np.abs(np.diff(xvals))
+        if len(diffs) > 0:
+            diff_std = float(np.std(diffs))
+            diff_mean = float(np.mean(diffs))
+            if diff_std > 0:
+                robust_diffs = diffs[diffs <= diff_mean + 3.0 * diff_std]
+            else:
+                robust_diffs = diffs
+            mean_spacing = float(np.mean(robust_diffs)) if len(robust_diffs) > 0 else diff_mean
+        else:
+            mean_spacing = 0.0
+
+        fraction = float(xvar_tolerance)
+        tol = fraction * mean_spacing
+
+        if np.isscalar(xvar_value) and not isinstance(xvar_value, (list, tuple, np.ndarray)):
+            idx = int(np.argmin(np.abs(xvals - xvar_value)))
+            if idx == 0 or idx == len(xvals) - 1:
+                warnings.warn(
+                    f"slice_atomdata: xvar_value={xvar_value!r} matched the edge of "
+                    f"xvars[{which_xvar_idx}] (index {idx}, value {xvals[idx]:.6g}). "
+                    f"Axis range: [{xvals[0]:.6g}, {xvals[-1]:.6g}].",
+                    stacklevel=3,
+                )
+            return np.array([idx], dtype=int)
+
+        elif isinstance(xvar_value, tuple):
+            if len(xvar_value) != 2:
+                raise ValueError(
+                    f"slice_atomdata: xvar_value tuple must have exactly 2 elements "
+                    f"(min, max); got {len(xvar_value)}."
+                )
+            vmin, vmax = float(xvar_value[0]), float(xvar_value[1])
+            mask = (xvals >= vmin - tol) & (xvals <= vmax + tol)
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                raise ValueError(
+                    f"slice_atomdata: no xvar values found in range "
+                    f"({vmin:.6g}, {vmax:.6g}) ± {tol:.4g} on axis {which_xvar_idx}. "
+                    f"Axis range: [{xvals[0]:.6g}, {xvals[-1]:.6g}]."
+                )
+            return indices.astype(int)
+
+        else:
+            # list or array of values
+            requested = np.asarray(xvar_value).ravel()
+            indices = []
+            for v in requested:
+                dists = np.abs(xvals - v)
+                idx = int(np.argmin(dists))
+                if dists[idx] > tol:
+                    raise ValueError(
+                        f"slice_atomdata: no xvar value matched {v:.6g} within "
+                        f"tolerance {tol:.4g} on axis {which_xvar_idx}. "
+                        f"Closest is {xvals[idx]:.6g} (distance {dists[idx]:.4g})."
+                    )
+                indices.append(idx)
+            return np.array(indices, dtype=int)
+
+    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False,
+                       xvar_value=None, xvar_tolerance=None):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
         that xvar, and returns an atomdata of reduced dimensionality as if that
         variable had been held constant.
@@ -926,14 +1008,35 @@ class atomdata_base():
             which_shot_idx (int or list): The index (or indices) into the xvar
             specified by which_xvar_idx to select. When selecting a single index
             from a multi-axis scan this reduces the dimensionality by one.
+            Ignored when xvar_value is provided.
             which_xvar_idx (int): The index of the xvar axis to slice along.
             ignore_repeats (bool): Only relevant for single-axis scans with
             repeats. When True, return only the single shot at which_shot_idx
             rather than all repeats of the corresponding unique value.
+            xvar_value: If provided, overrides which_shot_idx. Can be:
+                - scalar: select the xvar index closest to this value; warns if
+                  the match is at the edge of the axis.
+                - tuple (min, max): select all xvar indices whose value falls
+                  within [min, max] ± xvar_tolerance.
+                - list or ndarray: select the xvar index nearest to each
+                  requested value, within xvar_tolerance.
+            xvar_tolerance (float or None): Fraction of the robust mean spacing
+                between consecutive xvar values used as the absolute matching
+                tolerance (outlier diffs > 3σ removed before computing the mean).
+                Defaults to 0.05 (5%).
 
         Returns:
             atomdata: The sliced atomdata object.
         """
+        # Resolve xvar_value → which_shot_idx when the caller supplies a value.
+        if xvar_value is not None and which_shot_idx != 0:
+            raise ValueError(
+                "slice_atomdata: specify either 'xvar_value' or 'which_shot_idx', not both."
+            )
+        if xvar_value is not None:
+            which_shot_idx = self._resolve_xvar_value_to_indices(
+                xvar_value, which_xvar_idx, xvar_tolerance=xvar_tolerance
+            )
 
         # Fix #1: copy from self in memory — no disk reload.
         ad = self._copy_self_for_slice()

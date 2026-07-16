@@ -84,11 +84,15 @@ class atomdata(atomdata_base):
     def reshuffle(self):
         return super().reshuffle()
 
-    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False):
+    def slice_atomdata(self, which_xvar_idx=0, xvar_value=None,
+                    which_shot_idx=0, ignore_repeats=False,
+                    xvar_tolerance=0.05):
         return super().slice_atomdata(
             which_shot_idx=which_shot_idx,
             which_xvar_idx=which_xvar_idx,
             ignore_repeats=ignore_repeats,
+            xvar_value=xvar_value,
+            xvar_tolerance=xvar_tolerance,
         )
 
     def reassign_repeats(self, xvar_idx):
