@@ -138,8 +138,8 @@ class BristolDetuningWidget(QWidget):
         n_lbl.setStyleSheet("color: #888888; font-size: 10px;")
         ctl_row.addWidget(n_lbl)
         self._n_spin = QSpinBox()
-        self._n_spin.setRange(5, 1000)
-        self._n_spin.setValue(100)
+        self._n_spin.setRange(1, 1000)
+        self._n_spin.setValue(1)
         self._n_spin.setFixedWidth(70)
         self._n_spin.setFont(QFont("Monospace", 10))
         ctl_row.addWidget(self._n_spin)
@@ -157,6 +157,9 @@ class BristolDetuningWidget(QWidget):
         self._plot.getAxis("left").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._plot.getAxis("bottom").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._curve = self._plot.plot(pen=pg.mkPen("#ffaa00", width=1.5))
+        # Add Δ = 0 reference line (horizontal, only visible if in y-range)
+        zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color="#666666", style=pg.Qt.PenStyle.DashLine, width=1))
+        self._plot.addItem(zero_line)
         self._plot.setMinimumHeight(180)
 
         if hasattr(plot_box, "addWidget"):
