@@ -120,11 +120,11 @@ class Monitor:
                     self.dds_dict[attr_name] = dds_idx
                     self.dds_frequency_amplitude_kernels.append(kernel_from_string(
                         ["expt","f", "a"],
-                        f"expt.dds.{attr_name}.set_dds(frequency=f, amplitude=a)"
+                        f"expt.dds.{attr_name}.set_dds(frequency=f, amplitude=a, init=True)"
                     ))
                     self.dds_vpd_kernels.append(kernel_from_string(
                         ["expt","v_pd_val"],
-                        f"expt.dds.{attr_name}.set_dds(v_pd=v_pd_val)"
+                        f"expt.dds.{attr_name}.set_dds(v_pd=v_pd_val, init=True)"
                     ))
                     self.dds_sw_state_kernels.append(kernel_from_string(
                         ["expt","state"],
@@ -250,6 +250,8 @@ class Monitor:
             force_this = new_counter != last_counter
             if force_this:
                 self._force_update_counters[('dds', device_name)] = new_counter
+                if verbose:
+                    print(f"[FORCE_UPDATE] DDS {device_name}: force_update_counter {last_counter} → {new_counter}")
 
             if force_this or old_config.get('frequency') != new_config.get('frequency') or \
             old_config.get('amplitude') != new_config.get('amplitude'):
@@ -258,21 +260,24 @@ class Monitor:
                     kernel_index, new_config['frequency'], new_config['amplitude'])
                 changes_detected = True
                 if verbose:
-                    print(f"DDS {device_name}: Frequency/Amplitude changed to {new_config['frequency']}/{new_config['amplitude']}")
+                    reason = "[FORCE_UPDATE]" if force_this else "[VALUE_CHANGE]"
+                    print(f"DDS {device_name}: {reason} Frequency/Amplitude set to {new_config['frequency']}/{new_config['amplitude']}")
 
             if force_this or old_config.get('v_pd') != new_config.get('v_pd'):
                 update_index = self.dds_vpd_updates.index(DEFAULT_UPDATE_FLOAT)
                 self.dds_vpd_updates[update_index] = (kernel_index, new_config['v_pd'])
                 changes_detected = True
                 if verbose:
-                    print(f"DDS {device_name}: V_PD changed to {new_config['v_pd']}")
+                    reason = "[FORCE_UPDATE]" if force_this else "[VALUE_CHANGE]"
+                    print(f"DDS {device_name}: {reason} V_PD set to {new_config['v_pd']}")
 
             if force_this or old_config.get('sw_state') != new_config.get('sw_state'):
                 update_index = self.dds_sw_state_updates.index(DEFAULT_UPDATE_INT)
                 self.dds_sw_state_updates[update_index] = (kernel_index, new_config['sw_state'])
                 changes_detected = True
                 if verbose:
-                    print(f"DDS {device_name}: SW State changed to {new_config['sw_state']}")
+                    reason = "[FORCE_UPDATE]" if force_this else "[VALUE_CHANGE]"
+                    print(f"DDS {device_name}: {reason} SW State set to {new_config['sw_state']}")
 
         # Process TTL devices
         old_ttl = self.last_config_data.get('ttl', {})
@@ -286,6 +291,8 @@ class Monitor:
             force_this = new_counter != last_counter
             if force_this:
                 self._force_update_counters[('ttl', device_name)] = new_counter
+                if verbose:
+                    print(f"[FORCE_UPDATE] TTL {device_name}: force_update_counter {last_counter} → {new_counter}")
 
             if force_this or old_ttl.get(device_name, {}).get('ttl_state') != new_config.get('ttl_state'):
                 kernel_index = self.ttl_dict.get(device_name, -1)
@@ -293,7 +300,8 @@ class Monitor:
                 self.ttl_updates[update_index] = (kernel_index, new_config['ttl_state'])
                 changes_detected = True
                 if verbose:
-                    print(f"TTL {device_name}: State changed to {new_config['ttl_state']}")
+                    reason = "[FORCE_UPDATE]" if force_this else "[VALUE_CHANGE]"
+                    print(f"TTL {device_name}: {reason} State set to {new_config['ttl_state']}")
 
         # Process DAC devices
         old_dac = self.last_config_data.get('dac', {})
@@ -307,6 +315,8 @@ class Monitor:
             force_this = new_counter != last_counter
             if force_this:
                 self._force_update_counters[('dac', device_name)] = new_counter
+                if verbose:
+                    print(f"[FORCE_UPDATE] DAC {device_name}: force_update_counter {last_counter} → {new_counter}")
 
             if force_this or abs(old_dac.get(device_name, {}).get('voltage', 0.0) - new_config.get('voltage', 0.0)) > 1e-6:
                 kernel_index = self.dac_dict.get(device_name, -1)
@@ -314,7 +324,8 @@ class Monitor:
                 self.dac_updates[update_index] = (kernel_index, new_config['voltage'])
                 changes_detected = True
                 if verbose:
-                    print(f"DAC {device_name}: Voltage changed to {new_config['voltage']}")
+                    reason = "[FORCE_UPDATE]" if force_this else "[VALUE_CHANGE]"
+                    print(f"DAC {device_name}: {reason} Voltage set to {new_config['voltage']}")
 
         self.last_config_data = current_config
 

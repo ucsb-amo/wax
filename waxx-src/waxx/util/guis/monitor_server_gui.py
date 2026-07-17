@@ -137,17 +137,26 @@ class MonitorUDPServer(UdpServer):
         DAC control (written by ``generate_state_file.Generator``).  When either
         side changes the voltage the other side is updated atomically and a
         broadcast is sent so GUI widgets on both tabs stay in sync.
+        
+        Also propagates force_update_counter to ensure linked devices are
+        force-updated together.
         """
         try:
             cfg = read_state(self.config_file_path)
         except Exception:
             return
 
-        if dtype == "dds" and "v_pd" in changes:
+        if dtype == "dds" and ("v_pd" in changes or "force_update_counter" in changes):
             dac_key = cfg.get("dds", {}).get(name, {}).get("dac_ch_key", "")
             if not dac_key:
                 return
-            linked = {"voltage": changes["v_pd"]}
+            linked = {}
+            if "v_pd" in changes:
+                linked["voltage"] = changes["v_pd"]
+            if "force_update_counter" in changes:
+                linked["force_update_counter"] = changes["force_update_counter"]
+            if not linked:
+                return
             try:
                 apply_delta(self.config_file_path, "dac", dac_key, linked)
             except Exception:
@@ -161,11 +170,17 @@ class MonitorUDPServer(UdpServer):
                 "changes": linked,
             })
 
-        elif dtype == "dac" and "voltage" in changes:
+        elif dtype == "dac" and ("voltage" in changes or "force_update_counter" in changes):
             for dds_name, dds_cfg in cfg.get("dds", {}).items():
                 if dds_cfg.get("dac_ch_key", "") != name:
                     continue
-                linked = {"v_pd": changes["voltage"]}
+                linked = {}
+                if "voltage" in changes:
+                    linked["v_pd"] = changes["voltage"]
+                if "force_update_counter" in changes:
+                    linked["force_update_counter"] = changes["force_update_counter"]
+                if not linked:
+                    continue
                 try:
                     apply_delta(self.config_file_path, "dds", dds_name, linked)
                 except Exception:

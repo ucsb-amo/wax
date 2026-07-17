@@ -500,6 +500,8 @@ class DDSWidget(DeviceWidget):
                 # even if a value happens to equal the current one.
                 self._force_update_pending = True
                 self.has_unsaved_changes = True
+                print(f"[GUI] DDS {self.device_name}: Default button pressed - set _force_update_pending=True")
+                print(f"[GUI] DDS {self.device_name}: Loading default values: freq={dds.frequency}, amp={dds.amplitude}, v_pd={dds.v_pd}")
                 self.update_default_button_state()
                 self.freq_spinbox.setFocus()
                 self.freq_spinbox.selectAll()
@@ -663,6 +665,8 @@ class DDSWidget(DeviceWidget):
         if self._force_update_pending:
             config["force_update_counter"] = config.get("force_update_counter", 0) + 1
             self._force_update_pending = False
+            print(f"[GUI] DDS {self.device_name}: Incremented force_update_counter to {config['force_update_counter']}")
+            print(f"[GUI] DDS {self.device_name}: Config = freq={config.get('frequency')}, amp={config.get('amplitude')}, v_pd={config.get('v_pd')}, sw_state={config.get('sw_state')}")
 
         return config
 
@@ -1992,8 +1996,11 @@ class DeviceStateGUI(QMainWindow):
         # (including our own echo) does not clobber the spinbox mid-interaction.
         self._pending[(device_type, device_name)] = time.time()
 
-        # Hand off to the background sender (coalesces rapid same-device edits).
-        self._update_sender.enqueue(device_type, device_name, updated_config)
+       if device_type == "dds" and "force_update_counter" in updated_config:
+           print(f"[GUI] on_device_value_changed: {device_type} {device_name}, force_update_counter={updated_config['force_update_counter']}")
+
+       # Hand off to the background sender (coalesces rapid same-device edits).
+       self._update_sender.enqueue(device_type, device_name, updated_config)
 
     def _on_update_ack(self, device_type: str, device_name: str, ack: dict) -> None:
         """Server accepted our delta."""
