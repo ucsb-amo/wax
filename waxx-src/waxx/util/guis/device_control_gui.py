@@ -1996,11 +1996,11 @@ class DeviceStateGUI(QMainWindow):
         # (including our own echo) does not clobber the spinbox mid-interaction.
         self._pending[(device_type, device_name)] = time.time()
 
-       if device_type == "dds" and "force_update_counter" in updated_config:
-           print(f"[GUI] on_device_value_changed: {device_type} {device_name}, force_update_counter={updated_config['force_update_counter']}")
+        if device_type == "dds" and "force_update_counter" in updated_config:
+            print(f"[GUI] on_device_value_changed: {device_type} {device_name}, force_update_counter={updated_config['force_update_counter']}")
 
-       # Hand off to the background sender (coalesces rapid same-device edits).
-       self._update_sender.enqueue(device_type, device_name, updated_config)
+        # Hand off to the background sender (coalesces rapid same-device edits).
+        self._update_sender.enqueue(device_type, device_name, updated_config)
 
     def _on_update_ack(self, device_type: str, device_name: str, ack: dict) -> None:
         """Server accepted our delta."""
