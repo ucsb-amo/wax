@@ -2019,14 +2019,31 @@ class atomdata_base():
 
     def reshuffle(self):
         if self.shuffle_mode == 'global':
-            raise NotImplementedError(
-                "reshuffle() is not defined for global (true-random) runs. The "
-                "shot order is a single permutation over all grid cells "
-                "(execution_order), which does not map onto a per-axis "
-                "hypercube reordering. The loaded data is already in natural "
-                "grid order. Use ad.execution_order / ad.grid_shape to inspect "
-                "the acquisition order directly."
-            )
+            if self.Nvars != 1:
+                raise NotImplementedError(
+                    "reshuffle() is not defined for global (true-random) runs "
+                    "with more than one xvar. The shot order is a single "
+                    "permutation over all grid cells (execution_order), which "
+                    "does not map onto a per-axis hypercube reordering for "
+                    "multi-xvar scans. The loaded data is already in natural "
+                    "grid order. Use ad.execution_order / ad.grid_shape to "
+                    "inspect the acquisition order directly."
+                )
+            # A 1-D global run's execution_order IS a permutation over the
+            # single scan axis, so it can be used directly like a per-axis
+            # shuffle table.
+            if self._analysis_tags.repeats_reassigned:
+                raise ValueError("Cannot reshuffle after repeats have been reassigned.")
+            if self._analysis_tags.xvars_shuffled == False:
+                self._shuff_global(reshuffle_bool=True)
+                _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+                if _has_images:
+                    self._sort_images()
+                self.analyze()
+                self._analysis_tags.xvars_shuffled = True
+            else:
+                print("Data is already in shuffled order.")
+            return
         if self._analysis_tags.repeats_reassigned:
             raise ValueError("Cannot reshuffle after repeats have been reassigned.")
         if self._analysis_tags.xvars_shuffled == False:
@@ -2041,9 +2058,22 @@ class atomdata_base():
 
     def unshuffle(self,reanalyze=True):
         if self.shuffle_mode == 'global':
-            # Global runs are saved and loaded in natural grid order already.
-            print("Global (true-random) runs are loaded in natural grid order; "
-                  "nothing to unshuffle.")
+            if self.Nvars != 1:
+                # Multi-xvar global runs are saved/loaded in natural grid
+                # order already; there is no per-axis unshuffle to reverse.
+                print("Global (true-random) runs with more than one xvar are "
+                      "loaded in natural grid order; nothing to unshuffle.")
+                return
+            if self._analysis_tags.xvars_shuffled == True:
+                self._shuff_global(reshuffle_bool=False)
+                if reanalyze:
+                    _has_images = getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0
+                    if _has_images:
+                        self._sort_images()
+                    self.analyze()
+                self._analysis_tags.xvars_shuffled = False
+            else:
+                print("Data is already in unshuffled order.")
             return
         if self._analysis_tags.xvars_shuffled == True:
             self._shuff(reshuffle_bool=False)
@@ -2055,6 +2085,65 @@ class atomdata_base():
             self._analysis_tags.xvars_shuffled = False
         else:
             print("Data is already in unshuffled order.")
+
+    def _shuff_global(self, reshuffle_bool):
+        """1-D-scan variant of _shuff() for global (true-random) runs.
+
+        Global mode never permutes on a per-axis basis: the single xvar's
+        values stay in natural (sorted) order, and everything except images/
+        timestamps is written to disk directly in that natural (grid) order.
+        The only recorded randomization is self._dealer.execution_order,
+        mapping shot k (in acquisition order) to its grid cell. When
+        Nvars == 1, "grid order" and "the single scan axis" are the same
+        thing, so execution_order can be used exactly like a nested-mode
+        per-axis shuffle table: gather_grid_axis_to_exec puts grid-ordered
+        data into acquisition ("shuffled") order, and
+        scatter_exec_axis_to_grid is its inverse.
+        """
+        dealer = self._dealer
+        N = int(self.xvardims[0])
+        reorder = (dealer.gather_grid_axis_to_exec if reshuffle_bool
+                   else dealer.scatter_exec_axis_to_grid)
+
+        if getattr(self, 'images', None) is not None and np.asarray(self.images).size > 0:
+            per_shot = int(self.params.N_pwa_per_shot) + 2
+            img_shape = self.images.shape[1:]
+            imgs = self.images.reshape((N, per_shot) + img_shape)
+            self.images = reorder(imgs, axis=0).reshape((N * per_shot,) + img_shape)
+
+            ts_shape = self.image_timestamps.shape[1:]
+            ts = self.image_timestamps.reshape((N, per_shot) + ts_shape)
+            self.image_timestamps = reorder(ts, axis=0).reshape((N * per_shot,) + ts_shape)
+
+        protected_keys = ['xvarnames', 'sort_idx', 'images',
+                          'image_timestamps', 'sort_N',
+                          'xvars', 'N_repeats', 'N_shots',
+                          'N_shots_with_repeats', 'scan_xvars',
+                          'xvardims', 'data']
+
+        def _reorder_struct(struct):
+            for k in struct.__dict__.keys():
+                if k in protected_keys:
+                    continue
+                var = vars(struct)[k]
+                if isinstance(var, list):
+                    var = np.array(var)
+                if isinstance(var, np.ndarray) and var.ndim >= 1 and var.shape[0] == N:
+                    vars(struct)[k] = reorder(var, axis=0)
+
+        _reorder_struct(self)
+        _reorder_struct(self.params)
+        _reorder_struct(self.data)
+
+        if hasattr(self, 'scope_data'):
+            for k in self.scope_data.keys():
+                for ch in self.scope_data[k].keys():
+                    for s in ['t', 'v']:
+                        y = np.asarray(vars(self.scope_data[k][ch])[s])
+                        if y.ndim >= 1 and y.shape[0] == N:
+                            vars(self.scope_data[k][ch])[s] = reorder(y, axis=0)
+
+        self.xvars = self._unpack_xvars()
 
     def _unshuffle_old_data(self):
         """Unshuffles data that was taken before we started saving data in
