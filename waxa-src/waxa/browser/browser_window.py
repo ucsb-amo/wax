@@ -1202,6 +1202,7 @@ class DataBrowserWindow(QMainWindow):
             }
             QLineEdit, QDateEdit, QPushButton, QComboBox, QListWidget, QTableWidget {
                 background: #ffffff;
+                color: #1f2a33;
                 border: 1px solid #d5dde4;
                 border-radius: 8px;
                 padding: 4px 7px;
@@ -1209,6 +1210,12 @@ class DataBrowserWindow(QMainWindow):
             }
             QLineEdit:focus, QDateEdit:focus, QTableWidget:focus, QComboBox:focus, QListWidget:focus {
                 border: 1px solid #6f93aa;
+            }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #1f2a33;
+                selection-background-color: #dcebf3;
+                selection-color: #13212b;
             }
             QPushButton, QToolButton {
                 background: #1d506b;
