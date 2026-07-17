@@ -146,7 +146,8 @@ class Scanner():
         if any(s.key == param_key for s in self._adjust_specs):
             raise ValueError(f"adjust key {param_key!r} already registered.")
         if param_key in self.xvarnames:
-            raise ValueError(f"adjust key {param_key!r} is already an xvar.")
+            print(f"Warning: adjust key {param_key!r} is already an xvar; skipping adjust registration.")
+            return
         if step is None:
             raw = (max_val - min_val) / 50.0
             step = max(1, round(raw)) if dtype == int else raw
