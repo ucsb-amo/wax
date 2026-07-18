@@ -39,7 +39,7 @@ class atomdata(atomdata_base):
         skip_saved_roi=False,
         transpose_idx=[],
         avg_repeats=False,
-        no_images=False,
+        ignore_images=False,
         server_talk=st(),
     ):
         super().__init__(
@@ -50,7 +50,7 @@ class atomdata(atomdata_base):
             skip_saved_roi=skip_saved_roi,
             transpose_idx=transpose_idx,
             avg_repeats=avg_repeats,
-            no_images=no_images,
+            ignore_images=ignore_images,
             server_talk=server_talk,
         )
 
@@ -64,18 +64,20 @@ class atomdata(atomdata_base):
     def save_roi_h5(self, printouts=False):
         return super().save_roi_h5(printouts=printouts)
 
-    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
         return super().save_lite_copy(
             roi_id=roi_id,
             use_saved_roi=use_saved_roi,
             force_reread=force_reread,
+            ignore_images=ignore_images,
         )
 
-    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
         return super().create_lite_copy(
             roi_id=roi_id,
             use_saved_roi=use_saved_roi,
             force_reread=force_reread,
+            ignore_images=ignore_images,
         )
 
     def unshuffle(self, reanalyze=True):
@@ -113,17 +115,7 @@ class atomdata(atomdata_base):
         if not getattr(self, '_has_images', True):
             # No camera images were captured for this run; skip all
             # image-based analysis and set image-derived attrs to None.
-            self.img_atoms = None
-            self.img_light = None
-            self.img_dark  = None
-            self.od_raw    = None
-            self.od        = None
-            self.sum_od_x  = None
-            self.sum_od_y  = None
-            self.integrated_od = None
-            self.atom_number   = None
-            self.cloudfit_x    = None
-            self.cloudfit_y    = None
+            self._clear_image_analysis_attrs()
             self._refresh_repeat_statistics()
             return
         import time as _time
@@ -175,6 +167,8 @@ class atomdata(atomdata_base):
 
     def analyze(self):
         if not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
             return
         self.compute_raw_ods()
         self.analyze_ods()

@@ -122,6 +122,11 @@ class AtomdataVault(atomdata_base):
         created. Only the non-image data (params, DataVault fields,
         scope_data, xvars) is stitched together. Image-based analysis is
         skipped and image-derived attributes are set to ``None``.
+    scope_merge : {'strict', 'pad_nan', 'skip'}
+        How to concatenate ``scope_data`` traces. ``'strict'`` preserves the
+        previous behavior and skips all scope data if trace dimensions differ.
+        ``'pad_nan'`` pads shorter traces along the sample axis before
+        concatenating shots. ``'skip'`` ignores scope data entirely.
     """
 
     def __init__(self,
@@ -133,7 +138,8 @@ class AtomdataVault(atomdata_base):
                  merge_overlap=True,
                  drop_raw_images=False,
                  auto_lite_threshold=8,
-                 ignore_images=False):
+                 ignore_images=False,
+                 scope_merge='pad_nan'):
 
         # Lightweight book-keeping expected by inherited helpers.
         self._lite = lite
@@ -145,6 +151,11 @@ class AtomdataVault(atomdata_base):
         # Vault-specific configuration.
         self._merge_overlap = bool(merge_overlap)
         self._drop_raw_images = bool(drop_raw_images)
+        if scope_merge not in ('strict', 'pad_nan', 'skip'):
+            raise ValueError(
+                "scope_merge must be one of 'strict', 'pad_nan', or 'skip'."
+            )
+        self._scope_merge = scope_merge
         # Kwargs needed to rebuild an equivalent vault (used by add_runs).
         self._build_kwargs = dict(
             roi_id=roi_id,
@@ -154,6 +165,8 @@ class AtomdataVault(atomdata_base):
             merge_overlap=merge_overlap,
             drop_raw_images=drop_raw_images,
             auto_lite_threshold=auto_lite_threshold,
+            ignore_images=ignore_images,
+            scope_merge=scope_merge,
         )
 
         self.avg: Optional[atomdata_base] = None
@@ -218,7 +231,7 @@ class AtomdataVault(atomdata_base):
                 # additional GUI opens.
                 if _first_run_id is None:
                     ad = atomdata(int(item), roi_id=roi_id, lite=lite,
-                                  no_images=self._ignore_images)
+                                  ignore_images=self._ignore_images)
                     _first_run_id = int(ad.run_info.run_id)
                     # Persist the ROI so subsequent int loads (and lite-dataset
                     # creation for each run) can find it by run_id.
@@ -227,7 +240,7 @@ class AtomdataVault(atomdata_base):
                 else:
                     _roi = roi_id if roi_id is not None else _first_run_id
                     ad = atomdata(int(item), roi_id=_roi, lite=lite,
-                                  no_images=self._ignore_images)
+                                  ignore_images=self._ignore_images)
                 ads.append(ad)
             else:
                 raise TypeError(
@@ -313,7 +326,7 @@ class AtomdataVault(atomdata_base):
 
         # Concatenate scope_data only if every chunk has it (and contains the
         # same scope/channel keys). Otherwise emit a warning and skip.
-        self._maybe_concat_scope_data(chunks)
+        self._maybe_concat_scope_data(chunks, mode=self._scope_merge)
 
         # Patch the scanned param to the concatenated array.
         setattr(self.params, xvarname, xvar_values)
@@ -400,11 +413,7 @@ class AtomdataVault(atomdata_base):
         for runs that captured no camera images (e.g. APD/scope-only runs),
         otherwise defer to the standard base pipeline."""
         if not getattr(self, '_has_images', True):
-            for attr in ('img_atoms', 'img_light', 'img_dark',
-                         'od_raw', 'od', 'sum_od_x', 'sum_od_y',
-                         'integrated_od', 'atom_number',
-                         'cloudfit_x', 'cloudfit_y'):
-                setattr(self, attr, None)
+            self._clear_image_analysis_attrs()
             self._refresh_repeat_statistics()
             return
         return atomdata_base._initial_analysis(self, transpose_idx, avg_repeats)
@@ -614,7 +623,32 @@ class AtomdataVault(atomdata_base):
 
         return dv
 
-    def _maybe_concat_scope_data(self, chunks):
+    @staticmethod
+    def _pad_scope_array(arr, target_len):
+        arr = np.asarray(arr)
+        if arr.ndim < 2:
+            raise ValueError(
+                f"expected a scope trace shaped (n_shots, n_samples), got {arr.shape}"
+            )
+        arr = arr.astype(np.float64, copy=False)
+        if arr.shape[-1] == target_len:
+            return arr
+        pad_width = [(0, 0)] * arr.ndim
+        pad_width[-1] = (0, int(target_len) - int(arr.shape[-1]))
+        return np.pad(arr, pad_width, mode='constant', constant_values=np.nan)
+
+    @staticmethod
+    def _scope_arrays_pad_compatible(parts):
+        shapes = [np.asarray(p).shape for p in parts]
+        if any(len(s) < 2 for s in shapes):
+            return False
+        base_ndim = len(shapes[0])
+        base_middle = shapes[0][1:-1]
+        return all(len(s) == base_ndim and s[1:-1] == base_middle for s in shapes)
+
+    def _maybe_concat_scope_data(self, chunks, mode='strict'):
+        if mode == 'skip':
+            return
         if not all(hasattr(c, 'scope_data') and bool(c.scope_data) for c in chunks):
             return
 
@@ -640,6 +674,29 @@ class AtomdataVault(atomdata_base):
                 for ch in ch_keys:
                     t_parts = [np.asarray(c.scope_data[scope_key][ch].t) for c in chunks]
                     v_parts = [np.asarray(c.scope_data[scope_key][ch].v) for c in chunks]
+                    if mode == 'pad_nan':
+                        if (not self._scope_arrays_pad_compatible(t_parts)
+                                or not self._scope_arrays_pad_compatible(v_parts)):
+                            warnings.warn(
+                                f"AtomdataVault: scope_data arrays for scope "
+                                f"'{scope_key}' channel {ch} have incompatible "
+                                f"shapes; skipping scope_data concatenation.",
+                                stacklevel=2,
+                            )
+                            return
+                        t_lengths = [int(t.shape[-1]) for t in t_parts]
+                        v_lengths = [int(v.shape[-1]) for v in v_parts]
+                        target_len = max(max(t_lengths), max(v_lengths))
+                        if len(set(t_lengths + v_lengths)) > 1:
+                            warnings.warn(
+                                f"AtomdataVault: scope_data traces for scope "
+                                f"'{scope_key}' channel {ch} have different "
+                                f"sample lengths {sorted(set(t_lengths + v_lengths))}; "
+                                f"padding shorter traces with NaN.",
+                                stacklevel=2,
+                            )
+                        t_parts = [self._pad_scope_array(t, target_len) for t in t_parts]
+                        v_parts = [self._pad_scope_array(v, target_len) for v in v_parts]
                     t_cat = np.concatenate(t_parts, axis=0)
                     v_cat = np.concatenate(v_parts, axis=0)
                     merged[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_cat, v_cat)
