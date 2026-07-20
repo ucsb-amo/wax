@@ -16,6 +16,8 @@ Key capabilities:
     * Per-shot provenance. ``vault.shot_run_id`` records which source run each
       shot came from (carried through the internal sort), enabling drift plots
       coloured by run, ``shots_from_run``, and ``drop_runs``.
+    * Source-run access. ``vault.run_info.run_id`` lists all source run IDs, and
+      ``vault.atomdata(run_id)`` returns an already-loaded source run object.
     * Memory controls for large jobs: ``auto_lite_threshold`` and
       ``drop_raw_images`` keep many-run loads tractable.
     * Builder-aware discovery: ``AtomdataVault.from_run_range`` /
@@ -53,9 +55,11 @@ if TYPE_CHECKING:
 
 
 def _flatten_inputs(inputs):
-    """Flatten a scalar / list / tuple / ndarray of mixed types into a list."""
+    """Flatten a scalar / range / list / tuple / ndarray into a list."""
     if inputs is None:
         raise ValueError("AtomdataVault requires at least one input.")
+    if isinstance(inputs, range):
+        return np.asarray(inputs).ravel().tolist()
     if isinstance(inputs, (list, tuple)):
         out = []
         for item in inputs:
@@ -127,6 +131,21 @@ class AtomdataVault(atomdata_base):
         previous behavior and skips all scope data if trace dimensions differ.
         ``'pad_nan'`` pads shorter traces along the sample axis before
         concatenating shots. ``'skip'`` ignores scope data entirely.
+    structure : {'prompt', 'auto', 'manual', None}
+        How to handle scalar fixed parameters that differ across source runs.
+        ``'auto'`` promotes the only clear disagreement to the first xvar axis
+        without asking (default); ``'prompt'`` asks first; ``'manual'`` or
+        ``None`` leaves the vault flat until ``set_xvar`` is called.
+    xvar_mode : {'rectangular', 'pad'}
+        Grid policy used by automatic/prompted ``set_xvar``. ``'rectangular'``
+        requires every promoted-param value to share the same existing xvar
+        sequence. ``'pad'`` preserves differing sequences in a padded grid and
+        currently requires ``ignore_images=True``.
+    promote_xvar : str or None
+        Explicit scalar fixed-parameter key to promote to the first xvar axis
+        after loading. If given, this takes precedence over ``structure``.
+    flatten_xvar : str, int, or None
+        Structured xvar key/index to flatten automatically after any promotion.
     """
 
     def __init__(self,
@@ -139,7 +158,11 @@ class AtomdataVault(atomdata_base):
                  drop_raw_images=False,
                  auto_lite_threshold=8,
                  ignore_images=False,
-                 scope_merge='pad_nan'):
+                 scope_merge='pad_nan',
+                 structure='auto',
+                 xvar_mode='pad',
+                 promote_xvar=None,
+                 flatten_xvar=None):
 
         # Lightweight book-keeping expected by inherited helpers.
         self._lite = lite
@@ -156,6 +179,8 @@ class AtomdataVault(atomdata_base):
                 "scope_merge must be one of 'strict', 'pad_nan', or 'skip'."
             )
         self._scope_merge = scope_merge
+        self._structure = structure
+        self._xvar_mode = xvar_mode
         # Kwargs needed to rebuild an equivalent vault (used by add_runs).
         self._build_kwargs = dict(
             roi_id=roi_id,
@@ -167,6 +192,10 @@ class AtomdataVault(atomdata_base):
             auto_lite_threshold=auto_lite_threshold,
             ignore_images=ignore_images,
             scope_merge=scope_merge,
+            structure=structure,
+            xvar_mode=xvar_mode,
+            promote_xvar=promote_xvar,
+            flatten_xvar=flatten_xvar,
         )
 
         self.avg: Optional[atomdata_base] = None
@@ -180,6 +209,9 @@ class AtomdataVault(atomdata_base):
         self._saved_roi_from_file = False
         # Per-run parameter audit, filled in by _warn_param_mismatches.
         self.param_disagreements = {}
+        self.source_param_values = {}
+        self._shot_param_values = {}
+        self._structured_xvars = False
 
         # 1. Normalize and materialize inputs.
         raw_inputs = _flatten_inputs(inputs)
@@ -276,12 +308,16 @@ class AtomdataVault(atomdata_base):
         first = chunks[0]
         xvarname = _decode_xvarname(first.xvarnames[0])
         self.source_run_ids = [int(c.run_info.run_id) for c in chunks]
+        self._source_atomdata_by_run_id = {
+            int(c.run_info.run_id): c for c in chunks
+        }
 
         # params: deep-copy first, then patch the scanned attribute below.
         self.params = copy.deepcopy(first.params)
         self.p = self.params
         self.camera_params = copy.deepcopy(first.camera_params)
         self.run_info = copy.deepcopy(first.run_info)
+        self.run_info.run_id = list(self.source_run_ids)
         self.experiment_code = getattr(first, 'experiment_code', None)
         self._has_images = (
             False if self._ignore_images
@@ -303,6 +339,7 @@ class AtomdataVault(atomdata_base):
                     int(c.run_info.run_id), dtype=np.int64)
             for c in chunks
         ])
+        self._build_shot_param_values(chunks)
 
         # Concatenate images / timestamps if present.
         # Keep a reference to the first chunk's raw images so the ROI GUI
@@ -402,6 +439,18 @@ class AtomdataVault(atomdata_base):
         # 7. Run the standard initial analysis pipeline.
         self._initial_analysis(transpose_idx=[], avg_repeats=False)
 
+        if promote_xvar is not None:
+            self.set_xvar(
+                promote_xvar,
+                xvar_mode=xvar_mode,
+                refresh_statistics=flatten_xvar is None,
+            )
+        else:
+            self._maybe_structure_from_param_disagreements(structure, xvar_mode)
+
+        if flatten_xvar is not None:
+            self.flatten_xvar(flatten_xvar)
+
         # 8. Optionally free the raw image stack now that derived quantities
         #    (od, atom_number, fits, ...) have been computed.
         if self._drop_raw_images and self._has_images:
@@ -417,6 +466,48 @@ class AtomdataVault(atomdata_base):
             self._refresh_repeat_statistics()
             return
         return atomdata_base._initial_analysis(self, transpose_idx, avg_repeats)
+
+    def _maybe_structure_from_param_disagreements(self, structure, xvar_mode):
+        if structure in (None, False, 'manual'):
+            return
+        if structure not in ('prompt', 'auto'):
+            raise ValueError(
+                "structure must be one of 'prompt', 'auto', 'manual', None, "
+                f"or False; got {structure!r}."
+            )
+
+        candidates = sorted(getattr(self, '_shot_param_values', {}).keys())
+        if len(candidates) == 0:
+            return
+        if len(candidates) > 1:
+            warnings.warn(
+                "AtomdataVault: multiple scalar fixed parameters differ across "
+                "input runs; leaving data flat. Choose one with "
+                "vault.set_xvar(param_key). Available keys: "
+                + ", ".join(candidates),
+                stacklevel=2,
+            )
+            return
+
+        param_key = candidates[0]
+        if structure == 'prompt':
+            try:
+                answer = input(
+                    "AtomdataVault: promote differing parameter "
+                    f"{param_key!r} to the first xvar axis? [y/N] "
+                )
+            except EOFError:
+                warnings.warn(
+                    "AtomdataVault: could not prompt for xvar structure; "
+                    f"leaving data flat. Call vault.set_xvar({param_key!r}) "
+                    "to structure it manually.",
+                    stacklevel=2,
+                )
+                return
+            if answer.strip().lower() not in ('y', 'yes'):
+                return
+
+        self.set_xvar(param_key, xvar_mode=xvar_mode)
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -538,6 +629,7 @@ class AtomdataVault(atomdata_base):
                 }
 
         self.param_disagreements = disagreements
+        self.source_param_values = disagreements
 
         if mismatched:
             warnings.warn(
@@ -547,6 +639,24 @@ class AtomdataVault(atomdata_base):
                 + ". Call vault.param_report() for a per-run breakdown.",
                 stacklevel=2,
             )
+
+    def _build_shot_param_values(self, chunks):
+        """Broadcast scalar per-run disagreement values onto the shot axis."""
+        shot_values = {}
+        for key in self.param_disagreements:
+            pieces = []
+            scalar_values = True
+            for c in chunks:
+                value = vars(c.params).get(key, None)
+                arr = np.asarray(value)
+                if arr.ndim != 0:
+                    scalar_values = False
+                    break
+                n_shots = int(np.asarray(c.xvars[0]).shape[0])
+                pieces.append(np.full(n_shots, arr.item()))
+            if scalar_values and pieces:
+                shot_values[key] = np.concatenate(pieces, axis=0)
+        self._shot_param_values = shot_values
 
     # ------------------------------------------------------------------
     # Concatenation helpers
@@ -740,6 +850,11 @@ class AtomdataVault(atomdata_base):
         if hasattr(self, 'shot_run_id'):
             self.shot_run_id = np.asarray(self.shot_run_id)[order]
 
+        for key, values in list(getattr(self, '_shot_param_values', {}).items()):
+            values = np.asarray(values)
+            if values.ndim >= 1 and values.shape[0] == n_old:
+                self._shot_param_values[key] = values[order]
+
         # Images / timestamps (raw interleaved or 1-per-shot).
         if self._has_images and np.asarray(self.images).size:
             Nf = int(self.params.N_pwa_per_shot) + 2
@@ -788,6 +903,508 @@ class AtomdataVault(atomdata_base):
         if hasattr(self.params, 'N_shots'):
             self.params.N_shots = n_new // nrep if nrep > 0 else n_new
 
+    def _reshape_axis0_to_first_xvar(self, arr, order, new_shape):
+        arr = np.asarray(arr)
+        if arr.ndim < 1 or arr.shape[0] != len(order):
+            return arr
+        arr = arr[np.asarray(order, dtype=int)]
+        return arr.reshape(*new_shape, *arr.shape[1:])
+
+    def _reshape_structured_axis0_arrays(self, order, new_shape):
+        n_old = len(order)
+        self.shot_run_id = self._reshape_axis0_to_first_xvar(
+            self.shot_run_id, order, new_shape
+        )
+
+        for key, values in list(getattr(self, '_shot_param_values', {}).items()):
+            values = np.asarray(values)
+            if values.ndim >= 1 and values.shape[0] == n_old:
+                self._shot_param_values[key] = self._reshape_axis0_to_first_xvar(
+                    values, order, new_shape
+                )
+
+        if self._has_images and np.asarray(self.images).size and self.images.shape[0] == n_old:
+            self.images = self._reshape_axis0_to_first_xvar(
+                self.images, order, new_shape
+            )
+            self.image_timestamps = self._reshape_axis0_to_first_xvar(
+                self.image_timestamps, order, new_shape
+            )
+
+        for key in self.data.keys:
+            arr = vars(self.data)[key]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == n_old:
+                vars(self.data)[key] = self._reshape_axis0_to_first_xvar(
+                    arr, order, new_shape
+                )
+
+        if hasattr(self, 'scope_data'):
+            for scope_key, ch_dict in self.scope_data.items():
+                for ch, trace in ch_dict.items():
+                    t = np.asarray(trace.t)
+                    v = np.asarray(trace.v)
+                    if t.ndim >= 1 and t.shape[0] == n_old:
+                        trace.t = self._reshape_axis0_to_first_xvar(
+                            t, order, new_shape
+                        )
+                    if v.ndim >= 1 and v.shape[0] == n_old:
+                        trace.v = self._reshape_axis0_to_first_xvar(
+                            v, order, new_shape
+                        )
+
+        _skip = {
+            'images', 'image_timestamps', 'shot_run_id', 'xvars', 'xvarnames',
+            'xvardims', 'data', 'scope_data', 'params', 'p', 'camera_params',
+            'run_info', 'roi', 'avg', 'std', 'sem', 'sort_idx', 'sort_N',
+        }
+        for key, val in list(vars(self).items()):
+            if key in _skip or key.startswith('_'):
+                continue
+            if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == n_old:
+                vars(self)[key] = self._reshape_axis0_to_first_xvar(
+                    val, order, new_shape
+                )
+
+    @staticmethod
+    def _build_padded_order_grid(param_values, old_xvar, param_unique, sort=True):
+        row_orders = []
+        max_len = 0
+        for param_value in param_unique:
+            idx = np.where(param_values == param_value)[0]
+            if idx.size == 0:
+                raise ValueError(f'No shots found for promoted xvar value {param_value!r}.')
+            if sort:
+                idx = idx[np.argsort(old_xvar[idx], kind='stable')]
+            row_orders.append(idx)
+            max_len = max(max_len, int(idx.size))
+
+        order_grid = np.full((len(param_unique), max_len), -1, dtype=int)
+        old_xvar_grid = np.full((len(param_unique), max_len), np.nan, dtype=np.float64)
+        for row_idx, idx in enumerate(row_orders):
+            n = int(idx.size)
+            order_grid[row_idx, :n] = idx
+            old_xvar_grid[row_idx, :n] = np.asarray(old_xvar, dtype=np.float64)[idx]
+        return order_grid, old_xvar_grid
+
+    @staticmethod
+    def _pad_axis0_ndarray(arr, order_grid):
+        arr = np.asarray(arr)
+        if arr.ndim < 1:
+            return arr
+        valid = order_grid >= 0
+        trailing_shape = arr.shape[1:]
+        out_shape = tuple(order_grid.shape) + trailing_shape
+        if np.issubdtype(arr.dtype, np.number):
+            out = np.full(out_shape, np.nan, dtype=np.float64)
+        else:
+            out = np.full(out_shape, None, dtype=object)
+        if np.any(valid):
+            out[valid] = arr[order_grid[valid]]
+        return out
+
+    @staticmethod
+    def _pad_scope_trace_axis0(arr, order_grid):
+        arr = np.asarray(arr)
+        if arr.ndim < 1:
+            return arr
+        out = np.full(tuple(order_grid.shape), None, dtype=object)
+        valid = order_grid >= 0
+        if np.any(valid):
+            rows = arr[order_grid[valid]]
+            for idx, row in zip(zip(*np.where(valid)), rows):
+                out[idx] = row
+        return out
+
+    def _reshape_padded_axis0_arrays(self, order_grid):
+        n_old = int(np.max(order_grid)) + 1 if np.any(order_grid >= 0) else 0
+
+        if hasattr(self, 'shot_run_id'):
+            self.shot_run_id = self._pad_axis0_ndarray(
+                np.asarray(self.shot_run_id, dtype=object), order_grid
+            )
+
+        for key, values in list(getattr(self, '_shot_param_values', {}).items()):
+            values = np.asarray(values)
+            if values.ndim >= 1 and values.shape[0] == n_old:
+                self._shot_param_values[key] = self._pad_axis0_ndarray(
+                    values, order_grid
+                )
+
+        for key in self.data.keys:
+            arr = vars(self.data)[key]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 1 and arr.shape[0] == n_old:
+                vars(self.data)[key] = self._pad_axis0_ndarray(arr, order_grid)
+
+        if hasattr(self, 'scope_data'):
+            for scope_key, ch_dict in self.scope_data.items():
+                for ch, trace in ch_dict.items():
+                    t = np.asarray(trace.t)
+                    v = np.asarray(trace.v)
+                    if t.ndim >= 1 and t.shape[0] == n_old:
+                        trace.t = self._pad_scope_trace_axis0(t, order_grid)
+                    if v.ndim >= 1 and v.shape[0] == n_old:
+                        trace.v = self._pad_scope_trace_axis0(v, order_grid)
+
+        _skip = {
+            'images', 'image_timestamps', 'shot_run_id', 'xvars', 'xvarnames',
+            'xvardims', 'data', 'scope_data', 'params', 'p', 'camera_params',
+            'run_info', 'roi', 'avg', 'std', 'sem', 'sort_idx', 'sort_N',
+        }
+        for key, val in list(vars(self).items()):
+            if key in _skip or key.startswith('_'):
+                continue
+            if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == n_old:
+                vars(self)[key] = self._pad_axis0_ndarray(val, order_grid)
+
+    @staticmethod
+    def _stable_unique(values):
+        values = np.asarray(values)
+        _, idx = np.unique(values, return_index=True)
+        return values[np.sort(idx)]
+
+    def set_xvar(self, param_key, xvar_idx=None, *, xvar_mode='rectangular',
+                 sort=True, reanalyze=True, refresh_statistics=True):
+        """Promote a scalar per-run parameter to the first xvar axis.
+
+        ``xvar_mode='rectangular'`` supports the common builder pattern where
+        each value of ``param_key`` owns the same ordered sequence of shots on
+        the existing xvar. ``xvar_mode='pad'`` preserves uneven sequences in a
+        padded two-axis grid and currently requires ``ignore_images=True``.
+        """
+        if xvar_idx not in (None, 0):
+            raise NotImplementedError(
+                'AtomdataVault.set_xvar currently always inserts the new xvar '
+                'at axis 0; pass xvar_idx=None or xvar_idx=0.'
+            )
+        if xvar_mode not in ('rectangular', 'pad'):
+            raise ValueError(
+                "xvar_mode must be one of 'rectangular' or 'pad'; "
+                f"got {xvar_mode!r}."
+            )
+        if int(getattr(self, 'Nvars', 0)) != 1:
+            raise NotImplementedError(
+                'AtomdataVault.set_xvar currently supports vaults with one '
+                'existing xvar. Additional set_xvar calls are not implemented yet.'
+            )
+        if param_key not in getattr(self, '_shot_param_values', {}):
+            available = sorted(getattr(self, '_shot_param_values', {}).keys())
+            raise KeyError(
+                f"No scalar per-shot values are available for param "
+                f"{param_key!r}. Available keys: {available}."
+            )
+
+        param_values = np.asarray(self._shot_param_values[param_key])
+        old_xvar = np.asarray(self.xvars[0])
+        if param_values.shape[0] != old_xvar.shape[0]:
+            raise ValueError(
+                f"Param {param_key!r} has {param_values.shape[0]} shot values, "
+                f"but the vault xvar has {old_xvar.shape[0]} shots."
+            )
+        if xvar_mode == 'pad' and getattr(self, '_has_images', True):
+            raise NotImplementedError(
+                "AtomdataVault.set_xvar(..., xvar_mode='pad') currently "
+                "requires ignore_images=True. Rebuild the vault with "
+                "ignore_images=True or use xvar_mode='rectangular'."
+            )
+
+        param_unique = self._stable_unique(param_values)
+        if sort:
+            try:
+                param_unique = np.sort(param_unique)
+            except TypeError:
+                pass
+
+        old_xvarname = self.xvarnames[0]
+        if xvar_mode == 'pad':
+            order_grid, old_xvar_grid = self._build_padded_order_grid(
+                param_values, old_xvar, param_unique, sort=sort
+            )
+            self._reshape_padded_axis0_arrays(order_grid)
+
+            self.xvarnames = [str(param_key), old_xvarname]
+            self.xvars = [np.array(param_unique, copy=True), old_xvar_grid]
+            self.xvardims = np.array(order_grid.shape, dtype=int)
+            self.Nvars = 2
+            setattr(self.params, str(param_key), self.xvars[0])
+            setattr(self.params, old_xvarname, self.xvars[1])
+
+            self.params.N_repeats = np.array([1, 1], dtype=int)
+            self.params.N_shots_with_repeats = int(np.count_nonzero(order_grid >= 0))
+            if hasattr(self.params, 'N_shots'):
+                self.params.N_shots = int(np.count_nonzero(order_grid >= 0))
+
+            self.sort_idx = np.array([])
+            self.sort_N = np.array([])
+            self._structured_xvars = True
+            self._padded_xvar_mask = order_grid >= 0
+            self._dealer = self._init_dealer()
+
+            if not getattr(self, '_has_images', True):
+                self._clear_image_analysis_attrs()
+            if refresh_statistics:
+                self._refresh_repeat_statistics()
+            return self
+
+        order_parts = []
+        reference_xvar = None
+        for param_value in param_unique:
+            idx = np.where(param_values == param_value)[0]
+            if idx.size == 0:
+                raise ValueError(f'No shots found for {param_key}={param_value!r}.')
+            if sort:
+                idx = idx[np.argsort(old_xvar[idx], kind='stable')]
+            this_xvar = old_xvar[idx]
+            if reference_xvar is None:
+                reference_xvar = np.array(this_xvar, copy=True)
+            elif (this_xvar.shape != reference_xvar.shape
+                    or not np.array_equal(this_xvar, reference_xvar)):
+                raise ValueError(
+                    f"Cannot promote {param_key!r} to an xvar because its "
+                    "values do not form a rectangular grid with the existing "
+                    f"xvar {self.xvarnames[0]!r}. Pass xvar_mode='pad' "
+                    "or choose a different param."
+                )
+            order_parts.append(idx)
+
+        order = np.concatenate(order_parts)
+        new_shape = (len(param_unique), len(reference_xvar))
+        self._reshape_structured_axis0_arrays(order, new_shape)
+
+        self.xvarnames = [str(param_key), old_xvarname]
+        self.xvars = [np.array(param_unique, copy=True), reference_xvar]
+        self.xvardims = np.array(new_shape, dtype=int)
+        self.Nvars = 2
+        setattr(self.params, str(param_key), self.xvars[0])
+        setattr(self.params, old_xvarname, self.xvars[1])
+
+        _, counts = np.unique(reference_xvar, return_counts=True)
+        repeated_counts = counts[counts > 1]
+        n_repeats = 1
+        if repeated_counts.size:
+            unique_counts = np.unique(repeated_counts)
+            if unique_counts.size == 1:
+                n_repeats = int(unique_counts[0])
+        self.params.N_repeats = np.array([1, n_repeats], dtype=int)
+        self.params.N_shots_with_repeats = int(np.prod(self.xvardims))
+        if hasattr(self.params, 'N_shots'):
+            self.params.N_shots = int(len(param_unique) * len(np.unique(reference_xvar)))
+
+        self.sort_idx = np.array([])
+        self.sort_N = np.array([])
+        self._structured_xvars = True
+        self._dealer = self._init_dealer()
+
+        if reanalyze and getattr(self, '_has_images', True) and 'od_raw' in vars(self):
+            self.analyze_ods()
+        elif not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+        if refresh_statistics:
+            self._refresh_repeat_statistics()
+        return self
+
+    def _flatten_structured_ndarray(self, arr, old_dims):
+        arr = np.asarray(arr)
+        if arr.ndim < len(old_dims):
+            return arr
+        if tuple(arr.shape[:len(old_dims)]) != tuple(old_dims):
+            return arr
+        return arr.reshape(int(np.prod(old_dims)), *arr.shape[len(old_dims):])
+
+    @staticmethod
+    def _flatten_padded_ndarray(arr, old_dims, valid_mask):
+        arr = np.asarray(arr)
+        if arr.ndim < len(old_dims):
+            return arr
+        if tuple(arr.shape[:len(old_dims)]) != tuple(old_dims):
+            return arr
+        return arr[np.asarray(valid_mask, dtype=bool)]
+
+    def flatten_xvar(self, xvar_param_key_or_idx, *, reanalyze=True):
+        """Treat one structured xvar as repeated shots on the adjacent axis.
+
+        Supports two-axis vaults. For the monitored Rabi use case,
+        ``set_xvar('amp_imaging')`` produces ``['amp_imaging', 'dummy']``;
+        ``flatten_xvar('dummy')`` then removes ``dummy`` and leaves a one-axis
+        vault whose ``amp_imaging`` xvar has repeated values. If the structured
+        grid was padded, missing cells are dropped during flattening.
+        """
+        if int(getattr(self, 'Nvars', 0)) != 2:
+            raise NotImplementedError(
+                'AtomdataVault.flatten_xvar currently supports two-axis '
+                'structured vaults only.'
+            )
+
+        if isinstance(xvar_param_key_or_idx, (int, np.integer)):
+            flatten_idx = int(xvar_param_key_or_idx)
+        else:
+            try:
+                flatten_idx = list(self.xvarnames).index(str(xvar_param_key_or_idx))
+            except ValueError as e:
+                raise KeyError(
+                    f"Unknown xvar {xvar_param_key_or_idx!r}; available "
+                    f"xvars are {list(self.xvarnames)}."
+                ) from e
+        if flatten_idx not in (0, 1):
+            raise IndexError('xvar index is out of range for this vault.')
+
+        keep_idx = 1 - flatten_idx
+        old_dims = tuple(np.asarray(self.xvardims, dtype=int))
+        padded_mask = getattr(self, '_padded_xvar_mask', None)
+        if padded_mask is not None:
+            valid_mask = np.asarray(padded_mask, dtype=bool)
+            if valid_mask.shape != old_dims:
+                raise ValueError(
+                    'Padded xvar mask shape does not match xvardims: '
+                    f'{valid_mask.shape} vs {old_dims}.'
+                )
+
+            if keep_idx == 0:
+                keep_values = np.asarray(self.xvars[0])
+                keep_grid = np.broadcast_to(
+                    keep_values.reshape((-1, 1)), old_dims
+                )
+                new_xvar = keep_grid[valid_mask]
+            else:
+                keep_grid = np.asarray(self.xvars[1])
+                if keep_grid.shape != old_dims:
+                    keep_grid = np.broadcast_to(keep_grid, old_dims)
+                new_xvar = keep_grid[valid_mask]
+
+            if hasattr(self, 'shot_run_id'):
+                self.shot_run_id = self._flatten_padded_ndarray(
+                    self.shot_run_id, old_dims, valid_mask
+                )
+
+            for key, values in list(getattr(self, '_shot_param_values', {}).items()):
+                self._shot_param_values[key] = self._flatten_padded_ndarray(
+                    values, old_dims, valid_mask
+                )
+
+            for key in self.data.keys:
+                value = vars(self.data)[key]
+                if isinstance(value, np.ndarray):
+                    vars(self.data)[key] = self._flatten_padded_ndarray(
+                        value, old_dims, valid_mask
+                    )
+
+            if hasattr(self, 'scope_data'):
+                for scope_key, ch_dict in self.scope_data.items():
+                    for ch, trace in ch_dict.items():
+                        trace.t = self._flatten_padded_ndarray(
+                            trace.t, old_dims, valid_mask
+                        )
+                        trace.v = self._flatten_padded_ndarray(
+                            trace.v, old_dims, valid_mask
+                        )
+
+            _skip = {
+                'images', 'image_timestamps', 'shot_run_id', 'xvars', 'xvarnames',
+                'xvardims', 'data', 'scope_data', 'params', 'p', 'camera_params',
+                'run_info', 'roi', 'avg', 'std', 'sem', 'sort_idx', 'sort_N',
+            }
+            for key, val in list(vars(self).items()):
+                if key in _skip or key.startswith('_'):
+                    continue
+                if isinstance(val, np.ndarray):
+                    vars(self)[key] = self._flatten_padded_ndarray(
+                        val, old_dims, valid_mask
+                    )
+
+            keep_name = self.xvarnames[keep_idx]
+            self.xvarnames = [keep_name]
+            self.xvars = [new_xvar]
+            self.xvardims = np.array([new_xvar.shape[0]], dtype=int)
+            self.Nvars = 1
+            setattr(self.params, keep_name, new_xvar)
+            self.params.N_repeats = 1
+            self.params.N_shots_with_repeats = int(new_xvar.shape[0])
+            if hasattr(self.params, 'N_shots'):
+                self.params.N_shots = int(new_xvar.shape[0])
+
+            self.sort_idx = np.array([])
+            self.sort_N = np.array([])
+            self._structured_xvars = False
+            self._padded_xvar_mask = None
+            self._dealer = self._init_dealer()
+
+            if reanalyze and getattr(self, '_has_images', True) and 'od_raw' in vars(self):
+                self.analyze_ods()
+            elif not getattr(self, '_has_images', True):
+                self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
+            return self
+
+        keep_values = np.asarray(self.xvars[keep_idx])
+        flatten_len = int(old_dims[flatten_idx])
+        keep_len = int(old_dims[keep_idx])
+
+        if flatten_idx == 1:
+            new_xvar = np.repeat(keep_values, flatten_len)
+        else:
+            new_xvar = np.tile(keep_values, flatten_len)
+
+        if hasattr(self, 'shot_run_id'):
+            self.shot_run_id = self._flatten_structured_ndarray(
+                self.shot_run_id, old_dims
+            )
+
+        for key, values in list(getattr(self, '_shot_param_values', {}).items()):
+            values = np.asarray(values)
+            self._shot_param_values[key] = self._flatten_structured_ndarray(
+                values, old_dims
+            )
+
+        if self._has_images and np.asarray(self.images).size:
+            self.images = self._flatten_structured_ndarray(self.images, old_dims)
+            self.image_timestamps = self._flatten_structured_ndarray(
+                self.image_timestamps, old_dims
+            )
+
+        for key in self.data.keys:
+            value = vars(self.data)[key]
+            if isinstance(value, np.ndarray):
+                vars(self.data)[key] = self._flatten_structured_ndarray(value, old_dims)
+
+        if hasattr(self, 'scope_data'):
+            for scope_key, ch_dict in self.scope_data.items():
+                for ch, trace in ch_dict.items():
+                    trace.t = self._flatten_structured_ndarray(trace.t, old_dims)
+                    trace.v = self._flatten_structured_ndarray(trace.v, old_dims)
+
+        _skip = {
+            'images', 'image_timestamps', 'shot_run_id', 'xvars', 'xvarnames',
+            'xvardims', 'data', 'scope_data', 'params', 'p', 'camera_params',
+            'run_info', 'roi', 'avg', 'std', 'sem', 'sort_idx', 'sort_N',
+        }
+        for key, val in list(vars(self).items()):
+            if key in _skip or key.startswith('_'):
+                continue
+            if isinstance(val, np.ndarray):
+                vars(self)[key] = self._flatten_structured_ndarray(val, old_dims)
+
+        keep_name = self.xvarnames[keep_idx]
+        self.xvarnames = [keep_name]
+        self.xvars = [new_xvar]
+        self.xvardims = np.array([new_xvar.shape[0]], dtype=int)
+        self.Nvars = 1
+        setattr(self.params, keep_name, new_xvar)
+        self.params.N_repeats = flatten_len if keep_idx == 0 else keep_len
+        self.params.N_shots_with_repeats = int(new_xvar.shape[0])
+        if hasattr(self.params, 'N_shots'):
+            self.params.N_shots = int(len(np.unique(keep_values)))
+
+        self.sort_idx = np.array([])
+        self.sort_N = np.array([])
+        self._structured_xvars = False
+        self._dealer = self._init_dealer()
+
+        if reanalyze and getattr(self, '_has_images', True) and 'od_raw' in vars(self):
+            self.analyze_ods()
+        elif not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+        self._refresh_repeat_statistics()
+        return self
+
     # ------------------------------------------------------------------
     # Ragged-repeat-aware statistics (avg / std / sem by unique xvar value)
     # ------------------------------------------------------------------
@@ -802,7 +1419,7 @@ class AtomdataVault(atomdata_base):
             'data', 'scope_data', '_analysis_tags', '_dealer',
             '_ds', 'server_talk',
             'shot_run_id', 'source_run_ids', 'source_repeat_counts',
-            'param_disagreements', 'sort_idx', 'sort_N',
+            'param_disagreements', 'source_param_values', 'sort_idx', 'sort_N',
             'xvars', 'xvarnames', 'xvardims',
         }
 
@@ -974,7 +1591,7 @@ class AtomdataVault(atomdata_base):
     def _refresh_repeat_statistics(self):
         """Override: group by unique xvar value so overlapping ranges with
         ragged repeat counts average correctly."""
-        if not self._merge_overlap:
+        if not self._merge_overlap or int(getattr(self, 'Nvars', 1)) != 1:
             return atomdata_base._refresh_repeat_statistics(self)
         self._build_grouped_statistics()
 
@@ -1056,11 +1673,34 @@ class AtomdataVault(atomdata_base):
     def shots_from_run(self, run_id):
         """Boolean mask selecting the shots that came from ``run_id``."""
         rid = np.asarray(self.shot_run_id)
-        if rid.dtype == object:
+        if rid.dtype == object and any(
+                item is not None and np.asarray(item).ndim > 0
+                for item in rid.ravel()):
             raise RuntimeError(
                 'Per-shot provenance is unavailable after collapse_to_unique.'
             )
         return rid == int(run_id)
+
+    def atomdata(self, run_id, *, copy_obj=False):
+        """Return the already-loaded source ``atomdata`` for ``run_id``.
+
+        The returned object is the materialized source chunk used to build this
+        vault, so it reflects the vault's construction options (``lite``,
+        ``ignore_images``, ROI reuse, and any construction-time unshuffle copy)
+        without reloading from disk. Pass ``copy_obj=True`` to get a deep copy
+        that can be mutated independently.
+        """
+        rid = int(run_id)
+        try:
+            ad = self._source_atomdata_by_run_id[rid]
+        except KeyError as e:
+            raise KeyError(
+                f"Run ID {rid} is not part of this AtomdataVault. Available "
+                f"run IDs: {list(self.source_run_ids)}."
+            ) from e
+        if copy_obj:
+            return copy.deepcopy(ad)
+        return ad
 
     def drop_runs(self, run_ids, reanalyze=True):
         """Remove every shot belonging to ``run_ids`` and refresh statistics.
@@ -1074,7 +1714,13 @@ class AtomdataVault(atomdata_base):
         if not hasattr(self, 'shot_run_id'):
             raise RuntimeError('shot_run_id provenance is unavailable.')
         rid = np.asarray(self.shot_run_id)
-        if rid.dtype == object:
+        if rid.ndim != 1:
+            raise RuntimeError(
+                'drop_runs is only available on flat, unstructured vaults.'
+            )
+        if rid.dtype == object and any(
+                item is not None and np.asarray(item).ndim > 0
+                for item in rid.ravel()):
             raise RuntimeError(
                 'drop_runs is unavailable after collapse_to_unique.'
             )
@@ -1092,6 +1738,9 @@ class AtomdataVault(atomdata_base):
 
         self._reorder_shots(keep)
         self.source_run_ids = [r for r in self.source_run_ids if r not in drop]
+        for rid_to_drop in drop:
+            self._source_atomdata_by_run_id.pop(rid_to_drop, None)
+        self.run_info.run_id = list(self.source_run_ids)
 
         if reanalyze and 'od_raw' in vars(self):
             self.analyze_ods()
