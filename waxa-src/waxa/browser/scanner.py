@@ -1,7 +1,9 @@
 import glob
 import json
+import logging
 import os
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
@@ -10,6 +12,7 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 _SCAN_WORKERS = 8  # parallel HDF5 reader threads
+LOGGER = logging.getLogger(__name__)
 
 from .cache import MetadataCache
 from ..plotting.plotting_1d import detect_unit
@@ -24,6 +27,10 @@ EXCLUDED_DATA_KEYS = {
 }
 
 PARAM_SEARCH_MODES = ("params", "camera_params", "data")
+
+
+def _format_worker_exception(context: str, exc: Exception):
+    return f"{context}: {exc}\n{traceback.format_exc()}"
 
 
 def _decode_str(value):
@@ -534,7 +541,9 @@ class ScanWorker(QThread):
                 self.run_batch_found.emit(batch)
             self.scan_done.emit(count)
         except Exception as exc:
-            self.scan_error.emit(str(exc))
+            message = _format_worker_exception("ScanWorker failed", exc)
+            LOGGER.error(message)
+            self.scan_error.emit(message)
 
 
 def _summarize_xvar_values(name: str, values) -> dict:
@@ -660,7 +669,9 @@ class XvarDetailLoader(QThread):
                 self.details_ready.emit(details)
         except Exception as exc:
             if not self.isInterruptionRequested():
-                self.details_error.emit(str(exc))
+                message = _format_worker_exception(f"XvarDetailLoader failed for {self.filepath}", exc)
+                LOGGER.error(message)
+                self.details_error.emit(message)
 
 
 class ParamSearchLoader(QThread):
@@ -691,7 +702,10 @@ class ParamSearchLoader(QThread):
                 records["data"] = self._load_data_records(f)
             self.records_ready.emit(records)
         except Exception as exc:
-            self.load_error.emit(str(exc))
+            if not self.isInterruptionRequested():
+                message = _format_worker_exception(f"ParamSearchLoader failed for {self.filepath}", exc)
+                LOGGER.error(message)
+                self.load_error.emit(message)
 
     def _load_group_records(self, h5file, group_name: str):
         if group_name not in h5file:
@@ -752,7 +766,9 @@ class LiteCreateWorker(QThread):
             lite_path, _ = talk.get_data_file(self.run_id, lite=True)
             self.created.emit(self.run_id, lite_path)
         except Exception as exc:
-            self.error.emit(str(exc))
+            message = _format_worker_exception(f"LiteCreateWorker failed for run {self.run_id}", exc)
+            LOGGER.error(message)
+            self.error.emit(message)
 
 
 class BatchLiteCreateWorker(QThread):
@@ -798,4 +814,6 @@ class BatchLiteCreateWorker(QThread):
 
             self.completed.emit(created_count, total)
         except Exception as exc:
-            self.error.emit(str(exc))
+            message = _format_worker_exception(f"BatchLiteCreateWorker failed for runs {self.run_ids}", exc)
+            LOGGER.error(message)
+            self.error.emit(message)

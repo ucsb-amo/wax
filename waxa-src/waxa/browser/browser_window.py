@@ -5,7 +5,7 @@ import re
 import sys
 from datetime import date, timedelta
 
-from PyQt6.QtCore import QDate, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QDate, QItemSelectionModel, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontDatabase, QKeySequence, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -57,6 +57,27 @@ from ..data.server_talk import server_talk
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_browser_logging():
+    """Ensure browser diagnostics reach the launching terminal."""
+    browser_logger = logging.getLogger("waxa.browser")
+    browser_logger.setLevel(logging.DEBUG)
+
+    for handler in browser_logger.handlers:
+        if getattr(handler, "_waxa_browser_terminal_handler", False):
+            return
+
+    handler = logging.StreamHandler()
+    handler._waxa_browser_terminal_handler = True
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(threadName)s | %(message)s",
+        "%H:%M:%S",
+    ))
+    browser_logger.addHandler(handler)
+    browser_logger.propagate = False
+    LOGGER.debug("Browser logging configured for terminal output")
 
 
 def parse_name_search_terms(query: str):
@@ -350,6 +371,12 @@ class ParamSearchDialog(QDialog):
         self.status_label.setText("Load failed")
         self.results_table.setRowCount(0)
         self.detail_value.setPlainText(message)
+
+    def set_stale_run_message(self, run_id: int):
+        self.setWindowTitle(f"Run {run_id} - Param Search")
+        self.run_badge.setText(f"run {run_id} outside range")
+        self.status_label.setText("Showing stale values; run is outside the current load range")
+        self._apply_badge_style()
 
     def set_records(self, records_by_mode: dict):
         self._records_by_mode = {mode: list(records_by_mode.get(mode, [])) for mode in PARAM_SEARCH_MODES}
@@ -813,6 +840,10 @@ class DataBrowserWindow(QMainWindow):
         self._xvar_loader = None
         self._running_xvar_loaders: set = set()
         self._param_search_loader = None
+        self._running_param_search_loaders: set = set()
+        self._pending_scan_runs = []
+        self._pending_scan_request_id = None
+        self._scan_restore_state = None
         self._lite_worker = None
         self._run_id_lookup_worker = None
         self._latest_run_check_worker = None
@@ -829,6 +860,7 @@ class DataBrowserWindow(QMainWindow):
         self._busy_ops = 0
         self._pending_focus_run_id = None
         self._pending_requested_run_id = None
+        self._detail_pane_run_id = None
         self._param_search_dialog = None
         self._param_search_current_run_id = None
         self._param_search_loading_run_id = None
@@ -1349,6 +1381,152 @@ class DataBrowserWindow(QMainWindow):
         font.setPointSize(10)
         return font
 
+    def _current_selected_run_ids(self):
+        run_ids = []
+        for row in self._get_selected_rows():
+            run = self._get_run_for_row(row)
+            if run is not None:
+                run_ids.append(int(run.run_id))
+        return run_ids
+
+    def _visible_row_count(self):
+        return sum(1 for row in range(self.table.rowCount()) if not self.table.isRowHidden(row))
+
+    def _capture_scan_restore_state(self, scan_request_id: int):
+        current_run = self._get_run_for_row(self._get_selected_row())
+        focus_widget = QApplication.focusWidget()
+        state = {
+            "scan_request_id": int(scan_request_id),
+            "selected_run_ids": self._current_selected_run_ids(),
+            "current_run_id": None if current_run is None else int(current_run.run_id),
+            "detail_run_id": self._detail_pane_run_id,
+            "param_current_run_id": self._param_search_current_run_id,
+            "param_loading_run_id": self._param_search_loading_run_id,
+            "param_visible": bool(self._param_search_dialog is not None and self._param_search_dialog.isVisible()),
+            "focus_widget": focus_widget,
+            "scroll_value": self.table.verticalScrollBar().value(),
+            "old_row_count": self.table.rowCount(),
+            "old_visible_count": self._visible_row_count(),
+            "filters": {
+                "run_id_jump": self.run_id_jump_input.text(),
+                "experiment": self.experiment_filter_input.text(),
+                "xvar": self.search_input.text(),
+                "tag": self.tag_filter_input.text(),
+            },
+        }
+        LOGGER.debug(
+            "Scan state captured: request_id=%s selected=%s current=%s detail=%s param_current=%s "
+            "param_loading=%s param_visible=%s rows=%s visible=%s filters=%s focus=%s scroll=%s",
+            state["scan_request_id"],
+            state["selected_run_ids"],
+            state["current_run_id"],
+            state["detail_run_id"],
+            state["param_current_run_id"],
+            state["param_loading_run_id"],
+            state["param_visible"],
+            state["old_row_count"],
+            state["old_visible_count"],
+            state["filters"],
+            type(focus_widget).__name__ if focus_widget is not None else None,
+            state["scroll_value"],
+        )
+        return state
+
+    def _replace_table_with_runs(self, runs: list):
+        LOGGER.debug("Replacing table contents: new_run_count=%s old_row_count=%s", len(runs), self.table.rowCount())
+        previous_sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearSelection()
+            self.table.setRowCount(0)
+            self._runs_by_id = {}
+            self._scan_loaded_count = 0
+            for run in runs:
+                self._append_run(run)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.blockSignals(False)
+            self.table.setSortingEnabled(previous_sorting)
+
+    def _restore_scan_state(self, state: dict | None):
+        if not state:
+            return
+
+        selected_run_ids = [int(run_id) for run_id in state.get("selected_run_ids", [])]
+        surviving_selected = [run_id for run_id in selected_run_ids if run_id in self._runs_by_id]
+        dropped_selected = [run_id for run_id in selected_run_ids if run_id not in self._runs_by_id]
+        current_run_id = state.get("current_run_id")
+        detail_run_id = state.get("detail_run_id")
+
+        LOGGER.debug(
+            "Restoring scan state: request_id=%s surviving_selected=%s dropped_selected=%s current=%s detail=%s rows=%s",
+            state.get("scan_request_id"),
+            surviving_selected,
+            dropped_selected,
+            current_run_id,
+            detail_run_id,
+            self.table.rowCount(),
+        )
+
+        self.table.blockSignals(True)
+        try:
+            self.table.clearSelection()
+            selection_model = self.table.selectionModel()
+            for run_id in surviving_selected:
+                row = self._find_row_for_run_id(run_id)
+                if row is None:
+                    continue
+                index = self.table.model().index(row, self.COL_RUN_ID)
+                selection_model.select(
+                    index,
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+
+            focus_run_id = current_run_id if current_run_id in surviving_selected else (surviving_selected[0] if surviving_selected else None)
+            if focus_run_id is not None:
+                row = self._find_row_for_run_id(focus_run_id)
+                if row is not None:
+                    self.table.setCurrentCell(row, self.COL_RUN_ID)
+                    item = self.table.item(row, self.COL_RUN_ID)
+                    if item is not None:
+                        self.table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+            else:
+                self.table.verticalScrollBar().setValue(int(state.get("scroll_value", 0)))
+        finally:
+            self.table.blockSignals(False)
+
+        focus_widget = state.get("focus_widget")
+        if focus_widget is not None:
+            try:
+                focus_widget.setFocus()
+            except RuntimeError:
+                LOGGER.debug("Could not restore focus widget; it was deleted during scan")
+
+        if surviving_selected:
+            self._on_selection_changed()
+        else:
+            self._set_stat_chip_value(self.selected_chip, "none")
+            if detail_run_id is not None and int(detail_run_id) not in self._runs_by_id:
+                self.status_label.setText(f"Run {detail_run_id} is outside the current range; showing stale details")
+                LOGGER.info("Detail pane kept stale: run_id=%s outside current scan range", detail_run_id)
+            elif detail_run_id is not None:
+                run = self._runs_by_id.get(int(detail_run_id))
+                if run is not None:
+                    self._show_run_details(run)
+
+        if dropped_selected:
+            LOGGER.info("Selection partially dropped after scan: dropped_run_ids=%s", dropped_selected)
+
+        if state.get("param_visible"):
+            param_run_id = state.get("param_current_run_id") or state.get("param_loading_run_id")
+            if param_run_id is not None and int(param_run_id) not in self._runs_by_id:
+                dialog = self._param_search_dialog
+                if dialog is not None:
+                    dialog.set_stale_run_message(int(param_run_id))
+                LOGGER.info("Param search kept stale: run_id=%s outside current scan range", param_run_id)
+
     def _start_scan(self):
         if not self.data_dir:
             self.status_label.setText("DATA_DIR is empty")
@@ -1366,25 +1544,24 @@ class DataBrowserWindow(QMainWindow):
         self._scan_request_id += 1
         current_scan_id = self._scan_request_id
         self._detail_request_id += 1
+        self._scan_restore_state = self._capture_scan_restore_state(current_scan_id)
+        self._pending_scan_runs = []
+        self._pending_scan_request_id = current_scan_id
 
         if self._scan_worker is not None and self._scan_worker.isRunning():
+            LOGGER.info("Superseding active scan: old_request_id=%s new_request_id=%s", self._pending_scan_request_id, current_scan_id)
             self._scan_worker.request_stop()
             # Do not wait here; stale worker outputs are ignored via request ids.
-
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
-        self._runs_by_id = {}
-        self._scan_loaded_count = 0
-        self.detail_pane.clear_details()
-        self._set_stat_chip_value(self.loaded_chip, "0")
-        self._set_stat_chip_value(self.visible_chip, "0")
-        self._set_stat_chip_value(self.selected_chip, "none")
 
         date_from = self.date_from.date().toPyDate()
         date_to = self.date_to.date().toPyDate()
         self._active_filter_terms = self._parse_search_terms(self.search_input.text())
 
         if date_from > date_to:
+            LOGGER.warning("Invalid scan date range: date_from=%s date_to=%s request_id=%s", date_from, date_to, current_scan_id)
+            self._pending_scan_runs = []
+            self._pending_scan_request_id = None
+            self._scan_restore_state = None
             self.status_label.setText("Invalid date range")
             self._set_activity_idle()
             return
@@ -1545,11 +1722,22 @@ class DataBrowserWindow(QMainWindow):
 
     def _append_run_guarded(self, run: RunSummary, scan_request_id: int):
         if scan_request_id != self._scan_request_id:
+            LOGGER.debug("Ignoring stale single run: request_id=%s active_request_id=%s", scan_request_id, self._scan_request_id)
+            return
+        if self._pending_scan_request_id == scan_request_id:
+            self._pending_scan_runs.append(run)
+            self.status_label.setText(f"Scanning... {len(self._pending_scan_runs)} runs found")
             return
         self._append_run(run)
 
     def _append_run_batch_guarded(self, runs: list, scan_request_id: int):
         if scan_request_id != self._scan_request_id:
+            LOGGER.debug("Ignoring stale run batch: request_id=%s active_request_id=%s batch_size=%s", scan_request_id, self._scan_request_id, len(runs))
+            return
+        if self._pending_scan_request_id == scan_request_id:
+            self._pending_scan_runs.extend(runs)
+            self.status_label.setText(f"Scanning... {len(self._pending_scan_runs)} runs found")
+            LOGGER.debug("Scan batch buffered: request_id=%s batch_size=%s buffered=%s", scan_request_id, len(runs), len(self._pending_scan_runs))
             return
         self._append_run_batch(runs)
 
@@ -1863,7 +2051,10 @@ class DataBrowserWindow(QMainWindow):
         self._set_stat_chip_value(self.visible_chip, str(visible_count))
 
     def _on_scan_done(self, count: int):
-        LOGGER.info("Scan completed: count=%s", count)
+        pending_runs = list(self._pending_scan_runs) if self._pending_scan_request_id == self._scan_request_id else []
+        restore_state = self._scan_restore_state
+        LOGGER.info("Scan completed: count=%s buffered=%s request_id=%s", count, len(pending_runs), self._scan_request_id)
+        self._replace_table_with_runs(pending_runs)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(self.COL_RUN_ID, Qt.SortOrder.DescendingOrder)
         self.refresh_btn.setEnabled(True)
@@ -1871,6 +2062,9 @@ class DataBrowserWindow(QMainWindow):
         self._refresh_date_separators()
         self._apply_filter()
         self._update_summary_chips()
+        self._pending_scan_runs = []
+        self._pending_scan_request_id = None
+        self._scan_restore_state = None
 
         if self._pending_focus_run_id is not None:
             focused = self._focus_row_by_run_id(self._pending_focus_run_id)
@@ -1886,6 +2080,8 @@ class DataBrowserWindow(QMainWindow):
                 self.status_label.setText("Could not focus requested run")
             self._pending_focus_run_id = None
             self._pending_requested_run_id = None
+        else:
+            self._restore_scan_state(restore_state)
 
         self._set_activity_idle()
 
@@ -1900,6 +2096,9 @@ class DataBrowserWindow(QMainWindow):
 
     def _on_scan_error(self, message: str):
         LOGGER.error("Scan failed: %s", message)
+        self._pending_scan_runs = []
+        self._pending_scan_request_id = None
+        self._scan_restore_state = None
         self.refresh_btn.setEnabled(True)
         self.status_label.setText("Scan failed")
         QMessageBox.warning(self, "Scan Error", message)
@@ -1962,6 +2161,23 @@ class DataBrowserWindow(QMainWindow):
 
     def _on_selection_changed(self):
         selected_rows = self._get_selected_rows()
+        selected_run_ids = []
+        for selected_row in selected_rows:
+            selected_run = self._get_run_for_row(selected_row)
+            if selected_run is not None:
+                selected_run_ids.append(int(selected_run.run_id))
+        LOGGER.debug(
+            "Selection changed: rows=%s run_ids=%s detail_request_id=%s xvar_loader_running=%s "
+            "param_current=%s param_loading=%s param_visible=%s focus=%s",
+            selected_rows,
+            selected_run_ids,
+            self._detail_request_id,
+            bool(self._xvar_loader is not None and self._xvar_loader.isRunning()),
+            self._param_search_current_run_id,
+            self._param_search_loading_run_id,
+            bool(self._param_search_dialog is not None and self._param_search_dialog.isVisible()),
+            type(QApplication.focusWidget()).__name__ if QApplication.focusWidget() is not None else None,
+        )
         if len(selected_rows) > 1:
             self._set_stat_chip_value(self.selected_chip, "multi")
             self._sync_param_search_to_selected_run(None, selection_locked=True)
@@ -1972,6 +2188,7 @@ class DataBrowserWindow(QMainWindow):
         run = self._get_run_for_row(row)
         if run is None:
             self._set_stat_chip_value(self.selected_chip, "none")
+            self._detail_pane_run_id = None
             self.detail_pane.clear_details()
             self._sync_param_search_to_selected_run(None, selection_locked=False)
             return
@@ -1995,6 +2212,12 @@ class DataBrowserWindow(QMainWindow):
             old_loader = self._xvar_loader
             self._running_xvar_loaders.add(old_loader)
             old_loader.finished.connect(lambda l=old_loader: self._running_xvar_loaders.discard(l))
+            LOGGER.debug(
+                "Interrupting XvarDetailLoader: run_id=%s detail_request_id=%s retained_loaders=%s",
+                run.run_id,
+                current_detail_id,
+                len(self._running_xvar_loaders),
+            )
             old_loader.requestInterruption()
 
         self.detail_pane.clear_details()
@@ -2019,16 +2242,31 @@ class DataBrowserWindow(QMainWindow):
 
     def _on_xvar_details_ready_guarded(self, run_id: int, details: list, detail_request_id: int):
         if detail_request_id != self._detail_request_id:
+            LOGGER.debug(
+                "Dropping stale xvar details: run_id=%s request_id=%s active_request_id=%s details=%s",
+                run_id,
+                detail_request_id,
+                self._detail_request_id,
+                len(details),
+            )
             return
         self._on_xvar_details_ready(run_id, details)
 
     def _on_xvar_details_error_guarded(self, message: str, detail_request_id: int):
         if detail_request_id != self._detail_request_id:
+            LOGGER.debug(
+                "Dropping stale xvar error: request_id=%s active_request_id=%s message=%s",
+                detail_request_id,
+                self._detail_request_id,
+                message,
+            )
             return
+        LOGGER.error("Xvar detail load failed: %s", message)
         self.detail_pane.show_message(f"Failed to load xvar details: {message}")
         self._set_activity_idle()
 
     def _show_run_details(self, run: RunSummary):
+        self._detail_pane_run_id = int(run.run_id)
         self.detail_pane.set_run(
             run,
             self._format_datetime_for_table(run.run_datetime_str),
@@ -2517,6 +2755,14 @@ class DataBrowserWindow(QMainWindow):
             return
 
         dialog.set_selection_lock_state(selection_locked)
+        LOGGER.debug(
+            "Param search sync requested: target_run=%s selection_locked=%s current=%s loading=%s visible=%s",
+            None if run is None else int(run.run_id),
+            selection_locked,
+            self._param_search_current_run_id,
+            self._param_search_loading_run_id,
+            dialog.isVisible(),
+        )
         if selection_locked:
             LOGGER.info("Param search sync paused: multiple runs selected")
             return
@@ -2538,15 +2784,34 @@ class DataBrowserWindow(QMainWindow):
         target_run_id = int(run.run_id)
         if not force:
             if self._param_search_loading_run_id == target_run_id:
+                LOGGER.debug("Param search load skipped: run_id=%s already loading", target_run_id)
                 return
             if self._param_search_current_run_id == target_run_id:
+                LOGGER.debug("Param search load skipped: run_id=%s already current", target_run_id)
                 dialog.set_run(run)
                 return
 
-        LOGGER.info("Param search load started: run_id=%s", target_run_id)
+        LOGGER.info(
+            "Param search load started: run_id=%s force=%s show_dialog=%s focus_search=%s current=%s loading=%s",
+            target_run_id,
+            force,
+            show_dialog,
+            focus_search,
+            self._param_search_current_run_id,
+            self._param_search_loading_run_id,
+        )
         # Cancel any in-flight loader so it stops competing for I/O
         if self._param_search_loader is not None and self._param_search_loader.isRunning():
-            self._param_search_loader.requestInterruption()
+            old_loader = self._param_search_loader
+            self._running_param_search_loaders.add(old_loader)
+            old_loader.finished.connect(lambda l=old_loader: self._running_param_search_loaders.discard(l))
+            LOGGER.debug(
+                "Interrupting ParamSearchLoader: new_run_id=%s retained_loaders=%s request_id=%s",
+                target_run_id,
+                len(self._running_param_search_loaders),
+                self._param_search_request_id,
+            )
+            old_loader.requestInterruption()
         dialog.set_loading_state(run)
         self._set_activity_busy("Loading params…")
         self._param_search_request_id += 1
@@ -2593,18 +2858,38 @@ class DataBrowserWindow(QMainWindow):
 
     def _on_param_search_partial_records_guarded(self, mode: str, records: list, request_id: int):
         if request_id != self._param_search_request_id:
+            LOGGER.debug(
+                "Dropping stale param partial records: mode=%s request_id=%s active_request_id=%s records=%s",
+                mode,
+                request_id,
+                self._param_search_request_id,
+                len(records),
+            )
             return
         dialog = self._ensure_param_search_dialog()
         dialog.append_records(mode, records)
 
     def _on_param_search_records_ready_guarded(self, run_id: int, records: dict, request_id: int):
         if request_id != self._param_search_request_id:
+            LOGGER.debug(
+                "Dropping stale param records: run_id=%s request_id=%s active_request_id=%s modes=%s",
+                run_id,
+                request_id,
+                self._param_search_request_id,
+                {mode: len(values) for mode, values in records.items()},
+            )
             self._set_activity_idle()
             return
         self._on_param_search_records_ready(run_id, records)
 
     def _on_param_search_error_guarded(self, message: str, request_id: int):
         if request_id != self._param_search_request_id:
+            LOGGER.debug(
+                "Dropping stale param error: request_id=%s active_request_id=%s message=%s",
+                request_id,
+                self._param_search_request_id,
+                message,
+            )
             self._set_activity_idle()
             return
         LOGGER.error("Param search load failed: %s", message)
@@ -2998,6 +3283,7 @@ class DataBrowserWindow(QMainWindow):
 
 
 def launch(data_dir: str):
+    _configure_browser_logging()
     app = QApplication.instance()
     app_created = app is None
     if app_created:
