@@ -55,6 +55,10 @@ class _StateThread(QThread):
 # Widget
 # ---------------------------------------------------------------------------
 
+# Pending-update model colours (mirrors device_control_gui).
+DEFAULT_BUTTON_COLOR = "#363636"
+UNDO_BUTTON_COLOR = "orange"
+
 DARK_STYLE = """
 QWidget {
     background: #1a1b2e;
@@ -98,6 +102,16 @@ QPushButton#lock {
 QPushButton#lock:hover {
     background: #2a2d4a;
     border-radius: 4px;
+}
+QPushButton#default {
+    border: 1px solid #3a3c5a;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: #d0d4e8;
+}
+QPushButton#default:disabled {
+    color: #5a5d78;
+    border-color: #2a2c44;
 }
 QDoubleSpinBox, QSpinBox {
     background: #12132a;
