@@ -10,6 +10,11 @@ INIT_KERNEL_CAMERA_CONNECTION_TIMEOUT = 90.
 
 DATA_SAVER_TIMEOUT = 120.
 
+# Wall-clock cap on how long persistent_get_camera() retries to open a camera
+# before giving up and returning a DummyCamera (which triggers a fast
+# camera-not-ready handshake failure instead of blocking the run forever).
+CAMERA_OPEN_TIMEOUT = 30.
+
 CAMERA_GRAB_TIMEOUT_BASLER_INIT = 20.
 CAMERA_GRAB_TIMEOUT_BASLER_RUN = 8.
 
