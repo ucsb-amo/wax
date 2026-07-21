@@ -3189,30 +3189,79 @@ class DataBrowserWindow(QMainWindow):
 # Experiment file viewer (right-click submenu)
 # ---------------------------------------------------------------------------
 
+    # Preferred ordering for the source-text attrs. `expt_file` (the
+    # experiment itself) is the only one guaranteed to be present; every base
+    # class module is saved under a `base_class_<module>` attr, and the legacy
+    # keys are kept for older files. Any attr not listed here that still looks
+    # like source text is appended afterwards so nothing is silently dropped.
     _EXPT_FILE_ATTR_KEYS = [
         "expt_file",
+        "params_file",
         "control_file",
         "cooling_file",
         "sequence_file",
         "imaging_file",
     ]
 
+    @staticmethod
+    def _decode_attr_text(raw) -> str:
+        if raw is None:
+            return ""
+        # numpy.bytes_ subclasses bytes, so this also covers h5py scalar strings.
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            return raw
+        # numpy 0-d array holding a (byte)string.
+        item = getattr(raw, "item", None)
+        if callable(item) and getattr(raw, "shape", None) == ():
+            scalar = raw.item()
+            return scalar.decode("utf-8", errors="replace") if isinstance(scalar, bytes) else str(scalar)
+        return str(raw)
+
+    @staticmethod
+    def _expt_file_label(attr_key: str) -> str:
+        if attr_key.startswith("base_class_"):
+            name = attr_key[len("base_class_"):]
+        elif attr_key.endswith("_file"):
+            name = attr_key[:-len("_file")]
+        else:
+            name = attr_key
+        return name.replace("_", " ").title()
+
+    @staticmethod
+    def _expt_file_basename(attr_key: str) -> str:
+        if attr_key.startswith("base_class_"):
+            return f"{attr_key[len('base_class_'):]}.py"
+        if attr_key.endswith("_file"):
+            return f"{attr_key[:-len('_file')]}.py"
+        return f"{attr_key}.py"
+
     def _build_view_files_submenu(self, menu: QMenu, run: RunSummary):
-        """Populate a submenu with one action per experiment file attr found in the HDF5."""
+        """Populate a submenu with one action per experiment source file stored
+        in the HDF5 attrs (expt/params plus every base-class module saved)."""
         submenu = menu.addMenu("View Experiment Files")
         try:
             import h5py
             with h5py.File(run.filepath, "r") as f:
+                attr_keys = set(f.attrs.keys())
+                # expt/params/legacy keys first (in preferred order), then every
+                # remaining base-class module alphabetically.
+                ordered_keys = [k for k in self._EXPT_FILE_ATTR_KEYS if k in attr_keys]
+                ordered_keys += sorted(
+                    k for k in attr_keys
+                    if k.startswith("base_class_") and k not in ordered_keys
+                )
+
                 found = False
-                for key in self._EXPT_FILE_ATTR_KEYS:
-                    raw = f.attrs.get(key)
-                    if raw is None:
+                for key in ordered_keys:
+                    text = self._decode_attr_text(f.attrs.get(key))
+                    if not text.strip():
                         continue
-                    raw_str = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-                    label = f"{key.replace('_file', '').replace('_', ' ').title()}"
+                    label = self._expt_file_label(key)
                     action = submenu.addAction(f"  {label}")
                     action.triggered.connect(
-                        lambda checked=False, k=key, path=raw_str, rid=run.run_id: self._open_file_viewer(rid, k, path)
+                        lambda checked=False, k=key, t=text, rid=run.run_id: self._open_file_viewer(rid, k, t)
                     )
                     found = True
                 if not found:
@@ -3221,17 +3270,10 @@ class DataBrowserWindow(QMainWindow):
             submenu.addAction(f"Error: {exc}").setEnabled(False)
         return submenu
 
-    def _open_file_viewer(self, run_id: int, attr_key: str, file_path: str):
-        """Open a resizable popup showing the content of a Python source file."""
+    def _open_file_viewer(self, run_id: int, attr_key: str, content: str):
+        """Open a resizable popup showing stored experiment source text."""
         win = QDialog(self)
-        fallback_names = {
-            "expt_file": "expt.py",
-            "control_file": "control.py",
-            "cooling_file": "cooling.py",
-            "sequence_file": "sequence.py",
-            "imaging_file": "imaging.py",
-        }
-        basename = fallback_names.get(attr_key, "unknown.py")
+        basename = self._expt_file_basename(attr_key)
         win.setWindowTitle(f"Run ID {run_id} - {basename}")
         win.setSizeGripEnabled(True)
         win.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
@@ -3261,16 +3303,8 @@ class DataBrowserWindow(QMainWindow):
                 "QPlainTextEdit { background: #ffffff; color: #1f2a33; border: 1px solid #d5dde4; }"
             )
 
-        # Try to load from disk; fall back to a clear error message
-        norm_path = os.path.normpath(file_path)
-        if os.path.isfile(norm_path):
-            try:
-                with open(norm_path, "r", encoding="utf-8", errors="replace") as fh:
-                    editor.setPlainText(fh.read())
-            except Exception as exc:
-                editor.setPlainText(f"Could not read file:\n{exc}")
-        else:
-            editor.setPlainText(f"File not found on this machine:\n{norm_path}")
+        # The source text is stored directly in the HDF5 attrs at save time.
+        editor.setPlainText(content if content else "(empty)")
 
         layout.addWidget(editor)
 
