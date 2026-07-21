@@ -197,6 +197,115 @@ def _led_style(color: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Exposure spinbox with dynamic step size (10% of current value or 10 µs,
+# whichever is larger) and automatic clamping to the configured minimum.
+# ---------------------------------------------------------------------------
+
+class _ExposureSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox whose step adapts to the current value.
+
+    Each click advances by ``max(current * 0.10, 10.0)`` µs.  When the
+    user types a value below the spinbox minimum it is clamped to that
+    minimum on commit (``fixup`` is called by Qt when the text is
+    out-of-range).
+    """
+
+    def stepBy(self, steps: int) -> None:
+        step = max(round(self.value() * 0.10,-1), 10.0)
+        new_val = self.value() + steps * step
+        self.setValue(max(new_val, self.minimum()))
+
+    def fixup(self, text: str) -> str:  # type: ignore[override]
+        """Clamp out-of-range text to the minimum value."""
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            v = self.minimum()
+        clamped = max(v, self.minimum())
+        self.setValue(clamped)
+        return str(clamped)
+
+
+# ---------------------------------------------------------------------------
+# Custom compact y-axis: shows ×10^N at the top of the axis and %.2f ticks
+# ---------------------------------------------------------------------------
+
+_SUPERSCRIPT_MAP = str.maketrans("0123456789-", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b")
+
+
+def _sup(n: int) -> str:
+    """Return *n* as a string with unicode superscript digits/minus."""
+    return str(n).translate(_SUPERSCRIPT_MAP)
+
+
+class _CompactAxisItem(pg.AxisItem):
+    """Y-axis that rescales tick labels to a shared power-of-ten multiplier.
+
+    Tick values are formatted as ``%.2f`` after dividing by 10**N.  The
+    multiplier ``\u00d710\u1d4e`` is painted at the top of the axis area so no
+    horizontal space is lost to a rotated side label.
+    """
+
+    def __init__(self, orientation: str, **kwargs) -> None:
+        super().__init__(orientation, **kwargs)
+        self.enableAutoSIPrefix(False)
+        self._disp_exp: int = 0
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        if not values:
+            return []
+        scaled = [v * scale for v in values]
+        max_abs = max(abs(v) for v in scaled) if scaled else 0.0
+        if max_abs == 0.0 or not np.isfinite(max_abs):
+            return ["0.00"] * len(values)
+        exp = int(np.floor(np.log10(max_abs)))
+        self._disp_exp = exp
+        factor = 10.0 ** exp
+        return [f"{v / factor:.2f}" for v in scaled]
+
+    def paint(self, p, opt, widget):  # type: ignore[override]
+        super().paint(p, opt, widget)
+        if self._disp_exp != 0:
+            br = self.boundingRect()
+            p.save()
+            p.setPen(pg.mkPen(color=(180, 180, 180)))
+            font = p.font()
+            font.setPointSize(8)
+            p.setFont(font)
+            p.drawText(
+                pg.QtCore.QRectF(br.x(), br.y() - 2, br.width() - 4, 18),
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop),
+                f"\u00d710{_sup(self._disp_exp)}",
+            )
+            p.restore()
+
+
+class _NormAxisItem(pg.AxisItem):
+    """Right axis for normalized counts — ticks always formatted to 2 d.p.
+    Draws a small 'norm' label at the top of the axis (same position as the
+    exponent label on the left axis) instead of a rotated side label.
+    """
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        return [f"{v * scale:.2f}" for v in values]
+
+    def paint(self, p, opt, widget):  # type: ignore[override]
+        super().paint(p, opt, widget)
+        br = self.boundingRect()
+        p.save()
+        p.setPen(pg.mkPen(color=(180, 180, 180)))
+        font = p.font()
+        font.setPointSize(8)
+        p.setFont(font)
+        p.drawText(
+            pg.QtCore.QRectF(br.x() + 4, br.y() - 2, br.width() - 4, 18),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
+            "norm",
+        )
+        p.restore()
+
+
+# ---------------------------------------------------------------------------
 # Pixel-counts-over-time panel (ported from the original mot_viewer.py)
 # ---------------------------------------------------------------------------
 
@@ -210,7 +319,7 @@ class CountsPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.plot_widget = pg.PlotWidget()
+        self.plot_widget = pg.PlotWidget(axisItems={"left": _CompactAxisItem("left"), "right": _NormAxisItem("right")})
         self.plot_widget.setContentsMargins(0, 0, 0, 0)
         self.plot_widget.setLabel("bottom", "seconds ago")
         self.plot_widget.setTitle("Summed Pixel Counts vs Time")
@@ -315,6 +424,16 @@ class CountsPanel(QWidget):
     def update_plot(self) -> None:
         if not self.timestamps:
             self.main_curve.setData([], [])
+            # Still show the saved normalization reference line so the user
+            # can see where it is before any counts have been collected.
+            if self.normalize and self.norm_reference is not None:
+                self.norm_ref_line.setValue(self.norm_reference)
+                if self.show_norm_reference_line:
+                    self.norm_ref_line.show()
+                else:
+                    self.norm_ref_line.hide()
+            else:
+                self.norm_ref_line.hide()
             return
 
         current = self.timestamps[-1]
@@ -354,7 +473,6 @@ class CountsPanel(QWidget):
             if ref != 0:
                 self.vb2.setYRange(lo_v / ref, hi_v / ref, padding=0)
             self.plot_item.showAxis("right")
-            self.plot_item.getAxis("right").setLabel("Normalised")
             self.norm_ref_line.setValue(ref)
             if self.show_norm_reference_line:
                 self.norm_ref_line.show()
@@ -493,6 +611,23 @@ class _OpenWorker(QThread):
             self.done.emit({"ok": False, "error": str(exc)})
 
 
+class _LoadDefaultsWorker(QThread):
+    """One-shot worker that fetches saved camera defaults from the server."""
+
+    done = pyqtSignal(dict)
+
+    def __init__(self, client: BaslerCameraClient, parent=None) -> None:
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            resp = self._client.get_defaults()
+            self.done.emit(resp if isinstance(resp, dict) else {"ok": False, "error": "bad reply"})
+        except Exception as exc:
+            self.done.emit({"ok": False, "error": str(exc)})
+
+
 class _DefaultsWorker(QThread):
     """One-shot worker that persists camera defaults to the server."""
 
@@ -578,13 +713,13 @@ class BaslerCameraWidget(QFrame):
         self._saved_gain: Optional[float] = None
         self._saved_exposure: Optional[float] = None
         self._saved_trigger_mode: Optional[str] = None
+        self.current_rect: Optional[QRect] = None
         self._load_state()
 
         self.last_image: Optional[np.ndarray] = None
         self.show_rectangle: bool = True
         self.rect_start: Optional[QPoint] = None
         self.rect_end: Optional[QPoint] = None
-        self.current_rect: Optional[QRect] = None
         self.saturation_in_box_only: bool = True
         self.max_pixel_value: int = 255
 
@@ -595,6 +730,7 @@ class BaslerCameraWidget(QFrame):
         self._settings_worker: Optional[_SettingsWorker] = None
         self._open_worker: Optional[_OpenWorker] = None
         self._defaults_worker: Optional[_DefaultsWorker] = None
+        self._load_defaults_worker: Optional["_LoadDefaultsWorker"] = None
         # Tighten the frame socket timeout so missed triggers are cheap.
         try:
             self.client.set_frame_timeout_ms(400)
@@ -714,8 +850,8 @@ class BaslerCameraWidget(QFrame):
 
         tbar.addWidget(_tsep())
         tbar.addWidget(_tlabel("Exp µs"))
-        self.exposure_spinbox = QDoubleSpinBox()
-        self.exposure_spinbox.setRange(0.0, 1_000_000.0)
+        self.exposure_spinbox = _ExposureSpinBox()
+        self.exposure_spinbox.setRange(19.0, 1_000_000.0)
         self.exposure_spinbox.setDecimals(1)
         self.exposure_spinbox.setEnabled(False)
         self.exposure_spinbox.setFixedWidth(82)
@@ -796,13 +932,21 @@ class BaslerCameraWidget(QFrame):
         # Snapshot the current ROI / gain / exposure / trigger to the
         # per-camera state file so the next time the camera is opened it
         # comes up with these values.
-        self.save_defaults_btn = QPushButton("Save Defaults")
+        self.save_defaults_btn = QPushButton("Save")
         self.save_defaults_btn.setToolTip(
             "Save the current ROI, gain, exposure, and trigger mode as the\n"
             "default values for this camera (used when re-opening it)."
         )
         self.save_defaults_btn.clicked.connect(self._on_save_defaults)
         tbar.addWidget(self.save_defaults_btn)
+
+        self.load_defaults_btn = QPushButton("Load")
+        self.load_defaults_btn.setToolTip(
+            "Load the saved default ROI, gain, exposure, and trigger mode\n"
+            "for this camera and apply them to the current settings."
+        )
+        self.load_defaults_btn.clicked.connect(self._on_load_defaults)
+        tbar.addWidget(self.load_defaults_btn)
 
         tbar.addStretch()
 
@@ -1167,16 +1311,84 @@ class BaslerCameraWidget(QFrame):
             self._flash_save_button("Save failed")
 
     def _flash_save_button(self, text: str) -> None:
-        """Briefly show *text* on the Save Defaults button, then restore it."""
+        """Briefly show *text* on the Save button, then restore it."""
         self.save_defaults_btn.setText(text)
         self.save_defaults_btn.setEnabled(False)
         QTimer.singleShot(
             1200,
             lambda: (
-                self.save_defaults_btn.setText("Save Defaults"),
+                self.save_defaults_btn.setText("Save"),
                 self.save_defaults_btn.setEnabled(True),
             ),
         )
+
+    def _on_load_defaults(self) -> None:
+        """Fetch saved defaults from the server and apply them to the UI."""
+        if _thread_alive(self._load_defaults_worker):
+            return
+        self.load_defaults_btn.setEnabled(False)
+        self.load_defaults_btn.setText("Loading\u2026")
+        worker = _LoadDefaultsWorker(self.client, self)
+        worker.done.connect(self._on_defaults_loaded)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._clear_worker("_load_defaults_worker", w))
+        self._load_defaults_worker = worker
+        worker.start()
+
+    def _on_defaults_loaded(self, payload: dict) -> None:
+        self.load_defaults_btn.setText("Load")
+        self.load_defaults_btn.setEnabled(True)
+        if not payload.get("ok"):
+            print(f"[BaslerWidget] Could not load defaults: {payload.get('error')}")
+            return
+        defaults = payload.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        gain = defaults.get("gain")
+        if gain is not None and self.gain_spinbox.isEnabled():
+            self.gain_spinbox.blockSignals(True)
+            self.gain_spinbox.setValue(float(gain))
+            self.gain_spinbox.blockSignals(False)
+            self._saved_gain = float(gain)
+            client = self.client
+            QThreadPool.globalInstance().start(
+                _FireAndForget(lambda v=float(gain): client.set_gain(v))
+            )
+        exposure = defaults.get("exposure")
+        if exposure is not None and self.exposure_spinbox.isEnabled():
+            self.exposure_spinbox.blockSignals(True)
+            self.exposure_spinbox.setValue(float(exposure))
+            self.exposure_spinbox.blockSignals(False)
+            self._saved_exposure = float(exposure)
+            client = self.client
+            QThreadPool.globalInstance().start(
+                _FireAndForget(lambda v=float(exposure): client.set_exposure(v))
+            )
+        trigger = defaults.get("trigger_mode")
+        if trigger is not None and self.trigger_combo.isEnabled():
+            idx = self.trigger_combo.findText(str(trigger))
+            if idx >= 0:
+                self.trigger_combo.blockSignals(True)
+                self.trigger_combo.setCurrentIndex(idx)
+                self.trigger_combo.blockSignals(False)
+                self._saved_trigger_mode = str(trigger)
+                client = self.client
+                QThreadPool.globalInstance().start(
+                    _FireAndForget(lambda v=str(trigger): client.set_trigger_mode(v))
+                )
+        roi = defaults.get("roi")
+        if roi and len(roi) == 4:
+            x1, y1, x2, y2 = roi
+            self.current_rect = QRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+        nref = defaults.get("norm_reference")
+        if nref is not None:
+            self.counts_panel.norm_reference = float(nref)
+            self.counts_panel.normalize = True
+            self.counts_panel.update_plot()
+            self.norm_action.blockSignals(True)
+            self.norm_action.setChecked(True)
+            self.norm_action.blockSignals(False)
+        self._save_state()
 
     def _on_auto_rescale_toggled(self, checked: bool) -> None:
         self.counts_panel.auto_rescale = checked

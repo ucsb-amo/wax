@@ -90,6 +90,35 @@ def normalize(array,
         x = x/x_max
     return x
 
+def sort(x, y):
+    """
+    Sorts the first array and reorders the second array using the same sorting order.
+    
+    Args:
+        x (array-like): The array to sort by
+        y (array-like): The array to reorder using x's sort indices
+        
+    Returns:
+        tuple: (sorted_x, sorted_y) - both arrays sorted/reordered by x's sort order
+        
+    Raises:
+        ValueError: If x and y have different lengths
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    
+    if len(x) != len(y):
+        raise ValueError("Arrays x and y must have the same length")
+    
+    # Get the indices that would sort x
+    sort_indices = np.argsort(x)
+    
+    # Apply the same sorting to both arrays
+    sorted_x = x[sort_indices]
+    sorted_y = y[sort_indices]
+    
+    return sorted_x, sorted_y
+
 def rm_outliers(array,
                 outlier_method='mean',
                 outlier_threshold=0.3,

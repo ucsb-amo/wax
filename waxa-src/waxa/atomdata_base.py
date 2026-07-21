@@ -349,7 +349,7 @@ class atomdata_base():
                 skip_saved_roi = False,
                 transpose_idx = [],
                 avg_repeats = False,
-                no_images = False,
+                ignore_images = False,
                 server_talk = st()):
         '''
         Returns the atomdata stored in the `idx`th newest file at `path`.
@@ -379,7 +379,7 @@ class atomdata_base():
         '''
 
         self._lite = lite
-        self._no_images = no_images
+        self._ignore_images = ignore_images
         # When loading lite data, ignore any passed roi_id since lite files
         # are already pre-cropped to a specific ROI at creation time.
         if lite:
@@ -412,7 +412,7 @@ class atomdata_base():
 
         t_init = time.perf_counter()
         t_stage = time.perf_counter()
-        self._load_data(idx, path, lite=lite, roi_id=roi_id, no_images=no_images)
+        self._load_data(idx, path, lite=lite, roi_id=roi_id, ignore_images=ignore_images)
         self._timing['init_load_data_s'] = time.perf_counter() - t_stage
 
         ### Helper objects
@@ -517,7 +517,7 @@ class atomdata_base():
             return
         self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
 
-    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
         """Creates a lite (ROI-cropped) copy of this run's data file.
 
         Fast path: builds the lite HDF5 file directly from the arrays already
@@ -542,9 +542,15 @@ class atomdata_base():
             When True, skip the in-memory fast path and always rebuild the
             lite file by re-reading the source HDF5 (legacy behaviour via
             ``server_talk.create_lite_copy``).
+        ignore_images : bool or None
+            If True, write a lite file without camera images or ROI metadata.
+            If None, follows this atomdata object's ``_ignore_images`` state.
         """
+        if ignore_images is None:
+            ignore_images = bool(getattr(self, '_ignore_images', False))
+
         # Legacy disk-based path — only used when explicitly requested.
-        if force_reread:
+        if force_reread and not ignore_images:
             if roi_id is None:
                 self.roi.save_roi_h5(lite=self._lite, printouts=False)
                 use_saved_roi = True
@@ -581,7 +587,7 @@ class atomdata_base():
         # unshuffle helpers on local copies. The dealer's unscramble_images()
         # and _unscramble_timestamps() reassign the dealer's own attributes,
         # so we save/restore them around the call.
-        has_images = getattr(self, '_has_images', True)
+        has_images = getattr(self, '_has_images', True) and not ignore_images
 
         if has_images:
             if tags.xvars_shuffled:
@@ -690,23 +696,49 @@ class atomdata_base():
             if has_images:
                 f_lite.attrs['roix'] = [0, px]
                 f_lite.attrs['roiy'] = [0, py]
+            else:
+                for attr in ('roix', 'roiy'):
+                    if attr in f_lite.attrs:
+                        del f_lite.attrs[attr]
             f_lite.attrs['has_images'] = has_images
             f_lite.attrs['run_complete'] = True
 
         print(f'Lite version of run {self.run_info.run_id} saved at {lite_path}.')
 
     # Alias: create_lite_copy and save_lite_copy do the same thing.
-    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False):
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
         """Alias for :meth:`save_lite_copy`."""
         return self.save_lite_copy(
             roi_id=roi_id,
             use_saved_roi=use_saved_roi,
             force_reread=force_reread,
+            ignore_images=ignore_images,
         )
 
     ### Analysis
 
+    def _clear_image_analysis_attrs(self):
+        for attr in (
+            'img_atoms', 'img_light', 'img_dark',
+            'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark',
+            'od_raw', 'od', 'sum_od_x', 'sum_od_y',
+            'integrated_od', 'atom_number', 'atom_number_density',
+            'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'cloudfit_x', 'cloudfit_y',
+            'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
+            'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
+            'fit_area_x', 'fit_area_y',
+            'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
+            'axis_camera_px_x', 'axis_camera_px_y',
+        ):
+            setattr(self, attr, None)
+
     def _initial_analysis(self,transpose_idx,avg_repeats):
+        if not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
+            return
+
         t0 = time.perf_counter()
 
         t_stage = time.perf_counter()
@@ -767,6 +799,11 @@ class atomdata_base():
             )
 
     def analyze(self):
+        if not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
+            return
+
         t0 = time.perf_counter()
 
         t_stage = time.perf_counter()
@@ -906,7 +943,89 @@ class atomdata_base():
         self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section  
         self.atom_number = np.sum(np.sum(self.atom_number_density,-2),-1)
 
-    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False):
+    def _resolve_xvar_value_to_indices(self, xvar_value, which_xvar_idx, xvar_tolerance=0.05):
+        """Resolve an xvar_value specification to integer indices into self.xvars[which_xvar_idx].
+
+        Args:
+            xvar_value: One of:
+                - scalar: index of the closest xvar value; warns if at the edge of the axis.
+                - tuple (min, max): all indices whose xvar value falls in [min, max] ± tolerance.
+                - list or ndarray: for each requested value, the nearest index within tolerance.
+            which_xvar_idx (int): The xvar axis to search.
+            xvar_tolerance (float or None): Fraction of the robust mean spacing between
+                consecutive xvar values used as the absolute matching tolerance.
+                The mean is computed after discarding diffs whose absolute value exceeds
+                3× the standard deviation of all diffs (outlier removal).
+                Defaults to 0.05 (5%).
+
+        Returns:
+            np.ndarray of int: selected indices (1-D).
+        """
+        import warnings
+        xvals = np.asarray(self.xvars[which_xvar_idx])
+
+        # Robust mean spacing: discard diff outliers (|diff| > 3σ) before taking the mean.
+        diffs = np.abs(np.diff(xvals))
+        if len(diffs) > 0:
+            diff_std = float(np.std(diffs))
+            diff_mean = float(np.mean(diffs))
+            if diff_std > 0:
+                robust_diffs = diffs[diffs <= diff_mean + 3.0 * diff_std]
+            else:
+                robust_diffs = diffs
+            mean_spacing = float(np.mean(robust_diffs)) if len(robust_diffs) > 0 else diff_mean
+        else:
+            mean_spacing = 0.0
+
+        fraction = float(xvar_tolerance)
+        tol = fraction * mean_spacing
+
+        if np.isscalar(xvar_value) and not isinstance(xvar_value, (list, tuple, np.ndarray)):
+            idx = int(np.argmin(np.abs(xvals - xvar_value)))
+            if idx == 0 or idx == len(xvals) - 1:
+                warnings.warn(
+                    f"slice_atomdata: xvar_value={xvar_value!r} matched the edge of "
+                    f"xvars[{which_xvar_idx}] (index {idx}, value {xvals[idx]:.6g}). "
+                    f"Axis range: [{xvals[0]:.6g}, {xvals[-1]:.6g}].",
+                    stacklevel=3,
+                )
+            return np.array([idx], dtype=int)
+
+        elif isinstance(xvar_value, tuple):
+            if len(xvar_value) != 2:
+                raise ValueError(
+                    f"slice_atomdata: xvar_value tuple must have exactly 2 elements "
+                    f"(min, max); got {len(xvar_value)}."
+                )
+            vmin, vmax = float(xvar_value[0]), float(xvar_value[1])
+            mask = (xvals >= vmin - tol) & (xvals <= vmax + tol)
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                raise ValueError(
+                    f"slice_atomdata: no xvar values found in range "
+                    f"({vmin:.6g}, {vmax:.6g}) ± {tol:.4g} on axis {which_xvar_idx}. "
+                    f"Axis range: [{xvals[0]:.6g}, {xvals[-1]:.6g}]."
+                )
+            return indices.astype(int)
+
+        else:
+            # list or array of values
+            requested = np.asarray(xvar_value).ravel()
+            indices = []
+            for v in requested:
+                dists = np.abs(xvals - v)
+                idx = int(np.argmin(dists))
+                if dists[idx] > tol:
+                    raise ValueError(
+                        f"slice_atomdata: no xvar value matched {v:.6g} within "
+                        f"tolerance {tol:.4g} on axis {which_xvar_idx}. "
+                        f"Closest is {xvals[idx]:.6g} (distance {dists[idx]:.4g})."
+                    )
+                indices.append(idx)
+            return np.array(indices, dtype=int)
+
+    def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False,
+                       xvar_value=None, xvar_tolerance=None):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
         that xvar, and returns an atomdata of reduced dimensionality as if that
         variable had been held constant.
@@ -926,14 +1045,35 @@ class atomdata_base():
             which_shot_idx (int or list): The index (or indices) into the xvar
             specified by which_xvar_idx to select. When selecting a single index
             from a multi-axis scan this reduces the dimensionality by one.
+            Ignored when xvar_value is provided.
             which_xvar_idx (int): The index of the xvar axis to slice along.
             ignore_repeats (bool): Only relevant for single-axis scans with
             repeats. When True, return only the single shot at which_shot_idx
             rather than all repeats of the corresponding unique value.
+            xvar_value: If provided, overrides which_shot_idx. Can be:
+                - scalar: select the xvar index closest to this value; warns if
+                  the match is at the edge of the axis.
+                - tuple (min, max): select all xvar indices whose value falls
+                  within [min, max] ± xvar_tolerance.
+                - list or ndarray: select the xvar index nearest to each
+                  requested value, within xvar_tolerance.
+            xvar_tolerance (float or None): Fraction of the robust mean spacing
+                between consecutive xvar values used as the absolute matching
+                tolerance (outlier diffs > 3σ removed before computing the mean).
+                Defaults to 0.05 (5%).
 
         Returns:
             atomdata: The sliced atomdata object.
         """
+        # Resolve xvar_value → which_shot_idx when the caller supplies a value.
+        if xvar_value is not None and which_shot_idx != 0:
+            raise ValueError(
+                "slice_atomdata: specify either 'xvar_value' or 'which_shot_idx', not both."
+            )
+        if xvar_value is not None:
+            which_shot_idx = self._resolve_xvar_value_to_indices(
+                xvar_value, which_xvar_idx, xvar_tolerance=xvar_tolerance
+            )
 
         # Fix #1: copy from self in memory — no disk reload.
         ad = self._copy_self_for_slice()
@@ -1552,18 +1692,19 @@ class atomdata_base():
             return
 
         old_xvardims = np.array(self.xvardims, dtype=int)
-        keys = [
-            'img_atoms', 'img_light', 'img_dark',
-            'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark'
-        ]
-        for key in keys:
-            vars(self)[key] = self._reassign_repeat_ndarray(
-                vars(self)[key],
-                source_xvar_idx,
-                xvar_idx,
-                n_repeats,
-                old_xvardims
-            )
+        if getattr(self, '_has_images', True):
+            keys = [
+                'img_atoms', 'img_light', 'img_dark',
+                'img_timestamp_atoms', 'img_timestamp_light', 'img_timestamp_dark'
+            ]
+            for key in keys:
+                vars(self)[key] = self._reassign_repeat_ndarray(
+                    vars(self)[key],
+                    source_xvar_idx,
+                    xvar_idx,
+                    n_repeats,
+                    old_xvardims
+                )
 
         for key in self.data.keys:
             value = vars(self.data)[key]
@@ -1606,7 +1747,11 @@ class atomdata_base():
         # _reassign_repeat_ndarray — no need to re-stack and re-deal.
         # self.images is left stale; unshuffle/reshuffle after reassign_repeats
         # is not supported.
-        self.analyze()
+        if getattr(self, '_has_images', True):
+            self.analyze()
+        else:
+            self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
         self._analysis_tags.repeats_reassigned = True
 
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
@@ -1635,7 +1780,9 @@ class atomdata_base():
                     newkey = self._storage_key(key)
                     vars(struct)[newkey] = deepcopy(array)
 
-            self._store_keys = ['xvars','xvardims','od_raw']
+            self._store_keys = ['xvars','xvardims']
+            if getattr(self, '_has_images', True) and getattr(self, 'od_raw', None) is not None:
+                self._store_keys.append('od_raw')
             store_values(self,self._store_keys)
 
             self._store_param_keys = ['N_repeats',*self.xvarnames]
@@ -1666,7 +1813,8 @@ class atomdata_base():
                                 vars(self.scope_data[k][ch])[ax] = x
 
             for xvar_idx in xvars_to_avg:
-                avg_attrs(self, ['od_raw'])
+                if getattr(self, '_has_images', True) and getattr(self, 'od_raw', None) is not None:
+                    avg_attrs(self, ['od_raw'])
                 avg_attrs(self.data, self.data.keys)
                 avg_scope_dict()
                 # write in the unaveraged xvars
@@ -1675,11 +1823,14 @@ class atomdata_base():
                 self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
             self.params.N_repeats = 1
         
-            if reanalyze:
+            if reanalyze and getattr(self, '_has_images', True):
                 # don't unshuffle xvars again -- that will be confusing
                 self.analyze_ods()
+            elif not getattr(self, '_has_images', True):
+                self._clear_image_analysis_attrs()
 
             self._analysis_tags.averaged = True
+            self._refresh_repeat_statistics()
         else:
             print('Atomdata is already repeat averaged. To revert to original atomdata, use Atomdata.revert_repeats().')
                 
@@ -1714,7 +1865,10 @@ class atomdata_base():
             retrieve_values(self.data,self._store_data_keys)
             retrieve_scope_dict()
 
-            self.analyze_ods()
+            if getattr(self, '_has_images', True):
+                self.analyze_ods()
+            else:
+                self._clear_image_analysis_attrs()
             self._analysis_tags.averaged = False
             self._refresh_repeat_statistics()
         else:
@@ -1764,7 +1918,7 @@ class atomdata_base():
                     new_attr = np.array(new_attr)
                 vars(struct)[key] = new_attr
 
-        listlike_keys = ['xvars','xvarnames']
+        listlike_keys = ['xvars','xvarnames','xvardims']
         reorder_listlike(self,listlike_keys)
 
         if isinstance(self.params, np.ndarray):
@@ -1795,15 +1949,19 @@ class atomdata_base():
                     for ch in self.scope_data[k]:
                         reorder_ndarraylike(self.scope_data[k][ch],['t','v'])
 
-        ndarraylike_keys = ['img_atoms','img_light','img_dark']
-        reorder_ndarraylike(self,ndarraylike_keys)
+        if getattr(self, '_has_images', True):
+            ndarraylike_keys = ['img_atoms','img_light','img_dark']
+            reorder_ndarraylike(self,ndarraylike_keys)
         reorder_ndarraylike(self.data,self.data.keys)
         transpose_scopedata()
 
         self._dealer = self._init_dealer()
 
-        if reanalyze:
+        if reanalyze and getattr(self, '_has_images', True):
             self.analyze()
+        elif not getattr(self, '_has_images', True):
+            self._clear_image_analysis_attrs()
+            self._refresh_repeat_statistics()
 
         self._analysis_tags.transposed = not self._analysis_tags.transposed
 
@@ -1949,9 +2107,60 @@ class atomdata_base():
         dealer.N_xvars = len(self.xvardims)
         return dealer
 
-    def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True, no_images=False):
+    def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True, ignore_images=False):
         t_load_total = time.perf_counter()
         timing = {}
+
+        def _regenerate_lite_from_regular():
+            t_stage = time.perf_counter()
+            self._load_data(
+                idx,
+                path,
+                lite=False,
+                roi_id=roi_id,
+                _allow_lite_autocreate=False,
+                ignore_images=ignore_images,
+            )
+            timing['fallback_full_load_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
+            # Build the minimal helper state save_lite_copy() needs.
+            # __init__ will re-create these after _load_data returns;
+            # that's fine — they're cheap.
+            self._ds = DataSaver(data_dir=self._regular_data_dir(), server_talk=self.server_talk)
+            self._dealer = self._init_dealer()
+            self._analysis_tags = analysis_tags(roi_id, self.run_info.imaging_type)
+            if getattr(self, '_has_images', True):
+                self.roi = ROI(
+                    run_id=self.run_info.run_id,
+                    roi_id=roi_id,
+                    use_saved_roi=True,
+                    lite=False,
+                    printouts=False,
+                    server_talk=self.server_talk,
+                    current_file_path=self._data_file_path,
+                    current_saved_roi=self._saved_roi_from_file,
+                    images=self.images,
+                    imaging_type=self.run_info.imaging_type,
+                )
+            # self._lite is still True from __init__ (the user asked for
+            # lite); flip it temporarily so save_lite_copy() sees the full
+            # uncropped data we just loaded. If ignore_images=True,
+            # save_lite_copy writes only non-image datasets and skips ROI.
+            _saved_lite_flag = self._lite
+            self._lite = False
+            try:
+                self.save_lite_copy(ignore_images=ignore_images)
+            finally:
+                self._lite = _saved_lite_flag
+            timing['fallback_create_lite_copy_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
+            regenerated_file, regenerated_rid = self.server_talk.get_data_file(
+                self.run_info.run_id, "", lite=True
+            )
+            timing['get_data_file_retry_lite_s'] = time.perf_counter() - t_stage
+            return regenerated_file, regenerated_rid
 
         try:
             t_stage = time.perf_counter()
@@ -1963,49 +2172,25 @@ class atomdata_base():
             lite_missing = ("was not found" in msg or "lite copy does not exist" in msg)
             if lite and _allow_lite_autocreate and lite_missing:
                 # Missing lite file: load regular data, generate lite copy, then retry lite load.
-                t_stage = time.perf_counter()
-                self._load_data(idx, path, lite=False, roi_id=roi_id, _allow_lite_autocreate=False)
-                timing['fallback_full_load_s'] = time.perf_counter() - t_stage
-
-                t_stage = time.perf_counter()
-                # Build the minimal helper state save_lite_copy() needs.
-                # __init__ will re-create these after _load_data returns;
-                # that's fine — they're cheap.
-                self._ds = DataSaver(data_dir=self._regular_data_dir(), server_talk=self.server_talk)
-                self._dealer = self._init_dealer()
-                self._analysis_tags = analysis_tags(roi_id, self.run_info.imaging_type)
-                if getattr(self, '_has_images', True):
-                    self.roi = ROI(
-                        run_id=self.run_info.run_id,
-                        roi_id=roi_id,
-                        use_saved_roi=True,
-                        lite=False,
-                        printouts=False,
-                        server_talk=self.server_talk,
-                        current_file_path=self._data_file_path,
-                        current_saved_roi=self._saved_roi_from_file,
-                        images=self.images,
-                        imaging_type=self.run_info.imaging_type,
-                    )
-                # Fast in-memory lite-copy build using whatever roi_id the
-                # user passed to atomdata(). When roi_id is None this uses
-                # the saved/selected ROI loaded into self.roi above.
-                # self._lite is still True from __init__ (the user asked for
-                # lite); flip it temporarily so save_lite_copy() sees the
-                # full uncropped data we just loaded.
-                _saved_lite_flag = self._lite
-                self._lite = False
-                try:
-                    self.save_lite_copy()
-                finally:
-                    self._lite = _saved_lite_flag
-                timing['fallback_create_lite_copy_s'] = time.perf_counter() - t_stage
-
-                t_stage = time.perf_counter()
-                file, rid = self.server_talk.get_data_file(self.run_info.run_id, "", lite=True)
-                timing['get_data_file_retry_lite_s'] = time.perf_counter() - t_stage
+                file, rid = _regenerate_lite_from_regular()
             else:
                 raise
+
+        if lite and _allow_lite_autocreate:
+            try:
+                is_valid_hdf5 = h5py.is_hdf5(file)
+                if is_valid_hdf5:
+                    with h5py.File(file, 'r'):
+                        pass
+            except Exception:
+                is_valid_hdf5 = False
+            if not is_valid_hdf5:
+                print(f"[atomdata] Existing lite file is not readable HDF5; regenerating: {file}")
+                try:
+                    os.remove(file)
+                except FileNotFoundError:
+                    pass
+                file, rid = _regenerate_lite_from_regular()
 
         self._data_file_path = file
         self._saved_roi_from_file = False
@@ -2044,7 +2229,7 @@ class atomdata_base():
             # this attribute always have images, so we default to whether the
             # 'images' dataset actually exists in the file.
             self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
-            if no_images:
+            if ignore_images:
                 self._has_images = False
             if self._has_images:
                 self.images = f['data']['images'][()]

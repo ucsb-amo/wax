@@ -95,6 +95,7 @@ class MonitorUDPServer(UdpServer):
             apply_delta(self.config_file_path, dtype, name, changes)
         except Exception as e:
             return json.dumps({"status": "error", "msg": str(e)})
+        self._log_update(dtype, name, changes)
         self._version += 1
         version = self._version
         self._broadcaster.send({
@@ -108,6 +109,27 @@ class MonitorUDPServer(UdpServer):
         self._propagate_linked_vpd(dtype, name, changes)
         return json.dumps({"status": "ok", "version": version})
 
+    def _log_update(self, dtype: str, name: str, changes: dict) -> None:
+        """Print a formatted confirmation of an accepted device-state update."""
+        parts = []
+        if dtype == "dds":
+            if "frequency" in changes:
+                parts.append(f"freq {changes['frequency'] / 1e6:.3f} MHz")
+            if "amplitude" in changes:
+                parts.append(f"amp {changes['amplitude']:.3f}")
+            if "v_pd" in changes:
+                parts.append(f"v_pd {changes['v_pd']:.3f} V")
+            if "sw_state" in changes:
+                parts.append("sw " + ("on" if changes["sw_state"] else "off"))
+        elif dtype == "dac":
+            if "voltage" in changes:
+                parts.append(f"{changes['voltage']:.3f} V")
+        elif dtype == "ttl":
+            if "ttl_state" in changes:
+                parts.append("on" if changes["ttl_state"] else "off")
+        if parts:
+            print(f"[{dtype.upper()}] {name} -> {', '.join(parts)}")
+
     def _propagate_linked_vpd(self, dtype: str, name: str, changes: dict) -> None:
         """Cross-propagate v_pd <-> voltage for DDS/DAC pairs sharing a channel.
 
@@ -115,17 +137,26 @@ class MonitorUDPServer(UdpServer):
         DAC control (written by ``generate_state_file.Generator``).  When either
         side changes the voltage the other side is updated atomically and a
         broadcast is sent so GUI widgets on both tabs stay in sync.
+        
+        Also propagates force_update_counter to ensure linked devices are
+        force-updated together.
         """
         try:
             cfg = read_state(self.config_file_path)
         except Exception:
             return
 
-        if dtype == "dds" and "v_pd" in changes:
+        if dtype == "dds" and ("v_pd" in changes or "force_update_counter" in changes):
             dac_key = cfg.get("dds", {}).get(name, {}).get("dac_ch_key", "")
             if not dac_key:
                 return
-            linked = {"voltage": changes["v_pd"]}
+            linked = {}
+            if "v_pd" in changes:
+                linked["voltage"] = changes["v_pd"]
+            if "force_update_counter" in changes:
+                linked["force_update_counter"] = changes["force_update_counter"]
+            if not linked:
+                return
             try:
                 apply_delta(self.config_file_path, "dac", dac_key, linked)
             except Exception:
@@ -139,11 +170,17 @@ class MonitorUDPServer(UdpServer):
                 "changes": linked,
             })
 
-        elif dtype == "dac" and "voltage" in changes:
+        elif dtype == "dac" and ("voltage" in changes or "force_update_counter" in changes):
             for dds_name, dds_cfg in cfg.get("dds", {}).items():
                 if dds_cfg.get("dac_ch_key", "") != name:
                     continue
-                linked = {"v_pd": changes["voltage"]}
+                linked = {}
+                if "voltage" in changes:
+                    linked["v_pd"] = changes["voltage"]
+                if "force_update_counter" in changes:
+                    linked["force_update_counter"] = changes["force_update_counter"]
+                if not linked:
+                    continue
                 try:
                     apply_delta(self.config_file_path, "dds", dds_name, linked)
                 except Exception:

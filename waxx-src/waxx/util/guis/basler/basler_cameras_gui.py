@@ -199,6 +199,7 @@ class BaslerCamerasMainWindow(QMainWindow):
 
         # ---- Toolbar ---------------------------------------------------
         tb = QToolBar("Controls", self)
+        tb.setObjectName("basler_controls_toolbar")
         tb.setMovable(False)
         tb.setFloatable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
@@ -304,13 +305,27 @@ class BaslerCamerasMainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_cameras_found(self, clients: list[BaslerCameraClient]) -> None:
-        existing = {c.serial for c in self._all_clients}
+        # Build a serial → existing client map for fast lookup.
+        existing_by_serial = {c.serial: c for c in self._all_clients}
         new_clients: list[BaslerCameraClient] = []
         for c in clients:
-            if c.serial not in existing:
+            if c.serial not in existing_by_serial:
                 self._all_clients.append(c)
-                existing.add(c.serial)
+                existing_by_serial[c.serial] = c
                 new_clients.append(c)
+            else:
+                # Already known — update the connection in case the server
+                # restarted on a different port since we last discovered it.
+                existing = existing_by_serial[c.serial]
+                if existing.connection is not c.connection:
+                    old_conn = existing.connection
+                    existing.connection = c.connection
+                    logger.debug(
+                        "Updated connection for S/N %s: %s → %s",
+                        c.serial,
+                        getattr(old_conn, "_waxx_server_id", "?"),
+                        getattr(c.connection, "_waxx_server_id", "?"),
+                    )
 
         n_total = len(self._all_clients)
         if new_clients:

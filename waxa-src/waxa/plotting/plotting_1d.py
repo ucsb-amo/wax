@@ -4,9 +4,20 @@ from matplotlib.axes import Axes
 import numpy as np
 import numpy.typing as npt
 from waxa.helper import xlabels_1d
-from waxa.helper.datasmith import key_from_attribute
+from waxa.helper.datasmith import key_from_attribute, sort
 import inspect
 import re
+
+__all__ = [
+    'errorplot',
+    'get_param',
+    'guess_unit',
+    'detect_unit',
+    'plot_mixOD',
+    'plot_sum_od_fits',
+    'plot_fit_residuals',
+    'sort',
+]
 def _normalize_name(name):
     if isinstance(name, bytes):
         name = name.decode("utf-8")
@@ -210,7 +221,7 @@ def plot_mixOD(ad,
                max_od=0.,
                figsize=[],
                aspect='auto',
-               swap_axes=False):
+               swap_axes=None):
     # Extract necessary information
 
     from waxa import atomdata
@@ -238,6 +249,13 @@ def plot_mixOD(ad,
     else:
         n_repeats = int(ad.params.N_repeats)
     n_shots = int(n / n_repeats)
+
+    # Auto-detect swap_axes if not explicitly set
+    if swap_axes is None:
+        if n_shots == 1 and n_repeats > 1:
+            swap_axes = True
+        else:
+            swap_axes = False
 
     if swap_axes:
         total_width = n_repeats * px

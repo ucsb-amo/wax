@@ -18,6 +18,28 @@ dvlist = np.array([])
 def nothing():
     pass
 
+
+class AdjustSpec:
+    """Descriptor for a parameter that can be adjusted live between shots."""
+    def __init__(self, key, min_val, max_val, step, dtype=float, current_val=None):
+        self.key = key
+        self.min_val = float(min_val)
+        self.max_val = float(max_val)
+        self.step = float(step)
+        self.dtype = dtype          # float or int
+        self.current_val = float(current_val if current_val is not None else min_val)
+
+    def to_dict(self) -> dict:
+        return {
+            'key':         self.key,
+            'min_val':     self.min_val,
+            'max_val':     self.max_val,
+            'step':        self.step,
+            'dtype':       'int' if self.dtype == int else 'float',
+            'current_val': self.current_val,
+        }
+
+
 class Scanner():
     def __init__(self):
 
@@ -29,6 +51,8 @@ class Scanner():
         self.xvarnames = []
         self.scan_xvars = []
         self.Nvars = 0
+        self._adjust_specs = []
+        self._pending_adjust_values = {}
         
         self.update_nvars()
         self.compute_new_derived = nothing
@@ -63,6 +87,8 @@ class Scanner():
             key (str): The key of the ExptParams attribute to scan.
             values (ndarray): Values to scan over. Can be n-dimensional, scan will step over first index.
         """
+        if any(s.key == key for s in self._adjust_specs):
+            raise ValueError(f"xvar key {key!r} is already registered as an adjust param.")
         this_xvar = xvar(key,values,position=len(self.scan_xvars))
         if this_xvar.key in [x.key for x in self.scan_xvars]:
             raise ValueError(f"xvar of key {this_xvar.key} is assigned more than once.")
@@ -84,6 +110,49 @@ class Scanner():
         forbidden_chars = [":",",","."," ","-","+","(",")","@","#","$","%","^","&","*","=","!","[","]",";","/","\\","`","~"]
         if any([fc in xvar.key for fc in forbidden_chars]):
             raise ValueError("Key contains forbidden characters.")
+
+    def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None):
+        """Register a parameter for live adjustment between shots via the liveOD Adjust panel.
+
+        Args:
+            param_key (str): ExptParams attribute to adjust.
+            min_val (float, optional): Minimum allowed value. Defaults to current value - 0.2.
+            max_val (float, optional): Maximum allowed value. Defaults to current value + 0.2.
+            step (float, optional): Spinbox step size. Defaults to (max-min)/50.
+                For dtype=int the minimum effective step is 1.
+            dtype (type): float (default) or int.
+        """
+        if dtype is None:
+            if param_key not in vars(self.params):
+                raise ValueError(f"param {param_key!r} does not already exist, so a dtype must be provided")
+            raw_val = vars(self.params)[param_key]
+            dtype = int if isinstance(raw_val, (int, np.integer)) else float
+        if min_val is None or max_val is None:
+            current = getattr(self.params, param_key, 0.0)
+            if min_val is None:
+                min_val = float(current) - 0.2
+            if max_val is None:
+                max_val = float(current) + 0.2
+        if any(s.key == param_key for s in self._adjust_specs):
+            raise ValueError(f"adjust key {param_key!r} already registered.")
+        if param_key in self.xvarnames:
+            print(f"Warning: adjust key {param_key!r} is already an xvar; skipping adjust registration.")
+            return
+        if step is None:
+            raw = (max_val - min_val) / 50.0
+            step = max(1, round(raw)) if dtype == int else raw
+        elif dtype == int:
+            step = max(1, int(step))
+        current_val = dtype(max(min_val, min(max_val, getattr(self.params, param_key, min_val))))
+        if param_key not in vars(self.params):
+            vars(self.params)[param_key] = current_val
+        self._adjust_specs.append(
+            AdjustSpec(param_key, min_val, max_val, step, dtype, current_val)
+        )
+
+    def apply_pending_adjust_values(self):
+        """Apply GUI-side adjust values to host params. Overridden in Expt."""
+        pass
 
     def update_nvars(self):
         """Updates the number of xvars to be scanned.
@@ -154,13 +223,11 @@ class Scanner():
 
         while scanning:
 
+            self.core.wait_until_mu(now_mu())
             aborted_bool = self._check_for_abort_signal()
             
-            self.core.wait_until_mu(now_mu())
             self.update_params_from_xvars()
-            delay(RPC_DELAY)
-
-            self.core.wait_until_mu(now_mu())
+            
             self.write_host_params_to_kernel()
             delay(RPC_DELAY)
             self.core.break_realtime()
@@ -218,6 +285,8 @@ class Scanner():
         # update each xvar parameter in the host params
         for xvar in self.scan_xvars:
             vars(self.params)[xvar.key] = xvar.values[xvar.counter]
+        # apply any live GUI adjustments before recomputing derived params
+        self.apply_pending_adjust_values()
         # update derived params in the host params
         self.params.compute_derived()
         self.compute_new_derived()

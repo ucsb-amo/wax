@@ -292,6 +292,7 @@ class DDSWidget(DeviceWidget):
         self.has_unsaved_changes = False
         self.instant_apply = False
         self.device_label = None  # Will store reference to label for tooltip update
+        self._force_update_pending = False
         # Store previous values for undo functionality
         self.prev_freq = None
         self.prev_freq_unit = None
@@ -497,7 +498,10 @@ class DDSWidget(DeviceWidget):
                 self.vpd_spinbox.setValue(dds.v_pd)
                 # Stage the change: show "undo" and require Enter to confirm,
                 # even if a value happens to equal the current one.
+                self._force_update_pending = True
                 self.has_unsaved_changes = True
+                print(f"[GUI] DDS {self.device_name}: Default button pressed - set _force_update_pending=True")
+                print(f"[GUI] DDS {self.device_name}: Loading default values: freq={dds.frequency}, amp={dds.amplitude}, v_pd={dds.v_pd}")
                 self.update_default_button_state()
                 self.freq_spinbox.setFocus()
                 self.freq_spinbox.selectAll()
@@ -657,7 +661,13 @@ class DDSWidget(DeviceWidget):
 
         # Update sw state
         config["sw_state"] = int(self.state_button.isChecked())
-            
+
+        if self._force_update_pending:
+            config["force_update_counter"] = config.get("force_update_counter", 0) + 1
+            self._force_update_pending = False
+            print(f"[GUI] DDS {self.device_name}: Incremented force_update_counter to {config['force_update_counter']}")
+            print(f"[GUI] DDS {self.device_name}: Config = freq={config.get('frequency')}, amp={config.get('amplitude')}, v_pd={config.get('v_pd')}, sw_state={config.get('sw_state')}")
+
         return config
 
     def _freq_hz_to_display(self, freq_hz: float) -> float:
@@ -721,6 +731,7 @@ class DACWidget(DeviceWidget):
         self.dac_frame_obj = dac_frame_obj
         self.step_size_controller = step_size_controller  # Reference to shared step size controls
         self.has_unsaved_changes = False
+        self._force_update_pending = False
         # Store previous value for undo functionality
         self.prev_voltage = None
         self.setup_ui()
@@ -825,6 +836,7 @@ class DACWidget(DeviceWidget):
                 self.voltage_spinbox.setValue(dac.v)
                 # Stage the change: show "undo" and require Enter to confirm,
                 # even if the value happens to equal the current one.
+                self._force_update_pending = True
                 self.has_unsaved_changes = True
                 self.update_default_button_state()
                 self.voltage_spinbox.setFocus()
@@ -870,6 +882,9 @@ class DACWidget(DeviceWidget):
         """Return the updated configuration for this DAC device"""
         config = self.device_config.copy()
         config["voltage"] = self.voltage_spinbox.value()
+        if self._force_update_pending:
+            config["force_update_counter"] = config.get("force_update_counter", 0) + 1
+            self._force_update_pending = False
         return config
         
     def update_from_config(self, config: Dict[str, Any]):
@@ -1060,27 +1075,50 @@ class _UpdateSender(QThread):
 
 
 class _StateRequestWorker(QThread):
-    """Fetches the full device-state snapshot from the server (get_state)."""
+    """Fetches the full device-state snapshot from the server (get_state).
+
+    An existing ``MonitorClient`` may be supplied as ``initial_client`` to
+    avoid repeated service-discovery overhead.  If none is supplied (or if the
+    call fails), a fresh client is constructed so the parent can cache it for
+    subsequent requests.  The ``_rediscover`` path inside ``send_message``
+    handles server restarts transparently — if the cached client's address
+    goes stale, it self-heals after one failed attempt.  Only if all retries
+    fail is ``state_failed`` emitted to force the parent to discard the client
+    and rebuild from scratch on the next call.
+    """
 
     state_loaded = pyqtSignal(dict)   # {"version": int, "config": dict}
     state_failed = pyqtSignal()
+    # Emitted when this worker had to create a new MonitorClient so the parent
+    # can cache it for future requests.
+    client_ready = pyqtSignal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, initial_client=None, parent=None):
         super().__init__(parent)
+        self._initial_client = initial_client
 
     def run(self):
-        try:
-            client = MonitorClient(discovery_timeout=0.5)
-        except Exception:
-            self.state_failed.emit()
-            return
+        client = self._initial_client
+        created_new = False
+        if client is None:
+            try:
+                client = MonitorClient(discovery_timeout=0.5)
+                created_new = True
+            except Exception:
+                self.state_failed.emit()
+                return
         state = client.get_state()
         if state and state.get("status") == "ok":
+            if created_new:
+                # Let the parent cache this client before state_loaded fires.
+                self.client_ready.emit(client)
             self.state_loaded.emit({
                 "version": state.get("version"),
                 "config": state.get("config", {}) or {},
             })
         else:
+            # Signal failure so the parent discards the cached client and
+            # forces a fresh discovery (+ construction) on the next request.
             self.state_failed.emit()
 
 
@@ -1171,6 +1209,10 @@ class DeviceStateGUI(QMainWindow):
         # avoid clobbering an in-flight edit with an incoming broadcast).
         self._version = None
         self._pending: Dict[tuple, float] = {}
+        # Cached MonitorClient reused across state-request calls to avoid
+        # repeated service-discovery overhead.  Cleared on failure so the next
+        # request triggers a fresh discovery (handles server restarts).
+        self._state_client: "MonitorClient | None" = None
 
         # Compact layout is suppressed; always expanded (never auto-collapse).
         self._compact_mode = False
@@ -1446,7 +1488,7 @@ class DeviceStateGUI(QMainWindow):
         """
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_config_changes)
-        self.timer.start(5000)  # reconcile every 5 seconds
+        self.timer.start(1000)  # reconcile every 1 second
 
     def _setup_update_sender(self):
         """Start the background sender that pushes deltas to the server."""
@@ -1583,9 +1625,11 @@ class DeviceStateGUI(QMainWindow):
         if getattr(self, '_state_req_in_progress', False):
             return
         self._state_req_in_progress = True
-        worker = _StateRequestWorker(self)
+        worker = _StateRequestWorker(initial_client=self._state_client, parent=self)
         worker.state_loaded.connect(self._on_state_loaded)
         worker.state_failed.connect(self._on_state_failed)
+        worker.state_failed.connect(self._on_state_client_failed)
+        worker.client_ready.connect(self._on_state_client_ready)
         worker.finished.connect(lambda: setattr(self, '_state_req_in_progress', False))
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -1606,6 +1650,20 @@ class DeviceStateGUI(QMainWindow):
     def _on_state_failed(self) -> None:
         """Snapshot fetch failed — surface as a connection problem."""
         self.on_connection_failed()
+
+    def _on_state_client_ready(self, client) -> None:
+        """Cache a MonitorClient created by a state-request worker."""
+        self._state_client = client
+
+    def _on_state_client_failed(self) -> None:
+        """Discard the cached MonitorClient so the next request rebuilds it.
+
+        ``send_message`` already attempts ``_rediscover()`` internally, so
+        transient server restarts are handled transparently without reaching
+        here.  This path fires only when all retries are exhausted, meaning
+        the server is truly unreachable and the cached address is stale.
+        """
+        self._state_client = None
 
     def _device_keys(self, config: dict) -> set:
         keys = set()
@@ -1937,6 +1995,9 @@ class DeviceStateGUI(QMainWindow):
         # Mark this device as having an in-flight edit so an incoming broadcast
         # (including our own echo) does not clobber the spinbox mid-interaction.
         self._pending[(device_type, device_name)] = time.time()
+
+        if device_type == "dds" and "force_update_counter" in updated_config:
+            print(f"[GUI] on_device_value_changed: {device_type} {device_name}, force_update_counter={updated_config['force_update_counter']}")
 
         # Hand off to the background sender (coalesces rapid same-device edits).
         self._update_sender.enqueue(device_type, device_name, updated_config)

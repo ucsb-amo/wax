@@ -125,6 +125,14 @@ class Expt(Scanner, Dealer, Scribe):
                     "data will not be saved (setup_camera=False)."
                 )
 
+        if self._adjust_specs and self.run_info.save_data:
+            keys = ', '.join(s.key for s in self._adjust_specs)
+            print(
+                f"[adjust] WARNING: adjustable params detected with save_data=True: [{keys}]. "
+                "Values changed in the Adjust panel between shots will NOT be reflected "
+                "in saved data."
+            )
+
     @kernel
     def cleanup_scan_kernel_wax(self):
         self.data.put_shot_data()
@@ -151,12 +159,18 @@ class Expt(Scanner, Dealer, Scribe):
             self._N_shots_total,
             xvar_values,
         )
+        self._pending_adjust_values = getattr(_client, 'last_adjust_values', {})
         self._shot_complete_count += 1
         print(f"shot {n}/{N} done")
         if reset_requested:
             _client.abort_run()
             raise TerminationRequested
     
+    def apply_pending_adjust_values(self):
+        """Apply any adjust-panel values received from the last SHOT_COMPLETE reply."""
+        for key, val in self._pending_adjust_values.items():
+            setattr(self.params, key, val)
+
     def compute_new_derived(self):
         pass
     
@@ -273,6 +287,7 @@ class Expt(Scanner, Dealer, Scribe):
             'N_shots_with_repeats': int(getattr(self.params, 'N_shots_with_repeats', 1)),
             'N_pwa_per_shot': int(getattr(self.params, 'N_pwa_per_shot', 1)),
             'save_on_underflow': int(getattr(self.run_info, 'save_on_underflow', 0)),
+            'adjust_specs': [s.to_dict() for s in self._adjust_specs],
         }
 
     def _serialize_end_payload(self, expt_filepath: str) -> dict:

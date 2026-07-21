@@ -192,7 +192,14 @@ class Scribe():
         """
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
-            reset = _client.poll_reset()
+            # Reuse the reset flag cached from the last SHOT_COMPLETE reply
+            # instead of issuing a separate POLL round-trip every shot.  This
+            # RPC runs from the scan @kernel, so removing the extra ZMQ
+            # request-reply removes real latency from the real-time timeline.
+            # A reset requested mid-shot is already caught by shot_complete()
+            # (which raises TerminationRequested); the worst case here is a
+            # one-shot delay in aborting.
+            reset = getattr(_client, 'last_reset_requested', False)
             if reset and raise_error:
                 if hasattr(self,'monitor'):
                     self.monitor.update_device_states()
