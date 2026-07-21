@@ -111,7 +111,8 @@ def load_autostart_set(host_ip: Optional[str]) -> set[str]:
         _LOG.warning("hosts module %s not importable: %r", _HOSTS_MODULE, exc)
         return set()
     table = getattr(mod, "HOST_AUTOSTART_SERVERS", {})
-    return set(table.get(host_ip, []))
+    default = table.get("*", [])
+    return set(table.get(host_ip, []) + default)
 
 
 def load_layout_overrides(host_ip: Optional[str]) -> dict:
