@@ -8,11 +8,11 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QSignalBlocker, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QDoubleSpinBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -67,20 +67,6 @@ QFrame#card {
     border: 1px solid #3a3c5a;
     border-radius: 6px;
 }
-QLabel#header {
-    font-size: 13px;
-    font-weight: bold;
-    color: #a0a8d0;
-}
-QLabel#value {
-    font-size: 22px;
-    font-weight: bold;
-    color: #e8eaf6;
-}
-QLabel#unit {
-    font-size: 12px;
-    color: #7a7e9a;
-}
 QLabel#stale {
     font-size: 10px;
     color: #7a7e9a;
@@ -92,7 +78,7 @@ QPushButton#rfOn {
     border-radius: 4px;
     font-size: 14px;
     font-weight: bold;
-    padding: 6px 18px;
+    padding: 5px 10px;
 }
 QPushButton#rfOff {
     background: #4d1b1b;
@@ -101,22 +87,31 @@ QPushButton#rfOff {
     border-radius: 4px;
     font-size: 14px;
     font-weight: bold;
-    padding: 6px 18px;
+    padding: 5px 10px;
 }
-QPushButton#set {
+QPushButton#lock {
+    background: transparent;
+    border: none;
+    font-size: 14px;
+    padding: 0px;
+}
+QPushButton#lock:hover {
     background: #2a2d4a;
-    color: #90caf9;
-    border: 1px solid #5c7aaa;
     border-radius: 4px;
-    padding: 4px 10px;
 }
-QPushButton#set:hover { background: #353860; }
 QDoubleSpinBox, QSpinBox {
     background: #12132a;
-    color: #d0d4e8;
+    color: #e8eaf6;
     border: 1px solid #3a3c5a;
     border-radius: 3px;
     padding: 3px 6px;
+    font-size: 15px;
+    font-weight: bold;
+}
+QDoubleSpinBox:read-only, QSpinBox:read-only {
+    background: #191a30;
+    color: #d0d4e8;
+    font-weight: normal;
 }
 """
 
@@ -153,85 +148,95 @@ class TpiDeviceWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
+        # Device spec lives in the dock title bar, so no header here.
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(8)
-
-        # Header
-        header = QLabel(self._client.display_name)
-        header.setObjectName("header")
-        outer.addWidget(header)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
 
         card = QFrame()
         card.setObjectName("card")
-        grid = QGridLayout(card)
-        grid.setContentsMargins(14, 12, 14, 12)
-        grid.setSpacing(10)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(8)
 
         # --- RF switch ---------------------------------------------------
-        grid.addWidget(QLabel("RF output"), 0, 0)
-
         self._rf_btn = QPushButton("OFF")
         self._rf_btn.setObjectName("rfOff")
-        self._rf_btn.setFixedWidth(90)
+        self._rf_btn.setFixedWidth(64)
         self._rf_btn.clicked.connect(self._toggle_rf)
-        grid.addWidget(self._rf_btn, 0, 1, 1, 2)
+        row.addWidget(self._rf_btn)
 
-        # --- Frequency ---------------------------------------------------
-        grid.addWidget(QLabel("Frequency"), 1, 0)
-
-        self._freq_val = QLabel("—")
-        self._freq_val.setObjectName("value")
-        grid.addWidget(self._freq_val, 1, 1)
-
-        grid.addWidget(QLabel("MHz"), 1, 2)
-
-        freq_row = QHBoxLayout()
+        # --- Frequency (merged live display + editable spinbox) ----------
         self._freq_spin = QDoubleSpinBox()
         self._freq_spin.setRange(35.0, 4400.0)
-        self._freq_spin.setDecimals(3)
+        self._freq_spin.setDecimals(2)
         self._freq_spin.setSingleStep(1.0)
-        self._freq_spin.setFixedWidth(110)
-        freq_row.addWidget(self._freq_spin)
+        self._freq_spin.setSuffix(" MHz")
+        self._freq_spin.setFixedWidth(105)
+        self._freq_spin.editingFinished.connect(self._set_freq)
+        self._freq_lock = self._make_lock_button()
+        self._freq_lock.toggled.connect(
+            lambda locked: self._apply_lock(self._freq_spin, self._freq_lock, locked)
+        )
+        self._apply_lock(self._freq_spin, self._freq_lock, True)
+        row.addWidget(self._freq_spin)
+        row.addWidget(self._freq_lock)
 
-        freq_set = QPushButton("Set")
-        freq_set.setObjectName("set")
-        freq_set.clicked.connect(self._set_freq)
-        freq_row.addWidget(freq_set)
-        freq_row.addStretch()
-        grid.addLayout(freq_row, 2, 1, 1, 2)
-
-        # --- Level -------------------------------------------------------
-        grid.addWidget(QLabel("Level"), 3, 0)
-
-        self._level_val = QLabel("—")
-        self._level_val.setObjectName("value")
-        grid.addWidget(self._level_val, 3, 1)
-
-        grid.addWidget(QLabel("dBm"), 3, 2)
-
-        level_row = QHBoxLayout()
+        # --- Level (merged live display + editable spinbox) --------------
         self._level_spin = QSpinBox()
         self._level_spin.setRange(-90, 10)
-        self._level_spin.setFixedWidth(80)
-        level_row.addWidget(self._level_spin)
+        self._level_spin.setSuffix(" dBm")
+        self._level_spin.setFixedWidth(90)
+        self._level_spin.editingFinished.connect(self._set_level)
+        self._level_lock = self._make_lock_button()
+        self._level_lock.toggled.connect(
+            lambda locked: self._apply_lock(self._level_spin, self._level_lock, locked)
+        )
+        self._apply_lock(self._level_spin, self._level_lock, True)
+        row.addWidget(self._level_spin)
+        row.addWidget(self._level_lock)
 
-        level_set = QPushButton("Set")
-        level_set.setObjectName("set")
-        level_set.clicked.connect(self._set_level)
-        level_row.addWidget(level_set)
-        level_row.addStretch()
-        grid.addLayout(level_row, 4, 1, 1, 2)
+        row.addStretch()
 
-        grid.setColumnStretch(1, 1)
-        outer.addWidget(card)
-
-        self._stale_label = QLabel("Waiting for data…")
+        self._stale_label = QLabel("Waiting…")
         self._stale_label.setObjectName("stale")
         self._stale_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        outer.addWidget(self._stale_label)
+        row.addWidget(self._stale_label)
 
+        outer.addWidget(card)
         outer.addStretch()
+
+    # ------------------------------------------------------------------ #
+    # Lock toggle — purely local: gates whether the spinbox follows the
+    # live device value (locked) or is held for editing (unlocked).  It
+    # never sends anything to the device.
+    # ------------------------------------------------------------------ #
+
+    def _make_lock_button(self) -> QPushButton:
+        btn = QPushButton("🔒")
+        btn.setObjectName("lock")
+        btn.setCheckable(True)
+        btn.setChecked(True)  # start locked (read-only, tracks device)
+        btn.setFixedWidth(28)
+        return btn
+
+    @staticmethod
+    def _apply_lock(spin: QAbstractSpinBox, btn: QPushButton, locked: bool) -> None:
+        spin.setReadOnly(locked)
+        spin.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.NoButtons
+            if locked
+            else QAbstractSpinBox.ButtonSymbols.UpDownArrows
+        )
+        btn.setText("🔒" if locked else "🔓")
+        btn.setToolTip(
+            "Locked — tracks device. Click to edit."
+            if locked
+            else "Unlocked — edit and press Enter to apply."
+        )
+        if not locked:
+            spin.setFocus()
+            spin.selectAll()
 
     # ------------------------------------------------------------------ #
     # State updates from PUB socket
@@ -252,12 +257,11 @@ class TpiDeviceWidget(QWidget):
         self.style().unpolish(self._rf_btn)
         self.style().polish(self._rf_btn)
 
-        self._freq_val.setText(f"{freq:.3f}")
-        if not self._freq_spin.hasFocus():
+        # When locked the spinbox mirrors the live device value; when
+        # unlocked it is being edited, so leave it alone.
+        if self._freq_lock.isChecked():
             self._freq_spin.setValue(freq)
-
-        self._level_val.setText(str(level))
-        if not self._level_spin.hasFocus():
+        if self._level_lock.isChecked():
             self._level_spin.setValue(level)
 
     def _update_stale(self) -> None:

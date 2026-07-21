@@ -160,7 +160,8 @@ class TpiDevicesMainWindow(QMainWindow):
             return
 
         widget = TpiDeviceWidget(client)
-        title = f"{client.model}  ·  S/N {client.serial}  ·  @{client.hostname}"
+        key_prefix = f"{client.key}  ·  " if client.key else ""
+        title = f"{key_prefix}{client.model}  ·  S/N {client.serial}  ·  @{client.hostname}"
         dock = _DeviceDock(client.serial, title, self)
         dock.setObjectName(f"tpi_dock_{client.serial}")
         dock.setWidget(widget)

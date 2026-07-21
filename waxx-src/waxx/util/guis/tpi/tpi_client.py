@@ -141,11 +141,21 @@ class TpiDeviceClient:
         serial: str,
         model: str,
         firmware: str = "",
+        key: str = "",
+        default_freq_mhz: float | None = None,
+        default_level_dbm: int | None = None,
     ) -> None:
         self.connection = connection
         self.serial = serial
         self.model = model
         self.firmware = firmware
+        # Human-friendly label assigned by serial in kexp.config.rf_consultant_id.
+        # Empty when the device has no assignment (or the id file is unavailable).
+        self.key = key
+        # Optional "default" settings (from rf_consultant_id) surfaced by the
+        # GUI's default button.  ``None`` means no default configured.
+        self.default_freq_mhz = default_freq_mhz
+        self.default_level_dbm = default_level_dbm
 
     def _req(self, cmd: dict) -> dict:
         cmd["serial"] = self.serial
@@ -174,7 +184,8 @@ class TpiDeviceClient:
 
     @property
     def display_name(self) -> str:
-        return f"{self.model} [{self.serial}] @ {self.hostname}"
+        label = f"{self.key}  ·  " if self.key else ""
+        return f"{label}{self.model} [{self.serial}] @ {self.hostname}"
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +286,44 @@ _LAST_NO_SERVERS_WARNED: bool = False
 _LAST_CONTACT_FAILURES: set[str] = set()
 
 
+def resolve_consultant_labels(serials: list[str]) -> dict[str, str]:
+    """Return ``{serial: friendly_label}`` from ``kexp.config.rf_consultant_id``.
+
+    Reads the *most recent* on-disk version of the id file (it reloads the
+    module) so relabelling a consultant takes effect on the GUI's next rescan
+    without a restart.  Returns ``{}`` when the id file is unavailable — e.g.
+    running outside the kexp environment — so display gracefully falls back to
+    the raw serial.
+    """
+    try:
+        from kexp.config import rf_consultant_id  # noqa: PLC0415
+    except Exception:
+        return {}
+    try:
+        return rf_consultant_id.label_map(serials, reload_module=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("[TpiClient] rf_consultant_id lookup failed: %s", exc)
+        return {}
+
+
+def resolve_consultant_defaults(serials: list[str]) -> dict[str, dict]:
+    """Return ``{serial: {"freq_mhz": .., "level_dbm": ..}}`` default settings.
+
+    Same freshest-read semantics as :func:`resolve_consultant_labels`; returns
+    ``{}`` outside the kexp environment.  Serials without a configured default
+    are simply absent from the result.
+    """
+    try:
+        from kexp.config import rf_consultant_id  # noqa: PLC0415
+    except Exception:
+        return {}
+    try:
+        return rf_consultant_id.default_map(serials, reload_module=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("[TpiClient] rf_consultant_id defaults lookup failed: %s", exc)
+        return {}
+
+
 def discover_all_tpi_devices(
     collect_for: float = 3.0,
     quiet: bool = False,
@@ -320,6 +369,19 @@ def discover_all_tpi_devices(
             else:
                 logger.debug("[TpiClient] Could not contact server %s: %s", sid, exc)
     _LAST_CONTACT_FAILURES = current_failures
+
+    # Apply user-facing keys and default settings from the (freshest)
+    # rf_consultant_id file.
+    if clients:
+        serials = [c.serial for c in clients]
+        labels = resolve_consultant_labels(serials)
+        defaults = resolve_consultant_defaults(serials)
+        for c in clients:
+            c.key = labels.get(c.serial, "")
+            d = defaults.get(c.serial)
+            if d:
+                c.default_freq_mhz = d.get("freq_mhz")
+                c.default_level_dbm = d.get("level_dbm")
 
     fingerprint = (tuple(sorted(servers)), len(clients))
     changed = fingerprint != _LAST_DISCOVERY_FINGERPRINT
