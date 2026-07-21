@@ -1918,7 +1918,7 @@ class atomdata_base():
                     new_attr = np.array(new_attr)
                 vars(struct)[key] = new_attr
 
-        listlike_keys = ['xvars','xvarnames']
+        listlike_keys = ['xvars','xvarnames','xvardims']
         reorder_listlike(self,listlike_keys)
 
         if isinstance(self.params, np.ndarray):
