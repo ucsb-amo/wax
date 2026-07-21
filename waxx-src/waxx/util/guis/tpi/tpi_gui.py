@@ -192,13 +192,21 @@ class TpiDevicesMainWindow(QMainWindow):
     # Cleanup
     # ------------------------------------------------------------------ #
 
-    def closeEvent(self, event) -> None:
+    def cleanup(self) -> None:
+        """Stop the rescan timer, discovery worker, and per-device widgets.
+
+        Safe to call multiple times.  Used both by :meth:`closeEvent` (standalone
+        window) and by the dashboard panel wrapper when its dock is destroyed.
+        """
         self._rescan_timer.stop()
         for widget in self._widgets.values():
             widget.cleanup()
         if self._worker.isRunning():
             self._worker.quit()
             self._worker.wait(3500)
+
+    def closeEvent(self, event) -> None:
+        self.cleanup()
         super().closeEvent(event)
 
 
