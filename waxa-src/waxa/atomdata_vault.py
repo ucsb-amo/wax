@@ -923,13 +923,32 @@ class AtomdataVault(atomdata_base):
                     values, order, new_shape
                 )
 
-        if self._has_images and np.asarray(self.images).size and self.images.shape[0] == n_old:
-            self.images = self._reshape_axis0_to_first_xvar(
-                self.images, order, new_shape
-            )
-            self.image_timestamps = self._reshape_axis0_to_first_xvar(
-                self.image_timestamps, order, new_shape
-            )
+        if self._has_images and np.asarray(self.images).size:
+            # Raw camera images live in a flat (N_img, H, W) buffer that the
+            # dealer re-structures from xvardims, so they must be *reordered*
+            # to the new shot raster order but kept flat -- not reshaped onto
+            # the structured leading axes (which would break deal_data_ndarray).
+            Nf = int(self.params.N_pwa_per_shot) + 2
+            if self.images.shape[0] == n_old * Nf:
+                # Interleaved raw frames: expand each shot index to its Nf frames.
+                if n_old:
+                    frame_order = np.concatenate(
+                        [np.arange(i * Nf, (i + 1) * Nf)
+                         for i in np.asarray(order, dtype=int)]
+                    )
+                else:
+                    frame_order = np.array([], dtype=int)
+                self.images = self.images[frame_order]
+                self.image_timestamps = self.image_timestamps[frame_order]
+            elif self.images.shape[0] == n_old:
+                # One (already-processed) image per shot: promote onto the
+                # structured leading axes like the other scan-shaped arrays.
+                self.images = self._reshape_axis0_to_first_xvar(
+                    self.images, order, new_shape
+                )
+                self.image_timestamps = self._reshape_axis0_to_first_xvar(
+                    self.image_timestamps, order, new_shape
+                )
 
         for key in self.data.keys:
             arr = vars(self.data)[key]
