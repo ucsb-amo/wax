@@ -192,6 +192,13 @@ class WaxxServer:
             except Exception as exc:
                 logger.warning("[WaxxServer] Beacon send failed: %s", exc)
                 _close_sock()
+            # Also send to the limited broadcast so servers on non-192.168.1.x
+            # subnets (or same-machine tests) are discoverable locally.
+            if _BROADCAST_ADDR != "255.255.255.255":
+                try:
+                    sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+                except Exception:
+                    pass
 
             self._waxx_beacon_stop.wait(timeout=self._waxx_beacon_interval)
 
