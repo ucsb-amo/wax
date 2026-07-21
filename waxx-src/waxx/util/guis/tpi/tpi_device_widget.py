@@ -10,7 +10,6 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QSignalBlocker, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractSpinBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -143,6 +142,13 @@ class TpiDeviceWidget(QWidget):
         self._last_update: float = 0.0
         self._rf_on: Optional[bool] = None
 
+        # Pending-update model: an edit stages values (orange) until Enter
+        # commits them.  ``_prev_*`` hold the last committed/known-good values
+        # so "undo" can restore them.
+        self._has_unsaved: bool = False
+        self._prev_freq: Optional[float] = None
+        self._prev_level: Optional[int] = None
+
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
 
@@ -173,7 +179,7 @@ class TpiDeviceWidget(QWidget):
         row.setContentsMargins(10, 8, 10, 8)
         row.setSpacing(8)
 
-        # --- RF switch ---------------------------------------------------
+        # --- RF switch (instant; independent of the lock) ----------------
         self._rf_btn = QPushButton("OFF")
         self._rf_btn.setObjectName("rfOff")
         self._rf_btn.setFixedWidth(64)
@@ -187,28 +193,34 @@ class TpiDeviceWidget(QWidget):
         self._freq_spin.setSingleStep(1.0)
         self._freq_spin.setSuffix(" MHz")
         self._freq_spin.setFixedWidth(105)
-        self._freq_spin.editingFinished.connect(self._set_freq)
-        self._freq_lock = self._make_lock_button()
-        self._freq_lock.toggled.connect(
-            lambda locked: self._apply_lock(self._freq_spin, self._freq_lock, locked)
-        )
-        self._apply_lock(self._freq_spin, self._freq_lock, True)
+        self._freq_spin.valueChanged.connect(self._mark_unsaved)
+        self._freq_spin.lineEdit().returnPressed.connect(self._commit)
         row.addWidget(self._freq_spin)
-        row.addWidget(self._freq_lock)
 
         # --- Level (merged live display + editable spinbox) --------------
         self._level_spin = QSpinBox()
         self._level_spin.setRange(-90, 10)
         self._level_spin.setSuffix(" dBm")
         self._level_spin.setFixedWidth(90)
-        self._level_spin.editingFinished.connect(self._set_level)
-        self._level_lock = self._make_lock_button()
-        self._level_lock.toggled.connect(
-            lambda locked: self._apply_lock(self._level_spin, self._level_lock, locked)
-        )
-        self._apply_lock(self._level_spin, self._level_lock, True)
+        self._level_spin.valueChanged.connect(self._mark_unsaved)
+        self._level_spin.lineEdit().returnPressed.connect(self._commit)
         row.addWidget(self._level_spin)
-        row.addWidget(self._level_lock)
+
+        # --- default / undo (pending-update model) -----------------------
+        self._default_btn = QPushButton("default")
+        self._default_btn.setObjectName("default")
+        self._default_btn.setFixedWidth(64)
+        self._default_btn.clicked.connect(self._on_default_undo_clicked)
+        row.addWidget(self._default_btn)
+
+        # --- single lock for the whole device ----------------------------
+        self._lock_btn = QPushButton("🔒")
+        self._lock_btn.setObjectName("lock")
+        self._lock_btn.setCheckable(True)
+        self._lock_btn.setChecked(True)  # start locked (read-only, tracks device)
+        self._lock_btn.setFixedWidth(28)
+        self._lock_btn.toggled.connect(self._on_lock_toggled)
+        row.addWidget(self._lock_btn)
 
         row.addStretch()
 
@@ -220,37 +232,118 @@ class TpiDeviceWidget(QWidget):
         outer.addWidget(card)
         outer.addStretch()
 
+        self._apply_lock(True)
+        self._refresh_default_button()
+
     # ------------------------------------------------------------------ #
-    # Lock toggle — purely local: gates whether the spinbox follows the
-    # live device value (locked) or is held for editing (unlocked).  It
-    # never sends anything to the device.
+    # Lock toggle — purely local: gates whether the spinboxes are editable.
+    # Locked = read-only, tracks the live device value.  Never sends
+    # anything to the device.  One lock covers the whole device.
     # ------------------------------------------------------------------ #
 
-    def _make_lock_button(self) -> QPushButton:
-        btn = QPushButton("🔒")
-        btn.setObjectName("lock")
-        btn.setCheckable(True)
-        btn.setChecked(True)  # start locked (read-only, tracks device)
-        btn.setFixedWidth(28)
-        return btn
+    def _on_lock_toggled(self, locked: bool) -> None:
+        # Re-locking discards any staged (uncommitted) edit so the display
+        # snaps back to the device's actual value.
+        if locked and self._has_unsaved:
+            self._revert_pending()
+        self._apply_lock(locked)
 
-    @staticmethod
-    def _apply_lock(spin: QAbstractSpinBox, btn: QPushButton, locked: bool) -> None:
-        spin.setReadOnly(locked)
-        spin.setButtonSymbols(
-            QAbstractSpinBox.ButtonSymbols.NoButtons
+    def _apply_lock(self, locked: bool) -> None:
+        for spin in (self._freq_spin, self._level_spin):
+            spin.setReadOnly(locked)
+            spin.setButtonSymbols(
+                QAbstractSpinBox.ButtonSymbols.NoButtons
+                if locked
+                else QAbstractSpinBox.ButtonSymbols.UpDownArrows
+            )
+        self._default_btn.setEnabled(not locked)
+        self._lock_btn.setText("🔒" if locked else "🔓")
+        self._lock_btn.setToolTip(
+            "Locked — tracks device, editing disabled. Click to edit."
             if locked
-            else QAbstractSpinBox.ButtonSymbols.UpDownArrows
-        )
-        btn.setText("🔒" if locked else "🔓")
-        btn.setToolTip(
-            "Locked — tracks device. Click to edit."
-            if locked
-            else "Unlocked — edit and press Enter to apply."
+            else "Unlocked — edit and press Enter to apply; lock again to discard."
         )
         if not locked:
-            spin.setFocus()
-            spin.selectAll()
+            self._freq_spin.setFocus()
+            self._freq_spin.selectAll()
+
+    # ------------------------------------------------------------------ #
+    # Pending-update model
+    # ------------------------------------------------------------------ #
+
+    def _mark_unsaved(self, *_args) -> None:
+        """A spinbox value changed by the user — stage it until Enter."""
+        self._has_unsaved = True
+        self._refresh_default_button()
+        self._highlight_unsaved()
+
+    def _highlight_unsaved(self) -> None:
+        if self._has_unsaved:
+            self._freq_spin.setStyleSheet("QDoubleSpinBox { background-color: orange; color: black; }")
+            self._level_spin.setStyleSheet("QSpinBox { background-color: orange; color: black; }")
+        else:
+            self._freq_spin.setStyleSheet("")
+            self._level_spin.setStyleSheet("")
+
+    def _refresh_default_button(self) -> None:
+        if self._has_unsaved:
+            self._default_btn.setText("undo")
+            self._default_btn.setStyleSheet(f"background-color: {UNDO_BUTTON_COLOR}; color: black;")
+            self._default_btn.setToolTip("Discard staged edit")
+        else:
+            self._default_btn.setText("default")
+            self._default_btn.setStyleSheet(f"background-color: {DEFAULT_BUTTON_COLOR};")
+            if self._has_defaults():
+                self._default_btn.setToolTip("Load default settings (press Enter to apply)")
+            else:
+                self._default_btn.setToolTip("No default configured for this consultant")
+
+    def _has_defaults(self) -> bool:
+        return (self._client.default_freq_mhz is not None
+                or self._client.default_level_dbm is not None)
+
+    def _commit(self) -> None:
+        """Enter pressed — send the staged values to the device."""
+        if not self._has_unsaved:
+            return
+        freq = self._freq_spin.value()
+        level = self._level_spin.value()
+        self._prev_freq = freq
+        self._prev_level = level
+        self._has_unsaved = False
+        self._refresh_default_button()
+        self._highlight_unsaved()
+        self._client.set_freq(freq)
+        self._client.set_level(level)
+
+    def _revert_pending(self) -> None:
+        """Discard a staged edit and restore the last known-good values."""
+        with QSignalBlocker(self._freq_spin), QSignalBlocker(self._level_spin):
+            if self._prev_freq is not None:
+                self._freq_spin.setValue(self._prev_freq)
+            if self._prev_level is not None:
+                self._level_spin.setValue(self._prev_level)
+        self._has_unsaved = False
+        self._refresh_default_button()
+        self._highlight_unsaved()
+
+    def _on_default_undo_clicked(self) -> None:
+        if self._has_unsaved:
+            self._revert_pending()
+            return
+        # Stage the configured defaults; require Enter to actually apply them.
+        if not self._has_defaults():
+            return
+        if self._client.default_freq_mhz is not None:
+            self._freq_spin.setValue(float(self._client.default_freq_mhz))
+        if self._client.default_level_dbm is not None:
+            self._level_spin.setValue(int(self._client.default_level_dbm))
+        # Force the staged state even if a default equals the current value.
+        self._has_unsaved = True
+        self._refresh_default_button()
+        self._highlight_unsaved()
+        self._freq_spin.setFocus()
+        self._freq_spin.selectAll()
 
     # ------------------------------------------------------------------ #
     # State updates from PUB socket
@@ -267,16 +360,17 @@ class TpiDeviceWidget(QWidget):
         self._rf_on = rf_on
         self._rf_btn.setText("ON" if rf_on else "OFF")
         self._rf_btn.setObjectName("rfOn" if rf_on else "rfOff")
-        self._rf_btn.setStyleSheet(self._rf_btn.styleSheet())  # force re-polish
         self.style().unpolish(self._rf_btn)
         self.style().polish(self._rf_btn)
 
-        # When locked the spinbox mirrors the live device value; when
-        # unlocked it is being edited, so leave it alone.
-        if self._freq_lock.isChecked():
-            self._freq_spin.setValue(freq)
-        if self._level_lock.isChecked():
-            self._level_spin.setValue(level)
+        # Never clobber a staged edit; otherwise mirror the live device value.
+        # Signals are blocked so mirroring does not itself mark the row unsaved.
+        if not self._has_unsaved:
+            with QSignalBlocker(self._freq_spin), QSignalBlocker(self._level_spin):
+                self._freq_spin.setValue(freq)
+                self._level_spin.setValue(int(level))
+            self._prev_freq = self._freq_spin.value()
+            self._prev_level = self._level_spin.value()
 
     def _update_stale(self) -> None:
         if self._last_update == 0.0:
@@ -291,12 +385,6 @@ class TpiDeviceWidget(QWidget):
     def _toggle_rf(self) -> None:
         new_state = not bool(self._rf_on)
         self._client.set_rf(new_state)
-
-    def _set_freq(self) -> None:
-        self._client.set_freq(self._freq_spin.value())
-
-    def _set_level(self) -> None:
-        self._client.set_level(self._level_spin.value())
 
     # ------------------------------------------------------------------ #
     # Cleanup
