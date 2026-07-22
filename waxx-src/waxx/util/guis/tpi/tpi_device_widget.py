@@ -10,6 +10,7 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QSignalBlocker, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
