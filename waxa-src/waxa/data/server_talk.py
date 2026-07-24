@@ -8,7 +8,7 @@ import glob
 import numpy as np
 import h5py
 
-MAP_BAT_PATH = "\"G:\\Shared drives\\Weld Lab Shared Drive\\Infrastructure\\map_network_drives_PeterRecommended.bat\""
+MAP_BAT_PATH = "\"G:\\Shared drives\\Weld Lab Shared Drive\\Infrastructure\\map_network_drives.bat\""
 RECENT_COMPLETED_TRUST_WINDOW = 0
 SERVER_TALK_TIMING_ENABLED = False
 
