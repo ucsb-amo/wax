@@ -74,3 +74,10 @@ class PrecilaserGuiClient(WaxxClient):
 
     def set_stability_mode(self, enabled: bool) -> bool:
         return self._send_ok_command(f"SET_STABILITY_MODE {1 if enabled else 0}")
+
+    def get_ramp_endpoint(self) -> float:
+        payload = self._send_json_command("GET_RAMP_ENDPOINT")
+        return float(payload["ramp_up_endpoint_a"])
+
+    def set_ramp_endpoint(self, current_amps: float) -> bool:
+        return self._send_ok_command(f"SET_RAMP_ENDPOINT {float(current_amps):.6f}")

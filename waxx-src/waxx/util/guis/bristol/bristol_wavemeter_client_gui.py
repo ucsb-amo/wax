@@ -158,7 +158,7 @@ class BristolDetuningWidget(QWidget):
         self._plot.getAxis("bottom").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._curve = self._plot.plot(pen=pg.mkPen("#ffaa00", width=1.5))
         # Add Δ = 0 reference line (horizontal, only visible if in y-range)
-        zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color="#666666", style=pg.Qt.PenStyle.DashLine, width=1))
+        zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color="#666666", style=pg.QtCore.Qt.PenStyle.DashLine, width=1))
         self._plot.addItem(zero_line)
         self._plot.setMinimumHeight(180)
 

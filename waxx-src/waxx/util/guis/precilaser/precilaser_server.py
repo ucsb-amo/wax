@@ -62,6 +62,9 @@ class LogBufferHandler(logging.Handler):
         self.server.append_log_entry(self.format(record))
 
 
+DEFAULT_RAMP_UP_ENDPOINT_A = 9.5
+
+
 class PrecilaserLaserServer(WaxxServer):
     def __init__(
         self,
@@ -71,6 +74,7 @@ class PrecilaserLaserServer(WaxxServer):
         poll_interval_s: float = 1.0,
         max_log_entries: int = 2000,
         auto_connect: bool = True,
+        config_path: Optional[str] = None,
     ):
         WaxxServer.__init__(self, "precilaser", port)
         self.host = host
@@ -80,6 +84,14 @@ class PrecilaserLaserServer(WaxxServer):
         self.max_log_entries = int(max_log_entries)
         self.auto_connect = auto_connect
         self.reconnect_delay_s = 0.3
+
+        # Server-side persisted settings (JSON).  Currently just the current
+        # that the turn-on ramp finishes at.  config_path is provided by the
+        # kexp launcher; None disables persistence (value stays in memory).
+        self.config_path = config_path
+        self._config_lock = threading.Lock()
+        self.ramp_up_endpoint_a = DEFAULT_RAMP_UP_ENDPOINT_A
+        self._load_config()
 
         self.running = False
         self.server_socket: Optional[socket.socket] = None
@@ -196,7 +208,44 @@ class PrecilaserLaserServer(WaxxServer):
                     "type": self.sequence_type,
                 },
                 "log_count": self._log_offset + len(self._log_entries),
+                "ramp_up_endpoint_a": self.ramp_up_endpoint_a,
             }
+
+    def _load_config(self) -> None:
+        if not self.config_path or not os.path.exists(self.config_path):
+            return
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            value = float(data.get("ramp_up_endpoint_a", self.ramp_up_endpoint_a))
+            if value >= 0:
+                self.ramp_up_endpoint_a = value
+            LOGGER.info("Loaded ramp-up endpoint %.2f A from %s", self.ramp_up_endpoint_a, self.config_path)
+        except Exception as exc:
+            LOGGER.warning("Failed to load precilaser config from %s: %s", self.config_path, exc)
+
+    def _save_config(self) -> None:
+        if not self.config_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                json.dump({"ramp_up_endpoint_a": self.ramp_up_endpoint_a}, fh, indent=2)
+        except Exception as exc:
+            LOGGER.warning("Failed to save precilaser config to %s: %s", self.config_path, exc)
+
+    def get_ramp_up_endpoint(self) -> float:
+        with self._config_lock:
+            return self.ramp_up_endpoint_a
+
+    def set_ramp_up_endpoint(self, value_a: float) -> None:
+        value_a = float(value_a)
+        if value_a < 0:
+            raise ValueError("ramp_up_endpoint_a must be >= 0")
+        with self._config_lock:
+            self.ramp_up_endpoint_a = value_a
+            self._save_config()
+        LOGGER.info("Ramp-up endpoint set to %.2f A", value_a)
 
     def _accept_loop(self) -> None:
         try:
@@ -278,6 +327,11 @@ class PrecilaserLaserServer(WaxxServer):
                 return "OK"
             if command == "SET_STABILITY_MODE":
                 self.set_stability_mode(argument.lower() in {"1", "true", "on"})
+                return "OK"
+            if command == "GET_RAMP_ENDPOINT":
+                return json.dumps({"ramp_up_endpoint_a": self.get_ramp_up_endpoint()})
+            if command == "SET_RAMP_ENDPOINT":
+                self.set_ramp_up_endpoint(float(argument))
                 return "OK"
         except Exception as exc:
             LOGGER.exception("Command failed: %s", exc)
@@ -485,7 +539,10 @@ class PrecilaserLaserServer(WaxxServer):
                     if self.laser is None:
                         raise RuntimeError("Laser not connected")
                     laser_ref = self.laser
-                startup_controller = PrecilaserStartupController(laser_ref)
+                startup_controller = PrecilaserStartupController(
+                    laser_ref,
+                    target_working_current_a=self.get_ramp_up_endpoint(),
+                )
                 startup_controller.on_step = self._on_ramp_step
                 if sequence_type == "STARTUP":
                     startup_controller.run_turn_on_procedure(should_continue=self._should_continue_sequence)
@@ -557,7 +614,13 @@ class PrecilaserLaserServer(WaxxServer):
 
 
 
-def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6", log_path: str | None = None) -> None:
+def main(
+    host: str = "0.0.0.0",
+    port: int = 0,
+    serial_port: str = "COM6",
+    log_path: str | None = None,
+    config_path: str | None = None,
+) -> None:
     logging.basicConfig(level=logging.INFO)
     if log_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
@@ -570,7 +633,9 @@ def main(host: str = "0.0.0.0", port: int = 0, serial_port: str = "COM6", log_pa
         ))
         logging.getLogger().addHandler(_fh)
         LOGGER.info("Logging to file: %s", log_path)
-    server = PrecilaserLaserServer(host=host, port=port, serial_port=serial_port)
+    server = PrecilaserLaserServer(
+        host=host, port=port, serial_port=serial_port, config_path=config_path
+    )
 
     # Ensure COM port is released on any exit path (crash, SIGTERM, atexit).
     atexit.register(server.stop)

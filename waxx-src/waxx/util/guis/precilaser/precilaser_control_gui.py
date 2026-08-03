@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -126,6 +127,7 @@ class PrecilaserControlGUI(QMainWindow):
         self._last_remote_error: str | None = None
         self._laser_enabled = False
         self._stability_enabled = False
+        self._ramp_up_endpoint_a = 9.5
         self._remote_poll_in_flight = False
         self._remote_connect_in_flight = False
 
@@ -378,6 +380,15 @@ class PrecilaserControlGUI(QMainWindow):
         self.interrupt_button.clicked.connect(self._interrupt_sequence)
         seq_row.addWidget(self.interrupt_button)
         self.interrupt_button.hide()
+
+        # Settings cog — opens a dialog to edit the server-side turn-on ramp
+        # endpoint (Amps).  Sits inline with the startup/shutdown buttons.
+        self.settings_button = QPushButton("⚙")
+        self.settings_button.setToolTip("Settings (ramp-up endpoint)")
+        self.settings_button.setFixedWidth(34)
+        self.settings_button.clicked.connect(self._open_settings)
+        seq_row.addWidget(self.settings_button)
+
         layout.addLayout(seq_row)
 
         # The sequence-state label now lives in the Logs dropdown so the
@@ -631,6 +642,38 @@ class PrecilaserControlGUI(QMainWindow):
         except Exception as exc:
             self._append_log(f"ERROR interrupt sequence: {exc}")
 
+    def _open_settings(self):
+        # Prefer a fresh value straight from the server so the dialog reflects
+        # what's actually persisted; fall back to the last snapshot value.
+        current_value = self._ramp_up_endpoint_a
+        if self.client is not None:
+            try:
+                current_value = self.client.get_ramp_endpoint()
+                self._ramp_up_endpoint_a = current_value
+            except Exception as exc:
+                self._append_log(f"ERROR read ramp endpoint: {exc}")
+
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Settings",
+            "Ramp-up endpoint (A):",
+            current_value,
+            0.0,
+            655.35,
+            2,
+        )
+        if not ok:
+            return
+        if self.client is None:
+            self._set_status_message("Not connected to server")
+            return
+        try:
+            if self.client.set_ramp_endpoint(value):
+                self._ramp_up_endpoint_a = value
+                self._set_status_message(f"Ramp-up endpoint set to {value:.2f} A")
+        except Exception as exc:
+            self._append_log(f"ERROR set ramp endpoint: {exc}")
+
     def _set_server_conn_button_state(self, state: str) -> None:
         """Update the server TCP connection button appearance.
 
@@ -780,6 +823,12 @@ class PrecilaserControlGUI(QMainWindow):
             else:
                 total_current_a = float(status.get("working_current_a", 0.0))
             self.current_display_label.setText(f"{total_current_a:.2f} A")
+
+        if "ramp_up_endpoint_a" in snapshot:
+            try:
+                self._ramp_up_endpoint_a = float(snapshot["ramp_up_endpoint_a"])
+            except (TypeError, ValueError):
+                pass
 
         seq_state = str(sequence.get("state", "IDLE"))
         seq_type = str(sequence.get("type") or "-")
