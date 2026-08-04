@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -359,12 +360,20 @@ class CountsPanel(QWidget):
         self.vb2.addItem(self.norm_line)
         self.norm_line.hide()
 
-        # Capped at ~30 min of data at 20 fps; prevents unbounded O(n)
-        # linear scan in update_plot() after long runs.
+        # Hard safety cap on sample count; the primary bound is the time-based
+        # retention window below (old samples are dropped in add_count), which
+        # keeps update_plot()'s cost O(window) no matter how long a stream has
+        # been open.
         _MAX_COUNTS = 36_000
         self.timestamps: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
         self.counts: collections.deque = collections.deque(maxlen=_MAX_COUNTS)
         self.start_time: Optional[datetime] = None
+        # Drop plotted samples older than this many seconds (5 min).
+        self._max_age_s: float = 300.0
+        # Throttle plot redraws so a fast free-running camera does not force a
+        # replot on every single frame.
+        self._last_plot_time: float = 0.0
+        self._plot_min_interval: float = 0.1
 
         self.fixed_interval: bool = True
         self.time_window: int = 30
@@ -415,11 +424,26 @@ class CountsPanel(QWidget):
         self.update_plot()
 
     def add_count(self, count: float) -> None:
+        now = datetime.now()
         if self.start_time is None:
-            self.start_time = datetime.now()
-        self.timestamps.append((datetime.now() - self.start_time).total_seconds())
+            self.start_time = now
+        t = (now - self.start_time).total_seconds()
+        self.timestamps.append(t)
         self.counts.append(count)
-        self.update_plot()
+        # Drop samples older than the retention window so the history the plot
+        # scans stays bounded regardless of how long the stream has been open.
+        cutoff = t - self._max_age_s
+        while self.timestamps and self.timestamps[0] < cutoff:
+            self.timestamps.popleft()
+            self.counts.popleft()
+        # Only redraw when the panel is visible, and throttle so we do not
+        # replot on every frame of a fast camera.
+        if not self.isVisible():
+            return
+        now_m = time.monotonic()
+        if now_m - self._last_plot_time >= self._plot_min_interval:
+            self._last_plot_time = now_m
+            self.update_plot()
 
     def update_plot(self) -> None:
         if not self.timestamps:
@@ -508,9 +532,13 @@ class _FrameWorker(QThread):
     error = pyqtSignal(str)
     reconnected = pyqtSignal()
 
-    def __init__(self, client: BaslerCameraClient, parent=None) -> None:
+    def __init__(self, client: BaslerCameraClient, owner=None, parent=None) -> None:
         super().__init__(parent)
         self._client = client
+        # The owning widget, read (never mutated) from this thread to pick up
+        # the current ROI / saturation settings while the heavy image
+        # processing runs off the GUI thread.
+        self._owner = owner
         self._stop = False
         # Throttle between successful frames (ms).  Failures slow the loop
         # so we do not hammer an unreachable server.
@@ -551,10 +579,64 @@ class _FrameWorker(QThread):
                 # land here; just retry without spamming the GUI thread.
                 self.msleep(self._error_backoff_ms)
                 continue
-            self.frame_ready.emit(data)
+            try:
+                payload = self._process(data)
+            except Exception:
+                # A processing hiccup should not kill the stream; skip a frame.
+                self.msleep(self._idle_ms)
+                continue
+            self.frame_ready.emit(payload)
             # Yield briefly so the GUI thread can paint and so we do not
             # saturate the CPU when the camera is free-running fast.
             self.msleep(self._idle_ms)
+
+    def _process(self, data: dict) -> dict:
+        """Do the CPU-heavy image work off the GUI thread.
+
+        Colour-converts the frame, computes the ROI pixel sum and saturation
+        flag, and builds an owned ``QImage`` ready for display.  The GUI thread
+        then only paints cheap overlays, scales, and blits.  Widget state
+        (ROI rect / saturation option) is read locklessly here; a one-frame-
+        stale ROI in the live view is harmless.
+        """
+        frame: np.ndarray = data["frame"]
+        max_pv = int(data.get("max_pixel_value", 255))
+
+        if frame.ndim == 2:
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        else:
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = image_rgb.shape
+        # .copy() so the QImage owns its buffer (image_rgb can then be freed
+        # and the GUI thread can paint overlays onto it safely).
+        qt_image = QImage(
+            image_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888
+        ).copy()
+
+        owner = self._owner
+        rect = getattr(owner, "current_rect", None)
+        sat_in_box = getattr(owner, "saturation_in_box_only", True)
+
+        count: Optional[float] = None
+        sat_region = frame
+        if rect is not None and rect.width() > 0 and rect.height() > 0:
+            x1 = max(0, rect.x())
+            y1 = max(0, rect.y())
+            x2 = min(frame.shape[1], rect.x() + rect.width())
+            y2 = min(frame.shape[0], rect.y() + rect.height())
+            if x2 > x1 and y2 > y1:
+                count = float(np.sum(frame[y1:y2, x1:x2]))
+                if sat_in_box:
+                    sat_region = frame[y1:y2, x1:x2]
+        saturated = bool(np.any(sat_region >= max_pv))
+
+        return {
+            "qimage": qt_image,
+            "frame": frame,
+            "count": count,
+            "saturated": saturated,
+            "max_pixel_value": max_pv,
+        }
 
 
 class _SettingsWorker(QThread):
@@ -1048,7 +1130,7 @@ class BaslerCameraWidget(QFrame):
     def _start_frame_worker(self) -> None:
         if _thread_alive(self._frame_worker):
             return
-        worker = _FrameWorker(self.client, self)
+        worker = _FrameWorker(self.client, self, self)
         worker.frame_ready.connect(self._on_frame_ready)
         worker.error.connect(self._on_frame_error)
         worker.reconnected.connect(self._on_reconnected)
@@ -1238,6 +1320,9 @@ class BaslerCameraWidget(QFrame):
             # ROI is required for pixel counts to be meaningful; warn the
             # user if one hasn't been drawn yet.
             self._check_roi_for_counts()
+            # Panel was just revealed; render whatever history accumulated
+            # while it was hidden (add_count skips redraws when hidden).
+            self.counts_panel.update_plot()
 
     def _has_valid_roi(self) -> bool:
         r = self.current_rect
@@ -1435,33 +1520,21 @@ class BaslerCameraWidget(QFrame):
         self._status_dot.setStyleSheet(_led_style(_LED_OPEN))
         self._refresh_settings()
 
-    def _render_frame(self, data: dict) -> None:
+    def _render_frame(self, payload: dict) -> None:
+        # The heavy lifting (colour-convert, ROI sum, saturation scan, QImage
+        # construction) already happened in the frame worker thread; here we
+        # only paint cheap overlays, scale, and blit on the GUI thread.
+        qt_image = payload["qimage"]
+        self.last_image = payload["frame"]
+        self.max_pixel_value = payload.get("max_pixel_value", 255)
 
-        frame: np.ndarray = data["frame"]
-        self.last_image = frame
-        self.max_pixel_value = data.get("max_pixel_value", 255)
+        count = payload.get("count")
+        if count is not None:
+            self.counts_panel.add_count(count)
 
-        # Convert to RGB.
-        if frame.ndim == 2:
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        else:
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # ROI pixel counts.
-        if self.current_rect and self.current_rect.width() > 0 and self.current_rect.height() > 0:
-            x1 = max(0, self.current_rect.x())
-            y1 = max(0, self.current_rect.y())
-            x2 = min(frame.shape[1], self.current_rect.x() + self.current_rect.width())
-            y2 = min(frame.shape[0], self.current_rect.y() + self.current_rect.height())
-            if x2 > x1 and y2 > y1:
-                self.counts_panel.add_count(float(np.sum(frame[y1:y2, x1:x2])))
-
-        h, w, ch = image_rgb.shape
-        qt_image = QImage(image_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
-
-        # ROI rectangle overlay.
+        # ROI rectangle overlay.  The worker handed us a QImage that owns its
+        # buffer, so we can paint directly without another full-image copy.
         if self.show_rectangle:
-            qt_image = qt_image.copy()
             p = QPainter(qt_image)
             p.setPen(QPen(QColor(0, 255, 0), 3))
             if self.rect_start and self.rect_end:
@@ -1474,22 +1547,7 @@ class BaslerCameraWidget(QFrame):
                 p.drawRect(self.current_rect)
             p.end()
 
-        # Saturation check.
-        if (
-            self.saturation_in_box_only
-            and self.current_rect
-            and self.current_rect.width() > 0
-        ):
-            sx1 = max(0, self.current_rect.x())
-            sy1 = max(0, self.current_rect.y())
-            sx2 = min(frame.shape[1], self.current_rect.x() + self.current_rect.width())
-            sy2 = min(frame.shape[0], self.current_rect.y() + self.current_rect.height())
-            check = frame[sy1:sy2, sx1:sx2] if sx2 > sx1 and sy2 > sy1 else frame
-        else:
-            check = frame
-
-        if np.any(check >= self.max_pixel_value):
-            qt_image = qt_image.copy()
+        if payload.get("saturated"):
             p = QPainter(qt_image)
             p.setFont(QFont("Times", 100))
             p.setPen(QPen(QColor(255, 0, 0), 10))
@@ -1497,10 +1555,12 @@ class BaslerCameraWidget(QFrame):
             p.end()
 
         pixmap = QPixmap.fromImage(qt_image)
+        # FastTransformation (nearest-neighbour) for the live scale is far
+        # cheaper than smooth scaling and imperceptible on a moving preview.
         scaled = pixmap.scaled(
             self.image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         self.image_label.setPixmap(scaled)
 

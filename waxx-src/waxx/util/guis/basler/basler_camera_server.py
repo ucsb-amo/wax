@@ -96,6 +96,12 @@ class _ManagedCamera:
         self._camera: Optional[pylon.InstantCamera] = None
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_timestamp: float = 0.0
+        # Cached hardware values so GET_FRAME never reads GenICam nodes over USB
+        # on the hot path (those reads are slow and, done under the lock, also
+        # stall the grab thread).  Refreshed on open() and on set_gain/exposure.
+        self._cached_gain: float = 0.0
+        self._cached_exposure: float = 0.0
+        self._cached_max_pixel: int = 255
         self._is_open: bool = False
         # Set of client_ids currently holding this camera open.  The
         # physical device stays open as long as the set is non-empty;
@@ -157,6 +163,20 @@ class _ManagedCamera:
             self._camera = cam
             self._is_open = True
             self._latest_frame = None
+            # Prime the cached hardware values once, now, instead of reading
+            # them back from the camera on every GET_FRAME.
+            try:
+                self._cached_gain = float(cam.Gain.GetValue())
+            except Exception:
+                self._cached_gain = float(self.defaults.get("gain", 12.0))
+            try:
+                self._cached_exposure = float(cam.ExposureTime.GetValue())
+            except Exception:
+                self._cached_exposure = float(self.defaults.get("exposure", 300.0))
+            try:
+                self._cached_max_pixel = int(cam.PixelDynamicRangeMax.GetValue())
+            except Exception:
+                self._cached_max_pixel = 255
 
         self._grab_stop.clear()
         self._grab_thread = threading.Thread(
@@ -227,28 +247,26 @@ class _ManagedCamera:
     # ------------------------------------------------------------------ #
 
     def get_frame(self) -> dict:
+        # Hot path: hold the lock only long enough to snapshot the latest frame
+        # and the cached hardware values.  No GenICam / USB reads here, so many
+        # cameras' GET_FRAMEs stay cheap and never stall the grab thread.
         with self._lock:
             if not self._is_open or self._camera is None:
                 return {"ok": False, "error": "camera not open"}
             frame = self._latest_frame
             if frame is None:
                 return {"ok": False, "error": "no frame yet"}
-            try:
-                gain = float(self._camera.Gain.GetValue())
-                exposure = float(self._camera.ExposureTime.GetValue())
-                try:
-                    max_pv = int(self._camera.PixelDynamicRangeMax.GetValue())
-                except Exception:
-                    max_pv = 255
-            except Exception as exc:
-                return {"ok": False, "error": str(exc)}
+            gain = self._cached_gain
+            exposure = self._cached_exposure
+            max_pv = self._cached_max_pixel
+            timestamp = self._frame_timestamp
         return {
             "ok": True,
             "frame": frame,
             "gain": gain,
             "exposure": exposure,
             "max_pixel_value": max_pv,
-            "timestamp": self._frame_timestamp,
+            "timestamp": timestamp,
         }
 
     def get_gain(self) -> dict:
@@ -266,6 +284,11 @@ class _ManagedCamera:
                 return {"ok": False, "error": "camera not open"}
             try:
                 self._camera.Gain.SetValue(float(value))
+                # Refresh the cached value GET_FRAME hands out.
+                try:
+                    self._cached_gain = float(self._camera.Gain.GetValue())
+                except Exception:
+                    self._cached_gain = float(value)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
@@ -285,6 +308,10 @@ class _ManagedCamera:
                 return {"ok": False, "error": "camera not open"}
             try:
                 self._camera.ExposureTime.SetValue(float(value))
+                try:
+                    self._cached_exposure = float(self._camera.ExposureTime.GetValue())
+                except Exception:
+                    self._cached_exposure = float(value)
                 return {"ok": True}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
@@ -400,7 +427,8 @@ class BaslerCameraServer(WaxxServer):
             then broadcast via the WaxxServer beacon so clients discover it.
     """
 
-    def __init__(self, instance_index: int = 0, port: int = 0) -> None:
+    def __init__(self, instance_index: int = 0, port: int = 0,
+                 n_workers: int = 0) -> None:
         hostname = socket.gethostname()
         sid = (
             f"{BASLER_SERVER_PREFIX}{hostname}"
@@ -421,6 +449,10 @@ class BaslerCameraServer(WaxxServer):
         WaxxServer.__init__(self, sid, port)
         self._cameras: dict[str, _ManagedCamera] = {}
         self._running = False
+        # Number of dispatch worker threads (0 = auto-size from camera count)
+        # so each open stream is serviced concurrently instead of queueing
+        # behind the others on a single request loop.
+        self._n_workers = int(n_workers)
         self._defaults_store: dict[str, dict] = self._load_defaults()
         self._enumerate_cameras()
 
@@ -500,33 +532,77 @@ class BaslerCameraServer(WaxxServer):
     # ------------------------------------------------------------------ #
 
     def start(self) -> None:
-        """Bind the ZMQ REP socket, start the beacon, and enter the request loop.
+        """Bind the ZMQ front end, start the beacon, and serve requests.
+
+        Requests are dispatched by a pool of worker threads (ROUTER/DEALER
+        pattern) so frame fetches and control RPCs for different cameras run
+        concurrently instead of serialising behind one another on a single
+        loop.  The main thread runs a lightweight pump that shuttles messages
+        between the TCP front end and the in-process worker back end.
 
         Blocks until ``stop()`` is called or the process exits.
         """
-        context = zmq.Context()
-        rep_socket = context.socket(zmq.REP)
-        actual_port = rep_socket.bind_to_random_port("tcp://0.0.0.0")
+        context = zmq.Context(io_threads=2)
+        # TCP front end that clients' REQ sockets connect to.
+        frontend = context.socket(zmq.ROUTER)
+        actual_port = frontend.bind_to_random_port("tcp://0.0.0.0")
+        # In-process back end that worker REP sockets pull from.
+        backend = context.socket(zmq.DEALER)
+        backend.bind("inproc://basler_workers")
         # Update the advertised port so the beacon carries the right value.
         self._waxx_port = actual_port
         self._running = True
         self._start_beacon()
+
+        n_workers = self._n_workers or max(2, min(8, len(self._cameras) or 2))
+        workers: list[threading.Thread] = []
+        for i in range(n_workers):
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(context,),
+                name=f"BaslerWorker-{i}",
+                daemon=True,
+            )
+            t.start()
+            workers.append(t)
+
         logger.info(
-            "[BaslerServer] Listening on ZMQ port %d  (server_id=%s)",
+            "[BaslerServer] Listening on ZMQ port %d  (server_id=%s, %d workers)",
             actual_port,
             self._waxx_server_id,
+            n_workers,
         )
+
+        poller = zmq.Poller()
+        poller.register(frontend, zmq.POLLIN)
+        poller.register(backend, zmq.POLLIN)
         try:
-            self._req_loop(rep_socket)
+            # Pump only shuttles frames (no pickling / camera I/O), so the
+            # expensive work stays parallel across the worker pool.  copy=False
+            # avoids memcopying large frame replies through this thread.
+            while self._running:
+                socks = dict(poller.poll(timeout=500))
+                if socks.get(frontend) == zmq.POLLIN:
+                    backend.send_multipart(
+                        frontend.recv_multipart(copy=False), copy=False
+                    )
+                if socks.get(backend) == zmq.POLLIN:
+                    frontend.send_multipart(
+                        backend.recv_multipart(copy=False), copy=False
+                    )
         finally:
             self._stop_beacon()
+            # Let workers observe _running == False and exit their poll loops.
+            for t in workers:
+                t.join(timeout=1.0)
             for mc in self._cameras.values():
                 if mc.is_open:
                     try:
                         mc.close("__shutdown__", force=True)
                     except Exception:
                         pass
-            rep_socket.close()
+            frontend.close(0)
+            backend.close(0)
             context.term()
 
     def stop(self) -> None:
@@ -536,19 +612,32 @@ class BaslerCameraServer(WaxxServer):
     # Request dispatch
     # ------------------------------------------------------------------ #
 
-    def _req_loop(self, sock: zmq.Socket) -> None:
-        sock.setsockopt(zmq.RCVTIMEO, 500)
-        while self._running:
-            try:
-                raw = sock.recv()
-            except zmq.Again:
-                continue
-            try:
-                cmd = pickle.loads(raw)
-                reply = self._dispatch(cmd)
-            except Exception as exc:
-                reply = {"ok": False, "error": f"dispatch error: {exc}"}
-            sock.send(pickle.dumps(reply))
+    def _worker_loop(self, context: zmq.Context) -> None:
+        """Dispatch worker: pull one request, handle it, send the reply.
+
+        Each worker owns its own REP socket connected to the in-process back
+        end, so N workers service N requests concurrently.  Per-camera locks in
+        ``_ManagedCamera`` keep concurrent access to the same device safe, and
+        pickling of large frame replies happens here (in parallel) rather than
+        on one shared loop.
+        """
+        sock = context.socket(zmq.REP)
+        sock.connect("inproc://basler_workers")
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        try:
+            while self._running:
+                socks = dict(poller.poll(timeout=500))
+                if sock not in socks:
+                    continue
+                try:
+                    cmd = pickle.loads(sock.recv())
+                    reply = self._dispatch(cmd)
+                except Exception as exc:
+                    reply = {"ok": False, "error": f"dispatch error: {exc}"}
+                sock.send(pickle.dumps(reply))
+        finally:
+            sock.close(0)
 
     def _dispatch(self, cmd: dict) -> dict:
         name = cmd.get("cmd", "")
