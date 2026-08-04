@@ -5,3 +5,4 @@ from .fringes import SineEnvelope
 from .sine import Sine
 from .linear import LinearFit
 from .parabolic import *
+from .exponentials import ExponentialDecayFit
