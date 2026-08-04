@@ -19,8 +19,8 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                 ExposureTime=0.,
                 gain = 30,
                 hs_speed:int=0,
-                vs_speed:int=1,
-                vs_amp:int=3,
+                vs_speed:int=0,
+                vs_amp:int=0,
                 preamp = 2):
         # overwrite a broken method in the parent class
         self._initial_setup_temperature = self._initial_setup_temperature_fixed
