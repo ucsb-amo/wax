@@ -2351,7 +2351,7 @@ class DataBrowserWindow(QMainWindow):
             self._start_lite_creation_for_runs([r.run_id for r, _ in selected_run_rows])
         elif chosen is copy_run_id_action:
             if is_multi_selection:
-                ids = [r.run_id for r, _ in selected_run_rows]
+                ids = sorted(r.run_id for r, _ in selected_run_rows)
                 text = "[" + ", ".join(str(i) for i in ids) + "]"
             else:
                 text = str(run.run_id)
