@@ -1,9 +1,9 @@
 import socket
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 from waxx.util.comms_server.hardware_id import MONITOR_BASE_ID, resolve_scoped_server_id
 
-class CommClient(WaxxClient):
+class CommClient(NetClient):
     """
     A TCP client that discovers its server via UDP broadcast.
 

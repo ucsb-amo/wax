@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import socket
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 
 
-class PrecilaserGuiClient(WaxxClient):
+class PrecilaserGuiClient(NetClient):
     def __init__(self, timeout_s: float = 2.0, discovery_timeout: float = 3.0):
         super().__init__("precilaser", discovery_timeout=discovery_timeout)
         self.timeout_s = timeout_s

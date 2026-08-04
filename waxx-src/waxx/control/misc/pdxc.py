@@ -18,8 +18,8 @@ from typing import Optional
 
 import serial
 
-from waxx.util.comms_server.waxx_client import WaxxClient
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.client import NetClient
+from beacon.discovery.server import NetServer
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ class PDXC:
 # Server
 # ---------------------------------------------------------------------------
 
-class PDXC_Server(WaxxServer):
+class PDXC_Server(NetServer):
     """TCP server exposing PDXC serial control over LAN.
 
     Initialises the device (SMC mode + max speed) on ``start()``.
@@ -207,7 +207,7 @@ class PDXC_Server(WaxxServer):
     """
 
     def __init__(self, com_port: str = "COM26") -> None:
-        WaxxServer.__init__(self, SERVER_ID, port=0)
+        NetServer.__init__(self, SERVER_ID, port=0)
         self._com_port = com_port
         self._device: Optional[PDXC] = None
         self._running = False
@@ -302,7 +302,7 @@ class PDXC_Server(WaxxServer):
 # Client
 # ---------------------------------------------------------------------------
 
-class PDXC_Client(WaxxClient):
+class PDXC_Client(NetClient):
     """TCP client mirroring the PDXC motion API via ``PDXC_Server``.
 
     Discovered automatically via UDP broadcast beacon (server_id ``"pdxc"``).

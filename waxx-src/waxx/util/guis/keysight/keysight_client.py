@@ -5,12 +5,12 @@ import json
 import socket
 from typing import Optional
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 
 SERVER_ID = "keysight"
 
 
-class KeysightClient(WaxxClient):
+class KeysightClient(NetClient):
     """Discovers and communicates with a running ``KeysightServer``.
 
     All accessors return decoded JSON.  No direct VXI11 traffic — every

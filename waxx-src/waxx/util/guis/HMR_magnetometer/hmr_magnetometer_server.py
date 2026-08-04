@@ -32,7 +32,7 @@ from logging.handlers import RotatingFileHandler
 import serial
 import serial.tools.list_ports
 
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 DEFAULT_SERIAL_PORT = "COM33"
 DEFAULT_BAUD = 9600
@@ -151,7 +151,7 @@ class HMR2300Reader:
         raise ValueError(f"Could not parse sensor reply: {last_reply!r}")
 
 
-class MagnetometerServer(WaxxServer):
+class MagnetometerServer(NetServer):
     """Headless server: reads HMR2300 and serves field data over TCP."""
 
     def __init__(
@@ -164,7 +164,7 @@ class MagnetometerServer(WaxxServer):
         server_port=DEFAULT_SERVER_PORT,
         reference_csv_path=None,
     ):
-        WaxxServer.__init__(self, "magnetometer", server_port)
+        NetServer.__init__(self, "magnetometer", server_port)
         self.serial_port = serial_port
         self.baud = baud
         self.device_id = device_id

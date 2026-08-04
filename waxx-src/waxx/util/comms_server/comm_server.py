@@ -6,7 +6,7 @@ from PyQt6.QtGui import QFont
 import os
 from pathlib import Path
 
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 class ReadyBit:
     READY = 0
@@ -14,7 +14,7 @@ class ReadyBit:
     NOT_READY = 2
 STATES = ReadyBit()
 
-class UdpServer(QObject, WaxxServer):
+class UdpServer(QObject, NetServer):
     """
     A TCP server (QObject-based) that listens for connections in a QThread.
     Optionally broadcasts a UDP service-discovery beacon when server_id is given.
@@ -23,9 +23,9 @@ class UdpServer(QObject, WaxxServer):
 
     def __init__(self, host: str = "0.0.0.0", port: int = 0, server_id: str = None):
         super().__init__()  # QObject.__init__ (first in MRO)
-        # WaxxServer.__init__ called explicitly to avoid cooperative-super MRO conflict
+        # NetServer.__init__ called explicitly to avoid cooperative-super MRO conflict
         if server_id is not None:
-            WaxxServer.__init__(self, server_id, port)
+            NetServer.__init__(self, server_id, port)
         self.server_id = server_id
         self.host = host
         self.port = port

@@ -11,10 +11,10 @@ import socket
 import json
 from typing import Optional
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 
 
-class ALSGuiClient(WaxxClient):
+class ALSGuiClient(NetClient):
     """TCP client for remote control and monitoring of the ALS server."""
 
     def __init__(self, timeout_s: float = 2.0, discovery_timeout: float = 3.0):

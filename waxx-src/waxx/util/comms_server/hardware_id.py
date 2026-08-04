@@ -133,7 +133,7 @@ def resolve_scoped_server_id(base_id: str, collect_for: float = 1.5) -> str:
     if hw is not None:
         return f"{base_id}:{hw}"
 
-    from waxx.util.comms_server.waxx_client import discover_prefix  # noqa: PLC0415
+    from beacon.discovery.client import discover_prefix  # noqa: PLC0415
     servers = discover_prefix(base_id, collect_for=collect_for)
     matches = sorted(sid for sid in servers if _matches_base(sid, base_id))
     if len(matches) == 1:
@@ -159,7 +159,7 @@ def discover_scoped(base_id: str, timeout: float = 3.0) -> tuple[str, int] | Non
     Returns ``None`` (never raises) when not found or when the match is
     ambiguous, so polling callers (e.g. the remote viewer) can simply retry.
     """
-    from waxx.util.comms_server.waxx_client import discover, discover_prefix  # noqa: PLC0415
+    from beacon.discovery.client import discover, discover_prefix  # noqa: PLC0415
     hw = get_hardware_id()
     if hw is not None:
         return discover(f"{base_id}:{hw}", timeout=timeout)

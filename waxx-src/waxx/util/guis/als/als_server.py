@@ -16,7 +16,7 @@ from typing import Optional
 
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
 from waxx.util.notifications import send_email
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 
 LOGGER = logging.getLogger("als_laser_server")
@@ -87,7 +87,7 @@ class _LockedLaserProxy:
         return _locked_call
 
 
-class ALSLaserServer(WaxxServer):
+class ALSLaserServer(NetServer):
     STARTUP_STEPS = [
         (1, "Turn Power On", "step_1_turn_laser_power_on"),
         (2, "Turn Interlock On", "step_2_turn_interlock_on"),
@@ -114,7 +114,7 @@ class ALSLaserServer(WaxxServer):
         auto_connect: bool = True,
         state_file: Optional[str] = None,
     ):
-        WaxxServer.__init__(self, "als_laser", port)
+        NetServer.__init__(self, "als_laser", port)
         self.host = host
         self.port = int(port)
         self.serial_port = serial_port
