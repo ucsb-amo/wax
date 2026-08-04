@@ -22,7 +22,7 @@ import json
 import socket
 import time
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 50000
@@ -54,7 +54,7 @@ class HMRDummy():
         metadata = {"timestamp_s": 0.0, "datetime_iso": ""}
         return field_vec, metadata
 
-class HMRClient(WaxxClient):
+class HMRClient(NetClient):
     """Client for the HMR2300 magnetometer TCP server."""
 
     def __init__(self, discovery_timeout: float = 3.0):

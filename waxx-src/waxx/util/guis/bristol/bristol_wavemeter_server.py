@@ -16,7 +16,7 @@ import time
 from typing import Optional
 
 from waxx.control.misc.bristol_wavemeter import BristolWavemeter
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 LOGGER = logging.getLogger("bristol_wavemeter_server")
 LOGGER.setLevel(logging.INFO)
@@ -24,7 +24,7 @@ LOGGER.setLevel(logging.INFO)
 SERVER_ID = "bristol_wavemeter"
 
 
-class BristolWavemeterServer(WaxxServer):
+class BristolWavemeterServer(NetServer):
     """Polls a Bristol wavemeter in a background thread and serves readings over TCP."""
 
     def __init__(
@@ -34,7 +34,7 @@ class BristolWavemeterServer(WaxxServer):
         port: int = 0,
         poll_interval_s: float = 0.1,
     ):
-        WaxxServer.__init__(self, SERVER_ID, port)
+        NetServer.__init__(self, SERVER_ID, port)
         self.wavemeter_host = wavemeter_host
         self.host = host
         self.poll_interval_s = float(poll_interval_s)

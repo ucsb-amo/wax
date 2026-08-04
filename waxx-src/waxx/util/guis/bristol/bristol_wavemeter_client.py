@@ -4,12 +4,12 @@ from __future__ import annotations
 import json
 import socket
 
-from waxx.util.comms_server.waxx_client import WaxxClient
+from beacon.discovery.client import NetClient
 
 SERVER_ID = "bristol_wavemeter"
 
 
-class BristolWavemeterGuiClient(WaxxClient):
+class BristolWavemeterGuiClient(NetClient):
     """Discovers and communicates with a running BristolWavemeterServer."""
 
     def __init__(self, timeout_s: float = 2.0, discovery_timeout: float = 3.0):

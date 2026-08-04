@@ -17,7 +17,7 @@ from waxx.util.guis.precilaser.precilaser_controller import (
     PrecilaserController,
     PrecilaserStartupController,
 )
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 
 LOGGER = logging.getLogger("precilaser_server")
@@ -65,7 +65,7 @@ class LogBufferHandler(logging.Handler):
 DEFAULT_RAMP_UP_ENDPOINT_A = 9.5
 
 
-class PrecilaserLaserServer(WaxxServer):
+class PrecilaserLaserServer(NetServer):
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -76,7 +76,7 @@ class PrecilaserLaserServer(WaxxServer):
         auto_connect: bool = True,
         config_path: Optional[str] = None,
     ):
-        WaxxServer.__init__(self, "precilaser", port)
+        NetServer.__init__(self, "precilaser", port)
         self.host = host
         self.port = int(port)
         self.serial_port = serial_port

@@ -15,7 +15,7 @@ from waxx.util.dashboard.embed_helpers import WidgetPanelBase, embed_main_window
 class TpiServerPanel(WidgetPanelBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        from waxx.util.guis.tpi.tpi_gui import TpiDevicesMainWindow  # noqa: PLC0415
+        from beacon.tpi.gui import TpiDevicesMainWindow  # noqa: PLC0415
 
         self._gui = TpiDevicesMainWindow()
         embed_main_window(self, self._gui, embed_as_window=True)

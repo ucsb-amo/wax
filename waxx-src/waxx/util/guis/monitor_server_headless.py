@@ -20,7 +20,7 @@ from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.guis.monitor_server_gui import MonitorUDPServer, Status
 from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.hardware_id import monitor_server_id
-from waxx.util.comms_server.waxx_client import discover
+from beacon.discovery.client import discover
 from PyQt6.QtCore import QThread
 
 

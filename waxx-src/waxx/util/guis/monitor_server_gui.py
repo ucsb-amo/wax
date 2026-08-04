@@ -9,7 +9,7 @@ from waxx.util.device_state.monitor_manager import MonitorManager
 from waxx.util.comms_server.comm_server import UdpServer, STATES, ReadyBit
 from waxx.util.comms_server.state_broadcast import StateBroadcaster
 from waxx.util.comms_server.hardware_id import monitor_server_id
-from waxx.util.comms_server.waxx_client import discover
+from beacon.discovery.client import discover
 from waxx.util.device_state.state_file_io import read_state, apply_delta
 
 class Status:

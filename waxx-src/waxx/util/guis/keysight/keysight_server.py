@@ -28,7 +28,7 @@ from typing import Optional
 
 import vxi11
 
-from waxx.util.comms_server.waxx_server import WaxxServer
+from beacon.discovery.server import NetServer
 
 LOGGER = logging.getLogger("keysight_server")
 LOGGER.setLevel(logging.INFO)
@@ -192,7 +192,7 @@ class _Supply:
 # ---------------------------------------------------------------------------
 
 
-class KeysightServer(WaxxServer):
+class KeysightServer(NetServer):
     """Polls all configured Keysight supplies and serves snapshots over TCP."""
 
     def __init__(
@@ -202,7 +202,7 @@ class KeysightServer(WaxxServer):
         port: int = 0,
         poll_interval_s: float = 0.5,
     ) -> None:
-        WaxxServer.__init__(self, SERVER_ID, port)
+        NetServer.__init__(self, SERVER_ID, port)
         self.host = host
         self.poll_interval_s = float(poll_interval_s)
         if not supplies:
