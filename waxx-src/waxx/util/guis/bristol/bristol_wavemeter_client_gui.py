@@ -46,38 +46,84 @@ class BristolDetuningWidget(QWidget):
     def __init__(self):
         super().__init__()
         self._client: BristolWavemeterGuiClient | None = None
-        self._connecting = False
         # Bounded to _MAX_HISTORY_S worth of data; deque auto-evicts oldest
         # so the O(n) pop(0) trim loop is no longer needed.
         self._times: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
         self._detunings_ghz: collections.deque = collections.deque(maxlen=_MAX_HISTORY_S * (1000 // _POLL_MS))
         self._start_time = time.time()
+
+        # --- Shared state written by the background poller, read by the GUI ---
+        # All socket I/O happens on the poller thread so that a dead/stopped
+        # server can never block the Qt event loop (which would freeze the
+        # whole dashboard).  The GUI timer only ever reads these cached values.
+        self._state_lock = threading.Lock()
+        self._latest_freq_thz: float | None = None  # last good reading, or None
+        self._server_reachable = False              # did the last poll succeed?
+        self._stop_event = threading.Event()
+
         self._setup_ui()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update)
         self._timer.start(_POLL_MS)
-        self._try_connect()
+
+        # Background poller: discovery + blocking reads live entirely here.
+        self._poller = threading.Thread(
+            target=self._poll_loop, name="BristolPoller", daemon=True
+        )
+        self._poller.start()
 
     # ------------------------------------------------------------------
-    # Deferred connection
+    # Background poller (all network I/O — never touches Qt widgets)
     # ------------------------------------------------------------------
 
-    def _try_connect(self) -> None:
-        """Spawn a background thread to discover and connect to the server."""
-        if self._connecting:
-            return
-        self._connecting = True
-        self._status_lbl.setText("◌")
-        self._status_lbl.setStyleSheet("color: #888888; font-size: 10px;")
-        threading.Thread(target=self._connect_worker, daemon=True).start()
+    def _poll_loop(self) -> None:
+        """Discover the server and poll it in a loop, off the GUI thread.
 
-    def _connect_worker(self) -> None:
-        try:
-            self._client = BristolWavemeterGuiClient()
-        except RuntimeError:
-            pass  # _update will retry via _try_connect
-        finally:
-            self._connecting = False
+        Every blocking operation (discovery, socket connect, read) runs here,
+        so if the server is stopped the GUI stays perfectly responsive — the
+        worst that happens is this thread waits on a timeout while the UI keeps
+        rendering the last-known state and a red status dot.
+        """
+        while not self._stop_event.is_set():
+            client = self._client
+            if client is None:
+                try:
+                    # Short discovery timeout so we retry reasonably often
+                    # without spinning; this only blocks the poller thread.
+                    self._client = BristolWavemeterGuiClient(discovery_timeout=2.0)
+                except RuntimeError:
+                    self._set_state(None, reachable=False)
+                    self._stop_event.wait(1.0)  # back off before re-discovering
+                    continue
+                client = self._client
+
+            try:
+                reading = client.get_reading()
+                if reading.get("connected") and reading.get("frequency_thz") is not None:
+                    self._set_state(reading["frequency_thz"], reachable=True)
+                else:
+                    # Server answered but the wavemeter itself has no reading.
+                    self._set_state(None, reachable=True)
+            except Exception:
+                # Server went away mid-session — drop the client so the next
+                # iteration re-discovers it, and mark the link as down.
+                self._client = None
+                self._set_state(None, reachable=False)
+
+            self._stop_event.wait(_POLL_MS / 1000.0)
+
+    def _set_state(self, freq_thz: float | None, reachable: bool) -> None:
+        with self._state_lock:
+            self._latest_freq_thz = freq_thz
+            self._server_reachable = reachable
+
+    def stop(self) -> None:
+        """Signal the poller thread to exit (called on widget/window close)."""
+        self._stop_event.set()
+
+    def closeEvent(self, event):  # noqa: N802 (Qt override)
+        self.stop()
+        super().closeEvent(event)
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -176,27 +222,26 @@ class BristolDetuningWidget(QWidget):
         self._avg_lbl.setVisible(False)
 
     def _update(self) -> None:
-        if self._client is None:
-            if not self._connecting:
-                self._try_connect()
-            self._wm_lbl.setText("f = \u2014 THz")
-            return
+        # Non-blocking: read only the cached values published by the poller
+        # thread.  This runs on the Qt event loop, so it must never do socket
+        # I/O - otherwise a stopped server would freeze the whole dashboard.
+        with self._state_lock:
+            freq_thz = self._latest_freq_thz
+            reachable = self._server_reachable
 
         t = time.time() - self._start_time
-        freq_thz = None
 
-        try:
-            reading = self._client.get_reading()
-            if reading.get("connected") and reading.get("frequency_thz") is not None:
-                freq_thz = reading["frequency_thz"]
-                self._wm_lbl.setText(f"f = {freq_thz:.6f} THz")
-                self._status_lbl.setText("\u25cf")
-                self._status_lbl.setStyleSheet("color: #2ecc71; font-size: 10px;")
-            else:
-                self._wm_lbl.setText("f = \u2014 THz")
-                self._status_lbl.setText("\u25cf")
-                self._status_lbl.setStyleSheet("color: #e67e22; font-size: 10px;")
-        except Exception:
+        if freq_thz is not None:
+            self._wm_lbl.setText(f"f = {freq_thz:.6f} THz")
+            self._status_lbl.setText("\u25cf")
+            self._status_lbl.setStyleSheet("color: #2ecc71; font-size: 10px;")
+        elif reachable:
+            # Server reachable but the wavemeter itself has no reading.
+            self._wm_lbl.setText("f = \u2014 THz")
+            self._status_lbl.setText("\u25cf")
+            self._status_lbl.setStyleSheet("color: #e67e22; font-size: 10px;")
+        else:
+            # Server unreachable / stopped.
             self._wm_lbl.setText("f = \u2014 THz")
             self._status_lbl.setText("\u25cf")
             self._status_lbl.setStyleSheet("color: #e74c3c; font-size: 10px;")
@@ -241,7 +286,13 @@ class BristolClientWindow(QMainWindow):
         self.setWindowIcon(_make_sine_icon())
         self.setStyleSheet(DARK_STYLESHEET)
         self.setMinimumSize(320, 200)
-        self.setCentralWidget(BristolDetuningWidget())
+        self._widget = BristolDetuningWidget()
+        self.setCentralWidget(self._widget)
+
+    def closeEvent(self, event):  # noqa: N802 (Qt override)
+        # Child widgets don't receive closeEvent, so stop the poller here.
+        self._widget.stop()
+        super().closeEvent(event)
 
 
 def main() -> None:
