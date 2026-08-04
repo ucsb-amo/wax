@@ -101,6 +101,16 @@ class AtomdataVault(atomdata_base):
         vault's ROI. If ``None``, the ROI of the first input is used.
     lite : bool
         Forwarded to ``atomdata(...)`` when loading run-ids.
+    uniform_roi : bool
+        If True (default), the ROI is resolved once from the first input and
+        reused for every subsequent run so a single, consistent crop is applied
+        across the whole vault. Subsequent non-lite runs load with the anchor
+        ``roi_id``; subsequent lite runs reuse an existing pre-cropped lite file
+        when one is present (a warning is emitted, since its baked ROI is
+        trusted rather than re-applied), otherwise the lite file is generated
+        from the full run cropped to the anchor ROI. If False, each run is
+        loaded independently with the caller-supplied ``roi_id`` (the legacy
+        per-run behavior, where a ``roi_id=None`` GUI can open once per run).
     xvarname_override : bool
         If True, skip the requirement that all inputs share the same
         ``xvarnames[0]`` and use the first input's name. A warning is emitted.
@@ -152,6 +162,7 @@ class AtomdataVault(atomdata_base):
                  inputs,
                  roi_id=None,
                  lite=False,
+                 uniform_roi=True,
                  xvarname_override=False,
                  sort=True,
                  merge_overlap=True,
@@ -173,6 +184,7 @@ class AtomdataVault(atomdata_base):
 
         # Vault-specific configuration.
         self._merge_overlap = bool(merge_overlap)
+        self._uniform_roi = bool(uniform_roi)
         self._drop_raw_images = bool(drop_raw_images)
         if scope_merge not in ('strict', 'pad_nan', 'skip'):
             raise ValueError(
@@ -185,6 +197,7 @@ class AtomdataVault(atomdata_base):
         self._build_kwargs = dict(
             roi_id=roi_id,
             lite=lite,
+            uniform_roi=uniform_roi,
             xvarname_override=xvarname_override,
             sort=sort,
             merge_overlap=merge_overlap,
@@ -237,48 +250,12 @@ class AtomdataVault(atomdata_base):
             self._lite = True
             self._build_kwargs['lite'] = True
 
-        # Load run-ids sequentially so that only the first load can trigger
-        # the ROI selection GUI. After the first run is loaded (or if the
-        # first input is an already-loaded atomdata), its run_id is used as
-        # the roi_id for all subsequent int loads, ensuring one consistent ROI
-        # is reused rather than opening a new selector for each chunk.
-        ads = []
-        _first_run_id = None  # run_id of the first materialized atomdata
-        _has_subsequent_int_loads = any(
-            isinstance(item, (int, np.integer)) for item in raw_inputs[1:]
+        # Load run-ids sequentially. With uniform_roi (default), the ROI is
+        # resolved once from the first input and reused for every subsequent
+        # run so a single, consistent crop is applied across the whole vault.
+        ads = self._materialize_inputs(
+            raw_inputs, roi_id, lite, self._ignore_images, self._uniform_roi,
         )
-
-        for item in raw_inputs:
-            if isinstance(item, atomdata_base):
-                ads.append(item)
-                if _first_run_id is None:
-                    _first_run_id = int(item.run_info.run_id)
-                    # Save the ROI so subsequent int loads (and lite-dataset
-                    # creation) can look it up by run_id.
-                    if (not self._ignore_images) and (_has_subsequent_int_loads or lite):
-                        item.save_roi_h5()
-            elif isinstance(item, (int, np.integer)):
-                # First int load: use caller-supplied roi_id (may open GUI once).
-                # Subsequent int loads: reuse the first run's roi_id so no
-                # additional GUI opens.
-                if _first_run_id is None:
-                    ad = atomdata(int(item), roi_id=roi_id, lite=lite,
-                                  ignore_images=self._ignore_images)
-                    _first_run_id = int(ad.run_info.run_id)
-                    # Persist the ROI so subsequent int loads (and lite-dataset
-                    # creation for each run) can find it by run_id.
-                    if (not self._ignore_images) and (_has_subsequent_int_loads or lite):
-                        ad.save_roi_h5()
-                else:
-                    _roi = roi_id if roi_id is not None else _first_run_id
-                    ad = atomdata(int(item), roi_id=_roi, lite=lite,
-                                  ignore_images=self._ignore_images)
-                ads.append(ad)
-            else:
-                raise TypeError(
-                    f"AtomdataVault inputs must be atomdata objects or "
-                    f"run_id ints, got {type(item).__name__}."
-                )
 
         # 2. Validate compatibility. N_repeats may differ across inputs when
         #    merge_overlap is on (grouped statistics handle ragged counts).
@@ -508,6 +485,182 @@ class AtomdataVault(atomdata_base):
                 return
 
         self.set_xvar(param_key, xvar_mode=xvar_mode)
+
+    # ------------------------------------------------------------------
+    # Input materialization / ROI anchoring
+    # ------------------------------------------------------------------
+    def _materialize_inputs(self, raw_inputs, roi_id, lite, ignore_images,
+                            uniform_roi):
+        """Load every input into an ``atomdata`` object.
+
+        When ``uniform_roi`` is True the ROI is resolved once (from the first
+        input) and reused for every subsequent run: subsequent non-lite runs
+        load with ``roi_id=anchor``; subsequent lite runs reuse an existing
+        pre-cropped lite file when present (with a warning), otherwise the lite
+        file is generated from the full run cropped to the anchor ROI. When
+        False, each run is loaded independently with the caller-supplied
+        ``roi_id`` (the legacy per-run behavior).
+        """
+        # A server_talk instance is only needed to probe for / generate lite
+        # copies when anchoring the ROI on lite runs.
+        server_talk = None
+        if uniform_roi and lite and not ignore_images:
+            from waxa.data.server_talk import server_talk as _st
+            server_talk = _st()
+
+        # The anchor ROI only needs persisting to the run's h5 (so subsequent
+        # runs can look it up, and so lite copies can be generated from it) when
+        # there is more than one run or lite data is involved.
+        has_subsequent_int_loads = any(
+            isinstance(it, (int, np.integer)) for it in raw_inputs[1:]
+        )
+        persist_anchor = has_subsequent_int_loads or lite
+
+        ads = []
+        anchor_roi_id = None      # int run-id, str key, or None
+        anchor_established = False
+
+        for item in raw_inputs:
+            if isinstance(item, atomdata_base):
+                if uniform_roi and not anchor_established and not ignore_images:
+                    if getattr(item, 'roi', None) is not None:
+                        if persist_anchor:
+                            item.save_roi_h5()
+                        anchor_roi_id = int(item.run_info.run_id)
+                    anchor_established = True
+                ads.append(item)
+                continue
+
+            if not isinstance(item, (int, np.integer)):
+                raise TypeError(
+                    f"AtomdataVault inputs must be atomdata objects or "
+                    f"run_id ints, got {type(item).__name__}."
+                )
+
+            rid = int(item)
+
+            if not uniform_roi:
+                # Legacy per-run behavior: independent ROI per run.
+                ads.append(atomdata(rid, roi_id=roi_id, lite=lite,
+                                    ignore_images=ignore_images))
+                continue
+
+            if not anchor_established:
+                ad, anchor_roi_id = self._load_anchor_run(
+                    rid, roi_id, lite, ignore_images, server_talk,
+                    persist_anchor,
+                )
+                anchor_established = True
+                ads.append(ad)
+                continue
+
+            ads.append(self._load_with_anchor(
+                rid, anchor_roi_id, lite, ignore_images, server_talk,
+            ))
+
+        return ads
+
+    def _load_anchor_run(self, rid, roi_id, lite, ignore_images, server_talk,
+                         persist_anchor=True):
+        """Load the first run and establish the anchor ROI.
+
+        Returns ``(atomdata, anchor_roi_id)`` where ``anchor_roi_id`` is an int
+        run-id, a str ROI key, or ``None`` (images ignored).
+        """
+        if ignore_images:
+            return atomdata(rid, roi_id=roi_id, lite=lite,
+                            ignore_images=True), None
+
+        if not lite:
+            # Full load: honor the caller's roi_id (may open the GUI once when
+            # None), then persist the resolved ROI so subsequent runs can look
+            # it up by run-id.
+            ad = atomdata(rid, roi_id=roi_id, lite=False)
+            if persist_anchor:
+                ad.save_roi_h5()
+            return ad, (roi_id if roi_id is not None else rid)
+
+        # lite=True: the anchor ROI must be known in full-frame coordinates so
+        # it can crop the other runs. Resolve it cheaply when possible, falling
+        # back to a full load + GUI selection on the first run only.
+        full_ad = None
+        if roi_id is not None:
+            anchor_roi_id = roi_id
+        elif self._saved_roi_in_regular_h5(rid, server_talk):
+            anchor_roi_id = rid
+        else:
+            full_ad = atomdata(rid, roi_id=None, lite=False)
+            full_ad.save_roi_h5()
+            anchor_roi_id = rid
+
+        ad = self._load_lite_with_anchor(
+            rid, anchor_roi_id, server_talk, full_ad=full_ad,
+        )
+        return ad, anchor_roi_id
+
+    def _load_with_anchor(self, rid, anchor_roi_id, lite, ignore_images,
+                          server_talk):
+        """Load a subsequent run reusing the anchor ROI."""
+        if ignore_images:
+            return atomdata(rid, lite=lite, ignore_images=True)
+        if not lite:
+            return atomdata(rid, roi_id=anchor_roi_id, lite=False)
+        return self._load_lite_with_anchor(rid, anchor_roi_id, server_talk)
+
+    def _load_lite_with_anchor(self, rid, anchor_roi_id, server_talk,
+                               full_ad=None):
+        """Return a lite ``atomdata`` for ``rid`` cropped to the anchor ROI.
+
+        Reuses an existing pre-cropped lite file when present (warning that its
+        baked ROI is trusted, not re-applied); otherwise generates the lite
+        file from the full run cropped to the anchor ROI, reusing ``full_ad``
+        when it has already been loaded.
+        """
+        if self._lite_copy_exists(rid, server_talk):
+            warnings.warn(
+                f"AtomdataVault: reusing the ROI baked into the existing lite "
+                f"data for run {rid}; it is trusted as-is and may differ from "
+                f"the anchor ROI (run {anchor_roi_id}). Delete the lite file to "
+                f"regenerate it cropped to the anchor ROI.",
+                stacklevel=2,
+            )
+            return atomdata(rid, lite=True)
+
+        gen = full_ad if full_ad is not None else atomdata(
+            rid, roi_id=anchor_roi_id, lite=False,
+        )
+        gen.save_lite_copy(roi_id=anchor_roi_id, use_saved_roi=True)
+        return atomdata(rid, lite=True)
+
+    @staticmethod
+    def _lite_copy_exists(run_id, server_talk):
+        """True if a pre-cropped lite HDF5 already exists for ``run_id``."""
+        if server_talk is None:
+            return False
+        try:
+            path = server_talk.find_data_file_by_run_id(
+                int(run_id), lite=True, raise_on_missing=False, skip_check=True,
+            )
+        except Exception:
+            return False
+        return path is not None
+
+    @staticmethod
+    def _saved_roi_in_regular_h5(run_id, server_talk):
+        """True if the regular (non-lite) h5 for ``run_id`` has a saved ROI.
+
+        Reads only the file-level ROI attributes, so it never triggers the ROI
+        selection GUI.
+        """
+        if server_talk is None:
+            return False
+        import h5py
+        try:
+            fpath, _ = server_talk.get_data_file(int(run_id), lite=False)
+            with h5py.File(fpath, 'r') as f:
+                return ('roix' in f.attrs) and ('roiy' in f.attrs)
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -1821,14 +1974,16 @@ class AtomdataVault(atomdata_base):
     # ------------------------------------------------------------------
     @classmethod
     def from_run_range(cls, start_id, stop_id, experiment_name=None,
-                       skip_missing=True, roi_id=None, lite=True, **kwargs):
+                       skip_missing=True, roi_id=None, lite=True,
+                       uniform_roi=True, **kwargs):
         """Build a vault from a contiguous run-id range ``[start_id, stop_id]``.
 
         Missing/aborted run-ids are skipped (``skip_missing``). If
         ``experiment_name`` is given, only runs whose experiment class or
         filepath contains that substring are kept -- handy for an experiment
-        builder that interleaves several experiment types. Subsequent runs
-        reuse the first loaded run's ROI so the selector opens at most once.
+        builder that interleaves several experiment types. When ``uniform_roi``
+        is True (default), subsequent runs reuse the first loaded run's ROI so
+        the selector opens at most once.
         """
         start_id, stop_id = int(start_id), int(stop_id)
         if stop_id < start_id:
@@ -1837,14 +1992,17 @@ class AtomdataVault(atomdata_base):
         ads, skipped = [], []
         anchor_roi = roi_id
         for rid in range(start_id, stop_id + 1):
+            # With uniform_roi, reuse the first loaded run's ROI for every
+            # subsequent load; otherwise honor the caller's roi_id per run.
+            load_roi_id = anchor_roi if uniform_roi else roi_id
             try:
-                ad = atomdata(rid, roi_id=anchor_roi, lite=lite)
+                ad = atomdata(rid, roi_id=load_roi_id, lite=lite)
             except Exception:
                 if skip_missing:
                     skipped.append(rid)
                     continue
                 raise
-            if anchor_roi is None:
+            if uniform_roi and anchor_roi is None:
                 anchor_roi = int(ad.run_info.run_id)
                 try:
                     ad.save_roi_h5()
@@ -1873,7 +2031,8 @@ class AtomdataVault(atomdata_base):
                 f'({preview}{more}).',
                 stacklevel=2,
             )
-        return cls(ads, roi_id=roi_id, lite=lite, **kwargs)
+        return cls(ads, roi_id=roi_id, lite=lite, uniform_roi=uniform_roi,
+                   **kwargs)
 
     @classmethod
     def from_builder(cls, start_id, stop_id, experiment_name, **kwargs):
