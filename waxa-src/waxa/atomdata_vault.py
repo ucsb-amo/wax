@@ -101,6 +101,13 @@ class AtomdataVault(atomdata_base):
         vault's ROI. If ``None``, the ROI of the first input is used.
     lite : bool
         Forwarded to ``atomdata(...)`` when loading run-ids.
+    regenerate_lite : bool
+        If True, force lite loading (implies ``lite=True``) and regenerate every
+        pre-cropped lite file from the full run cropped to the anchor ROI,
+        overwriting any existing lite copy instead of reusing it. Use this when
+        stale lite files were baked with a different ROI (e.g. a full frame),
+        which otherwise raises an image-shape mismatch at concatenation. Defaults
+        to False.
     uniform_roi : bool
         If True (default), the ROI is resolved once from the first input and
         reused for every subsequent run so a single, consistent crop is applied
@@ -162,6 +169,7 @@ class AtomdataVault(atomdata_base):
                  inputs,
                  roi_id=None,
                  lite=False,
+                 regenerate_lite=False,
                  uniform_roi=True,
                  xvarname_override=False,
                  sort=True,
@@ -174,6 +182,13 @@ class AtomdataVault(atomdata_base):
                  xvar_mode='pad',
                  promote_xvar=None,
                  flatten_xvar=None):
+
+        # regenerate_lite forces lite loading and re-crops every lite file to
+        # the anchor ROI (see _load_lite_with_anchor), overriding the default
+        # reuse of existing pre-cropped lite copies.
+        self._regenerate_lite = bool(regenerate_lite)
+        if self._regenerate_lite:
+            lite = True
 
         # Lightweight book-keeping expected by inherited helpers.
         self._lite = lite
@@ -197,6 +212,7 @@ class AtomdataVault(atomdata_base):
         self._build_kwargs = dict(
             roi_id=roi_id,
             lite=lite,
+            regenerate_lite=regenerate_lite,
             uniform_roi=uniform_roi,
             xvarname_override=xvarname_override,
             sort=sort,
@@ -614,9 +630,11 @@ class AtomdataVault(atomdata_base):
         Reuses an existing pre-cropped lite file when present (warning that its
         baked ROI is trusted, not re-applied); otherwise generates the lite
         file from the full run cropped to the anchor ROI, reusing ``full_ad``
-        when it has already been loaded.
+        when it has already been loaded. When ``self._regenerate_lite`` is set,
+        the reuse path is skipped and the lite file is always regenerated
+        (overwriting any existing copy) so it is cropped to the anchor ROI.
         """
-        if self._lite_copy_exists(rid, server_talk):
+        if not self._regenerate_lite and self._lite_copy_exists(rid, server_talk):
             warnings.warn(
                 f"AtomdataVault: reusing the ROI baked into the existing lite "
                 f"data for run {rid}; it is trusted as-is and may differ from "
