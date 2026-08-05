@@ -20,5 +20,5 @@ class ExponentialDecayFit(Fit):
         time_constant_guess = np.ptp(x)/10
         popt, pcov = curve_fit(self._fit_func, x, y,
                                p0=[coefficient_guess,time_constant_guess,y_offset_guess],
-                               bounds=((0,0,-np.inf),(np.inf,np.inf,np.inf)))
+                               bounds=((-np.inf,0,-np.inf),(np.inf,np.inf,np.inf)))
         return popt

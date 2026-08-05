@@ -38,8 +38,54 @@ class ScopeTraceArray():
         self.v = v
 
 class _RepeatDataVault():
-    def __init__(self):
-        self.keys = []
+    """DataVault stand-in for the avg/std repeat-statistic siblings.
+
+    Keys that existed when the sibling was built are stored eagerly. Keys added
+    to the parent's DataVault *afterwards* -- e.g. a quantity computed in a
+    notebook and assigned back with ``ad.data.sz = ...`` -- are reduced on
+    demand by ``__getattr__``, so ``ad.avg.data.sz`` works without rebuilding
+    the siblings. Lazily-resolved keys are recomputed on every access rather
+    than cached, so they track later edits to the parent array.
+
+    Constructed without a source it is a plain container (a ``keys`` list plus
+    array attributes), which is how the non-sibling call sites use it.
+    """
+
+    def __init__(self, source=None, reducer=None, xvar_idx=None, n_repeats=1):
+        self._keys = []
+        self._source = source
+        self._reducer = reducer
+        self._xvar_idx = xvar_idx
+        self._n_repeats = n_repeats
+
+    @property
+    def keys(self):
+        if self._source is None:
+            return self._keys
+        # Mirror the parent so keys added after this sibling was built are
+        # listed; __getattr__ reduces them when they are actually read.
+        return list(dict.fromkeys(self._keys + list(self._source.data.keys)))
+
+    @keys.setter
+    def keys(self, value):
+        self._keys = list(value)
+
+    def __getattr__(self, key):
+        # Only reached when key is absent from __dict__, i.e. it was added to
+        # the parent DataVault after this sibling was built.
+        if key.startswith('_'):
+            raise AttributeError(key)
+        source = self.__dict__.get('_source')
+        reducer = self.__dict__.get('_reducer')
+        if source is None or reducer is None:
+            raise AttributeError(key)
+        value = getattr(source.data, key)
+        if not source._is_scan_shaped_numeric_array(value):
+            return value
+        mean_val, std_val = source._reduce_repeat_ndarray_mean_std(
+            value, self.__dict__['_xvar_idx'], self.__dict__['_n_repeats'],
+        )
+        return mean_val if reducer == 'mean' else std_val
 
 class _RepeatSEMDataProxy():
     def __init__(self, source, sem_divisor):
@@ -1394,7 +1440,7 @@ class atomdata_base():
                 scaled_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t, v)
         return scaled_scope
 
-    def _copy_metadata_to_repeat_sibling(self, ad_out, xvar_idx, n_repeats):
+    def _copy_metadata_to_repeat_sibling(self, ad_out, xvar_idx, n_repeats, reducer=None):
         from copy import deepcopy
 
         ad_out._lite = self._lite
@@ -1425,7 +1471,7 @@ class atomdata_base():
         ad_out.sort_idx = np.array([])
         ad_out.sort_N = np.array([])
 
-        ad_out.data = _RepeatDataVault()
+        ad_out.data = _RepeatDataVault(self, reducer, xvar_idx, n_repeats)
         ad_out.avg = None
         ad_out.std = None
         ad_out.sem = None
@@ -1459,7 +1505,7 @@ class atomdata_base():
 
     def _build_repeat_stat_atomdata(self, xvar_idx, n_repeats, reducer='mean'):
         ad_out = object.__new__(self.__class__)
-        self._copy_metadata_to_repeat_sibling(ad_out, xvar_idx, n_repeats)
+        self._copy_metadata_to_repeat_sibling(ad_out, xvar_idx, n_repeats, reducer)
 
         reduce_op = lambda x: self._reduce_repeat_ndarray(x, xvar_idx, n_repeats, reducer)
 
@@ -1481,7 +1527,6 @@ class atomdata_base():
                 vars(ad_out.data)[key] = reduce_op(value)
             else:
                 vars(ad_out.data)[key] = value
-            ad_out.data.keys.append(key)
 
         if hasattr(self, 'scope_data'):
             ad_out.scope_data = self.scope_data
@@ -1504,8 +1549,8 @@ class atomdata_base():
     def _build_repeat_stat_atomdata_pair(self, xvar_idx, n_repeats):
         ad_avg = object.__new__(self.__class__)
         ad_std = object.__new__(self.__class__)
-        self._copy_metadata_to_repeat_sibling(ad_avg, xvar_idx, n_repeats)
-        self._copy_metadata_to_repeat_sibling(ad_std, xvar_idx, n_repeats)
+        self._copy_metadata_to_repeat_sibling(ad_avg, xvar_idx, n_repeats, 'mean')
+        self._copy_metadata_to_repeat_sibling(ad_std, xvar_idx, n_repeats, 'std')
 
         skip_keys = ['avg', 'std', 'sem',
                      '_repeat_sem_source', '_repeat_sem_divisor',
@@ -1535,8 +1580,6 @@ class atomdata_base():
             else:
                 vars(ad_avg.data)[key] = value
                 vars(ad_std.data)[key] = value
-            ad_avg.data.keys.append(key)
-            ad_std.data.keys.append(key)
 
         if hasattr(self, 'scope_data'):
             avg_scope = {}
@@ -1628,6 +1671,113 @@ class atomdata_base():
         if not np.all(reshaped == unique_values[:, None]):
             raise ValueError('Repeated xvar values must be grouped consecutively to reassign repeats.')
         return unique_values
+
+    def _resolve_repeat_axis(self, xvar_idx=None):
+        """Resolves the axis over which repeats should be reduced.
+
+        Returns (xvar_idx, n_repeats), or (None, 1) when this atomdata has no
+        repeat axis (already repeat-averaged, or N_repeats == 1) -- the
+        *_array methods treat that as a pass-through. Pass xvar_idx explicitly
+        to disambiguate when more than one xvar carries repeated values.
+        """
+        if xvar_idx is not None:
+            _, counts = np.unique(np.asarray(self.xvars[xvar_idx]), return_counts=True)
+            ucounts = np.unique(counts)
+            if ucounts.size != 1:
+                raise ValueError('Number of repeats per value of an xvar must be the same for all values.')
+            return xvar_idx, int(ucounts[0])
+        try:
+            return self._get_repeat_axis_info()
+        except ValueError:
+            return None, 1
+
+    def _check_scan_shaped(self, arr, method_name):
+        """Validates that arr can be reduced over the scan axes, with a
+        readable error instead of a cryptic reshape failure."""
+        arr = np.asarray(arr)
+        if not self._is_scan_shaped_numeric_array(arr):
+            raise ValueError(
+                f"{method_name} expects a scan-shaped numeric array whose leading "
+                f"dimensions are {tuple(int(d) for d in self.xvardims)}; "
+                f"got shape {arr.shape}."
+            )
+        return arr
+
+    @staticmethod
+    def _pack_array_stats(avg, std, sem, return_std, return_sem):
+        """Assembles the avg_array return value from the requested pieces."""
+        out = [avg]
+        if return_std:
+            out.append(std)
+        if return_sem:
+            out.append(sem)
+        return tuple(out) if len(out) > 1 else avg
+
+    def avg_array(self, arr, xvar_idx=None, return_std=True, return_sem=True):
+        """Repeat-averages a scan-shaped array, with its spread over repeats.
+
+        The standalone counterpart of the `atomdata.avg` / `.std` / `.sem`
+        siblings, for quantities derived after those siblings were built:
+
+            y = (ad.data.apd - ad.data.apd_no_atoms)[:,0]
+            y_avg, y_std, y_sem = ad.avg_array(y)
+            plt.errorbar(ad.avg.xvars[0], y_avg, yerr=y_sem)
+
+        Args:
+            arr (np.ndarray): array whose leading dimensions are self.xvardims.
+            xvar_idx (int, optional): which xvar axis holds the repeats. By
+                default the repeated axis is found automatically.
+            return_std (bool, optional): include the standard deviation over
+                repeats. Defaults to True.
+            return_sem (bool, optional): include the standard error of the
+                mean over repeats. Defaults to True.
+
+        Returns:
+            tuple: (avg, std, sem) by default, where avg is arr with the
+            repeat axis collapsed to its unique values. Clearing return_std or
+            return_sem drops that entry; with both cleared the averaged array
+            is returned bare rather than as a 1-tuple. If there is no repeat
+            axis, avg is arr unchanged and std/sem are zeros.
+        """
+        arr = self._check_scan_shaped(arr, 'avg_array')
+        xvar_idx, n_repeats = self._resolve_repeat_axis(xvar_idx)
+        if xvar_idx is None:
+            avg = arr.astype(np.float64, copy=False)
+            std = np.zeros(arr.shape, dtype=np.float64)
+            sem = np.zeros(arr.shape, dtype=np.float64)
+        elif return_std or return_sem:
+            avg, std = self._reduce_repeat_ndarray_mean_std(arr, xvar_idx, n_repeats)
+            sem = std / np.sqrt(n_repeats)
+        else:
+            avg = self._reduce_repeat_ndarray(arr, xvar_idx, n_repeats, 'mean')
+            std = sem = None
+        return self._pack_array_stats(avg, std, sem, return_std, return_sem)
+
+    def std_array(self, arr, xvar_idx=None):
+        """Standard deviation over repeats of a scan-shaped array.
+
+        Population std (ddof=0), matching the `atomdata.std` sibling. See
+        avg_array for arguments. Returns zeros if there is no repeat axis.
+        """
+        arr = self._check_scan_shaped(arr, 'std_array')
+        xvar_idx, n_repeats = self._resolve_repeat_axis(xvar_idx)
+        if xvar_idx is None:
+            return np.zeros(arr.shape, dtype=np.float64)
+        _, std_val = self._reduce_repeat_ndarray_mean_std(arr, xvar_idx, n_repeats)
+        return std_val
+
+    def sem_array(self, arr, xvar_idx=None):
+        """Standard error of the mean over repeats of a scan-shaped array.
+
+        std_array / sqrt(N_repeats), matching the `atomdata.sem` sibling. See
+        avg_array for arguments. Returns zeros if there is no repeat axis.
+        """
+        arr = self._check_scan_shaped(arr, 'sem_array')
+        xvar_idx, n_repeats = self._resolve_repeat_axis(xvar_idx)
+        if xvar_idx is None:
+            return np.zeros(arr.shape, dtype=np.float64)
+        _, std_val = self._reduce_repeat_ndarray_mean_std(arr, xvar_idx, n_repeats)
+        return std_val / np.sqrt(n_repeats)
 
     def _reassign_repeat_ndarray(self, arr, source_xvar_idx, target_xvar_idx, n_repeats, old_xvardims):
         arr = np.asarray(arr)
@@ -2255,9 +2405,19 @@ class atomdata_base():
             all_keys = list(f['data'].keys())
             filtered_keys = [k for k in all_keys if k not in ['images', 'image_timestamps', 'sort_N', 'sort_idx', 'scope_data', 'timestamp_shot_end']]
 
+            n_xvar_axes = len(self.xvars) if self.xvars is not None else 0
             for k in filtered_keys:
                 data_k = f['data'][k][()]
                 data_k: np.ndarray
+
+                # Drop trailing size-1 per-shot axes, so a container holding one
+                # value per shot loads as (*xvardims) rather than (*xvardims,1).
+                # Newer files are already saved squeezed (see
+                # waxx.config.data_vault.DataContainer.squeeze_axes); this also
+                # normalizes files written before that was enabled. The leading
+                # xvar axes are never touched.
+                while data_k.ndim > n_xvar_axes and data_k.shape[-1] == 1:
+                    data_k = data_k.reshape(data_k.shape[:-1])
 
                 vars(self.data)[k] = data_k
                 self.data.keys.append(k)

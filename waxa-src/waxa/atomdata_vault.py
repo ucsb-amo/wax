@@ -81,10 +81,42 @@ def _decode_xvarname(name):
 
 class _VaultDataVault():
     """Mimics the ``DataVault`` shape used by atomdata_base (a ``keys`` list
-    plus arbitrary array attributes)."""
+    plus arbitrary array attributes).
 
-    def __init__(self):
-        self.keys = []
+    When constructed with a source vault and a stat kind it also backs the
+    avg/std/sem siblings: keys added to the parent's DataVault after the
+    siblings were built are grouped on demand by ``__getattr__``. See
+    ``waxa.atomdata_base._RepeatDataVault``.
+    """
+
+    def __init__(self, source=None, kind=None):
+        self._keys = []
+        self._source = source
+        self._kind = kind
+
+    @property
+    def keys(self):
+        if self._source is None:
+            return self._keys
+        return list(dict.fromkeys(self._keys + list(self._source.data.keys)))
+
+    @keys.setter
+    def keys(self, value):
+        self._keys = list(value)
+
+    def __getattr__(self, key):
+        if key.startswith('_'):
+            raise AttributeError(key)
+        source = self.__dict__.get('_source')
+        kind = self.__dict__.get('_kind')
+        if source is None or kind is None:
+            raise AttributeError(key)
+        value = getattr(source.data, key)
+        if not source._is_scan_shaped_numeric_array(value):
+            return value
+        return source._grouped_array_stats(value)[
+            {'mean': 0, 'std': 1, 'sem': 2}[kind]
+        ]
 
 
 class AtomdataVault(atomdata_base):
@@ -1646,7 +1678,7 @@ class AtomdataVault(atomdata_base):
         with np.errstate(invalid='ignore', divide='ignore'):
             return std / np.sqrt(n).reshape(shp)
 
-    def _copy_metadata_to_ragged_sibling(self, ad_out, unique_xvar):
+    def _copy_metadata_to_ragged_sibling(self, ad_out, unique_xvar, kind=None):
         """Populate a stat-sibling object (avg/std/sem) with metadata whose
         single scan axis is the *unique* xvar values."""
         ad_out._lite = self._lite
@@ -1673,7 +1705,7 @@ class AtomdataVault(atomdata_base):
         ad_out.sort_idx = np.array([])
         ad_out.sort_N = np.array([])
 
-        ad_out.data = _VaultDataVault()
+        ad_out.data = _VaultDataVault(self, kind)
         ad_out.avg = None
         ad_out.std = None
         ad_out.sem = None
@@ -1701,8 +1733,8 @@ class AtomdataVault(atomdata_base):
         ad_avg = object.__new__(self.__class__)
         ad_std = object.__new__(self.__class__)
         ad_sem = object.__new__(self.__class__)
-        for sib in (ad_avg, ad_std, ad_sem):
-            self._copy_metadata_to_ragged_sibling(sib, unique)
+        for sib, kind in ((ad_avg, 'mean'), (ad_std, 'std'), (ad_sem, 'sem')):
+            self._copy_metadata_to_ragged_sibling(sib, unique, kind)
 
         skip = self._stat_skip_keys()
 
@@ -1736,8 +1768,6 @@ class AtomdataVault(atomdata_base):
             else:
                 for sib in (ad_avg, ad_std, ad_sem):
                     vars(sib.data)[key] = value
-            for sib in (ad_avg, ad_std, ad_sem):
-                sib.data.keys.append(key)
 
         # Scope data (best effort; large arrays).
         if hasattr(self, 'scope_data'):
@@ -1784,6 +1814,50 @@ class AtomdataVault(atomdata_base):
         if not self._merge_overlap or int(getattr(self, 'Nvars', 1)) != 1:
             return atomdata_base._refresh_repeat_statistics(self)
         self._build_grouped_statistics()
+
+    def _grouped_array_stats(self, arr):
+        """(mean, std, sem) of a scan-shaped array grouped by unique xvar
+        value. SEM uses each group's own count, so ragged repeat counts from
+        overlapping merged ranges are handled correctly."""
+        xvar = np.asarray(self.xvars[0])
+        unique, inverse, counts = np.unique(
+            xvar, return_inverse=True, return_counts=True
+        )
+        inverse = np.asarray(inverse).ravel()
+        mean, std = self._grouped_mean_std(arr, inverse, unique.size, counts)
+        return mean, std, self._sem_from_std(std, counts)
+
+    def _use_grouped_array_stats(self):
+        """Same guard _refresh_repeat_statistics uses: the grouped path only
+        applies to single-xvar vaults built with merge_overlap."""
+        return self._merge_overlap and int(getattr(self, 'Nvars', 1)) == 1
+
+    def avg_array(self, arr, xvar_idx=None, return_std=True, return_sem=True):
+        """Override: groups by unique xvar value rather than a fixed repeat
+        stride. See atomdata_base.avg_array."""
+        if not self._use_grouped_array_stats():
+            return atomdata_base.avg_array(
+                self, arr, xvar_idx=xvar_idx,
+                return_std=return_std, return_sem=return_sem,
+            )
+        arr = self._check_scan_shaped(arr, 'avg_array')
+        avg, std, sem = self._grouped_array_stats(arr)
+        return self._pack_array_stats(avg, std, sem, return_std, return_sem)
+
+    def std_array(self, arr, xvar_idx=None):
+        """Override: see avg_array and atomdata_base.std_array."""
+        if not self._use_grouped_array_stats():
+            return atomdata_base.std_array(self, arr, xvar_idx=xvar_idx)
+        arr = self._check_scan_shaped(arr, 'std_array')
+        return self._grouped_array_stats(arr)[1]
+
+    def sem_array(self, arr, xvar_idx=None):
+        """Override: divides each point's std by sqrt of that point's own
+        repeat count. See avg_array and atomdata_base.sem_array."""
+        if not self._use_grouped_array_stats():
+            return atomdata_base.sem_array(self, arr, xvar_idx=xvar_idx)
+        arr = self._check_scan_shaped(arr, 'sem_array')
+        return self._grouped_array_stats(arr)[2]
 
     # ------------------------------------------------------------------
     # Collapsing / provenance / auditing

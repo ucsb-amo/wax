@@ -25,7 +25,8 @@ class DataContainer(DataContainerWaxa):
 
     def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt):
         self.key = ""
-        self._per_shot_data_shape = tuple(np.atleast_1d(per_shot_data_shape))
+        # plain ints (not np scalars) so shape mismatch messages read cleanly
+        self._per_shot_data_shape = tuple(int(n) for n in np.atleast_1d(per_shot_data_shape))
         self._dtype = dtype
         self._external_data_bool = external_data_bool
         self._expt = expt
@@ -38,6 +39,9 @@ class DataContainer(DataContainerWaxa):
         self._is_sentinel = False
 
         self._run_data = np.zeros(per_shot_data_shape,dtype=dtype)
+        # Shape of one shot's cell in _run_data. Equals _per_shot_data_shape
+        # until set_container_size drops trailing size-1 axes (see squeeze_axes).
+        self._cell_shape = self._per_shot_data_shape
         self.shot_data = np.zeros(per_shot_data_shape,dtype=dtype)
         self._reference_data = copy.deepcopy(self.shot_data)
 
@@ -52,7 +56,13 @@ class DataContainer(DataContainerWaxa):
         if self._data_gotten:
             try:
                 idx = tuple([x.counter for x in self._expt.scan_xvars])
-                self._run_data[idx] = self.shot_data
+                # Reshape to the cell shape rather than assigning shot_data
+                # directly: squeeze_axes may have dropped trailing size-1 axes
+                # from _run_data, and assigning a shape-(1,) array into a scalar
+                # cell is deprecated in numpy (and will eventually raise). A
+                # genuinely wrong-shaped shot_data raises here and is reported
+                # against the declared shape below.
+                self._run_data[idx] = self.shot_data.reshape(self._cell_shape)
             except Exception as e:
                 if self.shot_data.shape != self._per_shot_data_shape:
                     print(f"Value is not correct shape for data container '{self.key}':\n"+
@@ -71,32 +81,36 @@ class DataContainer(DataContainerWaxa):
         for d in np.flip(xvd):
             y = [y]*d
         self._run_data = np.asarray(y)
-        # squeeze the data shape axes if they have length == 1
-        # self.squeeze_axes(xvd)
+        # drop trailing per-shot axes of length == 1
+        self.squeeze_axes(xvd)
 
     def squeeze_axes(self, xvardims):
-        """Identifies if the per-shot data has any axes with dimension 1. If so,
-        squeezes them to avoid unnecessary indexing.
+        """Drops trailing per-shot axes of size 1 to avoid unnecessary indexing.
 
         Example: per-shot data is a single float (not a list of floats), with a
         2D scan with xvardims = [4,3]. set_container_size produces a data array
         of shape (4,3,1), but this is annoying -- to get the value corresponding
-        to the (i,j)th shot, you'd need to do array[i,j,0]. By squeezing out the
-        axis of size 1, we can index the (i,j)th value as array[i,j]. 
+        to the (i,j)th shot, you'd need to do array[i,j,0]. By dropping the
+        trailing axis of size 1, we can index the (i,j)th value as array[i,j].
+
+        Only *trailing* per-shot axes are dropped: (n0,...,nN,10,1) becomes
+        (n0,...,nN,10), but (n0,...,nN,1,10) is left alone. The xvar axes are
+        never touched, even when an xvar has a single value.
 
         Args:
             xvardims (list): The xvardims for the experiment.
-        """        
-        n_axes_to_squeeze = self._run_data.ndim - len(xvardims) # how many axes are for the per-shot data
-        sh_axes_to_squeeze = np.asarray(self._run_data.shape[-n_axes_to_squeeze:]) # their shape
-        squeeze_mask = sh_axes_to_squeeze == 1 # check which dims have size == 1
-        # make a mask to index these axes starting from the end (-1,-2,...),
-        # since xvar axes come first
-        ax_idx_to_squeeze = -(np.arange(0,n_axes_to_squeeze,dtype=int) + 1)[squeeze_mask]
-        # do the squeeze (convert axis index list to tuple to make it work with np.ndarray.squeeze)
-        self._run_data = self._run_data.squeeze(axis=tuple(ax_idx_to_squeeze))
-
-        self._per_shot_data_shape = self._run_data.shape[len(xvardims):]
+        """
+        n_xvar_axes = len(xvardims) # leading axes are the xvars; never dropped
+        shape = list(self._run_data.shape)
+        while len(shape) > n_xvar_axes and shape[-1] == 1:
+            shape.pop()
+        # reshape rather than squeeze(axis=...): no axis-index bookkeeping to get
+        # backwards, and it is a no-op when there is nothing to drop
+        self._run_data = self._run_data.reshape(shape)
+        # _per_shot_data_shape deliberately keeps the shape the user declared --
+        # shot_data is never squeezed, so the diagnostic in
+        # _put_shot_data_to_run_data must compare against the declared shape.
+        self._cell_shape = tuple(shape[n_xvar_axes:])
 
     def update_from_kernel(self, data):
         """Necessary to sync up host and kernel.

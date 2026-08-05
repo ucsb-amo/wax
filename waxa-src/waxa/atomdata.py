@@ -106,6 +106,16 @@ class atomdata(atomdata_base):
     def revert_repeats(self):
         return super().revert_repeats()
 
+    def avg_array(self, arr, xvar_idx=None, return_std=True, return_sem=True):
+        return super().avg_array(arr, xvar_idx=xvar_idx,
+                                 return_std=return_std, return_sem=return_sem)
+
+    def std_array(self, arr, xvar_idx=None):
+        return super().std_array(arr, xvar_idx=xvar_idx)
+
+    def sem_array(self, arr, xvar_idx=None):
+        return super().sem_array(arr, xvar_idx=xvar_idx)
+
     def transpose_data(self, new_xvar_idx=[], reanalyze=True):
         return super().transpose_data(new_xvar_idx=new_xvar_idx, reanalyze=reanalyze)
 
