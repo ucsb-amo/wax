@@ -526,29 +526,54 @@ class atomdata_base():
             a new one. Default is False.
         """
         if self._lite:
-            # Get new ROI (prompts GUI if roi_id is None and no saved ROI).
-            self.roi.load_roi(roi_id, use_saved)
-            # Save the new ROI into the regular (non-lite) h5 file so
-            # create_lite_copy can read it back.
-            self.roi.save_roi_h5(lite=False, printouts=False)
-            # Rebuild the lite file from the full original images.
-            self.server_talk.create_lite_copy(
-                self.run_info.run_id,
-                roi_id=self.run_info.run_id,
-                use_saved_roi=True,
-            )
-            # Reload the freshly-written lite data.
-            self._load_data(self.run_info.run_id, "", lite=True)
-            self._dealer = self._init_dealer()
-            self._sort_images()
-            self.compute_raw_ods()
-            self.analyze_ods()
-            self._refresh_repeat_statistics()
+            self.regenerate_lite_copy(roi_id=roi_id, use_saved=use_saved)
         else:
             od_flat = self.od_raw.reshape(-1, *self.od_raw.shape[-2:])
             self.roi.load_roi(roi_id, use_saved, display_ods=od_flat)
             self.analyze_ods()
             self._refresh_repeat_statistics()
+
+    def regenerate_lite_copy(self, roi_id=None, use_saved=False):
+        """Rebuilds this atomdata's lite file from the full original data.
+
+        Selects a new ROI (prompting the GUI if ``roi_id`` is None and no
+        saved ROI is being used), writes it into the regular (non-lite) h5
+        file, rebuilds the lite file from the full original images using
+        that ROI, then reloads and re-analyzes this instance from the
+        freshly-written lite data.
+
+        Args:
+            roi_id (None, int, or str): Specifies which crop to use. If None,
+            defaults to the ROI saved in the data if it exists, otherwise
+            prompts the user to select an ROI using the GUI. If an int,
+            interpreted as an run ID, which will be checked for a saved ROI
+            and that ROI will be used. If a string, interprets as a key in
+            the roi.xlsx document in the PotassiumData folder.
+
+            use_saved (bool): If False, ignores saved ROI and forces creation
+            of a new one. Default is False.
+        """
+        if not self._lite:
+            print("not a lite dataset, nothing to regenerate")
+            return
+        # Get new ROI (prompts GUI if roi_id is None and no saved ROI).
+        self.roi.load_roi(roi_id, use_saved)
+        # Save the new ROI into the regular (non-lite) h5 file so
+        # create_lite_copy can read it back.
+        self.roi.save_roi_h5(lite=False, printouts=False)
+        # Rebuild the lite file from the full original images.
+        self.server_talk.create_lite_copy(
+            self.run_info.run_id,
+            roi_id=self.run_info.run_id,
+            use_saved_roi=True,
+        )
+        # Reload the freshly-written lite data.
+        self._load_data(self.run_info.run_id, "", lite=True)
+        self._dealer = self._init_dealer()
+        self._sort_images()
+        self.compute_raw_ods()
+        self.analyze_ods()
+        self._refresh_repeat_statistics()
 
     ### ROI management
     def save_roi_excel(self,key=""):
