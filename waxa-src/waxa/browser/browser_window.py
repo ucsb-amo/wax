@@ -868,6 +868,9 @@ class DataBrowserWindow(QMainWindow):
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setSingleShot(False)
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh_timeout)
+        self._day_rollover_timer = QTimer(self)
+        self._day_rollover_timer.setSingleShot(False)
+        self._day_rollover_timer.timeout.connect(self._check_date_rollover)
 
         self.setWindowTitle("Data Browser")
         self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
@@ -893,6 +896,9 @@ class DataBrowserWindow(QMainWindow):
         self.date_to = QDateEdit(self)
         self.date_to.setCalendarPopup(True)
         self.date_to.setDate(QDate.currentDate())
+        self._date_to_tracks_today = True
+        self.date_to.dateChanged.connect(self._on_date_to_changed)
+        self._day_rollover_timer.start(60 * 1000)
 
         self.refresh_btn = QPushButton("Refresh", self)
         self.refresh_btn.clicked.connect(self._start_scan)
@@ -1660,6 +1666,24 @@ class DataBrowserWindow(QMainWindow):
             return
         LOGGER.warning("Auto-refresh latest-run check failed: %s", message)
 
+    def _on_date_to_changed(self, _qdate):
+        self._date_to_tracks_today = (self.date_to.date() == QDate.currentDate())
+
+    def _check_date_rollover(self):
+        if not self._date_to_tracks_today:
+            return
+        today = QDate.currentDate()
+        if self.date_to.date() == today:
+            return
+        LOGGER.info(
+            "Day changed; extending date_to to track today (%s -> %s)",
+            self.date_to.date().toString("yyyy-MM-dd"),
+            today.toString("yyyy-MM-dd"),
+        )
+        self.date_to.setDate(today)
+        self.status_label.setText("Date range extended to include today")
+        self._start_scan()
+
     def _append_run(self, run: RunSummary):
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -1931,6 +1955,24 @@ class DataBrowserWindow(QMainWindow):
 
     def _apply_saved_search(self, index: int):
         pass
+
+    def _format_run_ids_for_copy(self, ids: list[int]) -> str:
+        ids = sorted(int(i) for i in ids)
+        if len(ids) <= 5:
+            return "[" + ", ".join(str(i) for i in ids) + "]"
+
+        groups = []
+        start = prev = ids[0]
+        for value in ids[1:]:
+            if value == prev + 1:
+                prev = value
+                continue
+            groups.append((start, prev))
+            start = prev = value
+        groups.append((start, prev))
+
+        parts = [f"{lo}:{hi + 1}" if hi > lo else str(lo) for lo, hi in groups]
+        return "np.r_[" + ", ".join(parts) + "]"
 
     def _copy_selected_run_id(self):
         row = self._get_selected_row()
@@ -2351,8 +2393,8 @@ class DataBrowserWindow(QMainWindow):
             self._start_lite_creation_for_runs([r.run_id for r, _ in selected_run_rows])
         elif chosen is copy_run_id_action:
             if is_multi_selection:
-                ids = sorted(r.run_id for r, _ in selected_run_rows)
-                text = "[" + ", ".join(str(i) for i in ids) + "]"
+                ids = [r.run_id for r, _ in selected_run_rows]
+                text = self._format_run_ids_for_copy(ids)
             else:
                 text = str(run.run_id)
             QApplication.clipboard().setText(text)
