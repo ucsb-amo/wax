@@ -1,7 +1,7 @@
 import numpy as np
 
 from artiq.coredevice.core import Core
-from artiq.language import now_mu, kernel, delay, portable
+from artiq.language import now_mu, kernel, delay, portable, TFloat
 
 import vxi11
 
@@ -93,6 +93,10 @@ class SDG6000X_CH():
         if sw_changed:
             self._p.state = state if state >= 0. else self._p.state
             self._instr._sw_output(self.ch,self._p.state)
+
+    def get_frequency(self) -> TFloat:
+        self.fetch_state()
+        return self._p.frequency
 
     def fetch_state(self):
         reply = self._instr.ask(f"C{self.ch}:BSWV?")
