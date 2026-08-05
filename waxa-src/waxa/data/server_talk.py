@@ -457,7 +457,7 @@ class server_talk():
 
     def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True):
         from waxa.data import RunInfo, DataSaver
-        from waxa.atomdata import unpack_group
+        from waxa._atomdata import unpack_group
         import h5py
         from waxa import ROI
 

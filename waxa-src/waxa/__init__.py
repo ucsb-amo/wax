@@ -6,7 +6,7 @@
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .atomdata import atomdata
+    from ._atomdata import atomdata
     from .atomdata_vault import AtomdataVault
     from .data.load_atomdata import load_atomdata
     from .roi import ROI
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from .config.expt_params import ExptParams
 
 _lazy = {
-    'atomdata':     '.atomdata',
+    'atomdata':     '._atomdata',
     'AtomdataVault': '.atomdata_vault',
     'load_atomdata': '.data.load_atomdata',
     'ROI':          '.roi',
