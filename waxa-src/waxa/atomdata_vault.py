@@ -42,7 +42,7 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
-from waxa._atomdata import atomdata
+from waxa.atomdata import atomdata
 from waxa.atomdata_base import (
     atomdata_base,
     analysis_tags,
