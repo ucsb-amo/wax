@@ -71,23 +71,90 @@ def remove_infnan(*arrays):
 def normalize(array,
               map_minimum_to_zero=False,
               override_normalize_maximum=None,
-              override_normalize_minimum=None):
+              override_normalize_minimum=None,
+              axis=None,
+              return_map=False):
+    """
+    Normalizes an array to a maximum of 1, optionally mapping its minimum to 0.
+
+    Args:
+        array (array-like): 1D or 2D array to normalize.
+        map_minimum_to_zero (bool, optional): If True, maps the minimum to 0 and
+            the maximum to 1, i.e. (x - x_min) / (x_max - x_min). If False, only
+            divides by the maximum. Defaults to False.
+        override_normalize_maximum (scalar or array-like, optional): Value(s) to
+            use in place of the computed maximum. See `axis` for shape rules.
+        override_normalize_minimum (scalar or array-like, optional): Value(s) to
+            use in place of the computed minimum. See `axis` for shape rules.
+        axis (int or None, optional): If None, the whole array is normalized by a
+            single max/min, and any overrides must be scalar. If 0, each column is
+            normalized individually; if 1, each row is. Overrides may then be
+            either a scalar (same value used for every vector) or a vector with
+            one entry per normalized vector (length = array.shape[1] for axis=0,
+            array.shape[0] for axis=1). Ignored for 1D input. Defaults to None.
+        return_map (bool, optional): If True, also returns the pair of functions
+            (to_normalized, to_raw) implementing this normalization and its
+            inverse, so other data can be mapped with the same scaling.
+            Defaults to False.
+
+    Returns:
+        np.ndarray: Normalized array, same shape as the input. If `return_map`
+            is True, returns (normalized_array, (to_normalized, to_raw)).
+
+    Raises:
+        ValueError: If the input has more than 2 dimensions, if `axis` is not
+            None, 0, or 1, or if an override has a shape incompatible with `axis`.
+    """
     x = np.asarray(array)
 
-    if override_normalize_maximum != None:
-        x_max = override_normalize_maximum
-    else:
-        x_max = np.max(x)
+    if x.ndim > 2:
+        raise ValueError(f"`array` must be at most 2-dimensional (got {x.ndim} dimensions)")
+    if axis not in (None, 0, 1):
+        raise ValueError("`axis` must be None, 0, or 1")
 
-    if override_normalize_minimum != None:
-        x_min = override_normalize_minimum
-    else:
-        x_min = np.min(x)
+    # axis is meaningless for a 1D array -- normalize the whole thing
+    if x.ndim < 2:
+        axis = None
+
+    def _resolve(override, reduce_func):
+        if override is None:
+            value = reduce_func(x) if axis is None else reduce_func(x, axis=axis)
+        else:
+            value = np.asarray(override)
+            if axis is None:
+                if value.ndim != 0:
+                    raise ValueError("Overrides must be scalar when `axis` is None")
+            elif value.ndim == 0:
+                pass  # scalar broadcasts to every vector
+            elif value.ndim == 1:
+                # one entry per normalized vector
+                n_vectors = x.shape[1 - axis]
+                if value.size != n_vectors:
+                    raise ValueError(
+                        f"Override must be scalar or have length {n_vectors} "
+                        f"for axis={axis} (got length {value.size})")
+            else:
+                raise ValueError("Overrides must be scalar or 1-dimensional")
+        # reduce over axis=1 gives one value per row -- make it a column vector
+        # so it broadcasts back against the original array
+        if axis == 1:
+            value = np.reshape(value, (-1, 1))
+        return value
+
+    x_max = _resolve(override_normalize_maximum, np.max)
+    x_min = _resolve(override_normalize_minimum, np.min)
 
     if map_minimum_to_zero:
-        x = (x-x_min)/(x_max-x_min)
+        to_normalized = lambda raw: (np.asarray(raw)-x_min)/(x_max-x_min)
+        to_raw = lambda norm: np.asarray(norm)*(x_max-x_min) + x_min
     else:
-        x = x/x_max
+        to_normalized = lambda raw: np.asarray(raw)/x_max
+        to_raw = lambda norm: np.asarray(norm)*x_max
+
+    x = to_normalized(x)
+
+    if return_map:
+        return x, (to_normalized, to_raw)
     return x
 
 def sort(x, y):
