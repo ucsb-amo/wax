@@ -195,6 +195,10 @@ class AtomdataVault(atomdata_base):
         after loading. If given, this takes precedence over ``structure``.
     flatten_xvar : str, int, or None
         Structured xvar key/index to flatten automatically after any promotion.
+    skip_missing : bool
+        If True (default), run-id inputs that fail to load because the run is
+        missing/aborted are skipped with a warning and loading continues.
+        Non-missing failures are still raised.
     """
 
     def __init__(self,
@@ -213,7 +217,8 @@ class AtomdataVault(atomdata_base):
                  structure='auto',
                  xvar_mode='pad',
                  promote_xvar=None,
-                 flatten_xvar=None):
+                 flatten_xvar=None,
+                 skip_missing=True):
 
         # regenerate_lite forces lite loading and re-crops every lite file to
         # the anchor ROI (see _load_lite_with_anchor), overriding the default
@@ -233,6 +238,7 @@ class AtomdataVault(atomdata_base):
         self._merge_overlap = bool(merge_overlap)
         self._uniform_roi = bool(uniform_roi)
         self._drop_raw_images = bool(drop_raw_images)
+        self._skip_missing = bool(skip_missing)
         if scope_merge not in ('strict', 'pad_nan', 'skip'):
             raise ValueError(
                 "scope_merge must be one of 'strict', 'pad_nan', or 'skip'."
@@ -257,6 +263,7 @@ class AtomdataVault(atomdata_base):
             xvar_mode=xvar_mode,
             promote_xvar=promote_xvar,
             flatten_xvar=flatten_xvar,
+            skip_missing=skip_missing,
         )
 
         self.avg: Optional[atomdata_base] = None
@@ -304,6 +311,11 @@ class AtomdataVault(atomdata_base):
         ads = self._materialize_inputs(
             raw_inputs, roi_id, lite, self._ignore_images, self._uniform_roi,
         )
+        if len(ads) == 0:
+            raise ValueError(
+                "AtomdataVault: no loadable inputs remain after skipping "
+                "missing run-ids."
+            )
 
         # 2. Validate compatibility. N_repeats may differ across inputs when
         #    merge_overlap is on (grouped statistics handle ragged counts).
@@ -565,6 +577,7 @@ class AtomdataVault(atomdata_base):
         persist_anchor = has_subsequent_int_loads or lite
 
         ads = []
+        skipped_missing = []
         anchor_roi_id = None      # int run-id, str key, or None
         anchor_established = False
 
@@ -587,26 +600,57 @@ class AtomdataVault(atomdata_base):
 
             rid = int(item)
 
-            if not uniform_roi:
-                # Legacy per-run behavior: independent ROI per run.
-                ads.append(atomdata(rid, roi_id=roi_id, lite=lite,
-                                    ignore_images=ignore_images))
-                continue
+            try:
+                if not uniform_roi:
+                    # Legacy per-run behavior: independent ROI per run.
+                    ads.append(atomdata(rid, roi_id=roi_id, lite=lite,
+                                        ignore_images=ignore_images))
+                    continue
 
-            if not anchor_established:
-                ad, anchor_roi_id = self._load_anchor_run(
-                    rid, roi_id, lite, ignore_images, server_talk,
-                    persist_anchor,
-                )
-                anchor_established = True
-                ads.append(ad)
-                continue
+                if not anchor_established:
+                    ad, anchor_roi_id = self._load_anchor_run(
+                        rid, roi_id, lite, ignore_images, server_talk,
+                        persist_anchor,
+                    )
+                    anchor_established = True
+                    ads.append(ad)
+                    continue
 
-            ads.append(self._load_with_anchor(
-                rid, anchor_roi_id, lite, ignore_images, server_talk,
-            ))
+                ads.append(self._load_with_anchor(
+                    rid, anchor_roi_id, lite, ignore_images, server_talk,
+                ))
+            except Exception as e:
+                if self._skip_missing and self._is_missing_run_error(e):
+                    skipped_missing.append(rid)
+                    continue
+                raise
+
+        if skipped_missing:
+            preview = ', '.join(str(r) for r in skipped_missing[:20])
+            more = '...' if len(skipped_missing) > 20 else ''
+            warnings.warn(
+                f'AtomdataVault: skipped {len(skipped_missing)} missing '
+                f'run-id(s) while loading inputs ({preview}{more}).',
+                stacklevel=2,
+            )
 
         return ads
+
+    @staticmethod
+    def _is_missing_run_error(exc):
+        """Best-effort check for run-id missing/aborted load failures."""
+        if isinstance(exc, FileNotFoundError):
+            return True
+        msg = str(exc).lower()
+        return any(token in msg for token in (
+            'missing',
+            'not found',
+            'no such file',
+            'could not find',
+            'run id',
+            'run_id',
+            'data file',
+        ))
 
     def _load_anchor_run(self, rid, roi_id, lite, ignore_images, server_talk,
                          persist_anchor=True):
