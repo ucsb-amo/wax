@@ -1774,6 +1774,14 @@ class AtomdataVault(atomdata_base):
         inverse = np.asarray(inverse).ravel()
         n_groups = unique.size
 
+        # If every unique xvar value ended up with the same repeat count
+        # (e.g. non-overlapping merged ranges from equal-N_repeats runs, or
+        # overlapping ranges that happen to sum to a uniform count), reflect
+        # that in N_repeats so code reading it directly (rather than through
+        # the grouped stats) sees the true per-point repeat count.
+        if counts.size and np.all(counts == counts[0]):
+            self.params.N_repeats = int(counts[0])
+
         ad_avg = object.__new__(self.__class__)
         ad_std = object.__new__(self.__class__)
         ad_sem = object.__new__(self.__class__)

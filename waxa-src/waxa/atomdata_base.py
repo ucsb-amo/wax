@@ -504,6 +504,35 @@ class atomdata_base():
             )
 
     ###
+    @property
+    def run_id(self):
+        """Run id(s) in this dataset as a sorted, unique 1D int array.
+
+        A plain atomdata stores a scalar run_id and an AtomdataVault stores a
+        list of them; both come back here as an ``np.r_``-style array so
+        plotting/labelling code can treat them the same way.
+        """
+        rid = getattr(getattr(self, 'run_info', None), 'run_id', None)
+        if rid is None:
+            return np.array([], dtype=np.int64)
+        return np.unique(np.r_[rid].astype(np.int64))
+
+    @property
+    def run_id_title(self):
+        """Title string like ``run id 1234 to 1240, 1250 to 1252``.
+
+        Consecutive run ids collapse into a ``first to last`` range; each gap
+        in the run ids starts a new comma-separated range. A range holding a
+        single run id is printed as just that number.
+        """
+        rids = self.run_id
+        if rids.size == 0:
+            return 'run id (unknown)'
+        groups = np.split(rids, np.flatnonzero(np.diff(rids) != 1) + 1)
+        ranges = [f"{g[0]}" if g.size == 1 else f"{g[0]} to {g[-1]}"
+                  for g in groups]
+        return 'run id ' + ', '.join(ranges)
+
     def recrop(self,roi_id=None,use_saved=False):
         if not getattr(self, '_has_images', True):
             print("no images in dataset, no roi to crop")
@@ -2562,6 +2591,8 @@ class atomdata_base():
                     '_sem_scale_scope_data',
                     '_repeat_lazy_stat_context',
                     '_materialize_repeat_std_sem',
+                    'run_id',
+                    'run_id_title',
                     '__dict__',
                     '__class__']:
             return object.__getattribute__(self, name)

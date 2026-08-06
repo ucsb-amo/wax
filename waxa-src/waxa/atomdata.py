@@ -55,6 +55,16 @@ class atomdata(atomdata_base):
         )
 
     # User-facing operations: thin wrappers over parent implementations.
+    @property
+    def run_id(self):
+        """Sorted, unique array of the run id(s) in this dataset."""
+        return super().run_id
+
+    @property
+    def run_id_title(self):
+        """Title string like ``run id 1234 to 1240, 1250``."""
+        return super().run_id_title
+
     def recrop(self, roi_id=None, use_saved=False):
         return super().recrop(roi_id=roi_id, use_saved=use_saved)
 
