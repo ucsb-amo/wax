@@ -221,8 +221,15 @@ class server_talk():
                     yield path
 
     def _is_completed_run(self, filepath):
+        # locking=False: this probe runs newest-file-first over every candidate
+        # (RECENT_COMPLETED_TRUST_WINDOW = 0), so it routinely opens the data
+        # file of a run that is still being written — possibly from another
+        # machine, over a mapped network drive.  Taking a read lock there can
+        # make the writer's own open fail.  Everything below only reads attrs
+        # and small datasets under a blanket except, so a torn read degrades to
+        # "not complete", which is the right answer for an in-flight run.
         try:
-            with h5py.File(filepath, 'r') as f:
+            with h5py.File(filepath, 'r', locking=False) as f:
                 # Fast path: explicit completion marker (present in new files).
                 # True  → fully written; False → still being written by server.
                 # None  → old file without the attr; fall through to xvar check.

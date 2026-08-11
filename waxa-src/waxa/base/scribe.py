@@ -6,6 +6,7 @@ from waxa.data import DataSaver
 from waxa.data.server_talk import server_talk as st
 from waxa.config.timeouts import (DEFAULT_TIMEOUT, N_NOTIFY,
                                    CHECK_CAMERA_READY_ACK_PERIOD, REMOVE_DATA_POLL_INTERVAL,
+                                   REMOVE_DATA_TIMEOUT,
                                    CHECK_FOR_DATA_AVAILABLE_PERIOD as CHECK_PERIOD)
 
 def nothing():
@@ -24,34 +25,48 @@ class Scribe():
     def wait_for_data_available(self,openmode='r+',
                                 check_period=CHECK_PERIOD,
                                 timeout=DEFAULT_TIMEOUT,
-                                check_interrupt_method=nothing):
+                                check_interrupt_method=nothing,
+                                require_data_group=True):
         """Blocks until the file at self.datapath is available and fully populated.
 
-        The file is created as an empty stub by reserve_run_id_and_path() and
-        then populated (including the 'data' group) by
-        create_data_file_from_payload() on a background thread.  Returning as
-        soon as the file is *openable* would race with that background write and
-        let SaveWorker try to access self._f['data'] before the group exists.
-        We therefore also wait until the 'data' group is present in the file.
+        reserve_run_id_and_path() now creates *and* populates the file inside a
+        single exclusive open, so by the time the experiment knows the filepath
+        the 'data' group exists.  The 'data' check below is therefore only
+        defense-in-depth: hitting it means file creation did not complete, and
+        we must time out rather than spin — an earlier version `continue`d past
+        the deadline check and hung forever, silently discarding a whole run's
+        images while the caller waited.
+
+        Pass ``require_data_group=False`` when you only need the file to be
+        openable (i.e. not held by another process), as when deleting it.
         """
         t0 = time.time()
         count = 0
+        reason = "file busy"
         while True:
+            # Deadline is checked at the top so that *every* retry path below
+            # is bounded, including the 'data'-missing branch.
+            if timeout > 0. and time.time() - t0 > timeout:
+                raise ValueError(
+                    f"Timed out waiting for data to be available after "
+                    f"{time.time() - t0:.1f} s ({reason}): {self.data_filepath}"
+                )
             try:
                 if check_interrupt_method():
                     break
                 f = h5py.File(self.data_filepath, openmode)
-                # Guard against the file being an empty stub created by
-                # reserve_run_id_and_path() before create_data_file_from_payload()
-                # has finished writing the 'data' group.
-                if 'data' not in f:
+                # Guard against a file whose 'data' group was never written
+                # (incomplete creation).
+                if require_data_group and 'data' not in f:
                     f.close()
+                    reason = "file has no 'data' group"
                     time.sleep(check_period)
                     continue
                 return f
             except Exception as e:
                 if "Unable to" in str(e) or "Invalid file name" in str(e) or "cannot access" in str(e):
                     # file is busy -- wait for available
+                    reason = f"file busy ({e})"
                     count += 1
                     time.sleep(check_period)
                     if count == N_NOTIFY:
@@ -60,10 +75,7 @@ class Scribe():
                 else:
                     raise e
             self._check_data_file_exists()
-            if timeout > 0.:
-                if time.time() - t0 > timeout:
-                    raise ValueError("Timed out waiting for data to be available.")        
-                
+
     def wait_for_camera_ready(self,timeout=-1.) -> bool:
         # New path: delegate to the ZMQ client when available.
         if getattr(self, 'live_od_client', None) is not None:
@@ -141,7 +153,14 @@ class Scribe():
             count = 0
             while True:
                 try:
-                    with self.wait_for_data_available(check_period=REMOVE_DATA_POLL_INTERVAL) as f:
+                    # The open is only here to confirm no one still holds the
+                    # file, so don't require a 'data' group — a file that never
+                    # got one is exactly what we are tearing down.  Bounded
+                    # because this runs on the abort path.
+                    with self.wait_for_data_available(
+                            check_period=REMOVE_DATA_POLL_INTERVAL,
+                            timeout=REMOVE_DATA_TIMEOUT,
+                            require_data_group=False) as f:
                         pass
                     os.remove(self.data_filepath)
                     print(msg)
@@ -153,8 +172,23 @@ class Scribe():
                         if count == N_NOTIFY:
                             count = 0
                             print("Can't open data. Is another process using it?")
+                    elif "Timed out waiting for data" in str(e):
+                        # Can't open it (e.g. no 'data' group), but deletion may
+                        # still succeed — that's all we actually want here.
+                        try:
+                            os.remove(self.data_filepath)
+                            print(msg)
+                        except Exception as rm_exc:
+                            print(f"Could not delete incomplete data: {rm_exc}")
+                            raise e
                     else:
                         raise e
+                # Done as soon as the file is gone.  NB: _check_data_file_exists
+                # is overridden in this class to report the *reset flag*, not
+                # file existence, so on an aborted run it stays True and would
+                # spin this loop on an already-deleted file.
+                if not os.path.exists(self.data_filepath):
+                    break
                 if not self._check_data_file_exists(raise_error=False):
                     break
 

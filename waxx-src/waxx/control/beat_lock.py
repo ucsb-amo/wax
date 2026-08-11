@@ -1,11 +1,14 @@
 import numpy as np
 
 from artiq.experiment import portable, kernel, rpc, \
-                                TFloat, TArray
+                                TFloat, TInt32, TTuple, TArray
 from artiq.language.core import delay, now_mu, at_mu
+from artiq.coredevice.core import Core
 
-from waxx.control.artiq import DDS, TTL_OUT, DAC_CH
+from waxx.control.artiq import DDS, TTL_OUT, DAC_CH, DummyCore
+from waxx.control.integrator import Integrator
 from waxx.config.expt_params import ExptParams
+from waxx.config.sampler_id import sampler_frame
 from waxx.util.artiq.async_print import aprint
 
 dv = -10.e9
@@ -14,6 +17,10 @@ di = -10000
 FREQUENCY_GS_HFS = 461.7 * 1.e6
 
 T_PID_RESET_PULSE = 1.e-6
+
+# Sampler conversion is latched this many mu after CNV; the integrator clear is
+# scheduled here so it never corrupts the in-flight conversion.
+T_APD_SAMPLER_CONV_MU = 80
 
 POLMOD_H_IDX = 0
 POLMOD_V_IDX = 1
@@ -377,16 +384,32 @@ class BeatLockImagingPID(BeatLockImaging):
                  pid_override_ttl=TTL_OUT,
                  dac_pid_setpoint=DAC_CH,
                  dds_beatref=DDS,
+                 integrator=Integrator,
+                 sampler=sampler_frame,
+                 core: Core = DummyCore(),
                  N_beatref_mult=di,
                  beatref_sign=di,
                  frequency_minimum_beat=dv,
                  expt_params=ExptParams()):
-        
+
         self.dds_pid = dds_pid
 
         self.dac_pid = dac_pid_setpoint
         self.ttl_pid_int_clear = pid_int_clear_ttl
-        
+
+        # NOTE: the placeholders for integrator/sampler are the CLASSES, not
+        # instances -- Integrator.__init__ raises unless sampler_ch is a
+        # Sampler_Last_CH instance, and default args evaluate at import time.
+        # Matches the dds_sw=DDS / dac_pid_setpoint=DAC_CH convention above.
+        # These are the same objects the experiment holds as self.integrator /
+        # self.sampler / self.core, so ARTIQ embeds each exactly once.
+        self.integrator = integrator
+        # the integrated measurement reads through integrator.sampler_ch (which
+        # IS sampler.apd_integrator); this reference is here so other channels
+        # of the same sampler are reachable from the imaging object.
+        self.sampler = sampler
+        self._core = core
+
         super().__init__(dds_sw=dds_sw,
                 dds_beatref=dds_beatref,
                 N_beatref_mult=N_beatref_mult,
@@ -420,3 +443,212 @@ class BeatLockImagingPID(BeatLockImaging):
         if reset_pid:
             self.ttl_pid_int_clear.pulse(T_PID_RESET_PULSE)
             delay(-T_PID_RESET_PULSE)
+
+    @kernel
+    def _integrated_pulse_v(self, t, dark, reset) -> TFloat:
+        """Core integrated-APD measurement: one imaging pulse of length t.
+
+        Adds NO trailing slack, so the timeline is exactly what
+        integrated_imaging_pulse has always produced. Use measure_integrated_v
+        instead if you need to call this back-to-back.
+
+        TIMELINE: Integrator.begin_integrate pretriggers 600 mu into the past
+        (2100 mu if reset=True), so the caller MUST already have slack on the
+        timeline. The sampler readback is a BLOCKING RTIO input that stalls the
+        kernel until real time catches up, so on return slack is ~zero.
+
+        Leaves the integrator held in clear, the precondition for the next call
+        with reset=False.
+        """
+        self.integrator.begin_integrate(reset=reset)
+        if dark:
+            delay(t)
+        else:
+            self.pulse(t)
+        self.integrator.stop_and_settle()
+        t0 = now_mu()
+        # start the clear only after the integrator voltage is already latched
+        # in the sampler
+        at_mu(t0 + T_APD_SAMPLER_CONV_MU)
+        self.integrator.clear(t=0)
+        at_mu(t0)
+        v = self.integrator.sample()
+        return v
+
+    @kernel
+    def integrated_imaging_pulse(self, data_container, t, idx=0,
+                                 dark=False, reset=False):
+        """Pulse the imaging beam and store the integrated APD voltage.
+
+        Args:
+            data_container: DataContainer to store the reading in.
+            t (float): Length of the imaging pulse.
+            idx (int, optional): Slot in the container to write. Defaults to 0.
+            dark (bool, optional): If True, take a background reading -- the
+                integration window runs with no imaging pulse. Defaults to False.
+            reset (bool, optional): If True, fully reset the integrator before
+                the window (costs 1500 mu more pretrigger). Defaults to False.
+
+        Timeline is unchanged from when this lived on kexp.base.control.Control;
+        kexp keeps a thin delegating wrapper so self.integrated_imaging_pulse
+        still works from an experiment.
+        """
+        data_container.put_data(self._integrated_pulse_v(t, dark, reset), idx)
+
+    @kernel
+    def measure_integrated_v(self, t, dark=False, reset=False) -> TFloat:
+        """Integrated APD voltage returned directly, with slack re-armed.
+
+        Same measurement as integrated_imaging_pulse, but returns the value
+        instead of storing it, and re-arms t_apd_slack afterwards so the
+        blocking sampler readback cannot starve the next call's pretrigger.
+        That trailing delay is why this is NOT the same as
+        integrated_imaging_pulse -- adding it there would shift the timeline of
+        every existing call site.
+        """
+        v = self._integrated_pulse_v(t, dark, reset)
+        delay(self.p.t_apd_slack)
+        return v
+
+    @portable
+    def _clamp_v_pid(self, v) -> TFloat:
+        """Clamp a PID setpoint into a strictly POSITIVE band.
+
+        Lower rail: DDS.set_dds treats v_pd < 0 as "no change", so a negative
+        setpoint is a SILENT no-op and the feedback loop would spin uselessly.
+
+        Upper rail: DAC_CH.set ZEROES the channel if v > max_v -- it does not
+        clamp -- which would turn the beam fully off AND poison dac_pid.v for the
+        next ratio jump. Its error path is an async RPC, so the kernel never sees
+        it. Clamping below max_v guarantees that branch can never be reached.
+        """
+        v_min = self.p.v_pid_imaging_min
+        v_max = self.p.v_pid_imaging_max
+        if v_max > self.dac_pid.max_v:
+            v_max = self.dac_pid.max_v
+        if v < v_min:
+            v = v_min
+        elif v > v_max:
+            v = v_max
+        return v
+
+    @kernel
+    def stabilize_power(self, v_target) -> TTuple([TInt32, TFloat]):
+        """Servo the imaging PID setpoint until the integrated APD signal
+        (light minus dark) equals v_target.
+
+        check -> single multiplicative ratio jump -> P/I feedback.
+
+        The dark/background is measured ONCE on entry and reused for every
+        iteration, which halves the imaging light exposure relative to measuring
+        it per iteration. All tuning is read from ExptParams (self.p.*).
+
+        Costs roughly N_iter * (t_apd_imaging_check + t_apd_pid_settle) of
+        imaging light -- this is a calibration routine, run it before atoms are
+        present.
+
+        Preconditions: dds_pid is on (see init()) and dds.stash_defaults() has
+        run, since set_power reads _amplitude_default. This method deliberately
+        does NOT turn the beam on -- that is the caller's job.
+
+        Args:
+            v_target (float): Target integrated APD voltage (light minus dark).
+
+        Returns:
+            (n_iter, frac_err): iterations used and the final fractional error.
+            Convergence means frac_err < p.frac_err_threshold_imaging_pid.
+        """
+        if v_target <= 0.:
+            raise ValueError("stabilize_power needs a strictly positive target integrated APD voltage.")
+
+        # hoist -- fewer attribute loads in the loop, and each type is pinned once
+        t_check = self.p.t_apd_imaging_check
+        t_settle = self.p.t_apd_pid_settle
+        gain_p = self.p.gain_p_imaging_pid
+        gain_i = self.p.gain_i_imaging_pid
+        thresh = self.p.frac_err_threshold_imaging_pid
+        N_max = self.p.N_max_iter_imaging_pid
+        v_min = self.p.v_pid_imaging_min
+        v_max = self.p.v_pid_imaging_max
+        if v_max > self.dac_pid.max_v:
+            v_max = self.dac_pid.max_v
+
+        # the caller's slack is unknown, and the first measurement pretriggers
+        # 2100 mu into the past
+        self._core.break_realtime()
+
+        # dark/background: measured ONCE, reused for every iteration. reset=True
+        # self-arms the integrator regardless of prior state.
+        v_dark = self.measure_integrated_v(t_check, True, True)
+
+        # a multiplicative jump can never move off a zero setpoint, and
+        # DDS.off() zeroes dac_pid.v -- seed it so the ratio step has traction
+        if self.dac_pid.v <= 0.:
+            self.set_power(self.p.v_pid_imaging_seed)
+            delay(t_settle)
+
+        ### phase 1: check
+        v_signal = self.measure_integrated_v(t_check, False, False) - v_dark
+
+        ### phase 2: single multiplicative ratio jump
+        # v_signal <= 0 means no measurable light (blocked beam, or dark drift).
+        # Skip rather than dividing by zero or by a negative -- a negative ratio
+        # would flip the setpoint sign into the silent-no-op region. The P/I loop
+        # below still pushes in the right direction.
+        if v_signal > 0.:
+            v_new = self._clamp_v_pid(self.dac_pid.v * (v_target / v_signal))
+            self.set_power(v_new)
+            delay(t_settle)
+
+        ### phase 3: P/I feedback
+        n_iter = 0
+        frac_err = 1.
+        err_integral = 0.
+        saturated = False
+        railed = False
+
+        while n_iter < N_max:
+            v_signal = self.measure_integrated_v(t_check, False, False) - v_dark
+            err = v_signal - v_target
+            frac_err = abs(err / v_target)
+            if frac_err < thresh:
+                break
+
+            v_new = self.dac_pid.v + gain_p * err + gain_i * (err_integral + err)
+
+            if v_new > v_max:
+                v_new = v_max
+                saturated = True
+            elif v_new < v_min:
+                v_new = v_min
+                saturated = True
+            else:
+                saturated = False
+                err_integral += err  # anti-windup: only integrate when unsaturated
+
+            n_iter += 1
+
+            if saturated and (v_new == self.dac_pid.v):
+                # already pinned at this rail and the correction only pushes
+                # further into it -- more iterations cannot help. Abort instead
+                # of burning the rest of N_max_iter of imaging light.
+                railed = True
+                break
+
+            self.set_power(v_new)
+            # servo settling, and slack for the next begin_integrate pretrigger
+            delay(t_settle)
+
+        if frac_err >= thresh:
+            # one aprint AFTER the loop, never inside it -- it is an async RPC,
+            # so it does not stall the timeline, but marshalling the message
+            # costs kernel CPU time and therefore eats slack
+            if railed:
+                aprint("stabilize_power: imaging PID setpoint pinned at rail",
+                       self.dac_pid.v, "V -- cannot reach target. frac err =", frac_err)
+            else:
+                aprint("stabilize_power: no convergence in", n_iter,
+                       "iterations. frac err =", frac_err)
+            self._core.break_realtime()
+
+        return n_iter, frac_err

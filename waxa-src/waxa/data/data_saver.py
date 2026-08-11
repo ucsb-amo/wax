@@ -294,8 +294,17 @@ class DataSaver():
         The starting candidate is seeded from ``max(counter, on-disk max)``, so
         the run_id counter file acts only as a fast monotonic floor (preventing
         id reuse after a reset deletes an in-progress file) while the filesystem
-        is the true source of truth.  The reserved file is a minimal stub;
-        ``create_data_file_from_payload`` fills in the full datasets afterwards.
+        is the true source of truth.
+
+        The file is populated *completely* (``data`` / ``run_info`` / ``params``
+        / ``camera_params``) inside the same exclusive open that claims the id.
+        This matters: an earlier design left a bare stub here and re-opened the
+        path with a truncating ``'w'`` on a background thread.  That second open
+        could lose the HDF5 file lock to any concurrent reader of the newest
+        data file (``server_talk._is_completed_run``), and the failure was
+        invisible, so the ``data`` group was silently never created and every
+        image of the run was dropped.  One open, no stub window, no background
+        thread.
         """
         st = self.server_talk
         st.check_for_mapped_data_dir()
@@ -319,15 +328,33 @@ class DataSaver():
             fpath, folder = self._data_path(ri)
             os.makedirs(folder, exist_ok=True)
             try:
-                with h5py.File(fpath, "x") as f:
-                    f.attrs["run_complete"] = False
-                break
+                f = h5py.File(fpath, "x")
             except (FileExistsError, OSError):
                 if os.path.exists(fpath):
                     # Another run already claimed this id — try the next one.
                     candidate += 1
                     continue
                 raise
+            # The id is ours.  Fill in the full structure before releasing the
+            # handle so no other process can ever observe a file without a
+            # 'data' group.  If that fails, delete the file so the id is not
+            # left claimed by an unusable corpse, and let the caller refuse to
+            # start the run.
+            try:
+                self._populate_data_file(f, payload, candidate)
+            except Exception:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+                raise
+            else:
+                f.close()
+            break
 
         # Advance the monotonic floor to the next id.
         st.set_run_id(candidate + 1)
@@ -352,9 +379,28 @@ class DataSaver():
     def create_data_file_from_payload(self, payload: dict, run_id: int) -> str:
         """Create an HDF5 data file from an INIT_RUN payload.
 
-        This is the server-side counterpart of ``create_data_file``.  It
-        runs on the liveOD machine (which has the data drive mounted) and
-        receives all necessary metadata from the experiment client.
+        Legacy entry point, kept for callers that need to (re)create a data file
+        at a known run_id without going through ``reserve_run_id_and_path``.
+        The liveOD server no longer uses it: file creation now happens inside
+        the exclusive open that reserves the run_id, so there is no window in
+        which the file exists without its ``data`` group.
+        """
+        self.server_talk.check_for_mapped_data_dir()
+        fpath = self.compute_data_filepath_from_payload(payload, run_id)
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        f = h5py.File(fpath, "w")
+        try:
+            self._populate_data_file(f, payload, run_id)
+        finally:
+            f.close()
+        return fpath
+
+    def _populate_data_file(self, f: "h5py.File", payload: dict, run_id: int) -> None:
+        """Write the full run structure into an already-open HDF5 handle.
+
+        Creates the ``data``, ``run_info``, ``params`` and ``camera_params``
+        groups plus the top-level attrs.  The caller owns *f* and is
+        responsible for closing it.
 
         When ``capture_images=False`` the ``images`` / ``image_timestamps``
         datasets are omitted and ``f.attrs['has_images']`` is set to
@@ -376,19 +422,9 @@ class DataSaver():
         ri.xvarnames = list(payload.get("xvarnames", []))
         ri.experiment_filepath = ""
 
-        # ------ path computation & folder creation --------------------
-        # NB: _data_path returns absolute paths, so we must NOT os.chdir here.
-        # This method runs on a background thread and os.chdir is process-global
-        # — it would race with the main thread's working directory.
-        self.server_talk.check_for_mapped_data_dir()
-
-        fpath, folder = self._data_path(ri)
-        os.makedirs(folder, exist_ok=True)
-
         capture_images = bool(payload.get("capture_images", False))
 
         # ------ write HDF5 -------------------------------------------
-        f = h5py.File(fpath, "w")
         data_grp = f.create_group("data")
 
         f.attrs["has_images"] = capture_images
@@ -397,10 +433,9 @@ class DataSaver():
 
         # Images pre-allocation is intentionally deferred to SaveWorker.
         # Pre-allocating a large dataset here (e.g. 300 × 1024 × 1024 × 2 B ≈ 600 MB on a NAS)
-        # was the primary cause of DataHandler's wait_for_data_available timeout: the background
-        # thread held the file open for many seconds while DataHandler timed out waiting for the
-        # 'data' group to appear.  SaveWorker now creates the images/image_timestamps datasets
-        # lazily on its first write, after the file is already usable.
+        # would hold the file open — and now block the INIT_RUN reply — for many seconds.
+        # SaveWorker creates the images/image_timestamps datasets lazily on its first write,
+        # after the file is already usable.
         # Store shape/dtype as HDF5 attributes so the lazy path can use them if needed.
         if capture_images:
             images_shape = tuple(payload.get("images_shape", (0,)))
@@ -450,9 +485,6 @@ class DataSaver():
             except Exception:
                 pass
 
-        f.close()
-        return fpath
-
     def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None):
         """Write final experiment data to an existing HDF5 file.
 
@@ -473,9 +505,18 @@ class DataSaver():
         capture_images = bool(payload.get("capture_images", False))
         expt_filepath = str(payload.get("expt_filepath", ""))
 
-        # filepath is absolute; do not os.chdir (process-global, races with the
-        # file-creation background thread).
+        # filepath is absolute; do not os.chdir (process-global — it would race
+        # with any other thread in this process).
         with h5py.File(filepath, "r+") as f:
+            # A file without a 'data' group means creation never completed —
+            # fail with a diagnostic rather than a bare KeyError from every
+            # f["data"] access below.
+            if "data" not in f:
+                raise ValueError(
+                    f"Data file {filepath} has no 'data' group — file creation "
+                    "never completed, so no run data can be saved."
+                )
+
             # --- unshuffle images if the run was shuffled ---
             if capture_images and sort_idx_raw:
                 if "images" in f["data"] and f["data"]["images"].size > 0:
