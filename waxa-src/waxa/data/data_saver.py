@@ -1,5 +1,7 @@
 import numpy as np
 import os
+import pickle
+import time
 import h5py
 
 from waxa.data.server_talk import server_talk as st
@@ -7,6 +9,22 @@ from waxa.data.server_talk import server_talk as st
 # __DEFAULT_KEY = "no_one_will_ever_use_this_key000111"
 
 from waxa.dummy.expt import Expt as DummyExpt
+
+# --- END_RUN save resilience ------------------------------------------
+# The data drive is a network share.  A transient SMB drop surfaces from
+# h5py as OSError (errno 22, "Invalid argument" — Windows' catch-all for
+# ERROR_NETNAME_DELETED) or as RuntimeError from a failed H5Fclose, and is
+# usually over within seconds.  Delays (s) between successive attempts:
+SAVE_RETRY_DELAYS_S = (2.0, 5.0, 15.0)
+
+# Exceptions worth retrying an end-of-run save for.  h5py reports I/O
+# failures as OSError and id/close failures as RuntimeError.
+_RETRYABLE_SAVE_EXC = (OSError, RuntimeError)
+
+# Where the END_RUN payload is stashed while the save is in flight.  Local
+# disk on purpose: the failure mode being guarded against is the data drive
+# going away, so the stash must not live on the data drive.
+PENDING_SAVE_DIRNAME = "pending_saves"
 
 class DataSaver():
     def __init__(self,
@@ -485,29 +503,75 @@ class DataSaver():
             except Exception:
                 pass
 
+    # Params that must never be unshuffled — they describe the scan itself
+    # rather than per-shot results.
+    _PROTECTED_PARAM_KEYS = {
+        'xvarnames', 'sort_idx', 'sort_N', 'images', 'image_timestamps',
+        'xvars', 'N_repeats', 'N_shots', 'N_shots_with_repeats',
+        'scan_xvars', 'xvardims', 'data',
+    }
+
     def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None):
         """Write final experiment data to an existing HDF5 file.
 
         This is the server-side counterpart of ``save_data``.  It is
         called by ``LiveODServer`` after receiving the END_RUN message.
 
+        The work is split into three phases so a transient failure of the
+        (network) data drive can be retried without corrupting the file:
+
+        1. **read** — pull the values that have to come *from* the file
+           (images, timestamps, externally-written DataVault arrays).
+           Retriable because nothing has been written yet.
+        2. **compute** — unshuffle everything in memory.  No I/O.
+        3. **write** — write the results back.  Retriable because every
+           write is derived from phase 2's in-memory values and never from
+           a re-read of a possibly half-written file.
+
+        The 100s-of-MB in-place image rewrite is deliberately the last thing
+        written before ``run_complete``, so a drop during that long window
+        still leaves a file whose params, source texts and DataVault are
+        already final.
+
         Parameters
         ----------
         shot_timestamps:
             Optional list/array of Unix timestamps (one per shot) recorded
             server-side.  When provided they are reshaped, unshuffled, and
-            written as ``data/timestamp_shot_end`` inside the same ``with``
-            block as all other end-of-run data — before ``run_complete`` is
-            set to ``True``.
+            written as ``data/timestamp_shot_end`` — before ``run_complete``
+            is set to ``True``.
+        """
+        inputs = self._retry_io(
+            lambda: self._read_end_run_inputs(filepath, payload),
+            filepath, "end-of-run read",
+        )
+        outputs = self._compute_end_run_outputs(payload, inputs, shot_timestamps)
+        self._retry_io(
+            lambda: self._write_end_run_outputs(filepath, payload, outputs),
+            filepath, "end-of-run write",
+        )
+        print("[DataSaver] Parameters saved, data closed.")
+
+    # ------------------------------------------------------------------
+    # End-of-run save: read / compute / write phases
+    # ------------------------------------------------------------------
+
+    def _read_end_run_inputs(self, filepath: str, payload: dict) -> dict:
+        """Phase 1: read everything the end-of-run save needs *from* the file.
+
+        Kept separate from the write phase so that a retry never re-reads
+        data it may itself have partially overwritten.
         """
         sort_idx_raw = payload.get("sort_idx", [])
-        sort_N_raw = payload.get("sort_N", [])
         capture_images = bool(payload.get("capture_images", False))
-        expt_filepath = str(payload.get("expt_filepath", ""))
+
+        images = None
+        image_timestamps = None
+        external = {}
 
         # filepath is absolute; do not os.chdir (process-global — it would race
         # with any other thread in this process).
-        with h5py.File(filepath, "r+") as f:
+        with h5py.File(filepath, "r") as f:
             # A file without a 'data' group means creation never completed —
             # fail with a diagnostic rather than a bare KeyError from every
             # f["data"] access below.
@@ -517,70 +581,139 @@ class DataSaver():
                     "never completed, so no run data can be saved."
                 )
 
-            # --- unshuffle images if the run was shuffled ---
-            if capture_images and sort_idx_raw:
-                if "images" in f["data"] and f["data"]["images"].size > 0:
+            applied = bool(f.attrs.get("unshuffle_applied", False))
+            torn = bool(f.attrs.get("unshuffle_in_progress", False))
+
+            # Only the shuffled case needs any of this: without sort_idx the
+            # file-resident arrays are already in final order, and reading them
+            # back just to write them again would be pure risk.
+            if sort_idx_raw and not applied and not torn:
+                if capture_images and "images" in f["data"] and f["data"]["images"].size > 0:
                     images = f["data"]["images"][()]
-                    timestamps = f["data"]["image_timestamps"][()]
-                    images_ush, timestamps_ush = self._unshuffle_images_from_payload(
-                        images, timestamps, payload
-                    )
-                    f["data"]["images"][...] = images_ush
-                    f["data"]["image_timestamps"][...] = timestamps_ush
+                    image_timestamps = f["data"]["image_timestamps"][()]
 
-            # --- DataVault ---
-            n_xvars = len(payload.get("xvardims", []))
-            for key, dc_info in payload.get("datavault", {}).items():
+                for key, dc_info in payload.get("datavault", {}).items():
+                    # Data written directly to HDF5 by DataHandler.
+                    if bool(dc_info.get("external")) and key in f["data"]:
+                        external[key] = f["data"][key][()]
+
+        if torn:
+            print(
+                f"[DataSaver] WARNING: 'unshuffle_in_progress' is set on {filepath} "
+                "— a previous save died partway through the in-place rewrite, so shot "
+                "ordering of data/images and of externally-written DataVault arrays is "
+                "UNRELIABLE.  Leaving them untouched and keeping the flag set."
+            )
+
+        return {
+            "images": images,
+            "image_timestamps": image_timestamps,
+            "external": external,
+            "torn": torn,
+        }
+
+    def _compute_end_run_outputs(self, payload: dict, inputs: dict, shot_timestamps) -> dict:
+        """Phase 2: unshuffle everything in memory.  No I/O, so nothing here
+        can fail because of the network."""
+        sort_idx_raw = payload.get("sort_idx", [])
+        sort_N_raw = payload.get("sort_N", [])
+        n_xvars = len(payload.get("xvardims", []))
+
+        # --- images ---
+        images = inputs["images"]
+        image_timestamps = inputs["image_timestamps"]
+        if images is not None:
+            images, image_timestamps = self._unshuffle_images_from_payload(
+                images, image_timestamps, payload
+            )
+
+        # --- DataVault ---
+        # Split by provenance: payload-derived arrays can be rewritten any
+        # number of times, whereas externally-written ones are read back out
+        # of the file and so must only ever be unshuffled once (they go in the
+        # bracketed section of the write phase alongside the images).
+        datavault = {}
+        datavault_external = {}
+        for key, dc_info in payload.get("datavault", {}).items():
+            if bool(dc_info.get("external")):
+                if key not in inputs["external"]:
+                    continue
+                this_data = inputs["external"][key]
+                sink = datavault_external
+            elif bool(dc_info.get("data_gotten")):
                 this_data = np.asarray(dc_info["data"])
-                data_gotten = bool(dc_info["data_gotten"])
-                is_external = bool(dc_info["external"])
+                sink = datavault
+            else:
+                continue
 
-                if is_external:
-                    # Data was written directly to HDF5 by DataHandler
-                    if key in f["data"]:
-                        this_data = f["data"][key][()]
-                    else:
-                        continue
+            if sort_idx_raw:
+                ndims_per_shot = max(0, len(this_data.shape) - n_xvars)
+                this_data = self._unshuffle_single_array(
+                    this_data, sort_idx_raw, sort_N_raw,
+                    exclude_dims=ndims_per_shot,
+                )
+            sink[key] = this_data
 
-                if is_external or data_gotten:
-                    if sort_idx_raw:
-                        ndims_per_shot = max(0, len(this_data.shape) - n_xvars)
-                        this_data = self._unshuffle_single_array(
-                            this_data, sort_idx_raw, sort_N_raw,
-                            exclude_dims=ndims_per_shot,
-                        )
-                    if key in f["data"]:
-                        f["data"][key][...] = this_data
-
-            # --- scope data ---
-            self._save_scope_data_from_payload(f, payload, sort_idx_raw, sort_N_raw)
-
-            # --- final params (overwrite initial snapshot) ---
-            # Unshuffle all array-valued params before writing, mirroring
-            # what the old save_data() path did via _unshuffle_struct(params).
-            _protected_param_keys = {
-                'xvarnames', 'sort_idx', 'sort_N', 'images', 'image_timestamps',
-                'xvars', 'N_repeats', 'N_shots', 'N_shots_with_repeats',
-                'scan_xvars', 'xvardims', 'data',
-            }
-            del f["params"]
-            params_grp = f.create_group("params")
-            for key, val in payload.get("params", {}).items():
+        # --- final params (overwrite initial snapshot) ---
+        # Unshuffle all array-valued params, mirroring what the old
+        # save_data() path did via _unshuffle_struct(params).
+        params = {}
+        for key, val in payload.get("params", {}).items():
+            if sort_idx_raw and key not in self._PROTECTED_PARAM_KEYS:
                 try:
-                    if sort_idx_raw and key not in _protected_param_keys:
-                        try:
-                            arr = np.asarray(val)
-                            if arr.dtype.kind in ('f', 'i', 'u', 'c') and arr.ndim >= 1:
-                                val = self._unshuffle_single_array(
-                                    arr, sort_idx_raw, sort_N_raw, exclude_dims=0
-                                )
-                        except Exception:
-                            pass  # leave val unchanged if array conversion fails
+                    arr = np.asarray(val)
+                    if arr.dtype.kind in ('f', 'i', 'u', 'c') and arr.ndim >= 1:
+                        val = self._unshuffle_single_array(
+                            arr, sort_idx_raw, sort_N_raw, exclude_dims=0
+                        )
+                except Exception:
+                    pass  # leave val unchanged if array conversion fails
+            params[key] = val
+
+        # --- shot timestamps (server-side, one per shot) ---
+        ts_shot_end = None
+        if shot_timestamps:
+            ts_shot_end = np.array(shot_timestamps, dtype=np.float64)
+            xvardims = list(payload.get("xvardims", []))
+            if xvardims and int(np.prod(xvardims)) == len(ts_shot_end):
+                ts_shot_end = ts_shot_end.reshape(xvardims)
+            if sort_idx_raw:
+                ts_shot_end = self._unshuffle_single_array(
+                    ts_shot_end, sort_idx_raw, sort_N_raw, exclude_dims=0
+                )
+
+        return {
+            "images": images,
+            "image_timestamps": image_timestamps,
+            "torn": inputs["torn"],
+            "datavault": datavault,
+            "datavault_external": datavault_external,
+            "params": params,
+            "scope": self._compute_scope_data_from_payload(payload, sort_idx_raw, sort_N_raw),
+            "timestamp_shot_end": ts_shot_end,
+        }
+
+    def _write_end_run_outputs(self, filepath: str, payload: dict, out: dict) -> None:
+        """Phase 3: write phase-2 results.  Safe to re-run after a failure —
+        every value written comes from *out*, never from the file itself."""
+        expt_filepath = str(payload.get("expt_filepath", ""))
+
+        with h5py.File(filepath, "r+") as f:
+            # --- small, cheap metadata first ---
+            # All of this is kilobytes and lands in well under a second, so a
+            # drop during the big image write below cannot take it down too.
+
+            # final params (overwrite initial snapshot)
+            if "params" in f:
+                del f["params"]
+            params_grp = f.create_group("params")
+            for key, val in out["params"].items():
+                try:
                     params_grp.create_dataset(key, data=val)
                 except Exception as exc:
                     print(f"[DataSaver] Failed to save param '{key}': {exc}")
 
-            # --- experiment filepath ---
+            # experiment filepath
             if expt_filepath:
                 f.attrs["experiment_filepath"] = expt_filepath
                 if "experiment_filepath" in f["run_info"]:
@@ -589,31 +722,112 @@ class DataSaver():
                     except Exception:
                         pass
 
-            # --- source file texts ---
+            # source file texts
             f.attrs["expt_file"] = payload.get("expt_file_text", "")
             f.attrs["params_file"] = payload.get("params_file_text", "")
             for key, text in payload.get("base_class_texts", {}).items():
                 f.attrs[key] = text
 
-            # --- shot timestamps (server-side, one per shot) ---
-            if shot_timestamps:
-                _ts = np.array(shot_timestamps, dtype=np.float64)
-                xvardims = list(payload.get("xvardims", []))
-                if xvardims and int(np.prod(xvardims)) == len(_ts):
-                    _ts = _ts.reshape(xvardims)
-                if sort_idx_raw:
-                    _ts = self._unshuffle_single_array(
-                        _ts, sort_idx_raw, sort_N_raw, exclude_dims=0
-                    )
+            # DataVault (payload-derived — safe to rewrite any number of times)
+            for key, arr in out["datavault"].items():
+                if key in f["data"]:
+                    f["data"][key][...] = arr
+
+            # scope data
+            self._write_scope_data(f, out["scope"])
+
+            # shot timestamps
+            if out["timestamp_shot_end"] is not None:
                 grp = f["data"]
                 if "timestamp_shot_end" in grp:
                     del grp["timestamp_shot_end"]
-                grp.create_dataset("timestamp_shot_end", data=_ts)
+                grp.create_dataset("timestamp_shot_end", data=out["timestamp_shot_end"])
+
+            # --- in-place rewrite of file-resident arrays, last ---
+            # These are the only writes that cannot be reconstructed from the
+            # payload: their source is the file itself, so applying them twice
+            # would shuffle the data rather than unshuffle it.  They are done
+            # together, after everything else, bracketed by a flushed marker —
+            # so a process death mid-write leaves the file explicitly flagged
+            # as having an unknown shot order rather than silently mixing
+            # shuffled and unshuffled shots.  The images dominate this window
+            # (100s of MB); the DataVault arrays are along for the ride.
+            if out["images"] is not None or out["datavault_external"]:
+                f.attrs["unshuffle_in_progress"] = True
+                f.flush()
+                for key, arr in out["datavault_external"].items():
+                    if key in f["data"]:
+                        f["data"][key][...] = arr
+                if out["images"] is not None:
+                    f["data"]["images"][...] = out["images"]
+                    f["data"]["image_timestamps"][...] = out["image_timestamps"]
+                f.attrs["unshuffle_in_progress"] = False
+
+            # True ⇒ every file-resident array is in final (unshuffled) order.
+            # Also set for runs that were never shuffled, where it holds
+            # trivially — so the attr always answers the question.
+            if not out["torn"]:
+                f.attrs["unshuffle_applied"] = True
 
             # --- mark file as fully written ---
             f.attrs["run_complete"] = True
 
-        print("[DataSaver] Parameters saved, data closed.")
+    # ------------------------------------------------------------------
+    # End-of-run save: retry plumbing
+    # ------------------------------------------------------------------
+
+    def _retry_io(self, fn, filepath: str, what: str):
+        """Call *fn*, retrying on network-flavoured HDF5 failures.
+
+        Between attempts the data dir is re-checked (which re-runs the
+        drive-mapping batch file on Windows — the right remediation for a
+        dropped share) and any HDF5 file id left behind by the failed close
+        is dropped.
+        """
+        attempts = 1 + len(SAVE_RETRY_DELAYS_S)
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(SAVE_RETRY_DELAYS_S[attempt - 1])
+            try:
+                return fn()
+            except _RETRYABLE_SAVE_EXC as exc:
+                print(f"[DataSaver] {what} failed (attempt {attempt + 1}/{attempts}): {exc}")
+                if attempt == attempts - 1:
+                    raise
+                # A dropped SMB handle cannot be reused — drop the dead id
+                # before reopening, then try to bring the share back.
+                self._force_close_stale_handles(filepath)
+                try:
+                    self.server_talk.check_for_mapped_data_dir()
+                except Exception as map_exc:
+                    print(f"[DataSaver] ... could not re-check the data dir: {map_exc}")
+
+    @staticmethod
+    def _force_close_stale_handles(filepath: str) -> None:
+        """Drop HDF5 file ids left open for *filepath* by a failed close.
+
+        When a share disappears mid-write ``H5Fclose`` fails and h5py can keep
+        the (now dead) file id registered, so the next open of the same path
+        fails with a lock error caused by this process itself.  Safe to call
+        here because the server only saves after DataHandler is done with the
+        file.  Best-effort: never raises.
+        """
+        try:
+            from h5py import h5f
+            target = os.path.normcase(os.path.abspath(filepath))
+            for fid in h5f.get_obj_ids(h5f.OBJ_ALL, h5f.OBJ_FILE):
+                try:
+                    name = h5f.get_name(fid)
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", errors="replace")
+                    if os.path.normcase(os.path.abspath(name)) != target:
+                        continue
+                    while fid.valid:
+                        fid.close()
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Private helpers shared by server-side methods
@@ -746,17 +960,20 @@ class DataSaver():
 
         return out, ts_out
 
-    def _save_scope_data_from_payload(
+    def _compute_scope_data_from_payload(
         self,
-        f: "h5py.File",
         payload: dict,
         sort_idx_raw: list,
         sort_N_raw: list,
-    ) -> None:
-        """Save scope data from END_RUN payload into an open HDF5 file."""
+    ) -> list:
+        """Unshuffle and downcast scope traces from the END_RUN payload.
+
+        Pure computation — returns ``[(label, t, v), ...]`` for
+        :meth:`_write_scope_data` to write.
+        """
         if not payload.get("scope_data_taken", False):
-            return
-        scope_data_grp = f["data"].create_group("scope_data")
+            return []
+        traces = []
         for scope_info in payload.get("scope_data", []):
             label = str(scope_info["label"])
             data = np.asarray(scope_info["data"])
@@ -768,8 +985,118 @@ class DataSaver():
                     data, sort_idx_raw, sort_N_raw, exclude_dims=3
                 )
             data = data.astype(np.float32)
-            this_scope = scope_data_grp.create_group(label)
             t = np.take(np.take(data, 0, axis=-2), 0, axis=-2)
             v = np.take(data, 1, axis=-2)
+            traces.append((label, t, v))
+        return traces
+
+    @staticmethod
+    def _write_scope_data(f: "h5py.File", scope_traces: list) -> None:
+        """Write pre-computed scope traces into an open HDF5 file.
+
+        Re-creates the group, so a retry after a partially written attempt
+        starts from a clean slate instead of failing on an existing name.
+        """
+        if not scope_traces:
+            return
+        if "scope_data" in f["data"]:
+            del f["data"]["scope_data"]
+        scope_data_grp = f["data"].create_group("scope_data")
+        for label, t, v in scope_traces:
+            this_scope = scope_data_grp.create_group(label)
             this_scope.create_dataset("t", data=t, compression='gzip', compression_opts=4)
             this_scope.create_dataset("v", data=v, compression='gzip', compression_opts=4)
+
+
+# ----------------------------------------------------------------------
+# Pending-save stash
+# ----------------------------------------------------------------------
+# The END_RUN payload is the only copy of the run's final params: the
+# experiment sends it once and drops it.  If the end-of-run save fails (the
+# data drive is a network share and does occasionally vanish mid-write) the
+# payload would be lost and the run permanently stuck with its INIT_RUN
+# params snapshot.  Stashing it locally first turns that unrecoverable loss
+# into a deferred retry via retry_pending_save().
+
+
+def pending_save_dir() -> str:
+    """Return (creating if needed) the local directory holding stashed payloads."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "waxx", PENDING_SAVE_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=None) -> str:
+    """Pickle an END_RUN payload to local disk before the save is attempted.
+
+    Returns the stash path, or ``""`` if stashing failed — a stash failure
+    must never prevent the save itself from being attempted.
+    """
+    try:
+        stash_path = os.path.join(pending_save_dir(), f"{int(run_id):07d}_endrun.pkl")
+        with open(stash_path, "wb") as fh:
+            pickle.dump(
+                {
+                    "run_id": int(run_id),
+                    "filepath": str(filepath),
+                    "payload": payload,
+                    "shot_timestamps": list(shot_timestamps or []),
+                },
+                fh,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        return stash_path
+    except Exception as exc:
+        print(f"[DataSaver] WARNING: could not stash END_RUN payload: {exc}")
+        return ""
+
+
+def clear_end_run_payload(stash_path: str) -> None:
+    """Delete a stashed payload after its save succeeded.  Never raises."""
+    if not stash_path:
+        return
+    try:
+        os.remove(stash_path)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[DataSaver] WARNING: could not remove stashed payload {stash_path}: {exc}")
+
+
+def list_pending_saves() -> list:
+    """Return the paths of all stashed END_RUN payloads, oldest run first."""
+    try:
+        d = pending_save_dir()
+        names = [n for n in os.listdir(d) if n.endswith("_endrun.pkl")]
+    except Exception:
+        return []
+    return [os.path.join(d, n) for n in sorted(names)]
+
+
+def retry_pending_save(stash_path: str, data_saver=None) -> bool:
+    """Re-run the end-of-run save for a stashed payload.
+
+    Use after a save failed (e.g. the data drive dropped out) once the drive
+    is back.  Removes the stash on success.  Returns True if the save
+    completed.
+    """
+    with open(stash_path, "rb") as fh:
+        stashed = pickle.load(fh)
+
+    filepath = stashed["filepath"]
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"Data file for run {stashed['run_id']} is gone: {filepath}"
+        )
+
+    if data_saver is None:
+        data_saver = DataSaver(data_dir=os.getenv("data") or "")
+
+    data_saver.save_data_from_payload(
+        stashed["payload"], filepath,
+        shot_timestamps=stashed.get("shot_timestamps") or None,
+    )
+    clear_end_run_payload(stash_path)
+    print(f"[DataSaver] Pending save for run {stashed['run_id']} completed.")
+    return True
