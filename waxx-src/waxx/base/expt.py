@@ -175,7 +175,8 @@ class Expt(Scanner, Dealer, Scribe):
         pass
     
     def end_wax(self, expt_filepath,
-                notify=True):
+                notify=True,
+                restart_monitor=True):
 
         print(f"[end_wax] called, run_id={self.run_info.run_id}")
         try:
@@ -202,7 +203,8 @@ class Expt(Scanner, Dealer, Scribe):
 
         if hasattr(self,'monitor'):
             self.monitor.update_device_states()
-            self.monitor.signal_end()
+            if restart_monitor:
+                self.monitor.signal_end()
 
         self._run_done_printout(expt_filepath)
 
