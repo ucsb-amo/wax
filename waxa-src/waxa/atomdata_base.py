@@ -1125,7 +1125,7 @@ class atomdata_base():
             return np.array(indices, dtype=int)
 
     def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False,
-                       xvar_value=None, xvar_tolerance=None):
+                       xvar_value=None, xvar_tolerance=0.05):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
         that xvar, and returns an atomdata of reduced dimensionality as if that
         variable had been held constant.
@@ -1467,6 +1467,16 @@ class atomdata_base():
         ):
             if hasattr(self, attr):
                 setattr(ad, attr, getattr(self, attr))
+
+        # Fallback: copy any remaining attributes by reference (e.g.
+        # subclass-specific bookkeeping such as AtomdataVault's
+        # _merge_overlap/_uniform_roi/_scope_merge/...) so overridden methods
+        # on subclasses keep working after a slice. Anything explicitly set
+        # above (including deliberate resets like ad.avg = None) takes
+        # precedence and is left untouched.
+        for key, value in vars(self).items():
+            if key not in vars(ad):
+                vars(ad)[key] = value
 
         return ad
 
