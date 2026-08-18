@@ -14,12 +14,14 @@ class GaussianFit(Fit):
                  use_peak_bases_for_amplitude=False,
                  include_idx = [0,-1],
                  exclude_idx = [],
-                 print_errors = True):
+                 print_errors = True,
+                 force_zero_offset = False):
         super().__init__(xdata,ydata,
                          include_idx=include_idx,exclude_idx=exclude_idx,
                          savgol_window=20)
 
         self._debug_plotting = debug_plotting
+        self._force_zero_offset = force_zero_offset
 
         try:
             popt = self._fit(self.xdata,self.ydata,
@@ -77,13 +79,28 @@ class GaussianFit(Fit):
         fit_mask = out[0]
         guesses = out[1:]
 
-        popt, pcov = curve_fit(self._fit_func, x[fit_mask], y[fit_mask],
-                        p0=[*guesses],
-                        bounds=((0,0,-np.inf,-np.inf),(np.inf,np.inf,np.inf,np.inf)),
-                        maxfev=300,
-                        ftol=1e-6,
-                        xtol=1e-6,
-                        gtol=1e-5)
+        if self._force_zero_offset:
+            amplitude_guess, sigma_guess, x_center_guess, _ = guesses
+
+            def _fit_func_zero_offset(x, amplitude, sigma, x_center):
+                return self._fit_func(x, amplitude, sigma, x_center, 0.)
+
+            popt, pcov = curve_fit(_fit_func_zero_offset, x[fit_mask], y[fit_mask],
+                            p0=[amplitude_guess, sigma_guess, x_center_guess],
+                            bounds=((0,0,-np.inf),(np.inf,np.inf,np.inf)),
+                            maxfev=300,
+                            ftol=1e-6,
+                            xtol=1e-6,
+                            gtol=1e-5)
+            popt = np.array([*popt, 0.])
+        else:
+            popt, pcov = curve_fit(self._fit_func, x[fit_mask], y[fit_mask],
+                            p0=[*guesses],
+                            bounds=((0,0,-np.inf,-np.inf),(np.inf,np.inf,np.inf,np.inf)),
+                            maxfev=300,
+                            ftol=1e-6,
+                            xtol=1e-6,
+                            gtol=1e-5)
         return popt
     
     def _gaussian_guesses(self,x,y,
