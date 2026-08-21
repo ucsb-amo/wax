@@ -179,7 +179,8 @@ class AtomdataVault(atomdata_base):
     decimate_scope_data : int or None
         Forwarded to every ``atomdata(...)`` load: keep only every
         ``decimate_scope_data``-th sample of each scope trace (t and v) to
-        save memory.
+        save memory. A value of 0 (or None) loads all samples with no
+        decimation or averaging.
     smooth_decimate : bool
         Only used when ``decimate_scope_data`` is set. If True (default),
         each group of ``decimate_scope_data`` samples is block-averaged;
@@ -258,8 +259,11 @@ class AtomdataVault(atomdata_base):
         self._scope_merge = scope_merge
         if decimate_scope_data is not None:
             decimate_scope_data = int(decimate_scope_data)
-            if decimate_scope_data < 1:
-                raise ValueError("decimate_scope_data must be a positive integer.")
+            if decimate_scope_data < 0:
+                raise ValueError("decimate_scope_data must be a non-negative integer.")
+            if decimate_scope_data == 0:
+                # 0 means "load everything" — same as None.
+                decimate_scope_data = None
         self._decimate_scope_data = decimate_scope_data
         self._smooth_decimate = bool(smooth_decimate)
         # Forwarded to every atomdata(...) load below.

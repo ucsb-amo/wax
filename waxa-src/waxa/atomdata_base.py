@@ -518,7 +518,8 @@ class atomdata_base():
             If true, ignore saved ROI in the data file.
         decimate_scope_data: int or None
             If given, load only every `decimate_scope_data`-th sample of each
-            scope trace (both t and v) to save memory.
+            scope trace (both t and v) to save memory. A value of 0 (or None)
+            loads all samples with no decimation or averaging.
         smooth_decimate: bool
             Only used when `decimate_scope_data` is set. If True (default),
             each group of `decimate_scope_data` samples is block-averaged
@@ -534,8 +535,11 @@ class atomdata_base():
         self._ignore_images = ignore_images
         if decimate_scope_data is not None:
             decimate_scope_data = int(decimate_scope_data)
-            if decimate_scope_data < 1:
-                raise ValueError("decimate_scope_data must be a positive integer.")
+            if decimate_scope_data < 0:
+                raise ValueError("decimate_scope_data must be a non-negative integer.")
+            if decimate_scope_data == 0:
+                # 0 means "load everything" — same as None.
+                decimate_scope_data = None
         self._decimate_scope_data = decimate_scope_data
         self._smooth_decimate = bool(smooth_decimate)
         # When loading lite data, ignore any passed roi_id since lite files
