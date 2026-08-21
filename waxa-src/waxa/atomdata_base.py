@@ -285,37 +285,133 @@ class _RepeatLazyStatAtomdataProxy():
             return self._select_stat(mean_val, std_val)
         return value
 
-def format_scope_data(dataset, old_method=False):
+def _decimate_last_axis(arr, decimate, smooth):
+    """Downsample the trailing (sample) axis of *arr* by an integer factor.
+
+    ``smooth=True`` block-averages each group of ``decimate`` samples (acts as
+    a low-pass filter); ``smooth=False`` keeps every ``decimate``-th sample.
+    """
+    n = int(decimate)
+    arr = np.asarray(arr)
+    if n <= 1:
+        return arr
+    if smooth:
+        npts = arr.shape[-1] - (arr.shape[-1] % n)
+        if npts == 0:
+            return arr[..., :0]
+        return arr[..., :npts].reshape(*arr.shape[:-1], npts // n, n).mean(axis=-1)
+    return arr[..., ::n]
+
+
+def _read_scope_dataset(dset, decimate, smooth):
+    """Read an HDF5 scope dataset, decimating the sample axis if requested.
+
+    Plain-stride decimation is applied during the h5py read, so the full-size
+    array is never materialized in memory; block averaging necessarily reads
+    the full array first.
+    """
+    if not decimate or int(decimate) <= 1:
+        return dset[()]
+    if smooth:
+        return _decimate_last_axis(dset[()], decimate, True)
+    return dset[..., ::int(decimate)]
+
+
+def _rows_bitwise_equal(rows):
+    """True if every row of a 2-D array equals the first row (NaN == NaN)."""
+    if rows.shape[0] <= 1:
+        return True
+    first = rows[0]
+    if np.issubdtype(rows.dtype, np.floating):
+        eq = (rows == first) | (np.isnan(rows) & np.isnan(first))
+    else:
+        eq = rows == first
+    return bool(np.all(eq))
+
+
+def _collapse_shared_time_axes(t):
+    """Collapse identical per-shot time axes into a zero-copy broadcast view.
+
+    Given a fully materialized ``(*shot_dims, Npts)`` array whose per-shot
+    axes are all identical, return ``np.broadcast_to(axis_1d, t.shape)`` — the
+    same shape and indexing, but every shot references one shared 1-D axis and
+    the duplicated buffer can be freed.  If the axes differ, *t* is returned
+    unchanged.  Used for backward compatibility with files that stored a full
+    per-shot ``t``.
+    """
+    t = np.asarray(t)
+    if t.ndim < 2 or t.size == 0:
+        return t
+    rows = t.reshape(-1, t.shape[-1])
+    if not _rows_bitwise_equal(rows):
+        return t
+    row = rows[0].copy()  # detach from the big buffer so it can be freed
+    return np.broadcast_to(row, t.shape)
+
+
+def format_scope_data(dataset, old_method=False, decimate=None, smooth_decimate=True):
     """Scope data formatter optimized for fast loading.
-    
+
     Data MUST be materialized while h5py file is open (references become invalid after file close).
     Uses direct h5py indexing for efficient per-channel loading instead of np.take on full array.
+
+    Time-axis handling: newer files store the time axis deduplicated (see
+    ``waxa.data.data_saver.write_scope_time_axes``) — either a single 1-D
+    ``t`` shared by every shot, or ``(n_unique, Npts)`` unique axes plus an
+    int ``t_map`` giving each shot's axis.  The shared case is reconstructed
+    as a read-only ``np.broadcast_to`` view shaped ``(*xvardims, Npts)``:
+    indexing is unchanged, but ``t[idx]`` for every shot references the same
+    underlying 1-D axis (in-place writes to ``t`` raise; rebind instead).
+    Legacy files with a full per-shot ``t`` are collapsed to the same view on
+    load when all axes are identical.
+
+    decimate : int or None
+        If given, downsample the sample axis of both ``t`` and ``v`` by this
+        factor.  ``smooth_decimate=True`` block-averages each group of
+        ``decimate`` samples; ``False`` keeps every ``decimate``-th sample.
     """
     scope_dict = dict()
-    
+
     for scope_key in dataset.keys():
         this_scope_data = dict()
         if old_method:
             # Old format: single array with (channels, time/value, shots)
-            data_array = dataset[scope_key][()]
+            data_array = _read_scope_dataset(dataset[scope_key], decimate, smooth_decimate)
             data_array: np.ndarray
             for ch in range(data_array.shape[-3]):
                 ch_data = np.take(data_array, ch, -3)
-                t = np.take(ch_data, 0, axis=-2)
+                t = _collapse_shared_time_axes(np.take(ch_data, 0, axis=-2))
                 v = np.take(ch_data, 1, axis=-2)
                 this_scope_data[ch] = ScopeTraceArray(scope_key, ch, t, v)
             scope_dict[scope_key] = this_scope_data
         if not old_method:
             # New format: separate 't' and 'v' datasets
-            t = dataset[scope_key]['t'][()]  # Materialize now
+            grp = dataset[scope_key]
             # Materialize once while the HDF5 file is open; channel axis is -2.
-            v_data = dataset[scope_key]['v'][()]
+            v_data = _read_scope_dataset(grp['v'], decimate, smooth_decimate)
             n_channels = v_data.shape[-2]
+            shot_shape = v_data.shape[:-2]
+
+            t_raw = _read_scope_dataset(grp['t'], decimate, smooth_decimate)
+            if 't_map' in grp:
+                # Deduplicated format: unique axes + per-shot index map.
+                t_map = grp['t_map'][()]
+                if t_raw.shape[0] == 1:
+                    t = np.broadcast_to(np.ascontiguousarray(t_raw[0]),
+                                        t_map.shape + t_raw.shape[-1:])
+                else:
+                    t = np.asarray(t_raw)[t_map]
+            elif np.ndim(t_raw) == 1:
+                # Shared format: one axis for every shot.
+                t = np.broadcast_to(t_raw, shot_shape + t_raw.shape)
+            else:
+                # Legacy per-shot axes: collapse to a shared view if identical.
+                t = _collapse_shared_time_axes(t_raw)
 
             for ch in range(n_channels):
                 v = np.take(v_data, ch, axis=-2)
                 this_scope_data[ch] = ScopeTraceArray(scope_key, ch, t, v)
-            
+
             scope_dict[scope_key] = this_scope_data
 
     return scope_dict
@@ -396,6 +492,8 @@ class atomdata_base():
                 transpose_idx = [],
                 avg_repeats = False,
                 ignore_images = False,
+                decimate_scope_data = None,
+                smooth_decimate = True,
                 server_talk = st()):
         '''
         Returns the atomdata stored in the `idx`th newest file at `path`.
@@ -418,6 +516,14 @@ class atomdata_base():
             as dictated by `idx`.
         skip_saved_roi: bool
             If true, ignore saved ROI in the data file.
+        decimate_scope_data: int or None
+            If given, load only every `decimate_scope_data`-th sample of each
+            scope trace (both t and v) to save memory.
+        smooth_decimate: bool
+            Only used when `decimate_scope_data` is set. If True (default),
+            each group of `decimate_scope_data` samples is block-averaged
+            (low-pass filters the trace); if False, plain stride sampling
+            keeps every `decimate_scope_data`-th sample.
 
         Returns
         -------
@@ -426,6 +532,12 @@ class atomdata_base():
 
         self._lite = lite
         self._ignore_images = ignore_images
+        if decimate_scope_data is not None:
+            decimate_scope_data = int(decimate_scope_data)
+            if decimate_scope_data < 1:
+                raise ValueError("decimate_scope_data must be a positive integer.")
+        self._decimate_scope_data = decimate_scope_data
+        self._smooth_decimate = bool(smooth_decimate)
         # When loading lite data, ignore any passed roi_id since lite files
         # are already pre-cropped to a specific ROI at creation time.
         if lite:
@@ -1601,9 +1713,22 @@ class atomdata_base():
         arr = np.asarray(arr)
         if n_repeats == 1:
             # Fast path for no-repeat runs: mean is identity, std is exactly zero.
+            if 0 in arr.strides:
+                # Broadcast (shared-axis) array, e.g. a deduplicated scope time
+                # axis: keep the zero-copy view instead of materializing a
+                # float64 copy; the zero std is a broadcast view as well.
+                return arr, np.broadcast_to(np.zeros((), dtype=np.float64), arr.shape)
             mean_val = arr.astype(np.float64, copy=False)
             std_val = np.zeros_like(mean_val)
             return mean_val, std_val
+        if arr.ndim > xvar_idx and arr.strides[xvar_idx] == 0:
+            # The repeat axis is broadcast — every repeat references identical
+            # data, so the mean is just the (length-reduced) view and the std
+            # is exactly zero. Slicing keeps the zero-stride (shared) layout.
+            idx = [slice(None)] * arr.ndim
+            idx[xvar_idx] = slice(0, None, n_repeats)
+            mean_val = arr[tuple(idx)]
+            return mean_val, np.broadcast_to(np.zeros((), dtype=np.float64), mean_val.shape)
         split_shape = (*arr.shape[0:xvar_idx], -1, n_repeats, *arr.shape[(xvar_idx+1):])
         reshaped = arr.reshape(split_shape)
         mean_val = np.mean(reshaped, axis=xvar_idx+1, dtype=np.float64)
@@ -1854,6 +1979,20 @@ class atomdata_base():
         source_size = old_xvardims[source_xvar_idx]
         if source_size % n_repeats != 0:
             raise ValueError('Repeat axis length must be divisible by the repeat count.')
+
+        n_lead = len(old_xvardims)
+        if (arr.ndim > n_lead and arr.size
+                and all(arr.strides[i] == 0 for i in range(n_lead))):
+            # All scan axes are broadcast (a shared scope time axis):
+            # reassignment only permutes/reshapes those axes, which is a no-op
+            # on identical entries. Compute the output shape on a tiny probe
+            # array and rebuild the zero-copy view instead of materializing.
+            probe = self._reassign_repeat_ndarray(
+                np.empty(old_xvardims, dtype=np.uint8),
+                source_xvar_idx, target_xvar_idx, n_repeats, old_xvardims,
+            )
+            row = np.ascontiguousarray(arr[(0,) * n_lead])
+            return np.broadcast_to(row, probe.shape + arr.shape[n_lead:])
 
         expanded_shape = list(old_xvardims)
         expanded_shape[source_xvar_idx] = source_size // n_repeats
@@ -2557,7 +2696,11 @@ class atomdata_base():
                     SCOPE_DATA_CHANGE_EPOCH = datetime.datetime(2026,1,16,0)
                     old_method_bool = datetime.datetime(*self.run_info.run_datetime[:4]) < SCOPE_DATA_CHANGE_EPOCH
 
-                    self.scope_data = format_scope_data(d, old_method=old_method_bool)
+                    self.scope_data = format_scope_data(
+                        d, old_method=old_method_bool,
+                        decimate=getattr(self, '_decimate_scope_data', None),
+                        smooth_decimate=getattr(self, '_smooth_decimate', True),
+                    )
             except Exception as e:
                 print(e)
             timing['h5_read_scope_data_s'] = time.perf_counter() - t_stage

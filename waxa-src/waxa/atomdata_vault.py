@@ -46,6 +46,7 @@ from waxa.atomdata import atomdata
 from waxa.atomdata_base import (
     atomdata_base,
     analysis_tags,
+    _collapse_shared_time_axes,
 )
 from waxa.roi import ROI
 
@@ -175,6 +176,15 @@ class AtomdataVault(atomdata_base):
         created. Only the non-image data (params, DataVault fields,
         scope_data, xvars) is stitched together. Image-based analysis is
         skipped and image-derived attributes are set to ``None``.
+    decimate_scope_data : int or None
+        Forwarded to every ``atomdata(...)`` load: keep only every
+        ``decimate_scope_data``-th sample of each scope trace (t and v) to
+        save memory.
+    smooth_decimate : bool
+        Only used when ``decimate_scope_data`` is set. If True (default),
+        each group of ``decimate_scope_data`` samples is block-averaged;
+        if False, plain stride sampling keeps every
+        ``decimate_scope_data``-th sample.
     scope_merge : {'strict', 'pad_nan', 'skip'}
         How to concatenate ``scope_data`` traces. ``'strict'`` preserves the
         previous behavior and skips all scope data if trace dimensions differ.
@@ -213,6 +223,8 @@ class AtomdataVault(atomdata_base):
                  drop_raw_images=False,
                  auto_lite_threshold=8,
                  ignore_images=False,
+                 decimate_scope_data=None,
+                 smooth_decimate=True,
                  scope_merge='pad_nan',
                  structure='auto',
                  xvar_mode='pad',
@@ -244,6 +256,17 @@ class AtomdataVault(atomdata_base):
                 "scope_merge must be one of 'strict', 'pad_nan', or 'skip'."
             )
         self._scope_merge = scope_merge
+        if decimate_scope_data is not None:
+            decimate_scope_data = int(decimate_scope_data)
+            if decimate_scope_data < 1:
+                raise ValueError("decimate_scope_data must be a positive integer.")
+        self._decimate_scope_data = decimate_scope_data
+        self._smooth_decimate = bool(smooth_decimate)
+        # Forwarded to every atomdata(...) load below.
+        self._scope_load_kwargs = dict(
+            decimate_scope_data=decimate_scope_data,
+            smooth_decimate=bool(smooth_decimate),
+        )
         self._structure = structure
         self._xvar_mode = xvar_mode
         # Kwargs needed to rebuild an equivalent vault (used by add_runs).
@@ -258,6 +281,8 @@ class AtomdataVault(atomdata_base):
             drop_raw_images=drop_raw_images,
             auto_lite_threshold=auto_lite_threshold,
             ignore_images=ignore_images,
+            decimate_scope_data=decimate_scope_data,
+            smooth_decimate=smooth_decimate,
             scope_merge=scope_merge,
             structure=structure,
             xvar_mode=xvar_mode,
@@ -604,7 +629,8 @@ class AtomdataVault(atomdata_base):
                 if not uniform_roi:
                     # Legacy per-run behavior: independent ROI per run.
                     ads.append(atomdata(rid, roi_id=roi_id, lite=lite,
-                                        ignore_images=ignore_images))
+                                        ignore_images=ignore_images,
+                                        **self._scope_load_kwargs))
                     continue
 
                 if not anchor_established:
@@ -661,13 +687,15 @@ class AtomdataVault(atomdata_base):
         """
         if ignore_images:
             return atomdata(rid, roi_id=roi_id, lite=lite,
-                            ignore_images=True), None
+                            ignore_images=True,
+                            **self._scope_load_kwargs), None
 
         if not lite:
             # Full load: honor the caller's roi_id (may open the GUI once when
             # None), then persist the resolved ROI so subsequent runs can look
             # it up by run-id.
-            ad = atomdata(rid, roi_id=roi_id, lite=False)
+            ad = atomdata(rid, roi_id=roi_id, lite=False,
+                          **self._scope_load_kwargs)
             if persist_anchor:
                 ad.save_roi_h5()
             return ad, (roi_id if roi_id is not None else rid)
@@ -681,7 +709,8 @@ class AtomdataVault(atomdata_base):
         elif self._saved_roi_in_regular_h5(rid, server_talk):
             anchor_roi_id = rid
         else:
-            full_ad = atomdata(rid, roi_id=None, lite=False)
+            full_ad = atomdata(rid, roi_id=None, lite=False,
+                               **self._scope_load_kwargs)
             full_ad.save_roi_h5()
             anchor_roi_id = rid
 
@@ -694,9 +723,11 @@ class AtomdataVault(atomdata_base):
                           server_talk):
         """Load a subsequent run reusing the anchor ROI."""
         if ignore_images:
-            return atomdata(rid, lite=lite, ignore_images=True)
+            return atomdata(rid, lite=lite, ignore_images=True,
+                            **self._scope_load_kwargs)
         if not lite:
-            return atomdata(rid, roi_id=anchor_roi_id, lite=False)
+            return atomdata(rid, roi_id=anchor_roi_id, lite=False,
+                            **self._scope_load_kwargs)
         return self._load_lite_with_anchor(rid, anchor_roi_id, server_talk)
 
     def _load_lite_with_anchor(self, rid, anchor_roi_id, server_talk,
@@ -718,13 +749,16 @@ class AtomdataVault(atomdata_base):
                 f"regenerate it cropped to the anchor ROI.",
                 stacklevel=2,
             )
-            return atomdata(rid, lite=True)
+            return atomdata(rid, lite=True, **self._scope_load_kwargs)
 
         gen = full_ad if full_ad is not None else atomdata(
             rid, roi_id=anchor_roi_id, lite=False,
+            **self._scope_load_kwargs,
         )
+        # save_lite_copy copies scope data from the source h5 file, so the
+        # lite file always holds the full (undecimated) traces.
         gen.save_lite_copy(roi_id=anchor_roi_id, use_saved_roi=True)
-        return atomdata(rid, lite=True)
+        return atomdata(rid, lite=True, **self._scope_load_kwargs)
 
     @staticmethod
     def _lite_copy_exists(run_id, server_talk):
@@ -1054,7 +1088,10 @@ class AtomdataVault(atomdata_base):
                             )
                         t_parts = [self._pad_scope_array(t, target_len) for t in t_parts]
                         v_parts = [self._pad_scope_array(v, target_len) for v in v_parts]
-                    t_cat = np.concatenate(t_parts, axis=0)
+                    # Collapse identical per-shot time axes back into a shared
+                    # zero-copy broadcast view (concatenation materializes the
+                    # per-chunk views, so re-deduplicate afterwards).
+                    t_cat = _collapse_shared_time_axes(np.concatenate(t_parts, axis=0))
                     v_cat = np.concatenate(v_parts, axis=0)
                     merged[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_cat, v_cat)
         except Exception as e:
@@ -1131,7 +1168,12 @@ class AtomdataVault(atomdata_base):
                     t = np.asarray(trace.t)
                     v = np.asarray(trace.v)
                     if t.ndim >= 1 and t.shape[0] == n_old:
-                        trace.t = t[order]
+                        if t.ndim >= 2 and t.strides[0] == 0:
+                            # Shared (broadcast) time axis: reordering
+                            # identical rows is a no-op — keep the view.
+                            trace.t = np.broadcast_to(t[0], (n_new,) + t.shape[1:])
+                        else:
+                            trace.t = t[order]
                     if v.ndim >= 1 and v.shape[0] == n_old:
                         trace.v = v[order]
 
@@ -1210,9 +1252,17 @@ class AtomdataVault(atomdata_base):
                     t = np.asarray(trace.t)
                     v = np.asarray(trace.v)
                     if t.ndim >= 1 and t.shape[0] == n_old:
-                        trace.t = self._reshape_axis0_to_first_xvar(
-                            t, order, new_shape
-                        )
+                        if t.ndim >= 2 and t.strides[0] == 0:
+                            # Shared (broadcast) time axis: reordering and
+                            # reshaping identical rows only changes the leading
+                            # shape — keep the zero-copy view.
+                            trace.t = np.broadcast_to(
+                                t[0], tuple(new_shape) + t.shape[1:]
+                            )
+                        else:
+                            trace.t = self._reshape_axis0_to_first_xvar(
+                                t, order, new_shape
+                            )
                     if v.ndim >= 1 and v.shape[0] == n_old:
                         trace.v = self._reshape_axis0_to_first_xvar(
                             v, order, new_shape

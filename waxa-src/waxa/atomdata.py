@@ -40,6 +40,8 @@ class atomdata(atomdata_base):
         transpose_idx=[],
         avg_repeats=False,
         ignore_images=False,
+        decimate_scope_data=None,
+        smooth_decimate=True,
         server_talk=st(),
     ):
         super().__init__(
@@ -51,6 +53,8 @@ class atomdata(atomdata_base):
             transpose_idx=transpose_idx,
             avg_repeats=avg_repeats,
             ignore_images=ignore_images,
+            decimate_scope_data=decimate_scope_data,
+            smooth_decimate=smooth_decimate,
             server_talk=server_talk,
         )
 
