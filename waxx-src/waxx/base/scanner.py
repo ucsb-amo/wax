@@ -27,7 +27,26 @@ class AdjustSpec:
         self.max_val = float(max_val)
         self.step = float(step)
         self.dtype = dtype          # float or int
-        self.current_val = float(current_val if current_val is not None else min_val)
+        raw_current = current_val if current_val is not None else min_val
+        self.current_val = self.coerce(raw_current)
+
+    def coerce(self, value, like=None):
+        """Casts a value to this spec's dtype.
+
+        The liveOD server ships all adjust values as floats over JSON. A param
+        registered as an int must stay an int on the host, or the kernel-side
+        RPC (fetch_int32/fetch_int64) fails with a type mismatch.
+
+        Args:
+            value: the value to cast.
+            like: optional current param value whose numpy int type is preserved.
+        """
+        if self.dtype == int:
+            out = int(round(float(value)))
+            if isinstance(like, np.integer):
+                return type(like)(out)
+            return out
+        return float(value)
 
     def to_dict(self) -> dict:
         return {
@@ -361,7 +380,7 @@ class Scanner():
         Returns:
             TFloat: The value of the ith int64 ExptParam attribute.
         """      
-        return vars(self.params)[self._param_keylist_int64s[i]]
+        return int(round(vars(self.params)[self._param_keylist_int64s[i]]))
     
     def fetch_int32(self,i) -> TInt32:
         """Returns the value of the ith experiment parameter with datatype
@@ -374,7 +393,7 @@ class Scanner():
         Returns:
             TFloat: The value of the ith int32 ExptParam attribute.
         """     
-        return vars(self.params)[self._param_keylist_int32s[i]]
+        return int(round(vars(self.params)[self._param_keylist_int32s[i]]))
 
     def generate_assignment_kernels(self):
         """Generates a list of kernel functions for each param datatype (int32,
