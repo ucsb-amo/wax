@@ -745,9 +745,15 @@ class RamanBeamPair():
             t (float): The pulse duration in seconds.
         """        
         # self.on()
+        # with parallel:
+        #     self.dds0.dds_device.sw.on()
+        #     self.dds1.dds_device.sw.on()
         self.dds_sw.dds_device.sw.on()
         delay(t)
         self.dds_sw.dds_device.sw.off()
+        # with parallel:
+        #     self.dds0.dds_device.sw.off()
+        #     self.dds1.dds_device.sw.off()
         # self.off()
 
     @kernel
