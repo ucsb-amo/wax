@@ -53,7 +53,8 @@ class ROI():
                  current_file_path=None,
                  current_saved_roi=None,
                  images=None,
-                 imaging_type=None):
+                 imaging_type=None,
+                 n_pwa_per_shot=1):
         
         if server_talk == None:
             self.server_talk = st()
@@ -68,6 +69,11 @@ class ROI():
         self._current_saved_roi = current_saved_roi
         self._images = images
         self._imaging_type = imaging_type
+        self._n_pwa_per_shot = n_pwa_per_shot
+        # Populated by _auto_roi() when a suggestion is computed; kept so
+        # callers (and the headless roi_id='auto' path) can inspect the QC.
+        self.auto_roi_result = None
+        self.auto_roi_seconds = 0.
         self.load_roi(roi_id,
                       use_saved=use_saved_roi,
                       lite=lite,
@@ -87,6 +93,38 @@ class ROI():
         idx_x = range(self.roix[0],self.roix[1])
         cropOD = OD.take(idx_y,axis=OD.ndim-2).take(idx_x,axis=OD.ndim-1)
         return cropOD
+
+    def _auto_roi(self, printouts=True):
+        """Computes an auto-detected ROI suggestion from the loaded raw images.
+
+        Returns an AutoRoiResult, or None when there is nothing to work with
+        (no images in memory, or the detection raised). Never raises -- a
+        failed suggestion must not stop a human from picking an ROI by hand.
+
+        Args:
+            printouts (bool): If True, prints the outcome of the detection.
+        """
+        if self._images is None:
+            return None
+        try:
+            import time
+            from waxa.image_processing.auto_roi import suggest_roi
+            t_auto = time.perf_counter()
+            result = suggest_roi(images=self._images,
+                                 n_pwa_per_shot=self._n_pwa_per_shot)
+            self.auto_roi_seconds = time.perf_counter() - t_auto
+        except Exception as e:
+            if printouts:
+                print(f"Auto-ROI detection failed ({type(e).__name__}: {e}).")
+            return None
+        self.auto_roi_result = result
+        if printouts:
+            if result.valid:
+                print(f"Auto-ROI suggests roix={result.roix}, roiy={result.roiy} "
+                      f"(confidence {result.confidence:.2f}).")
+            else:
+                print(f"Auto-ROI found nothing to suggest: {result.reason}.")
+        return result
 
     def load_roi(self,roi_id=None,use_saved=True,lite=False,
                  printouts=True,display_ods=None):
@@ -110,6 +148,26 @@ class ROI():
             recomputing from raw camera images.
         """
         
+        # Headless auto-detection: never opens the GUI. Used by unattended
+        # callers that cannot answer a dialog. 'auto' is therefore a reserved
+        # roi.xlsx key.
+        if isinstance(roi_id,str) and roi_id == 'auto':
+            if lite:
+                if printouts: print("roi_id='auto' does not apply to lite data (already cropped).")
+                roi_id = None
+            else:
+                result = self._auto_roi(printouts=printouts)
+                if result is not None and result.valid:
+                    self.roix, self.roiy = list(result.roix), list(result.roiy)
+                    return
+                # Fall through to the whole-image default below rather than
+                # cropping on a box we do not trust.
+                if printouts: print("Falling back to whole image.")
+                px, py = self.get_image_size()
+                self.roix = [0,px]
+                self.roiy = [0,py]
+                return
+
         # Check for ROI saved in the current data file.
         saved_roi_bool = self.read_roi_from_h5(lite=lite,printouts=printouts)
         if roi_id == None:
@@ -122,7 +180,7 @@ class ROI():
                 self.select_roi(display_ods=display_ods)
             else:
                 if printouts: print("Specify the new ROI.")
-                self.select_roi(display_ods=display_ods)
+                self.select_roi(display_ods=display_ods,suggest_auto_roi=not lite)
         else:
             if saved_roi_bool:
                 if printouts: print("Saved ROI was found, but is being overridden.")
@@ -136,14 +194,14 @@ class ROI():
                 if printouts: print(f"Using ROI loaded from run {roi_id}.")
             else:
                 if printouts: print(f"Specify the new ROI.")
-                self.select_roi(display_ods=display_ods)
+                self.select_roi(display_ods=display_ods,suggest_auto_roi=not lite)
 
         if isinstance(roi_id,str):
             if printouts: print("ROI specified by string. Referencing roi.xslx spreadsheet (PotassiumData)...")
             roi_exists = self.read_roi_from_excel(roi_id,printouts=printouts)
             if not roi_exists:
                 if printouts: print(f"Creating ROI for key {roi_id}.")
-                self.select_roi(display_ods=display_ods)
+                self.select_roi(display_ods=display_ods,suggest_auto_roi=not lite)
                 self._update_excel()
 
         if self.check_for_blank_roi():
@@ -272,7 +330,7 @@ class ROI():
         """        
         return np.all(np.array([*self.roix,*self.roiy]) == -1)
     
-    def select_roi(self, run_id=[], display_ods=None):
+    def select_roi(self, run_id=[], display_ods=None, suggest_auto_roi=False):
         """Brings up the GUI to select a new ROI rectangle. The user should
         click and drag (LMB) in order to select a rectangle, then hit Enter to
         submit their selection. RMB clears the rectangle, and Escape/the X
@@ -285,6 +343,9 @@ class ROI():
             display_ods (np.ndarray or None): Pre-computed OD images shaped
             (N_shots, H, W). When provided, the GUI displays these directly
             without opening the h5 file.
+            suggest_auto_roi (bool): If True, auto-detect a candidate ROI and
+            open the GUI with that rectangle already drawn, so the user
+            confirms or adjusts rather than drawing from scratch.
         """        
         if run_id == []:
             run_id = self.run_id
@@ -292,6 +353,9 @@ class ROI():
         # Use pre-loaded images/ODs if available for this run (avoids h5 open).
         images = self._images if run_id == self.run_id else None
         imaging_type = self._imaging_type if run_id == self.run_id else None
+        auto_result = None
+        if suggest_auto_roi and run_id == self.run_id:
+            auto_result = self._auto_roi()
         update_bool, roix, roiy = roi_creator(
             run_id,
             self.key,
@@ -300,6 +364,7 @@ class ROI():
             images=images,
             imaging_type=imaging_type,
             precomputed_ods=display_ods,
+            auto_roi_result=auto_result,
         ).get_roi_rectangle()
         if update_bool:
             self.roix, self.roiy = roix, roiy
@@ -458,7 +523,8 @@ class _RoiSelectorDialog(QDialog):
     Below: resizable image canvas with all mouse interactions.
     """
 
-    def __init__(self, creator, preset_entries, parent=None):
+    def __init__(self, creator, preset_entries, parent=None,
+                 auto_preset_active=False):
         # Set window flags before calling super().__init__()
         if sys.platform.startswith("win"):
             # Use Qt.WindowType instead of passing to super
@@ -502,6 +568,13 @@ class _RoiSelectorDialog(QDialog):
 
         self._build_ui()
         self._setup_hotkeys()
+        # Seed the dialog with the auto-detected box. This is the same code
+        # path a user gets by picking a preset by hand, so it inherits clamping
+        # and the preset-coloured rectangle for free. Enter alone now accepts
+        # the suggestion; Escape still discards it and falls back to the whole
+        # image, exactly as before.
+        if auto_preset_active and self.preset_entries:
+            self._apply_preset_and_sync_combo(0)
         self._refresh_image()
         self.setWindowTitle("ROI Selector")
         self._set_emoji_window_icon()
@@ -998,11 +1071,11 @@ class _RoiSelectorDialog(QDialog):
         self._refresh_image()
 
     def _action_prev_image(self):
-        self.img_index = (self.img_index - 1) % self.creator.N_img
+        self.img_index = (self.img_index - 1) % self.creator.N_display
         self._change_image()
 
     def _action_next_image(self):
-        self.img_index = (self.img_index + 1) % self.creator.N_img
+        self.img_index = (self.img_index + 1) % self.creator.N_display
         self._change_image()
 
     def _action_zoom_out(self):
@@ -1078,6 +1151,9 @@ class _RoiSelectorDialog(QDialog):
             else:
                 self.active_roi_bounds = None
                 self.warning_message = f"Preset '{key}' is invalid for this image size."
+        if self.img_index == self.creator.N_img and self.creator._score_map is not None:
+            # Not a real shot -- say so, or the score map reads as a strange OD.
+            self.warning_message = "Auto-ROI score map (not a shot)."
         self._refresh_image()
 
     # ── Accept / finalise ─────────────────────────────────────────────────
@@ -1100,12 +1176,18 @@ class roi_creator():
     window_name = 'recrop'
 
     def __init__(self, run_id, key, server_talk, file_path=None,
-                 images=None, imaging_type=None, precomputed_ods=None):
+                 images=None, imaging_type=None, precomputed_ods=None,
+                 auto_roi_result=None):
 
         self.key = key
         self.run_id = run_id
         self.server_talk = server_talk
         self._od_cache = {}
+        # An auto-detected ROI suggestion (waxa.image_processing.AutoRoiResult)
+        # or None. When present and valid it seeds the dialog's rectangle, and
+        # its score map is browsable as one extra frame past the run's shots.
+        self.auto_roi_result = auto_roi_result
+        self._score_map = getattr(auto_roi_result, 'score_map', None)
 
         if precomputed_ods is not None:
             # Fast path: caller has already computed ODs — skip h5 open entirely.
@@ -1136,6 +1218,7 @@ class roi_creator():
             except Exception:
                 self.analysis_type = img_types.ABSORPTION
 
+        self.N_display = self.N_img + (1 if self._score_map is not None else 0)
         self.image = self.get_od(0)
 
         self.drawing = False
@@ -1199,6 +1282,10 @@ class roi_creator():
         Returns:
             np.ndarray: the OD to display.
         """
+        if self._score_map is not None and idx == self.N_img:
+            # One frame past the last shot: the auto-detection score map, so the
+            # suggestion is inspectable rather than magic.
+            return self._score_map
         if idx not in self._od_cache:
             if self._precomputed_ods is not None:
                 self._od_cache[idx] = self._precomputed_ods[idx]
@@ -1301,12 +1388,24 @@ class roi_creator():
         self.cmap_juice_factor = 1.0
         preset_entries = self._load_excel_roi_presets()
 
+        # Prepend the auto-detected box as a preset so the dialog opens with it
+        # already drawn. This rides the existing preset machinery, so it
+        # inherits clamping, the preset-coloured rectangle, and re-clamping on
+        # frame change. It is in-memory only and is never written to roi.xlsx.
+        auto_preset_active = False
+        auto = self.auto_roi_result
+        if auto is not None and auto.valid:
+            preset_entries = ([("auto (suggested)", list(auto.roix), list(auto.roiy))]
+                              + preset_entries)
+            auto_preset_active = True
+
         app = QApplication.instance()
         if app is None:
             app = QApplication(sys.argv)
 
         parent_window = app.activeWindow()
-        dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window)
+        dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window,
+                                    auto_preset_active=auto_preset_active)
         try:
             dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
             # Show and activate the dialog before entering the modal loop.

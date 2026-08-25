@@ -8,6 +8,52 @@ from waxa.helper import *
 dv = -1000.
 dv_fit_guess_rabi_frequency = 1.e5
 
+
+def _resolve_omega_upper(times, fit_guess_frequency, fit_max_frequency=dv):
+    """Upper bound on the fitted Omega (rad/s).
+
+    Never derive this from the initial guess: doing so makes the guess a silent
+    ceiling, so a fit that wanted a higher frequency rails at 1.2-1.5x whatever
+    you happened to guess and reports it as if it were a measurement.
+
+    With fit_max_frequency (Hz) given, use it. Otherwise use the Nyquist limit
+    of the pulse-time sampling, which is the real information limit of the scan,
+    floored at 4x the guess so a coarse scan cannot bound the answer below it.
+    """
+    if fit_max_frequency != dv and fit_max_frequency is not None:
+        return 2 * np.pi * float(fit_max_frequency)
+
+    omega_floor = 4.0 * float(fit_guess_frequency)
+    t_unique = np.unique(np.asarray(times, dtype=float))
+    if t_unique.size > 1:
+        dt = np.median(np.diff(t_unique))
+        if np.isfinite(dt) and dt > 0:
+            return max(2 * np.pi * (0.5 / dt), omega_floor)
+    return max(omega_floor, 1.0)
+
+
+def _warn_if_railed(popt, lower, upper, names, rtol=1.e-3):
+    """Print a warning for any fitted parameter sitting on its bound.
+
+    A railed parameter is not a fit result -- it is the bound being reported
+    back to you. curve_fit says nothing when this happens, which is how a
+    ceiling can masquerade as a measurement for months.
+    """
+    for value, lo, hi, name in zip(popt, lower, upper, names):
+        span = hi - lo
+        if not np.isfinite(span) or span <= 0:
+            span = max(abs(hi if np.isfinite(hi) else lo), 1.0)
+        tol = rtol * span
+        if np.isfinite(hi) and abs(value - hi) <= tol:
+            print(f"[rabi_oscillation] WARNING: fitted {name} = {value:.6g} is "
+                  f"railed at its UPPER bound ({hi:.6g}). This is the bound, "
+                  f"not a measurement -- widen it (see fit_max_frequency) and "
+                  f"re-fit.")
+        elif np.isfinite(lo) and abs(value - lo) <= tol:
+            print(f"[rabi_oscillation] WARNING: fitted {name} = {value:.6g} is "
+                  f"railed at its LOWER bound ({lo:.6g}). This is the bound, "
+                  f"not a measurement -- widen it and re-fit.")
+
 class TOF():
     def __init__(self,
                  ad,
@@ -101,6 +147,7 @@ def rabi_oscillation(ad,
                      fit_guess_amp=1.,
                      fit_guess_offset=1.,
                      fit_guess_decay_tau=dv,
+                     fit_max_frequency=dv,
                      figsize=[]):
     """Fits the signal (max-min sumOD) vs. pulse time to extract the rabi
     frequency and pi-pulse time, and produces a plot.
@@ -135,7 +182,12 @@ def rabi_oscillation(ad,
         fit_params_on_plot (bool, optional): If True, puts the fit parameter values on the plot.
         fit_params_on_left (bool, optional): If True, puts the fit parameter box
         on the left side of the plot.
-        
+        fit_max_frequency (float, optional): Hard upper bound on the fitted Rabi
+        frequency, in Hz. Defaults to the Nyquist limit of the pulse-time
+        sampling. Do NOT set this near the value you expect -- the bound is not
+        a prior, and a fit railed against it is reported as though it were a
+        measurement (a warning is printed if that happens).
+
 
     Returns:
         t_pi: The pi pulse time in seconds.
@@ -230,19 +282,38 @@ def rabi_oscillation(ad,
         popt_decay, _ = curve_fit(_fit_func_decay,times[0:2],y[0:2])
         fit_guess_decay_tau = popt_decay[0]
 
+    # Upper bound on Omega. This used to be a fixed multiple of
+    # fit_guess_frequency, which made the initial guess double as a hard
+    # ceiling: guess 2*pi*55 kHz and the fit could not report above 82.5 kHz no
+    # matter what the data said, with nothing printed to say so. The ceiling now
+    # comes from the sampling (Nyquist on the pulse-time grid) unless an
+    # explicit fit_max_frequency (in Hz) is given.
+    omega_upper = _resolve_omega_upper(times, fit_guess_frequency,
+                                       fit_max_frequency)
+
+    # p0 must follow _fit_func_rabi_oscillation(t, Omega, phi, B, A, tau), i.e.
+    # (frequency, phase, OFFSET, AMPLITUDE, tau). fit_guess_amp and
+    # fit_guess_offset were previously passed the other way round, so the
+    # amplitude guess seeded the offset and vice versa.
+    lower = (0., 0., 0., -1.1, 5.e-6)
+    upper = (omega_upper, 2*np.pi, 0.51, 1.1, np.inf)
+    p0 = [fit_guess_frequency, fit_guess_phase,
+          fit_guess_offset, fit_guess_amp, fit_guess_decay_tau]
+    p0 = [min(max(v, lo), hi) for v, lo, hi in zip(p0, lower, upper)]
+
     try:
         # Fit the data
         popt, _ = curve_fit(_fit_func_rabi_oscillation, times, populations,
-                            p0=[fit_guess_frequency, fit_guess_phase,
-                                 fit_guess_amp, fit_guess_offset,
-                                   fit_guess_decay_tau],
-                            bounds=((0.,0.,0.,0.,5.e-6),(1.2*fit_guess_frequency, 2*np.pi, 0.51, 1.1, np.inf)))
-        
+                            p0=p0, bounds=(lower, upper))
+
         y_fit = _fit_func_rabi_oscillation(times, *popt)
+
+        _warn_if_railed(popt, lower, upper,
+                        ('Omega', 'phi', 'B (offset)', 'A (amplitude)', 'tau'))
 
         # Print the fit parameters
         if print_results:
-            print(r"Fit function: f(t) = A * exp(-t/tau) * (cos(Omega t / 2 + phi))**2 + B")
+            print(r"Fit function: f(t) = B + (A/2) * exp(-t/tau) * cos(Omega t + phi)")
             print(f"Omega = 2*pi*{popt[0]/(2*np.pi)/1.e3:1.2f} kHz"
                 +f"\n phi = {popt[1]},\n A = {popt[3]},"
                 +f"\n B = {popt[2]},"
@@ -296,7 +367,7 @@ def rabi_oscillation(ad,
             title += f"\n$\\Omega = 2\\pi \\times {rabi_frequency_hz/1.e3:1.3f}$ kHz"
 
         ax.set_title(title)
-        ax.set_ylim([-0.1,1.1])
+        # ax.set_ylim([-0.1,1.1])
 
         if fit_params_on_plot:
             try:
@@ -473,8 +544,10 @@ def rabi_oscillation_2d(ad,
         # Fit the data
         try:
             popt, _ = curve_fit(_fit_func_rabi_oscillation, times, populations,
+                            # (Omega, phi, B, A, tau) -- offset before
+                            # amplitude; these two used to be passed swapped.
                             p0=[fit_guess_frequency, fit_guess_phase,
-                                 fit_guess_amp, fit_guess_offset,
+                                 fit_guess_offset, fit_guess_amp,
                                    fit_guess_decay_tau],
                             bounds=((0.,0.,0.,0.,0.),(np.inf,2*np.pi,1.,1.,np.inf)))
 

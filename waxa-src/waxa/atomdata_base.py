@@ -591,10 +591,14 @@ class atomdata_base():
                            current_file_path=self._data_file_path,
                            current_saved_roi=self._saved_roi_from_file,
                            images=self.images,
-                           imaging_type=self.run_info.imaging_type)
+                           imaging_type=self.run_info.imaging_type,
+                           n_pwa_per_shot=int(getattr(self.params,'N_pwa_per_shot',1)))
         else:
             self.roi = None
         self._timing['init_setup_helpers_roi_s'] = time.perf_counter() - t_stage
+        # Auto-ROI detection runs inside ROI.__init__, so pull its own timing
+        # out to keep it separately visible from the rest of ROI setup.
+        self._timing['init_suggest_roi_s'] = getattr(self.roi,'auto_roi_seconds',0.)
 
         t_stage = time.perf_counter()
         self._unshuffle_old_data()
@@ -609,11 +613,13 @@ class atomdata_base():
             print(
                 (
                     "[atomdata timing] init total={:.3f}s | load_data={:.3f}s | "
-                    "setup+roi={:.3f}s | unshuffle_old={:.3f}s | initial_analysis={:.3f}s"
+                    "setup+roi={:.3f}s | suggest_roi={:.3f}s | unshuffle_old={:.3f}s | "
+                    "initial_analysis={:.3f}s"
                 ).format(
                     self._timing['init_total_s'],
                     self._timing['init_load_data_s'],
                     self._timing['init_setup_helpers_roi_s'],
+                    self._timing['init_suggest_roi_s'],
                     self._timing['init_unshuffle_old_data_s'],
                     self._timing['init_initial_analysis_s'],
                 )
@@ -702,7 +708,7 @@ class atomdata_base():
             print("not a lite dataset, nothing to regenerate")
             return
         # Get new ROI (prompts GUI if roi_id is None and no saved ROI).
-        self.roi.load_roi(roi_id, use_saved)
+        self.roi.load_roi(roi_id, use_saved, lite=True)
         # Save the new ROI into the regular (non-lite) h5 file so
         # create_lite_copy can read it back.
         self.roi.save_roi_h5(lite=False, printouts=False)
