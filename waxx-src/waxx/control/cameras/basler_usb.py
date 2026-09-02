@@ -1,3 +1,6 @@
+import threading
+import time
+
 from pypylon import pylon
 from artiq.experiment import *
 import numpy as np
@@ -7,6 +10,26 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from waxx.config.timeouts import (CAMERA_GRAB_TIMEOUT_BASLER_INIT as TIMEOUT_INIT,
                                   CAMERA_GRAB_TIMEOUT_BASLER_RUN as TIMEOUT_RUN)
+
+# RetrieveResult is polled in slices of this length (s) instead of blocking for
+# the whole frame timeout, so an interrupted run releases the camera promptly.
+GRAB_POLL_INTERVAL = 0.2
+
+# Grab locks are keyed by serial number rather than kept on the BaslerUSB
+# instance: pypylon's InstantCamera.__setattr__ routes any unknown attribute
+# name into the GenICam node map, so plain attributes cannot be assigned here.
+# Keying by serial also covers the case where the camera object was replaced
+# (reopened) while an old one is still grabbing the same physical camera.
+_GRAB_LOCKS = {}
+_GRAB_LOCKS_GUARD = threading.Lock()
+
+def _grab_lock_for(serial):
+    with _GRAB_LOCKS_GUARD:
+        lock = _GRAB_LOCKS.get(serial)
+        if lock is None:
+            lock = threading.RLock()
+            _GRAB_LOCKS[serial] = lock
+        return lock
 
 def nothing():
     return False
@@ -76,33 +99,77 @@ class BaslerUSB(pylon.InstantCamera):
     
     def is_opened(self):
         return self.IsOpen()
-    
+
+    def grab_lock(self):
+        """The lock serializing grab loops on this physical camera."""
+        try:
+            serial = str(self.GetDeviceInfo().GetSerialNumber())
+        except Exception:
+            serial = ""
+        return _grab_lock_for(serial)
+
     def start_grab(self,N_img,output_queue:Queue,
                    check_interrupt_method=nothing):
-        this_timeout = TIMEOUT_INIT # initial timeout
-        Nimg = int(N_img)
+        # CameraNanny hands out one persistent camera object per key, so a
+        # CameraBaby left over from an aborted run can still be inside its grab
+        # loop when the next run's baby starts.  Without this lock both loops
+        # drive the same InstantCamera, and the old loop's StopGrabbing() (in
+        # the finally below) tears down the new run's grab -- which then times
+        # out and kills the run after it, cascading until liveOD is restarted.
+        with self.grab_lock():
+            self._grab_loop(int(N_img), output_queue, check_interrupt_method)
+
+    def _grab_loop(self, Nimg, output_queue:Queue, check_interrupt_method):
+        frame_timeout = TIMEOUT_INIT # initial timeout
+        deadline = time.monotonic() + frame_timeout
         self.StartGrabbingMax(Nimg, pylon.GrabStrategy_LatestImages)
         count = 0
         try:
             while self.IsGrabbing():
                 if check_interrupt_method():
                     break
-                grab = self.RetrieveResult(int(this_timeout*1000), pylon.TimeoutHandling_ThrowException)
-                if grab.GrabSucceeded():
-                    this_timeout = TIMEOUT_RUN
+                # Poll in short slices rather than blocking for the whole frame
+                # timeout, so an interrupt is honoured within GRAB_POLL_INTERVAL
+                # instead of holding the camera for up to TIMEOUT_INIT.
+                grab = self.RetrieveResult(int(GRAB_POLL_INTERVAL*1000),
+                                           pylon.TimeoutHandling_Return)
+                try:
+                    if grab is None or not grab.IsValid():
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(
+                                f"No image within {frame_timeout:.0f} s "
+                                f"(got {count}/{Nimg}). Camera not triggered?")
+                        continue
+                    if not grab.GrabSucceeded():
+                        print(f"Grab failed: {grab.GetErrorDescription()}")
+                        continue
                     print(f'gotem (img {count+1}/{Nimg})')
                     img = np.uint8(grab.GetArray())
                     img_t = grab.TimeStamp
-                    output_queue.put((img,img_t,count))
-                    count += 1
+                finally:
+                    if grab is not None and grab.IsValid():
+                        grab.Release()
+                frame_timeout = TIMEOUT_RUN
+                deadline = time.monotonic() + frame_timeout
+                output_queue.put((img,img_t,count))
+                count += 1
                 if count >= Nimg:
                     break
         finally:
             self.StopGrabbing()
 
     def stop_grab(self):
+        # Non-blocking on purpose: if another thread owns the grab loop (a newer
+        # CameraBaby that already claimed this camera), leave it alone -- its own
+        # start_grab() finally will stop it.  Stopping it from a dying baby's
+        # death handler is exactly what breaks the next run's grab.
+        lock = self.grab_lock()
+        if not lock.acquire(blocking=False):
+            print("Grab loop is owned by another thread; not stopping it here.")
+            return
         try:
             self.StopGrabbing()
         except Exception as e:
             print(f"Error stopping grab: {e}")
-            pass
+        finally:
+            lock.release()

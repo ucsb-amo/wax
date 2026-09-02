@@ -3,6 +3,8 @@ import pandas as pd
 import os
 import cv2
 import sys
+import time
+import threading
 
 from waxa.data.server_talk import server_talk as st
 from waxa.image_processing.compute_ODs import compute_OD
@@ -41,6 +43,134 @@ def _load_roi_excel_cached(path):
     }
     return df
 
+# ── Auto-ROI background detection ────────────────────────────────────────────
+# Detection only ever reads the raw image stack, so it runs on a worker thread
+# started as early as those images exist and is joined only when someone
+# actually needs the answer. That keeps it off the critical path: the ROI
+# dialog opens immediately and picks the suggestion up when it lands. Jobs are
+# kept per run so a second dialog (a recrop, or the dialog's "Auto ROI" button)
+# reuses the result instead of recomputing it.
+_AUTO_ROI_JOBS = {}
+_AUTO_ROI_JOBS_LOCK = threading.Lock()
+_AUTO_ROI_CACHE_SIZE = 8
+
+# Label the auto-detected box carries in the dialog's preset dropdown. It is
+# in-memory only and is never written to roi.xlsx.
+AUTO_PRESET_KEY = "auto (suggested)"
+
+
+class _AutoRoiJob():
+    """One auto-ROI detection, running on a background thread.
+
+    The result is read through :meth:`wait`; ``done`` is a non-blocking check
+    so a GUI can poll it without stalling its event loop. A failed detection
+    is stored, not raised -- it must never stop a human from picking an ROI by
+    hand.
+    """
+
+    def __init__(self, images, n_pwa_per_shot):
+        self._done = threading.Event()
+        self.result = None
+        self.error = None
+        self.seconds = 0.
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(images, int(n_pwa_per_shot)),
+            name="waxa-auto-roi",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, images, n_pwa_per_shot):
+        t_start = time.perf_counter()
+        try:
+            from waxa.image_processing.auto_roi import suggest_roi
+            self.result = suggest_roi(images=images,
+                                      n_pwa_per_shot=n_pwa_per_shot)
+        except Exception as e:
+            self.error = e
+        finally:
+            self.seconds = time.perf_counter() - t_start
+            self._done.set()
+
+    @property
+    def done(self):
+        return self._done.is_set()
+
+    def wait(self, timeout=None):
+        """Blocks until the detection finishes. Returns True if it has."""
+        return self._done.wait(timeout)
+
+
+def _auto_roi_key(run_id, images, n_pwa_per_shot):
+    """Cache key for a run's auto-ROI detection, or None if not applicable.
+
+    The image shape is part of the key so a run reloaded with a different
+    frame layout (or a vault pointed at a different chunk) does not pick up a
+    stale box.
+    """
+    if images is None:
+        return None
+    try:
+        shape = tuple(int(n) for n in np.shape(images))
+    except Exception:
+        return None
+    if len(shape) != 3 or shape[0] == 0:
+        return None
+    try:
+        rid = int(np.ravel(run_id)[0]) if np.size(run_id) else None
+    except Exception:
+        rid = None
+    return (rid, shape, int(n_pwa_per_shot))
+
+
+def _auto_roi_job(key, images, n_pwa_per_shot=1, start=True):
+    """Returns the (possibly already finished) auto-ROI job for `key`.
+
+    Idempotent: repeated calls for one key hand back the same job, so the
+    detection runs once per run however many times a dialog is opened.
+
+    Args:
+        key: the key from :func:`_auto_roi_key`.
+        images (np.ndarray): the raw image stack, only used on first call.
+        n_pwa_per_shot (int): probe-with-atoms frames per shot.
+        start (bool): if False, look up an existing job but never start one.
+
+    Returns:
+        _AutoRoiJob or None: None when there is nothing to run on.
+    """
+    if key is None:
+        return None
+    with _AUTO_ROI_JOBS_LOCK:
+        job = _AUTO_ROI_JOBS.get(key)
+        if job is not None:
+            return job
+        if not start or images is None:
+            return None
+        job = _AutoRoiJob(images, n_pwa_per_shot)
+        _AUTO_ROI_JOBS[key] = job
+        # A held result is a frame-sized score map, so keep only a handful.
+        # Evicting a job in flight is harmless: whoever holds it keeps working.
+        while len(_AUTO_ROI_JOBS) > _AUTO_ROI_CACHE_SIZE:
+            _AUTO_ROI_JOBS.pop(next(iter(_AUTO_ROI_JOBS)))
+        return job
+
+
+def prefetch_auto_roi(run_id, images, n_pwa_per_shot=1):
+    """Starts auto-ROI detection now, so it is ready when the dialog opens.
+
+    Call this as soon as a run's images exist and an ROI dialog is likely.
+    Returns immediately; the work happens on a background thread and is a
+    no-op when the same run is already running or cached.
+
+    Args:
+        run_id (int): the run the images belong to.
+        images (np.ndarray): (N_img, H, W) raw camera stack.
+        n_pwa_per_shot (int): probe-with-atoms frames per shot.
+    """
+    return _auto_roi_job(_auto_roi_key(run_id, images, n_pwa_per_shot),
+                         images, n_pwa_per_shot)
+
 class ROI():
     def __init__(self,
                  run_id=0,
@@ -70,10 +200,14 @@ class ROI():
         self._images = images
         self._imaging_type = imaging_type
         self._n_pwa_per_shot = n_pwa_per_shot
-        # Populated by _auto_roi() when a suggestion is computed; kept so
-        # callers (and the headless roi_id='auto' path) can inspect the QC.
+        # Populated when a suggestion is computed; kept so callers (and the
+        # headless roi_id='auto' path) can inspect the QC.
         self.auto_roi_result = None
+        # Time spent *waiting* on the detection in the foreground. Normally
+        # ~0: the work overlaps data loading and the dialog. The wall time the
+        # detection itself took is auto_roi_compute_seconds.
         self.auto_roi_seconds = 0.
+        self.auto_roi_compute_seconds = 0.
         self.load_roi(roi_id,
                       use_saved=use_saved_roi,
                       lite=lite,
@@ -94,29 +228,46 @@ class ROI():
         cropOD = OD.take(idx_y,axis=OD.ndim-2).take(idx_x,axis=OD.ndim-1)
         return cropOD
 
-    def _auto_roi(self, printouts=True):
-        """Computes an auto-detected ROI suggestion from the loaded raw images.
+    def _start_auto_roi(self):
+        """Starts (or looks up) this run's background auto-ROI detection.
 
-        Returns an AutoRoiResult, or None when there is nothing to work with
-        (no images in memory, or the detection raised). Never raises -- a
+        Returns immediately. The job is shared per run, so calling this from
+        several places costs one detection.
+
+        Returns:
+            _AutoRoiJob or None: None when there are no images to work with.
+        """
+        if self._images is None:
+            return None
+        key = _auto_roi_key(self.run_id, self._images, self._n_pwa_per_shot)
+        return _auto_roi_job(key, self._images, self._n_pwa_per_shot)
+
+    def _auto_roi(self, printouts=True):
+        """Waits for an auto-detected ROI suggestion for the loaded images.
+
+        Blocks until the background detection finishes, so this is the path
+        for callers that need an answer right now (the headless
+        roi_id='auto'). The GUI path uses _start_auto_roi() instead and never
+        waits. Returns an AutoRoiResult, or None when there is nothing to work
+        with (no images in memory, or the detection raised). Never raises -- a
         failed suggestion must not stop a human from picking an ROI by hand.
 
         Args:
             printouts (bool): If True, prints the outcome of the detection.
         """
-        if self._images is None:
+        job = self._start_auto_roi()
+        if job is None:
             return None
-        try:
-            import time
-            from waxa.image_processing.auto_roi import suggest_roi
-            t_auto = time.perf_counter()
-            result = suggest_roi(images=self._images,
-                                 n_pwa_per_shot=self._n_pwa_per_shot)
-            self.auto_roi_seconds = time.perf_counter() - t_auto
-        except Exception as e:
+        t_wait = time.perf_counter()
+        job.wait()
+        self.auto_roi_seconds = time.perf_counter() - t_wait
+        self.auto_roi_compute_seconds = job.seconds
+        if job.error is not None:
             if printouts:
-                print(f"Auto-ROI detection failed ({type(e).__name__}: {e}).")
+                print(f"Auto-ROI detection failed "
+                      f"({type(job.error).__name__}: {job.error}).")
             return None
+        result = job.result
         self.auto_roi_result = result
         if printouts:
             if result.valid:
@@ -343,9 +494,12 @@ class ROI():
             display_ods (np.ndarray or None): Pre-computed OD images shaped
             (N_shots, H, W). When provided, the GUI displays these directly
             without opening the h5 file.
-            suggest_auto_roi (bool): If True, auto-detect a candidate ROI and
-            open the GUI with that rectangle already drawn, so the user
-            confirms or adjusts rather than drawing from scratch.
+            suggest_auto_roi (bool): If True, offer an auto-detected candidate
+            ROI, so the user confirms or adjusts rather than drawing from
+            scratch. Detection runs on a background thread and the GUI never
+            waits on it: the rectangle is already drawn if the answer is ready
+            (the usual case), and appears as soon as it lands otherwise. The
+            "Auto ROI" button re-applies it at any time.
         """        
         if run_id == []:
             run_id = self.run_id
@@ -353,10 +507,14 @@ class ROI():
         # Use pre-loaded images/ODs if available for this run (avoids h5 open).
         images = self._images if run_id == self.run_id else None
         imaging_type = self._imaging_type if run_id == self.run_id else None
-        auto_result = None
+        auto_job = None
         if suggest_auto_roi and run_id == self.run_id:
-            auto_result = self._auto_roi()
-        update_bool, roix, roiy = roi_creator(
+            # Started, never waited on: the dialog opens at once and adopts
+            # the suggestion as soon as the worker delivers it. Usually the
+            # job was already started while the data was loading and is done
+            # before the window is even painted.
+            auto_job = self._start_auto_roi()
+        creator = roi_creator(
             run_id,
             self.key,
             self.server_talk,
@@ -364,8 +522,13 @@ class ROI():
             images=images,
             imaging_type=imaging_type,
             precomputed_ods=display_ods,
-            auto_roi_result=auto_result,
-        ).get_roi_rectangle()
+            auto_roi_job=auto_job,
+        )
+        update_bool, roix, roiy = creator.get_roi_rectangle()
+        if creator.auto_roi_result is not None:
+            self.auto_roi_result = creator.auto_roi_result
+        if auto_job is not None:
+            self.auto_roi_compute_seconds = auto_job.seconds
         if update_bool:
             self.roix, self.roiy = roix, roiy
         else:
@@ -523,8 +686,7 @@ class _RoiSelectorDialog(QDialog):
     Below: resizable image canvas with all mouse interactions.
     """
 
-    def __init__(self, creator, preset_entries, parent=None,
-                 auto_preset_active=False):
+    def __init__(self, creator, preset_entries, parent=None):
         # Set window flags before calling super().__init__()
         if sys.platform.startswith("win"):
             # Use Qt.WindowType instead of passing to super
@@ -538,8 +700,15 @@ class _RoiSelectorDialog(QDialog):
             )
         
         self.creator = creator
-        self.preset_entries = preset_entries
-        self.preset_keys = [e[0] for e in preset_entries]
+        self.preset_entries = list(preset_entries)
+        self.preset_keys = [e[0] for e in self.preset_entries]
+
+        # ── Auto-ROI state ────────────────────────────────────────────────
+        # Index of the auto-detected box within preset_entries, once it
+        # exists. It is appended (never inserted) so no already-issued preset
+        # index shifts under the user mid-dialog.
+        self._auto_preset_idx = None
+        self._auto_poll_timer = None
 
         # ── Image / zoom state ────────────────────────────────────────────
         self.original_image = creator.image.copy()
@@ -568,13 +737,7 @@ class _RoiSelectorDialog(QDialog):
 
         self._build_ui()
         self._setup_hotkeys()
-        # Seed the dialog with the auto-detected box. This is the same code
-        # path a user gets by picking a preset by hand, so it inherits clamping
-        # and the preset-coloured rectangle for free. Enter alone now accepts
-        # the suggestion; Escape still discards it and falls back to the whole
-        # image, exactly as before.
-        if auto_preset_active and self.preset_entries:
-            self._apply_preset_and_sync_combo(0)
+        self._init_auto_roi()
         self._refresh_image()
         self.setWindowTitle("ROI Selector")
         self._set_emoji_window_icon()
@@ -682,6 +845,17 @@ class _RoiSelectorDialog(QDialog):
         self.preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
         self.preset_combo.setToolTip("Choose a saved ROI preset")
 
+        self.btn_auto = self._make_toolbar_button("Auto ROI", self._action_auto_roi, mini=True)
+        self.btn_auto.setEnabled(False)
+
+        preset_widget = QWidget()
+        preset_layout = QVBoxLayout(preset_widget)
+        preset_layout.setContentsMargins(0, 0, 0, 0)
+        preset_layout.setSpacing(2)
+        preset_layout.addWidget(self.preset_combo)
+        preset_layout.addWidget(self.btn_auto)
+        preset_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
         self.btn_zoom_out = self._make_toolbar_button("Zoom Out", self._action_zoom_out, mini=True)
         self.btn_zoom_out.setToolTip("Zoom out (Right Mouse Button or Mouse Wheel)")
         self.btn_clear = self._make_toolbar_button("Clear ROI", self._action_clear, mini=True)
@@ -723,7 +897,7 @@ class _RoiSelectorDialog(QDialog):
 
         controls_row.addWidget(img_widget)
         controls_row.addWidget(zoom_clear_widget)
-        controls_row.addWidget(self.preset_combo)
+        controls_row.addWidget(preset_widget)
         controls_row.addWidget(centered_help_widget, 1)
         controls_row.addWidget(action_widget)
         top_layout.addLayout(controls_row)
@@ -802,6 +976,7 @@ class _RoiSelectorDialog(QDialog):
             "<div style='margin:0 0 0.2em 0;'>Right Arrow: Next image</div>"
             "<div style='margin:0 0 0.2em 0;'>Up Arrow: Brighter</div>"
             "<div style='margin:0 0 0.2em 0;'>Down Arrow: Dimmer</div>"
+            "<div style='margin:0 0 0.2em 0;'>A: Apply the auto-detected ROI</div>"
             "<div style='margin:0 0 0.2em 0;'>Enter: Accept ROI</div>"
             "<div style='margin:0 0 0.2em 0;'>Escape: Cancel</div>"
             "</td>"
@@ -845,6 +1020,7 @@ class _RoiSelectorDialog(QDialog):
         bind("Right", self._action_next_image)
         bind("Up", self._action_brighter)
         bind("Down", self._action_dimmer)
+        bind("A", self._action_auto_roi)
 
     def _focus_image_canvas(self):
         # Explicit activation helps foreground modal dialogs on Windows.
@@ -889,6 +1065,102 @@ class _RoiSelectorDialog(QDialog):
             src = self.active_roi_source
             self.roi_label.setText(f"ROI  x:[{x0}, {x1}]  y:[{y0}, {y1}]  ({src})")
         self.warning_label.setText(self.warning_message)
+
+    # ── Auto-ROI ──────────────────────────────────────────────────────────
+
+    def _init_auto_roi(self):
+        """Wires up the auto-detected ROI without ever waiting for it.
+
+        If detection already finished (the usual case -- it is started while
+        the run's data is still loading) the box is installed and applied
+        before the window is shown. If it is still running, the dialog opens
+        anyway and a poll timer adopts the box the moment it lands.
+        """
+        if self.creator.auto_roi_job is None:
+            self._on_auto_roi_ready()
+            return
+        self._set_auto_button_state('pending')
+        self._auto_poll_timer = QTimer(self)
+        self._auto_poll_timer.setInterval(50)
+        self._auto_poll_timer.timeout.connect(self._poll_auto_roi)
+        self._auto_poll_timer.start()
+        # It may already be done; check once now so a finished job never costs
+        # the user a frame of "Auto ROI ...".
+        self._poll_auto_roi()
+
+    def _poll_auto_roi(self):
+        if not self.creator.poll_auto_roi():
+            return
+        self._stop_auto_poll()
+        self._on_auto_roi_ready()
+
+    def _stop_auto_poll(self):
+        if self._auto_poll_timer is not None:
+            self._auto_poll_timer.stop()
+            self._auto_poll_timer = None
+
+    def _on_auto_roi_ready(self):
+        """Installs the detected box as a preset and applies it if the user
+        has not started choosing one of their own.
+
+        Appending rather than inserting matters once the dialog is already up:
+        the user may have a preset selected, and shifting the list under them
+        would silently point that selection at a different box.
+        """
+        result = self.creator.auto_roi_result
+        if result is None:
+            self._set_auto_button_state('unavailable')
+            return
+        if not result.valid:
+            # Say why, rather than leaving a dead button: the reason is the
+            # useful part ("the score map is scattered over 40% of the
+            # frame"). The score map itself stays browsable as the frame past
+            # the last shot, so the user can see what the detector saw.
+            message = f"No auto ROI: {result.reason}."
+            self._set_auto_button_state('unavailable', message)
+            if self.active_roi_bounds is None and self.active_roi_source == "none":
+                self.warning_message = message
+                self._update_labels()
+            return
+
+        self._auto_preset_idx = len(self.preset_entries)
+        self.preset_entries.append(
+            (AUTO_PRESET_KEY, list(result.roix), list(result.roiy)))
+        self.preset_keys.append(AUTO_PRESET_KEY)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.addItem(AUTO_PRESET_KEY)
+        self.preset_combo.blockSignals(False)
+        self._set_auto_button_state('ready')
+
+        # Only take over an untouched dialog. Enter then accepts the
+        # suggestion outright; Escape discards it as before.
+        untouched = (self.active_roi_bounds is None
+                     and self.active_roi_source == "none"
+                     and not self._is_drawing
+                     and self.preset_index < 0)
+        if untouched:
+            self._apply_preset_and_sync_combo(self._auto_preset_idx)
+
+    def _set_auto_button_state(self, state, reason=""):
+        if state == 'pending':
+            self.btn_auto.setText("Auto ROI …")
+            self.btn_auto.setEnabled(False)
+            self.btn_auto.setToolTip("Detecting the atom cloud…")
+        elif state == 'ready':
+            self.btn_auto.setText("Auto ROI")
+            self.btn_auto.setEnabled(True)
+            self.btn_auto.setToolTip("Apply the auto-detected ROI (A)")
+        else:
+            self.btn_auto.setText("No auto ROI")
+            self.btn_auto.setEnabled(False)
+            self.btn_auto.setToolTip(
+                reason or "No auto-detected ROI is available for this run.")
+
+    def _action_auto_roi(self):
+        """Re-applies the auto-detected box. Cached, so this never recomputes."""
+        if self._auto_preset_idx is None:
+            return
+        self._apply_preset_and_sync_combo(self._auto_preset_idx)
 
     # ── Preset helpers ────────────────────────────────────────────────────
 
@@ -1103,6 +1375,7 @@ class _RoiSelectorDialog(QDialog):
         self._adjust_colormap(make_brighter=False)
 
     def _cancel_dialog(self):
+        self._stop_auto_poll()
         self.result_update_bool = False
         self.result_roix = np.array([-1, -1])
         self.result_roiy = np.array([-1, -1])
@@ -1159,6 +1432,7 @@ class _RoiSelectorDialog(QDialog):
     # ── Accept / finalise ─────────────────────────────────────────────────
 
     def _accept_roi(self):
+        self._stop_auto_poll()
         if self.active_roi_bounds is not None:
             x0, x1, y0, y1 = self.active_roi_bounds
             self.result_update_bool = True
@@ -1177,7 +1451,7 @@ class roi_creator():
 
     def __init__(self, run_id, key, server_talk, file_path=None,
                  images=None, imaging_type=None, precomputed_ods=None,
-                 auto_roi_result=None):
+                 auto_roi_result=None, auto_roi_job=None):
 
         self.key = key
         self.run_id = run_id
@@ -1186,8 +1460,12 @@ class roi_creator():
         # An auto-detected ROI suggestion (waxa.image_processing.AutoRoiResult)
         # or None. When present and valid it seeds the dialog's rectangle, and
         # its score map is browsable as one extra frame past the run's shots.
+        # auto_roi_job is the same thing not yet finished: the dialog polls it
+        # rather than waiting, so detection never delays the window opening.
         self.auto_roi_result = auto_roi_result
-        self._score_map = getattr(auto_roi_result, 'score_map', None)
+        self.auto_roi_job = auto_roi_job
+        if auto_roi_result is None and auto_roi_job is not None and auto_roi_job.done:
+            self.poll_auto_roi()
 
         if precomputed_ods is not None:
             # Fast path: caller has already computed ODs — skip h5 open entirely.
@@ -1218,12 +1496,35 @@ class roi_creator():
             except Exception:
                 self.analysis_type = img_types.ABSORPTION
 
-        self.N_display = self.N_img + (1 if self._score_map is not None else 0)
         self.image = self.get_od(0)
 
         self.drawing = False
         self.start_x, self.start_y = -1, -1
         self.end_x, self.end_y = -1, -1
+
+    @property
+    def _score_map(self):
+        """The auto-ROI score map, once detection has produced one."""
+        return getattr(self.auto_roi_result, 'score_map', None)
+
+    @property
+    def N_display(self):
+        """Browsable frames: the run's shots, plus the score map if there is one."""
+        return self.N_img + (1 if self._score_map is not None else 0)
+
+    def poll_auto_roi(self):
+        """Picks up the background auto-ROI result if it has landed.
+
+        Non-blocking. Returns True the first time an outcome (a result or a
+        failure) is available, so the dialog can react to it exactly once.
+        """
+        job = self.auto_roi_job
+        if job is None or not job.done:
+            return False
+        self.auto_roi_job = None
+        if job.error is None:
+            self.auto_roi_result = job.result
+        return True
 
     def _clip_point(self, x, y, shape):
         y_max, x_max = shape[:2]
@@ -1373,6 +1674,7 @@ class roi_creator():
             Mouse wheel scroll down: Zoom back out to full scale.
             L/R arrow keys: Scroll through ODs from the run while keeping zoom.
             Up / Down arrows: Adjust colormap brightness.
+            A / the "Auto ROI" button: Apply the auto-detected ROI.
             Enter: Submit your selection.
             Escape / "X" button: Close the GUI without submitting selection.
 
@@ -1388,24 +1690,17 @@ class roi_creator():
         self.cmap_juice_factor = 1.0
         preset_entries = self._load_excel_roi_presets()
 
-        # Prepend the auto-detected box as a preset so the dialog opens with it
-        # already drawn. This rides the existing preset machinery, so it
-        # inherits clamping, the preset-coloured rectangle, and re-clamping on
-        # frame change. It is in-memory only and is never written to roi.xlsx.
-        auto_preset_active = False
-        auto = self.auto_roi_result
-        if auto is not None and auto.valid:
-            preset_entries = ([("auto (suggested)", list(auto.roix), list(auto.roiy))]
-                              + preset_entries)
-            auto_preset_active = True
-
+        # The auto-detected box is added by the dialog itself, as a preset --
+        # immediately if detection has already finished, otherwise the moment
+        # the background job delivers. Riding the preset machinery gets it
+        # clamping, the preset-coloured rectangle and re-clamping on a frame
+        # change for free.
         app = QApplication.instance()
         if app is None:
             app = QApplication(sys.argv)
 
         parent_window = app.activeWindow()
-        dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window,
-                                    auto_preset_active=auto_preset_active)
+        dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window)
         try:
             dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
             # Show and activate the dialog before entering the modal loop.

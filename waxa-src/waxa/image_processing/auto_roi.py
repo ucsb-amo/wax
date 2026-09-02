@@ -25,6 +25,9 @@ absorption darkens the atoms frame, fluorescence brightens it, and
 dispersive/polmod can go either way.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from scipy import ndimage as ndi
 
@@ -46,7 +49,9 @@ DEFAULT_MIN_CONFIDENCE = 0.10   # below this the box is not trusted
 DEFAULT_MAX_AREA_FRAC = 0.10    # a fragmented box larger than this is noise
 DEFAULT_COMPACT_COMPONENTS = 2  # this few blobs is a real cloud, however large
 DEFAULT_SIGMA_ROW_STRIDE = 4    # rows sampled for the noise estimate
+DEFAULT_SIGMA_SAMPLE_CAP = 1 << 18  # cap on pixels used for the noise estimate
 DEFAULT_BYTE_BUDGET = 200.e6    # decimate above this many bytes of touched image
+DEFAULT_MAX_WORKERS = 4         # threads the shot loop is split over
 
 
 class AutoRoiResult():
@@ -146,10 +151,89 @@ def _bin_factor(n_shots, height, width, itemsize, byte_budget=DEFAULT_BYTE_BUDGE
     return 8
 
 
+def _work_dtypes(sample_dtype, n_shots):
+    """Pick (scratch, accumulator) dtypes for the score accumulation.
+
+    Integer camera frames stay in int32 end to end: an int32 accumulator is
+    materially faster than ``float32 += int32``, which numpy evaluates through
+    a float64 inner loop. It cannot overflow as long as n_shots times the
+    dtype's full span still fits an int32 -- for uint16 frames that allows
+    32767 shots. Anything else (float frames, wide integer types) falls back
+    to float32.
+    """
+    if np.issubdtype(sample_dtype, np.integer):
+        info = np.iinfo(sample_dtype)
+        span = int(info.max) - int(info.min)
+        if span <= np.iinfo(np.int32).max:
+            acc = (np.int32 if n_shots * span <= np.iinfo(np.int32).max
+                   else np.float32)
+            return np.int32, acc
+    return np.float32, np.float32
+
+
+def _noise_row_stride(height, width, sigma_row_stride, sigma_sample_cap):
+    """Row stride keeping the noise estimate under `sigma_sample_cap` pixels.
+
+    Only rows are thinned, never columns: the estimator differences
+    horizontally adjacent pixels, and skipping columns would let the cloud's
+    own gradient leak into what is supposed to be a pixel-to-pixel noise
+    estimate. Dropping rows just uses fewer samples, which at this cap costs
+    well under 1% on sigma. The Andor's 512x512 frames are already under the
+    cap at the default stride, so their sigma is unchanged.
+    """
+    stride = max(int(sigma_row_stride), 1)
+    if sigma_sample_cap and sigma_sample_cap > 0 and width > 0:
+        needed = int(np.ceil(height * width / float(sigma_sample_cap)))
+        stride = max(stride, needed)
+    return stride
+
+
+def _accumulate_shots(atoms, light, indices, k, row_stride,
+                      scratch_dtype, acc_dtype):
+    """Sum the above-noise excess over `indices` into a private score buffer.
+
+    Each caller (thread) owns its scratch and score arrays, so the shot loop
+    parallelises with no locking -- every numpy call in here releases the GIL.
+    """
+    shape = atoms.shape[1:]
+    score = np.zeros(shape, dtype=acc_dtype)
+    scratch = np.empty(shape, dtype=scratch_dtype)
+    integer = np.issubdtype(scratch_dtype, np.integer)
+
+    for i in indices:
+        # Signed difference. The dark frame cancels exactly:
+        # (atoms - dark) - (light - dark) == atoms - light.
+        np.subtract(atoms[i], light[i], out=scratch, dtype=scratch_dtype)
+
+        # Noise floor from adjacent-pixel differences, which pass pixel-to-pixel
+        # noise but suppress anything smooth -- the cloud, illumination
+        # gradients, low-order fringes. Estimated on the SIGNED difference;
+        # estimating on the rectified |d| would be a biased half-normal.
+        rows = scratch[::row_stride]
+        sigma = float(np.diff(rows, axis=-1).std()) / np.sqrt(2.)
+        floor = int(k * sigma) if integer else scratch_dtype(k * sigma)
+
+        np.abs(scratch, out=scratch)
+        np.subtract(scratch, floor, out=scratch)
+        np.maximum(scratch, 0, out=scratch)
+        np.add(score, scratch, out=score)
+
+    return score
+
+
+def _n_workers(max_workers, n_shots):
+    """Threads to split the shot loop over."""
+    if max_workers is None:
+        max_workers = min(DEFAULT_MAX_WORKERS, os.cpu_count() or 1)
+    return max(1, min(int(max_workers), int(n_shots)))
+
+
 def score_map_from_images(atoms, light, k=DEFAULT_K,
                           border_trim=DEFAULT_BORDER_TRIM,
                           sigma_row_stride=DEFAULT_SIGMA_ROW_STRIDE,
-                          byte_budget=DEFAULT_BYTE_BUDGET):
+                          sigma_sample_cap=DEFAULT_SIGMA_SAMPLE_CAP,
+                          byte_budget=DEFAULT_BYTE_BUDGET,
+                          max_workers=None):
     """Accumulate the above-noise excess over shots.
 
     Args:
@@ -158,16 +242,23 @@ def score_map_from_images(atoms, light, k=DEFAULT_K,
         k (float): noise-floor multiplier.
         border_trim (int): pixels to drop from each edge before scoring.
         sigma_row_stride (int): row subsampling for the noise estimate.
+        sigma_sample_cap (int): cap on the pixels sampled per shot for that
+            estimate; large frames thin their rows further to respect it.
         byte_budget (float): decimate when the touched volume exceeds this.
+        max_workers (int or None): threads to split the shot loop over. None
+            picks a small default; 1 runs inline.
 
     Returns:
         tuple: (score, offset, step) -- the (h, w) accumulated score on the
         trimmed/decimated grid, the (y, x) origin of that grid in full-frame
         pixels, and the decimation stride.
 
-    The loop over shots is deliberate. Vectorising over the whole stack
-    allocates an (N, H, W) temporary; a reused (H, W) scratch buffer is both far
-    smaller and measurably faster, since it stays in cache.
+    The per-shot loop is deliberate. Vectorising over the whole stack allocates
+    an (N, H, W) temporary; a reused (H, W) scratch buffer is both far smaller
+    and measurably faster, since it stays in cache. The shots are independent
+    and the score is a plain sum, so the loop is split across threads over
+    contiguous chunks of shots and the partial sums added at the end -- numpy
+    drops the GIL for every op inside, so this is real parallelism.
     """
     atoms = np.asarray(atoms)
     light = np.asarray(light)
@@ -187,28 +278,27 @@ def score_map_from_images(atoms, light, k=DEFAULT_K,
         atoms = atoms[:, ::step, ::step]
         light = light[:, ::step, ::step]
 
-    shape = atoms.shape[1:]
-    score = np.zeros(shape, dtype=np.float32)
-    scratch = np.empty(shape, dtype=np.int32)
+    height, width = atoms.shape[1:]
+    row_stride = _noise_row_stride(height, width, sigma_row_stride,
+                                   sigma_sample_cap)
+    scratch_dtype, acc_dtype = _work_dtypes(atoms.dtype, n_shots)
 
-    for i in range(n_shots):
-        # Signed difference. The dark frame cancels exactly:
-        # (atoms - dark) - (light - dark) == atoms - light.
-        np.subtract(atoms[i], light[i], out=scratch, dtype=np.int32)
+    workers = _n_workers(max_workers, n_shots)
+    if workers <= 1:
+        score = _accumulate_shots(atoms, light, range(n_shots), k, row_stride,
+                                  scratch_dtype, acc_dtype)
+    else:
+        chunks = [c for c in np.array_split(np.arange(n_shots), workers) if c.size]
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            partials = list(pool.map(
+                lambda idx: _accumulate_shots(atoms, light, idx, k, row_stride,
+                                              scratch_dtype, acc_dtype),
+                chunks))
+        score = partials[0]
+        for partial in partials[1:]:
+            score += partial
 
-        # Noise floor from adjacent-pixel differences, which pass pixel-to-pixel
-        # noise but suppress anything smooth -- the cloud, illumination
-        # gradients, low-order fringes. Estimated on the SIGNED difference;
-        # estimating on the rectified |d| would be a biased half-normal.
-        rows = scratch[::sigma_row_stride]
-        sigma = float(np.diff(rows, axis=-1).std()) / np.sqrt(2.)
-
-        np.abs(scratch, out=scratch)
-        np.subtract(scratch, int(k * sigma), out=scratch)
-        np.maximum(scratch, 0, out=scratch)
-        score += scratch
-
-    return score, (t, t), step
+    return score.astype(np.float32, copy=False), (t, t), step
 
 
 def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
@@ -220,7 +310,7 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
                 min_confidence=DEFAULT_MIN_CONFIDENCE,
                 max_area_frac=DEFAULT_MAX_AREA_FRAC,
                 compact_components=DEFAULT_COMPACT_COMPONENTS,
-                byte_budget=DEFAULT_BYTE_BUDGET):
+                byte_budget=DEFAULT_BYTE_BUDGET, max_workers=None):
     """Suggest an ROI bounding box for a run.
 
     Supply either atoms/light directly, or the flat images stack as it is stored
@@ -250,6 +340,8 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
         compact_components (int): a detection with at most this many components
             is a real cloud whatever its size, so the area gate does not apply.
         byte_budget (float): decimate when the touched volume exceeds this.
+        max_workers (int or None): threads to split the shot loop over. None
+            picks a small default; 1 runs inline.
 
     Returns:
         AutoRoiResult: the box plus the QC scalars behind it. Always returns a
@@ -284,7 +376,8 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
         return _failed("frame too small to trim")
 
     score, (off_y, off_x), step = score_map_from_images(
-        atoms, light, k=k, border_trim=border_trim, byte_budget=byte_budget)
+        atoms, light, k=k, border_trim=border_trim, byte_budget=byte_budget,
+        max_workers=max_workers)
 
     # Despike before smoothing. A hot pixel or a hot readout row exceeds the
     # noise floor on every single shot, so it accumulates exactly like a real

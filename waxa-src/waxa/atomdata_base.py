@@ -6,7 +6,7 @@ import time
 
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
-from waxa.roi import ROI
+from waxa.roi import ROI, prefetch_auto_roi
 from waxa.data.data_saver import DataSaver
 from waxa.base import Dealer, xvar
 from waxa.data.server_talk import server_talk as st
@@ -574,7 +574,9 @@ class atomdata_base():
 
         t_init = time.perf_counter()
         t_stage = time.perf_counter()
-        self._load_data(idx, path, lite=lite, roi_id=roi_id, ignore_images=ignore_images)
+        self._load_data(idx, path, lite=lite, roi_id=roi_id,
+                        ignore_images=ignore_images,
+                        skip_saved_roi=skip_saved_roi)
         self._timing['init_load_data_s'] = time.perf_counter() - t_stage
 
         ### Helper objects
@@ -596,9 +598,12 @@ class atomdata_base():
         else:
             self.roi = None
         self._timing['init_setup_helpers_roi_s'] = time.perf_counter() - t_stage
-        # Auto-ROI detection runs inside ROI.__init__, so pull its own timing
-        # out to keep it separately visible from the rest of ROI setup.
-        self._timing['init_suggest_roi_s'] = getattr(self.roi,'auto_roi_seconds',0.)
+        # Auto-ROI detection runs on a worker thread started back in
+        # _load_data, so this is only the time actually spent *waiting* on it
+        # here (normally ~0 -- it overlaps the rest of the load and the ROI
+        # dialog). Its own wall time is roi.auto_roi_compute_seconds.
+        self._timing['init_suggest_roi_wait_s'] = getattr(self.roi,'auto_roi_seconds',0.)
+        self._timing['init_suggest_roi_compute_s'] = getattr(self.roi,'auto_roi_compute_seconds',0.)
 
         t_stage = time.perf_counter()
         self._unshuffle_old_data()
@@ -613,13 +618,13 @@ class atomdata_base():
             print(
                 (
                     "[atomdata timing] init total={:.3f}s | load_data={:.3f}s | "
-                    "setup+roi={:.3f}s | suggest_roi={:.3f}s | unshuffle_old={:.3f}s | "
+                    "setup+roi={:.3f}s | suggest_roi_wait={:.3f}s | unshuffle_old={:.3f}s | "
                     "initial_analysis={:.3f}s"
                 ).format(
                     self._timing['init_total_s'],
                     self._timing['init_load_data_s'],
                     self._timing['init_setup_helpers_roi_s'],
-                    self._timing['init_suggest_roi_s'],
+                    self._timing['init_suggest_roi_wait_s'],
                     self._timing['init_unshuffle_old_data_s'],
                     self._timing['init_initial_analysis_s'],
                 )
@@ -2470,7 +2475,9 @@ class atomdata_base():
         dealer.N_xvars = len(self.xvardims)
         return dealer
 
-    def _load_data(self, idx=0, path = "", lite=False, roi_id=None, _allow_lite_autocreate=True, ignore_images=False):
+    def _load_data(self, idx=0, path = "", lite=False, roi_id=None,
+                   _allow_lite_autocreate=True, ignore_images=False,
+                   skip_saved_roi=False):
         t_load_total = time.perf_counter()
         timing = {}
 
@@ -2483,6 +2490,7 @@ class atomdata_base():
                 roi_id=roi_id,
                 _allow_lite_autocreate=False,
                 ignore_images=ignore_images,
+                skip_saved_roi=skip_saved_roi,
             )
             timing['fallback_full_load_s'] = time.perf_counter() - t_stage
 
@@ -2587,6 +2595,14 @@ class atomdata_base():
             print(self.run_info.run_id)
 
             t_stage = time.perf_counter()
+            # Read before the images: whether this run already carries an ROI
+            # decides whether the selection GUI (and so the auto-ROI
+            # detection) is coming, and it is two attribute reads.
+            if 'roix' in f.attrs and 'roiy' in f.attrs:
+                self._saved_roi_from_file = [f.attrs['roix'], f.attrs['roiy']]
+            timing['h5_saved_roi_attrs_s'] = time.perf_counter() - t_stage
+
+            t_stage = time.perf_counter()
             # has_images=False means no camera images were captured (e.g.
             # save_data=True but setup_camera=False).  Old files that pre-date
             # this attribute always have images, so we default to whether the
@@ -2604,10 +2620,20 @@ class atomdata_base():
             self.xvars = self._unpack_xvars()
             timing['h5_read_core_arrays_s'] = time.perf_counter() - t_stage
 
-            t_stage = time.perf_counter()
-            if 'roix' in f.attrs and 'roiy' in f.attrs:
-                self._saved_roi_from_file = [f.attrs['roix'], f.attrs['roiy']]
-            timing['h5_saved_roi_attrs_s'] = time.perf_counter() - t_stage
+            # The ROI selection GUI is about to open: start auto-detecting the
+            # cloud now, on a worker thread, so the suggestion is ready by the
+            # time the window is. It overlaps the rest of this load (the data
+            # vault and, usually, the scope traces). Gated on actually needing
+            # it -- a run that already carries an ROI never pays for this.
+            # roi_id given as an int or a string may still prompt; those paths
+            # start the job themselves when they open the dialog.
+            _will_prompt_for_roi = (roi_id == 'auto'
+                                    or (roi_id is None
+                                        and (skip_saved_roi
+                                             or not self._saved_roi_from_file)))
+            if self._has_images and not lite and _will_prompt_for_roi:
+                prefetch_auto_roi(self.run_info.run_id, self.images,
+                                  int(getattr(self.params, 'N_pwa_per_shot', 1)))
 
             class DataVault():
                 def __init__(self):
