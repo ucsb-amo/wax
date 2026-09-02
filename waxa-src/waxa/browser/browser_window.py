@@ -5,8 +5,22 @@ import re
 import sys
 from datetime import date, timedelta
 
-from PyQt6.QtCore import QDate, QItemSelectionModel, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontDatabase, QKeySequence, QPen, QShortcut
+from PyQt6.QtCore import QDate, QItemSelectionModel, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QShortcut,
+    QTransform,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -78,6 +92,34 @@ def _configure_browser_logging():
     browser_logger.addHandler(handler)
     browser_logger.propagate = False
     LOGGER.debug("Browser logging configured for terminal output")
+
+
+def make_cog_icon(color: str = "#ffffff", teeth: int = 8) -> QIcon:
+    """Build a cog/gear icon; Qt ships no standard settings icon."""
+    size = 64
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.translate(size / 2.0, size / 2.0)
+
+    body = QPainterPath()
+    body.addEllipse(QPointF(0.0, 0.0), size * 0.30, size * 0.30)
+
+    tooth_width = size * 0.15
+    tooth_height = size * 0.42
+    for index in range(teeth):
+        tooth = QPainterPath()
+        tooth.addRoundedRect(QRectF(-tooth_width / 2.0, -tooth_height, tooth_width, tooth_height), 3.0, 3.0)
+        body.addPath(QTransform().rotate(index * (360.0 / teeth)).map(tooth))
+
+    hub = QPainterPath()
+    hub.addEllipse(QPointF(0.0, 0.0), size * 0.12, size * 0.12)
+
+    painter.fillPath(body.simplified().subtracted(hub), QColor(color))
+    painter.end()
+    return QIcon(pixmap)
 
 
 def parse_name_search_terms(query: str):
@@ -806,6 +848,45 @@ class RunDetailPane(QWidget):
             QListWidgetItem("(none)", self.data_list)
 
 
+class FixedLineScrollTable(QTableWidget):
+    """Table that scrolls a fixed number of rows per wheel notch.
+
+    Overrides the OS/Qt "lines per scroll" setting so the run list always moves
+    a configurable number of rows per notch, regardless of system mouse settings.
+    """
+
+    DEFAULT_LINES_PER_WHEEL_NOTCH = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lines_per_wheel_notch = self.DEFAULT_LINES_PER_WHEEL_NOTCH
+        self._wheel_remainder = 0.0
+
+    def lines_per_wheel_notch(self):
+        return self._lines_per_wheel_notch
+
+    def set_lines_per_wheel_notch(self, lines: int):
+        self._lines_per_wheel_notch = max(1, int(lines))
+        self._wheel_remainder = 0.0
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0 or event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            # Horizontal wheels and modifier combos keep default behaviour.
+            super().wheelEvent(event)
+            return
+
+        # Accumulate fractions so high-resolution wheels/trackpads still scroll.
+        self._wheel_remainder += (delta / 120.0) * self._lines_per_wheel_notch
+        steps = int(self._wheel_remainder)
+        self._wheel_remainder -= steps
+
+        if steps:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() - steps * bar.singleStep())
+        event.accept()
+
+
 class DataBrowserWindow(QMainWindow):
     COL_RUN_ID = 0
     COL_DATETIME = 1
@@ -971,7 +1052,7 @@ class DataBrowserWindow(QMainWindow):
 
         self.options_btn = QToolButton(self)
         self.options_btn.setToolTip("Options")
-        self.options_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.options_btn.setIcon(make_cog_icon())
         self.options_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.options_menu = QMenu(self.options_btn)
         self.options_btn.setMenu(self.options_menu)
@@ -1009,7 +1090,8 @@ class DataBrowserWindow(QMainWindow):
         filter_row.addWidget(self.fields_btn)
         filter_row.addWidget(self.options_btn)
 
-        self.table = QTableWidget(self)
+        self.table = FixedLineScrollTable(self)
+        self.table.set_lines_per_wheel_notch(self._wheel_scroll_lines())
         self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels(
             [
@@ -3070,6 +3152,10 @@ class DataBrowserWindow(QMainWindow):
         auto_refresh_interval_action.triggered.connect(self._set_auto_refresh_interval)
         self.options_menu.addAction(auto_refresh_interval_action)
 
+        scroll_lines_action = QAction("Set Scroll Lines…", self.options_menu)
+        scroll_lines_action.triggered.connect(self._set_scroll_lines)
+        self.options_menu.addAction(scroll_lines_action)
+
         self.options_menu.addSeparator()
 
         self._dark_mode_action = QAction("Dark Mode", self.options_menu)
@@ -3118,6 +3204,34 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText(f"Auto-refresh interval set to {int(value)}s")
         else:
             self.status_label.setText(f"Auto-refresh interval saved ({int(value)}s)")
+
+    def _wheel_scroll_lines(self):
+        value = int(
+            self.settings.value(
+                "wheelScrollLines",
+                FixedLineScrollTable.DEFAULT_LINES_PER_WHEEL_NOTCH,
+                type=int,
+            )
+        )
+        return max(1, value)
+
+    def _set_scroll_lines(self):
+        current_value = self._wheel_scroll_lines()
+        value, ok = QInputDialog.getInt(
+            self,
+            "Scroll Lines",
+            "Rows per mouse wheel notch:",
+            current_value,
+            1,
+            50,
+            1,
+        )
+        if not ok:
+            return
+
+        self.settings.setValue("wheelScrollLines", int(value))
+        self.table.set_lines_per_wheel_notch(int(value))
+        self.status_label.setText(f"Scroll set to {int(value)} rows per wheel notch")
 
     def _change_data_dir(self):
         new_dir = QFileDialog.getExistingDirectory(

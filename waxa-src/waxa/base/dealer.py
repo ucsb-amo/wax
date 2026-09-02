@@ -245,6 +245,12 @@ class Dealer():
         if isinstance(var,np.ndarray):
             sdims = self._dims_to_sort(var,exclude_dims)
             for dim in sdims:
+                if var.strides[dim] == 0:
+                    # Broadcast (shared) axis — every entry along it references
+                    # the same data (e.g. a deduplicated scope time axis), so
+                    # reordering is a no-op and take() would only materialize
+                    # redundant copies.
+                    continue
                 N = var.shape[dim]
                 if N in self.sort_N:
                     i = np.where(np.array(self.sort_N) == N)[0][0]

@@ -26,6 +26,66 @@ _RETRYABLE_SAVE_EXC = (OSError, RuntimeError)
 # going away, so the stash must not live on the data drive.
 PENDING_SAVE_DIRNAME = "pending_saves"
 
+
+def dedup_time_axes(t):
+    """Group per-shot scope time axes into unique rows plus a per-shot map.
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Per-shot time axes shaped ``(*shot_dims, Npts)``.
+
+    Returns
+    -------
+    (t_unique, t_map):
+        ``t_unique`` is ``(n_unique, Npts)`` holding the distinct axes in
+        first-occurrence order; ``t_map`` is ``(*shot_dims,)`` of int64
+        indices into ``t_unique`` giving each shot its axis.
+
+    Rows are compared bitwise, so axes that are NaN-padded the same way
+    (e.g. aborted shots) group together.
+    """
+    t = np.ascontiguousarray(t)
+    shot_shape = t.shape[:-1]
+    npts = int(t.shape[-1]) if t.ndim else 0
+    rows = t.reshape(-1, npts)
+    if rows.shape[0] == 0 or npts == 0:
+        return rows.copy(), np.zeros(shot_shape, dtype=np.int64)
+    void_rows = rows.view(np.dtype((np.void, rows.dtype.itemsize * npts))).ravel()
+    _, first_idx, inverse = np.unique(void_rows, return_index=True, return_inverse=True)
+    # np.unique sorts by byte value; reorder groups by first occurrence.
+    order = np.argsort(first_idx)
+    rank = np.empty(len(order), dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    t_unique = rows[first_idx[order]].copy()
+    t_map = rank[np.asarray(inverse).ravel()].reshape(shot_shape)
+    return t_unique, t_map
+
+
+def write_scope_time_axes(group, t):
+    """Write the time-axis dataset(s) for one scope group, deduplicated.
+
+    Most runs use the same time base for every shot, so storing one axis per
+    shot wastes space.  Written formats (detected on load by
+    ``waxa.atomdata_base.format_scope_data``):
+
+    * all shots share one axis → 1-D ``t`` of shape ``(Npts,)``
+    * several distinct axes     → ``t`` of shape ``(n_unique, Npts)`` plus an
+      int ``t_map`` of shape ``(*shot_dims,)`` mapping each shot to its axis.
+      The caller passes ``t`` already unshuffled, so the map is stored in
+      final shot order and survives shuffled scans.
+    """
+    t = np.asarray(t)
+    if t.ndim <= 1:
+        group.create_dataset('t', data=t, compression='gzip', compression_opts=4)
+        return
+    t_unique, t_map = dedup_time_axes(t)
+    if t_unique.shape[0] == 1:
+        group.create_dataset('t', data=t_unique[0], compression='gzip', compression_opts=4)
+    else:
+        group.create_dataset('t', data=t_unique, compression='gzip', compression_opts=4)
+        group.create_dataset('t_map', data=t_map)
+
 class DataSaver():
     def __init__(self,
                  data_dir="",
@@ -199,7 +259,7 @@ class DataSaver():
                 # take the voltage values
                 # resulting shape: (n0,...,nN,Nch,Npts)
                 v = np.take(data,1,-2)
-                this_scope_data.create_dataset('t', data=t, compression='gzip', compression_opts=4)
+                write_scope_time_axes(this_scope_data, t)
                 this_scope_data.create_dataset('v', data=v, compression='gzip', compression_opts=4)
 
     def _save_expt_files_text(self,
@@ -1004,7 +1064,7 @@ class DataSaver():
         scope_data_grp = f["data"].create_group("scope_data")
         for label, t, v in scope_traces:
             this_scope = scope_data_grp.create_group(label)
-            this_scope.create_dataset("t", data=t, compression='gzip', compression_opts=4)
+            write_scope_time_axes(this_scope, t)
             this_scope.create_dataset("v", data=v, compression='gzip', compression_opts=4)
 
 

@@ -168,7 +168,12 @@ class Expt(Scanner, Dealer, Scribe):
     
     def apply_pending_adjust_values(self):
         """Apply any adjust-panel values received from the last SHOT_COMPLETE reply."""
+        specs = {s.key: s for s in self._adjust_specs}
         for key, val in self._pending_adjust_values.items():
+            spec = specs.get(key)
+            if spec is not None:
+                # values arrive from the GUI as floats -- restore the registered dtype
+                val = spec.coerce(val, like=getattr(self.params, key, None))
             setattr(self.params, key, val)
 
     def compute_new_derived(self):

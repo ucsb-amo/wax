@@ -40,6 +40,8 @@ class atomdata(atomdata_base):
         transpose_idx=[],
         avg_repeats=False,
         ignore_images=False,
+        decimate_scope_data=None,
+        smooth_decimate=True,
         server_talk=st(),
     ):
         super().__init__(
@@ -51,6 +53,8 @@ class atomdata(atomdata_base):
             transpose_idx=transpose_idx,
             avg_repeats=avg_repeats,
             ignore_images=ignore_images,
+            decimate_scope_data=decimate_scope_data,
+            smooth_decimate=smooth_decimate,
             server_talk=server_talk,
         )
 
@@ -322,8 +326,8 @@ class atomdata(atomdata_base):
 
     def compute_atom_number(self):
         # cross section = 3 lambda^2 / 2 pi (for two-level system)
-        # self.atom_cross_section = 5.878324268151581e-13 # at 0-field
-        self.atom_cross_section = 2.8316243e-13 # for stretch transition (high field)
+        self.atom_cross_section = 5.878324268151581e-13 # at 0-field
+        # self.atom_cross_section = 2.8316243e-13 # for stretch transition (high field)
         dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
 
         self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / self.atom_cross_section
