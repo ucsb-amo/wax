@@ -130,28 +130,39 @@ class Scanner():
         if any([fc in xvar.key for fc in forbidden_chars]):
             raise ValueError("Key contains forbidden characters.")
 
-    def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None):
+    def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None,
+               default_val=None):
         """Register a parameter for live adjustment between shots via the liveOD Adjust panel.
 
         Args:
             param_key (str): ExptParams attribute to adjust.
-            min_val (float, optional): Minimum allowed value. Defaults to current value - 0.2.
-            max_val (float, optional): Maximum allowed value. Defaults to current value + 0.2.
+            min_val (float, optional): Minimum allowed value. Defaults to default value - 0.2.
+            max_val (float, optional): Maximum allowed value. Defaults to default value + 0.2.
             step (float, optional): Spinbox step size. Defaults to (max-min)/50.
                 For dtype=int the minimum effective step is 1.
-            dtype (type): float (default) or int.
+            dtype (type): float or int. Defaults to the type of the default value.
+            default_val (optional): Value the param starts at, and the value the
+                Adjust panel's reset (↺) button reverts to. If not given, the
+                param's existing value in ExptParams is used, or min_val if the
+                param does not exist yet. When given explicitly, it is written
+                into ExptParams, overwriting any existing value.
         """
+        param_exists = param_key in vars(self.params)
+        default_given = default_val is not None
+        if not default_given and param_exists:
+            default_val = vars(self.params)[param_key]
         if dtype is None:
-            if param_key not in vars(self.params):
-                raise ValueError(f"param {param_key!r} does not already exist, so a dtype must be provided")
-            raw_val = vars(self.params)[param_key]
-            dtype = int if isinstance(raw_val, (int, np.integer)) else float
+            if default_val is None:
+                raise ValueError(
+                    f"param {param_key!r} does not already exist, so a dtype or default_val must be provided"
+                )
+            dtype = int if isinstance(default_val, (int, np.integer)) else float
         if min_val is None or max_val is None:
-            current = getattr(self.params, param_key, 0.0)
+            current = float(default_val) if default_val is not None else 0.0
             if min_val is None:
-                min_val = float(current) - 0.2
+                min_val = current - 0.2
             if max_val is None:
-                max_val = float(current) + 0.2
+                max_val = current + 0.2
         if any(s.key == param_key for s in self._adjust_specs):
             raise ValueError(f"adjust key {param_key!r} already registered.")
         if param_key in self.xvarnames:
@@ -162,12 +173,16 @@ class Scanner():
             step = max(1, round(raw)) if dtype == int else raw
         elif dtype == int:
             step = max(1, int(step))
-        current_val = dtype(max(min_val, min(max_val, getattr(self.params, param_key, min_val))))
-        if param_key not in vars(self.params):
-            vars(self.params)[param_key] = current_val
-        self._adjust_specs.append(
-            AdjustSpec(param_key, min_val, max_val, step, dtype, current_val)
-        )
+        if default_val is None:
+            default_val = min_val
+        current_val = dtype(max(min_val, min(max_val, default_val)))
+        spec = AdjustSpec(param_key, min_val, max_val, step, dtype, current_val)
+        if not param_exists or default_given:
+            # coerce with like= so an existing numpy int type (and therefore the
+            # kernel writer it is assigned to) is preserved.
+            vars(self.params)[param_key] = spec.coerce(
+                current_val, like=vars(self.params).get(param_key))
+        self._adjust_specs.append(spec)
 
     def apply_pending_adjust_values(self):
         """Apply GUI-side adjust values to host params. Overridden in Expt."""
