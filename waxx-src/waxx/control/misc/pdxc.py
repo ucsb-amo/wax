@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 SERVER_ID = "pdxc"
 _BAUD = 115200
 _TIMEOUT_S = 2.0
-_MOVE_MARGIN_S = 1.0        # settle margin added to the computed move duration
+_MOVE_MARGIN_S = 1.2        # settle margin added to each move's computed duration
 _MOVE_TCP_TIMEOUT = 290.0   # client socket timeout for a full move
 _MOVE_METHODS = ("move_in", "move_out", "move_to")   # long-running: move lock
 
@@ -46,12 +46,12 @@ POSITION_OUT = "out"          # beamsplitter retracted: camera clear
 POSITION_UNKNOWN = "unknown"
 _POSITIONS = (POSITION_IN, POSITION_OUT)
 
-# Pulses driven by move_to() for a full end-to-end throw.  Sent in chunks of
-# MAX_PULSES.  The default matches the 2 x 60000 throw this driver originally
-# used; overdriving is harmless (the stage slips at the end stop), underdriving
-# leaves the stage short of position, so err high.
-_DEFAULT_THROW_PULSES = 120000
-_MAX_THROW_PULSES = 10 * MAX_PULSES
+# move_to() drives a fixed number of fixed-length moves into the end stop.
+# The throw is asymmetric: "in" takes two moves, "out" one.  Overdriving is
+# harmless (the stage slips at the stop), underdriving leaves it short.
+_DEFAULT_THROW_PULSES = 40000     # pulses per move
+_DEFAULT_MOVES = {POSITION_IN: 2, POSITION_OUT: 1}
+_MAX_THROW_MOVES = 10
 
 # Step size, throw length and last commanded position are persisted on the
 # *server* host so they survive server restarts and greet every client.
@@ -104,8 +104,16 @@ class PDXC:
         self._step_size: int = self._sane(
             _defaults.get("step_size"), MIN_PULSES, MAX_PULSES, MAX_PULSES, "step_size")
         self._throw_pulses: int = self._sane(
-            _defaults.get("throw_pulses"), MIN_PULSES, _MAX_THROW_PULSES,
+            _defaults.get("throw_pulses"), MIN_PULSES, MAX_PULSES,
             _DEFAULT_THROW_PULSES, "throw_pulses")
+        _moves = _defaults.get("throw_moves")
+        if not isinstance(_moves, dict):
+            _moves = {}
+        self._throw_moves: dict = {
+            state: self._sane(_moves.get(state), 1, _MAX_THROW_MOVES, default,
+                              f"throw_moves[{state}]")
+            for state, default in _DEFAULT_MOVES.items()
+        }
         _pos = _defaults.get("position")
         self._position: str = _pos if _pos in _POSITIONS else POSITION_UNKNOWN
         logger.info("PDXC connected on %s at %d baud", port, baudrate)
@@ -301,6 +309,7 @@ class PDXC:
             with open(_DEFAULTS_FILE, "w") as fh:
                 json.dump({"step_size": self._step_size,
                            "throw_pulses": self._throw_pulses,
+                           "throw_moves": self._throw_moves,
                            "position": self._position}, fh, indent=2)
         except Exception as exc:
             logger.warning("[PDXC] Could not write defaults file: %s", exc)
@@ -319,19 +328,38 @@ class PDXC:
         return self._step_size
 
     def get_throw_pulses(self) -> int:
-        """Return the pulse count move_to() drives for a full throw."""
+        """Return the pulse count of each move issued by move_to()."""
         return self._throw_pulses
 
     def set_throw_pulses(self, pulses: int) -> int:
-        """Set and persist the full-throw pulse count used by move_to()."""
+        """Set and persist the per-move pulse count used by move_to()."""
         pulses = int(pulses)
-        if not MIN_PULSES <= pulses <= _MAX_THROW_PULSES:
-            raise ValueError(
-                f"throw must be {MIN_PULSES}-{_MAX_THROW_PULSES}, got {pulses}"
-            )
+        if not MIN_PULSES <= pulses <= MAX_PULSES:
+            raise ValueError(f"throw must be {MIN_PULSES}-{MAX_PULSES}, got {pulses}")
         self._throw_pulses = pulses
         self._save_defaults()
         return self._throw_pulses
+
+    def get_throw_moves(self, state: str) -> int:
+        """Return how many moves move_to() issues to reach *state*."""
+        return self._throw_moves[self._valid_state(state)]
+
+    def set_throw_moves(self, state: str, moves: int) -> int:
+        """Set and persist how many moves move_to() issues to reach *state*."""
+        state = self._valid_state(state)
+        moves = int(moves)
+        if not 1 <= moves <= _MAX_THROW_MOVES:
+            raise ValueError(f"moves must be 1-{_MAX_THROW_MOVES}, got {moves}")
+        self._throw_moves[state] = moves
+        self._save_defaults()
+        return self._throw_moves[state]
+
+    @staticmethod
+    def _valid_state(state: str) -> str:
+        state = str(state).lower()
+        if state not in _POSITIONS:
+            raise ValueError(f"position must be one of {_POSITIONS}, got {state!r}")
+        return state
 
     def get_position_state(self) -> str:
         """Return the last commanded position: 'in', 'out' or 'unknown'."""
@@ -415,28 +443,26 @@ class PDXC:
     def move_to(self, state: str, channel: int = 0, force: bool = False) -> str:
         """Drive the stage to the named end stop and remember it got there.
 
-        Unlike the move_in / move_out jogs this drives the full throw
-        (``get_throw_pulses()``, sent in MAX_PULSES chunks) so the stage lands
-        against its mechanical stop regardless of where it started.
+        Unlike the move_in / move_out jogs this drives the full throw so the
+        stage lands against its mechanical stop regardless of where it
+        started: ``get_throw_moves(state)`` moves of ``get_throw_pulses()``
+        pulses each.  The throw is asymmetric -- "in" takes two moves, "out"
+        one -- so the two directions are configured separately.
 
         Returns immediately with "already <state>" when the stage was last
         commanded there, so calling this at the top of every experiment costs
         nothing after the first run.  Pass ``force=True`` to move anyway.
         """
-        state = str(state).lower()
-        if state not in _POSITIONS:
-            raise ValueError(f"position must be one of {_POSITIONS}, got {state!r}")
+        state = self._valid_state(state)
         if self._position == state and not force:
             return f"already {state}"
 
         direction = "MOVB" if state == POSITION_IN else "MOVF"
-        remaining = self._throw_pulses
+        steps = self._throw_pulses
         self._mark_position(POSITION_UNKNOWN)   # mid-throw: neither end
-        while remaining > 0:
-            chunk = min(remaining, MAX_PULSES)
-            self._move_one(direction, chunk, channel)
-            self._wait_stopped(chunk)
-            remaining -= chunk
+        for _ in range(self._throw_moves[state]):
+            self._move_one(direction, steps, channel)
+            self._wait_stopped(steps)
         self.check_error()
         self._mark_position(state)
         return f"moved {state}"
@@ -626,8 +652,16 @@ class PDXC_Client(NetClient):
         return int(self._call("get_throw_pulses"))
 
     def set_throw_pulses(self, pulses: int) -> int:
-        """Set and persist the full-throw pulse count used by move_to()."""
+        """Set and persist the per-move pulse count used by move_to()."""
         return int(self._call("set_throw_pulses", pulses=int(pulses)))
+
+    def get_throw_moves(self, state: str) -> int:
+        """Return how many moves move_to() issues to reach *state*."""
+        return int(self._call("get_throw_moves", state=state))
+
+    def set_throw_moves(self, state: str, moves: int) -> int:
+        """Set and persist how many moves move_to() issues to reach *state*."""
+        return int(self._call("set_throw_moves", state=state, moves=int(moves)))
 
 
 __all__ = ["PDXC", "PDXC_Server", "PDXC_Client", "SERVER_ID",
