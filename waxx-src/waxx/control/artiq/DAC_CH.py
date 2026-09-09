@@ -1,9 +1,9 @@
-from numpy import sqrt, exp
-
-from artiq.experiment import kernel, rpc, delay
+from artiq.experiment import kernel, rpc
 from artiq.language.core import now_mu, at_mu
 from artiq.coredevice.zotino import Zotino
 
+from waxx.control.artiq.ramp_math import (linear_step, cubic_coeffs,
+                                          exponential_coeffs, adiabatic_coeffs)
 from waxx.util.artiq.async_print import aprint
 
 dv = -10432.
@@ -54,30 +54,63 @@ class DAC_CH():
 
     @kernel(flags={"fast-math"})
     def linear_ramp(self,t,v_start,v_end,n):
+        """Ramp v_start -> v_end linearly.
+
+        Uses absolute timestamps, so the ramp lasts exactly t.
+
+        Args:
+            t (float): ramp duration (s).
+            v_start (float): starting voltage (V).
+            v_end (float): final voltage (V).
+            n (int): number of steps.
+        """
         if self.ch < 0:
             return
-        v0 = v_start
-        vf = v_end
-        delta_v = (vf-v0)/(n-1)
-        dt = t/n
+        if (v_start > self.max_v) or (v_end > self.max_v):
+            self.max_voltage_error()
+            return
+
+        dv_step = linear_step(v_start,v_end,n)
+        dt_mu = self.dac_device.core.seconds_to_mu(t / n)
+
+        t_mu = now_mu()
         for i in range(n):
-            self.set(v=v0+i*delta_v)
-            delay(dt)
+            at_mu(t_mu)
+            self.dac_device.write_dac(self.ch, v_start + i*dv_step)
+            self.dac_device.load()
+            t_mu += dt_mu
+        at_mu(t_mu)
+        self.v = v_end
 
     @kernel(flags={"fast-math"})
     def cubic_ramp(self,t,v_start,v_end,n):
+        """Ramp v_start -> v_end on a smoothstep (zero slope at both ends).
+
+        Uses absolute timestamps, so the ramp lasts exactly t.
+
+        Args:
+            t (float): ramp duration (s).
+            v_start (float): starting voltage (V).
+            v_end (float): final voltage (V).
+            n (int): number of steps.
+        """
         if self.ch < 0:
             return
-        v0 = v_start
-        vf = v_end
-        dt = t/n
-        A = -2*(vf-v0)/t**3
-        B =  3*(vf-v0)/t**2
-        Adt3 = A * dt**3
-        Bdt2 = B * dt**2
+        if (v_start > self.max_v) or (v_end > self.max_v):
+            self.max_voltage_error()
+            return
+
+        Adt3, Bdt2 = cubic_coeffs(t,v_start,v_end,n)
+        dt_mu = self.dac_device.core.seconds_to_mu(t / n)
+
+        t_mu = now_mu()
         for i in range(n):
-            self.set(v = Adt3 * i**3 + Bdt2 * i**2 + v0)
-            delay(dt)
+            at_mu(t_mu)
+            self.dac_device.write_dac(self.ch, Adt3 * i**3 + Bdt2 * i**2 + v_start)
+            self.dac_device.load()
+            t_mu += dt_mu
+        at_mu(t_mu)
+        self.v = v_end
 
     @kernel(flags={"fast-math"})
     def exponential_ramp(self,t,v_start,v_end,n,tau=dv):
@@ -91,7 +124,8 @@ class DAC_CH():
 
         Computed iteratively: exp() is evaluated twice up front and the loop
         carries a running factor e *= k, so each step costs one multiply and one
-        multiply-add. No exp/pow inside the loop.
+        multiply-add. No exp/pow inside the loop. See ramp_math for the
+        coefficient setup.
 
         Args:
             t (float): ramp duration (s).
@@ -111,14 +145,8 @@ class DAC_CH():
         if (v_start > self.max_v) or (v_end > self.max_v):
             self.max_voltage_error()
             return
-        # tau = 0 divides by zero; |tau| >> t sends the 1 - E normalisation to
-        # 0/0, and is a linear ramp to well within a DAC LSB anyway
-        if (tau == 0.) or (tau > 1000.*t) or (tau < -1000.*t):
-            raise ValueError('exponential_ramp needs 0 < |tau| < 1000*t')
 
-        e_end = exp(-t / tau)
-        k = exp(-(t / (n - 1)) / tau)   # per-step factor, k**(n-1) == e_end
-        a = (v_start - v_end) / (1. - e_end)
+        a, k, e_end = exponential_coeffs(t,v_start,v_end,n,tau)
 
         e = 1.
         dt_mu = self.dac_device.core.seconds_to_mu(t / n)
@@ -135,37 +163,15 @@ class DAC_CH():
     # -------------------------------------------------------------------------
     # constant-adiabaticity ramps (ODT power ramp-up)
     # -------------------------------------------------------------------------
-    #
-    # For a dipole trap U ~ P and omega ~ sqrt(U) ~ sqrt(P), so the adiabaticity
-    # parameter is
-    #
-    #     eps = |d(omega)/dt| / omega**2 = |d(1/omega)/dt|
-    #
-    # Holding eps constant therefore means 1/omega -- and hence 1/sqrt(P) -- is
-    # LINEAR in time. With the PID setpoint linear in power, P ~ (v - v_offset),
-    # the exact constant-eps trajectory over a ramp of duration t is
-    #
-    #     u(s) = u0 + (uf - u0)*s ,   u = 1/sqrt(v - v_offset) ,   s = t'/t
-    #     v(s) = 1/u(s)**2 + v_offset
-    #
-    # equivalently, for v_offset = 0,
-    #
-    #     v(s) = v_start / (1 - s*(1 - sqrt(v_start/v_end)))**2
-    #
-    # The linear-in-u form is the fast one: one add and one divide per step, no
-    # sqrt or pow inside the loop.
-    #
-    # Note that v_start -> v_offset (zero power) is unreachable: at constant eps
-    # it takes infinite time to leave omega = 0. Start from a small but finite
-    # setpoint -- the first bit of the ramp is non-adiabatic no matter what.
+    # See ramp_math.adiabatic_coeffs for the derivation.
 
     @kernel(flags={"fast-math"})
     def adiabatic_ramp(self,t,v_start,v_end,n,v_offset=0.05):
         """Ramp v_start -> v_end at constant adiabaticity parameter, computing
         the trajectory on the core device.
 
-        Drop-in sibling of linear_ramp / cubic_ramp. Uses absolute timestamps,
-        so the ramp lasts exactly t (linear_ramp overruns by n*(t_spi+t_ldac)).
+        Drop-in sibling of linear_ramp / cubic_ramp. Like them, it uses
+        absolute timestamps, so the ramp lasts exactly t.
 
         The Kasli CPU has no hardware FPU, so the per-step divide is soft-float.
         Below ~10 us/step use plan_adiabatic_ramp() + play() instead, which does
@@ -181,17 +187,11 @@ class DAC_CH():
         """
         if self.ch < 0:
             return
-        w0 = v_start - v_offset
-        wf = v_end - v_offset
-        if (w0 <= 0.) or (wf <= 0.):
-            raise ValueError('ramp cannot go to zero')
-            return
         if (v_start > self.max_v) or (v_end > self.max_v):
             self.max_voltage_error()
             return
 
-        u = 1. / sqrt(w0)
-        du = (1. / sqrt(wf) - u) / (n - 1)
+        u, du = adiabatic_coeffs(v_start,v_end,n,v_offset)
         dt_mu = self.dac_device.core.seconds_to_mu(t / n)
 
         t_mu = now_mu()
