@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 SERVER_ID = "pdxc"
 _BAUD = 115200
 _TIMEOUT_S = 2.0
-_MOVE_MARGIN_S = 1.2        # settle margin added to each move's computed duration
+_MOVE_MARGIN_S = 0.3        # settle margin added to each move's computed duration
 _MOVE_TCP_TIMEOUT = 290.0   # client socket timeout for a full move
 _MOVE_METHODS = ("move_in", "move_out", "move_to")   # long-running: move lock
 
@@ -47,10 +47,10 @@ POSITION_UNKNOWN = "unknown"
 _POSITIONS = (POSITION_IN, POSITION_OUT)
 
 # move_to() drives a fixed number of fixed-length moves into the end stop.
-# The throw is asymmetric: "in" takes two moves, "out" one.  Overdriving is
+# The throw is asymmetric: "in" takes three moves, "out" one.  Overdriving is
 # harmless (the stage slips at the stop), underdriving leaves it short.
 _DEFAULT_THROW_PULSES = 40000     # pulses per move
-_DEFAULT_MOVES = {POSITION_IN: 2, POSITION_OUT: 1}
+_DEFAULT_MOVES = {POSITION_IN: 3, POSITION_OUT: 1}
 _MAX_THROW_MOVES = 10
 
 # Step size, throw length and last commanded position are persisted on the
@@ -446,8 +446,8 @@ class PDXC:
         Unlike the move_in / move_out jogs this drives the full throw so the
         stage lands against its mechanical stop regardless of where it
         started: ``get_throw_moves(state)`` moves of ``get_throw_pulses()``
-        pulses each.  The throw is asymmetric -- "in" takes two moves, "out"
-        one -- so the two directions are configured separately.
+        pulses each.  The throw is asymmetric -- "in" takes three moves,
+        "out" one -- so the two directions are configured separately.
 
         Returns immediately with "already <state>" when the stage was last
         commanded there, so calling this at the top of every experiment costs
