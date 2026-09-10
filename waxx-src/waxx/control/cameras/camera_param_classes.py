@@ -106,3 +106,45 @@ class AndorParams(CameraParams):
             self.amp_imaging = self.__amp_dispersive__
             self.exposure_time = self.__exposure_time_dispersive__
             self.gain = self.__em_gain_dispersive
+
+class APDParams(AndorParams):
+    """The APD that shares the Andor imaging port.
+
+    Not a camera: a beamsplitter on the PDXC stage picks light off ahead of the
+    Andor and sends it to an avalanche photodiode, read out through the analog
+    integrator on Sampler ch 7.  It is an entry in `cameras` because selecting
+    it has to configure everything a camera selection configures -- trigger
+    TTL, imaging shutters, SLM phase mask, imaging amplitude and detuning --
+    plus the pickoff stage, and doing that by hand through four coupled
+    Base.__init__ flags was error-prone.
+
+    Subclasses AndorParams so every optical parameter (amplitudes, exposure
+    times, EM gains, magnification, pixel size, trigger timing) is the Andor's
+    by construction.  What differs is only what is not about light:
+
+      camera_type = "apd"        -> CameraNanny opens a DummyCamera rather than
+                                    a second AndorEMCCD handle on the same
+                                    hardware (it caches by key, dispatches by
+                                    camera_type).
+      optical_path_key = "andor" -> inherits the Andor's shutter and SLM
+                                    routing.  Getting this wrong reads as "the
+                                    APD sees nothing".
+      resolution = (1, 1)        -> no pixels; keeps prepare_image_array from
+                                    allocating a full 512x512 frame per image
+                                    on a run that takes no images.
+      _default_setup_camera      -> False; no liveOD camera thread, since the
+                                    stage blocks the camera when it is in.
+      _default_imaging_type      -> DISPERSIVE.
+      _default_apd_stage         -> True; move the pickoff stage in.
+
+    select_imaging_type is inherited unchanged: AndorParams.__init__ sets the
+    name-mangled _AndorParams__em_gain_* attributes on this instance, so the
+    inherited lookup resolves.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(resolution=(1,1,), **kwargs)
+        self.camera_type = "apd"
+        self.optical_path_key = "andor"
+        self._default_setup_camera = False
+        self._default_imaging_type = img_types.DISPERSIVE
+        self._default_apd_stage = True
