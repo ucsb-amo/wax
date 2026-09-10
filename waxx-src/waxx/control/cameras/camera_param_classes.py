@@ -134,17 +134,20 @@ class APDParams(AndorParams):
                                     on a run that takes no images.
       _default_setup_camera      -> False; no liveOD camera thread, since the
                                     stage blocks the camera when it is in.
-      _default_imaging_type      -> DISPERSIVE.
       _default_apd_stage         -> True; move the pickoff stage in.
+
+    Imaging type is not among them: the APD works with absorption or dispersive
+    imaging, and which one is a property of the measurement.  Pass imaging_type
+    to Base.__init__ as with any other detector.
 
     select_imaging_type is inherited unchanged: AndorParams.__init__ sets the
     name-mangled _AndorParams__em_gain_* attributes on this instance, so the
-    inherited lookup resolves.
+    inherited lookup resolves -- so the APD gets the Andor's amplitude,
+    exposure and gain for whichever imaging type is chosen.
     """
     def __init__(self, **kwargs):
         super().__init__(resolution=(1,1,), **kwargs)
         self.camera_type = "apd"
         self.optical_path_key = "andor"
         self._default_setup_camera = False
-        self._default_imaging_type = img_types.DISPERSIVE
         self._default_apd_stage = True

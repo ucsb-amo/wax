@@ -1,6 +1,3 @@
-from waxa.config.img_types import img_types
-
-
 class CameraParams():
     # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
     def __init__(self):
@@ -41,8 +38,11 @@ class CameraParams():
         # does belong here.  Host-side only, never in a kernel; the leading
         # underscore keeps them out of the liveOD payload and the HDF5
         # camera_params group.
+        #
+        # imaging_type is deliberately NOT here: absorption vs dispersive is a
+        # property of the measurement, not of the detector.  Every detector,
+        # the APD included, works with either.
         self._default_setup_camera = True       # does selecting this grab frames?
-        self._default_imaging_type = img_types.ABSORPTION
         self._default_apd_stage = False         # retract; clear the camera
 
     def select_imaging_type(self,imaging_type):
