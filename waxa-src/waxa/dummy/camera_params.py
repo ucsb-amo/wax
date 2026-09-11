@@ -33,17 +33,5 @@ class CameraParams():
         # CameraParams placeholders built before choose_camera runs.
         self.optical_path_key = ""
 
-        # What selecting this detector implies when the experiment says
-        # nothing.  Policy, not optical tuning, so unlike everything above it
-        # does belong here.  Host-side only, never in a kernel; the leading
-        # underscore keeps them out of the liveOD payload and the HDF5
-        # camera_params group.
-        #
-        # imaging_type is deliberately NOT here: absorption vs dispersive is a
-        # property of the measurement, not of the detector.  Every detector,
-        # the APD included, works with either.
-        self._default_setup_camera = True       # does selecting this grab frames?
-        self._default_apd_stage = False         # retract; clear the camera
-
     def select_imaging_type(self,imaging_type):
         pass

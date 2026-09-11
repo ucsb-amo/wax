@@ -118,9 +118,10 @@ class APDParams(AndorParams):
     plus the pickoff stage, and doing that by hand through four coupled
     Base.__init__ flags was error-prone.
 
-    Subclasses AndorParams so every optical parameter (amplitudes, exposure
-    times, EM gains, magnification, pixel size, trigger timing) is the Andor's
-    by construction.  What differs is only what is not about light:
+    Subclasses AndorParams, so it takes the same parameters and defaults as
+    the Andor.  kexp.config.camera_id sets its values; they may differ from
+    the Andor's, e.g. where a setting only matters to a camera sensor (EM
+    gain, magnification).  What differs structurally:
 
       camera_type = "apd"        -> CameraNanny opens a DummyCamera rather than
                                     a second AndorEMCCD handle on the same
@@ -132,22 +133,22 @@ class APDParams(AndorParams):
       resolution = (1, 1)        -> no pixels; keeps prepare_image_array from
                                     allocating a full 512x512 frame per image
                                     on a run that takes no images.
-      _default_setup_camera      -> False; no liveOD camera thread, since the
-                                    stage blocks the camera when it is in.
-      _default_apd_stage         -> True; move the pickoff stage in.
 
-    Imaging type is not among them: the APD works with absorption or dispersive
+    camera_type = "apd" is also what Base keys on: setup_camera=True with the
+    APD means acquire through it -- pickoff stage in, no liveOD frames -- and
+    the experiment's own kernel does the reading (integrated_imaging_pulse).
+    See kexp.base.cameras.resolve_run_config.
+
+    Imaging type is not among the differences: the APD works with absorption or dispersive
     imaging, and which one is a property of the measurement.  Pass imaging_type
     to Base.__init__ as with any other detector.
 
     select_imaging_type is inherited unchanged: AndorParams.__init__ sets the
     name-mangled _AndorParams__em_gain_* attributes on this instance, so the
-    inherited lookup resolves -- so the APD gets the Andor's amplitude,
-    exposure and gain for whichever imaging type is chosen.
+    inherited lookup resolves to the APD's own amplitude, exposure and gain
+    for whichever imaging type is chosen.
     """
     def __init__(self, **kwargs):
         super().__init__(resolution=(1,1,), **kwargs)
         self.camera_type = "apd"
         self.optical_path_key = "andor"
-        self._default_setup_camera = False
-        self._default_apd_stage = True
