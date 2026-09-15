@@ -1,4 +1,3 @@
-import glob
 import json
 import logging
 import os
@@ -15,7 +14,7 @@ _SCAN_WORKERS = 8  # parallel HDF5 reader threads
 LOGGER = logging.getLogger(__name__)
 
 from .cache import MetadataCache
-from ..plotting.plotting_1d import detect_unit
+from ..plotting.units import detect_unit
 from .run_summary import RunSummary
 
 EXCLUDED_DATA_KEYS = {
@@ -27,6 +26,15 @@ EXCLUDED_DATA_KEYS = {
 }
 
 PARAM_SEARCH_MODES = ("params", "camera_params", "data")
+
+# Datasets larger than this (in elements) are never read in full by the param
+# search loader: only a small leading slice is fetched for the preview and the
+# min/max/all_same summary is skipped.  Keeps `data/images` (hundreds of MB)
+# from being pulled over the network every time the selected run changes.
+PARAM_FULL_READ_MAX_ELEMENTS = 200_000
+
+# Datasets that are never worth previewing element-wise in the param search.
+PARAM_SEARCH_NO_READ_KEYS = {"images", "scope_data"}
 
 
 def _format_worker_exception(context: str, exc: Exception):
@@ -57,6 +65,73 @@ def _path_basename_no_ext(path_value):
     if basename.endswith(".py"):
         basename = basename[:-3]
     return basename, path_str
+
+
+def _run_id_from_filename(name: str):
+    try:
+        return int(name.split("_")[0])
+    except Exception:
+        return None
+
+
+def _parse_date_folder_name(name: str):
+    try:
+        return datetime.strptime(name, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _list_date_folders(data_dir: str):
+    """Return [(date, full_path)] for every YYYY-MM-DD folder under data_dir,
+    sorted ascending by date.  One directory read; no per-entry stat calls."""
+    folders = []
+    try:
+        with os.scandir(data_dir) as entries:
+            for entry in entries:
+                if entry.name == "_lite":
+                    continue
+                folder_date = _parse_date_folder_name(entry.name)
+                if folder_date is None:
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                folders.append((folder_date, entry.path))
+    except OSError:
+        return []
+    folders.sort(key=lambda item: item[0])
+    return folders
+
+
+def _scan_hdf5_files(folder: str, with_stat: bool = True):
+    """Return [(run_id, path, stat_or_None)] for *.hdf5 files in folder.
+
+    Uses os.scandir so the run id, path and (on Windows) the stat result all
+    come out of a single directory listing instead of one glob plus one
+    os.stat round-trip per file -- a big win over a mapped network drive.
+    """
+    files = []
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                name = entry.name
+                if not name.lower().endswith(".hdf5"):
+                    continue
+                run_id = _run_id_from_filename(name)
+                if run_id is None:
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                    stat_result = entry.stat() if with_stat else None
+                except OSError:
+                    continue
+                files.append((run_id, entry.path, stat_result))
+    except OSError:
+        return []
+    return files
 
 
 def _preview_dataset_value(dataset, max_items: int = 8):
@@ -112,7 +187,7 @@ def _decimals_from_spacing(scaled_values):
     if finite.size < 2:
         return 6
 
-    unique_sorted = np.unique(np.sort(finite))
+    unique_sorted = np.unique(finite)
     if unique_sorted.size < 2:
         return 6
 
@@ -123,6 +198,8 @@ def _decimals_from_spacing(scaled_values):
 
     step = float(np.min(positive))
     decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
+    # Keep one guard digit so adjacent values remain distinguishable
+    # after floating-point conversion and formatting.
     return max(0, min(10, decimals + 1))
 
 
@@ -226,39 +303,43 @@ def _read_n_repeats_value(h5file):
         return 1
 
 
-def _build_value_record(mode: str, name: str, value, dataset=None):
-    array_value = None
-    shape = "()"
-    dtype_name = type(value).__name__
+def _build_value_record(mode: str, name: str, dataset, max_full_read: int = PARAM_FULL_READ_MAX_ELEMENTS):
+    """Build a param-search record for one HDF5 dataset.
 
-    if dataset is not None:
-        shape = str(tuple(int(dim) for dim in dataset.shape)) if dataset.shape else "()"
-        dtype_name = str(dataset.dtype)
-        array_value = _preview_dataset_value(dataset)
-    else:
-        array_value = np.asarray(value) if isinstance(value, (list, tuple, np.ndarray, np.generic)) else value
-        if isinstance(array_value, np.ndarray):
-            shape = str(tuple(int(dim) for dim in array_value.shape)) if array_value.shape else "()"
-            dtype_name = str(array_value.dtype)
+    Small datasets are read once in full (value + stats).  Large ones only
+    contribute a leading slice for the preview so that switching runs never
+    drags an image stack over the network.
+    """
+    shape = str(tuple(int(dim) for dim in dataset.shape)) if dataset.shape else "()"
+    dtype_name = str(dataset.dtype)
+    size = int(dataset.size)
 
-    preview_source = array_value if array_value is not None else value
+    full_value = None
+    if size <= max_full_read:
+        try:
+            full_value = dataset[()]
+        except Exception:
+            full_value = None
+
+    # h5py returns an ndarray, a numpy scalar, or bytes here; _stringify_value
+    # handles all three directly.
+    preview_source = full_value if full_value is not None else _preview_dataset_value(dataset)
+
     preview = _stringify_value(preview_source, max_chars=160)
     detail = _stringify_value(preview_source, max_chars=8000)
 
-    if dataset is not None or mode in {"params", "camera_params"}:
-        values_for_summary = value
-        if values_for_summary is None and dataset is not None:
-            try:
-                values_for_summary = dataset[()]
-            except Exception:
-                values_for_summary = None
-        stats_text = _value_summary(str(name), values_for_summary) if values_for_summary is not None else None
+    if full_value is not None:
+        stats_text = _value_summary(str(name), full_value)
         if stats_text:
             preview = _stringify_value(f"{stats_text} | {preview}", max_chars=160)
             detail = f"{stats_text}\n\n{detail}"
-
-    if dataset is not None and dataset.size > 8:
-        detail += f"\n\nPreview truncated from dataset with shape {shape} and dtype {dtype_name}."
+        if size > 8:
+            detail += f"\n\nPreview truncated from dataset with shape {shape} and dtype {dtype_name}."
+    else:
+        detail += (
+            f"\n\nDataset with shape {shape} and dtype {dtype_name} ({size:,} elements) "
+            f"exceeds the {max_full_read:,}-element preview limit; only a leading slice was read."
+        )
 
     return {
         "mode": mode,
@@ -267,7 +348,7 @@ def _build_value_record(mode: str, name: str, value, dataset=None):
         "shape": shape,
         "preview": preview,
         "detail": detail,
-        "size": int(dataset.size) if dataset is not None else int(np.asarray(array_value).size) if isinstance(array_value, np.ndarray) else 1,
+        "size": size,
     }
 
 
@@ -289,29 +370,166 @@ def _is_completed_run(h5file):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Fast directory-level lookups (no HDF5 opens)
+# ---------------------------------------------------------------------------
+
+
+def find_nearest_run_date_and_id(data_dir: str, requested_run_id: int):
+    """Locate the run id closest to ``requested_run_id`` and its date folder.
+
+    Run ids increase monotonically with date, so the date folders form a sorted
+    sequence of run-id ranges.  A binary search over folders (one directory
+    listing per probe) replaces the previous exhaustive listing of every date
+    folder since 2023, which over a network drive took seconds.  Nothing here
+    opens an HDF5 file, and no validity filtering is applied.
+    """
+    requested_run_id = int(requested_run_id)
+    folders = _list_date_folders(data_dir)
+    if not folders:
+        return None, None
+
+    listing_cache = {}
+
+    def folder_ids(index):
+        if index not in listing_cache:
+            _, path = folders[index]
+            ids = sorted(run_id for run_id, _, _ in _scan_hdf5_files(path, with_stat=False))
+            listing_cache[index] = ids
+        return listing_cache[index]
+
+    def nearest_in(index):
+        ids = folder_ids(index)
+        if not ids:
+            return None
+        return min(ids, key=lambda rid: (abs(rid - requested_run_id), rid))
+
+    def nearest_nonempty(mid, lo, hi):
+        """Index of the non-empty folder closest to mid within [lo, hi], or None."""
+        for step in range(0, hi - lo + 1):
+            for probe in ((mid - step, mid + step) if step else (mid,)):
+                if lo <= probe <= hi and folder_ids(probe):
+                    return probe
+        return None
+
+    # Binary search for the last folder whose smallest id is <= requested.
+    lo, hi = 0, len(folders) - 1
+    candidate = None
+    while lo <= hi:
+        mid = nearest_nonempty((lo + hi) // 2, lo, hi)
+        if mid is None:
+            break
+        if folder_ids(mid)[0] <= requested_run_id:
+            candidate = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    probes = []
+    if candidate is not None:
+        probes.append(candidate)
+        # Nearest may sit at the start of the following folder.
+        nxt = candidate + 1
+        while nxt < len(folders) and not folder_ids(nxt):
+            nxt += 1
+        if nxt < len(folders):
+            probes.append(nxt)
+    else:
+        # Requested id predates everything; the earliest non-empty folder wins.
+        first = 0
+        while first < len(folders) and not folder_ids(first):
+            first += 1
+        if first < len(folders):
+            probes.append(first)
+
+    best_id = None
+    best_index = None
+    for index in probes:
+        rid = nearest_in(index)
+        if rid is None:
+            continue
+        if best_id is None or (abs(rid - requested_run_id), rid) < (abs(best_id - requested_run_id), best_id):
+            best_id = rid
+            best_index = index
+
+    if best_id is None:
+        return None, None
+    return best_id, folders[best_index][0]
+
+
+def find_newer_completed_run_id(data_dir: str, current_latest: int, is_completed=None):
+    """Return the newest completed run id greater than ``current_latest``.
+
+    Only files whose id is above ``current_latest`` are ever opened, so in the
+    steady state (no new files) this costs one directory listing of the newest
+    date folder and zero HDF5 opens.  ``is_completed(path) -> bool`` defaults to
+    the browser's own attr/xvar completion check.
+    """
+    current_latest = int(current_latest)
+    folders = _list_date_folders(data_dir)
+    if not folders:
+        return None
+
+    if is_completed is None:
+        def is_completed(path):
+            try:
+                with h5py.File(path, "r", locking=False) as f:
+                    rc = f.attrs.get("run_complete", None)
+                    if rc is True:
+                        return True
+                    if rc is False:
+                        return False
+                    return _is_completed_run(f)
+            except Exception:
+                return False
+
+    for _, folder in reversed(folders):
+        files = _scan_hdf5_files(folder, with_stat=False)
+        if not files:
+            continue
+        files.sort(key=lambda item: item[0], reverse=True)
+        newest_here = files[0][0]
+        if newest_here <= current_latest:
+            return None
+        for run_id, path, _ in files:
+            if run_id <= current_latest:
+                break
+            if is_completed(path):
+                return run_id
+        if current_latest < 0:
+            # Nothing loaded yet: only the newest populated folder matters.
+            return None
+    return None
+
+
 class RunScanner:
-    def __init__(self, data_dir: str, date_from: date, date_to: date):
+    def __init__(self, data_dir: str, date_from: date, date_to: date, cache: MetadataCache | None = None):
         self.data_dir = data_dir
         self.date_from = date_from
         self.date_to = date_to
         self._lite_runs_by_date = {}
-        self._cache = MetadataCache(data_dir)
-        self._cache_lock = threading.Lock()
+        self._cache = cache if cache is not None else MetadataCache(data_dir)
         self._lite_lock = threading.Lock()
 
-    def scan(self):
+    def scan(self, stop_requested=None):
         if not self.data_dir or not os.path.isdir(self.data_dir):
             return
+
+        def should_stop():
+            return bool(stop_requested is not None and stop_requested())
 
         uncached = []  # (filepath, stat_result) pairs not yet in cache
         try:
             # --- Fast pass: yield cached summaries immediately (preserves order) ---
             for folder in self._iter_date_folders():
-                for filepath in self._iter_hdf5_files(folder):
-                    try:
-                        stat_result = os.stat(filepath)
-                    except OSError:
-                        continue
+                if should_stop():
+                    return
+                for _, filepath, stat_result in self._iter_hdf5_files(folder):
+                    if stat_result is None:
+                        try:
+                            stat_result = os.stat(filepath)
+                        except OSError:
+                            continue
 
                     cached_summary = self._cache.get(filepath, stat_result)
                     if cached_summary is not None:
@@ -324,57 +542,45 @@ class RunScanner:
 
                     uncached.append((filepath, stat_result))
 
+            if not uncached:
+                return
+
             # --- Parallel pass: read uncached files with a thread pool ---
-            pending_puts = 0
             with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as executor:
                 future_to_stat = {
                     executor.submit(self._read_summary, fp): (fp, sr)
                     for fp, sr in uncached
                 }
                 for future in as_completed(future_to_stat):
+                    if should_stop():
+                        for pending in future_to_stat:
+                            pending.cancel()
+                        break
                     fp, sr = future_to_stat[future]
                     try:
                         summary = future.result()
                     except Exception:
                         continue
                     if summary is not None:
-                        with self._cache_lock:
-                            self._cache.put(summary, sr)
-                            pending_puts += 1
-                            if pending_puts >= 100:
-                                self._cache.save_if_dirty()
-                                pending_puts = 0
+                        self._cache.put(summary, sr)
+                        self._cache.save_if_dirty()
                         yield summary
         finally:
             self._cache.save()
 
     def _iter_date_folders(self):
-        folders = []
-        for name in os.listdir(self.data_dir):
-            full = os.path.join(self.data_dir, name)
-            if not os.path.isdir(full) or name == "_lite":
-                continue
-            try:
-                folder_date = datetime.strptime(name, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            if self.date_from <= folder_date <= self.date_to:
-                folders.append((folder_date, full))
-
+        folders = [
+            (folder_date, path)
+            for folder_date, path in _list_date_folders(self.data_dir)
+            if self.date_from <= folder_date <= self.date_to
+        ]
         folders.sort(key=lambda item: item[0], reverse=True)
         for _, full in folders:
             yield full
 
     def _iter_hdf5_files(self, folder):
-        files = glob.glob(os.path.join(folder, "*.hdf5"))
-
-        def rid_key(path):
-            try:
-                return int(os.path.basename(path).split("_")[0])
-            except Exception:
-                return -1
-
-        files.sort(key=rid_key, reverse=True)
+        files = _scan_hdf5_files(folder, with_stat=True)
+        files.sort(key=lambda item: item[0], reverse=True)
         return files
 
     def _read_summary(self, filepath):
@@ -497,16 +703,18 @@ class RunScanner:
 
     def _index_lite_runs_for_date(self, run_date_str: str):
         lite_day_dir = os.path.join(self.data_dir, "_lite", run_date_str)
-        if not os.path.isdir(lite_day_dir):
-            return set()
-
-        pattern = os.path.join(lite_day_dir, "*_lite_*.hdf5")
         run_ids = set()
-        for path in glob.iglob(pattern):
-            try:
-                run_ids.add(int(os.path.basename(path).split("_")[0]))
-            except Exception:
-                continue
+        try:
+            with os.scandir(lite_day_dir) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if "_lite_" not in name or not name.lower().endswith(".hdf5"):
+                        continue
+                    run_id = _run_id_from_filename(name)
+                    if run_id is not None:
+                        run_ids.add(run_id)
+        except OSError:
+            return set()
         return run_ids
 
 
@@ -529,14 +737,16 @@ class ScanWorker(QThread):
         count = 0
         batch = []
         try:
-            for run_summary in self.scanner.scan():
+            for run_summary in self.scanner.scan(stop_requested=lambda: self._stop_requested):
                 if self._stop_requested:
                     break
                 batch.append(run_summary)
+                count += 1
                 if len(batch) >= self.batch_size:
                     self.run_batch_found.emit(batch)
                     batch = []
-                count += 1
+            if self._stop_requested:
+                return
             if batch:
                 self.run_batch_found.emit(batch)
             self.scan_done.emit(count)
@@ -544,6 +754,21 @@ class ScanWorker(QThread):
             message = _format_worker_exception("ScanWorker failed", exc)
             LOGGER.error(message)
             self.scan_error.emit(message)
+
+
+def _unique_preserve_order(items):
+    """O(n) order-preserving unique, replacing the previous O(n^2) scan."""
+    seen = set()
+    unique_items = []
+    for item in items:
+        key = item
+        if isinstance(item, float) and item != item:  # NaN never equals itself
+            key = "__nan__"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_items.append(item)
+    return unique_items
 
 
 def _summarize_xvar_values(name: str, values) -> dict:
@@ -563,42 +788,8 @@ def _summarize_xvar_values(name: str, values) -> dict:
     unit, multiplier, _ = detect_unit(xvarnames=[name], xvar_idx=0, xvar_values=flat)
     unit = unit or ""
 
-    def decimals_from_spacing(scaled_values):
-        finite = np.asarray(scaled_values, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size < 2:
-            return 6
-
-        unique_sorted = np.unique(np.sort(finite))
-        if unique_sorted.size < 2:
-            return 6
-
-        diffs = np.diff(unique_sorted)
-        positive = diffs[diffs > 0]
-        if positive.size == 0:
-            return 6
-
-        step = float(np.min(positive))
-        decimals = int(np.ceil(-np.log10(step))) if step < 1.0 else 0
-        # Keep one guard digit so adjacent values remain distinguishable
-        # after floating-point conversion and formatting.
-        return max(0, min(10, decimals + 1))
-
     def format_numeric_value(value, decimals):
-        scaled = float(value) * multiplier
-        if not np.isfinite(scaled):
-            return "NA"
-        if scaled != 0.0 and (abs(scaled) >= 1e7 or abs(scaled) < 1e-4):
-            return f"{scaled:.6g}"
-        return f"{scaled:.{decimals}f}"
-
-    def unique_preserve_order(items):
-        unique_items = []
-        for item in items:
-            if any(item == existing for existing in unique_items):
-                continue
-            unique_items.append(item)
-        return unique_items
+        return _format_numeric_value(value, multiplier, decimals)
 
     def format_preview_text(items, formatter=str):
         if not items:
@@ -613,8 +804,8 @@ def _summarize_xvar_values(name: str, values) -> dict:
         min_val = float(np.nanmin(flat))
         max_val = float(np.nanmax(flat))
         scaled_vals = np.asarray(flat, dtype=np.float64) * multiplier
-        decimals = decimals_from_spacing(scaled_vals)
-        preview_values = unique_preserve_order(np.asarray(flat).tolist())
+        decimals = _decimals_from_spacing(scaled_vals)
+        preview_values = _unique_preserve_order(flat.tolist())
         return {
             "name": name,
             "unit": unit,
@@ -625,7 +816,7 @@ def _summarize_xvar_values(name: str, values) -> dict:
         }
 
     as_text = [_decode_str(item) for item in flat]
-    preview_values = unique_preserve_order(as_text)
+    preview_values = _unique_preserve_order(as_text)
     return {
         "name": name,
         "unit": unit,
@@ -687,19 +878,17 @@ class ParamSearchLoader(QThread):
         records = {mode: [] for mode in PARAM_SEARCH_MODES}
         try:
             with h5py.File(self.filepath, "r") as f:
-                if self.isInterruptionRequested():
-                    return
-                records["params"] = self._load_group_records(f, "params")
-                self.partial_records_ready.emit("params", records["params"])
-
-                if self.isInterruptionRequested():
-                    return
-                records["camera_params"] = self._load_group_records(f, "camera_params")
-                self.partial_records_ready.emit("camera_params", records["camera_params"])
-
-                if self.isInterruptionRequested():
-                    return
-                records["data"] = self._load_data_records(f)
+                for mode in PARAM_SEARCH_MODES:
+                    if self.isInterruptionRequested():
+                        return
+                    if mode == "data":
+                        loaded = self._load_data_records(f)
+                    else:
+                        loaded = self._load_group_records(f, mode)
+                    if loaded is None or self.isInterruptionRequested():
+                        return
+                    records[mode] = loaded
+                    self.partial_records_ready.emit(mode, loaded)
             self.records_ready.emit(records)
         except Exception as exc:
             if not self.isInterruptionRequested():
@@ -714,12 +903,12 @@ class ParamSearchLoader(QThread):
         records = []
         group = h5file[group_name]
         for key in sorted(group.keys()):
-            dataset = group[key]
-            try:
-                value = dataset[()]
-            except Exception:
-                value = None
-            records.append(_build_value_record(group_name, key, value, dataset=dataset))
+            if self.isInterruptionRequested():
+                return None
+            item = group[key]
+            if not isinstance(item, h5py.Dataset):
+                continue
+            records.append(_build_value_record(group_name, key, item))
         return records
 
     def _load_data_records(self, h5file):
@@ -729,22 +918,40 @@ class ParamSearchLoader(QThread):
         records = []
         group = h5file["data"]
         for key in sorted(group.keys()):
+            if self.isInterruptionRequested():
+                return None
             item = group[key]
             if isinstance(item, h5py.Group):
+                child_keys = sorted(item.keys())
                 records.append(
                     {
                         "mode": "data",
                         "name": str(key),
                         "dtype": "group",
                         "shape": "-",
-                        "preview": f"group with {len(item.keys())} entries",
-                        "detail": f"HDF5 group '{key}' with children: {', '.join(sorted(item.keys())) or '(none)'}",
-                        "size": len(item.keys()),
+                        "preview": f"group with {len(child_keys)} entries",
+                        "detail": f"HDF5 group '{key}' with children: {', '.join(child_keys) or '(none)'}",
+                        "size": len(child_keys),
                     }
                 )
                 continue
 
-            records.append(_build_value_record("data", key, None, dataset=item))
+            if key in PARAM_SEARCH_NO_READ_KEYS:
+                shape = str(tuple(int(dim) for dim in item.shape)) if item.shape else "()"
+                records.append(
+                    {
+                        "mode": "data",
+                        "name": str(key),
+                        "dtype": str(item.dtype),
+                        "shape": shape,
+                        "preview": f"shape {shape} (not read)",
+                        "detail": f"Dataset '{key}' with shape {shape} and dtype {item.dtype} is not previewed by the param search.",
+                        "size": int(item.size),
+                    }
+                )
+                continue
+
+            records.append(_build_value_record("data", key, item))
         return records
 
 
@@ -817,3 +1024,33 @@ class BatchLiteCreateWorker(QThread):
             message = _format_worker_exception(f"BatchLiteCreateWorker failed for runs {self.run_ids}", exc)
             LOGGER.error(message)
             self.error.emit(message)
+
+
+class AnnotationWriteWorker(QThread):
+    """Write browser_tags / browser_comment attrs to one or more HDF5 files
+    off the GUI thread (opening a file in append mode over the network can
+    stall for a noticeable fraction of a second)."""
+
+    written = pyqtSignal(int)  # run_id
+    error = pyqtSignal(int, str)  # run_id, message
+    completed = pyqtSignal(int, int)  # ok_count, total
+
+    def __init__(self, jobs: list[tuple[int, str, object, object]]):
+        """jobs: [(run_id, filepath, tags_or_None, comment_or_None)]"""
+        super().__init__()
+        self.jobs = list(jobs)
+
+    def run(self):
+        ok = 0
+        for run_id, filepath, tags, comment in self.jobs:
+            try:
+                with h5py.File(filepath, "a") as f:
+                    if tags is not None:
+                        f.attrs["browser_tags"] = json.dumps(list(tags))
+                    if comment is not None:
+                        f.attrs["browser_comment"] = str(comment)
+                ok += 1
+                self.written.emit(int(run_id))
+            except Exception as exc:
+                self.error.emit(int(run_id), str(exc))
+        self.completed.emit(ok, len(self.jobs))
