@@ -3,6 +3,7 @@ import datetime
 import h5py
 import os
 import time
+import warnings
 
 from waxa.image_processing.compute_ODs import compute_OD
 from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
@@ -2123,84 +2124,22 @@ class atomdata_base():
         self._analysis_tags.repeats_reassigned = True
 
     def avg_repeats(self,xvars_to_avg=[],reanalyze=True):
+        """Deprecated. Does nothing.
+
+        In-place repeat averaging has been replaced by the repeat-statistic
+        sibling atomdata objects, which are always available: `ad.avg` (mean
+        over repeats), `ad.std` (population std), and `ad.sem` (standard
+        error of the mean). E.g. plot `ad.avg.atom_number` with error bars
+        from `ad.sem.atom_number`.
         """
-        Averages the images along the axes specified in xvars_to_avg. Uses
-        absorption imaging analysis.
-
-        Args:
-            xvars_to_avg (list, optional): A list of xvar indices to average.
-            reanalyze (bool, optional): _description_. Defaults to True.
-        """
-        if not self._analysis_tags.averaged:
-            self._refresh_repeat_statistics()
-            if not xvars_to_avg:
-                xvars_to_avg = list(range(len(self.xvars)))
-            if not isinstance(xvars_to_avg,list):
-                xvars_to_avg = [xvars_to_avg]
-
-            from copy import deepcopy
-
-            self._xvars_stored = deepcopy(self.xvars)
-            def store_values(struct,keylist):
-                for key in keylist:
-                    array = vars(struct)[key]
-                    # save the old information
-                    newkey = self._storage_key(key)
-                    vars(struct)[newkey] = deepcopy(array)
-
-            self._store_keys = ['xvars','xvardims']
-            if getattr(self, '_has_images', True) and getattr(self, 'od_raw', None) is not None:
-                self._store_keys.append('od_raw')
-            store_values(self,self._store_keys)
-
-            self._store_param_keys = ['N_repeats',*self.xvarnames]
-            store_values(self.params,self._store_param_keys)
-
-            self._store_data_keys = self.data.keys
-            store_values(self.data,self._store_data_keys)
-
-            if hasattr(self,'scope_data'):
-                self._store_scope_keys = list(self.scope_data.keys())
-                for k in self._store_scope_keys:
-                    newkey = self._storage_key(k)
-                    self.scope_data[newkey] = deepcopy(self.scope_data[k])
-
-            def avg_attrs(struct,key_list):
-                for key in key_list:
-                    arr = vars(struct)[key]
-                    arr = self._avg_repeated_ndarray(arr, xvar_idx)
-                    vars(struct)[key] = arr
-
-            def avg_scope_dict():
-                if hasattr(self,'scope_data'):
-                    for k in self._store_scope_keys:
-                        sta:dict = self.scope_data[k]
-                        for ch in sta.keys():
-                            for ax in ['t','v']:
-                                x = self._avg_repeated_ndarray(vars(sta[ch])[ax], xvar_idx)
-                                vars(self.scope_data[k][ch])[ax] = x
-
-            for xvar_idx in xvars_to_avg:
-                if getattr(self, '_has_images', True) and getattr(self, 'od_raw', None) is not None:
-                    avg_attrs(self, ['od_raw'])
-                avg_attrs(self.data, self.data.keys)
-                avg_scope_dict()
-                # write in the unaveraged xvars
-                self.xvars[xvar_idx] = np.unique(self.xvars[xvar_idx])
-                vars(self.params)[self.xvarnames[xvar_idx]] = self.xvars[xvar_idx]
-                self.xvardims[xvar_idx] = self.xvars[xvar_idx].shape[0]
-            self.params.N_repeats = 1
-        
-            if reanalyze and getattr(self, '_has_images', True):
-                # don't unshuffle xvars again -- that will be confusing
-                self.analyze_ods()
-            elif not getattr(self, '_has_images', True):
-                self._clear_image_analysis_attrs()
-
-            self._analysis_tags.averaged = True
-            self._refresh_repeat_statistics()
-        else:
-            print('Atomdata is already repeat averaged. To revert to original atomdata, use Atomdata.revert_repeats().')
+        warnings.warn(
+            "atomdata.avg_repeats() is deprecated and no longer does anything. "
+            "Repeat statistics are always available on the sibling atomdata "
+            "objects ad.avg, ad.std, and ad.sem — e.g. use ad.avg.atom_number "
+            "with error bars from ad.sem.atom_number.",
+            FutureWarning,
+            stacklevel=2,
+        )
                 
     def _avg_repeated_ndarray(self,arr:np.ndarray,xvar_idx,N_repeats_for_this_xvar=-1):
         i = xvar_idx
@@ -2240,7 +2179,8 @@ class atomdata_base():
             self._analysis_tags.averaged = False
             self._refresh_repeat_statistics()
         else:
-            print("Atomdata is not repeat averaged. To average, use Atomdata.avg_repeats().")
+            print("Atomdata is not repeat averaged. In-place repeat averaging "
+                  "(avg_repeats) is deprecated — use ad.avg (and ad.std, ad.sem) instead.")
 
     def transpose_data(self,new_xvar_idx=[], reanalyze=True):
         """Swaps xvar order, then reruns the analysis.

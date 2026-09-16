@@ -115,6 +115,7 @@ class atomdata(atomdata_base):
         return super().reassign_repeats(xvar_idx)
 
     def avg_repeats(self, xvars_to_avg=[], reanalyze=True):
+        """Deprecated. Does nothing — use ad.avg (and ad.std, ad.sem) instead."""
         return super().avg_repeats(xvars_to_avg=xvars_to_avg, reanalyze=reanalyze)
 
     def revert_repeats(self):
