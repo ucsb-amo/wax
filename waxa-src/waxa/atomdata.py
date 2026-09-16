@@ -324,18 +324,6 @@ class atomdata(atomdata_base):
             self.img_timestamp_light = self._dealer.strip_shot_idx_axis(self.img_timestamp_light)[0]
             self.img_timestamp_dark = self._dealer.strip_shot_idx_axis(self.img_timestamp_dark)[0]
 
-    def compute_atom_number(self):
-        # cross section = 3 lambda^2 / 2 pi (for two-level system)
-        # self.atom_cross_section = 5.878324268151581e-13 # at 0-field
-        self.atom_cross_section = 2.8316243e-13 # for stretch transition (high field)
-        dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
-
-        self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / self.atom_cross_section
-        self.atom_number_fit_area_y = self.fit_area_y * dx_pixel / self.atom_cross_section
-
-        self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section
-        self.atom_number = np.sum(np.sum(self.atom_number_density, -2), -1)
-
     def _remap_fit_results(self):
         try:
             fits_x = self.cloudfit_x

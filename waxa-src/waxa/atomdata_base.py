@@ -1,6 +1,7 @@
 import numpy as np
 import datetime
 import h5py
+from waxa.calibrations.cross_section import cross_section_for_run
 import os
 import time
 
@@ -951,6 +952,7 @@ class atomdata_base():
             'od_raw', 'od', 'sum_od_x', 'sum_od_y',
             'integrated_od', 'atom_number', 'atom_number_density',
             'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'atom_cross_section', 'atom_cross_section_source',
             'cloudfit_x', 'cloudfit_y',
             'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
             'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
@@ -1161,13 +1163,31 @@ class atomdata_base():
 
     ### Physics
     def compute_atom_number(self):
-        self.atom_cross_section = 5.878324268151581e-13 # from kamo.Potassium39.get_cross_section
-        dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
-        
-        self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / self.atom_cross_section
-        self.atom_number_fit_area_y = self.fit_area_y * dx_pixel / self.atom_cross_section
+        """Atom number from the OD, with a per-shot cross section.
 
-        self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section  
+        The cross section is chosen per shot from the recorded outer-coil
+        current at imaging (``data.i_outer_imaging``, A): high-field value at
+        or above ``I_OUTER_HF_THRESHOLD_A``, the (uncalibrated) low-field value
+        below it, and the pre-record assumption (high field) for runs or vault
+        chunks that carry no record. Rules and provenance live in
+        ``waxa.calibrations.cross_section``.
+
+        Sets ``atom_cross_section`` (m^2, shape ``xvardims``) and
+        ``atom_cross_section_source`` (str, same shape). Note that
+        ``atom_cross_section`` used to be a scalar; ``np.unique`` it for a
+        one-line report.
+        """
+        sigma, source = cross_section_for_run(getattr(self, 'data', None),
+                                              self.xvardims)
+        self.atom_cross_section = sigma
+        self.atom_cross_section_source = source
+        dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
+
+        self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / sigma
+        self.atom_number_fit_area_y = self.fit_area_y * dx_pixel / sigma
+
+        # od is (*xvardims, py, px); broadcast sigma over the image axes
+        self.atom_number_density = self.od * dx_pixel**2 / sigma[..., None, None]
         self.atom_number = np.sum(np.sum(self.atom_number_density,-2),-1)
 
     def _resolve_xvar_value_to_indices(self, xvar_value, which_xvar_idx, xvar_tolerance=0.05):
@@ -1457,6 +1477,7 @@ class atomdata_base():
             'od_raw', 'od', 'sum_od_x', 'sum_od_y',
             'integrated_od', 'atom_number', 'atom_number_density',
             'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'atom_cross_section', 'atom_cross_section_source',
             'cloudfit_x', 'cloudfit_y',
             'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
             'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
@@ -1546,7 +1567,7 @@ class atomdata_base():
         ad._has_images = getattr(self, '_has_images', True)
 
         for attr in (
-            'experiment_code', 'atom_cross_section',
+            'experiment_code',
             'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
             'axis_camera_px_x', 'axis_camera_px_y',
         ):
@@ -1586,6 +1607,7 @@ class atomdata_base():
             'od_raw', 'od', 'sum_od_x', 'sum_od_y',
             'integrated_od', 'atom_number', 'atom_number_density',
             'atom_number_fit_area_x', 'atom_number_fit_area_y',
+            'atom_cross_section', 'atom_cross_section_source',
             'cloudfit_x', 'cloudfit_y',
             'fit_sd_x', 'fit_sd_y', 'fit_center_x', 'fit_center_y',
             'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
