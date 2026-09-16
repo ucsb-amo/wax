@@ -1,11 +1,12 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from waxa.helper.datasmith import sort
+from .units import detect_unit
 
 __all__ = [
     'plot_image_grid',
     'mixOD_grid',
-    'plot_sum_od_fits',
+    'plot_sum_od_fits_grid',
     'sort',
 ]
 
@@ -112,7 +113,6 @@ def mixOD_grid(ad,
     xvars = ad.xvars
 
     # Auto-detect unit scaling unless explicitly overridden by function args
-    from waxa.plotting import detect_unit
     if xvar0unit == '' and xvar0mult == dv:
         xvar0unit, xvar0mult, _ = detect_unit(ad, 0)
     if xvar1unit == '' and xvar1mult == dv:
@@ -158,7 +158,7 @@ def mixOD_grid(ad,
     
     plt.gca().set_aspect(aspect)
 
-def plot_sum_od_fits(ad,axis=0,
+def plot_sum_od_fits_grid(ad,axis=0,
                      xvarformat='1.3f',
                      xvar0format='',
                      xvar1format='',
