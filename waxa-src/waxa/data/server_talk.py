@@ -180,16 +180,30 @@ class server_talk():
         if not root or not os.path.isdir(root):
             return
 
-        days_ago = 0
-        while True:
-            date = datetime.today() - timedelta(days=days_ago)
-            if date < self._first_data_folder_date:
-                break
-            date_str = date.strftime('%Y-%m-%d')
-            path = os.path.join(root, date_str)
-            if os.path.isdir(path):
-                yield path
-            days_ago += 1
+        # One directory listing instead of an isdir() probe per calendar day
+        # back to the first data folder (well over a thousand round trips on
+        # the network share, ~1 s per lookup of an old run). Same result:
+        # existing date folders, newest first, within the same date window.
+        today = datetime.today()
+        first = self._first_data_folder_date
+        dated = []
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                        date = datetime.strptime(entry.name, '%Y-%m-%d')
+                    except (ValueError, OSError):
+                        continue
+                    if date < first or date > today:
+                        continue
+                    dated.append((date, entry.path))
+        except OSError:
+            return
+        dated.sort(reverse=True)
+        for _, path in dated:
+            yield path
 
     def _iter_hdf5_files_desc(self, date_dir_path):
         files = []
@@ -322,12 +336,23 @@ class server_talk():
         return self.find_data_file_by_run_id(run_id, lite=lite)
 
     def _find_data_file_by_run_id_fresh(self, run_id, lite=False, skip_check=False):
+        return self._scan_for_run_id(run_id, lite=lite, skip_check=skip_check)[0]
+
+    def _scan_for_run_id(self, run_id, lite=False, skip_check=False):
+        """Walk the date folders for ``run_id``.
+
+        Returns ``(path_or_None, scanned_any)`` where ``scanned_any`` says
+        whether at least one date folder was actually listed -- the way to
+        tell "the run is not there" from "the drive was not reachable".
+        """
         if not skip_check:
             self.check_for_mapped_data_dir()
         run_id = int(run_id)
         prefix = f"{run_id:07d}_"
+        scanned_any = False
 
         for date_dir in self._iter_date_dirs_desc(lite=lite):
+            scanned_any = True
             max_seen = -1
             matches = []
             try:
@@ -352,20 +377,23 @@ class server_talk():
                         f"{len(matches)} data files: {matches}. Loading "
                         f"{matches[0]}. This indicates a run_id collision."
                     )
-                return matches[0]
+                return matches[0], True
             # All run IDs in this folder are older than the target — stop searching.
             if max_seen >= 0 and max_seen < run_id:
                 break
 
-        return None
+        return None, scanned_any
 
     def find_data_file_by_run_id(self, run_id, lite=False, raise_on_missing=True, refresh=False, skip_check=False):
         t0 = time.perf_counter()
-        path = self._find_data_file_by_run_id_fresh(run_id, lite=lite, skip_check=skip_check)
-        
-        # If not found on first pass, retry once
-        if path is None and not refresh:
-            path = self._find_data_file_by_run_id_fresh(run_id, lite=lite, skip_check=skip_check)
+        path, scanned_any = self._scan_for_run_id(run_id, lite=lite, skip_check=skip_check)
+
+        # Retry once only when the first pass could not list any date folder
+        # (a dropped network drive). A pass that walked the folders and found
+        # nothing is a genuine miss -- e.g. probing for a lite copy that does
+        # not exist -- and repeating it just doubled the cost.
+        if path is None and not refresh and not scanned_any:
+            path, _ = self._scan_for_run_id(run_id, lite=lite, skip_check=skip_check)
         
         if path is None and raise_on_missing:
             raise ValueError(f"Data file with run ID {run_id:1.0f} was not found.")

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -35,6 +36,17 @@ PARAM_FULL_READ_MAX_ELEMENTS = 200_000
 
 # Datasets that are never worth previewing element-wise in the param search.
 PARAM_SEARCH_NO_READ_KEYS = {"images", "scope_data"}
+
+# Date folders older than this many days are treated as immutable for the
+# purposes of the per-folder run-id index (a run that starts before midnight
+# still lands in that day's folder, so "yesterday" can gain files).
+FOLDER_INDEX_MUTABLE_DAYS = 2
+
+# The root directory listing (one entry per date folder) changes at most once
+# a day; re-reading it from the network on every lookup is wasted latency.
+ROOT_LISTING_TTL_S = 30.0
+_root_listing_cache: dict = {}  # data_dir -> (monotonic_time, [(date, path)])
+_root_listing_lock = threading.Lock()
 
 
 def _format_worker_exception(context: str, exc: Exception):
@@ -103,6 +115,20 @@ def _list_date_folders(data_dir: str):
         return []
     folders.sort(key=lambda item: item[0])
     return folders
+
+
+def _list_date_folders_cached(data_dir: str, max_age_s: float = ROOT_LISTING_TTL_S):
+    """_list_date_folders with a short-lived process-wide cache.  Pass
+    max_age_s=0 to force a fresh listing (and refresh the cache)."""
+    now = time.monotonic()
+    with _root_listing_lock:
+        hit = _root_listing_cache.get(data_dir)
+        if hit is not None and now - hit[0] <= max_age_s:
+            return list(hit[1])
+    folders = _list_date_folders(data_dir)
+    with _root_listing_lock:
+        _root_listing_cache[data_dir] = (now, folders)
+    return list(folders)
 
 
 def _scan_hdf5_files(folder: str, with_stat: bool = True):
@@ -375,40 +401,67 @@ def _is_completed_run(h5file):
 # ---------------------------------------------------------------------------
 
 
-def find_nearest_run_date_and_id(data_dir: str, requested_run_id: int):
+def find_nearest_run_date_and_id(data_dir: str, requested_run_id: int, cache: MetadataCache | None = None,
+                                 stats: dict | None = None):
     """Locate the run id closest to ``requested_run_id`` and its date folder.
 
     Run ids increase monotonically with date, so the date folders form a sorted
-    sequence of run-id ranges.  A binary search over folders (one directory
-    listing per probe) replaces the previous exhaustive listing of every date
-    folder since 2023, which over a network drive took seconds.  Nothing here
-    opens an HDF5 file, and no validity filtering is applied.
+    sequence of run-id ranges and the search is a binary search over folders.
+    With a populated folder index (see MetadataCache.update_folder_index and
+    FolderIndexWorker) every probe of a folder older than
+    FOLDER_INDEX_MUTABLE_DAYS is answered from memory, so a lookup costs the
+    (cached) root listing plus at most one folder listing -- the one that has
+    to be enumerated to pick the exact nearest id.  Without an index it
+    degrades to ~log2(n_folders) listings.  Nothing here opens an HDF5 file,
+    and no validity filtering is applied.
+
+    ``stats`` (optional dict) receives {"listings": n} for diagnostics.
     """
     requested_run_id = int(requested_run_id)
-    folders = _list_date_folders(data_dir)
+    folders = _list_date_folders_cached(data_dir)
     if not folders:
         return None, None
 
-    listing_cache = {}
+    today = date.today()
+    index = cache.folder_index() if cache is not None else {}
+    listed = {}  # folder position -> sorted run ids
+    listings = 0
 
-    def folder_ids(index):
-        if index not in listing_cache:
-            _, path = folders[index]
-            ids = sorted(run_id for run_id, _, _ in _scan_hdf5_files(path, with_stat=False))
-            listing_cache[index] = ids
-        return listing_cache[index]
-
-    def nearest_in(index):
-        ids = folder_ids(index)
-        if not ids:
+    def trusted_entry(pos):
+        folder_date = folders[pos][0]
+        if (today - folder_date).days <= FOLDER_INDEX_MUTABLE_DAYS:
             return None
-        return min(ids, key=lambda rid: (abs(rid - requested_run_id), rid))
+        return index.get(folder_date.isoformat())
+
+    def folder_ids(pos):
+        nonlocal listings
+        if pos not in listed:
+            folder_date, path = folders[pos]
+            ids = sorted(run_id for run_id, _, _ in _scan_hdf5_files(path, with_stat=False))
+            listings += 1
+            listed[pos] = ids
+            if cache is not None:
+                cache.update_folder_index(folder_date.isoformat(), ids)
+        return listed[pos]
+
+    def bounds(pos):
+        """(min_id, max_id) for the folder, or None if empty.  Served from the
+        index when possible; lists the folder otherwise."""
+        if pos in listed:
+            ids = listed[pos]
+            return (ids[0], ids[-1]) if ids else None
+        entry = trusted_entry(pos)
+        if entry is not None:
+            lo, hi, n = entry
+            return None if n == 0 or lo is None else (lo, hi)
+        ids = folder_ids(pos)
+        return (ids[0], ids[-1]) if ids else None
 
     def nearest_nonempty(mid, lo, hi):
-        """Index of the non-empty folder closest to mid within [lo, hi], or None."""
+        """Position of the non-empty folder closest to mid within [lo, hi], or None."""
         for step in range(0, hi - lo + 1):
             for probe in ((mid - step, mid + step) if step else (mid,)):
-                if lo <= probe <= hi and folder_ids(probe):
+                if lo <= probe <= hi and bounds(probe) is not None:
                     return probe
         return None
 
@@ -419,42 +472,103 @@ def find_nearest_run_date_and_id(data_dir: str, requested_run_id: int):
         mid = nearest_nonempty((lo + hi) // 2, lo, hi)
         if mid is None:
             break
-        if folder_ids(mid)[0] <= requested_run_id:
+        if bounds(mid)[0] <= requested_run_id:
             candidate = mid
             lo = mid + 1
         else:
             hi = mid - 1
 
-    probes = []
-    if candidate is not None:
-        probes.append(candidate)
-        # Nearest may sit at the start of the following folder.
-        nxt = candidate + 1
-        while nxt < len(folders) and not folder_ids(nxt):
+    def next_nonempty(pos):
+        nxt = pos + 1
+        while nxt < len(folders) and bounds(nxt) is None:
             nxt += 1
-        if nxt < len(folders):
-            probes.append(nxt)
-    else:
-        # Requested id predates everything; the earliest non-empty folder wins.
-        first = 0
-        while first < len(folders) and not folder_ids(first):
-            first += 1
-        if first < len(folders):
-            probes.append(first)
+        return nxt if nxt < len(folders) else None
+
+    def key(rid):
+        return (abs(rid - requested_run_id), rid)
 
     best_id = None
-    best_index = None
-    for index in probes:
-        rid = nearest_in(index)
-        if rid is None:
-            continue
-        if best_id is None or (abs(rid - requested_run_id), rid) < (abs(best_id - requested_run_id), best_id):
-            best_id = rid
-            best_index = index
+    best_pos = None
+    if candidate is None:
+        # Requested id predates everything; the earliest non-empty folder wins.
+        first = next_nonempty(-1)
+        if first is not None:
+            best_id = bounds(first)[0]
+            best_pos = first
+    else:
+        cand_lo, cand_hi = bounds(candidate)
+        if requested_run_id <= cand_hi:
+            # Inside the candidate folder's range: list it to resolve gaps.
+            ids = folder_ids(candidate)
+            best_id = min(ids, key=key)
+            best_pos = candidate
+        else:
+            # Between candidate.max and the next folder's min: both ends are
+            # known from bounds, so no listing is needed.
+            best_id, best_pos = cand_hi, candidate
+            nxt = next_nonempty(candidate)
+            if nxt is not None:
+                nxt_lo = bounds(nxt)[0]
+                if key(nxt_lo) < key(best_id):
+                    best_id, best_pos = nxt_lo, nxt
 
+    if stats is not None:
+        stats["listings"] = listings
     if best_id is None:
         return None, None
-    return best_id, folders[best_index][0]
+    return best_id, folders[best_pos][0]
+
+
+class FolderIndexWorker(QThread):
+    """Background builder for the per-date-folder run-id index.
+
+    Lists every date folder that is not yet indexed (newest first, one
+    directory listing each, no HDF5 opens) and records (min_id, max_id, n) in
+    the metadata cache.  Runs once per data dir after the first scan and is
+    stopped while a scan is active so it never competes with HDF5 reads.
+    """
+
+    progress = pyqtSignal(int, int)  # indexed_so_far, total_to_index
+    done = pyqtSignal(int, bool)  # folders_indexed, completed
+
+    def __init__(self, data_dir: str, cache: MetadataCache):
+        super().__init__()
+        self.data_dir = data_dir
+        self.cache = cache
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        indexed = 0
+        completed = False
+        try:
+            folders = _list_date_folders_cached(self.data_dir, max_age_s=0)
+            index = self.cache.folder_index()
+            today = date.today()
+            todo = [
+                (folder_date, path)
+                for folder_date, path in folders
+                if folder_date.isoformat() not in index
+                or (today - folder_date).days <= FOLDER_INDEX_MUTABLE_DAYS
+            ]
+            todo.sort(key=lambda item: item[0], reverse=True)
+            total = len(todo)
+            for folder_date, path in todo:
+                if self._stop_requested:
+                    break
+                ids = [run_id for run_id, _, _ in _scan_hdf5_files(path, with_stat=False)]
+                self.cache.update_folder_index(folder_date.isoformat(), ids)
+                indexed += 1
+                if indexed % 25 == 0:
+                    self.progress.emit(indexed, total)
+                    self.cache.save_if_dirty()
+            completed = not self._stop_requested
+            self.cache.save()
+        except Exception as exc:
+            LOGGER.error(_format_worker_exception("FolderIndexWorker failed", exc))
+        self.done.emit(indexed, completed)
 
 
 def find_newer_completed_run_id(data_dir: str, current_latest: int, is_completed=None):
@@ -466,7 +580,8 @@ def find_newer_completed_run_id(data_dir: str, current_latest: int, is_completed
     the browser's own attr/xvar completion check.
     """
     current_latest = int(current_latest)
-    folders = _list_date_folders(data_dir)
+    # Fresh listing: a new day's folder must be seen as soon as it appears.
+    folders = _list_date_folders_cached(data_dir, max_age_s=0)
     if not folders:
         return None
 
@@ -571,7 +686,7 @@ class RunScanner:
     def _iter_date_folders(self):
         folders = [
             (folder_date, path)
-            for folder_date, path in _list_date_folders(self.data_dir)
+            for folder_date, path in _list_date_folders_cached(self.data_dir, max_age_s=0)
             if self.date_from <= folder_date <= self.date_to
         ]
         folders.sort(key=lambda item: item[0], reverse=True)
@@ -581,6 +696,8 @@ class RunScanner:
     def _iter_hdf5_files(self, folder):
         files = _scan_hdf5_files(folder, with_stat=True)
         files.sort(key=lambda item: item[0], reverse=True)
+        # Free by-product of the scan: keep the run-id folder index current.
+        self._cache.update_folder_index(os.path.basename(folder), [run_id for run_id, _, _ in files])
         return files
 
     def _read_summary(self, filepath):

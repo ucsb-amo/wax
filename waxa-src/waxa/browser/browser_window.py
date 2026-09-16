@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import date, timedelta
 
 from PyQt6.QtCore import QDate, QItemSelectionModel, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
@@ -63,6 +64,7 @@ from .scanner import (
     PARAM_SEARCH_MODES,
     AnnotationWriteWorker,
     BatchLiteCreateWorker,
+    FolderIndexWorker,
     LiteCreateWorker,
     ParamSearchLoader,
     RunScanner,
@@ -71,6 +73,9 @@ from .scanner import (
     find_nearest_run_date_and_id,
     find_newer_completed_run_id,
 )
+
+# Days shown on either side of a run found via the run-ID jump.
+RUN_ID_JUMP_CONTEXT_DAYS = 3
 from ..data.server_talk import server_talk
 
 
@@ -615,23 +620,30 @@ class ParamSearchDialog(QDialog):
 
 
 class RunIdLookupWorker(QThread):
-    lookup_ready = pyqtSignal(object, object)
+    lookup_ready = pyqtSignal(object, object, object)  # resolved_run_id, run_date, stats dict
     lookup_error = pyqtSignal(str)
 
-    def __init__(self, server: server_talk, data_dir: str, requested_run_id: int, parent=None):
+    def __init__(self, server: server_talk, data_dir: str, requested_run_id: int, cache=None, parent=None):
         super().__init__(parent)
         self._server = server
         self._data_dir = data_dir
         self._requested_run_id = int(requested_run_id)
+        self._cache = cache
 
     def run(self):
+        stats = {}
+        t0 = time.perf_counter()
         try:
-            # Binary search over date folders: a handful of directory listings
-            # and no HDF5 opens, instead of listing every folder since 2023.
-            resolved_run_id, run_date = find_nearest_run_date_and_id(self._data_dir, self._requested_run_id)
+            # Index-backed binary search over date folders: usually zero or one
+            # directory listing and never an HDF5 open.
+            resolved_run_id, run_date = find_nearest_run_date_and_id(
+                self._data_dir, self._requested_run_id, cache=self._cache, stats=stats
+            )
             if resolved_run_id is None:
                 resolved_run_id, run_date = self._server.find_nearest_run_date_and_id(self._requested_run_id)
-            self.lookup_ready.emit(resolved_run_id, run_date)
+                stats["fallback"] = True
+            stats["elapsed_ms"] = 1e3 * (time.perf_counter() - t0)
+            self.lookup_ready.emit(resolved_run_id, run_date, stats)
         except Exception as exc:
             self.lookup_error.emit(str(exc))
 
@@ -1050,6 +1062,11 @@ class DataBrowserWindow(QMainWindow):
         self._scan_after_annotations = False
         self._metadata_cache = None
         self._metadata_cache_dir = None
+        self._folder_index_worker = None
+        self._folder_index_complete_dir = None
+        # (date_from, date_to) to widen to once a run-ID jump has focused its row.
+        self._pending_widen_range = None
+        self._pending_focus_message = None
         self._server_talk = server_talk(data_dir=self.data_dir)
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setSingleShot(False)
@@ -1737,6 +1754,23 @@ class DataBrowserWindow(QMainWindow):
                     dialog.set_stale_run_message(int(param_run_id))
                 LOGGER.info("Param search kept stale: run_id=%s outside current scan range", param_run_id)
 
+    @staticmethod
+    def _worker_running(worker):
+        """isRunning() that tolerates a worker whose C++ side was deleted."""
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def _release_worker(self, attr_name: str, worker):
+        """finished-slot: drop the window's reference before deleteLater so a
+        later isRunning() check never touches a deleted QThread."""
+        if getattr(self, attr_name, None) is worker:
+            setattr(self, attr_name, None)
+        worker.deleteLater()
+
     def _get_metadata_cache(self):
         """One MetadataCache per data dir, kept across scans.  Re-parsing the
         JSON cache from the network drive on every refresh (auto-refresh can
@@ -1778,6 +1812,13 @@ class DataBrowserWindow(QMainWindow):
             LOGGER.info("Superseding active scan: old_request_id=%s new_request_id=%s", self._pending_scan_request_id, current_scan_id)
             self._scan_worker.request_stop()
             # Do not wait here; stale worker outputs are ignored via request ids.
+            # The superseded scan's completion is discarded, so retire its busy
+            # mark now (the new scan took its own above).
+            self._set_activity_idle()
+
+        # The background folder indexer must not compete with HDF5 reads.
+        if self._worker_running(self._folder_index_worker):
+            self._folder_index_worker.request_stop()
 
         date_from = self.date_from.date().toPyDate()
         date_to = self.date_to.date().toPyDate()
@@ -1841,7 +1882,7 @@ class DataBrowserWindow(QMainWindow):
             LOGGER.info("Auto-refresh tick skipped: scan already running")
             return
 
-        if self._latest_run_check_worker is not None and self._latest_run_check_worker.isRunning():
+        if self._worker_running(self._latest_run_check_worker):
             LOGGER.info("Auto-refresh tick skipped: latest-run check already running")
             return
 
@@ -1857,7 +1898,7 @@ class DataBrowserWindow(QMainWindow):
         )
         # Parented QThreads are otherwise retained until the window closes;
         # one every 10 s adds up over a lab day.
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._release_worker("_latest_run_check_worker", w))
         self._latest_run_check_worker = worker
         worker.start()
 
@@ -2010,13 +2051,13 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText("Run ID must be an integer")
             return
 
-        if self._run_id_lookup_worker is not None and self._run_id_lookup_worker.isRunning():
+        if self._worker_running(self._run_id_lookup_worker):
             self.status_label.setText("Run ID search already in progress")
             LOGGER.info("Run ID lookup request ignored: another lookup is already running")
             return
 
-        # Fast path: the run is already loaded, so no directory walk or rescan
-        # is needed -- just clear filters that might hide it and focus the row.
+        # Fast path 1: the run is already loaded, so no directory walk or
+        # rescan is needed -- clear filters that might hide it and focus the row.
         if requested_run_id in self._runs_by_id:
             self._clear_filters_silently()
             if self._focus_row_by_run_id(requested_run_id):
@@ -2024,21 +2065,37 @@ class DataBrowserWindow(QMainWindow):
                 self.status_label.setText(f"Focused run {requested_run_id}")
                 return
 
+        # Fast path 2: the id falls strictly inside the loaded id range, so the
+        # nearest *valid* run is already in the table (any closer file would be
+        # an incomplete run the browser would not show anyway).  Zero I/O.
+        if self._runs_by_id:
+            loaded_min = min(self._runs_by_id)
+            loaded_max = max(self._runs_by_id)
+            if loaded_min < requested_run_id < loaded_max:
+                nearest = min(self._runs_by_id, key=lambda rid: (abs(rid - requested_run_id), rid))
+                self._clear_filters_silently()
+                if self._focus_row_by_run_id(nearest):
+                    LOGGER.info("Run ID lookup satisfied locally: requested=%s nearest_loaded=%s", requested_run_id, nearest)
+                    self.status_label.setText(f"Run {requested_run_id} not found; focused nearest loaded run {nearest}")
+                    return
+
         LOGGER.info("Run ID lookup started: requested_run_id=%s", requested_run_id)
         self._set_activity_busy("Searching run ID…")
         self.run_id_jump_btn.setEnabled(False)
 
         self._run_id_lookup_request_id += 1
         current_request_id = self._run_id_lookup_request_id
-        worker = RunIdLookupWorker(self._server_talk, self.data_dir, requested_run_id, self)
+        worker = RunIdLookupWorker(
+            self._server_talk, self.data_dir, requested_run_id, cache=self._get_metadata_cache(), parent=self
+        )
         worker.lookup_ready.connect(
-            lambda resolved_run_id, run_date, req_id=current_request_id, requested=requested_run_id:
-            self._on_run_id_lookup_ready_guarded(requested, resolved_run_id, run_date, req_id)
+            lambda resolved_run_id, run_date, stats, req_id=current_request_id, requested=requested_run_id:
+            self._on_run_id_lookup_ready_guarded(requested, resolved_run_id, run_date, req_id, stats)
         )
         worker.lookup_error.connect(
             lambda message, req_id=current_request_id: self._on_run_id_lookup_error_guarded(message, req_id)
         )
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._release_worker("_run_id_lookup_worker", w))
         self._run_id_lookup_worker = worker
         worker.start()
 
@@ -2056,7 +2113,7 @@ class DataBrowserWindow(QMainWindow):
         self._active_filter_terms = []
         self._apply_filter()
 
-    def _on_run_id_lookup_ready_guarded(self, requested_run_id: int, resolved_run_id, run_date, request_id: int):
+    def _on_run_id_lookup_ready_guarded(self, requested_run_id: int, resolved_run_id, run_date, request_id: int, stats=None):
         if request_id != self._run_id_lookup_request_id:
             return
 
@@ -2068,15 +2125,45 @@ class DataBrowserWindow(QMainWindow):
             return
 
         LOGGER.info(
-            "Run ID lookup complete: requested=%s resolved=%s date=%s",
+            "Run ID lookup complete: requested=%s resolved=%s date=%s stats=%s",
             requested_run_id,
             resolved_run_id,
             run_date,
+            stats,
         )
 
+        if int(resolved_run_id) in self._runs_by_id:
+            # Nearest run is already on screen (typical when the requested id is
+            # newer than anything on disk): focus it, no rescan.
+            self._clear_filters_silently()
+            if self._focus_row_by_run_id(int(resolved_run_id)):
+                if int(resolved_run_id) != int(requested_run_id):
+                    self.status_label.setText(f"Run {requested_run_id} not found; focused nearest run {resolved_run_id}")
+                else:
+                    self.status_label.setText(f"Focused run {resolved_run_id}")
+                self._set_activity_idle()
+                return
+
         center_qdate = QDate(run_date.year, run_date.month, run_date.day)
-        self.date_from.setDate(center_qdate.addDays(-3))
-        self.date_to.setDate(center_qdate.addDays(3))
+        widen_from = center_qdate.addDays(-RUN_ID_JUMP_CONTEXT_DAYS)
+        widen_to = center_qdate.addDays(RUN_ID_JUMP_CONTEXT_DAYS)
+        already_loaded = (
+            self.date_from.date() <= center_qdate <= self.date_to.date()
+            and self._scan_worker is not None
+            and not self._scan_worker.isRunning()
+        )
+        if already_loaded:
+            # The day is on screen already (id fell in a gap at the edge of the
+            # loaded range); widen straight away in one scan.
+            self.date_from.setDate(min(self.date_from.date(), widen_from))
+            self.date_to.setDate(max(self.date_to.date(), widen_to))
+            self._pending_widen_range = None
+        else:
+            # Two-phase: scan only the target day first so the row appears as
+            # soon as possible, then widen to the surrounding days.
+            self.date_from.setDate(center_qdate)
+            self.date_to.setDate(center_qdate)
+            self._pending_widen_range = (widen_from, widen_to)
 
         # Clear active filters so the target row stays visible.  The scan that
         # follows rebuilds the table anyway, so skip the immediate filter pass.
@@ -2097,6 +2184,7 @@ class DataBrowserWindow(QMainWindow):
             return
         LOGGER.error("Run ID lookup failed: %s", message)
         self.run_id_jump_btn.setEnabled(True)
+        self._pending_widen_range = None
         self.status_label.setText("Run ID search failed")
         QMessageBox.warning(self, "Run ID Search Error", message)
         self._set_activity_idle()
@@ -2365,23 +2453,71 @@ class DataBrowserWindow(QMainWindow):
         self._scan_restore_state = None
 
         if self._pending_focus_run_id is not None:
-            focused = self._focus_row_by_run_id(self._pending_focus_run_id)
+            target = int(self._pending_focus_run_id)
             requested = self._pending_requested_run_id
+            focused = self._focus_row_by_run_id(target)
             if focused:
-                if requested is not None and int(requested) != int(self._pending_focus_run_id):
-                    self.status_label.setText(
-                        f"Run {requested} not found; focused nearest run {self._pending_focus_run_id}"
-                    )
+                if requested is not None and int(requested) != target:
+                    message = f"Run {requested} not found; focused nearest run {target}"
                 else:
-                    self.status_label.setText(f"Focused run {self._pending_focus_run_id}")
+                    message = f"Focused run {target}"
+            elif self._runs_by_id:
+                # The nearest file on disk is not a completed run (still being
+                # written, or broken), so it is not in the table.  Fall back to
+                # the nearest run that is.
+                anchor = target if requested is None else int(requested)
+                fallback = min(self._runs_by_id, key=lambda rid: (abs(rid - anchor), rid))
+                focused = self._focus_row_by_run_id(fallback)
+                message = (
+                    f"Run {anchor} not found; nearest file {target} is not a completed run; "
+                    f"focused run {fallback}"
+                )
             else:
-                self.status_label.setText("Could not focus requested run")
+                message = "Could not focus requested run"
+            self.status_label.setText(message)
+            self._pending_focus_message = message if focused else None
             self._pending_focus_run_id = None
             self._pending_requested_run_id = None
         else:
             self._restore_scan_state(restore_state)
+            if self._pending_focus_message is not None:
+                # Second phase of a run-ID jump: keep the focus message visible.
+                self.status_label.setText(self._pending_focus_message)
+                self._pending_focus_message = None
 
         self._set_activity_idle()
+
+        if self._pending_widen_range is not None:
+            # Phase two of a run-ID jump: the target day is on screen and its
+            # row is focused; now widen to the surrounding days.  The restore
+            # logic keeps the selection and re-centres the row.
+            widen_from, widen_to = self._pending_widen_range
+            self._pending_widen_range = None
+            LOGGER.info("Run ID jump: widening range to %s..%s", widen_from.toString("yyyy-MM-dd"), widen_to.toString("yyyy-MM-dd"))
+            self.date_from.setDate(widen_from)
+            self.date_to.setDate(widen_to)
+            self._start_scan()
+            return
+
+        self._maybe_start_folder_indexing()
+
+    def _maybe_start_folder_indexing(self):
+        """Kick off the one-time background run-id index build for this data
+        dir (resumed if an earlier attempt was interrupted by a scan)."""
+        if self._folder_index_complete_dir == self.data_dir:
+            return
+        if self._worker_running(self._folder_index_worker):
+            return
+        worker = FolderIndexWorker(self.data_dir, self._get_metadata_cache())
+        worker.done.connect(lambda n, completed, d=self.data_dir: self._on_folder_index_done(d, n, completed))
+        worker.finished.connect(lambda w=worker: self._release_worker("_folder_index_worker", w))
+        self._folder_index_worker = worker
+        worker.start()
+
+    def _on_folder_index_done(self, data_dir: str, indexed: int, completed: bool):
+        if completed and data_dir == self.data_dir:
+            self._folder_index_complete_dir = data_dir
+        LOGGER.info("Folder index pass finished: folders_indexed=%s completed=%s", indexed, completed)
 
     def _on_scan_done_guarded(self, count: int, scan_request_id: int):
         if scan_request_id != self._scan_request_id:
@@ -2531,6 +2667,9 @@ class DataBrowserWindow(QMainWindow):
                 len(self._running_xvar_loaders),
             )
             old_loader.requestInterruption()
+            # An interrupted loader never reports back, so retire its busy mark
+            # here or the activity indicator stays amber for good.
+            self._set_activity_idle()
 
         self.detail_pane.clear_details()
         self._set_activity_busy("Loading run details…")
@@ -3192,6 +3331,8 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
             )
             old_loader.requestInterruption()
+            # Its request id is now stale, so nothing else will decrement this.
+            self._set_activity_idle()
         dialog.set_loading_state(run)
         self._set_activity_busy("Loading params…")
         self._param_search_request_id += 1
@@ -3260,7 +3401,6 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
                 {mode: len(values) for mode, values in records.items()},
             )
-            self._set_activity_idle()
             return
         self._on_param_search_records_ready(run_id, records)
 
@@ -3272,7 +3412,6 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
                 message,
             )
-            self._set_activity_idle()
             return
         LOGGER.error("Param search load failed: %s", message)
         dialog = self._ensure_param_search_dialog()

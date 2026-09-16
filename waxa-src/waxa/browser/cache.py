@@ -24,6 +24,7 @@ class MetadataCache:
         self.data_dir = data_dir
         self.cache_path = os.path.join(data_dir, self.FILENAME) if data_dir else ""
         self._entries = {}
+        self._folder_index = {}
         self._dirty = False
         self._last_save_time = 0.0
         self._lock = threading.Lock()
@@ -45,9 +46,50 @@ class MetadataCache:
         if isinstance(entries, dict):
             self._entries = entries
 
+        folder_index = payload.get("folder_index", {})
+        if isinstance(folder_index, dict):
+            cleaned = {}
+            for date_str, value in folder_index.items():
+                try:
+                    lo, hi, n = value
+                    cleaned[str(date_str)] = (
+                        None if lo is None else int(lo),
+                        None if hi is None else int(hi),
+                        int(n),
+                    )
+                except Exception:
+                    continue
+            self._folder_index = cleaned
+
     def __len__(self):
         with self._lock:
             return len(self._entries)
+
+    # ------------------------------------------------------------------
+    # Per-date-folder run-id index: date_str -> (min_run_id, max_run_id, n_files)
+    #
+    # Run ids increase monotonically with date, so this tiny table answers
+    # "which folder holds run N / what are the nearest ids" without touching
+    # the network.  It is filled as a by-product of every scan and by the
+    # background FolderIndexWorker, and persisted alongside the entries.
+    # ------------------------------------------------------------------
+
+    def folder_index(self) -> dict:
+        with self._lock:
+            return dict(self._folder_index)
+
+    def folder_index_entry(self, date_str: str):
+        with self._lock:
+            return self._folder_index.get(date_str)
+
+    def update_folder_index(self, date_str: str, run_ids):
+        ids = [int(r) for r in run_ids]
+        entry = (min(ids), max(ids), len(ids)) if ids else (None, None, 0)
+        with self._lock:
+            if self._folder_index.get(date_str) == entry:
+                return
+            self._folder_index[date_str] = entry
+            self._dirty = True
 
     def get(self, filepath: str, stat_result: os.stat_result) -> Optional[RunSummary]:
         with self._lock:
@@ -103,6 +145,7 @@ class MetadataCache:
             payload = {
                 "version": self.VERSION,
                 "entries": self._entries,
+                "folder_index": {k: list(v) for k, v in self._folder_index.items()},
             }
             # Serialise under the lock (entries may be mutated concurrently),
             # but the JSON encode itself is the expensive bit; keep it here so
