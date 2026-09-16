@@ -9,7 +9,7 @@ import os
 import numpy as np
 import pytest
 
-from waxa.image_processing.auto_roi import (AutoRoiResult, split_images,
+from waxa.image_processing.auto_roi import (AutoRoiResult, rebox, split_images,
                                             suggest_roi)
 
 # A small synthetic frame. Big enough that the border trim and the smoothing
@@ -285,3 +285,81 @@ def test_speed_is_a_small_fraction_of_load():
     suggest_roi(images=images)
     elapsed = time.perf_counter() - t
     assert elapsed < 0.5, f"detection took {elapsed * 1000.0:.0f} ms"
+
+
+# ── conservativeness / rebox ─────────────────────────────────────────────────
+
+def test_default_conservativeness_reproduces_the_module_defaults():
+    from waxa.image_processing import auto_roi as m
+    p = m.conservative_params(m.DEFAULT_CONSERVATIVENESS)
+    assert p['threshold_frac'] == pytest.approx(m.DEFAULT_THRESHOLD_FRAC)
+    assert p['component_frac'] == pytest.approx(m.DEFAULT_COMPONENT_FRAC)
+    assert p['margin_frac'] == pytest.approx(m.DEFAULT_MARGIN_FRAC)
+
+
+def test_conservative_params_are_monotonic_and_clipped():
+    from waxa.image_processing.auto_roi import conservative_params
+    cs = np.linspace(0, 1, 11)
+    thr = [conservative_params(c)['threshold_frac'] for c in cs]
+    mar = [conservative_params(c)['margin_frac'] for c in cs]
+    assert all(a >= b for a, b in zip(thr, thr[1:]))     # cut falls
+    assert all(a <= b for a, b in zip(mar, mar[1:]))     # padding grows
+    assert conservative_params(-3.) == conservative_params(0.)
+    assert conservative_params(7.) == conservative_params(1.)
+
+
+def _area(r):
+    return (r.roix[1] - r.roix[0]) * (r.roiy[1] - r.roiy[0])
+
+
+def test_more_generous_gives_a_bigger_box_that_still_holds_the_cloud():
+    atoms, light = _frames(blob=(64, 70, 5, 0.5))
+    tight = suggest_roi(atoms=atoms, light=light, conservativeness=0.)
+    mid = suggest_roi(atoms=atoms, light=light)
+    loose = suggest_roi(atoms=atoms, light=light, conservativeness=1.)
+    for r in (tight, mid, loose):
+        assert r.valid, r
+        assert _contains(r, 64, 70)
+    assert _area(tight) < _area(mid) < _area(loose)
+
+
+def test_rebox_matches_a_fresh_suggestion_without_rescoring():
+    atoms, light = _frames(blob=(64, 70, 5, 0.5))
+    base = suggest_roi(atoms=atoms, light=light)
+    assert base.can_rebox
+    for c in (0., 0.25, 0.8, 1.):
+        fresh = suggest_roi(atoms=atoms, light=light, conservativeness=c)
+        again = rebox(base, c)
+        assert again.roix == fresh.roix and again.roiy == fresh.roiy
+        assert again.valid == fresh.valid
+        assert again.conservativeness == pytest.approx(c)
+        assert again.score_map is base.score_map      # shared, not rebuilt
+        assert again.can_rebox
+    # Reboxing back to the base setting reproduces the base box exactly.
+    back = rebox(rebox(base, 0.), base.conservativeness)
+    assert back.roix == base.roix and back.roiy == base.roiy
+
+
+def test_explicit_boxing_parameters_override_the_knob():
+    atoms, light = _frames(blob=(64, 70, 5, 0.5))
+    pinned = suggest_roi(atoms=atoms, light=light, conservativeness=1.,
+                         margin_frac=0.5, threshold_frac=0.3,
+                         component_frac=0.3)
+    default = suggest_roi(atoms=atoms, light=light)
+    assert pinned.roix == default.roix and pinned.roiy == default.roiy
+    # ...and the pins survive a rebox.
+    assert rebox(pinned, 0.).roix == default.roix
+
+
+def test_rebox_of_a_failed_detection_is_harmless():
+    atoms, light = _frames(blob=None)
+    r = suggest_roi(atoms=atoms, light=light)
+    assert not r.valid
+    again = rebox(r, 1.)
+    assert not again.valid
+    assert again.reason == r.reason
+    assert again.conservativeness == pytest.approx(1.)
+    empty = suggest_roi(atoms=np.zeros((0, FRAME, FRAME), np.uint16),
+                        light=np.zeros((0, FRAME, FRAME), np.uint16))
+    assert not empty.can_rebox
+    assert not rebox(empty, 0.3).valid

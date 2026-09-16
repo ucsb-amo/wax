@@ -1,5 +1,6 @@
 import numpy as np
 import datetime
+import functools
 import h5py
 from waxa.calibrations.cross_section import cross_section_for_run
 import os
@@ -30,7 +31,19 @@ if TYPE_CHECKING:
     from kexp.config.data_vault import DataVault as _KexpDataVault  # type: ignore[import-not-found]
     _ExptParamsHint = Union[_KexpExptParams, _WaxaExptParams]
     _DataVaultHint = _KexpDataVault
-    
+
+# Scan-shaped arrays at or above this size are reduced for the avg/std/sem
+# siblings on first access instead of eagerly when the siblings are built.
+# Eager reduction of everything cost ~7 s per load on a Basler run, almost all
+# of it on the raw frames and the full-frame OD, which are rarely read through
+# the siblings. Everything below this size (the cropped od, atom numbers, fit
+# results, DataVault keys) is still reduced eagerly, so vars(ad.avg) keeps
+# holding the quantities people actually plot.
+REPEAT_STAT_LAZY_BYTES = 32 * 1024 ** 2
+
+# Bookkeeping keys the lazy siblings carry; never treated as data.
+_LAZY_STAT_KEYS = ('_lazy_stat_attrs', '_lazy_stat_resolver')
+
 class ScopeTraceArray():
     def __init__(self, scope_key, ch, t, v):
         self.scope_key = scope_key
@@ -685,7 +698,13 @@ class atomdata_base():
         if self._lite:
             self.regenerate_lite_copy(roi_id=roi_id, use_saved=use_saved)
         else:
-            od_flat = self.od_raw.reshape(-1, *self.od_raw.shape[-2:])
+            # Hand the GUI the full-frame ODs only if they already exist;
+            # otherwise it computes the OD of each displayed frame from the
+            # raw images on demand, which is far cheaper than materializing
+            # od_raw for the whole run just to browse a few frames.
+            od_raw = vars(self).get('od_raw')
+            od_flat = (od_raw.reshape(-1, *od_raw.shape[-2:])
+                       if od_raw is not None else None)
             self.roi.load_roi(roi_id, use_saved, display_ods=od_flat)
             self.analyze_ods()
             self._refresh_repeat_statistics()
@@ -728,7 +747,7 @@ class atomdata_base():
         self._load_data(self.run_info.run_id, "", lite=True)
         self._dealer = self._init_dealer()
         self._sort_images()
-        self.compute_raw_ods()
+        vars(self).pop('od_raw', None)
         self.analyze_ods()
         self._refresh_repeat_statistics()
 
@@ -982,10 +1001,8 @@ class atomdata_base():
         else:
             t_transpose = 0.0
 
-        t_stage = time.perf_counter()
-        self.compute_raw_ods()
-        t_compute_raw = time.perf_counter() - t_stage
-
+        # No full-frame OD pass here any more: analyze_ods computes the OD on
+        # the ROI crop directly, and od_raw is materialized only on demand.
         if avg_repeats:
             t_stage = time.perf_counter()
             self.avg_repeats(reanalyze=False)
@@ -1004,7 +1021,6 @@ class atomdata_base():
 
         self._timing['initial_analysis_sort_images_s'] = t_sort
         self._timing['initial_analysis_transpose_s'] = t_transpose
-        self._timing['initial_analysis_compute_raw_ods_s'] = t_compute_raw
         self._timing['initial_analysis_avg_repeats_s'] = t_avg_repeats
         self._timing['initial_analysis_analyze_ods_s'] = t_analyze_ods
         self._timing['initial_analysis_refresh_repeat_stats_s'] = t_repeat_stats
@@ -1014,13 +1030,12 @@ class atomdata_base():
             print(
                 (
                     "[atomdata timing] initial_analysis total={:.3f}s | sort_images={:.3f}s | "
-                    "transpose={:.3f}s | compute_raw_ods={:.3f}s | avg_repeats={:.3f}s | "
+                    "transpose={:.3f}s | avg_repeats={:.3f}s | "
                     "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s"
                 ).format(
                     t_total,
                     t_sort,
                     t_transpose,
-                    t_compute_raw,
                     t_avg_repeats,
                     t_analyze_ods,
                     t_repeat_stats,
@@ -1035,9 +1050,10 @@ class atomdata_base():
 
         t0 = time.perf_counter()
 
-        t_stage = time.perf_counter()
-        self.compute_raw_ods()
-        t_compute_raw = time.perf_counter() - t_stage
+        # analyze() is called after the raw frames were re-dealt, transposed
+        # or had their repeats reassigned, so any materialized full-frame OD
+        # is stale. Drop it; analyze_ods recomputes od from the frames.
+        self._invalidate_od_raw()
 
         t_stage = time.perf_counter()
         self.analyze_ods()
@@ -1048,7 +1064,6 @@ class atomdata_base():
         t_repeat_stats = time.perf_counter() - t_stage
         t_total = time.perf_counter() - t0
 
-        self._timing['analyze_compute_raw_ods_s'] = t_compute_raw
         self._timing['analyze_analyze_ods_s'] = t_analyze_ods
         self._timing['analyze_refresh_repeat_stats_s'] = t_repeat_stats
         self._timing['analyze_total_s'] = t_total
@@ -1056,32 +1071,62 @@ class atomdata_base():
         if self._timing_enabled:
             print(
                 (
-                    "[atomdata timing] analyze total={:.3f}s | compute_raw_ods={:.3f}s | "
+                    "[atomdata timing] analyze total={:.3f}s | "
                     "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s"
                 ).format(
                     t_total,
-                    t_compute_raw,
                     t_analyze_ods,
                     t_repeat_stats,
                 )
             )
 
     def compute_raw_ods(self):
-        """Computes the ODs. If not absorption analysis, OD = (pwa - dark)/(pwoa - dark).
-        """        
+        """Computes the full-frame ODs into ``od_raw``.
+
+        If not absorption analysis, OD = (pwa - dark)/(pwoa - dark). This is no
+        longer part of the load: ``od_raw`` is a property that calls this the
+        first time it is read (see ``_compute_od`` for why).
+        """
         self.od_raw = compute_OD(self.img_atoms,self.img_light,self.img_dark,
                                  imaging_type=self._analysis_tags.imaging_type)
 
-    def analyze_ods(self):
-        """Crops ODs, computes sum_ods, gaussian fits to sum_ods, and populates
-        fit results.
+    def _invalidate_od_raw(self):
+        """Forget a materialized full-frame OD (it will be recomputed on demand)."""
+        vars(self).pop('od_raw', None)
+
+    def _compute_od(self):
+        """The OD on the ROI crop.
+
+        When ``od_raw`` has been materialized (after avg_repeats /
+        revert_repeats, collapse_to_unique, or an explicit compute_raw_ods) it
+        is cropped, so those paths keep their exact semantics. Otherwise the
+        raw frames are cropped *first* and the OD is computed on the crop
+        only. The result is identical -- OD is a per-pixel function -- but on
+        a Basler run it is ~30x less work than the full-frame OD that used to
+        be computed, cropped, and 99% discarded (1.6 GB of float64 per 88
+        shots).
         """
-        # Lite files store images already cropped to an ROI during creation.
-        # Avoid applying ROI cropping a second time on load.
+        imaging_type = self._analysis_tags.imaging_type
+        od_raw = vars(self).get('od_raw')
+        if od_raw is not None:
+            # Lite frames were cropped when the lite file was made; never
+            # crop them a second time.
+            return od_raw if self._lite else self.roi.crop(od_raw)
         if self._lite:
-            self.od = self.od_raw
-        else:
-            self.od = self.roi.crop(self.od_raw)
+            od = compute_OD(self.img_atoms, self.img_light, self.img_dark,
+                            imaging_type=imaging_type)
+            # Already the whole (cropped) frame, and small: keep it as od_raw.
+            vars(self)['od_raw'] = od
+            return od
+        crop = self.roi.crop
+        return compute_OD(crop(self.img_atoms), crop(self.img_light),
+                          crop(self.img_dark), imaging_type=imaging_type)
+
+    def analyze_ods(self):
+        """Computes the cropped OD, sum_ods, gaussian fits to sum_ods, and
+        populates fit results.
+        """
+        self.od = self._compute_od()
         self.sum_od_x = np.sum(self.od,self.od.ndim-2)
         self.sum_od_y = np.sum(self.od,self.od.ndim-1)
 
@@ -1133,7 +1178,6 @@ class atomdata_base():
             self.atom_number_apd = atom_number_apd(number_up, number_down)
 
     def _sort_images(self):
-        print(self.images.shape)
         imgs_tuple = self._dealer.deal_data_ndarray(self.images)
         self.img_atoms = imgs_tuple[0]
         self.img_light = imgs_tuple[1]
@@ -1473,6 +1517,9 @@ class atomdata_base():
         # directly.  After reassign_repeats (if called) ad already holds fresh
         # analysis arrays; otherwise they mirror self.  Either way slicing is
         # equivalent to running analyze() on the sliced images and is much faster.
+        # Read through vars(): od_raw is a property that would otherwise
+        # materialize the full-frame OD just to slice it. Left absent, the
+        # slice computes its own od_raw on demand from its sliced frames.
         for attr in (
             'od_raw', 'od', 'sum_od_x', 'sum_od_y',
             'integrated_od', 'atom_number', 'atom_number_density',
@@ -1483,7 +1530,7 @@ class atomdata_base():
             'fit_amp_x', 'fit_amp_y', 'fit_offset_x', 'fit_offset_y',
             'fit_area_x', 'fit_area_y',
         ):
-            arr = getattr(ad, attr, None)
+            arr = vars(ad).get(attr)
             if arr is not None:
                 try:
                     setattr(ad, attr, slice_ndarray(arr))
@@ -1515,6 +1562,16 @@ class atomdata_base():
         array-valued attributes are copied by reference and sliced by the caller.
         """
         from copy import deepcopy
+
+        # A lazily-reduced stat sibling (ad.avg / ad.std / ad.sem) resolves
+        # some of its arrays on first access. Resolve the ones the slice
+        # needs now, so the copy below sees plain arrays. od_raw is left out:
+        # the slice computes its own from its sliced frames if ever asked.
+        lazy = vars(self).get('_lazy_stat_attrs')
+        if lazy:
+            for name in list(lazy):
+                if name not in ('od_raw',) and name not in vars(self):
+                    getattr(self, name)
 
         ad = object.__new__(self.__class__)
 
@@ -1603,6 +1660,8 @@ class atomdata_base():
             ad.scope_data = {}
 
         # Pre-computed analysis results — shallow refs; caller will slice.
+        # Membership is tested on vars() rather than with hasattr(): od_raw is
+        # a property, and hasattr() would materialize the full-frame OD.
         for attr in (
             'od_raw', 'od', 'sum_od_x', 'sum_od_y',
             'integrated_od', 'atom_number', 'atom_number_density',
@@ -1614,17 +1673,18 @@ class atomdata_base():
             'fit_area_x', 'fit_area_y',
             'atom_number_apd',
         ):
-            if hasattr(self, attr):
-                setattr(ad, attr, getattr(self, attr))
+            if attr in vars(self):
+                setattr(ad, attr, vars(self)[attr])
 
         # Fallback: copy any remaining attributes by reference (e.g.
         # subclass-specific bookkeeping such as AtomdataVault's
         # _merge_overlap/_uniform_roi/_scope_merge/...) so overridden methods
         # on subclasses keep working after a slice. Anything explicitly set
         # above (including deliberate resets like ad.avg = None) takes
-        # precedence and is left untouched.
+        # precedence and is left untouched. The lazy-sibling bookkeeping is
+        # never carried over: it would resolve against the unsliced source.
         for key, value in vars(self).items():
-            if key not in vars(ad):
+            if key not in vars(ad) and key not in _LAZY_STAT_KEYS:
                 vars(ad)[key] = value
 
         return ad
@@ -1772,6 +1832,43 @@ class atomdata_base():
         std_val = np.std(reshaped, axis=xvar_idx+1, dtype=np.float64)
         return mean_val, std_val
 
+    def _reduce_scope_data_mean_std(self, scope_data, xvar_idx, n_repeats):
+        """(avg_scope, std_scope) dicts of ScopeTraceArray, reduced over repeats."""
+        avg_scope = {}
+        std_scope = {}
+        for scope_key, channel_dict in scope_data.items():
+            avg_scope[scope_key] = {}
+            std_scope[scope_key] = {}
+            for ch, trace in channel_dict.items():
+                t = trace.t
+                v = trace.v
+                if self._is_scan_shaped_numeric_array(t):
+                    t_avg, t_std = self._reduce_repeat_ndarray_mean_std(t, xvar_idx, n_repeats)
+                else:
+                    t_avg = t
+                    t_std = t
+                if self._is_scan_shaped_numeric_array(v):
+                    v_avg, v_std = self._reduce_repeat_ndarray_mean_std(v, xvar_idx, n_repeats)
+                else:
+                    v_avg = v
+                    v_std = v
+                avg_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_avg, v_avg)
+                std_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_std, v_std)
+        return avg_scope, std_scope
+
+    @staticmethod
+    def _install_lazy_stats(siblings, lazy_attrs, resolve):
+        """Arm ``siblings`` to reduce ``lazy_attrs`` on first access.
+
+        ``resolve(name, kind)`` must return the reduced value for one sibling
+        kind. Access goes through ``atomdata_base.__getattr__`` (plain
+        attributes) and the ``od_raw`` property; the value is then cached in
+        the sibling's __dict__ like any eagerly reduced one.
+        """
+        for sib, kind in siblings:
+            vars(sib)['_lazy_stat_attrs'] = set(lazy_attrs)
+            vars(sib)['_lazy_stat_resolver'] = functools.partial(resolve, kind=kind)
+
     def _build_repeat_stat_atomdata_pair(self, xvar_idx, n_repeats):
         ad_avg = object.__new__(self.__class__)
         ad_std = object.__new__(self.__class__)
@@ -1782,12 +1879,18 @@ class atomdata_base():
                      '_repeat_sem_source', '_repeat_sem_divisor',
                      'params', 'p', 'camera_params', 'run_info', 'roi',
                      'data', 'scope_data', '_analysis_tags', '_dealer',
-                     '_ds', 'server_talk']
+                     '_ds', 'server_talk', *_LAZY_STAT_KEYS]
 
+        # Small arrays are reduced now; large ones (the raw frames, a
+        # materialized od_raw, ...) on first access -- see REPEAT_STAT_LAZY_BYTES.
+        lazy_attrs = set()
         for key, value in vars(self).items():
             if key in skip_keys:
                 continue
             if self._is_scan_shaped_numeric_array(value):
+                if value.nbytes >= REPEAT_STAT_LAZY_BYTES:
+                    lazy_attrs.add(key)
+                    continue
                 mean_val, std_val = self._reduce_repeat_ndarray_mean_std(value, xvar_idx, n_repeats)
                 vars(ad_avg)[key] = mean_val
                 vars(ad_std)[key] = std_val
@@ -1796,6 +1899,12 @@ class atomdata_base():
                     vars(ad_avg)[key] = value
                 if key not in vars(ad_std):
                     vars(ad_std)[key] = value
+
+        # od_raw is itself computed on demand, so the siblings must never
+        # force it: ad.avg.od_raw materializes the source's od_raw and
+        # reduces it only when actually read.
+        if getattr(self, '_has_images', True) and 'od_raw' not in vars(ad_avg):
+            lazy_attrs.add('od_raw')
 
         for key in self.data.keys:
             value = vars(self.data)[key]
@@ -1808,29 +1917,28 @@ class atomdata_base():
                 vars(ad_std.data)[key] = value
 
         if hasattr(self, 'scope_data'):
-            avg_scope = {}
-            std_scope = {}
-            for scope_key, channel_dict in self.scope_data.items():
-                avg_scope[scope_key] = {}
-                std_scope[scope_key] = {}
-                for ch, trace in channel_dict.items():
-                    t = trace.t
-                    v = trace.v
-                    if self._is_scan_shaped_numeric_array(t):
-                        t_avg, t_std = self._reduce_repeat_ndarray_mean_std(t, xvar_idx, n_repeats)
-                    else:
-                        t_avg = t
-                        t_std = t
-                    if self._is_scan_shaped_numeric_array(v):
-                        v_avg, v_std = self._reduce_repeat_ndarray_mean_std(v, xvar_idx, n_repeats)
-                    else:
-                        v_avg = v
-                        v_std = v
-                    avg_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_avg, v_avg)
-                    std_scope[scope_key][ch] = ScopeTraceArray(scope_key, ch, t_std, v_std)
-            ad_avg.scope_data = avg_scope
-            ad_std.scope_data = std_scope
+            if self.scope_data:
+                # Scope traces can be as large as the images; reduce on demand.
+                lazy_attrs.add('scope_data')
+            else:
+                ad_avg.scope_data = {}
+                ad_std.scope_data = {}
 
+        shared = {}
+
+        def _resolve(name, kind):
+            if name not in shared:
+                if name == 'scope_data':
+                    shared[name] = self._reduce_scope_data_mean_std(
+                        self.scope_data, xvar_idx, n_repeats)
+                else:
+                    shared[name] = self._reduce_repeat_ndarray_mean_std(
+                        getattr(self, name), xvar_idx, n_repeats)
+            mean_val, std_val = shared[name]
+            return mean_val if kind == 'mean' else std_val
+
+        self._install_lazy_stats(((ad_avg, 'mean'), (ad_std, 'std')),
+                                 lazy_attrs, _resolve)
         return ad_avg, ad_std
 
     def _build_repeat_sem_atomdata(self, std, n_repeats):
@@ -2794,6 +2902,50 @@ class atomdata_base():
                         timing.get('get_data_file_retry_lite_s', 0.0),
                     )
                 )
+
+    @property
+    def od_raw(self):
+        """The full-frame OD stack, computed on first read.
+
+        The load computes the OD on the ROI crop only (see ``_compute_od``);
+        the full frames are only needed by the recrop GUI, ``avg_repeats`` and
+        the like, so they are materialized here on demand and then cached in
+        ``__dict__`` like an ordinary attribute. Assigning to ``od_raw`` stores
+        the given array; ``_invalidate_od_raw`` forgets it.
+        """
+        d = vars(self)
+        if 'od_raw' in d:
+            return d['od_raw']
+        lazy = d.get('_lazy_stat_attrs')
+        if lazy and 'od_raw' in lazy:
+            # A stat sibling: reduce the source's od_raw rather than computing
+            # an OD of the already-reduced frames.
+            return self.__getattr__('od_raw')
+        if not getattr(self, '_has_images', True) or d.get('img_atoms') is None:
+            return None
+        self.compute_raw_ods()
+        return d['od_raw']
+
+    @od_raw.setter
+    def od_raw(self, value):
+        vars(self)['od_raw'] = value
+
+    @od_raw.deleter
+    def od_raw(self):
+        vars(self).pop('od_raw', None)
+
+    def __getattr__(self, name):
+        # Reached only when normal lookup fails. The avg/std/sem siblings
+        # defer their large arrays to here (see _install_lazy_stats); the
+        # resolved value is cached so this runs once per attribute.
+        d = object.__getattribute__(self, '__dict__')
+        lazy = d.get('_lazy_stat_attrs')
+        if lazy and name in lazy:
+            value = d['_lazy_stat_resolver'](name)
+            d[name] = value
+            return value
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def __getattribute__(self, name):
         if name in ['_repeat_sem_source',

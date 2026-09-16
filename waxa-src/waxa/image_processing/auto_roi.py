@@ -53,7 +53,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from scipy import ndimage as ndi
 
-__all__ = ["AutoRoiResult", "suggest_roi", "score_map_from_images", "split_images"]
+__all__ = ["AutoRoiResult", "suggest_roi", "rebox", "conservative_params",
+           "score_map_from_images", "split_images"]
 
 # The Andor's last sensor rows carry a readout artifact hundreds of times
 # brighter than a typical row; without trimming it dominates the score map and
@@ -68,6 +69,18 @@ DEFAULT_SMOOTH = 5              # uniform_filter width, px
 DEFAULT_THRESHOLD_FRAC = 0.3    # mask cut, as a fraction of the smoothed max
 DEFAULT_COMPONENT_FRAC = 0.3    # keep components peaking this high, vs the map max
 DEFAULT_MARGIN_FRAC = 0.5       # box padding, as a fraction of the box extent
+DEFAULT_CONSERVATIVENESS = 0.5  # one knob for the three above; 0.5 is the defaults
+# Where the boxing parameters land at the two ends of the conservativeness
+# scale. 0 is tight: a high mask cut hugs the dense core and the padding is
+# slim. 1 is generous: the cut drops to the cloud's wings, faint secondary
+# positions are kept, and the padding grows to a full cloud's width. The
+# midpoint reproduces the DEFAULT_* values exactly, so an existing caller that
+# never touches the knob sees no change.
+CONSERVATIVE_RANGE = {
+    'threshold_frac': (0.6, DEFAULT_THRESHOLD_FRAC, 0.1),
+    'component_frac': (0.6, DEFAULT_COMPONENT_FRAC, 0.1),
+    'margin_frac': (0.2, DEFAULT_MARGIN_FRAC, 1.0),
+}
 DEFAULT_MARGIN_MIN = 6          # px, floor on the padding
 DEFAULT_MIN_CONFIDENCE = 0.02   # below this the box captured next to nothing
 DEFAULT_MIN_DETECTED_FRAC = 0.05  # shots that must hold a cloud for a real run
@@ -117,11 +130,16 @@ class AutoRoiResult():
         reason (str): why valid is False, or "ok".
         score_map (np.ndarray): the (H, W) smoothed score map, placed back on
             the full frame so it can be displayed against the run's images.
+        conservativeness (float): the knob the box was drawn with, 0 (tight)
+            to 1 (generous); see :func:`conservative_params`.
+        can_rebox (bool): whether :func:`rebox` can redraw the box at another
+            conservativeness without rescoring the images.
     """
 
     def __init__(self, roix, roiy, valid, confidence, n_components,
                  n_shots, peak, reason, score_map, n_kept=0, area_frac=0.,
-                 fill=0., peak_per_shot=0.):
+                 fill=0., peak_per_shot=0.,
+                 conservativeness=DEFAULT_CONSERVATIVENESS):
         self.roix = roix
         self.roiy = roiy
         self.valid = valid
@@ -135,13 +153,47 @@ class AutoRoiResult():
         self.peak = peak
         self.reason = reason
         self.score_map = score_map
+        self.conservativeness = float(conservativeness)
+        # The scored grid the box was cut from, and the boxing parameters the
+        # caller pinned explicitly. Together they let rebox() redraw the box at
+        # another conservativeness for the cost of a threshold, not a rescore.
+        self._grid = None
+        self._box_params = {}
+
+    @property
+    def can_rebox(self):
+        return self._grid is not None
 
     def __repr__(self):
         state = "valid" if self.valid else "INVALID (" + self.reason + ")"
         return (f"AutoRoiResult({state}, roix={self.roix}, roiy={self.roiy}, "
                 f"confidence={self.confidence:.3f}, fill={self.fill:.3f}, "
                 f"peak_per_shot={self.peak_per_shot:.3f}, n_kept={self.n_kept}, "
-                f"area_frac={self.area_frac:.4f}, n_components={self.n_components})")
+                f"area_frac={self.area_frac:.4f}, n_components={self.n_components}, "
+                f"conservativeness={self.conservativeness:.2f})")
+
+
+def conservative_params(conservativeness=DEFAULT_CONSERVATIVENESS):
+    """Boxing parameters for a conservativeness in [0, 1].
+
+    One knob for the three parameters that decide how much frame the box
+    takes around a detected cloud. 0 is tight (the box hugs the dense core),
+    1 is generous (the box takes the cloud's wings, any faint secondary
+    position, and a wide margin), 0.5 reproduces the module defaults. Each
+    parameter is interpolated linearly on either side of the midpoint through
+    the ends in CONSERVATIVE_RANGE. Values outside [0, 1] are clipped.
+
+    Returns:
+        dict: threshold_frac, component_frac and margin_frac.
+    """
+    c = float(np.clip(conservativeness, 0., 1.))
+    out = {}
+    for name, (lo, mid, hi) in CONSERVATIVE_RANGE.items():
+        if c <= 0.5:
+            out[name] = lo + (mid - lo) * (c / 0.5)
+        else:
+            out[name] = mid + (hi - mid) * ((c - 0.5) / 0.5)
+    return out
 
 
 def split_images(images, n_pwa_per_shot=1):
@@ -545,9 +597,10 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
                 k=DEFAULT_K, border_trim=DEFAULT_BORDER_TRIM,
                 levels=DEFAULT_LEVELS, norm_floor=DEFAULT_NORM_FLOOR,
                 despike=DEFAULT_DESPIKE, smooth=DEFAULT_SMOOTH,
-                threshold_frac=DEFAULT_THRESHOLD_FRAC,
-                component_frac=DEFAULT_COMPONENT_FRAC,
-                margin_frac=DEFAULT_MARGIN_FRAC, margin_min=DEFAULT_MARGIN_MIN,
+                conservativeness=DEFAULT_CONSERVATIVENESS,
+                threshold_frac=None,
+                component_frac=None,
+                margin_frac=None, margin_min=DEFAULT_MARGIN_MIN,
                 min_confidence=DEFAULT_MIN_CONFIDENCE,
                 min_detected_frac=DEFAULT_MIN_DETECTED_FRAC,
                 max_area_frac=DEFAULT_MAX_AREA_FRAC,
@@ -571,14 +624,20 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
         despike (int): median_filter width applied to the score map, a backstop
             behind the per-shot defect rejection.
         smooth (int): uniform_filter width applied to the score map.
-        threshold_frac (float): mask cut as a fraction of the smoothed max.
-        component_frac (float): keep components whose own peak reaches at least
-            this share of the map's peak, so a cloud that jumped between shots
-            contributes every position it visited. Defaults to threshold_frac,
-            i.e. every blob that entered the mask is kept; raise it to demand
-            that secondary blobs be brighter.
-        margin_frac (float): padding as a fraction of the largest component's
-            extent.
+        conservativeness (float): 0 (tight) to 1 (generous), one knob setting
+            threshold_frac, component_frac and margin_frac together; see
+            :func:`conservative_params`. The default reproduces the module
+            defaults. Any of the three given explicitly overrides the knob.
+        threshold_frac (float or None): mask cut as a fraction of the smoothed
+            max. None derives it from conservativeness.
+        component_frac (float or None): keep components whose own peak reaches
+            at least this share of the map's peak, so a cloud that jumped
+            between shots contributes every position it visited. Defaults to
+            threshold_frac, i.e. every blob that entered the mask is kept;
+            raise it to demand that secondary blobs be brighter. None derives
+            it from conservativeness.
+        margin_frac (float or None): padding as a fraction of the largest
+            component's extent. None derives it from conservativeness.
         margin_min (int): minimum padding in pixels.
         min_confidence (float): confidence below which valid is False.
         min_detected_frac (float): fraction of shots that must hold a cloud.
@@ -597,7 +656,9 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
 
     Returns:
         AutoRoiResult: the box plus the QC scalars behind it. Always returns a
-        result -- check .valid rather than catching exceptions.
+        result -- check .valid rather than catching exceptions. The result
+        remembers its scored grid, so :func:`rebox` can redraw the box at a
+        different conservativeness without touching the images again.
     """
     if images is not None:
         atoms, light = split_images(images, n_pwa_per_shot)
@@ -611,23 +672,17 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
         blank = np.zeros((1, 1), dtype=np.float32)
         return AutoRoiResult(roix=[-1, -1], roiy=[-1, -1], valid=False,
                              confidence=0., n_components=0, n_shots=0, peak=0.,
-                             reason="no images", score_map=blank)
+                             reason="no images", score_map=blank,
+                             conservativeness=conservativeness)
 
-    full_shape = atoms.shape[-2:]
+    full_shape = tuple(atoms.shape[-2:])
     n_shots = int(atoms.shape[0])
 
-    def _failed(reason, score_map=None):
-        if score_map is None:
-            score_map = np.zeros(full_shape, dtype=np.float32)
-        return AutoRoiResult(roix=[0, full_shape[1]], roiy=[0, full_shape[0]],
-                             valid=False, confidence=0., n_components=0,
-                             n_shots=n_shots, peak=0., reason=reason,
-                             score_map=score_map, n_kept=0, area_frac=1.)
-
     if min(full_shape) <= 2 * border_trim:
-        return _failed("frame too small to trim")
+        return _failed_result("frame too small to trim", full_shape, n_shots,
+                              conservativeness=conservativeness)
 
-    score, n_detected, (off_y, off_x), step = score_map_from_images(
+    score, n_detected, offset, step = score_map_from_images(
         atoms, light, k=k, border_trim=border_trim, levels=levels,
         norm_floor=norm_floor, pixel_budget=pixel_budget, max_workers=max_workers)
 
@@ -638,15 +693,122 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
     if smooth and smooth > 1:
         score = ndi.uniform_filter(score, size=int(smooth))
 
+    grid = (score, int(n_detected), tuple(offset), int(step), full_shape,
+            n_shots)
+    explicit = {'threshold_frac': threshold_frac,
+                'component_frac': component_frac,
+                'margin_frac': margin_frac,
+                'margin_min': margin_min,
+                'min_confidence': min_confidence,
+                'min_detected_frac': min_detected_frac,
+                'max_area_frac': max_area_frac,
+                'compact_components': compact_components}
+    return _box_from_grid(grid, conservativeness, explicit)
+
+
+def rebox(result, conservativeness, **overrides):
+    """Redraw a suggestion's box at a different conservativeness.
+
+    Cheap -- a threshold, a labelling and a few sums on the cached score map,
+    so it can sit behind a slider. Only the box and the shape gates change;
+    the shots are not rescored, so the score map and the "were there atoms at
+    all" verdict are the same as in `result`.
+
+    Args:
+        result (AutoRoiResult): a result from :func:`suggest_roi`.
+        conservativeness (float): 0 (tight) to 1 (generous).
+        **overrides: any of the boxing parameters suggest_roi takes
+            (threshold_frac, margin_min, ...) to pin explicitly, on top of
+            those pinned when `result` was made.
+
+    Returns:
+        AutoRoiResult: a new result sharing `result`'s score map. If `result`
+        holds no scored grid (it failed before scoring), a copy of it with
+        the new conservativeness recorded.
+    """
+    if not result.can_rebox:
+        return AutoRoiResult(roix=list(result.roix), roiy=list(result.roiy),
+                             valid=result.valid, confidence=result.confidence,
+                             n_components=result.n_components,
+                             n_shots=result.n_shots, peak=result.peak,
+                             reason=result.reason, score_map=result.score_map,
+                             n_kept=result.n_kept, area_frac=result.area_frac,
+                             fill=result.fill,
+                             peak_per_shot=result.peak_per_shot,
+                             conservativeness=conservativeness)
+    explicit = dict(result._box_params)
+    explicit.update(overrides)
+    return _box_from_grid(result._grid, conservativeness, explicit,
+                          score_full=result.score_map)
+
+
+def _failed_result(reason, full_shape, n_shots, score_map=None,
+                   conservativeness=DEFAULT_CONSERVATIVENESS):
+    if score_map is None:
+        score_map = np.zeros(full_shape, dtype=np.float32)
+    return AutoRoiResult(roix=[0, full_shape[1]], roiy=[0, full_shape[0]],
+                         valid=False, confidence=0., n_components=0,
+                         n_shots=n_shots, peak=0., reason=reason,
+                         score_map=score_map, n_kept=0, area_frac=1.,
+                         conservativeness=conservativeness)
+
+
+def _box_from_grid(grid, conservativeness, explicit, score_full=None):
+    """Cut the box and its QC scalars from a scored grid.
+
+    The cheap half of suggest_roi, split out so rebox() can rerun it alone.
+
+    Args:
+        grid (tuple): (score, n_detected, (off_y, off_x), step, full_shape,
+            n_shots) as assembled by suggest_roi.
+        conservativeness (float): the knob; see conservative_params.
+        explicit (dict): boxing parameters the caller pinned. A None value
+            (or a missing key) for threshold_frac, component_frac or
+            margin_frac means "derive it from the knob"; the gate parameters
+            fall back to the module defaults.
+        score_full (np.ndarray or None): an already-built full-frame score
+            map to share rather than rebuild.
+    """
+    score, n_detected, (off_y, off_x), step, full_shape, n_shots = grid
+    full_shape = tuple(full_shape)
+
+    derived = conservative_params(conservativeness)
+    params = {name: (explicit.get(name) if explicit.get(name) is not None
+                     else derived[name])
+              for name in derived}
+    threshold_frac = params['threshold_frac']
+    component_frac = params['component_frac']
+    margin_frac = params['margin_frac']
+
+    def _gate(name, default):
+        value = explicit.get(name)
+        return default if value is None else value
+
+    margin_min = _gate('margin_min', DEFAULT_MARGIN_MIN)
+    min_confidence = _gate('min_confidence', DEFAULT_MIN_CONFIDENCE)
+    min_detected_frac = _gate('min_detected_frac', DEFAULT_MIN_DETECTED_FRAC)
+    max_area_frac = _gate('max_area_frac', DEFAULT_MAX_AREA_FRAC)
+    compact_components = _gate('compact_components', DEFAULT_COMPACT_COMPONENTS)
+
+    def _remember(res):
+        res._grid = grid
+        res._box_params = dict(explicit)
+        return res
+
+    def _failed(reason, score_map=None):
+        return _remember(_failed_result(reason, full_shape, n_shots, score_map,
+                                        conservativeness=conservativeness))
+
     # Place the (trimmed, possibly decimated) score map back on the full frame
     # so callers can display it against the run's own images. Each score pixel
     # covers a step x step block, so fill the block rather than one pixel of it.
-    score_full = np.zeros(full_shape, dtype=np.float32)
-    spread = (np.repeat(np.repeat(score, step, axis=0), step, axis=1)
-              if step > 1 else score)
-    h = min(full_shape[0] - off_y, spread.shape[0])
-    w = min(full_shape[1] - off_x, spread.shape[1])
-    score_full[off_y:off_y + h, off_x:off_x + w] = spread[:h, :w]
+    if score_full is None:
+        score_full = np.zeros(full_shape, dtype=np.float32)
+        spread = (np.repeat(np.repeat(score, step, axis=0), step, axis=1)
+                  if step > 1 else score)
+        h = min(full_shape[0] - off_y, spread.shape[0])
+        w = min(full_shape[1] - off_x, spread.shape[1])
+        score_full[off_y:off_y + h, off_x:off_x + w] = spread[:h, :w]
 
     peak = float(score.max())
     total = float(score.sum())
@@ -723,9 +885,11 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
     else:
         reason = "ok"
 
-    return AutoRoiResult(roix=roix, roiy=roiy, valid=(reason == "ok"),
-                         confidence=confidence, n_components=int(n_components),
-                         n_shots=n_shots, peak=peak, reason=reason,
-                         score_map=score_full, n_kept=n_kept,
-                         area_frac=area_frac, fill=fill,
-                         peak_per_shot=peak_per_shot)
+    return _remember(AutoRoiResult(
+        roix=roix, roiy=roiy, valid=(reason == "ok"),
+        confidence=confidence, n_components=int(n_components),
+        n_shots=n_shots, peak=peak, reason=reason,
+        score_map=score_full, n_kept=n_kept,
+        area_frac=area_frac, fill=fill,
+        peak_per_shot=peak_per_shot,
+        conservativeness=float(np.clip(conservativeness, 0., 1.))))
