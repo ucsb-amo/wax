@@ -1,4 +1,3 @@
-from kamo import Potassium39
 from waxx.control.misc.moglabs import MOGDevice
 import numpy as np
 import sys

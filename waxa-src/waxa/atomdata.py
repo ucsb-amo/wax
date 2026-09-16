@@ -156,10 +156,8 @@ class atomdata(atomdata_base):
             self.transpose_data(transpose_idx=False, reanalyze=False)
         self._timing['initial_analysis_transpose_s'] = _time.perf_counter() - t_stage
 
-        t_stage = _time.perf_counter()
-        self.compute_raw_ods()
-        self._timing['initial_analysis_compute_raw_ods_s'] = _time.perf_counter() - t_stage
-
+        # No full-frame OD pass: analyze_ods computes the OD on the ROI crop
+        # and od_raw is materialized only on demand (atomdata_base.od_raw).
         t_stage = _time.perf_counter()
         if avg_repeats:
             self.avg_repeats(reanalyze=False)
@@ -178,12 +176,11 @@ class atomdata(atomdata_base):
         if self._timing_enabled:
             print(
                 "[atomdata timing] initial_analysis total={:.3f}s | sort_images={:.3f}s | "
-                "transpose={:.3f}s | compute_raw_ods={:.3f}s | avg_repeats={:.3f}s | "
+                "transpose={:.3f}s | avg_repeats={:.3f}s | "
                 "analyze_ods={:.3f}s | refresh_repeat_stats={:.3f}s".format(
                     self._timing['initial_analysis_total_s'],
                     self._timing['initial_analysis_sort_images_s'],
                     self._timing['initial_analysis_transpose_s'],
-                    self._timing['initial_analysis_compute_raw_ods_s'],
                     self._timing['initial_analysis_avg_repeats_s'],
                     self._timing['initial_analysis_analyze_ods_s'],
                     self._timing['initial_analysis_refresh_repeat_stats_s'],
@@ -195,7 +192,9 @@ class atomdata(atomdata_base):
             self._clear_image_analysis_attrs()
             self._refresh_repeat_statistics()
             return
-        self.compute_raw_ods()
+        # The raw frames were just rearranged, so a materialized od_raw is
+        # stale; analyze_ods recomputes od from the frames.
+        self._invalidate_od_raw()
         self.analyze_ods()
         self._refresh_repeat_statistics()
 
@@ -214,7 +213,8 @@ class atomdata(atomdata_base):
         t0 = _time.perf_counter()
 
         t_stage = _time.perf_counter()
-        self.od = self.roi.crop(self.od_raw)
+        # OD on the ROI crop (or a crop of od_raw when that is materialized).
+        self.od = self._compute_od()
         self._timing['analyze_ods_roi_crop_s'] = _time.perf_counter() - t_stage
 
         t_stage = _time.perf_counter()
@@ -324,18 +324,6 @@ class atomdata(atomdata_base):
             self.img_timestamp_atoms = self._dealer.strip_shot_idx_axis(self.img_timestamp_atoms)[0]
             self.img_timestamp_light = self._dealer.strip_shot_idx_axis(self.img_timestamp_light)[0]
             self.img_timestamp_dark = self._dealer.strip_shot_idx_axis(self.img_timestamp_dark)[0]
-
-    def compute_atom_number(self):
-        # cross section = 3 lambda^2 / 2 pi (for two-level system)
-        # self.atom_cross_section = 5.878324268151581e-13 # at 0-field
-        self.atom_cross_section = 2.8316243e-13 # for stretch transition (high field)
-        dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
-
-        self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / self.atom_cross_section
-        self.atom_number_fit_area_y = self.fit_area_y * dx_pixel / self.atom_cross_section
-
-        self.atom_number_density = self.od * dx_pixel**2 / self.atom_cross_section
-        self.atom_number = np.sum(np.sum(self.atom_number_density, -2), -1)
 
     def _remap_fit_results(self):
         try:

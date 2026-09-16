@@ -5,8 +5,10 @@ import numpy as np
 import numpy.typing as npt
 from waxa.helper import xlabels_1d
 from waxa.helper.datasmith import key_from_attribute, sort
-import inspect
-import re
+# Unit detection lives in waxa.plotting.units; re-exported here because many
+# notebooks and kexp import it from this module.
+from .units import (UNIT_MAP_FROM_COMMENT, _normalize_name, get_param,
+                    guess_unit, detect_unit)
 
 __all__ = [
     'errorplot',
@@ -18,29 +20,6 @@ __all__ = [
     'plot_fit_residuals',
     'sort',
 ]
-def _normalize_name(name):
-    if isinstance(name, bytes):
-        name = name.decode("utf-8")
-    return name.strip().strip("\x00")
-
-
-UNIT_MAP_FROM_COMMENT = {
-    "ns":        ("ns", 1e9),
-    "us":        ("µs", 1e6),
-    "µs":        ("µs", 1e6),
-    "ms":        ("ms", 1e3),
-    "s":         ("s", 1.0),
-    "MHz":       ("MHz", 1e-6),
-    "kHz":       ("kHz", 1e-3),
-    "Hz":        ("Hz", 1.0),
-    "Gamma":     ("Γ", 1.0),
-    "V":         ("V", 1.0),
-    "A":         ("A", 1.0),
-    "amplitude": ("", 1.0),
-    "fraction":  ("", 1.0),
-    "rad":       ("π", 1 / np.pi),
-    "unitless":  ("", 1.0),
-}
 
 def errorplot(ad, mean=None, yerr=None, y=None,
               ymult = 1., yunit = None):
@@ -71,145 +50,6 @@ def errorplot(ad, mean=None, yerr=None, y=None,
     axs[0].set_title(f"run {ad.run_info.run_id}")
 
     return fig, axs
-
-def get_param(params_obj, param_name):
-    param_name = _normalize_name(param_name)
-
-    try:
-        src = inspect.getsource(params_obj.__class__)
-    except OSError:
-        return None, 1.0
-    pattern = rf"self\.{re.escape(param_name)}\s*=\s*.*?#\s*([^\n]+)"
-    m = re.search(pattern, src)
-    if not m:
-        return None, 1.0
-
-    raw_unit = m.group(1).strip()
-
-    for key, (unit_label, mult) in UNIT_MAP_FROM_COMMENT.items():
-        if key in raw_unit:
-            return unit_label, mult
-
-    return None, 1.0
-
-
-def guess_unit(name, values):
-
-    name = _normalize_name(name)
-    lname = name.lower()
-
-    try:
-        vals = np.asarray(values, dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            return None, 1.0
-        vmax = float(np.max(np.abs(vals)))
-    except Exception:
-        return None, 1.0
-
-    # Time 
-    if lname.startswith("t_") or "time" in lname or lname.endswith("_t"):
-        if vmax >= 1:
-            return "s", 1.0
-        elif vmax >= 1e-3:
-            return "ms", 1e3
-        elif vmax >= 1e-6:
-            return "µs", 1e6
-        elif vmax >= 1e-9:
-            return "ns", 1e9
-        else:
-            return "s", 1.0
-
-    # Frequency
-    if ("freq" in lname or "frequency" in lname or "_detuning" in lname or lname.startswith("f_")):
-        if vmax >= 1e9:
-            return "GHz", 1e-9
-        elif vmax >= 1e6:
-            return "MHz", 1e-6
-        elif vmax >= 1e3:
-            return "kHz", 1e-3
-        else:
-            return "Hz", 1.0
-
-    # detuning in units of Gamma Γ
-    if lname.startswith("detune_") or "detun_" in lname:
-        return "Γ", 1.0
-    
-    # Voltage
-    if lname.startswith("v_") or "volt" in lname:
-        return "V", 1.0
-
-    # Current
-    if lname.startswith("i_") or "current" in lname:
-        return "A", 1.0
-
-    # Amplitude / power fraction (dimensionless)
-    if (lname.startswith("amp_") or
-            lname.startswith("pfrac_") or "fraction" in lname):
-        return "amp", 1.0
-    
-    if (lname.startswith("phase_")):
-        return "π", 1/np.pi
-    
-    if (lname.startswith("dimension_")):
-        if vmax >= 1:
-            return "m", 1.0
-        elif vmax >= 1e-3:
-            return "mm", 1e3
-        elif vmax >= 1e-6:
-            return "µm", 1e6
-        elif vmax >= 1e-9:
-            return "nm", 1e9
-        else:
-            return "m", 1.0     
-
-
-    # Default: unknown / unitless
-    return None, 1.0
-
-
-def detect_unit(
-    ad: "atomdata | None" = None,
-    xvar_idx=0,
-    xvarunit="",
-    xvarmult=1.0,
-    xvarnames=None,
-    xvar_values=None,
-    params_obj=None,
-    verbose=False,
-):
-
-    if ad is None and xvarnames is None:
-        raise ValueError("detect_unit requires either `ad` or `xvarnames`.")
-
-    if ad is not None:
-        xvarname = _normalize_name(ad.xvarnames[xvar_idx])
-        xvar_vals = ad.xvars[xvar_idx]
-        params_obj = ad.params if params_obj is None else params_obj
-    else:
-        xvarname = _normalize_name(xvarnames[xvar_idx])
-        xvar_vals = [] if xvar_values is None else xvar_values
-
-    unit_from_comment = None
-    mult_from_comment = 1.0
-    if params_obj is not None:
-        unit_from_comment, mult_from_comment = get_param(params_obj, xvarname)
-
-    source = "comment"
-    if unit_from_comment is None:
-        unit_from_comment, mult_from_comment = guess_unit(xvarname, xvar_vals)
-        source = "guess"
-
-    final_unit = xvarunit if xvarunit != "" else (unit_from_comment or "")
-
-    final_mult = xvarmult if xvarmult != 1.0 else (mult_from_comment or 1.0)
-
-    if verbose:
-        print(f"xvar = {xvarname}, source = {source}, "
-              f"detected unit = {unit_from_comment}, multiplier = {mult_from_comment:.1e}")
-        print(f"final xvarunit = {final_unit}, xvarmult = {final_mult:.1e}")
-
-    return final_unit, final_mult, xvarname
 
 def plot_mixOD(ad,
                ndarray=[],
@@ -371,9 +211,29 @@ def plot_mixOD(ad,
     fig.tight_layout()
 
 def plot_sum_od_fits(ad,axis=0,
-                    xvarformat='3.3g',
-                    xvarmult=1.,
-                    figsize=[]):
+                    xvarformat=None,
+                    xvarmult=None,
+                    figsize=[],
+                    **kwargs):
+    # A 2D scan holds a grid of fits (one per xvar0/xvar1 pair), so the flat
+    # indexing below would iterate over single fit objects.  Hand those off.
+    if getattr(ad, 'Nvars', len(ad.xvars)) > 1:
+        from .plotting_2d import plot_sum_od_fits_grid
+        if xvarformat is not None:
+            kwargs['xvarformat'] = xvarformat
+        if xvarmult is not None:
+            kwargs.setdefault('xvar0mult', xvarmult)
+            kwargs.setdefault('xvar1mult', xvarmult)
+        return plot_sum_od_fits_grid(ad, axis=axis, figsize=figsize, **kwargs)
+
+    if kwargs:
+        raise TypeError(f"plot_sum_od_fits() got unexpected keyword arguments "
+                        f"{sorted(kwargs)} for a 1D scan")
+    if xvarformat is None:
+        xvarformat = '3.3g'
+    if xvarmult is None:
+        xvarmult = 1.
+
     if axis == 0:
         fits = ad.cloudfit_x
         label = "x"

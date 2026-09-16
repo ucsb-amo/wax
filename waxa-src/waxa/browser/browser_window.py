@@ -1,8 +1,9 @@
-import json
+import functools
 import logging
 import os
 import re
 import sys
+import time
 from datetime import date, timedelta
 
 from PyQt6.QtCore import QDate, QItemSelectionModel, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
@@ -57,20 +58,45 @@ from PyQt6.QtWidgets import (
     QStyle,
 )
 
+from .cache import MetadataCache
 from .run_summary import RunSummary
 from .scanner import (
     PARAM_SEARCH_MODES,
+    AnnotationWriteWorker,
     BatchLiteCreateWorker,
+    FolderIndexWorker,
     LiteCreateWorker,
     ParamSearchLoader,
     RunScanner,
     ScanWorker,
     XvarDetailLoader,
+    find_nearest_run_date_and_id,
+    find_newer_completed_run_id,
 )
+
+# Days shown on either side of a run found via the run-ID jump.
+RUN_ID_JUMP_CONTEXT_DAYS = 3
 from ..data.server_talk import server_talk
 
 
 LOGGER = logging.getLogger(__name__)
+
+# Debounce intervals (ms).  Typing in a filter box or arrow-keying through the
+# run list fires one event per keystroke; coalescing them keeps the table and
+# the param-search loader from doing redundant work on every intermediate state.
+FILTER_DEBOUNCE_MS = 120
+PARAM_SYNC_DEBOUNCE_MS = 150
+
+# Shared brushes for row styling; constructing a QColor per cell per row adds up
+# when the table is rebuilt with thousands of runs.
+_COLOR_LITE_ROW = QColor(220, 245, 223)
+_COLOR_PLAIN_ROW = QColor(255, 255, 255)
+_COLOR_MUTED_TEXT = QColor("#607380")
+_COLOR_EXPERIMENT_TEXT = QColor("#17384b")
+_COLOR_SCOPE_BG = QColor("#e1eef4")
+_COLOR_SCOPE_FG = QColor("#24536b")
+_COLOR_LITE_BG = QColor("#def2e4")
+_COLOR_LITE_FG = QColor("#29603a")
 
 
 def _configure_browser_logging():
@@ -127,8 +153,14 @@ def parse_name_search_terms(query: str):
     return [term.strip() for term in normalized_query.split("+") if term.strip()]
 
 
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
+
+
+@functools.lru_cache(maxsize=65536)
 def normalize_match_text(value: str):
-    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    # Memoised: the same xvar/experiment names recur across thousands of runs,
+    # and this runs once per name per filter term on every filter pass.
+    return _NON_ALNUM_RE.sub("", (value or "").lower())
 
 
 def is_subsequence(needle: str, haystack: str):
@@ -268,6 +300,16 @@ class ScrollableValueField(QScrollArea):
         self._label.setTextInteractionFlags(flags)
 
 
+class _RunIdItem(QTableWidgetItem):
+    """run_id cell that sorts numerically (text sort breaks at digit rollover)."""
+
+    def __lt__(self, other):
+        try:
+            return int(self.data(Qt.ItemDataRole.UserRole)) < int(other.data(Qt.ItemDataRole.UserRole))
+        except (TypeError, ValueError):
+            return super().__lt__(other)
+
+
 class ParamSearchDialog(QDialog):
     MODE_LABELS = {
         "params": "Params",
@@ -278,6 +320,11 @@ class ParamSearchDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._records_by_mode = {mode: [] for mode in PARAM_SEARCH_MODES}
+        # Rows in results_table map 1:1 onto _table_records (the active mode's
+        # full record list); filtering only hides rows, so typing in the search
+        # box never rebuilds QTableWidgetItems.
+        self._table_records = []
+        self._table_mode = None
         self._filtered_records = []
         self._active_mode = "params"
         self._mode_buttons = {}
@@ -397,7 +444,10 @@ class ParamSearchDialog(QDialog):
         self.set_run(run)
         self._records_by_mode = {mode: [] for mode in PARAM_SEARCH_MODES}
         self.status_label.setText("Loading values…")
-        self.results_table.setRowCount(0)
+        # Keep the previous run's rows on screen until the new ones arrive:
+        # clearing here and repopulating a few hundred ms later is what made
+        # arrow-keying through runs flicker.  Rows are replaced in one shot by
+        # the first append_records() for the active mode.
         self.detail_value.setPlainText("Loading values…")
 
     def append_records(self, mode: str, records: list):
@@ -406,12 +456,14 @@ class ParamSearchDialog(QDialog):
         n = len(records)
         self.status_label.setText(f"{mode}: {n} entries loaded")
         if mode == self._active_mode:
-            preferred_name = self._preferred_name_by_mode.get(self._active_mode)
-            self._apply_filter(preferred_name=preferred_name)
+            self._rebuild_table()
 
     def set_error_message(self, message: str):
         self.status_label.setText("Load failed")
         self.results_table.setRowCount(0)
+        self._table_records = []
+        self._table_mode = None
+        self._filtered_records = []
         self.detail_value.setPlainText(message)
 
     def set_stale_run_message(self, run_id: int):
@@ -420,10 +472,28 @@ class ParamSearchDialog(QDialog):
         self.status_label.setText("Showing stale values; run is outside the current load range")
         self._apply_badge_style()
 
+    @staticmethod
+    def _same_records(a: list, b: list):
+        if len(a) != len(b):
+            return False
+        return all(x.get("name") == y.get("name") and x.get("preview") == y.get("preview") for x, y in zip(a, b))
+
     def set_records(self, records_by_mode: dict):
-        self._records_by_mode = {mode: list(records_by_mode.get(mode, [])) for mode in PARAM_SEARCH_MODES}
-        preferred_name = self._preferred_name_by_mode.get(self._active_mode)
-        self._apply_filter(preferred_name=preferred_name)
+        """Final delivery of all modes.  Modes already delivered via
+        append_records() are left alone so the active table is not rebuilt a
+        second time with identical content."""
+        active_changed = False
+        for mode in PARAM_SEARCH_MODES:
+            incoming = list(records_by_mode.get(mode, []))
+            if self._same_records(self._records_by_mode.get(mode, []), incoming):
+                continue
+            self._records_by_mode[mode] = incoming
+            if mode == self._active_mode:
+                active_changed = True
+        if active_changed or self._table_mode != self._active_mode:
+            self._rebuild_table()
+        else:
+            self._apply_filter()
 
     def focus_search(self):
         self.search_input.setFocus()
@@ -442,65 +512,101 @@ class ParamSearchDialog(QDialog):
     def _set_mode(self, mode: str):
         self._remember_selection_for_active_mode()
         self._active_mode = mode if mode in PARAM_SEARCH_MODES else "params"
-        preferred_name = self._preferred_name_by_mode.get(self._active_mode)
-        self._apply_filter(preferred_name=preferred_name)
+        self._rebuild_table()
 
     def _selected_record_name(self):
         row = self.results_table.currentRow()
-        if row < 0 or row >= len(self._filtered_records):
+        if row < 0 or row >= len(self._table_records):
             return None
-        return self._filtered_records[row].get("name")
+        return self._table_records[row].get("name")
 
     def _remember_selection_for_active_mode(self):
         selected_name = self._selected_record_name()
         if selected_name:
             self._preferred_name_by_mode[self._active_mode] = selected_name
 
-    def _apply_filter(self, preferred_name: str | None = None):
-        terms = parse_name_search_terms(self.search_input.text())
+    def _rebuild_table(self):
+        """Repopulate the table with the active mode's full record list, then
+        apply the current text filter by hiding rows."""
         source_records = self._records_by_mode.get(self._active_mode, [])
-        self._filtered_records = [
-            record for record in source_records if name_matches_all_terms(record.get("name", ""), terms)
-        ]
+        self._table_records = source_records
+        self._table_mode = self._active_mode
 
-        self.results_table.setRowCount(len(self._filtered_records))
-        for row, record in enumerate(self._filtered_records):
-            values = [
-                record.get("name", "-"),
-                record.get("dtype", "-"),
-                record.get("preview", "-"),
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setData(Qt.ItemDataRole.UserRole, record)
-                self.results_table.setItem(row, col, item)
+        table = self.results_table
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.setRowCount(0)
+            table.setRowCount(len(source_records))
+            for row, record in enumerate(source_records):
+                name_item = QTableWidgetItem(str(record.get("name", "-")))
+                # Only the name cell carries the record payload; storing the
+                # dict on all three cells tripled the QVariant conversions.
+                name_item.setData(Qt.ItemDataRole.UserRole, record)
+                table.setItem(row, 0, name_item)
+                table.setItem(row, 1, QTableWidgetItem(str(record.get("dtype", "-"))))
+                table.setItem(row, 2, QTableWidgetItem(str(record.get("preview", "-"))))
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(True)
+
+        self._apply_filter()
+
+    def _apply_filter(self, preferred_name: str | None = None):
+        if self._table_mode != self._active_mode:
+            self._rebuild_table()
+            return
+
+        terms = parse_name_search_terms(self.search_input.text())
+        source_records = self._table_records
+        if preferred_name is None:
+            preferred_name = self._preferred_name_by_mode.get(self._active_mode)
+
+        table = self.results_table
+        visible_rows = []
+        table.setUpdatesEnabled(False)
+        try:
+            for row, record in enumerate(source_records):
+                matches = name_matches_all_terms(record.get("name", ""), terms)
+                table.setRowHidden(row, not matches)
+                if matches:
+                    visible_rows.append(row)
+        finally:
+            table.setUpdatesEnabled(True)
+
+        self._filtered_records = [source_records[row] for row in visible_rows]
 
         total = len(source_records)
-        count = len(self._filtered_records)
+        count = len(visible_rows)
         self.status_label.setText(f"{count} matching entries" + ("" if count == total else f" of {total}"))
 
-        if self._filtered_records:
-            preferred_row = 0
+        if visible_rows:
+            preferred_row = visible_rows[0]
             if preferred_name:
-                for row, record in enumerate(self._filtered_records):
-                    if record.get("name") == preferred_name:
+                for row in visible_rows:
+                    if source_records[row].get("name") == preferred_name:
                         preferred_row = row
                         break
-            self.results_table.selectRow(preferred_row)
-            selected_name = self._filtered_records[preferred_row].get("name")
+            # selectRow() emits itemSelectionChanged, which already refreshes
+            # the detail pane; suppress it when the row is unchanged.
+            if table.currentRow() == preferred_row and table.selectionModel().isRowSelected(preferred_row):
+                self._update_detail_from_selection()
+            else:
+                table.selectRow(preferred_row)
+            selected_name = source_records[preferred_row].get("name")
             if selected_name:
                 self._preferred_name_by_mode[self._active_mode] = selected_name
-            self._update_detail_from_selection()
         else:
+            table.clearSelection()
             self.detail_value.setPlainText("No matching values.")
 
     def _update_detail_from_selection(self):
         row = self.results_table.currentRow()
-        if row < 0 or row >= len(self._filtered_records):
+        if row < 0 or row >= len(self._table_records) or self.results_table.isRowHidden(row):
             self.detail_value.setPlainText("No matching values.")
             return
 
-        record = self._filtered_records[row]
+        record = self._table_records[row]
         selected_name = record.get("name")
         if selected_name:
             self._preferred_name_by_mode[self._active_mode] = selected_name
@@ -514,50 +620,56 @@ class ParamSearchDialog(QDialog):
 
 
 class RunIdLookupWorker(QThread):
-    lookup_ready = pyqtSignal(object, object)
+    lookup_ready = pyqtSignal(object, object, object)  # resolved_run_id, run_date, stats dict
     lookup_error = pyqtSignal(str)
 
-    def __init__(self, server: server_talk, requested_run_id: int, parent=None):
+    def __init__(self, server: server_talk, data_dir: str, requested_run_id: int, cache=None, parent=None):
         super().__init__(parent)
         self._server = server
+        self._data_dir = data_dir
         self._requested_run_id = int(requested_run_id)
+        self._cache = cache
 
     def run(self):
+        stats = {}
+        t0 = time.perf_counter()
         try:
-            resolved_run_id, run_date = self._server.find_nearest_run_date_and_id(self._requested_run_id)
-            self.lookup_ready.emit(resolved_run_id, run_date)
+            # Index-backed binary search over date folders: usually zero or one
+            # directory listing and never an HDF5 open.
+            resolved_run_id, run_date = find_nearest_run_date_and_id(
+                self._data_dir, self._requested_run_id, cache=self._cache, stats=stats
+            )
+            if resolved_run_id is None:
+                resolved_run_id, run_date = self._server.find_nearest_run_date_and_id(self._requested_run_id)
+                stats["fallback"] = True
+            stats["elapsed_ms"] = 1e3 * (time.perf_counter() - t0)
+            self.lookup_ready.emit(resolved_run_id, run_date, stats)
         except Exception as exc:
             self.lookup_error.emit(str(exc))
 
 
-class LatestCompletedRunWorker(QThread):
+class NewRunProbeWorker(QThread):
+    """Auto-refresh probe: is there a completed run newer than what the table
+    already shows?  Only files with a run id above ``current_latest`` are ever
+    opened, so an idle tick costs a single directory listing."""
+
     latest_ready = pyqtSignal(object)
     latest_error = pyqtSignal(str)
 
-    def __init__(self, server: server_talk, parent=None):
+    def __init__(self, server: server_talk, data_dir: str, current_latest: int, parent=None):
         super().__init__(parent)
         self._server = server
+        self._data_dir = data_dir
+        self._current_latest = int(current_latest)
 
     def run(self):
         try:
-            latest_path = self._server.get_completed_data_file_by_relative_index(
-                relative_idx=0,
-                lite=False,
-                use_fresh_scan=True,
+            newer = find_newer_completed_run_id(
+                self._data_dir,
+                self._current_latest,
+                is_completed=self._server._is_completed_run,
             )
-            if not latest_path:
-                self.latest_ready.emit(None)
-                return
-
-            # Auto-refresh should only react to genuinely completed runs.
-            # The server uses a trust-window optimization for recent files,
-            # so validate strictly here before emitting a run id.
-            if not self._server._is_completed_run(latest_path):
-                self.latest_ready.emit(None)
-                return
-
-            latest_run_id = self._server.run_id_from_filepath(latest_path, lite=False)
-            self.latest_ready.emit(latest_run_id)
+            self.latest_ready.emit(newer)
         except Exception as exc:
             self.latest_error.emit(str(exc))
 
@@ -945,6 +1057,16 @@ class DataBrowserWindow(QMainWindow):
         self._param_search_dialog = None
         self._param_search_current_run_id = None
         self._param_search_loading_run_id = None
+        self._pending_param_sync_run_id = None
+        self._annotation_workers: set = set()
+        self._scan_after_annotations = False
+        self._metadata_cache = None
+        self._metadata_cache_dir = None
+        self._folder_index_worker = None
+        self._folder_index_complete_dir = None
+        # (date_from, date_to) to widen to once a run-ID jump has focused its row.
+        self._pending_widen_range = None
+        self._pending_focus_message = None
         self._server_talk = server_talk(data_dir=self.data_dir)
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setSingleShot(False)
@@ -952,6 +1074,16 @@ class DataBrowserWindow(QMainWindow):
         self._day_rollover_timer = QTimer(self)
         self._day_rollover_timer.setSingleShot(False)
         self._day_rollover_timer.timeout.connect(self._check_date_rollover)
+        # Coalesce filter keystrokes into one table pass.
+        self._filter_debounce_timer = QTimer(self)
+        self._filter_debounce_timer.setSingleShot(True)
+        self._filter_debounce_timer.setInterval(FILTER_DEBOUNCE_MS)
+        self._filter_debounce_timer.timeout.connect(self._apply_filter)
+        # Coalesce rapid selection changes before (re)loading the param search.
+        self._param_sync_timer = QTimer(self)
+        self._param_sync_timer.setSingleShot(True)
+        self._param_sync_timer.setInterval(PARAM_SYNC_DEBOUNCE_MS)
+        self._param_sync_timer.timeout.connect(self._flush_pending_param_sync)
 
         self.setWindowTitle("Data Browser")
         self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
@@ -1531,12 +1663,17 @@ class DataBrowserWindow(QMainWindow):
             self.table.setRowCount(0)
             self._runs_by_id = {}
             self._scan_loaded_count = 0
-            for run in runs:
-                self._append_run(run)
+            # Pre-size once instead of insertRow() per run: each insertRow on a
+            # QTableWidget triggers model row-insert bookkeeping for every column.
+            self.table.setRowCount(len(runs))
+            filters = self._current_filter_queries()
+            for row, run in enumerate(runs):
+                self._fill_row(row, run, filters)
         finally:
             self.table.setUpdatesEnabled(True)
             self.table.blockSignals(False)
             self.table.setSortingEnabled(previous_sorting)
+        self._update_summary_chips()
 
     def _restore_scan_state(self, state: dict | None):
         if not state:
@@ -1562,8 +1699,10 @@ class DataBrowserWindow(QMainWindow):
         try:
             self.table.clearSelection()
             selection_model = self.table.selectionModel()
+            # One pass over the table instead of a linear search per selected run.
+            row_by_run_id = self._row_by_run_id_map() if surviving_selected else {}
             for run_id in surviving_selected:
-                row = self._find_row_for_run_id(run_id)
+                row = row_by_run_id.get(int(run_id))
                 if row is None:
                     continue
                 index = self.table.model().index(row, self.COL_RUN_ID)
@@ -1574,7 +1713,7 @@ class DataBrowserWindow(QMainWindow):
 
             focus_run_id = current_run_id if current_run_id in surviving_selected else (surviving_selected[0] if surviving_selected else None)
             if focus_run_id is not None:
-                row = self._find_row_for_run_id(focus_run_id)
+                row = row_by_run_id.get(int(focus_run_id))
                 if row is not None:
                     self.table.setCurrentCell(row, self.COL_RUN_ID)
                     item = self.table.item(row, self.COL_RUN_ID)
@@ -1615,9 +1754,42 @@ class DataBrowserWindow(QMainWindow):
                     dialog.set_stale_run_message(int(param_run_id))
                 LOGGER.info("Param search kept stale: run_id=%s outside current scan range", param_run_id)
 
+    @staticmethod
+    def _worker_running(worker):
+        """isRunning() that tolerates a worker whose C++ side was deleted."""
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def _release_worker(self, attr_name: str, worker):
+        """finished-slot: drop the window's reference before deleteLater so a
+        later isRunning() check never touches a deleted QThread."""
+        if getattr(self, attr_name, None) is worker:
+            setattr(self, attr_name, None)
+        worker.deleteLater()
+
+    def _get_metadata_cache(self):
+        """One MetadataCache per data dir, kept across scans.  Re-parsing the
+        JSON cache from the network drive on every refresh (auto-refresh can
+        fire every 10 s) was pure overhead."""
+        if self._metadata_cache is None or self._metadata_cache_dir != self.data_dir:
+            self._metadata_cache = MetadataCache(self.data_dir)
+            self._metadata_cache_dir = self.data_dir
+        return self._metadata_cache
+
     def _start_scan(self):
         if not self.data_dir:
             self.status_label.setText("DATA_DIR is empty")
+            return
+
+        if self._annotation_workers:
+            # A tag/comment write still holds a file open in append mode; the
+            # scanner's read-open would fail and drop that run from the table.
+            self._scan_after_annotations = True
+            self.status_label.setText("Waiting for annotation save before refreshing…")
             return
 
         LOGGER.info(
@@ -1640,6 +1812,13 @@ class DataBrowserWindow(QMainWindow):
             LOGGER.info("Superseding active scan: old_request_id=%s new_request_id=%s", self._pending_scan_request_id, current_scan_id)
             self._scan_worker.request_stop()
             # Do not wait here; stale worker outputs are ignored via request ids.
+            # The superseded scan's completion is discarded, so retire its busy
+            # mark now (the new scan took its own above).
+            self._set_activity_idle()
+
+        # The background folder indexer must not compete with HDF5 reads.
+        if self._worker_running(self._folder_index_worker):
+            self._folder_index_worker.request_stop()
 
         date_from = self.date_from.date().toPyDate()
         date_to = self.date_to.date().toPyDate()
@@ -1654,7 +1833,7 @@ class DataBrowserWindow(QMainWindow):
             self._set_activity_idle()
             return
 
-        scanner = RunScanner(self.data_dir, date_from, date_to)
+        scanner = RunScanner(self.data_dir, date_from, date_to, cache=self._get_metadata_cache())
         self._scan_worker = ScanWorker(scanner, batch_size=256)
         self._scan_worker.run_batch_found.connect(
             lambda runs, rid=current_scan_id: self._append_run_batch_guarded(runs, rid)
@@ -1703,43 +1882,35 @@ class DataBrowserWindow(QMainWindow):
             LOGGER.info("Auto-refresh tick skipped: scan already running")
             return
 
-        if self._latest_run_check_worker is not None and self._latest_run_check_worker.isRunning():
+        if self._worker_running(self._latest_run_check_worker):
             LOGGER.info("Auto-refresh tick skipped: latest-run check already running")
             return
 
         self._latest_run_check_request_id += 1
         current_request_id = self._latest_run_check_request_id
-        self._latest_run_check_worker = LatestCompletedRunWorker(self._server_talk, self)
-        self._latest_run_check_worker.latest_ready.connect(
+        current_latest = max((int(run_id) for run_id in self._runs_by_id.keys()), default=-1)
+        worker = NewRunProbeWorker(self._server_talk, self.data_dir, current_latest, self)
+        worker.latest_ready.connect(
             lambda latest_run_id, req_id=current_request_id: self._on_latest_run_check_ready_guarded(latest_run_id, req_id)
         )
-        self._latest_run_check_worker.latest_error.connect(
+        worker.latest_error.connect(
             lambda message, req_id=current_request_id: self._on_latest_run_check_error_guarded(message, req_id)
         )
-        self._latest_run_check_worker.start()
+        # Parented QThreads are otherwise retained until the window closes;
+        # one every 10 s adds up over a lab day.
+        worker.finished.connect(lambda w=worker: self._release_worker("_latest_run_check_worker", w))
+        self._latest_run_check_worker = worker
+        worker.start()
 
     def _on_latest_run_check_ready_guarded(self, latest_run_id, request_id: int):
         if request_id != self._latest_run_check_request_id:
             return
 
         if latest_run_id is None:
-            LOGGER.info("Auto-refresh tick: no completed runs found")
+            LOGGER.debug("Auto-refresh tick: no new completed run")
             return
 
-        current_latest = max((int(run_id) for run_id in self._runs_by_id.keys()), default=-1)
-        if int(latest_run_id) <= int(current_latest):
-            LOGGER.info(
-                "Auto-refresh tick: no new valid run (latest_completed=%s current_latest=%s)",
-                latest_run_id,
-                current_latest,
-            )
-            return
-
-        LOGGER.info(
-            "Auto-refresh tick: new run detected (latest_completed=%s current_latest=%s)",
-            latest_run_id,
-            current_latest,
-        )
+        LOGGER.info("Auto-refresh tick: new run detected (run_id=%s)", latest_run_id)
         self.status_label.setText("New run detected, refreshing…")
         self._start_scan()
 
@@ -1769,8 +1940,13 @@ class DataBrowserWindow(QMainWindow):
     def _append_run(self, run: RunSummary):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        self._fill_row(row, run, self._current_filter_queries())
+        self._update_summary_chips()
 
-        run_id_item = QTableWidgetItem(str(run.run_id))
+    def _fill_row(self, row: int, run: RunSummary, filters: tuple):
+        """Populate one already-allocated table row.  No per-row chip/status
+        updates here: doing that inside the fill loop made a rebuild O(n^2)."""
+        run_id_item = _RunIdItem(str(run.run_id))
         run_id_item.setData(Qt.ItemDataRole.UserRole, int(run.run_id))
         datetime_item = QTableWidgetItem(self._format_datetime_for_table(run.run_datetime_str))
         datetime_item.setData(Qt.ItemDataRole.UserRole, run.run_datetime_str)
@@ -1808,12 +1984,9 @@ class DataBrowserWindow(QMainWindow):
         self._runs_by_id[run.run_id] = run
         self._scan_loaded_count += 1
 
-        if self._active_filter_terms:
-            self.table.setRowHidden(row, not self._run_matches_terms(run, self._active_filter_terms))
-
-        if self._scan_loaded_count <= 10 or self._scan_loaded_count % 50 == 0:
-            self.status_label.setText("Scanning...")
-        self._update_summary_chips()
+        terms, experiment_query, tag_query = filters
+        if terms or experiment_query or tag_query:
+            self.table.setRowHidden(row, not self._run_matches_terms(run, terms, experiment_query, tag_query))
 
     def _append_run_batch(self, runs: list):
         if not runs:
@@ -1821,10 +1994,14 @@ class DataBrowserWindow(QMainWindow):
 
         self.table.setUpdatesEnabled(False)
         try:
-            for run in runs:
-                self._append_run(run)
+            start = self.table.rowCount()
+            self.table.setRowCount(start + len(runs))
+            filters = self._current_filter_queries()
+            for offset, run in enumerate(runs):
+                self._fill_row(start + offset, run, filters)
         finally:
             self.table.setUpdatesEnabled(True)
+        self._update_summary_chips()
 
     def _append_run_guarded(self, run: RunSummary, scan_request_id: int):
         if scan_request_id != self._scan_request_id:
@@ -1849,7 +2026,7 @@ class DataBrowserWindow(QMainWindow):
 
     def _on_filter_text_changed(self, *_args):
         self._active_filter_terms = self._parse_search_terms(self.search_input.text())
-        self._apply_filter()
+        self._filter_debounce_timer.start()
 
     def _apply_date_preset(self, days_back: int):
         self.date_to.setDate(QDate.currentDate())
@@ -1874,10 +2051,33 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText("Run ID must be an integer")
             return
 
-        if self._run_id_lookup_worker is not None and self._run_id_lookup_worker.isRunning():
+        if self._worker_running(self._run_id_lookup_worker):
             self.status_label.setText("Run ID search already in progress")
             LOGGER.info("Run ID lookup request ignored: another lookup is already running")
             return
+
+        # Fast path 1: the run is already loaded, so no directory walk or
+        # rescan is needed -- clear filters that might hide it and focus the row.
+        if requested_run_id in self._runs_by_id:
+            self._clear_filters_silently()
+            if self._focus_row_by_run_id(requested_run_id):
+                LOGGER.info("Run ID lookup satisfied locally: run_id=%s", requested_run_id)
+                self.status_label.setText(f"Focused run {requested_run_id}")
+                return
+
+        # Fast path 2: the id falls strictly inside the loaded id range, so the
+        # nearest *valid* run is already in the table (any closer file would be
+        # an incomplete run the browser would not show anyway).  Zero I/O.
+        if self._runs_by_id:
+            loaded_min = min(self._runs_by_id)
+            loaded_max = max(self._runs_by_id)
+            if loaded_min < requested_run_id < loaded_max:
+                nearest = min(self._runs_by_id, key=lambda rid: (abs(rid - requested_run_id), rid))
+                self._clear_filters_silently()
+                if self._focus_row_by_run_id(nearest):
+                    LOGGER.info("Run ID lookup satisfied locally: requested=%s nearest_loaded=%s", requested_run_id, nearest)
+                    self.status_label.setText(f"Run {requested_run_id} not found; focused nearest loaded run {nearest}")
+                    return
 
         LOGGER.info("Run ID lookup started: requested_run_id=%s", requested_run_id)
         self._set_activity_busy("Searching run ID…")
@@ -1885,17 +2085,35 @@ class DataBrowserWindow(QMainWindow):
 
         self._run_id_lookup_request_id += 1
         current_request_id = self._run_id_lookup_request_id
-        self._run_id_lookup_worker = RunIdLookupWorker(self._server_talk, requested_run_id, self)
-        self._run_id_lookup_worker.lookup_ready.connect(
-            lambda resolved_run_id, run_date, req_id=current_request_id, requested=requested_run_id:
-            self._on_run_id_lookup_ready_guarded(requested, resolved_run_id, run_date, req_id)
+        worker = RunIdLookupWorker(
+            self._server_talk, self.data_dir, requested_run_id, cache=self._get_metadata_cache(), parent=self
         )
-        self._run_id_lookup_worker.lookup_error.connect(
+        worker.lookup_ready.connect(
+            lambda resolved_run_id, run_date, stats, req_id=current_request_id, requested=requested_run_id:
+            self._on_run_id_lookup_ready_guarded(requested, resolved_run_id, run_date, req_id, stats)
+        )
+        worker.lookup_error.connect(
             lambda message, req_id=current_request_id: self._on_run_id_lookup_error_guarded(message, req_id)
         )
-        self._run_id_lookup_worker.start()
+        worker.finished.connect(lambda w=worker: self._release_worker("_run_id_lookup_worker", w))
+        self._run_id_lookup_worker = worker
+        worker.start()
 
-    def _on_run_id_lookup_ready_guarded(self, requested_run_id: int, resolved_run_id, run_date, request_id: int):
+    def _clear_filters_silently(self):
+        """Clear the three filter boxes and apply the (now empty) filter once,
+        without the debounce timer and without three separate table passes."""
+        boxes = [self.search_input, self.experiment_filter_input, self.tag_filter_input]
+        if not any(box.text() for box in boxes):
+            return
+        for box in boxes:
+            box.blockSignals(True)
+            box.clear()
+            box.blockSignals(False)
+        self._filter_debounce_timer.stop()
+        self._active_filter_terms = []
+        self._apply_filter()
+
+    def _on_run_id_lookup_ready_guarded(self, requested_run_id: int, resolved_run_id, run_date, request_id: int, stats=None):
         if request_id != self._run_id_lookup_request_id:
             return
 
@@ -1907,20 +2125,54 @@ class DataBrowserWindow(QMainWindow):
             return
 
         LOGGER.info(
-            "Run ID lookup complete: requested=%s resolved=%s date=%s",
+            "Run ID lookup complete: requested=%s resolved=%s date=%s stats=%s",
             requested_run_id,
             resolved_run_id,
             run_date,
+            stats,
         )
 
-        center_qdate = QDate(run_date.year, run_date.month, run_date.day)
-        self.date_from.setDate(center_qdate.addDays(-3))
-        self.date_to.setDate(center_qdate.addDays(3))
+        if int(resolved_run_id) in self._runs_by_id:
+            # Nearest run is already on screen (typical when the requested id is
+            # newer than anything on disk): focus it, no rescan.
+            self._clear_filters_silently()
+            if self._focus_row_by_run_id(int(resolved_run_id)):
+                if int(resolved_run_id) != int(requested_run_id):
+                    self.status_label.setText(f"Run {requested_run_id} not found; focused nearest run {resolved_run_id}")
+                else:
+                    self.status_label.setText(f"Focused run {resolved_run_id}")
+                self._set_activity_idle()
+                return
 
-        # Clear active filters so the target row stays visible.
-        self.search_input.clear()
-        self.experiment_filter_input.clear()
-        self.tag_filter_input.clear()
+        center_qdate = QDate(run_date.year, run_date.month, run_date.day)
+        widen_from = center_qdate.addDays(-RUN_ID_JUMP_CONTEXT_DAYS)
+        widen_to = center_qdate.addDays(RUN_ID_JUMP_CONTEXT_DAYS)
+        already_loaded = (
+            self.date_from.date() <= center_qdate <= self.date_to.date()
+            and self._scan_worker is not None
+            and not self._scan_worker.isRunning()
+        )
+        if already_loaded:
+            # The day is on screen already (id fell in a gap at the edge of the
+            # loaded range); widen straight away in one scan.
+            self.date_from.setDate(min(self.date_from.date(), widen_from))
+            self.date_to.setDate(max(self.date_to.date(), widen_to))
+            self._pending_widen_range = None
+        else:
+            # Two-phase: scan only the target day first so the row appears as
+            # soon as possible, then widen to the surrounding days.
+            self.date_from.setDate(center_qdate)
+            self.date_to.setDate(center_qdate)
+            self._pending_widen_range = (widen_from, widen_to)
+
+        # Clear active filters so the target row stays visible.  The scan that
+        # follows rebuilds the table anyway, so skip the immediate filter pass.
+        for box in (self.search_input, self.experiment_filter_input, self.tag_filter_input):
+            box.blockSignals(True)
+            box.clear()
+            box.blockSignals(False)
+        self._filter_debounce_timer.stop()
+        self._active_filter_terms = []
 
         self._pending_focus_run_id = int(resolved_run_id)
         self._pending_requested_run_id = int(requested_run_id)
@@ -1932,6 +2184,7 @@ class DataBrowserWindow(QMainWindow):
             return
         LOGGER.error("Run ID lookup failed: %s", message)
         self.run_id_jump_btn.setEnabled(True)
+        self._pending_widen_range = None
         self.status_label.setText("Run ID search failed")
         QMessageBox.warning(self, "Run ID Search Error", message)
         self._set_activity_idle()
@@ -2129,7 +2382,7 @@ class DataBrowserWindow(QMainWindow):
         return f"{date_str} {time_str.strip()}"
 
     def _set_lite_highlight(self, row: int, enabled: bool):
-        color = QColor(220, 245, 223) if enabled else QColor(255, 255, 255)
+        color = _COLOR_LITE_ROW if enabled else _COLOR_PLAIN_ROW
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)
             if item is not None:
@@ -2139,32 +2392,32 @@ class DataBrowserWindow(QMainWindow):
         xvardims_item = self.table.item(row, self.COL_XVARDIMS)
         if xvardims_item is not None:
             xvardims_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            xvardims_item.setForeground(QColor("#607380"))
+            xvardims_item.setForeground(_COLOR_MUTED_TEXT)
 
         n_repeats_item = self.table.item(row, self.COL_N_REPEATS)
         if n_repeats_item is not None:
             n_repeats_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            n_repeats_item.setForeground(QColor("#607380"))
+            n_repeats_item.setForeground(_COLOR_MUTED_TEXT)
 
         experiment_item = self.table.item(row, self.COL_EXPERIMENT)
         if experiment_item is not None:
-            experiment_item.setForeground(QColor("#17384b"))
+            experiment_item.setForeground(_COLOR_EXPERIMENT_TEXT)
 
         scope_item = self.table.item(row, self.COL_SCOPE)
         if scope_item is not None:
             scope_item.setText("scope" if run.has_scope_data else "-")
             scope_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if run.has_scope_data:
-                scope_item.setBackground(QColor("#e1eef4"))
-                scope_item.setForeground(QColor("#24536b"))
+                scope_item.setBackground(_COLOR_SCOPE_BG)
+                scope_item.setForeground(_COLOR_SCOPE_FG)
 
         lite_item = self.table.item(row, self.COL_LITE)
         if lite_item is not None:
             lite_item.setText("lite" if run.has_lite else "-")
             lite_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if run.has_lite:
-                lite_item.setBackground(QColor("#def2e4"))
-                lite_item.setForeground(QColor("#29603a"))
+                lite_item.setBackground(_COLOR_LITE_BG)
+                lite_item.setForeground(_COLOR_LITE_FG)
 
     def _update_summary_chips(self):
         visible_count = 0
@@ -2173,6 +2426,15 @@ class DataBrowserWindow(QMainWindow):
                 visible_count += 1
         self._set_stat_chip_value(self.loaded_chip, str(self.table.rowCount()))
         self._set_stat_chip_value(self.visible_chip, str(visible_count))
+
+    def _current_filter_queries(self):
+        """(xvar_terms, experiment_query, tag_query) read once per filter pass
+        rather than once per row."""
+        return (
+            list(self._active_filter_terms),
+            self.experiment_filter_input.text().strip().lower(),
+            self.tag_filter_input.text().strip().lower(),
+        )
 
     def _on_scan_done(self, count: int):
         pending_runs = list(self._pending_scan_runs) if self._pending_scan_request_id == self._scan_request_id else []
@@ -2191,23 +2453,71 @@ class DataBrowserWindow(QMainWindow):
         self._scan_restore_state = None
 
         if self._pending_focus_run_id is not None:
-            focused = self._focus_row_by_run_id(self._pending_focus_run_id)
+            target = int(self._pending_focus_run_id)
             requested = self._pending_requested_run_id
+            focused = self._focus_row_by_run_id(target)
             if focused:
-                if requested is not None and int(requested) != int(self._pending_focus_run_id):
-                    self.status_label.setText(
-                        f"Run {requested} not found; focused nearest run {self._pending_focus_run_id}"
-                    )
+                if requested is not None and int(requested) != target:
+                    message = f"Run {requested} not found; focused nearest run {target}"
                 else:
-                    self.status_label.setText(f"Focused run {self._pending_focus_run_id}")
+                    message = f"Focused run {target}"
+            elif self._runs_by_id:
+                # The nearest file on disk is not a completed run (still being
+                # written, or broken), so it is not in the table.  Fall back to
+                # the nearest run that is.
+                anchor = target if requested is None else int(requested)
+                fallback = min(self._runs_by_id, key=lambda rid: (abs(rid - anchor), rid))
+                focused = self._focus_row_by_run_id(fallback)
+                message = (
+                    f"Run {anchor} not found; nearest file {target} is not a completed run; "
+                    f"focused run {fallback}"
+                )
             else:
-                self.status_label.setText("Could not focus requested run")
+                message = "Could not focus requested run"
+            self.status_label.setText(message)
+            self._pending_focus_message = message if focused else None
             self._pending_focus_run_id = None
             self._pending_requested_run_id = None
         else:
             self._restore_scan_state(restore_state)
+            if self._pending_focus_message is not None:
+                # Second phase of a run-ID jump: keep the focus message visible.
+                self.status_label.setText(self._pending_focus_message)
+                self._pending_focus_message = None
 
         self._set_activity_idle()
+
+        if self._pending_widen_range is not None:
+            # Phase two of a run-ID jump: the target day is on screen and its
+            # row is focused; now widen to the surrounding days.  The restore
+            # logic keeps the selection and re-centres the row.
+            widen_from, widen_to = self._pending_widen_range
+            self._pending_widen_range = None
+            LOGGER.info("Run ID jump: widening range to %s..%s", widen_from.toString("yyyy-MM-dd"), widen_to.toString("yyyy-MM-dd"))
+            self.date_from.setDate(widen_from)
+            self.date_to.setDate(widen_to)
+            self._start_scan()
+            return
+
+        self._maybe_start_folder_indexing()
+
+    def _maybe_start_folder_indexing(self):
+        """Kick off the one-time background run-id index build for this data
+        dir (resumed if an earlier attempt was interrupted by a scan)."""
+        if self._folder_index_complete_dir == self.data_dir:
+            return
+        if self._worker_running(self._folder_index_worker):
+            return
+        worker = FolderIndexWorker(self.data_dir, self._get_metadata_cache())
+        worker.done.connect(lambda n, completed, d=self.data_dir: self._on_folder_index_done(d, n, completed))
+        worker.finished.connect(lambda w=worker: self._release_worker("_folder_index_worker", w))
+        self._folder_index_worker = worker
+        worker.start()
+
+    def _on_folder_index_done(self, data_dir: str, indexed: int, completed: bool):
+        if completed and data_dir == self.data_dir:
+            self._folder_index_complete_dir = data_dir
+        LOGGER.info("Folder index pass finished: folders_indexed=%s completed=%s", indexed, completed)
 
     def _on_scan_done_guarded(self, count: int, scan_request_id: int):
         if scan_request_id != self._scan_request_id:
@@ -2234,25 +2544,38 @@ class DataBrowserWindow(QMainWindow):
         self._on_scan_error(message)
 
     def _apply_filter(self):
-        terms = self._active_filter_terms
+        self._filter_debounce_timer.stop()
+        terms, experiment_query, tag_query = self._current_filter_queries()
+        no_filter = not terms and not experiment_query and not tag_query
 
-        for row in range(self.table.rowCount()):
-            run = self._get_run_for_row(row)
-            if run is None:
-                self.table.setRowHidden(row, True)
-                continue
-            self.table.setRowHidden(row, not self._run_matches_terms(run, terms))
+        table = self.table
+        table.setUpdatesEnabled(False)
+        try:
+            for row in range(table.rowCount()):
+                run = self._get_run_for_row(row)
+                if run is None:
+                    table.setRowHidden(row, True)
+                    continue
+                if no_filter:
+                    table.setRowHidden(row, False)
+                    continue
+                table.setRowHidden(row, not self._run_matches_terms(run, terms, experiment_query, tag_query))
+        finally:
+            table.setUpdatesEnabled(True)
         self._update_summary_chips()
 
     def _parse_search_terms(self, query: str):
         return parse_name_search_terms(query)
 
-    def _run_matches_terms(self, run: RunSummary, terms: list[str]):
-        experiment_query = self.experiment_filter_input.text().strip().lower()
+    def _run_matches_terms(self, run: RunSummary, terms: list[str], experiment_query: str = None, tag_query: str = None):
+        if experiment_query is None:
+            experiment_query = self.experiment_filter_input.text().strip().lower()
+        if tag_query is None:
+            tag_query = self.tag_filter_input.text().strip().lower()
+
         if experiment_query and not name_matches_term(experiment_query, run.experiment_name or ""):
             return False
 
-        tag_query = self.tag_filter_input.text().strip().lower()
         if tag_query:
             if not any(name_matches_term(tag_query, t) for t in run.tags):
                 return False
@@ -2302,14 +2625,12 @@ class DataBrowserWindow(QMainWindow):
             bool(self._param_search_dialog is not None and self._param_search_dialog.isVisible()),
             type(QApplication.focusWidget()).__name__ if QApplication.focusWidget() is not None else None,
         )
-        if len(selected_rows) > 1:
-            self._set_stat_chip_value(self.selected_chip, "multi")
-            self._sync_param_search_to_selected_run(None, selection_locked=True)
-        else:
-            self._sync_param_search_to_selected_run(None, selection_locked=False)
-
         row = self._get_selected_row()
         run = self._get_run_for_row(row)
+        multi = len(selected_rows) > 1
+
+        if multi:
+            self._set_stat_chip_value(self.selected_chip, "multi")
         if run is None:
             self._set_stat_chip_value(self.selected_chip, "none")
             self._detail_pane_run_id = None
@@ -2317,7 +2638,10 @@ class DataBrowserWindow(QMainWindow):
             self._sync_param_search_to_selected_run(None, selection_locked=False)
             return
 
-        self._sync_param_search_to_selected_run(run, selection_locked=False)
+        # One sync call per selection change (previously up to three).  The
+        # actual param load is debounced so holding an arrow key does not
+        # spawn a loader thread per row.
+        self._sync_param_search_to_selected_run(None if multi else run, selection_locked=multi)
 
         self._detail_request_id += 1
         current_detail_id = self._detail_request_id
@@ -2343,6 +2667,9 @@ class DataBrowserWindow(QMainWindow):
                 len(self._running_xvar_loaders),
             )
             old_loader.requestInterruption()
+            # An interrupted loader never reports back, so retire its busy mark
+            # here or the activity indicator stays amber for good.
+            self._set_activity_idle()
 
         self.detail_pane.clear_details()
         self._set_activity_busy("Loading run details…")
@@ -2641,8 +2968,8 @@ class DataBrowserWindow(QMainWindow):
             return
         new_comment = edit.toPlainText()
         for run in runs:
-            self._write_run_annotation(run, comment=new_comment)
             run.comment = new_comment
+        self._write_run_annotations([(run, None, new_comment) for run in runs])
 
         if multiple:
             self.status_label.setText(f"Comment saved for {len(runs)} runs")
@@ -2656,19 +2983,45 @@ class DataBrowserWindow(QMainWindow):
             self._show_run_details(selected_run)
 
     def _write_run_annotation(self, run: RunSummary, tags=None, comment=None):
-        """Write browser_tags / browser_comment attrs to the HDF5 file in-place."""
+        """Queue a browser_tags / browser_comment write for one run."""
+        self._write_run_annotations([(run, tags, comment)])
+
+    def _write_run_annotations(self, jobs: list):
+        """Write annotations for several runs in one background thread.
+
+        jobs: [(run, tags_or_None, comment_or_None)].  Opening a file in append
+        mode over the network can take a few hundred ms; tagging a multi-select
+        of 50 runs used to freeze the window for the whole batch.  The in-memory
+        RunSummary and table cells are updated optimistically by the caller; a
+        failed write is reported via a warning dialog.
+        """
+        payload = [
+            (int(run.run_id), run.filepath, None if tags is None else list(tags), comment)
+            for run, tags, comment in jobs
+        ]
+        if not payload:
+            return
+
         self._set_activity_busy("Saving annotations…")
-        try:
-            import h5py as _h5py
-            with _h5py.File(run.filepath, "a") as f:
-                if tags is not None:
-                    f.attrs["browser_tags"] = json.dumps(tags)
-                if comment is not None:
-                    f.attrs["browser_comment"] = comment
-        except Exception as exc:
-            QMessageBox.warning(self, "Write Error", f"Could not save annotation:\n{exc}")
-        finally:
-            self._set_activity_idle()
+        worker = AnnotationWriteWorker(payload)
+        self._annotation_workers.add(worker)
+        worker.error.connect(self._on_annotation_write_error)
+        worker.completed.connect(lambda ok, total, w=worker: self._on_annotation_writes_completed(w, ok, total))
+        worker.start()
+
+    def _on_annotation_write_error(self, run_id: int, message: str):
+        LOGGER.error("Annotation write failed: run_id=%s error=%s", run_id, message)
+        QMessageBox.warning(self, "Write Error", f"Could not save annotation for run {run_id}:\n{message}")
+
+    def _on_annotation_writes_completed(self, worker, ok: int, total: int):
+        self._annotation_workers.discard(worker)
+        worker.deleteLater()
+        self._set_activity_idle()
+        if ok == total:
+            LOGGER.info("Annotation writes completed: %s/%s", ok, total)
+        if not self._annotation_workers and self._scan_after_annotations:
+            self._scan_after_annotations = False
+            self._start_scan()
 
     def _get_common_tags(self):
         raw = self.settings.value("commonTags", [], type=list)
@@ -2719,6 +3072,7 @@ class DataBrowserWindow(QMainWindow):
 
         remove_from_all = self._all_selected_runs_have_tag(run_rows, tag)
         changed = 0
+        jobs = []
         for run, row in run_rows:
             tags = list(run.tags or [])
             if remove_from_all:
@@ -2732,12 +3086,13 @@ class DataBrowserWindow(QMainWindow):
             if new_tags == tags:
                 continue
 
-            self._write_run_annotation(run, tags=new_tags)
             run.tags = new_tags
+            jobs.append((run, new_tags, None))
             tags_item = self.table.item(row, self.COL_TAGS)
             if tags_item is not None:
                 tags_item.setText(", ".join(new_tags))
             changed += 1
+        self._write_run_annotations(jobs)
 
         selected_row = self._get_selected_row()
         selected_run = self._get_run_for_row(selected_row)
@@ -2794,18 +3149,20 @@ class DataBrowserWindow(QMainWindow):
 
         added_count = 0
         unchanged_count = 0
+        jobs = []
         for run, row in run_rows:
             tags = list(run.tags or [])
             if any(existing.lower() == tag.lower() for existing in tags):
                 unchanged_count += 1
                 continue
             tags.append(tag)
-            self._write_run_annotation(run, tags=tags)
             run.tags = tags
+            jobs.append((run, tags, None))
             tags_item = self.table.item(row, self.COL_TAGS)
             if tags_item is not None:
                 tags_item.setText(", ".join(tags))
             added_count += 1
+        self._write_run_annotations(jobs)
 
         selected_row = self._get_selected_row()
         selected_run = self._get_run_for_row(selected_row)
@@ -2870,8 +3227,12 @@ class DataBrowserWindow(QMainWindow):
     def _on_param_search_dialog_closed(self):
         if self._param_search_dialog is not None:
             self.settings.setValue("paramSearchMode", self._param_search_dialog._active_mode)
+        self._param_sync_timer.stop()
+        self._pending_param_sync_run_id = None
         self._param_search_current_run_id = None
         self._param_search_loading_run_id = None
+        if self._param_search_loader is not None and self._param_search_loader.isRunning():
+            self._param_search_loader.requestInterruption()
 
     def _sync_param_search_to_selected_run(self, run: RunSummary | None, selection_locked: bool = False):
         dialog = self._param_search_dialog
@@ -2889,9 +3250,43 @@ class DataBrowserWindow(QMainWindow):
         )
         if selection_locked:
             LOGGER.info("Param search sync paused: multiple runs selected")
+            self._param_sync_timer.stop()
+            self._pending_param_sync_run_id = None
             return
 
         if run is None:
+            return
+
+        target_run_id = int(run.run_id)
+        if target_run_id in (self._param_search_current_run_id, self._param_search_loading_run_id):
+            self._param_sync_timer.stop()
+            self._pending_param_sync_run_id = None
+            dialog.set_run(run)
+            return
+
+        # Show the target immediately so the badge tracks the selection, but
+        # defer the HDF5 read until the selection has settled.
+        dialog.set_run(run)
+        self._pending_param_sync_run_id = target_run_id
+        self._param_sync_timer.start()
+
+    def _flush_pending_param_sync(self):
+        run_id = self._pending_param_sync_run_id
+        self._pending_param_sync_run_id = None
+        if run_id is None:
+            return
+        dialog = self._param_search_dialog
+        if dialog is None or not dialog.isVisible():
+            return
+        run = self._runs_by_id.get(int(run_id))
+        if run is None:
+            return
+        # Only load if the run is still the single selected one.
+        selected_rows = self._get_selected_rows()
+        if len(selected_rows) != 1:
+            return
+        current = self._get_run_for_row(selected_rows[0])
+        if current is None or int(current.run_id) != int(run_id):
             return
         self._load_param_search_for_run(run, show_dialog=False, focus_search=False, force=False)
 
@@ -2936,6 +3331,8 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
             )
             old_loader.requestInterruption()
+            # Its request id is now stale, so nothing else will decrement this.
+            self._set_activity_idle()
         dialog.set_loading_state(run)
         self._set_activity_busy("Loading params…")
         self._param_search_request_id += 1
@@ -2965,6 +3362,8 @@ class DataBrowserWindow(QMainWindow):
             self.status_label.setText("Select a single run for param search")
             return
 
+        self._param_sync_timer.stop()
+        self._pending_param_sync_run_id = None
         self._load_param_search_for_run(run, show_dialog=True, focus_search=True, force=False)
 
     def _on_param_search_records_ready(self, run_id: int, records: dict):
@@ -3002,7 +3401,6 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
                 {mode: len(values) for mode, values in records.items()},
             )
-            self._set_activity_idle()
             return
         self._on_param_search_records_ready(run_id, records)
 
@@ -3014,7 +3412,6 @@ class DataBrowserWindow(QMainWindow):
                 self._param_search_request_id,
                 message,
             )
-            self._set_activity_idle()
             return
         LOGGER.error("Param search load failed: %s", message)
         dialog = self._ensure_param_search_dialog()
@@ -3109,6 +3506,23 @@ class DataBrowserWindow(QMainWindow):
             if int(item_run_id) == int(run_id):
                 return row
         return None
+
+    def _row_by_run_id_map(self):
+        """run_id -> row for the table's current (possibly sorted) order.
+        Use when several lookups are needed at once."""
+        mapping = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, self.COL_RUN_ID)
+            if item is None:
+                continue
+            item_run_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_run_id is None:
+                try:
+                    item_run_id = int(item.text())
+                except ValueError:
+                    continue
+            mapping[int(item_run_id)] = row
+        return mapping
 
     def _open_file_in_default_program(self, path_text: str, label: str = "file"):
         clean = (path_text or "").strip()
@@ -3394,36 +3808,52 @@ class DataBrowserWindow(QMainWindow):
         return f"{attr_key}.py"
 
     def _build_view_files_submenu(self, menu: QMenu, run: RunSummary):
-        """Populate a submenu with one action per experiment source file stored
-        in the HDF5 attrs (expt/params plus every base-class module saved)."""
-        submenu = menu.addMenu("View Experiment Files")
-        try:
-            import h5py
-            with h5py.File(run.filepath, "r") as f:
-                attr_keys = set(f.attrs.keys())
-                # expt/params/legacy keys first (in preferred order), then every
-                # remaining base-class module alphabetically.
-                ordered_keys = [k for k in self._EXPT_FILE_ATTR_KEYS if k in attr_keys]
-                ordered_keys += sorted(
-                    k for k in attr_keys
-                    if k.startswith("base_class_") and k not in ordered_keys
-                )
+        """Add a lazily-populated submenu with one action per experiment source
+        file stored in the HDF5 attrs (expt/params plus every base-class module).
 
-                found = False
-                for key in ordered_keys:
-                    text = self._decode_attr_text(f.attrs.get(key))
-                    if not text.strip():
-                        continue
-                    label = self._expt_file_label(key)
-                    action = submenu.addAction(f"  {label}")
-                    action.triggered.connect(
-                        lambda checked=False, k=key, t=text, rid=run.run_id: self._open_file_viewer(rid, k, t)
+        The HDF5 file is only opened when the submenu is actually hovered, so a
+        right-click no longer pays a network round-trip before the context menu
+        can appear.
+        """
+        submenu = menu.addMenu("View Experiment Files")
+        placeholder = submenu.addAction("Loading…")
+        placeholder.setEnabled(False)
+        state = {"populated": False}
+
+        def populate():
+            if state["populated"]:
+                return
+            state["populated"] = True
+            submenu.clear()
+            try:
+                import h5py
+                with h5py.File(run.filepath, "r") as f:
+                    attr_keys = set(f.attrs.keys())
+                    # expt/params/legacy keys first (in preferred order), then every
+                    # remaining base-class module alphabetically.
+                    ordered_keys = [k for k in self._EXPT_FILE_ATTR_KEYS if k in attr_keys]
+                    ordered_keys += sorted(
+                        k for k in attr_keys
+                        if k.startswith("base_class_") and k not in ordered_keys
                     )
-                    found = True
-                if not found:
-                    submenu.addAction("(no files in attributes)").setEnabled(False)
-        except Exception as exc:
-            submenu.addAction(f"Error: {exc}").setEnabled(False)
+
+                    found = False
+                    for key in ordered_keys:
+                        text = self._decode_attr_text(f.attrs.get(key))
+                        if not text.strip():
+                            continue
+                        label = self._expt_file_label(key)
+                        action = submenu.addAction(f"  {label}")
+                        action.triggered.connect(
+                            lambda checked=False, k=key, t=text, rid=run.run_id: self._open_file_viewer(rid, k, t)
+                        )
+                        found = True
+                    if not found:
+                        submenu.addAction("(no files in attributes)").setEnabled(False)
+            except Exception as exc:
+                submenu.addAction(f"Error: {exc}").setEnabled(False)
+
+        submenu.aboutToShow.connect(populate)
         return submenu
 
     def _open_file_viewer(self, run_id: int, attr_key: str, content: str):
