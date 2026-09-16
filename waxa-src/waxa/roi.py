@@ -1174,11 +1174,11 @@ class _RoiSelectorDialog(QDialog):
         self._update_labels()
 
     def on_canvas_resized(self):
-        """Re-renders only when the canvas has grown past the pixmap's size.
+        """Re-renders when the canvas no longer fits the pixmap's resolution.
 
-        Shrinking the window just lets Qt scale the pixmap down; growing it
-        past the resolution the pixmap was built at would show the area
-        average's softness, so rebuild then.
+        The pixmap is built at the canvas's own size, so a bigger canvas
+        needs a sharper one and a smaller canvas can drop pixels. Rendering
+        is a few milliseconds at that size, so a window drag is fine.
         """
         if self._render_size is None or not hasattr(self, 'display_image'):
             return
