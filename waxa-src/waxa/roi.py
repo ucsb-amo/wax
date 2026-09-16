@@ -5,6 +5,7 @@ import cv2
 import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from waxa.data.server_talk import server_talk as st
 from waxa.image_processing.compute_ODs import compute_OD
@@ -16,7 +17,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QDialog, QVBoxLayout, QHBoxLayout,
         QWidget, QLabel, QComboBox, QSizePolicy, QFrame, QPushButton,
-        QMessageBox,
+        QMessageBox, QSlider,
     )
     from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence, QFont, QIcon
     from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QCoreApplication
@@ -57,6 +58,20 @@ _AUTO_ROI_CACHE_SIZE = 8
 # Label the auto-detected box carries in the dialog's preset dropdown. It is
 # in-memory only and is never written to roi.xlsx.
 AUTO_PRESET_KEY = "auto (suggested)"
+
+# How generous the auto-detected box is, 0 (tight) to 1 (generous). The
+# dialog's slider starts here and writes back what the user accepted with, so
+# a setting carries from one recrop to the next within a session. Detection
+# itself always runs at the module default; the slider reboxes the cached
+# score map, which is cheap, rather than rescoring the run.
+_auto_roi_conservativeness = None
+
+
+def _default_conservativeness():
+    if _auto_roi_conservativeness is not None:
+        return _auto_roi_conservativeness
+    from waxa.image_processing.auto_roi import DEFAULT_CONSERVATIVENESS
+    return DEFAULT_CONSERVATIVENESS
 
 
 class _AutoRoiJob():
@@ -222,11 +237,29 @@ class ROI():
         Returns:
             ndarray: The cropped ndarray.
         """        
-        OD: np.ndarray
-        idx_y = range(self.roiy[0],self.roiy[1])
-        idx_x = range(self.roix[0],self.roix[1])
-        cropOD = OD.take(idx_y,axis=OD.ndim-2).take(idx_x,axis=OD.ndim-1)
-        return cropOD
+        # A slice plus one copy of the crop, rather than two take() calls:
+        # take() copied the whole input at the first axis (1.6 GB for a
+        # Basler run's od_raw) before cropping the second. The copy keeps the
+        # result independent of the input, as before.
+        y0, y1 = int(self.roiy[0]), int(self.roiy[1])
+        x0, x1 = int(self.roix[0]), int(self.roix[1])
+        return np.asarray(OD)[..., y0:y1, x0:x1].copy()
+
+    def __deepcopy__(self, memo):
+        """Deep-copies the ROI bounds but shares the (large) image stack.
+
+        ``_images`` is a reference to the run's raw camera frames, kept only so
+        the selection GUI and auto-ROI can show/detect on them. atomdata
+        deep-copies its ROI for every avg/std sibling and every slice, and a
+        plain deepcopy duplicated the 600 MB stack each time.
+        """
+        import copy as _copy
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        shared = ('_images', 'server_talk', 'auto_roi_result')
+        for k, v in self.__dict__.items():
+            new.__dict__[k] = v if k in shared else _copy.deepcopy(v, memo)
+        return new
 
     def _start_auto_roi(self):
         """Starts (or looks up) this run's background auto-ROI detection.
@@ -676,6 +709,7 @@ class _RoiImageWidget(QWidget):
         self._dialog.keyPressEvent(event)
 
     def resizeEvent(self, event):
+        self._dialog.on_canvas_resized()
         self.update()
 
 
@@ -709,12 +743,22 @@ class _RoiSelectorDialog(QDialog):
         # index shifts under the user mid-dialog.
         self._auto_preset_idx = None
         self._auto_poll_timer = None
+        # The detection as it came off the worker, at the default
+        # conservativeness. The slider reboxes this; creator.auto_roi_result
+        # holds whatever the slider currently says.
+        self._auto_base_result = None
 
         # ── Image / zoom state ────────────────────────────────────────────
-        self.original_image = creator.image.copy()
-        self.display_image = self.original_image.copy()
+        # These arrays are only ever read (colorised, resized, indexed for
+        # coordinates), so they are held, never copied: a Basler OD is 40 MB
+        # and copying it twice per frame change was a good part of the scroll
+        # latency.
+        self.original_image = creator.image
+        self.display_image = self.original_image
         self.zoom_region = None          # (x0, y0, x1, y1) in original coords
         self.img_index = 0
+        self._scroll_direction = 1       # which way the user last stepped
+        self._render_size = None         # (w, h) the pixmap was last built at
 
         # ── ROI state ─────────────────────────────────────────────────────
         self.active_roi_bounds = None    # (x0, x1, y0, y1) in original coords
@@ -739,6 +783,9 @@ class _RoiSelectorDialog(QDialog):
         self._setup_hotkeys()
         self._init_auto_roi()
         self._refresh_image()
+        # Warm the frames either side of the first one while the user is
+        # still looking at it.
+        self.creator.prefetch_ods(self.img_index, self._scroll_direction)
         self.setWindowTitle("ROI Selector")
         self._set_emoji_window_icon()
         self.resize(450, 550)
@@ -784,6 +831,15 @@ class _RoiSelectorDialog(QDialog):
             "  background: #3f6fd8; border: 1px solid #82a4f1; color: #f3f5fb;"
             "}"
             "QPushButton#mini_accent:hover { background: #5582e5; }"
+            "QSlider::groove:horizontal { height: 4px; background: #3a435e; border-radius: 2px; }"
+            "QSlider::sub-page:horizontal { background: #3f6fd8; border-radius: 2px; }"
+            "QSlider::handle:horizontal {"
+            "  background: #d4d8e8; border: 1px solid #82a4f1; width: 10px;"
+            "  margin: -4px 0; border-radius: 5px;"
+            "}"
+            "QSlider::handle:horizontal:hover { background: #ffffff; }"
+            "QSlider:disabled::sub-page:horizontal { background: #2a324a; }"
+            "QSlider:disabled::handle:horizontal { background: #5f6a90; border: 1px solid #5f6a90; }"
         )
 
         # Top bar
@@ -902,6 +958,40 @@ class _RoiSelectorDialog(QDialog):
         controls_row.addWidget(action_widget)
         top_layout.addLayout(controls_row)
 
+        # Auto-ROI conservativeness: how much frame the suggested box takes
+        # around the cloud. Reboxing the cached score map is instant, so the
+        # box follows the handle live.
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(6)
+        self.auto_slider_label = QLabel("Auto ROI box:")
+        self.auto_slider_label.setObjectName("group_label")
+        slider_row.addWidget(self.auto_slider_label)
+        tight_label = QLabel("tight")
+        tight_label.setObjectName("group_label")
+        slider_row.addWidget(tight_label)
+        self.auto_slider = QSlider(Qt.Orientation.Horizontal)
+        self.auto_slider.setRange(0, 100)
+        self.auto_slider.setSingleStep(5)
+        self.auto_slider.setPageStep(10)
+        self.auto_slider.setValue(int(round(100 * _default_conservativeness())))
+        self.auto_slider.setEnabled(False)
+        self.auto_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.auto_slider.setToolTip(
+            "How conservative the auto-detected ROI is. Left hugs the dense "
+            "core of the cloud; right takes its wings, any faint secondary "
+            "position, and a wider margin.")
+        self.auto_slider.valueChanged.connect(self._on_auto_slider_changed)
+        slider_row.addWidget(self.auto_slider, 1)
+        generous_label = QLabel("generous")
+        generous_label.setObjectName("group_label")
+        slider_row.addWidget(generous_label)
+        self.auto_slider_value = QLabel("")
+        self.auto_slider_value.setObjectName("status_label")
+        self.auto_slider_value.setMinimumWidth(34)
+        slider_row.addWidget(self.auto_slider_value)
+        self._update_auto_slider_value_label()
+        top_layout.addLayout(slider_row)
+
         info_row = QHBoxLayout()
         info_row.setSpacing(8)
 
@@ -977,6 +1067,7 @@ class _RoiSelectorDialog(QDialog):
             "<div style='margin:0 0 0.2em 0;'>Up Arrow: Brighter</div>"
             "<div style='margin:0 0 0.2em 0;'>Down Arrow: Dimmer</div>"
             "<div style='margin:0 0 0.2em 0;'>A: Apply the auto-detected ROI</div>"
+            "<div style='margin:0 0 0.2em 0;'>[ / ]: Tighter / more generous auto ROI</div>"
             "<div style='margin:0 0 0.2em 0;'>Enter: Accept ROI</div>"
             "<div style='margin:0 0 0.2em 0;'>Escape: Cancel</div>"
             "</td>"
@@ -1021,6 +1112,8 @@ class _RoiSelectorDialog(QDialog):
         bind("Up", self._action_brighter)
         bind("Down", self._action_dimmer)
         bind("A", self._action_auto_roi)
+        bind("[", self._action_auto_tighter)
+        bind("]", self._action_auto_more_generous)
 
     def _focus_image_canvas(self):
         # Explicit activation helps foreground modal dialogs on Windows.
@@ -1049,13 +1142,48 @@ class _RoiSelectorDialog(QDialog):
         h, w = self.display_image.shape[:2]
         return w, h
 
+    def _render_size_for_canvas(self):
+        """(w, h) to colorise at: the display image shrunk to fit the canvas.
+
+        The canvas is a few hundred pixels across and Qt scales whatever
+        pixmap it is handed into that rectangle, so colorising a full Basler
+        frame (5 Mpx, ~120 ms with the pixmap conversion) to show 0.2 Mpx of
+        it was pure waste. Shrinking first with an area average makes the
+        frame change cost the same whatever the sensor. Never upscaled: a
+        small image stays at its own resolution and Qt magnifies it as
+        before. Coordinates are unaffected -- the mouse mapping goes through
+        display_image's shape and the letterboxed rectangle, neither of which
+        depends on the pixmap's pixel count.
+        """
+        h, w = self.display_image.shape[:2]
+        ww = max(self.image_widget.width(), 1)
+        wh = max(self.image_widget.height(), 1)
+        scale = min(ww / w, wh / h)
+        if scale >= 1.:
+            return w, h
+        return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
     def _refresh_image(self):
-        colorized = self.creator._colorize_image(self.display_image)
+        size = self._render_size_for_canvas()
+        colorized = self.creator._colorize_image(self.display_image, render_size=size)
         h, w = colorized.shape[:2]
-        rgb = colorized[:, :, ::-1].copy()   # BGR → RGB
+        rgb = np.ascontiguousarray(colorized[:, :, ::-1])   # BGR → RGB
         qimage = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
         self.image_widget.set_pixmap(QPixmap.fromImage(qimage))
+        self._render_size = size
         self._update_labels()
+
+    def on_canvas_resized(self):
+        """Re-renders only when the canvas has grown past the pixmap's size.
+
+        Shrinking the window just lets Qt scale the pixmap down; growing it
+        past the resolution the pixmap was built at would show the area
+        average's softness, so rebuild then.
+        """
+        if self._render_size is None or not hasattr(self, 'display_image'):
+            return
+        if self._render_size_for_canvas() != self._render_size:
+            self._refresh_image()
 
     def _update_labels(self):
         if self.active_roi_bounds is None:
@@ -1111,6 +1239,14 @@ class _RoiSelectorDialog(QDialog):
         if result is None:
             self._set_auto_button_state('unavailable')
             return
+        self._auto_base_result = result
+        if result.can_rebox:
+            self.auto_slider.setEnabled(True)
+            # The worker always detects at the default; if the slider was left
+            # elsewhere by an earlier dialog, honour that from the start.
+            wanted = self._slider_conservativeness()
+            if abs(wanted - result.conservativeness) > 1e-9:
+                result = self.creator.rebox_auto_roi(wanted)
         if not result.valid:
             # Say why, rather than leaving a dead button: the reason is the
             # useful part ("the score map is scattered over 40% of the
@@ -1161,6 +1297,54 @@ class _RoiSelectorDialog(QDialog):
         if self._auto_preset_idx is None:
             return
         self._apply_preset_and_sync_combo(self._auto_preset_idx)
+
+    # ── Auto-ROI conservativeness slider ──────────────────────────────────
+
+    def _slider_conservativeness(self):
+        return self.auto_slider.value() / 100.
+
+    def _update_auto_slider_value_label(self):
+        self.auto_slider_value.setText(f"{self.auto_slider.value():d}%")
+
+    def _action_auto_tighter(self):
+        if self.auto_slider.isEnabled():
+            self.auto_slider.setValue(self.auto_slider.value() - self.auto_slider.singleStep())
+
+    def _action_auto_more_generous(self):
+        if self.auto_slider.isEnabled():
+            self.auto_slider.setValue(self.auto_slider.value() + self.auto_slider.singleStep())
+
+    def _on_auto_slider_changed(self, value):
+        """Reboxes the cached detection at the slider's setting and shows it.
+
+        Moving the slider is a request to see the auto box at that setting,
+        so it is applied outright -- even over a hand-drawn rectangle, which
+        the user can redraw. The gates are re-run too: a detection the
+        default setting called "scattered" can become a valid box once
+        tightened, and a valid one can scatter when loosened. In either case
+        the box is still shown, with the verdict in the warning label, so the
+        user sees what the detector would have done rather than a dead
+        button.
+        """
+        self._update_auto_slider_value_label()
+        if self._auto_base_result is None or not self._auto_base_result.can_rebox:
+            return
+        result = self.creator.rebox_auto_roi(value / 100.)
+        bounds = (list(result.roix), list(result.roiy))
+        if self._auto_preset_idx is None:
+            self._auto_preset_idx = len(self.preset_entries)
+            self.preset_entries.append((AUTO_PRESET_KEY,) + bounds)
+            self.preset_keys.append(AUTO_PRESET_KEY)
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.addItem(AUTO_PRESET_KEY)
+            self.preset_combo.blockSignals(False)
+        else:
+            self.preset_entries[self._auto_preset_idx] = (AUTO_PRESET_KEY,) + bounds
+        self._set_auto_button_state('ready')
+        self._apply_preset_and_sync_combo(self._auto_preset_idx)
+        if not result.valid:
+            self.warning_message = f"Auto ROI at this setting: {result.reason}."
+            self._update_labels()
 
     # ── Preset helpers ────────────────────────────────────────────────────
 
@@ -1343,17 +1527,19 @@ class _RoiSelectorDialog(QDialog):
         self._refresh_image()
 
     def _action_prev_image(self):
+        self._scroll_direction = -1
         self.img_index = (self.img_index - 1) % self.creator.N_display
         self._change_image()
 
     def _action_next_image(self):
+        self._scroll_direction = 1
         self.img_index = (self.img_index + 1) % self.creator.N_display
         self._change_image()
 
     def _action_zoom_out(self):
         if self.zoom_region is not None:
             self.zoom_region = None
-            self.display_image = self.original_image.copy()
+            self.display_image = self.original_image
             self._refresh_image()
 
     def _action_clear(self):
@@ -1406,10 +1592,13 @@ class _RoiSelectorDialog(QDialog):
     # ── Image switching ───────────────────────────────────────────────────
 
     def _change_image(self):
-        self.original_image = self.creator.get_od(self.img_index).copy()
+        self.original_image = self.creator.get_od(self.img_index)
         self.display_image = self.creator._extract_display_image(
             self.original_image, self.zoom_region
         )
+        # Queue the frames the user is heading towards, so the next arrow
+        # press finds its OD already computed.
+        self.creator.prefetch_ods(self.img_index, self._scroll_direction)
         if self.active_roi_source.startswith("preset:") and 0 <= self.preset_index < len(self.preset_entries):
             key, roix, roiy = self.preset_entries[self.preset_index]
             roi_bounds, was_clamped, valid, is_full_image_sentinel = self._resolve_preset_bounds(
@@ -1433,6 +1622,9 @@ class _RoiSelectorDialog(QDialog):
 
     def _accept_roi(self):
         self._stop_auto_poll()
+        if self.auto_slider.isEnabled():
+            global _auto_roi_conservativeness
+            _auto_roi_conservativeness = self._slider_conservativeness()
         if self.active_roi_bounds is not None:
             x0, x1, y0, y1 = self.active_roi_bounds
             self.result_update_bool = True
@@ -1446,6 +1638,14 @@ class _RoiSelectorDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Frames the dialog keeps decoded, and which neighbours of the shown frame it
+# decodes ahead of time (in units of the scroll direction). A Basler OD is
+# ~40 MB as float64, so the cache is bounded; three ahead and one behind is
+# what a single worker can stay in front of at key-repeat speed.
+_OD_CACHE_SIZE = 12
+_OD_PREFETCH_OFFSETS = (1, 2, 3, -1)
+
+
 class roi_creator():
     window_name = 'recrop'
 
@@ -1456,7 +1656,14 @@ class roi_creator():
         self.key = key
         self.run_id = run_id
         self.server_talk = server_talk
+        # Decoded ODs by frame index, insertion-ordered so the oldest can be
+        # dropped. Filled from the main thread on demand and from a single
+        # worker ahead of the scroll; the lock covers the cache and the
+        # in-flight table, never the decode itself.
         self._od_cache = {}
+        self._od_pending = {}
+        self._od_lock = threading.Lock()
+        self._od_pool = None
         # An auto-detected ROI suggestion (waxa.image_processing.AutoRoiResult)
         # or None. When present and valid it seeds the dialog's rectangle, and
         # its score map is browsable as one extra frame past the run's shots.
@@ -1512,6 +1719,28 @@ class roi_creator():
         """Browsable frames: the run's shots, plus the score map if there is one."""
         return self.N_img + (1 if self._score_map is not None else 0)
 
+    def rebox_auto_roi(self, conservativeness):
+        """Redraws the auto-detected box at another conservativeness.
+
+        Cheap: reboxes the cached score map rather than rescoring the run.
+        The new result replaces auto_roi_result (and is what the caller of
+        the dialog gets back), so the box the user accepted is the one that
+        is reported.
+
+        Args:
+            conservativeness (float): 0 (tight) to 1 (generous).
+
+        Returns:
+            AutoRoiResult: the reboxed result, or the current one unchanged
+            when there is nothing to rebox.
+        """
+        result = self.auto_roi_result
+        if result is None or not result.can_rebox:
+            return result
+        from waxa.image_processing.auto_roi import rebox
+        self.auto_roi_result = rebox(result, conservativeness)
+        return self.auto_roi_result
+
     def poll_auto_roi(self):
         """Picks up the background auto-ROI result if it has landed.
 
@@ -1547,16 +1776,18 @@ class roi_creator():
         return self._clip_point(mapped_x, mapped_y, original_shape)
 
     def _extract_display_image(self, original_image, zoom_region):
+        # The unzoomed image is handed back as is: nothing downstream writes
+        # to it, and copying a full frame per frame change is not free.
         if zoom_region is None:
-            return original_image.copy()
+            return original_image
 
         x0, y0, x1, y1 = zoom_region
         if x1 <= x0 or y1 <= y0:
-            return original_image.copy()
+            return original_image
 
         zoomed_region = original_image[y0:y1, x0:x1]
         if zoomed_region.size == 0:
-            return original_image.copy()
+            return original_image
 
         return cv2.resize(
             zoomed_region,
@@ -1564,14 +1795,42 @@ class roi_creator():
             interpolation=cv2.INTER_LINEAR,
         )
 
-    def _colorize_image(self, image):
+    def _colorize_image(self, image, render_size=None):
+        """Maps an OD (or score map) to a BGR uint8 image for display.
+
+        Args:
+            image (np.ndarray): (H, W) float image.
+            render_size (tuple or None): (w, h) to produce. When smaller than
+                the image, the image is area-averaged down first and only
+                the small one is colorised. The grey levels are set from the
+                full image's min and max, so the picture is the same one at
+                lower resolution rather than a re-stretched one.
+
+        The mapping: values are clipped to [0, juice * max] and that range is
+        stretched over 0..255, with the image's own (non-negative) minimum
+        as black. That is what cv2.normalize(NORM_MINMAX) on the clipped
+        image used to do; it is spelled out here so it can be computed from
+        the full image's statistics and applied to the shrunken one.
+        """
+        image = np.asarray(image)
+        h, w = image.shape[:2]
+        if render_size is not None and tuple(render_size) != (w, h):
+            src = cv2.resize(np.ascontiguousarray(image), tuple(render_size),
+                             interpolation=cv2.INTER_AREA)
+        else:
+            src = image
+
         max_pixel_value = float(np.max(image))
         if max_pixel_value <= 0.0:
-            normalized_image = np.zeros_like(image, dtype=np.uint8)
+            normalized_image = np.zeros(src.shape[:2], dtype=np.uint8)
         else:
             threshold = max(self.cmap_juice_factor * max_pixel_value, np.finfo(float).eps)
-            normalized_image = np.clip(image, 0, threshold)
-            normalized_image = cv2.normalize(normalized_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            low = min(max(float(np.min(image)), 0.0), threshold)
+            if threshold - low <= 0.0:
+                normalized_image = np.zeros(src.shape[:2], dtype=np.uint8)
+            else:
+                scaled = (np.clip(src, low, threshold) - low) * (255.0 / (threshold - low))
+                normalized_image = np.clip(scaled, 0, 255).astype(np.uint8)
         return cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
 
     def get_od(self, idx):
@@ -1587,15 +1846,96 @@ class roi_creator():
             # One frame past the last shot: the auto-detection score map, so the
             # suggestion is inspectable rather than magic.
             return self._score_map
-        if idx not in self._od_cache:
-            if self._precomputed_ods is not None:
-                self._od_cache[idx] = self._precomputed_ods[idx]
-            else:
-                pwa = self.images[3 * idx]
-                pwoa = self.images[3 * idx + 1]
-                dark = self.images[3 * idx + 2]
-                self._od_cache[idx] = compute_OD(pwa, pwoa, dark, self.analysis_type)
-        return self._od_cache[idx]
+        if self._precomputed_ods is not None:
+            # Already decoded by the caller; indexing is free, so no cache.
+            return self._precomputed_ods[idx]
+
+        with self._od_lock:
+            od = self._od_cache.get(idx)
+            future = self._od_pending.get(idx)
+        if od is not None:
+            return od
+        if future is not None:
+            # The worker is on it (or has just finished): waiting on it is
+            # never slower than decoding the same frame again here.
+            try:
+                od = future.result()
+            except Exception:
+                od = None
+        if od is None:
+            od = self._compute_od(idx)
+            self._remember_od(idx, od)
+        return od
+
+    def _compute_od(self, idx):
+        """Decodes frame `idx` from the raw image stack. Pure; no cache."""
+        pwa = self.images[3 * idx]
+        pwoa = self.images[3 * idx + 1]
+        dark = self.images[3 * idx + 2]
+        return compute_OD(pwa, pwoa, dark, self.analysis_type)
+
+    def _remember_od(self, idx, od):
+        with self._od_lock:
+            self._od_cache.pop(idx, None)
+            self._od_cache[idx] = od
+            while len(self._od_cache) > _OD_CACHE_SIZE:
+                self._od_cache.pop(next(iter(self._od_cache)))
+
+    def _prefetch_one(self, idx):
+        try:
+            od = self._compute_od(idx)
+            self._remember_od(idx, od)
+            return od
+        finally:
+            with self._od_lock:
+                self._od_pending.pop(idx, None)
+
+    def prefetch_ods(self, idx, direction=1):
+        """Queues the frames the user is scrolling towards on the worker.
+
+        Non-blocking. The frames ahead of `idx` in `direction` (and one
+        behind) are decoded on a single background thread and land in the
+        cache, so the next arrow press finds its OD ready. Frames still
+        queued from an earlier call that are no longer wanted are dropped, so
+        a fast scroll does not leave the worker grinding through frames the
+        user has already passed. A no-op when the ODs were handed in
+        precomputed, since there is then nothing to decode.
+        """
+        if self._precomputed_ods is not None or self.N_img <= 1:
+            return
+        wanted = []
+        for offset in _OD_PREFETCH_OFFSETS:
+            j = (idx + direction * offset) % self.N_display
+            if j < self.N_img and j != idx and j not in wanted:
+                wanted.append(j)
+        with self._od_lock:
+            if self._od_pool is None:
+                self._od_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="waxa-roi-od")
+            for j, future in list(self._od_pending.items()):
+                if j not in wanted and future.cancel():
+                    self._od_pending.pop(j, None)
+            for j in wanted:
+                if j in self._od_cache or j in self._od_pending:
+                    continue
+                # Registered under the lock, so the worker's own pop in
+                # _prefetch_one cannot run before the entry exists.
+                self._od_pending[j] = self._od_pool.submit(self._prefetch_one, j)
+
+    def close(self):
+        """Stops the prefetch worker and closes the h5 file, in that order.
+
+        The worker reads from the file, so it has to be drained first: what
+        is queued is cancelled, and the one decode possibly in flight is
+        allowed to finish (a frame's worth of time at most).
+        """
+        pool = self._od_pool
+        self._od_pool = None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        if self.h5_file is not None:
+            self.h5_file.close()
+            self.h5_file = None
 
     def _clamp_roi_to_shape(self, roix, roiy, image_shape):
         height, width = image_shape[:2]
@@ -1675,6 +2015,8 @@ class roi_creator():
             L/R arrow keys: Scroll through ODs from the run while keeping zoom.
             Up / Down arrows: Adjust colormap brightness.
             A / the "Auto ROI" button: Apply the auto-detected ROI.
+            Auto ROI slider, [ / ]: How conservative the auto-detected box is,
+                from tight around the dense core to generous.
             Enter: Submit your selection.
             Escape / "X" button: Close the GUI without submitting selection.
 
@@ -1711,7 +2053,6 @@ class roi_creator():
             # Now enter modal exec with proper focus.
             dialog.exec()
         finally:
-            if self.h5_file is not None:
-                self.h5_file.close()
+            self.close()
 
         return dialog.result_update_bool, dialog.result_roix, dialog.result_roiy
