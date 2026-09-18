@@ -257,13 +257,17 @@ class Scanner():
 
         while scanning:
 
-            self.core.wait_until_mu(now_mu())
+            # No sync here: RPCs execute at kernel-CPU time regardless of the
+            # timeline cursor, so this host block runs during the t_recover
+            # slack banked below (previous shot's events were already drained
+            # by the wait inside put_shot_data). The recovery interval is
+            # still honored: the next shot's events sit >= t_recover after the
+            # previous shot's on the timeline.
             aborted_bool = self._check_for_abort_signal()
             
             self.update_params_from_xvars()
             
             self.write_host_params_to_kernel()
-            delay(RPC_DELAY)
             self.core.break_realtime()
 
             # overloaded in kexp.Base
@@ -283,10 +287,11 @@ class Scanner():
             # overloaded in kexp.Base
             self.cleanup_scan_kernel()
 
+            # Banked as timeline slack (not spun out on the kernel CPU) so the
+            # next iteration's host RPCs overlap it instead of following it.
             delay(self.params.t_recover)
             self.core.break_realtime()
 
-            self.core.wait_until_mu(now_mu())
             scanning = self.step_scan()
             self.update_scan_xvar_counters()
 
@@ -379,7 +384,7 @@ class Scanner():
         Returns:
             TFloat: The value of the ith ndarray ExptParam attribute.
             TInt: length of the array
-        """    
+        """
         N = len(vars(self.params)[self._param_keylist_arrays[i]])
         self._dummy_array[0:N] = vars(self.params)[self._param_keylist_arrays[i]]
         return (N, self._dummy_array)

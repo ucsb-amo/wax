@@ -4,8 +4,11 @@ from joblib import Parallel, delayed
 from waxa.fitting import GaussianFit
 
 # Minimum number of fits to justify spawning a process pool.
-# Below this threshold the pool startup cost exceeds the parallelism gain.
-N_PROC_THRESHOLD = 64
+# A single fit takes ~2.5 ms serially, while the first use of the loky pool in
+# a fresh Python process costs ~4 s on Windows (spawning interpreters and
+# importing waxa/scipy in each). Measured on 88 Basler profiles: 0.22 s serial
+# vs 4.3 s with the pool. The break-even is therefore of order 2000 fits.
+N_PROC_THRESHOLD = 2000
 
 # Module-level worker function (must be importable by loky workers).
 def _fit_one_worker(this_sum_dist, xaxis):

@@ -80,7 +80,10 @@ class Scribe():
         # New path: delegate to the ZMQ client when available.
         if getattr(self, 'live_od_client', None) is not None:
             cam_timeout = timeout if timeout > 0. else 60.0
-            self.live_od_client.wait_cam_ready(timeout=cam_timeout)
+            # False: a reset arrived while waiting (a reset camera never becomes
+            # ready, so this used to sit out the whole timeout).
+            if not self.live_od_client.wait_cam_ready(timeout=cam_timeout):
+                self._abort_for_reset('while waiting for the camera')
             print('Acknowledged camera ready signal.')
             return True
 
@@ -234,6 +237,11 @@ class Scribe():
             # (which raises TerminationRequested); the worst case here is a
             # one-shot delay in aborting.
             reset = getattr(_client, 'last_reset_requested', False)
+            # Before the first shot there is no SHOT_COMPLETE reply to reuse, so
+            # a reset sent during compile / init_kernel would go unnoticed until
+            # the first shot ended. One real POLL per run (~1 ms) closes that.
+            if not reset and getattr(self, '_shot_complete_count', 0) == 0:
+                reset = _client.poll_reset()
             if reset and raise_error:
                 if hasattr(self,'monitor'):
                     self.monitor.update_device_states()
@@ -246,6 +254,19 @@ class Scribe():
         
     def _check_data_file_exists(self, raise_error=True) -> bool:
         return self._check_for_abort_signal(raise_error)
+
+    def _abort_for_reset(self, where=''):
+        """A reset was requested: hand the machine back and stop the run. Same
+        steps as the abort branch of _check_for_abort_signal; raised from inside
+        an RPC, the exception ends the kernel."""
+        if hasattr(self, 'monitor'):
+            self.monitor.update_device_states()
+            self.monitor.signal_end()
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            _client.abort_run()
+        print(f'Run {self.run_info.run_id} reset {where}'.rstrip() + ' -- aborting.')
+        raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
 
     def _send_abort_to_server(self):
         """Notify the liveOD server that the run has been aborted due to

@@ -106,3 +106,49 @@ class AndorParams(CameraParams):
             self.amp_imaging = self.__amp_dispersive__
             self.exposure_time = self.__exposure_time_dispersive__
             self.gain = self.__em_gain_dispersive
+
+class APDParams(AndorParams):
+    """The APD that shares the Andor imaging port.
+
+    Not a camera: a beamsplitter on the PDXC stage picks light off ahead of the
+    Andor and sends it to an avalanche photodiode, read out through the analog
+    integrator on Sampler ch 7.  It is an entry in `cameras` because selecting
+    it has to configure everything a camera selection configures -- trigger
+    TTL, imaging shutters, SLM phase mask, imaging amplitude and detuning --
+    plus the pickoff stage, and doing that by hand through four coupled
+    Base.__init__ flags was error-prone.
+
+    Subclasses AndorParams, so it takes the same parameters and defaults as
+    the Andor.  kexp.config.camera_id sets its values; they may differ from
+    the Andor's, e.g. where a setting only matters to a camera sensor (EM
+    gain, magnification).  What differs structurally:
+
+      camera_type = "apd"        -> CameraNanny opens a DummyCamera rather than
+                                    a second AndorEMCCD handle on the same
+                                    hardware (it caches by key, dispatches by
+                                    camera_type).
+      optical_path_key = "andor" -> inherits the Andor's shutter and SLM
+                                    routing.  Getting this wrong reads as "the
+                                    APD sees nothing".
+      resolution = (1, 1)        -> no pixels; keeps prepare_image_array from
+                                    allocating a full 512x512 frame per image
+                                    on a run that takes no images.
+
+    camera_type = "apd" is also what Base keys on: setup_camera=True with the
+    APD means acquire through it -- pickoff stage in, no liveOD frames -- and
+    the experiment's own kernel does the reading (integrated_imaging_pulse).
+    See kexp.base.cameras.resolve_run_config.
+
+    Imaging type is not among the differences: the APD works with absorption or dispersive
+    imaging, and which one is a property of the measurement.  Pass imaging_type
+    to Base.__init__ as with any other detector.
+
+    select_imaging_type is inherited unchanged: AndorParams.__init__ sets the
+    name-mangled _AndorParams__em_gain_* attributes on this instance, so the
+    inherited lookup resolves to the APD's own amplitude, exposure and gain
+    for whichever imaging type is chosen.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(resolution=(1,1,), **kwargs)
+        self.camera_type = "apd"
+        self.optical_path_key = "andor"

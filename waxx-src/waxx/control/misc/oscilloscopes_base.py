@@ -3,7 +3,7 @@ import vxi11
 import struct
 import numpy as np
 from enum import Enum
-from pylablib.devices import Tektronix
+from typing import TYPE_CHECKING
 
 class Scope_Base():
     def __init__(self):
@@ -21,9 +21,34 @@ class Scope_Base():
     def set_trigger_run(self):
         pass
 
-class TektronixTBS1104B_Base(Tektronix.ITektronixScope, Scope_Base):
-    def __init__(self, device_id):
-        super().__init__(device_id=device_id)
+# TektronixTBS1104B_Base subclasses a pylablib class, and importing pylablib
+# (+pandas, numba) costs ~0.8 s.  Every experiment imports this module through
+# ScopeData, while almost none adds a Tektronix scope, so the class is built on
+# first access (PEP 562).  `from .oscilloscopes_base import
+# TektronixTBS1104B_Base` works as before.
+if TYPE_CHECKING:
+    from pylablib.devices import Tektronix
+
+    class TektronixTBS1104B_Base(Tektronix.ITektronixScope, Scope_Base):
+        def __init__(self, device_id): ...
+
+def _make_tektronix_base():
+    from pylablib.devices import Tektronix
+
+    class TektronixTBS1104B_Base(Tektronix.ITektronixScope, Scope_Base):
+        def __init__(self, device_id):
+            super().__init__(device_id=device_id)
+
+    TektronixTBS1104B_Base.__module__ = __name__
+    TektronixTBS1104B_Base.__qualname__ = "TektronixTBS1104B_Base"
+    return TektronixTBS1104B_Base
+
+def __getattr__(name):
+    if name == "TektronixTBS1104B_Base":
+        cls = _make_tektronix_base()
+        globals()[name] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 TIMEBASE_VALUES = (
         200e-12, 500e-12, 1e-9, 2e-9, 5e-9, 10e-9, 20e-9, 50e-9, 100e-9, 200e-9,

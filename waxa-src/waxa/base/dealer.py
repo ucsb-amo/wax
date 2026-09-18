@@ -180,8 +180,16 @@ class Dealer():
         ndarray = ndarray.reshape((Ns,Nps+2)+ndarray.shape[1:])
 
         pwa = ndarray[:,0:Nps]
-        pwoa = np.expand_dims(ndarray[:,Nps],axis=1).repeat(Nps,axis=1)
-        dark = np.expand_dims(ndarray[:,Nps+1],axis=1).repeat(Nps,axis=1)
+        # Views into the stack, not copies: repeat() always copies, and for the
+        # usual one-pwa-per-shot case that duplicated the light and dark frames
+        # (0.4 GB and a quarter second on a Basler run) for nothing. The
+        # shared light/dark frame is only replicated when there really are
+        # several pwa frames per shot.
+        pwoa = ndarray[:,Nps:Nps+1]
+        dark = ndarray[:,Nps+1:Nps+2]
+        if Nps > 1:
+            pwoa = pwoa.repeat(Nps,axis=1)
+            dark = dark.repeat(Nps,axis=1)
 
         pwa = self._reshape_data_array_to_nxvar(pwa)
         pwoa = self._reshape_data_array_to_nxvar(pwoa)

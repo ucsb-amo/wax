@@ -206,16 +206,19 @@ class Expt(Scanner, Dealer, Scribe):
                 else:
                     self.remove_incomplete_data()
 
+        # Data is saved at this point. The Gmail round trip takes seconds, so
+        # send it in the background while the monitor state is written and the
+        # process winds down (non-daemon thread: exit waits for it).
+        if notify:
+            from waxx.util.notifications import send_run_done_email_async
+            send_run_done_email_async(self.run_info.run_id, expt_filepath)
+
         if hasattr(self,'monitor'):
             self.monitor.update_device_states()
             if restart_monitor:
                 self.monitor.signal_end()
 
         self._run_done_printout(expt_filepath)
-
-        if notify:
-            from waxx.util.notifications import send_run_done_email
-            send_run_done_email(self.run_info.run_id, expt_filepath)
 
     def _run_done_printout(self, expt_filepath):
         rid = self.run_info.run_id

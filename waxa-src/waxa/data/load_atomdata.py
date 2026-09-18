@@ -33,8 +33,8 @@ def load_atomdata(idx=0, roi_id=None, path = "",
         switched.
     
     avg_repeats: bool
-        If true, averages the OD for multiple shots which have the same value
-        for all xvars.
+        Deprecated — has no effect (warns if True). Repeat statistics are
+        always available on ad.avg, ad.std, and ad.sem.
     
     Returns
     -------
