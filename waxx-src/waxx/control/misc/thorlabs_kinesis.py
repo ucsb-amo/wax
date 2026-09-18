@@ -8,7 +8,6 @@ from typing import Union, Literal
 import numpy as np
 from waxa.helper.datasmith import normalize
 
-from pylablib.devices.Thorlabs import KinesisMotor
 from artiq.coredevice.core import Core
 from artiq.language import TBool, TFloat, TInt32, now_mu, delay, kernel
 from waxx.control.artiq import Sampler_CH
@@ -27,6 +26,9 @@ class ThorlabsKinesisMotor():
              force_home=True,
              move_to_zero=True) -> TBool:
         aprint('initializing kinesis mount')
+        # Imported here, not at module level: pylablib (+pandas, numba) costs
+        # ~1.6 s, and kexp.base.devices imports this module in every experiment.
+        from pylablib.devices.Thorlabs import KinesisMotor
         self.motor = KinesisMotor(self._device_id)
         self.setup_velocity()
         aprint('start homing...')

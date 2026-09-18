@@ -1,5 +1,5 @@
 import numpy as np
-from .oscilloscopes_base import Scope_Base, TektronixTBS1104B_Base, SiglentSDS2000X_Base
+from .oscilloscopes_base import Scope_Base, SiglentSDS2000X_Base
 from artiq.language import TBool, now_mu
 from artiq.experiment import kernel, rpc
 from waxx.util.artiq.async_print import aprint
@@ -205,6 +205,8 @@ class TektronixScope_TBS1104(GenericWaxxScope):
             scope_data (ScopeData): Should be the ScopeData object of the
             experiment ("self.scope_data").
         """  
+        # built on first access -- see oscilloscopes_base (pylablib is slow to import)
+        from .oscilloscopes_base import TektronixTBS1104B_Base
         self.scope = TektronixTBS1104B_Base(self.device_id)
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
 

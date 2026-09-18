@@ -46,12 +46,32 @@ def get_core_addr() -> str | None:
         logger.warning("[hardware_id] device db path '%s' does not exist", db_path)
         return None
 
+    # Executing the ~2000-line device db is ~5 ms and an experiment asks several
+    # times per run. Keyed on mtime so long-lived servers still see an edited db.
+    try:
+        cache_key = (db_path, os.path.getmtime(db_path))
+    except OSError:
+        cache_key = None
+    if cache_key is not None and cache_key in _core_addr_cache:
+        return _core_addr_cache[cache_key]
+
     try:
         namespace = runpy.run_path(db_path)
     except Exception as exc:  # noqa: BLE001 — any failure -> no id, never raise
         logger.warning("[hardware_id] could not load device db '%s': %s", db_path, exc)
         return None
 
+    core_addr = _core_addr_from_namespace(namespace, db_path)
+    if cache_key is not None:
+        _core_addr_cache.clear()
+        _core_addr_cache[cache_key] = core_addr
+    return core_addr
+
+
+_core_addr_cache: dict = {}
+
+
+def _core_addr_from_namespace(namespace, db_path) -> str | None:
     core_addr = namespace.get("core_addr")
     if not core_addr:
         try:
