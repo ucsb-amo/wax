@@ -40,6 +40,11 @@ class WavemeterController(MOGDevice):
 
     def set_channel(self, ch):
         try:
+            # Already on the requested channel: skip the SET and its settle
+            # sleep. check_ch returns 0 (not a valid channel) on failure, so a
+            # failed read falls through to the full set-and-verify path.
+            if self.check_ch() == ch:
+                return
             self._set_channel(ch)
             for attempt in range(3):
                 time.sleep(0.075)
@@ -152,8 +157,8 @@ class WavemeterClient():
 
     def lock_status(self, frequency_shift=0., robust=True) -> float:
         if robust:
-            ok = self.check_exposure()
-            ok = ok & self.check_exposure()
+            self.check_exposure()
+            self.check_saturation()
         self._f = self.get_frequency()
 
         f_target = self.target_freq + frequency_shift
