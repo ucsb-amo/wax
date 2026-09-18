@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _SMTP_SERVER = "smtp.gmail.com"
 _SMTP_PORT = 587
+_SMTP_TIMEOUT_S = 10.
 
 
 def _load_credentials(credentials_filepath=None):
@@ -65,7 +66,8 @@ def send_email(recipient, subject, body, credentials_filepath=None):
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
 
-    server = smtplib.SMTP(_SMTP_SERVER, _SMTP_PORT)
+    # Without a timeout a stalled connection blocks the end of the run forever.
+    server = smtplib.SMTP(_SMTP_SERVER, _SMTP_PORT, timeout=_SMTP_TIMEOUT_S)
     server.starttls()
     server.login(sender_email, sender_password)
     server.sendmail(sender_email, recipient, msg.as_string())
@@ -117,3 +119,27 @@ def send_run_done_email(
         logger.info("Run-done notification sent to %s: %s", recipient, subject)
     except Exception as exc:
         logger.warning("Failed to send run-done notification: %s", exc)
+
+
+def send_run_done_email_async(run_id, experiment_filename, **kwargs):
+    """send_run_done_email on a background thread; returns the Thread.
+
+    The Gmail round trip (credentials off the shared drive, DNS, TLS, login,
+    send) takes seconds and nothing at the end of a run depends on it. The
+    subject timestamp is fixed here, at call time, not when the send happens.
+
+    The thread is deliberately NOT a daemon: the interpreter waits for it at
+    exit, so the mail is not lost when the process ends right after end().
+    The wait is bounded by _SMTP_TIMEOUT_S per SMTP operation.
+    """
+    import threading
+    kwargs.setdefault('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    thread = threading.Thread(
+        target=send_run_done_email,
+        args=(run_id, experiment_filename),
+        kwargs=kwargs,
+        name="run-done-email",
+        daemon=False,
+    )
+    thread.start()
+    return thread

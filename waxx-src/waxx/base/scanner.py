@@ -384,15 +384,10 @@ class Scanner():
         Returns:
             TFloat: The value of the ith ndarray ExptParam attribute.
             TInt: length of the array
-        """    
-        # Return only the live elements, not a fixed 10000-element buffer
-        # (80 kB per RPC otherwise). Not staged through _dummy_array: the
-        # kernel-side copy of _dummy_array shrinks to the last returned array
-        # at attribute writeback, so the host buffer cannot be relied on
-        # across kernel invocations. The reply is serialized synchronously
-        # (comm_kernel astype copies), so returning a view is safe.
-        arr = np.asarray(vars(self.params)[self._param_keylist_arrays[i]], dtype=float)
-        return (len(arr), arr)
+        """
+        N = len(vars(self.params)[self._param_keylist_arrays[i]])
+        self._dummy_array[0:N] = vars(self.params)[self._param_keylist_arrays[i]]
+        return (N, self._dummy_array)
     
     def fetch_int64(self,i) -> TInt64:
         """Returns the value of the ith experiment parameter with datatype
