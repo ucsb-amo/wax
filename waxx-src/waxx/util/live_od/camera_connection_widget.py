@@ -1,0 +1,208 @@
+from PyQt6.QtWidgets import (QLabel, QWidget, QVBoxLayout, QHBoxLayout,
+                              QPushButton, QPlainTextEdit, QComboBox)
+from PyQt6.QtCore import QTimer, pyqtSignal
+import os
+
+# the class: `from waxa.data import server_talk` is the MODULE, and calling it
+# raised TypeError in ROISelector (latent -- nothing constructs one today)
+from waxa.data.server_talk import server_talk as st
+
+from waxx.control.cameras import DummyCamera, CameraParams
+
+from waxx.util.live_od import CameraNanny
+from waxx.util.live_od.config import get_config
+
+class CamConnBar(QWidget):
+    """One button per camera the lab declares (LiveODConfig.camera_params_list),
+    laid out in that order."""
+
+    def __init__(self,camera_nanny,output_window,camera_params_list=None):
+        super().__init__()
+
+        self.cn = camera_nanny
+        self.output_window = output_window
+        config = get_config()
+        if camera_params_list is None:
+            camera_params_list = config.camera_params_list
+        self._camera_params_list = list(camera_params_list)
+        self._open_on_start = set(config.cameras_open_on_start)
+        self.setup_camera_buttons()
+        self.setup_layout()
+
+    def setup_camera_buttons(self):
+        self.buttons = []
+        for camera_params in self._camera_params_list:
+            button = CameraButton(camera_params, self.cn, self.output_window,
+                                  open_camera_on_start=camera_params.key in self._open_on_start)
+            self.buttons.append(button)
+            # `bar.<key>_button`, as the attributes were named when the five
+            # K-machine cameras were written out here by hand
+            setattr(self, f"{camera_params.key}_button", button)
+
+    def get_button(self, camera_key: str):
+        for btn in self.buttons:
+            if btn.camera_name == camera_key:
+                return btn
+        return None
+
+    def get_states(self) -> dict:
+        return {btn.camera_name: btn.state for btn in self.buttons}
+
+    def setup_layout(self):
+        self.layout = QVBoxLayout()
+        # label = QLabel("Camera connections")
+        buttonlayout = QHBoxLayout()
+        for button in self.buttons:
+            buttonlayout.addWidget(button)
+        # self.layout.addWidget(label)
+        self.layout.addLayout(buttonlayout)
+        self.setLayout(self.layout)
+
+class CameraButton(QPushButton):
+    state_changed = pyqtSignal(str, str)   # camera_name, state
+
+    def __init__(self,camera_params:CameraParams,
+                 camera_nanny:CameraNanny,
+                 output_window:QPlainTextEdit,
+                 open_camera_on_start:bool=False):
+        super().__init__()
+        self.camera_params = camera_params
+        self.camera_name = self.camera_params.key
+        self.cn = camera_nanny
+        self.camera = DummyCamera()
+        self.output_window = output_window
+        self.state = 'closed'
+        self._set_color_closed()
+
+        self.setText(self.camera_name)
+        if open_camera_on_start:
+            self.open_camera()
+
+        self.is_grabbing = False
+
+        self.clicked.connect(self.button_pressed)
+
+    def msg(self,txt):
+        self.output_window.appendPlainText(txt)
+
+    def button_pressed(self):
+        if self.camera.is_opened():
+            self.close_camera()
+            # self.msg(f'Connection to {self.camera_params.key} closed.')
+        else:
+            self.open_camera()
+    
+    def close_camera(self):
+        if not self.camera.is_opened():
+            return
+        # Use Close() (capital) — both BaslerUSB and AndorEMCCD define a
+        # symmetric Open/Close pair.  AndorEMCCD.Close() closes the shutter
+        # before the underlying SDK close; the lowercase close() inherited
+        # from pylablib does not, which left the andor in a half-open state
+        # and required a second button press to fully release the device.
+        # Only swap to DummyCamera (and flip the button to gray) if the
+        # close actually succeeded; otherwise leave the live handle in place
+        # so the button still reports the real device state on the next
+        # check_new_camera() pass.
+        try:
+            self.camera.Close()
+        except Exception as e:
+            self.msg(f'Error closing {self.camera_name}: {e}')
+            self._set_color_failed()
+            return
+        self._set_color_closed()
+        self.camera = DummyCamera()
+
+    def open_camera(self):
+        self._set_color_loading()
+        camera = self.cn.get_camera(self.camera_params)
+        if not camera.is_opened():
+            self._set_color_failed()
+            self.msg(f'Failed to open camera {self.camera_params.key}')
+        else:
+            self._set_color_success()
+        self.camera = camera
+
+    def toggle_grabbing(self,success_bool=True):
+        self.is_grabbing = not self.is_grabbing
+        if self.is_grabbing:
+            self._set_color_grabbing()
+        elif not success_bool:
+            self._set_color_failed()
+        else:
+            self._set_color_success()
+
+    def _set_state(self, state: str, color: str):
+        self.setStyleSheet(f"background-color: {color}")
+        if state != self.state:
+            self.state = state
+            try:
+                self.state_changed.emit(self.camera_name, state)
+            except Exception:
+                pass
+
+    def _set_color_loading(self):
+        self._set_state('loading', 'orchid')
+
+    def _set_color_failed(self):
+        self._set_state('failed', 'red')
+
+    def _set_color_success(self):
+        self._set_state('open', 'green')
+
+    def _set_color_grabbing(self):
+        self._set_state('grabbing', 'blue')
+
+    def _set_color_closed(self):
+        self._set_state('closed', 'gray')
+
+class ROISelector(QWidget):
+    def __init__(self, server_talk=None):
+        super().__init__()
+        
+        if server_talk == None:
+            self.server_talk = st()
+        else:
+            self.server_talk = server_talk
+            
+        self.setup_widgets()
+        self.setup_layout()
+        self._last_roi_mtime = None
+        self._roi_timer = QTimer(self)
+        self._roi_timer.timeout.connect(self.check_roi_file_update)
+        self._roi_timer.start(10000)  # 10 seconds
+
+    def check_roi_file_update(self):
+        try:
+            mtime = os.path.getmtime(self.server_talk.roi_csv_path)
+            if self._last_roi_mtime is None:
+                self._last_roi_mtime = mtime
+            elif mtime != self._last_roi_mtime:
+                self._last_roi_mtime = mtime
+                self.update_rois()
+        except Exception:
+            pass
+
+    def setup_widgets(self):
+        self.label = QLabel("ROI Selection")
+        self.crop_dropdown = QComboBox()
+        self.update_rois()
+
+    def update_rois(self):
+        self.load_roi_from_spreadsheet()
+        self.crop_dropdown.addItems(self.roi_keys)
+        
+    def load_roi_from_spreadsheet(self):
+        import pandas as pd
+        roicsv = pd.read_excel(self.server_talk.roi_csv_path)
+        self.roi_keys = roicsv['key'].to_list()
+
+    def set_dropdown_to_key(self,key):
+        idx = self.roi_keys.index(key)
+        self.crop_dropdown.setCurrentIndex(idx)
+        
+    def setup_layout(self):
+        self.layout = QVBoxLayout()
+        self.layout.addWidget(self.label)
+        self.layout.addWidget(self.crop_dropdown)
+        self.setLayout(self.layout)
