@@ -26,9 +26,25 @@ Key capabilities:
     * Incremental growth (``add_runs``) and a per-run parameter audit
       (``param_report``).
 
+    * Multi-axis runs. Runs with ``Nvars > 1`` are *stacked* along a per-run
+      parameter (``promote_xvar``), giving an ``Nvars + 1`` axis vault, e.g.
+      two (phase x detuning) runs at different trap compressions become a
+      (compression, phase, detuning) dataset. An inner axis the runs sample
+      differently is merged onto the sorted union of its values; cells a run
+      did not take are NaN and ``vault.stack_mask`` marks the real ones. The
+      runs' own analysis is reused, so nothing is re-cropped or re-fit.
+    * Axis relabelling. ``remap_xvar`` replaces an xvar by a function of it
+      (photodiode volts -> optical power) or by an existing param of the same
+      shape; ``data_container_to_xvar`` does the same from a recorded
+      ``vault.data`` key. Both add the new values to ``params``, keep the old
+      param, leave the data layout alone, and work on flat and stacked vaults.
+
 Limitations:
-    * Only 1-D scans are supported. Every input must have ``Nvars == 1``.
-    * All inputs must share the same ``xvarnames[0]`` unless
+    * 1-D inputs concatenate; multi-axis inputs stack (one run per promoted
+      value, identical xvarnames). The two cannot be mixed, and
+      ``set_xvar`` / ``flatten_xvar`` / ``drop_runs`` / ``collapse_to_unique``
+      / ``recrop`` are unavailable on a stacked vault.
+    * 1-D inputs must share the same ``xvarnames[0]`` unless
       ``xvarname_override=True``.
     * All inputs must share ``imaging_type`` and per-shot image shape.
       ``N_repeats`` may now differ across inputs (see ``merge_overlap``).
@@ -205,6 +221,8 @@ class AtomdataVault(atomdata_base):
     promote_xvar : str or None
         Explicit scalar fixed-parameter key to promote to the first xvar axis
         after loading. If given, this takes precedence over ``structure``.
+        For multi-axis input runs this is the axis the runs are stacked
+        along (required unless exactly one scalar parameter differs).
     flatten_xvar : str, int, or None
         Structured xvar key/index to flatten automatically after any promotion.
     skip_missing : bool
@@ -349,11 +367,16 @@ class AtomdataVault(atomdata_base):
 
         # 2. Validate compatibility. N_repeats may differ across inputs when
         #    merge_overlap is on (grouped statistics handle ragged counts).
-        self._validate_inputs(
-            ads, xvarname_override,
-            allow_repeat_mismatch=self._merge_overlap,
-            ignore_images=self._ignore_images,
-        )
+        #    Multi-axis runs take the stacked path (see _assemble_stacked).
+        self._stacked = int(getattr(ads[0], 'Nvars', 0)) > 1
+        if self._stacked:
+            self._validate_inputs_nd(ads, ignore_images=self._ignore_images)
+        else:
+            self._validate_inputs(
+                ads, xvarname_override,
+                allow_repeat_mismatch=self._merge_overlap,
+                ignore_images=self._ignore_images,
+            )
 
         # 3. Unshuffle each chunk so the per-shot arrays are in xvar order on
         #    axis 0. Only chunks that actually need unshuffling are deep-copied
@@ -364,12 +387,22 @@ class AtomdataVault(atomdata_base):
         for ad in ads:
             if getattr(ad._analysis_tags, 'xvars_shuffled', False):
                 ad_copy = copy.deepcopy(ad)
-                ad_copy.unshuffle(reanalyze=False)
-                if getattr(ad_copy, '_has_images', True):
+                # The stacked path reuses each chunk's own analysis, so it has
+                # to be redone in the unshuffled order.
+                ad_copy.unshuffle(reanalyze=self._stacked)
+                if not self._stacked and getattr(ad_copy, '_has_images', True):
                     ad_copy._sort_images()
                 chunks.append(ad_copy)
             else:
                 chunks.append(ad)
+
+        if self._stacked:
+            if flatten_xvar is not None:
+                raise NotImplementedError(
+                    'flatten_xvar is not supported for multi-axis input runs.'
+                )
+            self._assemble_stacked(chunks, promote_xvar, structure, sort, roi_id)
+            return
 
         # 4. Assemble vault state from chunks.
         first = chunks[0]
@@ -713,6 +746,12 @@ class AtomdataVault(atomdata_base):
             anchor_roi_id = roi_id
         elif self._saved_roi_in_regular_h5(rid, server_talk):
             anchor_roi_id = rid
+        elif not self._regenerate_lite and self._lite_copy_exists(rid, server_talk):
+            # An existing lite copy carries its own baked ROI, so there is
+            # nothing to select: do not full-load the run just to open the ROI
+            # GUI. The full-frame anchor is then only resolved if a later run
+            # has no lite copy and must be cropped to it.
+            anchor_roi_id = rid
         else:
             full_ad = atomdata(rid, roi_id=None, lite=False,
                                **self._scope_load_kwargs)
@@ -875,13 +914,267 @@ class AtomdataVault(atomdata_base):
         # Record per-run repeat counts for the parameter audit.
         self.source_repeat_counts = repeat_counts
 
+    # ------------------------------------------------------------------
+    # Multi-axis inputs: stack along a promoted parameter
+    # ------------------------------------------------------------------
+    def _validate_inputs_nd(self, ads, ignore_images=False):
+        first = ads[0]
+        nvars = int(first.Nvars)
+        names = [_decode_xvarname(n) for n in first.xvarnames]
+        for ad in ads[1:]:
+            rid = ad.run_info.run_id
+            if int(getattr(ad, 'Nvars', 0)) != nvars:
+                raise ValueError(
+                    f"Nvars mismatch: run {rid} has Nvars={ad.Nvars} but the "
+                    f"first input has Nvars={nvars}."
+                )
+            these = [_decode_xvarname(n) for n in ad.xvarnames]
+            if these != names:
+                raise ValueError(
+                    f"xvarname mismatch: run {rid} scans {these} but the first "
+                    f"input scans {names}. Multi-axis inputs must share their "
+                    "xvars, in the same order."
+                )
+            if ad.run_info.imaging_type != first.run_info.imaging_type:
+                raise ValueError(f"imaging_type mismatch on run {rid}.")
+        self.source_repeat_counts = {
+            int(ad.run_info.run_id): ad.params.N_repeats for ad in ads
+        }
+
+    def _resolve_stack_key(self, chunks, promote_xvar, structure):
+        """The scalar per-run parameter that becomes xvar 0 of a stacked vault."""
+        scalar_keys = sorted(
+            key for key, per_run in self.param_disagreements.items()
+            if all(np.ndim(v) == 0 and v is not None for v in per_run.values())
+        )
+        if promote_xvar is None:
+            if structure == 'auto' and len(scalar_keys) == 1:
+                promote_xvar = scalar_keys[0]
+            else:
+                raise ValueError(
+                    "Multi-axis runs are combined by stacking them along a "
+                    "per-run parameter: pass promote_xvar=<param key>. Scalar "
+                    "parameters that differ across these runs: "
+                    + (", ".join(scalar_keys) or "none") + "."
+                )
+        values = []
+        for c in chunks:
+            value = vars(c.params).get(promote_xvar, None)
+            if value is None or np.ndim(value) != 0:
+                raise KeyError(
+                    f"promote_xvar={promote_xvar!r} is not a scalar parameter "
+                    f"of run {c.run_info.run_id}."
+                )
+            values.append(np.asarray(value).item())
+        if len(set(values)) != len(values):
+            raise NotImplementedError(
+                f"Several multi-axis runs share {promote_xvar!r} = "
+                f"{sorted(values)}; merging runs within one promoted value is "
+                "not implemented. Pass one run per value."
+            )
+        return str(promote_xvar), values
+
+    @staticmethod
+    def _union_axis(chunk_values):
+        """One 1-D axis holding every chunk's values, and each chunk's index
+        into it.
+
+        Identical axes pass through untouched, repeats included. Axes that
+        differ are merged onto their sorted union, which requires each chunk
+        to sample a value once: a ragged axis cannot also carry the repeats.
+        """
+        arrays = [np.asarray(v) for v in chunk_values]
+        if all(a.shape == arrays[0].shape and np.array_equal(a, arrays[0])
+               for a in arrays[1:]):
+            idx = np.arange(arrays[0].shape[0])
+            return np.array(arrays[0], copy=True), [idx for _ in arrays]
+        for a in arrays:
+            if np.unique(a).size != a.size:
+                raise NotImplementedError(
+                    "An xvar that differs between runs cannot also carry the "
+                    "repeats; put the repeats on an axis the runs share."
+                )
+        union = np.unique(np.concatenate(arrays))
+        return union, [np.searchsorted(union, a) for a in arrays]
+
+    @staticmethod
+    def _stack_scan_arrays(arrays, inner_dims, index_maps):
+        """Stack per-chunk scan-shaped arrays along a new axis 0, scattering
+        each onto the (possibly larger) union grid. Cells a chunk did not
+        sample are NaN (numeric, promoted to float64) or None (object)."""
+        arrays = [np.asarray(a) for a in arrays]
+        nv = len(inner_dims)
+        trailing = arrays[0].shape[nv:]
+        padded = any(tuple(a.shape[:nv]) != tuple(inner_dims) for a in arrays)
+        if not padded:
+            return np.stack(arrays, axis=0)
+        if arrays[0].dtype == object:
+            out = np.full((len(arrays), *inner_dims, *trailing), None, dtype=object)
+        elif np.issubdtype(arrays[0].dtype, np.number):
+            out = np.full((len(arrays), *inner_dims, *trailing), np.nan, dtype=np.float64)
+        else:
+            raise TypeError(f'cannot pad dtype {arrays[0].dtype}')
+        for i, (a, maps) in enumerate(zip(arrays, index_maps)):
+            out[(i, *np.ix_(*maps))] = a
+        return out
+
+    def _assemble_stacked(self, chunks, promote_xvar, structure, sort, roi_id):
+        """Build an (Nvars + 1)-axis vault from multi-axis runs.
+
+        Each run becomes one slab along a new leading axis, the promoted
+        per-run parameter. Unlike the 1-D path nothing is re-analyzed: the
+        scan-shaped results of every chunk (``od``, ``atom_number``, fit
+        arrays, DataVault fields, ...) are stacked as they are, so the runs
+        keep the ROI they were loaded with. ``vault.stack_mask`` marks the
+        cells that hold data; the rest are NaN.
+        """
+        first = chunks[0]
+        nv = int(first.Nvars)
+
+        self.params = copy.deepcopy(first.params)
+        self.p = self.params
+        self.camera_params = copy.deepcopy(first.camera_params)
+        self.run_info = copy.deepcopy(first.run_info)
+        self.experiment_code = getattr(first, 'experiment_code', None)
+        self._has_images = (
+            False if self._ignore_images
+            else bool(getattr(first, '_has_images', True))
+        )
+
+        self._warn_param_mismatches(chunks)
+        key, values = self._resolve_stack_key(chunks, promote_xvar, structure)
+        if sort:
+            order = np.argsort(values, kind='stable')
+            chunks = [chunks[i] for i in order]
+            values = [values[i] for i in order]
+
+        self.source_run_ids = [int(c.run_info.run_id) for c in chunks]
+        self._source_atomdata_by_run_id = {
+            int(c.run_info.run_id): c for c in chunks
+        }
+        self.run_info.run_id = list(self.source_run_ids)
+
+        inner_names = [_decode_xvarname(n) for n in first.xvarnames]
+        inner_xvars, per_axis_maps = [], []
+        for j in range(nv):
+            axis, maps = self._union_axis([c.xvars[j] for c in chunks])
+            inner_xvars.append(axis)
+            per_axis_maps.append(maps)
+        inner_dims = tuple(len(x) for x in inner_xvars)
+        # index_maps[i][j]: where chunk i's axis-j samples land on the union axis
+        index_maps = [[per_axis_maps[j][i] for j in range(nv)]
+                      for i in range(len(chunks))]
+
+        def _scan_shaped(c, arr):
+            return (isinstance(arr, np.ndarray) and arr.ndim >= nv
+                    and tuple(arr.shape[:nv]) == tuple(c.xvardims))
+
+        def _stack(getter, label, skipped):
+            arrays = [getter(c) for c in chunks]
+            if not all(_scan_shaped(c, a) for c, a in zip(chunks, arrays)):
+                return None
+            if len({a.shape[nv:] for a in arrays}) != 1:
+                skipped.append(label)
+                return None
+            try:
+                return self._stack_scan_arrays(arrays, inner_dims, index_maps)
+            except TypeError:
+                skipped.append(label)
+                return None
+
+        skip = {'images', 'image_timestamps', 'xvars', 'xvardims', 'sort_idx',
+                'sort_N', 'avg', 'std', 'sem', 'od_raw'}
+        if self._drop_raw_images or not self._has_images:
+            skip |= {'img_atoms', 'img_light', 'img_dark'}
+        skipped = []
+        for attr, val in list(vars(first).items()):
+            if attr.startswith('_') or attr in skip or not _scan_shaped(first, val):
+                continue
+            stacked = _stack(lambda c, a=attr: vars(c).get(a, None), attr, skipped)
+            if stacked is not None:
+                vars(self)[attr] = stacked
+
+        self.data = _VaultDataVault()
+        for k in first.data.keys:
+            stacked = _stack(lambda c, k=k: vars(c.data).get(k, None), f'data.{k}', skipped)
+            if stacked is not None:
+                vars(self.data)[k] = stacked
+                self.data.keys.append(k)
+        if skipped:
+            warnings.warn(
+                "AtomdataVault: not stacked because their per-shot shapes "
+                "differ between runs (different ROIs?): " + ", ".join(skipped),
+                stacklevel=3,
+            )
+        if any(getattr(c, 'scope_data', None) for c in chunks):
+            warnings.warn(
+                "AtomdataVault: scope_data is not carried into a stacked "
+                "(multi-axis) vault; read it from vault.atomdata(run_id).",
+                stacklevel=3,
+            )
+
+        self.stack_mask = self._stack_scan_arrays(
+            [np.ones(tuple(c.xvardims), dtype=float) for c in chunks],
+            inner_dims, index_maps) == 1.0
+        self._padded_xvar_mask = self.stack_mask
+        self.shot_run_id = np.where(
+            self.stack_mask,
+            np.asarray(self.source_run_ids, dtype=np.int64).reshape(-1, *([1] * nv)),
+            -1,
+        )
+        self._shot_param_values = {}
+
+        self.images = np.array([])
+        self.image_timestamps = np.array([])
+
+        self.xvarnames = [key, *inner_names]
+        self.xvars = [np.asarray(values), *inner_xvars]
+        self.xvardims = np.array([len(x) for x in self.xvars], dtype=int)
+        self.Nvars = nv + 1
+        for name, axis in zip(self.xvarnames, self.xvars):
+            setattr(self.params, name, axis)
+
+        n_repeats = []
+        for axis in self.xvars:
+            _, counts = np.unique(axis, return_counts=True)
+            n_repeats.append(int(counts.max()))
+        self.params.N_repeats = np.array(n_repeats, dtype=int)
+        self.params.N_shots_with_repeats = int(np.count_nonzero(self.stack_mask))
+        if hasattr(self.params, 'N_shots'):
+            self.params.N_shots = int(
+                self.params.N_shots_with_repeats // max(int(np.prod(n_repeats)), 1)
+            )
+
+        self.sort_idx = np.array([])
+        self.sort_N = np.array([])
+        self._structured_xvars = True
+
+        from waxa.data.data_saver import DataSaver
+        self._ds = DataSaver()
+        self._dealer = None
+        self._analysis_tags = analysis_tags(
+            roi_id=roi_id, imaging_type=self.run_info.imaging_type,
+        )
+        self._analysis_tags.xvars_shuffled = False
+        self.roi = copy.deepcopy(getattr(first, 'roi', None)) if self._has_images else None
+
+        self._refresh_repeat_statistics()
+
+    def _require_flat(self, method_name):
+        if getattr(self, '_stacked', False):
+            raise NotImplementedError(
+                f"AtomdataVault.{method_name} is not available on a vault "
+                "stacked from multi-axis runs; work on "
+                "vault.atomdata(run_id) or rebuild the vault instead."
+            )
+
     def _warn_param_mismatches(self, chunks):
         """Emit a single warning summarizing fixed-param disagreements
         across chunks (excluding the scanned xvar itself) and record the
         per-run values in ``self.param_disagreements`` for ``param_report``."""
         first = chunks[0]
         first_params = vars(first.params)
-        xvarname = _decode_xvarname(first.xvarnames[0])
+        scanned = {_decode_xvarname(name) for name in first.xvarnames}
 
         def _equalish(a_val, b_val):
             try:
@@ -897,7 +1190,7 @@ class AtomdataVault(atomdata_base):
         mismatched = []
         disagreements = {}
         for key, first_val in first_params.items():
-            if key.startswith('_') or key == xvarname:
+            if key.startswith('_') or key in scanned:
                 continue
             differs = False
             for c in chunks[1:]:
@@ -1392,6 +1685,7 @@ class AtomdataVault(atomdata_base):
         the existing xvar. ``xvar_mode='pad'`` preserves uneven sequences in a
         padded two-axis grid and currently requires ``ignore_images=True``.
         """
+        self._require_flat('set_xvar')
         if xvar_idx not in (None, 0):
             raise NotImplementedError(
                 'AtomdataVault.set_xvar currently always inserts the new xvar '
@@ -1527,6 +1821,202 @@ class AtomdataVault(atomdata_base):
             self._refresh_repeat_statistics()
         return self
 
+    # ------------------------------------------------------------------
+    # Relabelling an xvar axis (values change, the data layout does not)
+    # ------------------------------------------------------------------
+    def _resolve_xvar_idx(self, xvar):
+        """Axis index from an int (negative allowed) or an xvar name."""
+        names = [_decode_xvarname(n) for n in self.xvarnames]
+        if isinstance(xvar, (int, np.integer)) and not isinstance(xvar, bool):
+            idx = int(xvar)
+            if not -len(names) <= idx < len(names):
+                raise IndexError(f"xvar index {idx} is out of range for xvars {names}.")
+            return idx % len(names)
+        key = _decode_xvarname(xvar)
+        if key not in names:
+            raise KeyError(f"{key!r} is not an xvar of this vault; xvars are {names}.")
+        return names.index(key)
+
+    def _swap_xvar(self, idx, new_key, values, *, overwrite=False):
+        """Install ``values`` as xvar ``idx`` under ``new_key`` and as a param.
+
+        Only the axis label changes: no array is reordered, so ``values[i]``
+        must describe the same shots ``xvars[idx][i]`` did. The old xvar stays
+        in ``params`` under its own key.
+        """
+        new_key = str(new_key)
+        names = [_decode_xvarname(n) for n in self.xvarnames]
+        old_key = names[idx]
+        if new_key in names[:idx] + names[idx + 1:]:
+            raise ValueError(f"{new_key!r} is already the xvar on another axis ({names}).")
+
+        values = np.array(values, copy=True)
+        n = int(self.xvardims[idx])
+        if values.shape != (n,):
+            raise ValueError(
+                f"New values for xvar {old_key!r} (axis {idx}) must have shape ({n},); "
+                f"got {values.shape}.")
+        if np.issubdtype(values.dtype, np.number) and not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"New values for xvar {old_key!r} contain NaN or inf; an xvar must be "
+                "finite for grouping and repeat statistics.")
+
+        existing = vars(self.params).get(new_key, None)
+        if existing is not None and new_key != old_key and not overwrite:
+            same = (np.shape(existing) == values.shape
+                    and np.array_equal(np.asarray(existing), values))
+            if not same:
+                raise ValueError(
+                    f"Param {new_key!r} already exists with different values; pass "
+                    "overwrite=True to replace it, or choose another key.")
+
+        n_unique_old = np.unique(np.asarray(self.xvars[idx])).size
+        if np.unique(values).size != n_unique_old:
+            warnings.warn(
+                f"Remapping xvar {old_key!r} -> {new_key!r} changed the number of distinct "
+                f"values ({n_unique_old} -> {np.unique(values).size}); repeat grouping on "
+                "this axis will change.")
+
+        names[idx] = new_key
+        self.xvarnames = names
+        self.xvars[idx] = values
+        setattr(self.params, new_key, values)
+        if not hasattr(self, 'xvar_remaps'):
+            self.xvar_remaps = []
+        self.xvar_remaps.append((idx, old_key, new_key))
+        self._refresh_repeat_statistics()
+        return self
+
+    def remap_xvar(self, xvar, func=None, new_key=None, *, overwrite=False):
+        """Replace one xvar axis by a function of it, or by an existing param.
+
+        Parameters
+        ----------
+        xvar : int or str
+            Axis index, or the xvar's name.
+        func : callable, optional
+            Maps the old xvar values to the new ones, e.g.
+            ``lambda v: P0 * v / 0.444``. Called once with the whole array; if
+            that fails or does not return one value per element it is applied
+            element by element. Omit it to swap in an existing param.
+        new_key : str
+            Name of the new xvar. With ``func`` it is the name the generated
+            values are stored under in ``params``; without ``func`` it must
+            name an existing param whose shape already matches the axis
+            (otherwise ``ValueError``). ``remap_xvar(xvar, 'key')`` is accepted
+            as shorthand for the latter.
+        overwrite : bool
+            Allow ``func`` output to replace an existing, different param.
+
+        The new values become ``xvars[i]`` and ``params.<new_key>``, the name
+        replaces ``xvarnames[i]``, and the old xvar stays in ``params``. Shots
+        are not reordered, so a non-monotonic map leaves the axis unsorted.
+        Returns ``self``.
+        """
+        if isinstance(func, str) and new_key is None:
+            func, new_key = None, func
+        if new_key is None:
+            raise TypeError("remap_xvar needs new_key: the name of the new xvar.")
+        idx = self._resolve_xvar_idx(xvar)
+        old = np.asarray(self.xvars[idx])
+
+        if func is None:
+            if new_key not in vars(self.params):
+                raise KeyError(
+                    f"No func was given, so {new_key!r} must be an existing param; it is not.")
+            values = np.asarray(vars(self.params)[new_key])
+            if values.shape != old.shape:
+                raise ValueError(
+                    f"Param {new_key!r} has shape {values.shape} but xvar "
+                    f"{_decode_xvarname(self.xvarnames[idx])!r} has shape {old.shape}; pass a "
+                    "func to generate the new values instead.")
+            return self._swap_xvar(idx, new_key, values, overwrite=True)
+
+        if not callable(func):
+            raise TypeError(f"func must be callable or None; got {type(func).__name__}.")
+        try:
+            values = np.asarray(func(old))
+            if values.shape != old.shape:
+                raise ValueError
+        except (TypeError, ValueError):
+            values = np.array([func(v) for v in old])
+        return self._swap_xvar(idx, new_key, values, overwrite=overwrite)
+
+    def data_container_to_xvar(self, xvar, data_key, func=None, new_key=None, *,
+                               reduce=None, overwrite=False):
+        """Replace one xvar axis by a recorded data container (``vault.data.<key>``).
+
+        Parameters
+        ----------
+        xvar : int or str
+            Axis index, or the xvar's name.
+        data_key : str
+            Key into ``vault.data``. The container must be either 1-D with one
+            value per point of the axis, or scan-shaped (``xvardims``), in which
+            case it has to collapse onto that axis.
+        func : callable, optional
+            Applied to the collapsed values (see :meth:`remap_xvar`).
+        new_key : str, optional
+            Name of the new xvar and param; defaults to ``data_key``.
+        reduce : {None, 'mean', 'median', 'first'}
+            How a scan-shaped container collapses over the other axes. ``None``
+            (default) requires it to be constant along them and raises
+            otherwise; the reducers ignore NaN cells (``stack_mask`` holes).
+
+        A per-shot record differs between repeats, so using one on the axis
+        that carries the repeats removes the repeat grouping. Returns ``self``.
+        """
+        idx = self._resolve_xvar_idx(xvar)
+        data_key = str(data_key)
+        if data_key not in list(self.data.keys):
+            raise KeyError(
+                f"{data_key!r} is not a data container; available: {list(self.data.keys)}.")
+        arr = np.asarray(getattr(self.data, data_key), dtype=float)
+        n = int(self.xvardims[idx])
+        dims = tuple(int(d) for d in self.xvardims)
+
+        if arr.shape == (n,):
+            values = arr
+        elif arr.shape == dims:
+            other = tuple(a for a in range(len(dims)) if a != idx)
+            reducers = {'mean': np.nanmean, 'median': np.nanmedian}
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)     # all-NaN slices
+                if reduce is None:
+                    lo, hi = np.nanmin(arr, axis=other), np.nanmax(arr, axis=other)
+                    if not np.allclose(lo, hi, equal_nan=True):
+                        raise ValueError(
+                            f"Data container {data_key!r} varies along the other xvar axes "
+                            f"(spread up to {np.nanmax(hi - lo):.4g}); pass reduce='mean', "
+                            "'median' or 'first' to collapse it.")
+                    values = lo
+                elif reduce in reducers:
+                    values = reducers[reduce](arr, axis=other)
+                elif reduce == 'first':
+                    moved = np.moveaxis(arr, idx, 0).reshape(n, -1)
+                    values = np.array([row[np.isfinite(row)][0] if np.isfinite(row).any()
+                                       else np.nan for row in moved])
+                else:
+                    raise ValueError(
+                        f"reduce must be None, 'mean', 'median' or 'first'; got {reduce!r}.")
+        else:
+            raise ValueError(
+                f"Data container {data_key!r} has shape {arr.shape}; expected ({n},) or the "
+                f"scan shape {dims}. Per-shot arrays cannot label an axis.")
+
+        if func is not None:
+            if not callable(func):
+                raise TypeError(f"func must be callable or None; got {type(func).__name__}.")
+            try:
+                mapped = np.asarray(func(values))
+                if mapped.shape != values.shape:
+                    raise ValueError
+            except (TypeError, ValueError):
+                mapped = np.array([func(v) for v in values])
+            values = mapped
+        return self._swap_xvar(idx, data_key if new_key is None else new_key, values,
+                               overwrite=overwrite)
+
     def _flatten_structured_ndarray(self, arr, old_dims):
         arr = np.asarray(arr)
         if arr.ndim < len(old_dims):
@@ -1553,6 +2043,7 @@ class AtomdataVault(atomdata_base):
         vault whose ``amp_imaging`` xvar has repeated values. If the structured
         grid was padded, missing cells are dropped during flattening.
         """
+        self._require_flat('flatten_xvar')
         if int(getattr(self, 'Nvars', 0)) != 2:
             raise NotImplementedError(
                 'AtomdataVault.flatten_xvar currently supports two-axis '
@@ -2040,6 +2531,7 @@ class AtomdataVault(atomdata_base):
             If True (default) and the raw OD is available, re-run ``analyze_ods``
             so fits/atom-number are recomputed from the collapsed OD.
         """
+        self._require_flat('collapse_to_unique')
         if getattr(self._analysis_tags, 'averaged', False):
             print('AtomdataVault is already collapsed to unique xvar values.')
             return self
@@ -2145,6 +2637,7 @@ class AtomdataVault(atomdata_base):
 
         Useful for excluding an outlier/aborted run discovered after loading.
         """
+        self._require_flat('drop_runs')
         if np.isscalar(run_ids):
             run_ids = [run_ids]
         drop = {int(r) for r in run_ids}
@@ -2326,6 +2819,7 @@ class AtomdataVault(atomdata_base):
             use_saved (bool): If False (default), ignores any saved ROI and
                 forces selection of a new one.
         """
+        self._require_flat('recrop')
         if not getattr(self, '_has_images', True):
             print("no images in dataset (ignore_images), no roi to crop")
             return
