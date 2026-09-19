@@ -14,10 +14,10 @@ def test_import_is_stdlib_only():
 
 
 def test_defaults():
-    cfg = LiveODConfig(data_saver=object(), run_id_source=object())
-    # the beacon ids are how every viewer and tool finds the server
-    assert (cfg.server_id_base, cfg.broadcast_id_base) == ("live_od", "live_od_broadcast")
-    assert cfg.camera_params_list == [] and cfg.cameras_closed_on_start == []
+    cfg = LiveODConfig()
+    assert cfg.data_saver is None and cfg.run_id_source is None
+    assert cfg.camera_params_list == [] and cfg.cameras_open_on_start == []
+    assert cfg.camera_needs_grab_drain("xy_basler") and not cfg.camera_needs_grab_drain("other")
     assert cfg.resolve_camera_params("anything") is None
     assert cfg.default_roi_id_for("anything") is None
     assert cfg.cross_section_for_shot is None
@@ -27,7 +27,15 @@ def test_defaults():
 
 
 def test_mutable_defaults_are_not_shared():
-    a = LiveODConfig(data_saver=None, run_id_source=None)
-    b = LiveODConfig(data_saver=None, run_id_source=None)
+    a, b = LiveODConfig(), LiveODConfig()
     a.camera_params_list.append("x")
     assert b.camera_params_list == []
+
+
+def test_registry(monkeypatch):
+    from waxx.util.live_od import config as module
+    monkeypatch.setattr(module, "_active", None)
+    default = module.get_config()
+    assert isinstance(default, LiveODConfig) and module.get_config() is default
+    mine = LiveODConfig(window_title="x")
+    assert module.set_config(mine) is mine and module.get_config() is mine
