@@ -1073,74 +1073,84 @@ class ParamSearchLoader(QThread):
 
 
 class LiteCreateWorker(QThread):
+    """Writes lite copies of one or more runs with an ROI chosen beforehand.
+
+    The ROI is resolved on the GUI thread (waxa.roi.pick_roi) and passed in
+    as explicit bounds: this thread must never build a Qt widget, and the ROI
+    dialog run from here is what used to freeze the browser.
+
+    A failed run is reported and the batch moves on; cancel() stops between
+    frames of the run in progress and leaves no partial file.
+    """
+
     created = pyqtSignal(int, str)
+    progress = pyqtSignal(int, int, int)  # runs finished, total, run starting (-1 at end)
+    completed = pyqtSignal(int, int, bool)  # created, total, cancelled
     error = pyqtSignal(str)
 
-    def __init__(self, data_dir: str, run_id: int):
+    def __init__(self, data_dir: str, runs, roix, roiy):
+        """
+        Args:
+            data_dir (str): the data root.
+            runs (list of (int, str)): (run_id, raw file path) pairs; an
+                empty path means look the run up by id.
+            roix, roiy (sequence of 2 ints): crop bounds in raw pixels.
+        """
         super().__init__()
         self.data_dir = data_dir
-        self.run_id = run_id
+        self.runs = [(int(rid), str(fp or "")) for rid, fp in runs]
+        self.roix = [int(v) for v in roix]
+        self.roiy = [int(v) for v in roiy]
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
 
     def run(self):
+        total = len(self.runs)
+        created_count = 0
+        failures = []
         try:
             from waxa.data.server_talk import server_talk
 
             talk = server_talk(data_dir=self.data_dir)
-            talk.create_lite_copy(self.run_id)
-            lite_path, _ = talk.get_data_file(self.run_id, lite=True)
-            self.created.emit(self.run_id, lite_path)
-        except Exception as exc:
-            message = _format_worker_exception(f"LiteCreateWorker failed for run {self.run_id}", exc)
-            LOGGER.error(message)
-            self.error.emit(message)
-
-
-class BatchLiteCreateWorker(QThread):
-    created = pyqtSignal(int, str)
-    completed = pyqtSignal(int, int)
-    error = pyqtSignal(str)
-
-    def __init__(self, data_dir: str, run_ids: list[int]):
-        super().__init__()
-        self.data_dir = data_dir
-        self.run_ids = [int(rid) for rid in run_ids]
-
-    def run(self):
-        try:
-            from waxa.data.server_talk import server_talk
-
-            if not self.run_ids:
-                raise ValueError("No runs were selected for lite creation.")
-
-            talk = server_talk(data_dir=self.data_dir)
-            total = len(self.run_ids)
-            created_count = 0
-
-            if total > 1:
-                from waxa.roi import ROI
-
-                oldest_run_id = min(self.run_ids)
-                # Select ROI once on the oldest run, then reuse it for all selected runs.
-                roi = ROI(run_id=oldest_run_id, use_saved_roi=False, printouts=False, server_talk=talk)
-                roi.save_roi_h5(printouts=False)
-
-                for run_id in self.run_ids:
-                    talk.create_lite_copy(run_id, roi_id=oldest_run_id, use_saved_roi=True)
-                    lite_path, _ = talk.get_data_file(run_id, lite=True)
-                    self.created.emit(run_id, lite_path)
-                    created_count += 1
-            else:
-                run_id = self.run_ids[0]
-                talk.create_lite_copy(run_id)
-                lite_path, _ = talk.get_data_file(run_id, lite=True)
-                self.created.emit(run_id, lite_path)
+            for i, (run_id, filepath) in enumerate(self.runs):
+                if self._cancel.is_set():
+                    break
+                self.progress.emit(i, total, run_id)
+                try:
+                    lite_path = talk.create_lite_copy(
+                        run_id,
+                        roix=self.roix,
+                        roiy=self.roiy,
+                        path=filepath,
+                        should_cancel=self._cancel.is_set,
+                    )
+                except Exception as exc:
+                    message = _format_worker_exception(f"Lite creation failed for run {run_id}", exc)
+                    LOGGER.error(message)
+                    failures.append(f"run {run_id}: {exc}")
+                    continue
+                if lite_path is None:
+                    break
                 created_count += 1
-
-            self.completed.emit(created_count, total)
+                self.created.emit(run_id, lite_path)
         except Exception as exc:
-            message = _format_worker_exception(f"BatchLiteCreateWorker failed for runs {self.run_ids}", exc)
+            message = _format_worker_exception(f"LiteCreateWorker failed for runs {[r for r, _ in self.runs]}", exc)
             LOGGER.error(message)
             self.error.emit(message)
+            self.completed.emit(created_count, total, self._cancel.is_set())
+            return
+        self.progress.emit(total, total, -1)
+        if failures:
+            self.error.emit(
+                f"Lite creation failed for {len(failures)} of {total} run(s):\n" + "\n".join(failures)
+            )
+        self.completed.emit(created_count, total, self._cancel.is_set())
+
+
+# Kept for callers of the old two-class API; one worker now handles any count.
+BatchLiteCreateWorker = LiteCreateWorker
 
 
 class AnnotationWriteWorker(QThread):

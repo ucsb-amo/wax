@@ -490,25 +490,80 @@ class server_talk():
             with open(self.run_id_path, 'w') as f:
                 f.write(f"{int(value)}")
 
-    def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True):
+    def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True,
+                         roix=None,roiy=None,path="",should_cancel=None):
+        """Writes a lite copy of a run: non-image data copied, scope traces
+        downcast to float32, images cropped to an ROI.
+
+        Pass ``roix``/``roiy`` to crop headlessly: nothing here then touches
+        Qt, so it is safe on a worker thread (the data browser does this). The
+        ``roi_id``/``use_saved_roi`` form builds an ROI and may open the ROI
+        dialog, so only call it that way from the main thread.
+
+        The file is written to ``<lite>.tmp`` and renamed into place only when
+        complete, so a failure or cancel never leaves a partial lite file.
+
+        Args:
+            run_idx (int): run id (see get_data_file).
+            roi_id, use_saved_roi: as for ROI; ignored when roix/roiy are given.
+            roix, roiy (sequence of 2 ints): explicit crop bounds in raw-image
+                pixels, [x0, x1] and [y0, y1].
+            path (str): the raw file, if already known (skips the run lookup).
+            should_cancel (callable): polled between frames; returning True
+                aborts, removes the temporary file and returns None.
+
+        Returns:
+            str or None: the lite file path, or None if cancelled.
+        """
         from waxa.data import RunInfo, DataSaver
         from waxa.atomdata import unpack_group
         import h5py
-        from waxa import ROI
 
-        original_data_filepath, rid = self.get_data_file(run_idx)
+        if (roix is None) != (roiy is None):
+            raise ValueError("Pass both roix and roiy, or neither.")
+
+        original_data_filepath, rid = self.get_data_file(run_idx, path=path)
 
         ri = RunInfo()
-        with h5py.File(original_data_filepath) as file:
+        with h5py.File(original_data_filepath,'r') as file:
             unpack_group(file,'run_info',ri)
+
+        if roix is None:
+            from waxa import ROI
+            roi = ROI(rid,roi_id=roi_id,use_saved_roi=use_saved_roi,server_talk=self)
+            roix, roiy = roi.roix, roi.roiy
+        x0, x1 = (int(v) for v in roix)
+        y0, y1 = (int(v) for v in roiy)
 
         ds = DataSaver(data_dir=self.data_dir, server_talk=self)
         lite_data_path, lite_data_folder = ds._data_path(ri,lite=True)
-
         os.makedirs(lite_data_folder, exist_ok=True)
+        tmp_path = lite_data_path + '.tmp'
 
-        with h5py.File(lite_data_path,'w') as f_lite:
-            with h5py.File(original_data_filepath,'r') as f_src:
+        cancelled = False
+        try:
+            cancelled = self._write_lite_file(
+                original_data_filepath, tmp_path, x0, x1, y0, y1, should_cancel)
+            if not cancelled:
+                os.replace(tmp_path, lite_data_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        if cancelled:
+            print(f'Lite creation for run {rid} cancelled.')
+            return None
+        print(f'Lite version of run {rid} saved at {lite_data_path}.')
+        return lite_data_path
+
+    def _write_lite_file(self, src_path, out_path, x0, x1, y0, y1, should_cancel=None):
+        """Body of create_lite_copy. Returns True if cancelled."""
+        import h5py
+
+        with h5py.File(out_path,'w') as f_lite:
+            with h5py.File(src_path,'r') as f_src:
                 # copy over other datasets (not data)
                 keys = f_src.keys()
                 for key in keys:
@@ -541,19 +596,35 @@ class server_talk():
                 for key in akeys:
                     f_lite.attrs[key] = f_src.attrs[key]
 
-                roi = ROI(rid,roi_id=roi_id,use_saved_roi=use_saved_roi,server_talk=self)
-                
-                N_img = f_src['data']['images'].shape[0]
-                px = np.diff(roi.roix)[0]
-                py = np.diff(roi.roiy)[0]
+                if 'images' not in f_src['data']:
+                    f_lite.attrs['has_images'] = False
+                    for attr in ('roix', 'roiy'):
+                        if attr in f_lite.attrs:
+                            del f_lite.attrs[attr]
+                    return False
 
+                src_images = f_src['data']['images']
+                N_img, H, W = src_images.shape
+                if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
+                    raise ValueError(
+                        f"ROI roix={[x0, x1]}, roiy={[y0, y1]} does not fit "
+                        f"images of shape ({H}, {W}).")
+                px, py = x1 - x0, y1 - y0
+
+                # Lite images are pre-cropped, so the lite ROI is the whole
+                # frame; the crop taken from the raw file is kept alongside.
                 f_lite.attrs['roix'] = [0,px]
                 f_lite.attrs['roiy'] = [0,py]
+                f_lite.attrs['lite_source_roix'] = [x0,x1]
+                f_lite.attrs['lite_source_roiy'] = [y0,y1]
 
-                dtype = f_src['data']['images'][0].dtype
-                images = np.zeros((N_img,py,px),dtype=dtype)
-
+                # Hyperslab reads pull only the ROI rows off disk, and a
+                # frame-by-frame write keeps memory flat and makes cancel
+                # responsive.
+                out = f_lite['data'].create_dataset(
+                    'images', shape=(N_img,py,px), dtype=src_images.dtype)
                 for idx in range(N_img):
-                    images[idx] = roi.crop(f_src['data']['images'][idx])
-                f_lite['data']['images'] = images
-        print(f'Lite version of run {rid} saved at {lite_data_path}.')
+                    if should_cancel is not None and should_cancel():
+                        return True
+                    out[idx] = src_images[idx, y0:y1, x0:x1]
+        return False

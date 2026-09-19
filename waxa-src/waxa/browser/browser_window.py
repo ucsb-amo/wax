@@ -63,7 +63,6 @@ from .run_summary import RunSummary
 from .scanner import (
     PARAM_SEARCH_MODES,
     AnnotationWriteWorker,
-    BatchLiteCreateWorker,
     FolderIndexWorker,
     LiteCreateWorker,
     ParamSearchLoader,
@@ -1295,6 +1294,11 @@ class DataBrowserWindow(QMainWindow):
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(0)
         status_row.addWidget(self.status_label, 1)
+        self.lite_cancel_btn = QPushButton("Cancel lite", self)
+        self.lite_cancel_btn.setToolTip("Stop lite creation; the run in progress is discarded")
+        self.lite_cancel_btn.clicked.connect(self._cancel_lite_creation)
+        self.lite_cancel_btn.setVisible(False)
+        status_row.addWidget(self.lite_cancel_btn)
 
         layout.addLayout(toolbar)
         layout.addLayout(filter_row)
@@ -3431,26 +3435,86 @@ class DataBrowserWindow(QMainWindow):
             QMessageBox.information(self, "Busy", "A lite creation job is already running.")
             return
 
-        if len(unique_run_ids) == 1:
-            run_id = unique_run_ids[0]
-            self._lite_worker = LiteCreateWorker(self.data_dir, run_id)
-            self.status_label.setText(f"Creating lite dataset for run {run_id}...")
-        else:
-            self._lite_worker = BatchLiteCreateWorker(self.data_dir, unique_run_ids)
-            oldest = min(unique_run_ids)
-            self.status_label.setText(
-                f"Select ROI on oldest selected run {oldest}; creating lite datasets for {len(unique_run_ids)} runs..."
-            )
+        # The ROI is chosen here, on the GUI thread, before any background work
+        # starts. The worker only ever gets explicit bounds: opening the ROI
+        # dialog from the worker thread is what used to freeze the browser.
+        roi = self._pick_lite_roi(unique_run_ids)
+        if roi is None:
+            self.status_label.setText("Lite creation cancelled (no ROI selected)")
+            return
+        roix, roiy = roi
 
+        runs = []
+        for run_id in unique_run_ids:
+            run = self._runs_by_id.get(run_id)
+            runs.append((run_id, run.filepath if run is not None else ""))
+
+        LOGGER.info("Lite creation: runs=%s roix=%s roiy=%s", unique_run_ids, roix, roiy)
+        self._lite_worker = LiteCreateWorker(self.data_dir, runs, roix, roiy)
         self._lite_worker.created.connect(self._on_lite_created)
-        if hasattr(self._lite_worker, "completed"):
-            self._lite_worker.completed.connect(self._on_lite_batch_completed)
+        self._lite_worker.progress.connect(self._on_lite_progress)
+        self._lite_worker.completed.connect(self._on_lite_batch_completed)
         self._lite_worker.error.connect(self._on_lite_error)
+        self.lite_cancel_btn.setEnabled(True)
+        self.lite_cancel_btn.setVisible(True)
+        self._set_activity_busy(f"Creating lite datasets for {len(runs)} run(s)...")
         self._lite_worker.start()
 
-    def _on_lite_batch_completed(self, created_count: int, total_count: int):
-        LOGGER.info("Lite creation batch completed: created=%s total=%s", created_count, total_count)
-        self.status_label.setText(f"Lite creation complete: {created_count}/{total_count} runs")
+    def _pick_lite_roi(self, run_ids: list[int]):
+        """Opens the ROI dialog on the oldest selected run, pre-drawn with its
+        saved ROI when it has one. Returns (roix, roiy) or None if closed."""
+        from waxa.roi import pick_roi, read_saved_roi
+
+        oldest = min(run_ids)
+        run = self._runs_by_id.get(oldest)
+        file_path = run.filepath if run is not None else None
+        suffix = f" (applied to all {len(run_ids)} runs)" if len(run_ids) > 1 else ""
+        self.status_label.setText(f"Select ROI on run {oldest}{suffix}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        cursor_restored = False
+        try:
+            talk = server_talk(data_dir=self.data_dir)
+            if file_path is None:
+                file_path, _ = talk.get_data_file(oldest)
+            initial_roi = read_saved_roi(file_path)
+            # The dialog decodes its first OD while opening; the busy cursor
+            # covers that read and is dropped once the window is up.
+            QTimer.singleShot(0, QApplication.restoreOverrideCursor)
+            cursor_restored = True
+            return pick_roi(
+                oldest,
+                server_talk=talk,
+                file_path=file_path,
+                initial_roi=initial_roi,
+                suggest_auto_roi=True,
+                parent=self,
+            )
+        except Exception as exc:
+            LOGGER.exception("ROI selection for lite creation failed")
+            QMessageBox.warning(self, "Lite Creation Error", f"Could not open the ROI selector for run {oldest}:\n{exc}")
+            return None
+        finally:
+            if not cursor_restored:
+                QApplication.restoreOverrideCursor()
+
+    def _cancel_lite_creation(self):
+        if self._lite_worker is not None and self._lite_worker.isRunning():
+            self._lite_worker.cancel()
+            self.lite_cancel_btn.setEnabled(False)
+            self.status_label.setText("Cancelling lite creation...")
+
+    def _on_lite_progress(self, done: int, total: int, run_id: int):
+        if run_id >= 0:
+            self.status_label.setText(f"Creating lite datasets: {done}/{total} done, writing run {run_id}...")
+
+    def _on_lite_batch_completed(self, created_count: int, total_count: int, cancelled: bool):
+        LOGGER.info(
+            "Lite creation finished: created=%s total=%s cancelled=%s", created_count, total_count, cancelled
+        )
+        self.lite_cancel_btn.setVisible(False)
+        word = "cancelled" if cancelled else "complete"
+        self._set_activity_idle()
+        self.status_label.setText(f"Lite creation {word}: {created_count}/{total_count} runs")
 
     def _on_lite_created(self, run_id: int, lite_path: str):
         LOGGER.info("Lite created: run_id=%s path=%s", run_id, lite_path)
@@ -3474,9 +3538,19 @@ class DataBrowserWindow(QMainWindow):
         self.status_label.setText(f"Lite created: {lite_path}")
 
     def _on_lite_error(self, message: str):
+        # The worker follows every error with `completed`, which resets the
+        # busy indicator and the cancel button.
         LOGGER.error("Lite creation failed: %s", message)
-        self.status_label.setText("Lite creation failed")
         QMessageBox.warning(self, "Lite Creation Error", message)
+
+    def closeEvent(self, event):
+        # A QThread destroyed while running aborts the process; stop the lite
+        # job between frames (it discards the partial file) and let it finish.
+        worker = self._lite_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(10000)
+        super().closeEvent(event)
 
     def _get_run_for_row(self, row: int):
         if row < 0:
