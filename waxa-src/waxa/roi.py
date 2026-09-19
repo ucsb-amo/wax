@@ -20,7 +20,7 @@ try:
         QMessageBox, QSlider,
     )
     from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence, QFont, QIcon
-    from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QCoreApplication
+    from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QCoreApplication, QThread
     _PYQT6_AVAILABLE = True
 except ImportError:
     _PYQT6_AVAILABLE = False
@@ -58,6 +58,7 @@ _AUTO_ROI_CACHE_SIZE = 8
 # Label the auto-detected box carries in the dialog's preset dropdown. It is
 # in-memory only and is never written to roi.xlsx.
 AUTO_PRESET_KEY = "auto (suggested)"
+SAVED_PRESET_KEY = "saved (this run)"
 
 # How generous the auto-detected box is, 0 (tight) to 1 (generous). The
 # dialog's slider starts here and writes back what the user accepted with, so
@@ -83,11 +84,12 @@ class _AutoRoiJob():
     hand.
     """
 
-    def __init__(self, images, n_pwa_per_shot):
+    def __init__(self, images, n_pwa_per_shot, loader=None):
         self._done = threading.Event()
         self.result = None
         self.error = None
         self.seconds = 0.
+        self._loader = loader
         self._thread = threading.Thread(
             target=self._run,
             args=(images, int(n_pwa_per_shot)),
@@ -100,6 +102,10 @@ class _AutoRoiJob():
         t_start = time.perf_counter()
         try:
             from waxa.image_processing.auto_roi import suggest_roi
+            if self._loader is not None:
+                # Reading the images is part of the background work when the
+                # caller only has a file (the data browser).
+                images = self._loader()
             self.result = suggest_roi(images=images,
                                       n_pwa_per_shot=n_pwa_per_shot)
         except Exception as e:
@@ -139,7 +145,7 @@ def _auto_roi_key(run_id, images, n_pwa_per_shot):
     return (rid, shape, int(n_pwa_per_shot))
 
 
-def _auto_roi_job(key, images, n_pwa_per_shot=1, start=True):
+def _auto_roi_job(key, images, n_pwa_per_shot=1, start=True, loader=None):
     """Returns the (possibly already finished) auto-ROI job for `key`.
 
     Idempotent: repeated calls for one key hand back the same job, so the
@@ -150,6 +156,8 @@ def _auto_roi_job(key, images, n_pwa_per_shot=1, start=True):
         images (np.ndarray): the raw image stack, only used on first call.
         n_pwa_per_shot (int): probe-with-atoms frames per shot.
         start (bool): if False, look up an existing job but never start one.
+        loader (callable): returns the image stack; used instead of `images`
+            when the stack is not in memory yet, and run on the job's thread.
 
     Returns:
         _AutoRoiJob or None: None when there is nothing to run on.
@@ -160,9 +168,9 @@ def _auto_roi_job(key, images, n_pwa_per_shot=1, start=True):
         job = _AUTO_ROI_JOBS.get(key)
         if job is not None:
             return job
-        if not start or images is None:
+        if not start or (images is None and loader is None):
             return None
-        job = _AutoRoiJob(images, n_pwa_per_shot)
+        job = _AutoRoiJob(images, n_pwa_per_shot, loader=loader)
         _AUTO_ROI_JOBS[key] = job
         # A held result is a frame-sized score map, so keep only a handful.
         # Evicting a job in flight is harmless: whoever holds it keeps working.
@@ -185,6 +193,104 @@ def prefetch_auto_roi(run_id, images, n_pwa_per_shot=1):
     """
     return _auto_roi_job(_auto_roi_key(run_id, images, n_pwa_per_shot),
                          images, n_pwa_per_shot)
+
+def _file_auto_roi_job(run_id, file_path):
+    """Starts (or looks up) auto-ROI detection for a run known only by file.
+
+    The image stack is read on the job's thread, one frame per h5py call, so
+    the GUI thread's own reads (the dialog decoding ODs) interleave with it
+    rather than waiting behind one long read of the whole stack.
+    """
+    try:
+        with h5py.File(file_path, 'r') as f:
+            shape = tuple(int(n) for n in f['data']['images'].shape)
+            n_pwa = 1
+            if 'params' in f and 'N_pwa_per_shot' in f['params']:
+                n_pwa = int(np.ravel(f['params']['N_pwa_per_shot'][()])[0])
+    except Exception:
+        return None
+    if len(shape) != 3 or shape[0] == 0:
+        return None
+
+    def loader():
+        with h5py.File(file_path, 'r') as f:
+            dset = f['data']['images']
+            out = np.empty(shape, dtype=dset.dtype)
+            for i in range(shape[0]):
+                out[i] = dset[i]
+        return out
+
+    key = (int(run_id), shape, n_pwa)
+    return _auto_roi_job(key, None, n_pwa, loader=loader)
+
+
+def read_saved_roi(file_path):
+    """Returns the (roix, roiy) saved in a run's h5 attrs, or None.
+
+    The all -1 "no selection" sentinel counts as no ROI.
+    """
+    try:
+        with h5py.File(file_path, 'r') as f:
+            roix = [int(v) for v in f.attrs['roix']]
+            roiy = [int(v) for v in f.attrs['roiy']]
+    except Exception:
+        return None
+    if all(v == -1 for v in (*roix, *roiy)):
+        return None
+    return roix, roiy
+
+
+def _on_qt_main_thread():
+    """True if Qt widgets may be created from the calling thread."""
+    app = QApplication.instance()
+    if app is None:
+        return threading.current_thread() is threading.main_thread()
+    return QThread.currentThread() == app.thread()
+
+
+def pick_roi(run_id, server_talk=None, file_path=None, initial_roi=None,
+             suggest_auto_roi=True, parent=None):
+    """Opens the ROI dialog for one run and returns the box the user chose.
+
+    GUI-thread only: this is the entry point for Qt applications (the data
+    browser) that resolve an ROI before handing work to a background thread.
+    It never writes the ROI anywhere.
+
+    Args:
+        run_id (int): the run whose ODs are shown.
+        server_talk: used to find the file when `file_path` is not given.
+        file_path (str): the run's raw h5 file.
+        initial_roi (tuple): (roix, roiy) to draw when the dialog opens, e.g.
+            the run's saved ROI. It is offered as the "saved" preset and takes
+            precedence over the auto suggestion.
+        suggest_auto_roi (bool): run auto-ROI detection in the background and
+            offer its box as a preset.
+        parent (QWidget): dialog parent.
+
+    Returns:
+        tuple or None: ([x0, x1], [y0, y1]), or None if the dialog was closed
+        without a selection.
+    """
+    if not _PYQT6_AVAILABLE:
+        raise ImportError(
+            "PyQt6 is required for the ROI selector. Install it with: pip install PyQt6"
+        )
+    if not _on_qt_main_thread():
+        raise RuntimeError("pick_roi must be called from the Qt main thread.")
+    talk = server_talk if server_talk is not None else st()
+    if file_path is None:
+        file_path, _ = talk.get_data_file(run_id)
+    creator = roi_creator(run_id, "", talk, file_path=file_path,
+                          initial_roi=initial_roi)
+    if suggest_auto_roi:
+        # Started after the first OD is decoded, so the dialog's own read of
+        # frame 0 never queues behind the stack read.
+        creator.auto_roi_job = _file_auto_roi_job(run_id, file_path)
+    update_bool, roix, roiy = creator.get_roi_rectangle(parent=parent)
+    if not update_bool:
+        return None
+    return [int(roix[0]), int(roix[1])], [int(roiy[0]), int(roiy[1])]
+
 
 class ROI():
     def __init__(self,
@@ -781,6 +887,7 @@ class _RoiSelectorDialog(QDialog):
 
         self._build_ui()
         self._setup_hotkeys()
+        self._init_initial_roi()
         self._init_auto_roi()
         self._refresh_image()
         # Warm the frames either side of the first one while the user is
@@ -1195,6 +1302,24 @@ class _RoiSelectorDialog(QDialog):
         self.warning_label.setText(self.warning_message)
 
     # ── Auto-ROI ──────────────────────────────────────────────────────────
+
+    def _init_initial_roi(self):
+        """Draws the caller's starting ROI (e.g. the saved one) as a preset.
+
+        Applied before the auto suggestion is wired up, so the auto box, which
+        only takes over an untouched dialog, stays an alternative.
+        """
+        initial = getattr(self.creator, 'initial_roi', None)
+        if initial is None:
+            return
+        roix, roiy = initial
+        idx = len(self.preset_entries)
+        self.preset_entries.append((SAVED_PRESET_KEY, list(roix), list(roiy)))
+        self.preset_keys.append(SAVED_PRESET_KEY)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.addItem(SAVED_PRESET_KEY)
+        self.preset_combo.blockSignals(False)
+        self._apply_preset_and_sync_combo(idx)
 
     def _init_auto_roi(self):
         """Wires up the auto-detected ROI without ever waiting for it.
@@ -1651,9 +1776,11 @@ class roi_creator():
 
     def __init__(self, run_id, key, server_talk, file_path=None,
                  images=None, imaging_type=None, precomputed_ods=None,
-                 auto_roi_result=None, auto_roi_job=None):
+                 auto_roi_result=None, auto_roi_job=None, initial_roi=None):
 
         self.key = key
+        # (roix, roiy) drawn when the dialog opens, e.g. the run's saved ROI.
+        self.initial_roi = initial_roi
         self.run_id = run_id
         self.server_talk = server_talk
         # Decoded ODs by frame index, insertion-ordered so the oldest can be
@@ -2002,7 +2129,7 @@ class roi_creator():
             return []
         return presets
 
-    def get_roi_rectangle(self):
+    def get_roi_rectangle(self, parent=None):
         """Brings up the GUI to select an ROI over a display of the ODs from a
         given run.
 
@@ -2020,6 +2147,9 @@ class roi_creator():
             Enter: Submit your selection.
             Escape / "X" button: Close the GUI without submitting selection.
 
+        Args:
+            parent (QWidget): dialog parent; defaults to the active window.
+
         Returns:
             bool: Whether an ROI has been selected.
             tuple: roix, given as [roix0, roix1] (left and right bounds of the ROI).
@@ -2029,6 +2159,14 @@ class roi_creator():
             raise ImportError(
                 "PyQt6 is required for the ROI selector. Install it with: pip install PyQt6"
             )
+        # A dialog built on a worker thread deadlocks the application (this
+        # froze the data browser's lite creation), so refuse loudly instead.
+        if not _on_qt_main_thread():
+            self.close()
+            raise RuntimeError(
+                "The ROI selector must be opened from the Qt main thread. "
+                "Resolve the ROI first (waxa.roi.pick_roi) and pass explicit "
+                "bounds to the background work.")
         self.cmap_juice_factor = 1.0
         preset_entries = self._load_excel_roi_presets()
 
@@ -2041,7 +2179,7 @@ class roi_creator():
         if app is None:
             app = QApplication(sys.argv)
 
-        parent_window = app.activeWindow()
+        parent_window = parent if parent is not None else app.activeWindow()
         dialog = _RoiSelectorDialog(self, preset_entries, parent=parent_window)
         try:
             dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
