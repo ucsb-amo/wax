@@ -126,9 +126,8 @@ class Expt(Scanner, Dealer, Scribe):
                 )
 
         if self._adjust_specs and self.run_info.save_data:
-            keys = ', '.join(s.key for s in self._adjust_specs)
             print(
-                f"[adjust] WARNING: adjustable params detected with save_data=True: [{keys}]. "
+                "[adjust] WARNING: adjustable params detected with save_data=True. "
                 "Values changed in the Adjust panel between shots will NOT be reflected "
                 "in saved data."
             )
@@ -154,11 +153,20 @@ class Expt(Scanner, Dealer, Scribe):
             }
         except Exception:
             xvar_values = {}
-        reset_requested = _client.shot_complete(
-            self._shot_complete_count,
-            self._N_shots_total,
-            xvar_values,
-        )
+        try:
+            reset_requested = _client.shot_complete(
+                self._shot_complete_count,
+                self._N_shots_total,
+                xvar_values,
+                shot_conditions=self._shot_conditions(),
+            )
+        except TypeError:
+            # a client from before shot_conditions existed
+            reset_requested = _client.shot_complete(
+                self._shot_complete_count,
+                self._N_shots_total,
+                xvar_values,
+            )
         self._pending_adjust_values = getattr(_client, 'last_adjust_values', {})
         self._shot_complete_count += 1
         print(f"shot {n}/{N} done")
@@ -166,6 +174,26 @@ class Expt(Scanner, Dealer, Scribe):
             _client.abort_run()
             raise TerminationRequested
     
+    def _shot_conditions(self) -> dict:
+        """What this shot recorded about itself, for the live viewer: every
+        single-valued DataVault container, as ``{key: float}``.
+
+        Called right after ``data.put_shot_data()``, which has just synced each
+        container's ``shot_data`` to the host. liveOD uses it to pick the
+        absorption cross section from the field at imaging (kexp records
+        ``i_outer_imaging``); waxx does not need to know which keys matter.
+        Never raises: a run must not die for the viewer's sake.
+        """
+        conditions = {}
+        try:
+            for key in list(self.data.keys):
+                value = np.asarray(getattr(self.data, key).shot_data)
+                if value.size == 1 and np.issubdtype(value.dtype, np.number):
+                    conditions[key] = float(value.ravel()[0])
+        except Exception:
+            pass
+        return conditions
+
     def apply_pending_adjust_values(self):
         """Apply any adjust-panel values received from the last SHOT_COMPLETE reply."""
         specs = {s.key: s for s in self._adjust_specs}
