@@ -207,7 +207,8 @@ class TektronixScope_TBS1104(GenericWaxxScope):
         """  
         # built on first access -- see oscilloscopes_base (pylablib is slow to import)
         from .oscilloscopes_base import TektronixTBS1104B_Base
-        self.scope = TektronixTBS1104B_Base(self.device_id)
+        # the local: self.device_id only exists after super().__init__ below
+        self.scope = TektronixTBS1104B_Base(device_id)
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
 
     def read_sweep(self,channels) -> TBool:

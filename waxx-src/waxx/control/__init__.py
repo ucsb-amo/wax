@@ -27,4 +27,4 @@ def __getattr__(name):
     raise AttributeError(f"module 'waxx.control' has no attribute {name!r}")
 
 def __dir__():
-    return sorted(list(globals()) + list(_lazy))
+    return sorted(set(globals()) | set(_lazy))

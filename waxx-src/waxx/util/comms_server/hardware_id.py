@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 MONITOR_BASE_ID: str = "monitor"
 
 
+# get_core_addr's cache: {(db_path, mtime): core_addr or None}. One entry at most.
+_core_addr_cache: dict = {}
+_MISS = object()
+
+
 def get_core_addr() -> str | None:
     """Return ``core_addr`` from the device database pointed to by env var ``db``.
 
@@ -52,12 +57,17 @@ def get_core_addr() -> str | None:
         cache_key = (db_path, os.path.getmtime(db_path))
     except OSError:
         cache_key = None
-    if cache_key is not None and cache_key in _core_addr_cache:
-        return _core_addr_cache[cache_key]
+    # One lookup, not "in" then "[]": another thread in this process may clear the
+    # cache in between, and this function must never raise. None is a legitimate
+    # cached result, hence the sentinel.
+    cached = _core_addr_cache.get(cache_key, _MISS) if cache_key is not None else _MISS
+    if cached is not _MISS:
+        return cached
 
     try:
         namespace = runpy.run_path(db_path)
     except Exception as exc:  # noqa: BLE001 — any failure -> no id, never raise
+        # Not cached on purpose: a db being edited into shape should be retried.
         logger.warning("[hardware_id] could not load device db '%s': %s", db_path, exc)
         return None
 
@@ -66,9 +76,6 @@ def get_core_addr() -> str | None:
         _core_addr_cache.clear()
         _core_addr_cache[cache_key] = core_addr
     return core_addr
-
-
-_core_addr_cache: dict = {}
 
 
 def _core_addr_from_namespace(namespace, db_path) -> str | None:

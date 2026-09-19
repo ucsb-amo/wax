@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _SMTP_SERVER = "smtp.gmail.com"
 _SMTP_PORT = 587
 _SMTP_TIMEOUT_S = 10.
+_EXIT_WAIT_S = 20.      # longest the run-done mail may delay process exit
 
 
 def _load_credentials(credentials_filepath=None):
@@ -85,16 +86,9 @@ def send_run_done_email(
 
     Subject format: ``run {run_id} done: {experiment basename} - {timestamp}``
 
-    Intended to be called from ``analyze()`` immediately after ``self.end()``.
-    Failures are caught and logged as warnings so they never abort analysis.
-
-    Example::
-
-        def analyze(self):
-            import os
-            self.end(os.path.abspath(__file__))
-            from waxx.util.notifications import send_run_done_email
-            send_run_done_email(self.run_info.run_id, os.path.abspath(__file__))
+    Blocking. Experiments do not call this themselves: ``Expt.end_wax`` sends it
+    through :func:`send_run_done_email_async` when ``notify=True``. Failures are
+    caught and logged as warnings so they never abort a run.
 
     Parameters
     ----------
@@ -128,10 +122,13 @@ def send_run_done_email_async(run_id, experiment_filename, **kwargs):
     send) takes seconds and nothing at the end of a run depends on it. The
     subject timestamp is fixed here, at call time, not when the send happens.
 
-    The thread is deliberately NOT a daemon: the interpreter waits for it at
-    exit, so the mail is not lost when the process ends right after end().
-    The wait is bounded by _SMTP_TIMEOUT_S per SMTP operation.
+    The process usually ends right after end(), so the mail needs a chance to
+    finish -- but must never be able to hang the exit. The SMTP calls are bounded
+    (_SMTP_TIMEOUT_S each); reading the credentials off the shared drive is not.
+    So this is a daemon thread, joined at interpreter exit for at most
+    _EXIT_WAIT_S: a stuck drive costs that long, once, and loses the mail.
     """
+    import atexit
     import threading
     kwargs.setdefault('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     thread = threading.Thread(
@@ -139,7 +136,8 @@ def send_run_done_email_async(run_id, experiment_filename, **kwargs):
         args=(run_id, experiment_filename),
         kwargs=kwargs,
         name="run-done-email",
-        daemon=False,
+        daemon=True,
     )
     thread.start()
+    atexit.register(thread.join, _EXIT_WAIT_S)
     return thread

@@ -13,27 +13,24 @@ analysis switches the cross section on that current:
 Every shot carries its source tag in ``atomdata.atom_cross_section_source``
 so a mixed vault or an old run is visible rather than silent.
 
-Values and provenance
----------------------
-SIGMA_HF_M2
-    3 lambda^2 / 2 pi on the closed sigma- D2 line
-    (4,0,1/2,-1/2,m_i) -> (4,1,3/2,-3/2,m_i) at the high-field imaging point
-    B = 520.583 G (kamo ``Potassium39``, portal matrix elements, 2022-survey
-    hyperfine constants; 2026-09-12). Replaces the value 2.8316243e-13 m^2 the
-    analysis carried before 2026-09-16, which is 3 lambda^2 / 2 pi at the D1
-    wavelength (0.9 % high). Kept below as SIGMA_LEGACY_D1_M2 for comparison.
-    Treated as field-independent for any current above the threshold: the
-    line shifts by ~1.4 MHz/G, i.e. 5e-6 in lambda^2 per gauss.
-SIGMA_LF_M2
-    Placeholder. The value the analysis carried (commented out) as the
-    "0-field" cross section. It equals lambda_D2^2, not 3 lambda^2 / 2 pi
-    (2.81e-13), so it is not a physical closed-line cross section; it is kept
-    only so that switching to the low-field branch reproduces what the
-    analysis code used to assume for low-field runs. The low-field cross
-    section must be calibrated against field (open transition, optical
-    pumping during the pulse; see the "Cross-section model" in
-    k-jam/jpagett/imaging_field_record/PLAN.md). Replace this constant and its
-    tag when that calibration lands.
+Values
+------
+The numbers are atomic physics and are defined, with their provenance and the
+recipe that reproduces the high-field one, in ``kamo.imaging.cross_sections``
+(since 2026-09-18). Only the policy lives here: which value a shot gets. The
+``SIGMA_*`` names are aliases kept for existing code.
+
+SIGMA_HF_M2 = kamo ``K39_D2_CLOSED_HIGH_FIELD_M2``
+    Closed sigma- D2 line at the high-field imaging point. Used for any current
+    above the threshold (the value moves by 5e-6 per gauss).
+SIGMA_LF_M2 = kamo ``K39_LEGACY_LAMBDA_SQUARED_M2``
+    Placeholder, not a physical cross section (it is lambda^2, 2.09x the
+    closed-line value); hence the 'low-field-uncalibrated' tag. Kept so the
+    low-field branch reproduces what the analysis used to assume. Replace it and
+    its tag when the low-field cross section has been calibrated against field
+    (see the "Cross-section model" in k-jam/jpagett/imaging_field_record/PLAN.md).
+SIGMA_LEGACY_D1_M2 = kamo ``K39_LEGACY_D1_M2``
+    The constant the analysis carried before 2026-09-16 (0.9 % high). Not used.
 SIGMA_FALLBACK_M2
     Used when a shot has no recorded current. Equal to the high-field value,
     which is what every run was assumed to be before the record existed.
@@ -50,9 +47,27 @@ import numpy as np
 # -- tunables --
 I_OUTER_HF_THRESHOLD_A = 1.0  # A; >= is high field, < is low field
 
-SIGMA_HF_M2 = 2.80668e-13  # kamo closed sigma- D2 line at 520.583 G, 2026-09-12
-SIGMA_LF_M2 = 5.878324268151581e-13  # legacy "0-field" placeholder (= lambda_D2^2); uncalibrated
-SIGMA_LEGACY_D1_M2 = 2.8316243e-13  # 3 lambda^2/2pi at D1; the pre-2026-09-16 constant, not used
+# The numbers are atomic physics and live in kamo.imaging.cross_sections (ARC-free,
+# cheap to import), with their provenance and the recipe that reproduces them.
+# This module only decides which one applies to which shot.
+try:
+    from kamo.imaging.cross_sections import (K39_D2_CLOSED_HIGH_FIELD_M2,
+                                             K39_LEGACY_LAMBDA_SQUARED_M2,
+                                             K39_LEGACY_D1_M2)
+except ImportError:
+    # A kamo checkout from before 2026-09-18 has no such module. Same values, so
+    # no result changes; say so rather than fail every atomdata load.
+    import warnings
+    warnings.warn("kamo.imaging.cross_sections not found: update k-amo. Using waxa's "
+                  "built-in copy of the absorption cross sections (same values).",
+                  stacklevel=2)
+    K39_D2_CLOSED_HIGH_FIELD_M2 = 2.80668e-13
+    K39_LEGACY_LAMBDA_SQUARED_M2 = 5.878324268151581e-13
+    K39_LEGACY_D1_M2 = 2.8316243e-13
+
+SIGMA_HF_M2 = K39_D2_CLOSED_HIGH_FIELD_M2   # closed sigma- D2 line at 520.583 G
+SIGMA_LF_M2 = K39_LEGACY_LAMBDA_SQUARED_M2  # legacy "0-field" placeholder (= lambda_D2^2); uncalibrated
+SIGMA_LEGACY_D1_M2 = K39_LEGACY_D1_M2       # the pre-2026-09-16 constant, not used
 SIGMA_FALLBACK_M2 = SIGMA_HF_M2  # no recorded current: assume high field, as before
 
 TAG_HF = 'high-field'

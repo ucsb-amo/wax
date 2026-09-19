@@ -167,3 +167,33 @@ def test_high_field_value_matches_kamo():
     f_Hz = float(np.asarray(f_Hz).ravel()[0])
     lam = 299792458.0 / f_Hz
     assert np.isclose(3 * lam**2 / (2 * np.pi), cs.SIGMA_HF_M2, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# the numbers come from kamo; the built-in copy must never drift from it
+# ---------------------------------------------------------------------------
+
+def test_values_come_from_kamo():
+    kamo_cs = pytest.importorskip("kamo.imaging.cross_sections")
+    assert cs.SIGMA_HF_M2 == kamo_cs.K39_D2_CLOSED_HIGH_FIELD_M2
+    assert cs.SIGMA_LF_M2 == kamo_cs.K39_LEGACY_LAMBDA_SQUARED_M2
+    assert cs.SIGMA_LEGACY_D1_M2 == kamo_cs.K39_LEGACY_D1_M2
+    assert cs.SIGMA_FALLBACK_M2 == cs.SIGMA_HF_M2
+
+
+def test_fallback_copy_matches_kamo(monkeypatch):
+    """An older kamo has no cross_sections module: waxa must warn and carry on
+    with the same numbers."""
+    import importlib, sys
+    kamo_cs = pytest.importorskip("kamo.imaging.cross_sections")
+    expected = (kamo_cs.K39_D2_CLOSED_HIGH_FIELD_M2,
+                kamo_cs.K39_LEGACY_LAMBDA_SQUARED_M2,
+                kamo_cs.K39_LEGACY_D1_M2)
+    monkeypatch.setitem(sys.modules, "kamo.imaging.cross_sections", None)  # import -> ImportError
+    try:
+        with pytest.warns(UserWarning, match="update k-amo"):
+            fallback = importlib.reload(cs)
+        assert (fallback.SIGMA_HF_M2, fallback.SIGMA_LF_M2, fallback.SIGMA_LEGACY_D1_M2) == expected
+    finally:
+        monkeypatch.undo()
+        importlib.reload(cs)

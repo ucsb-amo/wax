@@ -60,7 +60,14 @@ class BeatLockImaging():
     @kernel
     def init(self):
         self.dds_beatref.on()
-        # self.dds_sw.dac_ch = -1 # disconnect the logic for dac control of the dds
+        # Removed 2026-09-18: `self.dds_sw.dac_ch = -1`, which forced DAC control of
+        # dds_sw off here. It was the only kernel write to DDS.dac_ch, which blocked
+        # declaring it a kernel invariant (kexp/util/profiling/KERNEL_INVARIANTS_PLAN.md,
+        # stage 1), and this non-PID lock is not instantiated anywhere
+        # (BeatLockImagingPID overrides init() and never called this). update_dac_bool()
+        # below now just recomputes dac_control_bool from whatever dac_ch already is. If
+        # this class is revived and needs DAC control off, assign dds_sw with dac_ch=-1
+        # on the host instead -- or put the line back and take dac_ch out of the plan.
         self.dds_sw.update_dac_bool()
         self.ttl_pid_manual_override.on()
 

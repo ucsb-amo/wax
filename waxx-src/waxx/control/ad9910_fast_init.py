@@ -69,7 +69,12 @@ class AD9910FastInit:
             own key if an experiment ever drives more than one.
 
     After a run, ``report`` (dict or None) and ``failures`` (list of dict) hold
-    what happened; nothing is printed unless a channel fails its check.
+    what happened. Every run prints one line saying how many channels were fully
+    initialised and why -- skipping is invisible otherwise, and whoever is chasing
+    a DDS phase problem needs to see it in an ordinary `ar` log -- plus a WARNING
+    per channel that failed its check. The `art` startup report shows the same. Validated on hardware 2026-09-18 for
+    the all-intact case only (0 of 24 channels, 13 ms); the reboot and power-cycle
+    paths and the phase-coherence comparison below are still owed.
     """
 
     kernel_invariants = {"core", "core_cache", "dds_list", "cache_key"}
@@ -78,7 +83,11 @@ class AD9910FastInit:
         self.core = core
         self.core_cache = core_cache
         self.dds_list = dds_list
-        self.cache_key = cache_key
+        # Scoped to the channel count: a cached list of another length (a channel
+        # added or removed) can be neither used nor replaced -- a value read back
+        # in a kernel is borrowed until the kernel ends -- so under one fixed key
+        # every run would silently pay the full init until the next reboot.
+        self.cache_key = f"{cache_key}_{len(dds_list)}"
         self.report = None
         self.failures = []
 
@@ -90,7 +99,7 @@ class AD9910FastInit:
         n_cached = 0
         if not force:
             n_cached = self._restore_sync_data()
-        fast = n_cached == 2 * n_ch
+        fast = n_ch > 0 and n_cached == 2 * n_ch
 
         t_start_mu = self.core.get_rtio_counter_mu()
         if fast:
@@ -116,7 +125,7 @@ class AD9910FastInit:
 
         # A non-empty cache value is borrowed for the rest of the kernel and cannot
         # be replaced, so only write when nothing was read back.
-        if force or n_cached == 0:
+        if n_ch > 0 and (force or n_cached == 0):
             # every channel just ran init(), which read its EEPROM
             sync_values = [0 for _ in range(2 * n_ch)]
             i = 0
@@ -126,7 +135,7 @@ class AD9910FastInit:
                 i += 1
             self.core_cache.put(self.cache_key, sync_values)
         t_end_mu = self.core.get_rtio_counter_mu()
-        self._record(n_full, n_ch,
+        self._record(n_full, n_ch, n_cached, force,
                      self.core.mu_to_seconds(t_end_mu - t_start_mu),
                      self.core.mu_to_seconds(t_checks_mu - t_start_mu))
 
@@ -185,15 +194,28 @@ class AD9910FastInit:
         return True
 
     @rpc(flags={"async"})
-    def _record(self, n_full, n_ch, t_total, t_check_pass):
-        self.report = dict(n_full=n_full, n_channels=n_ch, t_total_s=t_total,
+    def _record(self, n_full, n_ch, n_cached, forced, t_total, t_check_pass):
+        # `why` separates the three ways every channel can end up fully initialised:
+        # asked for, nothing cached since the core device booted, or checks failed
+        # (then `failures` says which).
+        if forced:
+            why = "forced"
+        elif n_cached == 0:
+            why = "no cache: first run since the core device booted"
+        elif n_cached != 2 * n_ch:
+            why = f"cache has {n_cached} values, expected {2 * n_ch}"
+        else:
+            why = "cache hit"
+        self.report = dict(n_full=n_full, n_channels=n_ch, why=why, t_total_s=t_total,
                            t_check_pass_s=t_check_pass)
+        print(f"[dds init] full init on {n_full} of {n_ch} channels, "
+              f"{n_ch - n_full} skipped ({why}), {t_total * 1e3:.0f} ms")
 
     @rpc(flags={"async"})
     def _record_failure(self, urukul_idx, ch, reason, raw):
         reason = FAIL_REASONS.get(reason, reason)
         raw = hex(raw & 0xffffffff)
         self.failures.append(dict(urukul=urukul_idx, ch=ch, reason=reason, raw=raw))
-        # The quiet case (every channel intact) prints nothing; this one should be seen.
+        # On top of the one-line summary from _record: say which channel and why.
         print(f"[dds init] WARNING: urukul {urukul_idx} ch {ch} failed its check "
               f"({reason}, raw {raw}) -- running the full AD9910 init on it.")

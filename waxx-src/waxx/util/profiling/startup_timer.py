@@ -49,7 +49,8 @@ class _Timeline:
         self._depth = 0
         self.n_compiles = 0
         self.n_rpcs = 0
-        self.rpc_times = []    # completion time of every RPC served
+        self.totals = {}       # name -> summed duration, for calls too frequent to list
+        self.rpc_times = []    # completion time of every RPC served (one float each)
         self.census = []       # per compile: {module: [n_functions, n_source_lines]}
 
     def now(self):
@@ -59,11 +60,13 @@ class _Timeline:
         self.marks.setdefault(name, self.now())
 
     def wrap(self, owner, attr, name=None, after=None, first_only_mark=None,
-             label_fn=None, min_s=0.0):
+             label_fn=None, min_s=0.0, total_into=None):
         """Replace owner.attr with a timed wrapper. Returns False if absent.
 
         label_fn(args, kwargs) -> str builds a per-call label; spans shorter
         than min_s are dropped (keeps no-op calls out of the timeline).
+        total_into names a counter in self.totals to add the duration to INSTEAD
+        of recording a span -- for calls made hundreds of times per shot.
         """
         orig = getattr(owner, attr, None)
         if orig is None:
@@ -83,7 +86,9 @@ class _Timeline:
             finally:
                 tl._depth -= 1
                 dur = tl.now() - start
-                if dur >= min_s:
+                if total_into is not None:
+                    tl.totals[total_into] = tl.totals.get(total_into, 0.0) + dur
+                elif dur >= min_s:
                     this_label = label
                     if label_fn is not None:
                         try:
@@ -108,9 +113,11 @@ TL = _Timeline()
 def _dds_init_results(experiment):
     """(report, failures) left by waxx.control.ad9910_fast_init.AD9910FastInit,
     wherever the experiment keeps one."""
-    from_attr = getattr(experiment, "dds_initializer", None)
-    candidates = [from_attr] + [v for v in vars(experiment).values()] if experiment is not None else []
+    if experiment is None:
+        return None, []
+    candidates = [getattr(experiment, "dds_initializer", None)] + list(vars(experiment).values())
     for obj in candidates:
+        # matched by class name: this file must not import waxx (see module docstring)
         if type(obj).__name__ == "AD9910FastInit":
             return obj.report, obj.failures
     return None, []
@@ -121,7 +128,8 @@ def _dds_init_lines(experiment):
     report, failures = _dds_init_results(experiment)
     if report is None:
         return []
-    lines = ["", f"  DDS INIT: full init on {report['n_full']} of {report['n_channels']} channels, "
+    lines = ["", f"  DDS INIT [{report.get('why', '?')}]: full init on "
+                 f"{report['n_full']} of {report['n_channels']} channels, "
                  f"{report['t_total_s'] * 1e3:.1f} ms on the core device "
                  f"(check pass {report['t_check_pass_s'] * 1e3:.1f} ms)"]
     for f in failures:
@@ -275,8 +283,9 @@ def _install_hooks():
     ok["CommKernel.load"] = TL.wrap(CommKernel, "load", "upload kernel")
     ok["CommKernel.run"] = TL.wrap(CommKernel, "run", "start kernel",
                                    first_only_mark="kernel started")
+    # a few hundred calls per shot: summed, not listed
     ok["CommKernel._serve_rpc"] = TL.wrap(CommKernel, "_serve_rpc", "rpc",
-                                          after=count_rpc,
+                                          after=count_rpc, total_into="rpc_host_s",
                                           first_only_mark="first RPC from kernel")
     ok["CommKernel.serve"] = TL.wrap(CommKernel, "serve", "kernel running (serve RPCs until exit)")
 
@@ -290,8 +299,8 @@ def _install_hooks():
 
 def _report(json_path, argv):
     total = TL.now()
-    spans = [s for s in TL.spans if s[0] != "rpc"]
-    rpc_spans = [s for s in TL.spans if s[0] == "rpc"]
+    spans = TL.spans
+    rpc_host_s = TL.totals.get("rpc_host_s", 0.0)
     out = sys.stderr
 
     print("\n" + "=" * 78, file=out)
@@ -338,7 +347,7 @@ def _report(json_path, argv):
         print(f"  {'>> submission -> kernel running':<36s} {m['kernel started']:9.3f} s", file=out)
     print(f"\n  kernels compiled: {TL.n_compiles}    "
           f"RPCs served: {TL.n_rpcs} "
-          f"({sum(d for _, _, d, _ in rpc_spans):.3f} s host time inside RPC handlers)", file=out)
+          f"({rpc_host_s:.3f} s host time inside RPC handlers)", file=out)
     for key, val in TL.counts.items():
         print(f"  {key}: {val}", file=out)
 
@@ -375,7 +384,7 @@ def _report(json_path, argv):
             "spans": [dict(name=n, start=s, duration=d, depth=k) for n, s, d, k in spans],
             "n_compiles": TL.n_compiles,
             "n_rpcs": TL.n_rpcs,
-            "rpc_host_time_s": sum(d for _, _, d, _ in rpc_spans),
+            "rpc_host_time_s": rpc_host_s,
             "counts": TL.counts,
             "rpc_bursts": bursts,
             "dds_init": _dds_init_results(getattr(TL, "experiment", None))[0],
