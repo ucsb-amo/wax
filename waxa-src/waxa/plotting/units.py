@@ -136,6 +136,17 @@ def guess_unit(name, values):
             lname.startswith("pfrac_") or "fraction" in lname):
         return "amp", 1.0
 
+    # Optical power
+    if lname.startswith("power_"):
+        if vmax >= 1:
+            return "W", 1.0
+        elif vmax >= 1e-3:
+            return "mW", 1e3
+        elif vmax >= 1e-6:
+            return "µW", 1e6
+        else:
+            return "nW", 1e9
+
     if (lname.startswith("phase_")):
         return "π", 1/np.pi
 
