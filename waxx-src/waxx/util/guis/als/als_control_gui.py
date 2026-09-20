@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QGridLayout, QGroupBox, QStatusBar, QFrame,
-    QLineEdit, QCheckBox, QPlainTextEdit
+    QLineEdit, QCheckBox, QPlainTextEdit, QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThread, QThreadPool, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
@@ -76,15 +76,50 @@ class SequenceState(Enum):
 
 
 class StatusDot(QPushButton):
-    """Clickable status indicator with red/green state."""
-    def __init__(self, label: str, parent=None):
+    """Clickable status indicator with red/green state.
+
+    Compact pill form: fixed 20 px height and a centred short label, so
+    several of them fit on one row instead of costing a row each.  The
+    click hint lives in the tooltip.
+    """
+
+    _HEIGHT = 20
+
+    def __init__(self, label: str, tooltip: str = "", parent=None):
         super().__init__(parent)
         self.label_text = label
+        self.tooltip_text = tooltip
+        # Fixed state strings, named so ``preferred_width`` can measure both.
+        self.on_text = "ON"
+        self.off_text = "OFF"
+        self._preferred_width = None
         self.is_on = False
         self.setObjectName("StatusDotButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(22)
+        self.setFixedHeight(self._HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # A text-derived minimum width would hold the indicator row wider
+        # than the dock and clip it; let the pill shrink instead, so the
+        # grid can actually re-flow to fewer columns.
+        self.setMinimumWidth(1)
         self._update_color()
+
+    def preferred_width(self) -> int:
+        """Widest this pill wants to be, over both its ON and OFF texts.
+
+        Measured once and cached: the label and the two state strings never
+        change, and re-measuring on every resize would both churn the
+        layout and let the column count flip as the status flips.
+        """
+        if self._preferred_width is None:
+            restore = self.text()
+            widths = []
+            for state_text in (self.on_text, self.off_text):
+                self.setText(f"{self.label_text} {state_text}")
+                widths.append(self.sizeHint().width())
+            self.setText(restore)
+            self._preferred_width = max(widths)
+        return self._preferred_width
 
     def set_status(self, is_on: bool):
         """Set status: True for on (green), False for off (red)."""
@@ -94,15 +129,17 @@ class StatusDot(QPushButton):
     def _update_color(self):
         if self.is_on:
             color = QColor(43, 163, 99)
-            state_text = "ON"
+            state_text = self.on_text
         else:
             color = QColor(208, 63, 55)
-            state_text = "OFF"
+            state_text = self.off_text
 
-        self.setText(f"{self.label_text}: {state_text}")
+        self.setText(f"{self.label_text} {state_text}")
+        hint = f" \u2014 {self.tooltip_text}" if self.tooltip_text else ""
+        self.setToolTip(f"{self.label_text}: {state_text}{hint}")
         self.setStyleSheet(
-            f"background-color: {color.name()}; color: #ffffff; border-radius: 10px; "
-            f"padding: 8px 10px; font-weight: 700; text-align: left;"
+            f"background-color: {color.name()}; color: #ffffff; border-radius: 9px; "
+            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;"
         )
 
 
@@ -614,11 +651,11 @@ class ALSControlGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(8)
-        
+        main_layout.setContentsMargins(5, 4, 5, 4)
+        main_layout.setSpacing(5)
+
         dashboard_layout = QVBoxLayout()
-        dashboard_layout.setSpacing(8)
+        dashboard_layout.setSpacing(5)
 
         # Vertically stacked to match the Precilaser GUI layout: the
         # panel can compress horizontally to almost any width because
@@ -691,20 +728,20 @@ class ALSControlGUI(QMainWindow):
             }
             QGroupBox {
                 border: 1px solid #4a4a4a;
-                border-radius: 10px;
-                margin-top: 12px;
-                padding: 10px 8px 8px 8px;
+                border-radius: 8px;
+                margin-top: 9px;
+                padding: 6px 6px 5px 6px;
                 background: #323232;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
-                left: 12px;
-                padding: 0 6px;
+                left: 10px;
+                padding: 0 5px;
                 color: #9aa3a8;
-                font-size: 11px;
+                font-size: 10px;
                 font-weight: 600;
                 letter-spacing: 0.04em;
             }
@@ -717,8 +754,9 @@ class ALSControlGUI(QMainWindow):
                 background: #3d6b78;
                 color: #f1f3f4;
                 border: 1px solid #4f8896;
-                border-radius: 6px;
-                padding: 5px 10px;
+                border-radius: 5px;
+                padding: 3px 8px;
+                font-size: 11px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -737,8 +775,8 @@ class ALSControlGUI(QMainWindow):
                 background: #2a2a2a;
                 color: #e0e0e0;
                 border: 1px solid #555;
-                border-radius: 6px;
-                padding: 5px 8px;
+                border-radius: 5px;
+                padding: 3px 6px;
                 selection-background-color: #4d8294;
             }
             QLineEdit:focus { border: 1px solid #6aa3b3; }
@@ -766,14 +804,14 @@ class ALSControlGUI(QMainWindow):
             }
             QLabel#PowerOutputLabel {
                 color: #e8a87c;
-                font-size: 24px;
+                font-size: 20px;
                 font-weight: 700;
             }
             QLabel#MetricIcon {
-                font-size: 18px;
+                font-size: 14px;
             }
             QLabel#MetricValue {
-                font-size: 20px;
+                font-size: 15px;
                 font-weight: 700;
                 color: #e6e6e6;
             }
@@ -803,17 +841,17 @@ class ALSControlGUI(QMainWindow):
         card = QFrame()
         card.setObjectName("MetricCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(2)
 
         header_layout = QHBoxLayout()
-        header_layout.setSpacing(8)
+        header_layout.setSpacing(6)
         icon_label = QLabel(icon)
         icon_label.setObjectName("MetricIcon")
         header_layout.addWidget(icon_label)
 
         title_layout = QVBoxLayout()
-        title_layout.setSpacing(2)
+        title_layout.setSpacing(0)
         title_label = QLabel(title)
         title_label.setObjectName("CardEyebrow")
         title_layout.addWidget(title_label)
@@ -834,8 +872,8 @@ class ALSControlGUI(QMainWindow):
         """Create status display panel"""
         group = QGroupBox("System")
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 2, 6, 3)
+        layout.setSpacing(3)
 
         # Connection buttons kept as orphan widgets so existing setText /
         # setEnabled / setStyleSheet calls still work, but hidden from the
@@ -855,18 +893,72 @@ class ALSControlGUI(QMainWindow):
         self.connect_button.setVisible(False)
 
         # Status dots live directly in the System group — no inner
-        # "Laser Indicators" frame/title wrapper, to save vertical space.
-        self.power_status_dot = StatusDot("Power")
+        # "Laser Indicators" frame/title wrapper, to save vertical space —
+        # and sit in a grid that reflows between 1, 2 and 3 columns with the
+        # panel width, so a normally-sized dock shows all three on a single
+        # ~20 px row instead of a three-row stack.
+        self.power_status_dot = StatusDot("PWR", tooltip="click to toggle the power supply")
         self.power_status_dot.clicked.connect(self._toggle_power_status)
-        layout.addWidget(self.power_status_dot)
-        self.interlock_status_dot = StatusDot("Interlock")
+        self.interlock_status_dot = StatusDot("ILOCK", tooltip="click to toggle the interlock")
         self.interlock_status_dot.clicked.connect(self._toggle_interlock_status)
-        layout.addWidget(self.interlock_status_dot)
-        self.second_stage_status_dot = StatusDot("2nd Stage")
+        self.second_stage_status_dot = StatusDot("2ND", tooltip="click to toggle the second stage")
         self.second_stage_status_dot.clicked.connect(self._toggle_second_stage_status)
-        layout.addWidget(self.second_stage_status_dot)
+
+        self._status_dots = [
+            self.power_status_dot,
+            self.interlock_status_dot,
+            self.second_stage_status_dot,
+        ]
+        self._status_grid = QGridLayout()
+        self._status_grid.setContentsMargins(0, 0, 0, 0)
+        self._status_grid.setHorizontalSpacing(4)
+        self._status_grid.setVerticalSpacing(3)
+        self._status_columns = 0
+        layout.addLayout(self._status_grid)
+        self._status_box = group
+        group.installEventFilter(self)
+        self._relayout_status_dots(3)
 
         return group
+
+    def _status_columns_for_width(self, width: int) -> int:
+        """Widest column count whose pills still fit in *width* pixels.
+
+        Candidates are "all on one row", "two rows" and "one per row", so
+        the grid never ends up with a ragged three-of-four layout.
+        """
+        dots = getattr(self, "_status_dots", None)
+        if not dots:
+            return 1
+        n = len(dots)
+        # Discount the group box border + padding around the grid.
+        available = width - 16
+        if available <= 0:
+            return n
+        needed = max(dot.preferred_width() for dot in dots)
+        spacing = self._status_grid.horizontalSpacing()
+        for cols in sorted({n, (n + 1) // 2, 1}, reverse=True):
+            if cols <= 1 or available >= cols * needed + (cols - 1) * spacing:
+                return cols
+        return 1
+
+    def _relayout_status_dots(self, columns: int) -> None:
+        """Re-flow the indicator grid to *columns* wide.
+
+        Cheap and idempotent: bails out when the column count is unchanged,
+        which is also what stops a resize -> relayout -> resize loop.
+        """
+        columns = max(1, int(columns))
+        if columns == self._status_columns:
+            return
+        self._status_columns = columns
+        grid = self._status_grid
+        # ``takeAt`` detaches the layout item without reparenting the
+        # widget, so nothing flickers as a top-level window in between.
+        while grid.count():
+            grid.takeAt(0)
+        for index, dot in enumerate(self._status_dots):
+            grid.addWidget(dot, index // columns, index % columns)
 
     def _create_measurements_panel(self) -> QWidget:
         """Create the right-side power and telemetry block.
@@ -878,16 +970,16 @@ class ALSControlGUI(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(5)
 
         # ── Power readouts side-by-side, each in its own group box ───
         power_col = QHBoxLayout()
-        power_col.setSpacing(8)
+        power_col.setSpacing(5)
 
         power_box = QGroupBox("Power")
         power_layout = QVBoxLayout(power_box)
-        power_layout.setContentsMargins(10, 8, 10, 8)
-        power_layout.setSpacing(6)
+        power_layout.setContentsMargins(6, 2, 6, 3)
+        power_layout.setSpacing(3)
 
         # Edit checkbox lives on the QGroupBox title strip itself — not
         # as a separate header row inside — to save vertical space.
@@ -917,7 +1009,7 @@ class ALSControlGUI(QMainWindow):
 
         self.power_setpoint_label = QLabel("0%")
         self.power_setpoint_label.setStyleSheet(
-            "font-size: 26px; font-weight: 800; color: #5fb6c8;"
+            "font-size: 22px; font-weight: 800; color: #5fb6c8;"
         )
         self.power_setpoint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # Stretch above keeps the readout vertically centered when the
@@ -927,15 +1019,15 @@ class ALSControlGUI(QMainWindow):
 
         self.power_input_field = PowerInputField(on_focus_out=self._on_power_input_focus_out)
         self.power_input_field.setStyleSheet(
-            "font-size: 18px; font-weight: 700; color: #5fb6c8; background: #2a2a2a;"
-            " border: 1px solid #555; border-radius: 6px; padding: 4px;"
+            "font-size: 16px; font-weight: 700; color: #5fb6c8; background: #2a2a2a;"
+            " border: 1px solid #555; border-radius: 5px; padding: 2px;"
         )
         self.power_input_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_input_field.returnPressed.connect(self._on_power_input_submit)
         power_layout.addWidget(self.power_input_field)
 
         self.power_submit_hint = QLabel("ENTER to submit")
-        self.power_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
+        self.power_submit_hint.setStyleSheet("font-size: 9px; color: #8a949a;")
         self.power_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         power_layout.addWidget(self.power_submit_hint)
         # Trailing stretch matches the leading one to centre the column.
@@ -946,12 +1038,12 @@ class ALSControlGUI(QMainWindow):
 
         optical_box = QGroupBox("Optical Output")
         optical_layout = QVBoxLayout(optical_box)
-        optical_layout.setContentsMargins(10, 8, 10, 8)
-        optical_layout.setSpacing(6)
+        optical_layout.setContentsMargins(6, 2, 6, 3)
+        optical_layout.setSpacing(3)
 
         self.optical_power_label = QLabel("0 W")
         self.optical_power_label.setStyleSheet(
-            "font-size: 26px; font-weight: 800; color: #e8a87c;"
+            "font-size: 22px; font-weight: 800; color: #e8a87c;"
         )
         self.optical_power_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         optical_layout.addStretch()
@@ -971,8 +1063,8 @@ class ALSControlGUI(QMainWindow):
             telem_group = QGroupBox("Telemetry")
             QHBoxLayout(telem_group)
         telem_inner = QHBoxLayout()
-        telem_inner.setContentsMargins(8, 8, 8, 8)
-        telem_inner.setSpacing(8)
+        telem_inner.setContentsMargins(6, 4, 6, 4)
+        telem_inner.setSpacing(6)
         temp_card, self.temp_label = self._create_metric_card(
             "🌡", "Temperatures", "Actual / Setpoint", "0.0 / 0.0 °C"
         )
@@ -1004,7 +1096,7 @@ class ALSControlGUI(QMainWindow):
         log_font = self.log_output.font()
         log_font.setPointSize(9)
         self.log_output.setFont(log_font)
-        self.log_output.setMinimumHeight(80)
+        self.log_output.setMinimumHeight(60)
         if hasattr(log_box, "addWidget"):
             log_box.addWidget(self.log_output)
         else:
@@ -1017,20 +1109,20 @@ class ALSControlGUI(QMainWindow):
     def _create_control_panel(self) -> QGroupBox:
         """Create control panel with startup/shutdown buttons"""
         group = QGroupBox("Controls")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout = QHBoxLayout(group)
+        layout.setContentsMargins(6, 2, 6, 3)
+        layout.setSpacing(4)
 
+        # Side-by-side (was stacked): one button row instead of two, so the
+        # Controls box survives much deeper panel collapse.
         self.startup_button = QPushButton("Startup")
         self.startup_button.clicked.connect(self._start_startup)
         layout.addWidget(self.startup_button)
-        
+
         self.shutdown_button = QPushButton("Shutdown")
         self.shutdown_button.clicked.connect(self._start_shutdown)
         layout.addWidget(self.shutdown_button)
-        
-        layout.addStretch()
-        
+
         return group
     
     def _create_startup_sequence_panel(self) -> QGroupBox:
@@ -1674,6 +1766,13 @@ class ALSControlGUI(QMainWindow):
         # group box title strip after every resize / show, so removing the
         # in-box "Edit" header row doesn't lose the control.
         from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        status_box = getattr(self, "_status_box", None)
+        if status_box is not None and obj is status_box and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show,
+        ):
+            self._relayout_status_dots(
+                self._status_columns_for_width(status_box.width())
+            )
         anchor = getattr(self, "_power_edit_anchor", None)
         cb = getattr(self, "power_edit_checkbox", None)
         if anchor is not None and cb is not None and obj is anchor and event.type() in (

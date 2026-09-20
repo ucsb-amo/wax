@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -72,6 +73,15 @@ def create_emoji_icon(emoji: str) -> QIcon:
 
 
 class StatusDot(QPushButton):
+    """Compact pill indicator, sized to sit several-across in one row.
+
+    Short label + short state text, centred, at a fixed 20 px height, so a
+    whole row of indicators costs about what one indicator used to.  The
+    long form (and any click hint) lives in the tooltip.
+    """
+
+    _HEIGHT = 20
+
     def __init__(
         self,
         label: str,
@@ -79,6 +89,7 @@ class StatusDot(QPushButton):
         off_color: str = "#d64545",
         on_text: str = "OK",
         off_text: str = "NOT OK",
+        tooltip: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -87,10 +98,34 @@ class StatusDot(QPushButton):
         self.off_color = QColor(off_color)
         self.on_text = on_text
         self.off_text = off_text
+        self.tooltip_text = tooltip
+        self._preferred_width: int | None = None
         self.is_on = False
         self.setEnabled(False)
-        self.setMinimumHeight(22)
+        self.setFixedHeight(self._HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # A text-derived minimum width would hold the indicator row wider
+        # than the dock and clip it; let the pill shrink instead, so the
+        # grid can actually re-flow to fewer columns.
+        self.setMinimumWidth(1)
         self._update_color()
+
+    def preferred_width(self) -> int:
+        """Widest this pill wants to be, over both its ON and OFF texts.
+
+        Measured once and cached: the label and the two state strings never
+        change, and re-measuring on every resize would both churn the
+        layout and let the column count flip as the status flips.
+        """
+        if self._preferred_width is None:
+            restore = self.text()
+            widths = []
+            for state_text in (self.on_text, self.off_text):
+                self.setText(f"{self.label_text} {state_text}")
+                widths.append(self.sizeHint().width())
+            self.setText(restore)
+            self._preferred_width = max(widths)
+        return self._preferred_width
 
     def set_status(self, is_on: bool):
         self.is_on = bool(is_on)
@@ -103,10 +138,12 @@ class StatusDot(QPushButton):
         else:
             color = self.off_color
             state_text = self.off_text
-        self.setText(f"{self.label_text}: {state_text}")
+        self.setText(f"{self.label_text} {state_text}")
+        hint = f" \u2014 {self.tooltip_text}" if self.tooltip_text else ""
+        self.setToolTip(f"{self.label_text}: {state_text}{hint}")
         self.setStyleSheet(
-            f"background-color: {color.name()}; color: #ffffff; border-radius: 10px; "
-            f"padding: 4px 10px; font-weight: 700; text-align: left;"
+            f"background-color: {color.name()}; color: #ffffff; border-radius: 9px; "
+            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;"
         )
 
 
@@ -138,11 +175,11 @@ class PrecilaserControlGUI(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(8, 8, 8, 8)
-        root_layout.setSpacing(8)
+        root_layout.setContentsMargins(5, 4, 5, 4)
+        root_layout.setSpacing(5)
 
         dashboard_layout = QVBoxLayout()
-        dashboard_layout.setSpacing(8)
+        dashboard_layout.setSpacing(5)
 
         # All boxes/dropdowns vertically stacked so the panel can compress
         # horizontally to almost any width.
@@ -216,20 +253,20 @@ class PrecilaserControlGUI(QMainWindow):
             }
             QGroupBox {
                 border: 1px solid #4a4a4a;
-                border-radius: 10px;
-                margin-top: 12px;
-                padding: 10px 8px 8px 8px;
+                border-radius: 8px;
+                margin-top: 9px;
+                padding: 6px 6px 5px 6px;
                 background: #323232;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
-                left: 12px;
-                padding: 0 6px;
+                left: 10px;
+                padding: 0 5px;
                 color: #9aa3a8;
-                font-size: 11px;
+                font-size: 10px;
                 font-weight: 600;
                 letter-spacing: 0.04em;
             }
@@ -237,8 +274,9 @@ class PrecilaserControlGUI(QMainWindow):
                 background: #3d6b78;
                 color: #f1f3f4;
                 border: 1px solid #4f8896;
-                border-radius: 6px;
-                padding: 4px 10px;
+                border-radius: 5px;
+                padding: 3px 8px;
+                font-size: 11px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -257,9 +295,9 @@ class PrecilaserControlGUI(QMainWindow):
                 background: #2a2a2a;
                 color: #e0e0e0;
                 border: 1px solid #555;
-                border-radius: 6px;
-                padding: 5px 8px;
-                font-size: 13px;
+                border-radius: 5px;
+                padding: 3px 6px;
+                font-size: 12px;
                 selection-background-color: #4d8294;
             }
             QLineEdit:focus { border: 1px solid #6aa3b3; }
@@ -302,8 +340,8 @@ class PrecilaserControlGUI(QMainWindow):
         """
         box = QGroupBox("Current")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(6, 2, 6, 3)
+        layout.setSpacing(2)
 
         self.current_edit_checkbox = QCheckBox("Edit", box)
         self.current_edit_checkbox.setChecked(False)
@@ -330,7 +368,7 @@ class PrecilaserControlGUI(QMainWindow):
 
         self.current_display_label = QLabel("-- A")
         self.current_display_label.setStyleSheet(
-            "font-size: 36px; font-weight: 800; color: #5fb6c8; padding: 0px; margin: 0px;"
+            "font-size: 26px; font-weight: 800; color: #5fb6c8; padding: 0px; margin: 0px;"
         )
         self.current_display_label.setContentsMargins(0, 0, 0, 0)
         self.current_display_label.setMinimumHeight(0)
@@ -341,7 +379,7 @@ class PrecilaserControlGUI(QMainWindow):
 
         self.current_input = QLineEdit()
         self.current_input.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: #5fb6c8; padding: 2px;"
+            "font-size: 20px; font-weight: 700; color: #5fb6c8; padding: 1px;"
         )
         self.current_input.setMinimumHeight(0)
         self.current_input.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -350,7 +388,7 @@ class PrecilaserControlGUI(QMainWindow):
         layout.addWidget(self.current_input)
 
         self.current_submit_hint = QLabel("ENTER to submit")
-        self.current_submit_hint.setStyleSheet("font-size: 10px; color: #8a949a;")
+        self.current_submit_hint.setStyleSheet("font-size: 9px; color: #8a949a;")
         self.current_submit_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.current_submit_hint)
         layout.addStretch()
@@ -361,18 +399,19 @@ class PrecilaserControlGUI(QMainWindow):
     def _create_control_panel(self) -> QGroupBox:
         box = QGroupBox("Controls")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 2, 6, 3)
+        layout.setSpacing(4)
 
         # Laser enable/disable is handled by clicking the Laser Enable
         # status dot in the status panel (no separate button needed).
 
         seq_row = QHBoxLayout()
-        self.startup_button = QPushButton("Start Turn On")
+        seq_row.setSpacing(4)
+        self.startup_button = QPushButton("Ramp On")
         self.startup_button.clicked.connect(self._start_startup)
         seq_row.addWidget(self.startup_button)
 
-        self.shutdown_button = QPushButton("Start Turn Off")
+        self.shutdown_button = QPushButton("Ramp Off")
         self.shutdown_button.clicked.connect(self._start_shutdown)
         seq_row.addWidget(self.shutdown_button)
 
@@ -385,7 +424,7 @@ class PrecilaserControlGUI(QMainWindow):
         # endpoint (Amps).  Sits inline with the startup/shutdown buttons.
         self.settings_button = QPushButton("⚙")
         self.settings_button.setToolTip("Settings (ramp-up endpoint)")
-        self.settings_button.setFixedWidth(34)
+        self.settings_button.setFixedWidth(26)
         self.settings_button.clicked.connect(self._open_settings)
         seq_row.addWidget(self.settings_button)
 
@@ -396,15 +435,15 @@ class PrecilaserControlGUI(QMainWindow):
         # if the log panel hasn't already been built.
         if not hasattr(self, "sequence_state_value"):
             self.sequence_state_value = QLabel("Sequence: IDLE")
-            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
+            self.sequence_state_value.setStyleSheet("font-size: 11px; font-weight: 700;")
 
         return box
 
     def _create_status_panel(self) -> QGroupBox:
-        box = QGroupBox("Status Indicators")
+        box = QGroupBox("Status")
         layout = QVBoxLayout(box)
-        layout.setSpacing(6)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(3)
+        layout.setContentsMargins(6, 2, 6, 3)
 
         # Server / serial buttons kept as orphan widgets (so existing
         # callbacks and setText() calls still work) but not added to the
@@ -416,7 +455,7 @@ class PrecilaserControlGUI(QMainWindow):
         self.server_conn_button.setVisible(False)
 
         self.connection_state_value = QLabel("DISCONNECTED")
-        self.connection_state_value.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.connection_state_value.setStyleSheet("font-size: 12px; font-weight: 700;")
         self.connection_state_value.setVisible(False)
 
         self.serial_connect_button = QPushButton("Connect Serial")
@@ -424,29 +463,89 @@ class PrecilaserControlGUI(QMainWindow):
         self.serial_connect_button.setVisible(False)
         self._update_connection_button("DISCONNECTED")
 
-        self.pd_ok_dot = StatusDot("PD OK")
-        self.temp_ok_dot = StatusDot("Temperature OK")
+        self.pd_ok_dot = StatusDot("PD", off_text="FAULT")
+        self.temp_ok_dot = StatusDot("TEMP", off_text="FAULT")
         self.laser_enable_dot = StatusDot(
-            "Laser Enable", on_text="ON (click to disable)", off_text="OFF (click to enable)"
+            "LASER",
+            on_text="ON",
+            off_text="OFF",
+            tooltip="click to toggle the laser enable",
         )
         self.laser_enable_dot.setEnabled(True)
+        self.laser_enable_dot.setCursor(Qt.CursorShape.PointingHandCursor)
         self.laser_enable_dot.clicked.connect(self._toggle_laser_enable)
         self.stability_dot = StatusDot(
-            "Power Stability",
+            "STAB",
             on_color="#2b6de0",
             off_color="#8b949e",
             on_text="ON",
             off_text="OFF",
+            tooltip="click to toggle power stability",
         )
         self.stability_dot.setEnabled(True)
+        self.stability_dot.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stability_dot.clicked.connect(self._toggle_stability_mode)
 
-        layout.addWidget(self.pd_ok_dot)
-        layout.addWidget(self.temp_ok_dot)
-        layout.addWidget(self.laser_enable_dot)
-        layout.addWidget(self.stability_dot)
+        # The indicators sit in a grid that reflows between 1, 2 and 4
+        # columns with the panel width (see ``_relayout_status_dots``), so a
+        # normally-sized dock shows all four on a single ~20 px row instead
+        # of a four-row stack.
+        self._status_dots = [
+            self.pd_ok_dot,
+            self.temp_ok_dot,
+            self.laser_enable_dot,
+            self.stability_dot,
+        ]
+        self._status_grid = QGridLayout()
+        self._status_grid.setContentsMargins(0, 0, 0, 0)
+        self._status_grid.setHorizontalSpacing(4)
+        self._status_grid.setVerticalSpacing(3)
+        self._status_columns = 0
+        layout.addLayout(self._status_grid)
+        self._status_box = box
+        box.installEventFilter(self)
+        self._relayout_status_dots(2)
 
         return box
+
+    def _status_columns_for_width(self, width: int) -> int:
+        """Widest column count whose pills still fit in *width* pixels.
+
+        Candidates are "all on one row", "two rows" and "one per row", so
+        the grid never ends up with a ragged three-of-four layout.
+        """
+        dots = getattr(self, "_status_dots", None)
+        if not dots:
+            return 1
+        n = len(dots)
+        # Discount the group box border + padding around the grid.
+        available = width - 16
+        if available <= 0:
+            return n
+        needed = max(dot.preferred_width() for dot in dots)
+        spacing = self._status_grid.horizontalSpacing()
+        for cols in sorted({n, (n + 1) // 2, 1}, reverse=True):
+            if cols <= 1 or available >= cols * needed + (cols - 1) * spacing:
+                return cols
+        return 1
+
+    def _relayout_status_dots(self, columns: int) -> None:
+        """Re-flow the indicator grid to *columns* wide.
+
+        Cheap and idempotent: bails out when the column count is unchanged,
+        which is also what stops a resize -> relayout -> resize loop.
+        """
+        columns = max(1, int(columns))
+        if columns == self._status_columns:
+            return
+        self._status_columns = columns
+        grid = self._status_grid
+        # ``takeAt`` detaches the layout item without reparenting the
+        # widget, so nothing flickers as a top-level window in between.
+        while grid.count():
+            grid.takeAt(0)
+        for index, dot in enumerate(self._status_dots):
+            grid.addWidget(dot, index // columns, index % columns)
 
     def _create_telemetry_panel(self) -> QWidget:
         # No outer QGroupBox title — the CollapsibleGroupBox wrapper
@@ -454,22 +553,26 @@ class PrecilaserControlGUI(QMainWindow):
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(10)
+        top_row.setSpacing(6)
 
         pd_group = QGroupBox("Laser Readings")
         pd_layout = QGridLayout(pd_group)
+        pd_layout.setContentsMargins(6, 2, 6, 3)
+        pd_layout.setVerticalSpacing(2)
         pd_icon = QLabel("🔆")
-        pd_icon.setStyleSheet("font-size: 20px;")
+        pd_icon.setStyleSheet("font-size: 15px;")
         pd_layout.addWidget(pd_icon, 0, 0)
         pd_layout.addWidget(QLabel("PD1-PD5"), 0, 1)
 
         temp_group = QGroupBox("Temperature Readings")
         temp_layout = QGridLayout(temp_group)
+        temp_layout.setContentsMargins(6, 2, 6, 3)
+        temp_layout.setVerticalSpacing(2)
         temp_icon = QLabel("🌡")
-        temp_icon.setStyleSheet("font-size: 20px;")
+        temp_icon.setStyleSheet("font-size: 15px;")
         temp_layout.addWidget(temp_icon, 0, 0)
         temp_layout.addWidget(QLabel("T1-T4"), 0, 1)
 
@@ -480,7 +583,7 @@ class PrecilaserControlGUI(QMainWindow):
         for i in range(5):
             title = QLabel(f"PD{i + 1}")
             value = QLabel("--")
-            value.setStyleSheet("font-size: 16px; font-weight: 700;")
+            value.setStyleSheet("font-size: 13px; font-weight: 700;")
             pd_layout.addWidget(title, i + 1, 0)
             pd_layout.addWidget(value, i + 1, 1)
             self.pd_labels.append(value)
@@ -488,7 +591,7 @@ class PrecilaserControlGUI(QMainWindow):
         for i in range(4):
             title = QLabel(f"T{i + 1} (C)")
             value = QLabel("--")
-            value.setStyleSheet("font-size: 16px; font-weight: 700;")
+            value.setStyleSheet("font-size: 13px; font-weight: 700;")
             temp_layout.addWidget(title, i + 1, 0)
             temp_layout.addWidget(value, i + 1, 1)
             self.temp_labels.append(value)
@@ -499,10 +602,12 @@ class PrecilaserControlGUI(QMainWindow):
 
         currents_group = QGroupBox("Currents (A)")
         currents_layout = QGridLayout(currents_group)
+        currents_layout.setContentsMargins(6, 2, 6, 3)
+        currents_layout.setVerticalSpacing(2)
         for i in range(3):
             title = QLabel(f"ISET_RT[{i}]")
             value = QLabel("--")
-            value.setStyleSheet("font-size: 17px; font-weight: 800;")
+            value.setStyleSheet("font-size: 13px; font-weight: 800;")
             currents_layout.addWidget(title, i, 0)
             currents_layout.addWidget(value, i, 1)
             self.current_labels.append(value)
@@ -520,7 +625,7 @@ class PrecilaserControlGUI(QMainWindow):
         # than pushing down the always-visible Controls box.
         if not hasattr(self, "sequence_state_value"):
             self.sequence_state_value = QLabel("Sequence: IDLE")
-            self.sequence_state_value.setStyleSheet("font-size: 13px; font-weight: 700;")
+            self.sequence_state_value.setStyleSheet("font-size: 11px; font-weight: 700;")
         layout.addWidget(self.sequence_state_value)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
@@ -843,6 +948,13 @@ class PrecilaserControlGUI(QMainWindow):
         # Re-anchor the Current-box Edit checkbox to the top-right of the
         # group box title strip after every resize / show.
         from PyQt6.QtCore import QEvent  # noqa: PLC0415
+        status_box = getattr(self, "_status_box", None)
+        if status_box is not None and obj is status_box and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show,
+        ):
+            self._relayout_status_dots(
+                self._status_columns_for_width(status_box.width())
+            )
         anchor = getattr(self, "_current_edit_anchor", None)
         cb = getattr(self, "current_edit_checkbox", None)
         if anchor is not None and cb is not None and obj is anchor and event.type() in (
