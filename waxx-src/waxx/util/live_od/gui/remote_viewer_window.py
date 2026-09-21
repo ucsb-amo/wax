@@ -459,6 +459,7 @@ class RemoteViewerWindow(QWidget):
     def _on_shot_progress(self, shot_idx: int, N_total: int,
                           xvar_values: object):
         self.viewer_window.update_image_count(shot_idx + 1, N_total)
+        self.viewer_window.set_shot_xvars(shot_idx, xvar_values)
         # no log line here: the server's own (about one shot in twenty) arrives as LOG_MSG
 
     def _on_markers(self, camera_key: str, markers: list):

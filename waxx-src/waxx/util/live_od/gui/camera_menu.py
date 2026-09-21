@@ -164,5 +164,5 @@ class CameraMenuButton(QToolButton):
             _style(STATES[state][0], "QToolButton")
             + f" QToolButton {{ padding-right: {ARROW_WIDTH + 2}px; }}"
             f" QToolButton::menu-button {{ border: none; width: {ARROW_WIDTH}px;"
-            " border-left: 1px solid rgba(255, 255, 255, 110); }}")
+            " border-left: 1px solid rgba(255, 255, 255, 110); }")
         self._menu.setEnabled(others)

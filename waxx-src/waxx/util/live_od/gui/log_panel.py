@@ -1,7 +1,7 @@
 """The log panel at the top of the liveOD viewer.
 
-Timestamped, coloured by level, filterable, collapsible to its last line, and with
-a banner that keeps the most recent error in view until it is dismissed.
+Timestamped, coloured by level, filterable, collapsible to its last line (by its
+arrow only; the viewer's splitter never shrinks it to nothing), and with a banner that keeps the most recent error in view until it is dismissed.
 
 It stands where a bare ``QPlainTextEdit`` used to, and still answers
 ``appendPlainText`` so existing callers (camera buttons, the remote viewer) work
@@ -13,11 +13,10 @@ import logging
 import time
 from collections import deque
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QPlainTextEdit,
                              QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
-
 from waxx.util.live_od.gui import theme
 
 MAX_RECORDS = 5000
@@ -123,20 +122,12 @@ class LogPanel(QWidget):
         self._filter.setToolTip("Lowest level shown")
         self._filter.currentIndexChanged.connect(self._on_filter_changed)
 
-        self._copy_button = QPushButton("Copy")
-        self._copy_button.setToolTip("Copy the whole log to the clipboard")
-        self._copy_button.clicked.connect(self.copy_all)
-        self._clear_button = QPushButton("Clear")
-        self._clear_button.clicked.connect(self.clear)
-
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.addWidget(self._toggle)
         header.addWidget(QLabel("Log"))
         header.addWidget(self._last_line, 1)
         header.addWidget(self._filter)
-        header.addWidget(self._copy_button)
-        header.addWidget(self._clear_button)
         self._header = QWidget()
         self._header.setLayout(header)
 
@@ -151,6 +142,20 @@ class LogPanel(QWidget):
         font.setPointSize(9)
         self._text.setFont(font)
 
+        # Copy and Clear float over the text's top-right corner, so they go away
+        # with it when the log is collapsed. Children of the text box, not of its
+        # viewport: the viewport scrolls its children along with the text.
+        self._copy_button = QToolButton(self._text)
+        self._copy_button.setText("Copy")
+        self._copy_button.setToolTip("Copy the whole log to the clipboard")
+        self._copy_button.clicked.connect(self.copy_all)
+        self._clear_button = QToolButton(self._text)
+        self._clear_button.setText("Clear")
+        self._clear_button.setToolTip("Clear the log")
+        self._clear_button.clicked.connect(self.clear)
+        self._text.installEventFilter(self)
+        self._text.viewport().installEventFilter(self)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
@@ -158,8 +163,39 @@ class LogPanel(QWidget):
         layout.addWidget(self.banner)
         layout.addWidget(self._text, 1)
         self.setLayout(layout)
+        self._restyle_overlay_buttons()
         # level colours differ between the themes: redraw what is already shown
         theme.notifier().changed.connect(lambda _dark: self._on_filter_changed(self._filter.currentIndex()))
+        theme.notifier().changed.connect(self._restyle_overlay_buttons)
+
+    def _restyle_overlay_buttons(self, *_):
+        # a plate that reads over any line of the log, in either theme
+        style = (f"QToolButton {{ background-color: palette(button); "
+                 f"border: 1px solid {theme.color('separator')}; border-radius: 3px; "
+                 f"padding: 0px 5px; }} "
+                 f"QToolButton:hover {{ border-color: {theme.color('muted')}; }}")
+        for button in (self._copy_button, self._clear_button):
+            button.setStyleSheet(style)
+            button.adjustSize()
+        self._place_overlay_buttons()
+
+    def _place_overlay_buttons(self):
+        """Top right of the text, left of its scroll bar."""
+        viewport = self._text.viewport().geometry()
+        margin = 4
+        x = viewport.right() - margin
+        for button in (self._clear_button, self._copy_button):
+            x -= button.width()
+            button.move(x, viewport.top() + margin)
+            button.raise_()
+            x -= 3
+
+    def eventFilter(self, watched, event):
+        # the viewport too: it narrows when the scroll bar appears
+        if (watched in (self._text, self._text.viewport())
+                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            self._place_overlay_buttons()
+        return super().eventFilter(watched, event)
 
     # ------------------------------------------------------------------
     # Appending

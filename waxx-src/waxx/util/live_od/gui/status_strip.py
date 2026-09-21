@@ -1,16 +1,18 @@
 """One-line run status for the liveOD window.
 
-    [Running] 80545 · hf_tweezer_bec  [andor ▾]  [====> 37/120]  Δt 8.2s · ETA 14:32   t_tof=0.012
+    [Running] 80545 · hf_tweezer_bec  [andor ▾]  [====> 37/120]  Δt 8.2s · ETA 14:32
 
-The state comes from ``LiveODServer.run_state_signal``; the strip adds a stall
-watchdog (no shot for several times the usual shot period) and the elapsed time.
+The shot's xvar values are not here: they are a plate on the OD image (the
+viewer's ``set_shot_xvars``). The state comes from ``LiveODServer.run_state_signal``;
+the strip adds a stall watchdog (no shot for several times the usual shot period)
+and the elapsed time.
 No server, camera or config imports: it only displays what it is told. The camera
 button is the window's (``add_camera_widget``); without one the run label names the
 camera instead.
 
 The strip's minimum width never changes. Every piece is either a fixed width or
-elides its text, so a run starting (long experiment name, badge appearing, xvars
-arriving) cannot push the window wider. What is cut off is in the tooltip.
+elides its text, so a run starting (long experiment name, badge appearing) cannot
+push the window wider. What is cut off is in the tooltip.
 """
 
 import time
@@ -55,13 +57,6 @@ def _format_duration(seconds: float) -> str:
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def _format_value(value) -> str:
-    try:
-        return f"{float(value):.4g}"
-    except (TypeError, ValueError):
-        return str(value)
 
 
 class ElidedLabel(QLabel):
@@ -147,7 +142,6 @@ class StatusStrip(QWidget):
         self.timing_label = QLabel()
         self.timing_label.setTextFormat(Qt.TextFormat.RichText)
         self.timing_label.setFixedWidth(TIMING_WIDTH)
-        self.xvar_label = ElidedLabel(min_width=30)
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -156,7 +150,6 @@ class StatusStrip(QWidget):
         layout.addWidget(self.run_label, 5)
         layout.addWidget(self.progress)
         layout.addWidget(self.timing_label)
-        layout.addWidget(self.xvar_label, 2)
         self.setLayout(layout)
         self._layout = layout
 
@@ -170,7 +163,6 @@ class StatusStrip(QWidget):
         self._render_run_label()
 
     def _restyle(self, *_):
-        self.xvar_label.setStyleSheet(f"color: {theme.color('muted')};")
         # a quiet bar: it is there to glance at, not to be the brightest thing in the window
         self.progress.setStyleSheet(
             f"QProgressBar {{ border: 1px solid {theme.color('separator')}; border-radius: 3px; "
@@ -227,7 +219,6 @@ class StatusStrip(QWidget):
         self.progress.setRange(0, max(1, self._n_shots))
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
-        self.xvar_label.clear()
         self._render_run_label()
         self._render_timing()
         self._emit_title()
@@ -253,12 +244,6 @@ class StatusStrip(QWidget):
         if self._shot > 1:                      # the first period includes camera start-up
             self._shot_periods = (self._shot_periods + [self._delta_t])[-5:]
         self._render_timing()
-
-    def set_xvars(self, xvar_values):
-        if not xvar_values:
-            self.xvar_label.clear()
-            return
-        self.xvar_label.setText("  ".join(f"{k}={_format_value(v)}" for k, v in dict(xvar_values).items()))
 
     # ------------------------------------------------------------------
     # Rendering

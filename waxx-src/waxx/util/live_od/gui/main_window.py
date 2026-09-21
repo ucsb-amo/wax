@@ -439,6 +439,7 @@ class LiveODWindow(QWidget):
         if capture_images and camera_key:
             self.camera_menu.set_current(camera_key)
         self.viewer_window.on_new_run()
+        self.viewer_window.set_xvar_ranges(getattr(self.live_od_server, '_current_xvar_ranges', {}))
         run_id = self.live_od_server._current_run_id
         # the experiment file's name (the class name from an older experiment process)
         expt_class = (self.live_od_server._current_expt_name
@@ -614,7 +615,7 @@ class LiveODWindow(QWidget):
     def on_shot_progress(self, shot_idx: int, N_total: int, xvar_values: object):
         """Update the GUI with per-shot progress from the ZMQ server."""
         self.status_strip.set_progress(shot_idx + 1, N_total)
-        self.status_strip.set_xvars(xvar_values)
+        self.viewer_window.set_shot_xvars(shot_idx, xvar_values)
         self.update_image_count(shot_idx + 1, N_total)
 
     def restart_mother(self):

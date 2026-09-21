@@ -363,6 +363,9 @@ class LiveODServer(QThread, NetServer):
         # The run goes by its experiment file's name; an experiment process from
         # before that was sent only gives the class.
         self._current_expt_name = str(msg.get('expt_file') or msg.get('expt_class', ''))
+        # {name: [min, max]} of the scan, for the units the viewer shows the xvars
+        # in; an older experiment process does not send it
+        self._current_xvar_ranges = dict(msg.get('xvar_ranges') or {})
 
         adjust_specs = list(msg.get('adjust_specs', []))
         with self._adjust_lock:

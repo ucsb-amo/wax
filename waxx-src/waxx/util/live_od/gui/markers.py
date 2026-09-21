@@ -202,13 +202,17 @@ class _ColorButton(QPushButton):
     def __init__(self):
         super().__init__()
         self._color = "#ffffff"
+        self.setObjectName("markerColorButton")
         self.setFixedWidth(34)
         self.setToolTip("Marker color")
         self.clicked.connect(self._choose)
 
     def set_color(self, color: str):
         self._color = color
-        self.setStyleSheet(f"background-color: {color}; border: 1px solid {theme.color('separator')};")
+        # Scoped to this button: the color dialog is our child, and an unscoped
+        # rule would paint its background with the marker color too.
+        self.setStyleSheet(f"#markerColorButton {{ background-color: {color}; "
+                           f"border: 1px solid {theme.color('separator')}; }}")
 
     def color(self) -> str:
         return self._color
@@ -306,6 +310,11 @@ class MarkerDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.accept)
         buttons.addButton(delete_button, QDialogButtonBox.ButtonRole.DestructiveRole)
+        # Enter commits the field being typed in; it must not press a button (the
+        # first auto-default one was the color picker, and Delete is another)
+        for button in (self.fields.color_button, *buttons.buttons()):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         form.addRow(buttons)
         self.setLayout(form)
         self._refresh()
@@ -366,7 +375,7 @@ class MarkerPanel(QWidget):
         scroll.setWidget(self._grid_host)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
-        self._empty_label = QLabel("No markers on this camera. Right-click the image, press M with "
+        self._empty_label = QLabel("No markers on this camera. Double-click the image, right-click it, press M with "
                                    "the cursor over it, or use Add marker.")
         self._empty_label.setWordWrap(True)
         self._empty_label.setStyleSheet(f"color: {theme.color('muted')};")

@@ -17,6 +17,7 @@ from waxx.util.live_od.gui.log_panel import LogPanel
 from waxx.util.live_od.log import get_logger
 from waxx.util.live_od.marker_store import clean_markers
 from waxx.util.live_od.gui.markers import MarkerItem, MarkerDialog, MarkerPanel, random_marker_color
+from waxa.units import mult_for, unit_for_param
 
 logger = get_logger("viewer")
 
@@ -33,6 +34,7 @@ HISTORY_MAX_SHOTS = 50
 HISTORY_MAX_BYTES = 256e6       # a 2 MP Basler shot is ~30 MB of arrays
 SATURATION_LEVELS = (255, 1023, 4095, 16383, 65535)
 SATURATION_MIN_PIXELS = 5
+AUTO_ROI_DEFAULT_SHOTS = 10
 
 
 class SuppressPrints:
@@ -92,11 +94,11 @@ def _label_value(label, value):
     return f'<span style="color:#b0b0b0; font-weight:normal">{label}</span>&nbsp;{value}'
 
 
-def _format_number(value):
-    """3 significant figures, '3.51e5' rather than '3.51e+05'."""
+def _format_number(value, digits=3):
+    """3 significant figures (or ``digits``), '3.51e5' rather than '3.51e+05'."""
     if not np.isfinite(value):
         return "–"
-    text = f"{value:.3g}"
+    text = f"{value:.{digits}g}"
     if "e" in text:
         mantissa, exponent = text.split("e")
         text = f"{mantissa}e{int(exponent)}"
@@ -176,7 +178,7 @@ class LiveODViewer(QWidget):
 
     Keys: R reset zoom, P profiles, L live plot, Space pause, Left/Right step
     through recent shots, M add a marker, Delete/Backspace delete the marker under
-    the cursor.
+    the cursor. Double-click the image to add a marker there.
     """
 
     live_plot_requested = pyqtSignal()   # emitted when the Live Plot button is clicked
@@ -212,6 +214,10 @@ class LiveODViewer(QWidget):
         self._history = deque(maxlen=HISTORY_MAX_SHOTS)
         self._shown_entry = None        # the history entry on screen
         self._early_scalars = {}        # shot_idx -> scalars that beat their image here
+        self._shot_xvars = {}           # shot_idx -> that shot's xvar values (SI)
+        self._latest_xvars = {}         # the last shot's, for when no image is up
+        self._xvar_ranges = {}          # xvar name -> (min, max) of its scan, from INIT_RUN
+        self._xvar_units = {}           # xvar name -> (unit, mult), fixed for the run
         self._history_pos = None        # index into _history while paused, None = live
         self._frames_seen = 0
         self._settings = None           # QSettings, if the window attached one
@@ -254,6 +260,7 @@ class LiveODViewer(QWidget):
         self.top_splitter.setStretchFactor(0, 0)
         self.top_splitter.setStretchFactor(1, 1)
         self.top_splitter.setSizes([70, 1000])
+        self.top_splitter.setCollapsible(0, False)     # the log is never dragged shut
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -372,22 +379,41 @@ class LiveODViewer(QWidget):
         self.clear_button.setToolTip("Clear the images and the shot history")
         self.clear_button.clicked.connect(self.clear_plots)
 
+        # Auto ROI: one row, the button and how many shots it looks at
+        auto_roi_tip = ("Set the ROI around the atoms in the last N shots (up to the one on "
+                        "screen): waxa's auto-ROI detector on the atoms and light frames")
+        self.auto_roi_button = QPushButton('Auto ROI')
+        self.auto_roi_button.setToolTip(auto_roi_tip)
+        self.auto_roi_button.clicked.connect(lambda: self.auto_roi())
+        self.auto_roi_spinner = QSpinBox()
+        self.auto_roi_spinner.setRange(1, HISTORY_MAX_SHOTS)
+        self.auto_roi_spinner.setValue(AUTO_ROI_DEFAULT_SHOTS)
+        self.auto_roi_spinner.setPrefix("last ")
+        self.auto_roi_spinner.setToolTip(auto_roi_tip)
+        self.auto_roi_row = QWidget()
+        auto_roi_layout = QHBoxLayout()
+        auto_roi_layout.setContentsMargins(0, 0, 0, 0)
+        auto_roi_layout.setSpacing(4)
+        auto_roi_layout.addWidget(self.auto_roi_button)
+        auto_roi_layout.addWidget(self.auto_roi_spinner)
+        self.auto_roi_row.setLayout(auto_roi_layout)
+
         self.view_button = QToolButton()
         self.view_button.setText("View  ")    # room for the menu arrow
         self.view_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.view_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.view_button.setToolTip("Lock views, profiles (P), shot averaging, clear")
+        self.view_button.setToolTip("Lock views, profiles (P), shot averaging, auto ROI, clear")
         view_menu = QMenu(self.view_button)
         self.markers_button = QPushButton('Markers')
         self.markers_button.setToolTip(
             "The markers on this camera's image: add, label, reshape, resize, recolor, hide, "
             "delete. Hover a row to light its marker up.\n"
-            "On the image: right-click for 'Add marker here' (or press M), drag a marker to move "
+            "On the image: double-click, right-click for 'Add marker here', or press M; drag a marker to move "
             "it, right-click a marker to edit it, Delete or Backspace over a marker to delete it. "
             "Markers are kept per camera by the liveOD server.")
         self.markers_button.clicked.connect(self.open_marker_panel)
         for widget in (self.lock_views_checkbox, self.profiles_checkbox,
-                       None, self.avg_spinner,
+                       None, self.avg_spinner, self.auto_roi_row,
                        None, self.clear_button):
             if widget is None:
                 view_menu.addSeparator()
@@ -401,6 +427,7 @@ class LiveODViewer(QWidget):
             action.setDefaultWidget(holder)
             view_menu.addAction(action)
         self.clear_button.clicked.connect(view_menu.close)
+        self.auto_roi_button.clicked.connect(view_menu.close)
         self.view_button.setMenu(view_menu)
 
         self.settings_button = QToolButton()
@@ -411,8 +438,9 @@ class LiveODViewer(QWidget):
         # Qt gives a push button a 75 px minimum whatever it says; a toolbar of short
         # words is a third narrower with each sized to its text.
         for button in (self.reset_zoom_button, self.roi_button, self.od_auto_button,
-                       self.live_plot_button, self.markers_button):
+                       self.live_plot_button, self.markers_button, self.auto_roi_button):
             _fit_to_text(button)
+        self.auto_roi_spinner.setFixedWidth(self.auto_roi_spinner.sizeHint().width())
 
         # One row, left to right: the image, its colour scale, which shot; the other
         # windows and the settings sit at the right-hand end.
@@ -528,6 +556,8 @@ class LiveODViewer(QWidget):
             _label_value("x, y", "8888, 8888 µm"), _label_value("OD", "−8.88"))))
         # which units the axes, readouts and ROI are in: bottom left
         self.units_label = _OverlayLabel(self.od_plot)
+        # the shown shot's xvar values: top left
+        self.xvar_label = _OverlayLabel(self.od_plot)
         self.od_plot.installEventFilter(self)
 
         # markers and the colormap in the image's right-click menu (M also adds a marker)
@@ -715,6 +745,7 @@ class LiveODViewer(QWidget):
         self._fit = None
         self._early_scalars.clear()
         self.readout_label.show_text("")
+        self._clear_xvars()
         for name in self._raw_labels:
             self._set_raw_label(name)
         self._clear_history()
@@ -729,6 +760,7 @@ class LiveODViewer(QWidget):
         self._fit = None
         self._early_scalars.clear()
         self.readout_label.show_text("")
+        self._clear_xvars()
         # a new series: the raw frames' levels are taken afresh from its first shot
         self._autoscale_ready = False
         self._first_image_minmax = {}
@@ -766,6 +798,7 @@ class LiveODViewer(QWidget):
         self._shown_entry = entry
         self._fit = entry[2]
         self._render_readout()
+        self._render_xvars()
         self._syncing_image_views = True # workaround for not having image sizes reset on replotting new images
         try:
             self.plot_images(img_atoms, img_light, img_dark)
@@ -1003,6 +1036,87 @@ class LiveODViewer(QWidget):
         self.readout_label.show_text(" &nbsp;&nbsp; ".join(parts))
         self._place_overlays()
 
+    # ------------------------------------------------------------------
+    # xvars (top left of the OD image)
+    # ------------------------------------------------------------------
+
+    def set_xvar_ranges(self, ranges):
+        """The run's scan ranges, ``{name: (min, max)}`` in SI, from INIT_RUN. Each
+        xvar's display unit is picked from its range, so it does not change from
+        shot to shot. Call after ``on_new_run``."""
+        self._xvar_ranges = {}
+        for name, bounds in dict(ranges or {}).items():
+            try:
+                lo, hi = (float(v) for v in bounds)
+            except (TypeError, ValueError):
+                continue
+            self._xvar_ranges[str(name)] = (lo, hi)
+        self._xvar_units = {}
+
+    def set_shot_xvars(self, shot_idx, xvar_values):
+        """Slot for the server's shot progress: this shot's xvar values (SI), kept
+        with the shot so they come back when it is stepped to."""
+        if not xvar_values:
+            return
+        xvar_values = dict(xvar_values)
+        self._latest_xvars = xvar_values
+        if shot_idx is not None:
+            self._shot_xvars[int(shot_idx)] = xvar_values
+            for idx in sorted(self._shot_xvars)[:-4 * HISTORY_MAX_SHOTS]:
+                del self._shot_xvars[idx]
+        shown = self._shown_entry
+        if shown is None or shown[1] is None or shown[1] == shot_idx:
+            self._render_xvars()
+
+    def _clear_xvars(self):
+        self._shot_xvars.clear()
+        self._latest_xvars = {}
+        self._xvar_ranges = {}
+        self._xvar_units = {}
+        self.xvar_label.setMinimumWidth(0)
+        self.xvar_label.show_text("")
+
+    def _xvar_unit(self, name, value):
+        """(unit, mult) for an xvar, fixed for the run: from its scan range when
+        INIT_RUN gave one, else from the first value seen."""
+        if name not in self._xvar_units:
+            lo, hi = self._xvar_ranges.get(name, (value, value))
+            try:
+                magnitude = max(abs(float(lo)), abs(float(hi)))
+            except (TypeError, ValueError):
+                return "", 1.0      # not a number: shown as it is
+            unit = unit_for_param(name, [magnitude])
+            self._xvar_units[name] = (unit, mult_for(unit) if unit else 1.0)
+        return self._xvar_units[name]
+
+    def _format_xvar(self, name, value):
+        unit, mult = self._xvar_unit(name, value)
+        try:
+            text = _format_number(float(value) * mult, digits=4)
+        except (TypeError, ValueError):
+            text = str(value)
+        return _label_value(name, f"{text} {unit}".rstrip())
+
+    def _render_xvars(self):
+        """The xvars of the shot on screen; before a run's first image, the latest."""
+        shown = self._shown_entry
+        if shown is None or shown[1] is None:
+            xvars = self._latest_xvars
+        else:
+            xvars = self._shot_xvars.get(shown[1])
+            if xvars is None and shown[2]:
+                xvars = shown[2].get('xvar_values')     # a remote viewer's scalars carry them
+            if xvars is None:
+                return          # its progress message is still on the way: leave what is up
+        if not xvars:
+            self.xvar_label.show_text("")
+            return
+        self.xvar_label.show_text("<br>".join(self._format_xvar(str(k), v) for k, v in xvars.items()))
+        # grows to the widest it has been this run, never back: no jumping about
+        self.xvar_label.setMinimumWidth(max(self.xvar_label.minimumWidth(),
+                                            self.xvar_label.sizeHint().width()))
+        self._place_overlays()
+
     def set_pixel_size_m(self, px_size_m):
         """Size of one camera pixel at the atoms (pixel size / magnification), which
         is what the µm button converts with. None: unknown, so pixels only."""
@@ -1043,12 +1157,13 @@ class LiveODViewer(QWidget):
     def _place_overlays(self):
         """Keep the overlays in the corners of the image area (inside the axes, left
         of the colour bar): per-shot numbers top right, cursor bottom right, units
-        bottom left."""
+        bottom left, xvars top left."""
         rect = self.od_plot.mapFromScene(self.od_plot.getViewBox().sceneBoundingRect()).boundingRect()
         margin = 6
         for label, at_top, at_right in ((self.readout_label, True, True),
                                         (self.cursor_label, False, True),
-                                        (self.units_label, False, False)):
+                                        (self.units_label, False, False),
+                                        (self.xvar_label, True, False)):
             x = rect.right() - label.width() - margin if at_right else rect.left() + margin
             y = rect.top() + margin if at_top else rect.bottom() - label.height() - margin
             label.move(int(max(rect.left(), x)), int(y))
@@ -1152,11 +1267,20 @@ class LiveODViewer(QWidget):
         self._marker_panel.show()
         self._marker_panel.raise_()
 
-    def _remember_right_click(self, view_box, ev):
-        """Where on the image the context menu was opened, for "Add marker here"."""
+    def _on_image_clicked(self, view_box, ev):
+        """Remember where the context menu was opened (for "Add marker here"), and
+        add a marker where the image is double-clicked, unless that is on a marker
+        already or off the image (the colour bar, the axes)."""
         if ev.button() == Qt.MouseButton.RightButton:
             point = view_box.mapSceneToView(ev.scenePos())
             self._last_right_click = (point.x(), point.y())
+        elif ev.button() == Qt.MouseButton.LeftButton and ev.double():
+            if not view_box.sceneBoundingRect().contains(ev.scenePos()):
+                return
+            if any(item.is_hovered() for item in self._marker_items):
+                return
+            point = view_box.mapSceneToView(ev.scenePos())
+            self.add_marker((point.x(), point.y()))
 
     def _extend_image_menu(self, view_box, scene):
         """An image's right-click menu is markers and the colormap, nothing else. The
@@ -1166,7 +1290,7 @@ class LiveODViewer(QWidget):
         pyqtgraph's own entries are taken out: the ViewBox's (View All, X axis, Y
         axis, Mouse Mode), and what it adds from the items above it (the plot's Plot
         Options, the scene's Export...), by popping the menu up without asking them."""
-        scene.sigMouseClicked.connect(lambda ev, vb=view_box: self._remember_right_click(vb, ev))
+        scene.sigMouseClicked.connect(lambda ev, vb=view_box: self._on_image_clicked(vb, ev))
         menu = view_box.menu
         if menu is None:
             return
@@ -1400,6 +1524,40 @@ class LiveODViewer(QWidget):
         self._sync_roi_controls()
         self._update_marginals()
 
+    def auto_roi(self, n_shots=None):
+        """Set the ROI around the atoms in the last ``n_shots`` shots (default: the
+        View menu's spinbox), counting back from the one on screen. Uses waxa's
+        auto-ROI detector on the raw atoms and light frames, as the analysis does.
+        Returns the (x1, y1, x2, y2) set, or None if nothing was found."""
+        if not self._history:
+            logger.warning("Auto ROI: no shots yet")
+            return None
+        if n_shots is None:
+            n_shots = self.auto_roi_spinner.value()
+        pos = len(self._history) - 1 if self._history_pos is None else self._history_pos
+        shape = np.shape(self._history[pos][0][0])
+        entries = [self._history[i][0] for i in range(max(0, pos - int(n_shots) + 1), pos + 1)
+                   if np.shape(self._history[i][0][0]) == shape]
+        from waxa.image_processing.auto_roi import suggest_roi
+        try:
+            result = suggest_roi(atoms=np.stack([e[0] for e in entries]),
+                                 light=np.stack([e[1] for e in entries]))
+        except Exception as exc:
+            logger.warning(f"Auto ROI failed: {exc}")
+            return None
+        if not result.valid:
+            logger.warning(f"Auto ROI: no ROI set over {len(entries)} shot(s): {result.reason}")
+            return None
+        rect = (float(result.roix[0]), float(result.roiy[0]),
+                float(result.roix[1]), float(result.roiy[1]))
+        self._show_roi(*rect)
+        self._save_rect()
+        self._sync_roi_controls()
+        self._update_marginals()
+        logger.info(f"Auto ROI over {len(entries)} shot(s): x {rect[0]:.0f}–{rect[2]:.0f}, "
+                    f"y {rect[1]:.0f}–{rect[3]:.0f} px")
+        return rect
+
     def _on_roi_moving(self):
         self._sync_roi_controls()
         self._update_marginals()
@@ -1478,6 +1636,10 @@ class LiveODViewer(QWidget):
                 state = settings.value(key)
                 if state is not None:
                     splitter.restoreState(state)
+            # a layout saved with the log dragged shut: open it again
+            sizes = self.top_splitter.sizes()
+            if sizes[0] < self.output_window.minimumSizeHint().height():
+                self.top_splitter.setSizes([70, max(sizes[1] - 70, 1)])
             for key, checkbox in (("viewer/lock_views", self.lock_views_checkbox),
                                   ("viewer/profiles", self.profiles_checkbox),
                                   ("viewer/um_axes", self.um_checkbox)):
@@ -1486,6 +1648,9 @@ class LiveODViewer(QWidget):
                     checkbox.setChecked(str(value).lower() in ("true", "1"))
             self.output_window.set_collapsed(
                 str(settings.value("viewer/log_collapsed", "false")).lower() in ("true", "1"))
+            value = settings.value("viewer/auto_roi_shots")
+            if value is not None:
+                self.auto_roi_spinner.setValue(int(value))
         except Exception as exc:
             logger.warning(f"Could not restore the viewer layout: {exc}")
 
@@ -1500,6 +1665,7 @@ class LiveODViewer(QWidget):
         settings.setValue("viewer/lock_views", self.lock_views_checkbox.isChecked())
         settings.setValue("viewer/profiles", self.profiles_checkbox.isChecked())
         settings.setValue("viewer/um_axes", self.um_checkbox.isChecked())
+        settings.setValue("viewer/auto_roi_shots", self.auto_roi_spinner.value())
         settings.setValue("viewer/log_collapsed", self.output_window.is_collapsed())
 
     def open_settings_dialog(self):

@@ -270,11 +270,41 @@ class Expt(Scanner, Dealer, Scribe):
     def _expt_file_stem(self) -> str:
         """Name (no extension) of the file that defines this experiment's class,
         or '' if it cannot be found."""
+        import inspect
+        cls = type(self)
         try:
-            import inspect
-            return Path(inspect.getsourcefile(type(self))).stem
+            return Path(inspect.getsourcefile(cls)).stem
         except Exception:
-            return ""
+            pass
+        # ARTIQ's file_import never registers the module in sys.modules, so
+        # inspect cannot find the class's file.  The methods defined in the class
+        # body still carry it (unwrap @kernel's functools.wraps wrapper first).
+        for attr in vars(cls).values():
+            try:
+                code = inspect.unwrap(attr).__code__
+            except Exception:
+                continue
+            if code.co_filename.endswith('.py'):
+                return Path(code.co_filename).stem
+        # file_import names the module prefix + file stem.
+        prefix = "file_import_"
+        if cls.__module__.startswith(prefix):
+            return cls.__module__[len(prefix):]
+        return ""
+
+    def _xvar_ranges(self) -> dict:
+        """{name: [min, max]} of each numeric xvar's scan: liveOD picks the unit it
+        shows that xvar in from this, once for the run."""
+        ranges = {}
+        for xv in self.scan_xvars:
+            try:
+                values = np.asarray(xv.values, dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size:
+                    ranges[str(xv.key)] = [float(values.min()), float(values.max())]
+            except (TypeError, ValueError):
+                pass
+        return ranges
 
     def _serialize_init_payload(self) -> dict:
         """Build the INIT_RUN payload from current experiment state."""
@@ -323,6 +353,7 @@ class Expt(Scanner, Dealer, Scribe):
             'save_data_flag': int(self.run_info.save_data),
             'xvarnames': list(self.xvarnames),
             'xvardims': list(self.xvardims),
+            'xvar_ranges': self._xvar_ranges(),
             'sort_idx': [np.array(s).tolist() for s in self.sort_idx] if self.sort_idx else [],
             'sort_N': [int(n) for n in self.sort_N] if self.sort_N else [],
             'images_shape': images_shape,

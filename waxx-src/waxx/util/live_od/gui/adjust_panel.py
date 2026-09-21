@@ -3,8 +3,9 @@ Live-adjust panel for the liveOD GUI.
 
 AdjustPanel hosts one AdjustParamRow per adjustable parameter registered with
 ``self.adjust()`` in an experiment's ``prepare()``.  Each row shows a checkbox,
-the param name, a spinbox, and a unit dropdown; the row's context menu (right
-click) edits min/max/step and copies the param's assignment line.
+the param name, a ⚙ button for min/max/step, a spinbox, and a unit dropdown;
+the row's context menu (right click) also edits min/max/step and copies the
+param's assignment line.
 
 Values are SI everywhere -- in ExptParams, over the wire, and in every signal
 this module emits.  The unit is display only: a ``t_tof`` of 2e-05 s is shown
@@ -50,6 +51,7 @@ _KEY_WIDTH   = 190
 _SPIN_WIDTH  = 104
 _UNIT_WIDTH  = 56
 _BUTTON_SIZE = 22
+_SPEC_BUTTON_SIZE = 16
 
 _SETTINGS_ORG, _SETTINGS_APP = "waxx", "liveod"
 _CHANGED_STYLE = "color: #b35c00; font-weight: bold;"
@@ -95,14 +97,24 @@ class ScientificDoubleSpinBox(_NoScrollMixin, QDoubleSpinBox):
     def textFromValue(self, value: float) -> str:
         return f"{value:.12g}"
 
+    def _strip_affixes(self, text: str) -> str:
+        """The number alone -- Qt hands these methods the text with the unit suffix."""
+        text = text.strip()
+        prefix, suffix = self.prefix().strip(), self.suffix().strip()
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        if suffix and text.endswith(suffix):
+            text = text[:-len(suffix)]
+        return text.strip()
+
     def valueFromText(self, text: str) -> float:
         try:
-            return float(text)
+            return float(self._strip_affixes(text))
         except ValueError:
             return self.value()
 
     def validate(self, text: str, pos: int):
-        stripped = text.strip()
+        stripped = self._strip_affixes(text)
         try:
             float(stripped)
             return QValidator.State.Acceptable, text, pos
@@ -201,10 +213,11 @@ class ClickableLabel(QLabel):
 
 
 class AdjustParamRow(QWidget):
-    """One row: checkbox | key label | spinbox | unit | reset.
+    """One row: checkbox | key label | ⚙ | spinbox | unit | reset.
 
     The checkbox controls whether this row is included in "Copy params".
     Clicking the key label copies an assignment line prefix for that param.
+    The ⚙ button opens the min/max/step dialog.
     The reset button (↺) reverts to the value present when adjust() was called,
     and is enabled only while the value differs from it.  Right-clicking the row
     opens min/max/step editing and the copy actions.
@@ -255,6 +268,16 @@ class AdjustParamRow(QWidget):
         self._label.clicked.connect(lambda: self.name_clicked.emit(self.key))
         self._elide_key()
         layout.addWidget(self._label)
+
+        # --- Spec (min/max/step) button ---
+        self._spec_btn = QToolButton()
+        self._spec_btn.setText("⚙")
+        self._spec_btn.setAutoRaise(True)
+        self._spec_btn.setFixedSize(_SPEC_BUTTON_SIZE, _BUTTON_SIZE)
+        self._spec_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._spec_btn.setToolTip("Edit min / max / step")
+        self._spec_btn.clicked.connect(self.edit_spec)
+        layout.addWidget(self._spec_btn)
 
         # --- Spinbox ---
         if self._is_int:
