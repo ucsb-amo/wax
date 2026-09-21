@@ -6,6 +6,7 @@ from artiq.language.core import now_mu
 from artiq.coredevice.core import Core
 from artiq.experiment import rpc, kernel, delay, parallel, TFloat, portable, TArray, TInt32
 
+import atexit
 import time
 import spcm
 from spcm import units
@@ -21,6 +22,43 @@ T_AWG_RPC_DELAY = 25.e-3
 
 VAL_TYPE_FREQ = 0
 VAL_TYPE_AMP = 1
+
+# Driver error texts that mean "the card is there, but the connection could not
+# be made right now" -- usually the previous run has not let go of it yet. The
+# AWG is a network device and accepts only one connection at a time.
+RETRYABLE_AWG_ERROR_TEXTS = ('in use','locked','network','timeout','not found','no connection')
+
+class AwgConnectionError(Exception):
+    """Raised when the connection to the tweezer AWG could not be opened."""
+    pass
+
+def awg_driver_error_text(handle=None):
+    """Returns the driver's description of the last error.
+
+    Passing no handle asks the driver for the last error overall, which is how
+    the reason for a failed open is read back (there is no handle to ask).
+    """
+    try:
+        error = spcm.SpcmError()
+        error._handle = handle
+        error.get_info()
+        text = str(error).strip()
+    except Exception:
+        text = ""
+    return text or "no reason reported by the driver"
+
+def awg_error_text(e):
+    """Returns a readable message for an exception raised by the spcm driver."""
+    text = str(e).strip()
+    if text and text != "None":
+        return text
+    return awg_driver_error_text()
+
+def is_retryable_awg_error(e):
+    if isinstance(e,AwgConnectionError):
+        return True
+    text = awg_error_text(e).lower()
+    return any(s in text for s in RETRYABLE_AWG_ERROR_TEXTS)
 
 class TweezerTrap():
     def __init__(self,
@@ -723,17 +761,38 @@ class TweezerController():
     def get_trap_position(self,idx) -> TFloat:
         return self.traps_saved[idx].position
     
+    def _open_card(self):
+        """Opens the connection to the AWG and returns the card.
+
+        spcm.Card.open stores whatever spcm_hOpen hands back, including a null
+        handle when the connection fails, and marks the card as open anyway. If
+        we do not check here, the failure only shows up at the first register
+        access (card_mode), which makes it look like a card mode problem.
+        """
+        card = spcm.Card(self._awg_ip)
+        card.open(self._awg_ip)
+        if not card.handle():
+            # Nothing to stop or close -- otherwise Device.__del__ raises on
+            # the null handle while it is being garbage collected.
+            card._closed = True
+            raise AwgConnectionError(
+                f"Could not connect to the tweezer AWG at {self._awg_ip}: {awg_driver_error_text()}")
+        return card
+
     def awg_init(self,two_d = False):
         """Connects to spectrum AWG, sets full-scale voltage amplitude, initializes trigger mode.
-        """        
+        """
         max_retries = 3
-        retry_delay = 0.5
-        
+        retry_delay = 2.
+
+        # If this process already holds the card (a second init_kernel in the
+        # same run, e.g. after a warm-up dry run), let go of it first -- the
+        # card takes one connection at a time.
+        self.close()
+
         for attempt in range(max_retries):
             try:
-                self.card = spcm.Card(self._awg_ip)
-
-                self.card.open(self._awg_ip)
+                self.card = self._open_card()
 
                 # self.card.reset()
 
@@ -779,17 +838,28 @@ class TweezerController():
 
                 # Start command including enable of trigger engine
                 self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
+                self._register_awg_atexit()
                 break
-                
-            except spcm.classes_error_exception.SpcmException as e:
-                if e.args[0] == 285:
-                    if attempt < max_retries - 1:
-                        print('error with tweezer awg, trying again')
-                        time.sleep(retry_delay)
-                    else:
-                        raise
-                else:
-                    raise
+
+            except (AwgConnectionError, spcm.SpcmException) as e:
+                reason = str(e) if isinstance(e, AwgConnectionError) else awg_error_text(e)
+
+                # Drop this attempt's connection before trying again, otherwise
+                # the retry adds a second connection to a card that only
+                # accepts one.
+                self.close()
+
+                if is_retryable_awg_error(e) and attempt < max_retries - 1:
+                    print(f"tweezer awg connection failed ({reason}), retrying in {retry_delay} s")
+                    time.sleep(retry_delay)
+                    continue
+
+                # ARTIQ carries only the type and message of an exception back
+                # from the kernel, and SpcmException never passes its message
+                # to Exception.__init__ -- so print the reason here, where it
+                # reaches the terminal, and re-raise with it in the message.
+                print(f"tweezer awg init failed: {reason}")
+                raise RuntimeError(f"tweezer awg init failed: {reason}") from e
 
     def set_static_tweezers(self, freq_list=[0.], amp_list=[0.], phase_list=[0.]):
         """Sets a static tweezer array. If no arguments are provided,
@@ -884,8 +954,39 @@ class TweezerController():
     def trigger(self):
         self.awg_trg_ttl.pulse(1.e-6)
 
+    def _register_awg_atexit(self):
+        """Releases the AWG connection when the process ends.
+
+        A run that crashes never reaches post_scan, so without this the card
+        stays claimed until the interpreter happens to garbage collect it, and
+        the next run cannot connect.
+        """
+        if getattr(self,'_awg_atexit_registered',False):
+            return
+        atexit.register(self.close)
+        self._awg_atexit_registered = True
+
     def close(self):
-        self.card.stop()
-        # self.card.close(self.card._handle)
+        """Stops the card and closes the connection to it.
+
+        Stopping alone leaves the connection claimed. Each step is guarded
+        because close() also runs on the failure path, where the card may be
+        half set up.
+        """
+        card = getattr(self,'card',None)
+        if card is None:
+            return
+        try:
+            card.stop()
+        except Exception as e:
+            print(f"tweezer awg: stop failed while closing ({awg_error_text(e)})")
+        try:
+            card.close(card.handle())
+        except Exception as e:
+            print(f"tweezer awg: close failed ({awg_error_text(e)})")
+        # Keeps Device.__del__ from stopping/closing the handle a second time.
+        card._closed = True
+        card._handle = None
+        self.card = None
 
     
