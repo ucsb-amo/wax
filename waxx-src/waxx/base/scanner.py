@@ -21,12 +21,14 @@ def nothing():
 
 class AdjustSpec:
     """Descriptor for a parameter that can be adjusted live between shots."""
-    def __init__(self, key, min_val, max_val, step, dtype=float, current_val=None):
+    def __init__(self, key, min_val, max_val, step, dtype=float, current_val=None,
+                 unit=''):
         self.key = key
         self.min_val = float(min_val)
         self.max_val = float(max_val)
         self.step = float(step)
         self.dtype = dtype          # float or int
+        self.unit = unit or ''      # display unit only; values stay SI everywhere
         raw_current = current_val if current_val is not None else min_val
         self.current_val = self.coerce(raw_current)
 
@@ -56,6 +58,7 @@ class AdjustSpec:
             'step':        self.step,
             'dtype':       'int' if self.dtype == int else 'float',
             'current_val': self.current_val,
+            'unit':        self.unit,
         }
 
 
@@ -131,7 +134,7 @@ class Scanner():
             raise ValueError("Key contains forbidden characters.")
 
     def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None,
-               default_val=None):
+               default_val=None, unit=None):
         """Register a parameter for live adjustment between shots via the liveOD Adjust panel.
 
         Args:
@@ -146,6 +149,11 @@ class Scanner():
                 param's existing value in ExptParams is used, or min_val if the
                 param does not exist yet. When given explicitly, it is written
                 into ExptParams, overwriting any existing value.
+            unit (str, optional): Unit the Adjust panel shows this param in
+                ('µs', 'MHz', 'V', ...). Defaults to the unit comment on the
+                param's line in ExptParams, else a guess from its name and the
+                size of its default value. Display only: the value stays SI
+                here, over the wire, and in ExptParams.
         """
         param_exists = param_key in vars(self.params)
         default_given = default_val is not None
@@ -176,13 +184,34 @@ class Scanner():
         if default_val is None:
             default_val = min_val
         current_val = dtype(max(min_val, min(max_val, default_val)))
-        spec = AdjustSpec(param_key, min_val, max_val, step, dtype, current_val)
+        if unit is None:
+            unit = self._detect_adjust_unit(param_key, current_val, min_val, max_val, dtype)
+        spec = AdjustSpec(param_key, min_val, max_val, step, dtype, current_val, unit)
         if not param_exists or default_given:
             # coerce with like= so an existing numpy int type (and therefore the
             # kernel writer it is assigned to) is preserved.
             vars(self.params)[param_key] = spec.coerce(
                 current_val, like=vars(self.params).get(param_key))
         self._adjust_specs.append(spec)
+
+    def _detect_adjust_unit(self, param_key, current_val, min_val, max_val, dtype):
+        """Display unit for an adjust param: the ExptParams comment, else the name.
+
+        Sized by the default value rather than the range, so a t_tof that starts
+        at 20 us shows in us even though it can be adjusted up into the ms.
+        Ints are counts (shot numbers, indices) and stay unitless. A failure
+        here must never stop an experiment from being built, so it falls back to
+        no unit.
+        """
+        if dtype == int:
+            return ''
+        try:
+            from waxa.units import unit_for_param
+            return unit_for_param(param_key, [current_val, min_val, max_val],
+                                  params_obj=self.params)
+        except Exception as exc:
+            print(f"[adjust] unit detection failed for {param_key!r}: {exc}")
+            return ''
 
     def apply_pending_adjust_values(self):
         """Apply GUI-side adjust values to host params. Overridden in Expt."""
