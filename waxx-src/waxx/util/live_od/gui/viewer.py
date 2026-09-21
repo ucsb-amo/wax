@@ -261,6 +261,8 @@ class LiveODViewer(QWidget):
         self.top_splitter.setStretchFactor(1, 1)
         self.top_splitter.setSizes([70, 1000])
         self.top_splitter.setCollapsible(0, False)     # the log is never dragged shut
+        self._log_open_height = 70      # the log's splitter share before it was collapsed
+        self.output_window.collapsed_changed.connect(self._on_log_collapsed)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1382,6 +1384,22 @@ class LiveODViewer(QWidget):
 
     def _display_latest(self, entry):
         self._redisplay() if self.avg_spinner.value() > 1 else self._display(entry)
+
+    def _on_log_collapsed(self, collapsed):
+        """Move the splitter handle with the log: down to its header when it is
+        collapsed, back to where it was when it is opened again."""
+        log_height, rest = self.top_splitter.sizes()
+        total = log_height + rest
+        if collapsed:
+            target = self.output_window.maximumHeight()
+            if log_height > target:
+                self._log_open_height = log_height
+        else:
+            target = self._log_open_height
+        if total <= 0:          # not laid out yet: sizes are proportions
+            total = target + 1000
+        target = min(target, max(total - 1, 1))
+        self.top_splitter.setSizes([target, total - target])
 
     def _on_pause_toggled(self, paused):
         if paused:

@@ -99,6 +99,7 @@ class ErrorBanner(QFrame):
 
 class LogPanel(QWidget):
     error_logged = pyqtSignal(str)      # an ERROR-or-worse record was appended
+    collapsed_changed = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -247,6 +248,7 @@ class LogPanel(QWidget):
                                   + 8)
         else:
             self.setMaximumHeight(16777215)
+        self.collapsed_changed.emit(self._collapsed)
 
     def is_collapsed(self) -> bool:
         return self._collapsed
