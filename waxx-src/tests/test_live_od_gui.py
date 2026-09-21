@@ -214,6 +214,45 @@ def test_overlays_are_readable_plates_in_the_image_corners(viewer, app):
     assert label.geometry().top() < image_area.center().y()
 
 
+def test_xvars_are_a_plate_top_left_in_units_fixed_for_the_run(viewer, app):
+    viewer.on_new_run()
+    viewer.set_xvar_ranges({"t_tof": [5e-6, 2e-3], "f_raman": [1.0e6, 1.5e6]})
+    assert viewer.xvar_label.isHidden()
+    viewer.set_shot_xvars(0, {"t_tof": 1.2e-3, "f_raman": 1.25e6, "n_thing": 3})
+    viewer.handle_plot_data(_tagged(make_shot(), 0))
+    app.processEvents()
+    text = viewer.xvar_label.text()
+    assert "1.2 ms" in text and "1.25 MHz" in text and "n_thing" in text
+    assert "rgba(0, 0, 0, 170)" in viewer.xvar_label.styleSheet()
+    image_area = viewer.od_plot.mapFromScene(
+        viewer.od_plot.getViewBox().sceneBoundingRect()).boundingRect()
+    geometry = viewer.xvar_label.geometry()
+    assert geometry.left() >= image_area.left() and geometry.top() >= image_area.top()
+    assert geometry.left() < image_area.center().x() and geometry.top() < image_area.center().y()
+
+    # a small value stays in the run's unit: no switching to µs mid-scan
+    viewer.set_shot_xvars(1, {"t_tof": 5e-6, "f_raman": 1.0e6, "n_thing": 4})
+    viewer.handle_plot_data(_tagged(make_shot(), 1))
+    assert "0.005 ms" in viewer.xvar_label.text()
+    # stepping back through the history brings back that shot's xvars
+    viewer.show_previous_shot()
+    assert "1.2 ms" in viewer.xvar_label.text()
+    viewer.show_next_shot()
+
+    # an older experiment process sends no ranges: the first value decides, for the run
+    viewer.on_new_run()
+    assert viewer.xvar_label.isHidden()
+    viewer.set_shot_xvars(0, {"t_tof": 20e-6})
+    assert "20 µs" in viewer.xvar_label.text()       # no image yet: the latest is shown
+    viewer.set_shot_xvars(1, {"t_tof": 2e-3})
+    assert "2000 µs" in viewer.xvar_label.text()
+
+
+def _tagged(shot, shot_idx):
+    from waxx.util.live_od.gui.plotter import ShotPlotData
+    return ShotPlotData(shot, shot_idx)
+
+
 def test_toolbar_width_does_not_depend_on_the_run(viewer, app):
     before = viewer.minimumSizeHint().width()
     for i in range(12):
@@ -434,6 +473,43 @@ def test_log_panel_is_a_drop_in_for_the_old_text_box(app):
     assert not panel._text.isHidden()
 
 
+def test_log_header_has_only_the_level_filter_and_copy_clear_float_over_the_text(app):
+    from waxx.util.live_od.gui.log_panel import LogPanel
+    from PyQt6.QtWidgets import QAbstractButton
+    panel = LogPanel()
+    panel.resize(500, 200)
+    panel.show()
+    app.processEvents()
+    header_buttons = [b for b in panel._header.findChildren(QAbstractButton) if b is not panel._toggle]
+    assert header_buttons == []
+    for button in (panel._copy_button, panel._clear_button):
+        assert button.parent() is panel._text and button.isVisible()
+    viewport = panel._text.viewport().geometry()
+    assert panel._clear_button.geometry().right() <= viewport.right()
+    assert panel._clear_button.geometry().top() < viewport.center().y()          # top right
+    assert panel._copy_button.geometry().right() < panel._clear_button.geometry().left()
+    panel.append_record(logging.INFO, "camera ready")
+    panel._clear_button.click()
+    assert panel.toPlainText() == ""
+    panel.set_collapsed(True)
+    assert not panel._copy_button.isVisible() and not panel._clear_button.isVisible()
+    panel.set_collapsed(False)
+    app.processEvents()
+    assert panel._copy_button.isVisible()
+    panel.hide()
+
+
+def test_splitter_cannot_shrink_the_log_to_nothing(viewer):
+    assert not viewer.top_splitter.isCollapsible(0)
+    viewer.top_splitter.setSizes([0, 1000])
+    assert viewer.top_splitter.sizes()[0] > 0
+    # collapsed by its arrow, the log still keeps its header row
+    viewer.output_window.set_collapsed(True)
+    viewer.top_splitter.setSizes([0, 1000])
+    assert viewer.top_splitter.sizes()[0] > 0
+    viewer.output_window.set_collapsed(False)
+
+
 def test_qt_log_handler_delivers_from_a_worker_thread(app):
     from waxx.util.live_od.log import QtLogHandler
     logger = logging.getLogger("waxx.live_od.test_handler")
@@ -504,12 +580,11 @@ def test_status_strip_run_and_stall(app, monkeypatch):
     for shot in (1, 2, 3):
         strip.set_progress(shot, 120)
         strip.set_timing(8.0, "14:32")
-    strip.set_xvars({"t_tof": 0.012})
     assert strip.progress.value() == 3 and strip.progress.maximum() == 120
     assert "8.0s" in strip.timing_label.text() and "14:32" in strip.timing_label.text()
     assert "font-weight:bold" in strip.timing_label.text()       # the numbers stand out
     assert strip.timing_label.toolTip().startswith("Elapsed")
-    assert strip.xvar_label.text() == "t_tof=0.012"
+    assert not hasattr(strip, "xvar_label")      # the xvars are a plate on the OD image
     assert titles[-1] == "Run 80545 — Running — 3/120"
     strip.start_run(80546, "hf_tweezer_bec", "andor", save_data=True, n_shots=120)
     assert strip.run_label.text() == "80546 · hf_tweezer_bec · andor"
@@ -544,7 +619,6 @@ def test_status_strip_never_asks_for_more_width(app):
     strip.set_state("waiting_grab_drain", "a long detail string " * 5)
     strip.set_progress(9999, 10000)
     strip.set_timing(123.4, "23:59")
-    strip.set_xvars({f"xvar_number_{i}": 1.2345e-6 for i in range(6)})
     app.processEvents()
     assert strip.minimumSizeHint().width() == idle
     assert strip.run_label.minimumSizeHint().width() == 90
@@ -615,6 +689,30 @@ def test_camera_button_shows_one_camera_and_drops_down_the_others(app):
     assert remote.text() == "no camera" and not remote.isEnabled()
     remote.set_states({"cam_x": "grabbing", "cam_y": "closed"})
     assert remote.camera_keys() == ["cam_x", "cam_y"] and remote.text() == "cam_x"
+
+
+def test_camera_button_stylesheets_parse(app):
+    """Qt drops a stylesheet it can't parse and only says so on the console."""
+    from PyQt6.QtCore import qInstallMessageHandler
+    from waxx.util.live_od.gui.camera_menu import CameraMenuButton, STATES
+    messages = []
+    previous = qInstallMessageHandler(lambda _mode, _ctx, msg: messages.append(msg))
+    try:
+        menu = CameraMenuButton(["cam_a", "cam_b"])
+        for state in STATES:
+            menu.set_state("cam_a", state)
+            menu.set_state("cam_b", state)
+            menu.show()
+            menu.ensurePolished()
+            for _action, button in menu._menu_actions.values():
+                button.ensurePolished()
+            app.processEvents()
+        menu.hide()
+        empty = CameraMenuButton()
+        empty.ensurePolished()
+    finally:
+        qInstallMessageHandler(previous)
+    assert not [m for m in messages if "stylesheet" in m.lower()]
 
 
 # ----------------------------------------------------------------------
@@ -769,6 +867,34 @@ def test_new_markers_get_random_colors_apart_from_the_others(viewer, app):
     assert min(gaps) > 0.03                              # no two alike
     viewer.add_marker((10.0, 10.0), color="#123456")     # asked for: kept
     assert viewer.get_markers()[-1]["color"] == "#123456"
+
+
+def test_double_click_adds_a_marker_where_clicked(viewer, app):
+    from PyQt6.QtCore import QPointF, Qt
+    viewer.handle_plot_data(make_shot())
+    app.processEvents()
+    vb = viewer.od_plot.getViewBox()
+
+    class Click:
+        def __init__(self, scene_pos, double=True, button=Qt.MouseButton.LeftButton):
+            self._pos, self._double, self._button = scene_pos, double, button
+        def button(self): return self._button
+        def double(self): return self._double
+        def scenePos(self): return self._pos
+
+    at = vb.mapViewToScene(QPointF(150.0, 220.0))
+    viewer._on_image_clicked(vb, Click(at, double=False))       # a single click: nothing
+    assert viewer.get_markers() == []
+    viewer._on_image_clicked(vb, Click(at))
+    (marker,) = viewer.get_markers()
+    assert (marker["x"], marker["y"]) == pytest.approx((150.0, 220.0), abs=0.5)
+
+    viewer._marker_items[0]._hovered = True              # on a marker: no second one on top
+    viewer._on_image_clicked(vb, Click(at))
+    assert len(viewer.get_markers()) == 1
+    off_image = vb.sceneBoundingRect().bottomRight() + QPointF(5, 5)    # the axes, the colour bar
+    viewer._on_image_clicked(vb, Click(off_image))
+    assert len(viewer.get_markers()) == 1
 
 
 def test_delete_or_backspace_deletes_the_hovered_marker(viewer, app):
@@ -939,6 +1065,34 @@ def test_colorbar_does_not_waste_the_right_hand_edge(viewer, app):
     assert viewer.od_plot.width() - bar_right <= 4
 
 
+def test_auto_roi_boxes_the_cloud_over_the_last_n_shots(viewer, app, tmp_path, monkeypatch):
+    from waxx.util.live_od.gui.viewer import LiveODViewer
+    monkeypatch.setattr(LiveODViewer, "_STATE_DIR", str(tmp_path))
+    viewer.set_camera_key("cam_a")
+    assert viewer.auto_roi() is None                     # no shots: nothing to do
+    rng = np.random.default_rng(0)
+
+    def noisy_shot(cx, cy):
+        atoms, light, dark, od, sx, sy = make_shot(cx=cx, cy=cy)
+        noise = lambda a: (a + rng.normal(0, 20, a.shape)).astype(np.float32)
+        return noise(atoms), noise(light), dark, od, sx, sy
+
+    viewer.handle_plot_data(noisy_shot(100, 100))        # an old shot, far away
+    for _ in range(3):
+        viewer.handle_plot_data(noisy_shot(350, 300))
+    viewer.auto_roi_spinner.setValue(3)
+    x1, y1, x2, y2 = viewer.auto_roi()
+    assert x1 < 350 < x2 and y1 < 300 < y2
+    assert x1 > 150 and y1 > 150                         # the old shot was left out
+    assert viewer.roi_button.isChecked()
+    assert viewer.get_od_roi_rect() == (x1, y1, x2, y2)
+    assert (tmp_path / "live_od_cam_a_rect.json").exists()
+
+    viewer.auto_roi(n_shots=4)                           # now it spans both clouds
+    x1, y1, _, _ = viewer.get_od_roi_rect()
+    assert x1 < 100 and y1 < 100
+
+
 def test_markers_are_cleared_when_the_camera_changes(viewer, app, tmp_path, monkeypatch):
     from waxx.util.live_od.gui.viewer import LiveODViewer
     monkeypatch.setattr(LiveODViewer, "_STATE_DIR", str(tmp_path))
@@ -1017,3 +1171,27 @@ def test_live_plot_second_metric_on_the_right_axis(app):
     win.metric2_combo.setCurrentIndex(0)
     assert not right_axis.isVisible() and len(win._scatter_item2.getData()[0]) == 0
     win.close()
+
+
+def test_enter_in_the_marker_dialog_commits_the_size_and_presses_no_button(viewer, app, monkeypatch):
+    """Enter used to open the color picker (the dialog's first auto-default button)."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QColor
+    from PyQt6.QtTest import QTest
+    from waxx.util.live_od.gui import markers
+    picked = []
+    monkeypatch.setattr(markers.QColorDialog, "getColor",
+                        staticmethod(lambda *a, **k: picked.append(a) or QColor()))
+    viewer.handle_plot_data(make_shot())
+    viewer.add_marker((100.0, 100.0), size=30.0)
+    dialog = markers.MarkerDialog(viewer, 0)
+    dialog.show()
+    spin = dialog.fields.size_spin
+    spin.setFocus()
+    spin.lineEdit().selectAll()
+    QTest.keyClicks(spin, "44")
+    QTest.keyClick(spin, Qt.Key.Key_Return)
+    assert not picked
+    assert viewer.get_markers()[0]["size"] == 44.0 and len(viewer.get_markers()) == 1
+    assert dialog.isVisible()
+    dialog.close()

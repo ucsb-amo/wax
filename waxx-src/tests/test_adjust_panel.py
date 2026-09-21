@@ -337,3 +337,31 @@ def test_adjust_gives_every_spec_a_unit():
                      'n_repeats': '', 't_tof_forced': 'ms'}
     # and the unit rides along in the dict that goes over the wire
     assert stub._adjust_specs[0].to_dict()['unit'] == 'µs'
+
+
+# ---------------------------------------------------------------- keyboard
+
+def test_enter_commits_an_edit_typed_next_to_the_unit_suffix(qapp):
+    """Typing into '20 µs' leaves the suffix in the field; Enter used to revert."""
+    from PyQt6.QtTest import QTest
+    row = ap.AdjustParamRow(spec())
+    row.show()
+    published = []
+    row.value_changed.connect(lambda key, v: published.append(v))
+    sb = row._spinbox
+    sb.setFocus()
+    sb.lineEdit().setCursorPosition(2)                  # after '20'
+    QTest.keyClick(sb, Qt.Key.Key_Backspace)
+    QTest.keyClicks(sb, "5")
+    assert sb.lineEdit().text() == "25 µs"
+    QTest.keyClick(sb, Qt.Key.Key_Return)
+    assert published == [pytest.approx(25.e-6)] and row.value() == pytest.approx(25.e-6)
+    assert sb.lineEdit().text() == "25 µs"
+
+
+def test_the_gear_button_opens_the_spec_dialog(qapp, monkeypatch):
+    opened = []
+    monkeypatch.setattr(ap.AdjustSpecDialog, "exec", lambda self: opened.append(self) or 0)
+    row = ap.AdjustParamRow(spec())
+    row._spec_btn.click()
+    assert len(opened) == 1 and opened[0].spec['key'] == "t_tof"
