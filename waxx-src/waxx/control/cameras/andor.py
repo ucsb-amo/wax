@@ -87,6 +87,12 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                 self.set_frame_format("chunks")
                 result=self.grab(nframes=N_img,frame_timeout=TIMEOUT,missing_frame=missing_frame,return_info=return_info,buff_size=buff_size)
                 return tuple(np.concatenate(r,axis=0) for r in result) if return_info else np.concatenate(result,axis=0)
+            except self.TimeoutError:
+                # pylablib's AndorTimeoutError carries no message; re-raise as
+                # the builtin TimeoutError that liveOD reports without a traceback.
+                raise TimeoutError(
+                    f"No Andor image within {TIMEOUT:.0f} s "
+                    f"(expected {N_img}). Camera not triggered?") from None
             finally:
                 self.set_frame_format("array")
         acq_params=self._get_grab_acquisition_parameters(N_img,buff_size)
@@ -97,7 +103,12 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                 if check_interrupt_method():
                     print('Interrupt submitted, waiting for grab loop termination...')
                     break
-                self.wait_for_frame(timeout=TIMEOUT,check_interrupt_method=check_interrupt_method)
+                try:
+                    self.wait_for_frame(timeout=TIMEOUT,check_interrupt_method=check_interrupt_method)
+                except self.TimeoutError:
+                    raise TimeoutError(
+                        f"No Andor image within {TIMEOUT:.0f} s "
+                        f"(got {nacq}/{N_img}). Camera not triggered?") from None
                 print(f'gotem (img {nacq+1}/{N_img})') # added this line to give print statements
                 if return_info:
                     new_frames,new_info,rng=self.read_multiple_images(missing_frame=missing_frame,return_info=True,return_rng=True)

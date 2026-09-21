@@ -26,6 +26,10 @@ from queue import Queue, Empty
 def nothing():
     pass
 
+class CameraNotReadyError(ValueError):
+    """The handshake got no open camera.  A ValueError because it used to be a
+    bare ``ValueError("Camera not ready")``."""
+
 class CameraMother(QThread):
     """Legacy stub kept for import compatibility.
 
@@ -279,6 +283,21 @@ class CameraBaby(QThread):
             self.data_handler.read_params()
             self.handshake()
             self.grab_loop()
+        except TimeoutError as e:
+            # An expected failure (camera never triggered, experiment aborted
+            # or stalled), so one line, no traceback.  Camera drivers raise the
+            # builtin TimeoutError with the details in the message.
+            logger.warning(f"{self.name}: camera timed out. {e} "
+                           f"Ending this run's grab; its incomplete data file is discarded.")
+        except CameraNotReadyError as e:
+            # Also expected, and CameraNanny has already logged why: the run
+            # was aborted while waiting for the camera, or opening/configuring
+            # it failed.  One line, no traceback.
+            if self.interrupted:
+                logger.info(f"{self.name}: run aborted before the camera was ready.")
+            else:
+                logger.warning(f"{self.name}: {e}; not starting this run's grab. "
+                               f"Check the camera connection and the messages above.")
         except Exception as e:
             logger.exception(f"CameraBaby {self.name}: fatal error: {e}")
         if self.interrupted and self.death is not self.honorable_death:
@@ -307,7 +326,10 @@ class CameraBaby(QThread):
         self.create_camera()
         self.cam_status_signal.emit(1)
         if self.camera is None or not self.camera.is_opened():
-            raise ValueError("Camera not ready")
+            key = self.data_handler.camera_params.key
+            if isinstance(key, bytes):
+                key = key.decode()
+            raise CameraNotReadyError(f"Camera {key} is not open")
         # Status 2 → triggers server._cam_ready_event via DirectConnection
         self.cam_status_signal.emit(2)
         # Status 3 kept for the status-lights widget

@@ -137,7 +137,7 @@ class BaslerUSB(pylon.InstantCamera):
                     if grab is None or not grab.IsValid():
                         if time.monotonic() > deadline:
                             raise TimeoutError(
-                                f"No image within {frame_timeout:.0f} s "
+                                f"No Basler image within {frame_timeout:.0f} s "
                                 f"(got {count}/{Nimg}). Camera not triggered?")
                         continue
                     if not grab.GrabSucceeded():
