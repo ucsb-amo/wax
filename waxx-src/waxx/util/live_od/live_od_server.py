@@ -10,13 +10,13 @@ on the GUI machine. All HDF5 I/O stays on the server side; the experiment
 client never needs the data drive mounted.
 """
 
+import logging
 import pickle
 import os
 import threading
 import time
 
 from waxx.config.timeouts import DATA_SAVER_TIMEOUT
-from waxa.data.data_saver import clear_end_run_payload, stash_end_run_payload
 
 import zmq
 import numpy as np
@@ -24,6 +24,13 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from beacon.discovery.server import NetServer
 from waxx.util.comms_server.hardware_id import scoped_server_id
 from waxx.util.live_od.config import get_config
+# Everything the server does to the run's data file (reserve, save, delete) is
+# in live_od/data/run_file.py; this module keeps the protocol and the run state.
+from waxx.util.live_od.data.run_file import RunFile, RunFileSaveError
+from waxx.util.live_od.log import get_logger
+from waxx.util.live_od.marker_store import MarkerStore
+
+logger = get_logger("server")
 
 
 class LiveODServer(QThread, NetServer):
@@ -45,6 +52,11 @@ class LiveODServer(QThread, NetServer):
         Emitted for each SHOT_COMPLETE message.
     run_done_signal()
         Emitted after END_RUN is fully handled.
+    run_state_signal(state, detail)
+        Where the run is, for the GUI's status strip: ``waiting_camera``,
+        ``waiting_grab_drain``, ``running``, ``saving``, ``saved``, ``done``
+        (finished, nothing to save), ``aborting``, ``aborted``, ``error``.
+        Emitted on change only.
     """
 
     new_run_signal = pyqtSignal(str, str, bool, bool, int, int, int, int, object, object, object)   # filepath, camera_key, capture_images, save_data, imaging_type, n_img, n_shots, n_pwa_per_shot, camera_params, params_payload, run_info_payload
@@ -57,21 +69,19 @@ class LiveODServer(QThread, NetServer):
     camera_control_signal = pyqtSignal(str, str)              # camera_key, action ('open'|'close'|'toggle')
     adjust_specs_signal = pyqtSignal(list)                    # list of spec dicts, emitted after every INIT_RUN (empty list when no adjust params)
     shot_adjust_values_signal = pyqtSignal(dict)              # current adjust values dict, emitted per shot
+    run_state_signal = pyqtSignal(str, str)                   # state, detail (see class docstring)
+    markers_changed_signal = pyqtSignal(str, list)            # camera_key, markers (a remote viewer edited them)
 
-    def __init__(self, server_talk, data_saver, port: int = 0):
+    def __init__(self, server_talk, data_saver, port: int = 0, marker_path=None):
         super().__init__()  # QThread.__init__
         NetServer.__init__(self, scoped_server_id("live_od"), port)  # explicit — avoids MRO conflict
         self._server_talk = server_talk
-        self._data_saver = data_saver
+        self._run_file = RunFile(data_saver)
         self._ip = "0.0.0.0"
         self._port = port
         self._cam_ready_event = threading.Event()
-        self._data_handler_done_event = threading.Event()
-        self._data_handler_done_event.set()  # default: no DataHandler in flight
         self._running = False
-        self._current_save_data = False
         self._current_capture_images = False
-        self._current_filepath = ""
         self._current_run_id = 0
         self._current_camera_key = ""
         self._reset_requested = False   # set by RESET; cleared by next INIT_RUN
@@ -94,6 +104,29 @@ class LiveODServer(QThread, NetServer):
         self._basler_babies_live = 0
         self._init_run_time: float = 0.0  # time.time() recorded at INIT_RUN
         self._shot_durations: list = []  # rolling list of last 5 shot durations (excluding first shot)
+        self._run_state = "idle"
+        self._current_expt_name = ""    # the run's experiment file (class name from an older client)
+        # pins on the image, per camera; the file is not touched until first used
+        self.markers = MarkerStore(marker_path)
+
+    def set_markers(self, camera_key: str, markers) -> list:
+        """Store one camera's markers (from the GUI; remote viewers use SET_MARKERS)."""
+        return self.markers.set(camera_key, markers)
+
+    def _set_run_state(self, state: str, detail: str = ""):
+        """Emit run_state_signal if the state changed. WAIT_CAM_READY arrives in
+        short slices, so the same state is reported many times over."""
+        if state == self._run_state and not detail:
+            return
+        self._run_state = state
+        self.run_state_signal.emit(state, detail)
+
+    # The server's old file-handling attributes, read-only, for anything that
+    # still looks at them. The state itself is RunFile's.
+    _current_filepath = property(lambda self: self._run_file.filepath)
+    _current_save_data = property(lambda self: self._run_file.save_data)
+    _data_handler_done_event = property(lambda self: self._run_file.writer_done)
+    _data_saver = property(lambda self: self._run_file._data_saver)
 
     # ------------------------------------------------------------------
     # Public slots (safe to call from any thread)
@@ -122,7 +155,7 @@ class LiveODServer(QThread, NetServer):
             remaining = self._basler_babies_live
             if remaining <= 1:
                 self._basler_prev_grab_done_event.set()
-        print(f"[LiveODServer] Basler grab loop exited ({remaining} still live).")
+        logger.info(f"Basler grab loop exited ({remaining} still live).")
 
     def _release_basler_slot(self):
         """Give back a Basler live-baby slot claimed by INIT_RUN when no
@@ -139,7 +172,7 @@ class LiveODServer(QThread, NetServer):
         ``Qt.ConnectionType.DirectConnection`` so the event is set from
         the DataHandler thread immediately after it closes the HDF5 file.
         """
-        self._data_handler_done_event.set()
+        self._run_file.writer_finished()
 
     def stop(self):
         """Request the server loop to stop on the next poll cycle."""
@@ -159,7 +192,7 @@ class LiveODServer(QThread, NetServer):
         socket.setsockopt(zmq.RCVTIMEO, 500)   # 500 ms poll so we can honour stop()
         self._running = True
         self._start_beacon()
-        print(f"[LiveODServer] Listening on tcp://0.0.0.0:{self._port}")
+        logger.info(f"liveOD server listening on tcp://0.0.0.0:{self._port}")
         try:
             while self._running:
                 try:
@@ -197,13 +230,15 @@ class LiveODServer(QThread, NetServer):
                         reply = self._handle_set_adjust_value(msg)
                     elif tag == "SET_ADJUST_SPEC":
                         reply = self._handle_set_adjust_spec(msg)
+                    elif tag == "GET_MARKERS":
+                        reply = self._handle_get_markers(msg)
+                    elif tag == "SET_MARKERS":
+                        reply = self._handle_set_markers(msg)
                     else:
                         reply = {"ok": False, "error": f"Unknown tag: {tag}"}
                 except Exception as exc:
                     reply = {"ok": False, "error": str(exc)}
-                    import traceback
-                    print(f"[LiveODServer] Error handling {tag!r}:")
-                    traceback.print_exc()
+                    logger.exception(f"Error handling {tag!r}: {exc}")
 
                 socket.send(pickle.dumps(reply))
         finally:
@@ -238,22 +273,12 @@ class LiveODServer(QThread, NetServer):
         # incorrectly call update_run_id() (no active baby → else branch).
         if notify_gui and self._current_capture_images:
             self.reset_signal.emit()
-        # Delete the HDF5 file if it still exists (may already be gone for
-        # camera runs whose CameraBaby called dishonorable_death).
-        if self._current_filepath and os.path.exists(self._current_filepath):
-            # Wait for the DataHandler (camera writer) to close its HDF5
-            # handle before attempting deletion.  Without this the file is
-            # still open and os.remove raises WinError 32 on Windows.
-            if not self._data_handler_done_event.wait(timeout=DATA_SAVER_TIMEOUT):
-                print(f"[LiveODServer] WARNING: DataHandler did not release the file within {DATA_SAVER_TIMEOUT:.0f} s — deletion may fail.")
-            try:
-                os.remove(self._current_filepath)
-                print(f"Deleted incomplete data file: {self._current_filepath}")
-            except Exception as exc:
-                print(f"Warning: could not delete incomplete data file: {exc}")
-            self._current_filepath = ""
+        # Delete the run's file if it still exists, once the image writer has
+        # let go of it.
+        self._run_file.discard()
         self._reset_requested = False
         self._run_in_progress = False
+        self._set_run_state("aborted")
         self.run_done_signal.emit()
 
     def _handle_init_run(self, msg: dict) -> dict:
@@ -284,56 +309,36 @@ class LiveODServer(QThread, NetServer):
                 if stale > 0:
                     self._basler_prev_grab_done_event.clear()
             if stale > 0:
-                print(f"[LiveODServer] INIT_RUN: {stale} Basler grab loop(s) not yet done — WAIT_CAM_READY will block until they exit.")
+                logger.warning(f"INIT_RUN: {stale} Basler grab loop(s) not yet done — WAIT_CAM_READY will block until they exit.")
 
         camera_params = msg.get('camera_params', {})
         self._cam_ready_event.clear()
-        self._current_save_data = save_data
         self._current_capture_images = capture_images
-        # Gate END_RUN saves on DataHandler finishing.  For no-camera runs
-        # there is no DataHandler, so mark it done immediately.
-        self._data_handler_done_event.clear()
-        if not capture_images:
-            self._data_handler_done_event.set()
+        # Gates the END_RUN save on the image writer finishing (a run without a
+        # camera has none).
+        self._run_file.begin(save_data, has_writer=capture_images)
 
         run_id = 0
         filepath = ""
 
         if save_data:
-            # Atomically reserve a unique run_id by exclusively creating the
-            # data file ('x' mode).  Exclusive create is atomic on the shared
-            # filesystem, so two liveOD servers driving different hardware but
-            # writing to one data drive can never collide on a run_id.
-            #
-            # The file is fully populated inside that same exclusive open, so by
-            # the time we reply the file is ready for SaveWorker.  Doing this
-            # synchronously is deliberate: the previous background-thread design
-            # could fail silently and leave a file with no 'data' group, which
-            # cost an entire run's images before anything noticed.  Image
-            # pre-allocation is deferred to SaveWorker, so this is a small write.
+            # Synchronous on purpose, and a small write: see RunFile.reserve.
             _t_create = time.time()
             try:
-                run_id, filepath = self._data_saver.reserve_run_id_and_path(msg)
+                run_id, filepath = self._run_file.reserve(msg)
             except Exception as exc:
-                import traceback
-                print("[LiveODServer] INIT_RUN: could not create data file:")
-                traceback.print_exc()
-                # No DataHandler will be spawned, so release the gate we cleared
-                # above — otherwise the next END_RUN / reset blocks on it.
-                self._data_handler_done_event.set()
-                # No CameraBaby will be spawned either, so give back the Basler
+                logger.exception(f"INIT_RUN: could not create data file: {exc}")
+                # No CameraBaby will be spawned, so give back the Basler
                 # slot claimed above — otherwise the count never returns to zero
                 # and every later run blocks in WAIT_CAM_READY.
                 self._release_basler_slot()
-                self._current_filepath = ""
                 self._run_in_progress = False
+                self._set_run_state("error", f"Data file creation failed: {exc}")
                 return {"ok": False, "error": f"Data file creation failed: {exc}"}
             _dt_create = time.time() - _t_create
             if _dt_create > 2.0:
-                print(f"[LiveODServer] WARNING: data file creation took "
-                      f"{_dt_create:.1f} s — is the data drive slow?")
+                logger.warning(f"Data file creation took {_dt_create:.1f} s — is the data drive slow?")
 
-        self._current_filepath = filepath
         self._current_run_id = run_id
         self._reset_requested = False
         self._run_in_progress = True
@@ -355,23 +360,29 @@ class LiveODServer(QThread, NetServer):
             'xvarnames': list(msg.get('xvarnames', [])),
         }
 
+        # The run goes by its experiment file's name; an experiment process from
+        # before that was sent only gives the class.
+        self._current_expt_name = str(msg.get('expt_file') or msg.get('expt_class', ''))
+
         adjust_specs = list(msg.get('adjust_specs', []))
         with self._adjust_lock:
             self._adjust_specs = adjust_specs
             self._adjust_values = {s['key']: s['current_val'] for s in adjust_specs}
         self.adjust_specs_signal.emit(adjust_specs)
         if adjust_specs and save_data:
-            print(
-                "[LiveODServer] WARNING: adjustable params are active with "
-                "save_data=True. Values changed in the Adjust panel will NOT "
-                "be reflected in saved data."
+            logger.warning(
+                "Adjustable params are active with save_data=True. Values changed "
+                "in the Adjust panel will NOT be reflected in saved data."
             )
 
         self.run_started_signal.emit(run_id, list(run_info_payload.get('xvarnames', [])))
         self.new_run_signal.emit(filepath, camera_key, capture_images, save_data, imaging_type, n_img, n_shots, n_pwa, camera_params, params_payload, run_info_payload)
-        print(
-            f"[LiveODServer] INIT_RUN: run_id={run_id}, "
-            f"save={save_data}, cam={capture_images}"
+        self._run_state = "idle"    # so the new run's first state is always emitted
+        self._set_run_state("waiting_camera" if capture_images else "running", camera_key)
+        logger.info(
+            f"INIT_RUN: run_id={run_id}, {self._current_expt_name}, "
+            f"{n_shots} shots, save={save_data}, "
+            f"camera={camera_key if capture_images else 'none'}"
         )
         return {"ok": True, "run_id": run_id, "filepath": filepath}
 
@@ -395,6 +406,8 @@ class LiveODServer(QThread, NetServer):
         # experiment from arming the hardware while the old grab is still
         # blocking in RetrieveResult() and the camera is not yet free.
         if get_config().camera_needs_grab_drain(self._current_camera_key):
+            if not self._basler_prev_grab_done_event.is_set():
+                self._set_run_state("waiting_grab_drain")
             remaining = deadline - time.time()
             grab_done = self._basler_prev_grab_done_event.wait(timeout=max(0.0, remaining))
             if not grab_done:
@@ -402,12 +415,16 @@ class LiveODServer(QThread, NetServer):
                         "reset_requested": self._reset_requested,
                         "error": "Basler previous grab-loop exit timeout"}
 
+        if not self._cam_ready_event.is_set():
+            self._set_run_state("waiting_camera")
         remaining = deadline - time.time()
         ready = self._cam_ready_event.wait(timeout=max(0.0, remaining))
         if not ready:
             return {"ok": False, "ready": False, "timed_out": True,
                     "reset_requested": self._reset_requested,
                     "error": "Camera ready timeout"}
+        if not self._reset_requested:
+            self._set_run_state("running")
         return {"ok": True, "ready": True, "reset_requested": self._reset_requested}
 
     def _handle_shot_complete(self, msg: dict) -> dict:
@@ -454,60 +471,38 @@ class LiveODServer(QThread, NetServer):
         if adjust_values:
             self.shot_adjust_values_signal.emit(adjust_values)
 
-        print(f"[LiveODServer] shot {shot_idx + 1}/{N_total} (Δt={delta_t:.1f}s | ETA {eta_str})")
+        if not self._reset_requested:
+            self._set_run_state("running")
+        # Every shot goes to the terminal and the log file; the GUI's progress
+        # bar carries the per-shot news, so its log only gets about one in twenty.
+        line = f"shot {shot_idx + 1}/{N_total} (Δt={delta_t:.1f}s | ETA {eta_str})"
+        sparse = shot_idx == 0 or shot_idx + 1 == N_total or (shot_idx + 1) % max(1, N_total // 20) == 0
+        logger.log(logging.INFO if sparse else logging.DEBUG, line)
         # Include reset flag so the experiment can abort at shot boundary
         # even if the POLL-based check misses it.
         return {"ok": True, "reset_requested": self._reset_requested, "adjust_values": adjust_values}
 
     def _handle_end_run(self, msg: dict) -> dict:
         if self._reset_requested:
-            print(f"[LiveODServer] END_RUN: run {self._current_run_id} was reset — discarding data.")
-            if self._current_filepath and os.path.exists(self._current_filepath):
-                try:
-                    os.remove(self._current_filepath)
-                    print(f"[LiveODServer] Deleted data file: {self._current_filepath}")
-                except Exception as exc:
-                    print(f"[LiveODServer] Warning: could not delete data file: {exc}")
+            logger.warning(f"END_RUN: run {self._current_run_id} was reset — discarding data.")
+            # As before the move: this path does not wait for the image writer.
+            self._run_file.discard(wait_for_writer=False)
             self._reset_requested = False
             self._run_in_progress = False
+            self._set_run_state("aborted")
             self.run_done_signal.emit()
             return {"ok": True}
-        if self._current_save_data and self._current_filepath:
-            # Wait for DataHandler to close its HDF5 handle before we open
-            # the same file for the end-of-run save.  Without this wait the
-            # two h5py opens race and either corrupt the file or raise OSError.
-            if not self._data_handler_done_event.wait(timeout=DATA_SAVER_TIMEOUT):
-                print(f"[LiveODServer] WARNING: DataHandler did not finish within {DATA_SAVER_TIMEOUT:.0f} s — proceeding anyway.")
-            # Stash the payload on local disk BEFORE touching the data file.
-            # The experiment sends its final params exactly once and then
-            # drops them, so without this a failed save loses them for good.
-            stash_path = stash_end_run_payload(
-                msg, self._current_filepath, self._current_run_id,
-                shot_timestamps=self._shot_timestamps,
-            )
+        if self._run_file.pending:
+            self._set_run_state("saving")
             try:
-                self._data_saver.save_data_from_payload(
-                    msg, self._current_filepath,
-                    shot_timestamps=self._shot_timestamps,
-                )
-                print(f"[LiveODServer] END_RUN: run_id={self._current_run_id} saved.")
-                clear_end_run_payload(stash_path)
-                # Clear filepath so a late RESET cannot delete an already-saved file.
-                self._current_filepath = ""
-            except Exception as exc:
-                import traceback
-                print(f"[LiveODServer] END_RUN: save failed:")
-                traceback.print_exc()
-                error = str(exc)
-                if stash_path:
-                    hint = (
-                        f"Final params for run {self._current_run_id} are preserved at "
-                        f"{stash_path}. Once the data drive is back, finish the save with:\n"
-                        f"    from waxa.data.data_saver import retry_pending_save\n"
-                        f"    retry_pending_save(r'{stash_path}')"
-                    )
-                    print(f"[LiveODServer] {hint}")
-                    error = f"{error}\n{hint}"
+                # waits for the image writer, stashes the payload, then saves
+                self._run_file.save(msg, self._current_run_id, self._shot_timestamps)
+                logger.info(f"END_RUN: run_id={self._current_run_id} saved.")
+            except RunFileSaveError as exc:
+                error = str(exc)    # the saver's error, plus the way out if the payload was stashed
+                # one record, so the error banner shows the failure and the way out together
+                logger.error(f"END_RUN: save of run {self._current_run_id} failed: {error}")
+                self._set_run_state("error", f"Save failed: {exc.cause}")
                 # The run is over either way.  Clear the in-progress state
                 # before reporting the failure, otherwise the server rejects
                 # all CAMERA_CONTROL for the rest of the session and the GUI
@@ -515,16 +510,24 @@ class LiveODServer(QThread, NetServer):
                 self._run_in_progress = False
                 self.run_done_signal.emit()
                 return {"ok": False, "error": error}
+            self._set_run_state("saved")
         else:
-            print("[LiveODServer] END_RUN: save_data=False, nothing written.")
+            logger.info("END_RUN: save_data=False, nothing written.")
+            self._set_run_state("done", "save_data=False, nothing written")
 
         self._run_in_progress = False
         self.run_done_signal.emit()
         return {"ok": True}
 
+    def note_reset_requested(self):
+        """The GUI's own abort button was pressed (the remote path is _handle_reset)."""
+        if self._run_in_progress:
+            self._set_run_state("aborting")
+
     def _handle_reset(self, msg: dict) -> dict:
-        print("[LiveODServer] RESET requested by remote viewer.")
+        logger.warning("RESET requested by remote viewer.")
         self._reset_requested = True
+        self.note_reset_requested()
         self.reset_signal.emit()
         return {"ok": True}
 
@@ -541,15 +544,15 @@ class LiveODServer(QThread, NetServer):
         # (Andor cooler init can take several seconds) and stalls all queued
         # SHOT_COMPLETE / RESET signals.
         if self._run_in_progress:
-            print(f"[LiveODServer] CAMERA_CONTROL rejected ({camera_key} -> {action}): run in progress")
+            logger.warning(f"CAMERA_CONTROL rejected ({camera_key} -> {action}): run in progress")
             return {"ok": False, "error": "Camera control rejected: run in progress"}
-        print(f"[LiveODServer] CAMERA_CONTROL: {camera_key} -> {action}")
+        logger.info(f"CAMERA_CONTROL: {camera_key} -> {action}")
         self.camera_control_signal.emit(camera_key, action)
         return {"ok": True}
 
     def _handle_abort_run(self, msg: dict) -> dict:
         """Experiment has acknowledged the abort — clean up and close out the run."""
-        print("Experiment acknowledged: run aborted.")
+        logger.warning("Experiment acknowledged: run aborted.")
         # If _reset_requested is True, the viewer's _handle_reset already
         # emitted reset_signal and the GUI ran main_window.reset().  Re-emitting
         # reset_signal here would queue a second main_window.reset() that races
@@ -602,6 +605,20 @@ class LiveODServer(QThread, NetServer):
             self._scalar_subscriber_count[tier] = max(0, count - 1)
         return {"ok": True}
 
+    def _handle_get_markers(self, msg: dict) -> dict:
+        """Markers for ``camera_key`` (default: the current run's camera)."""
+        camera_key = str(msg.get('camera_key') or self._current_camera_key)
+        return {"ok": True, "camera_key": camera_key, "markers": self.markers.get(camera_key)}
+
+    def _handle_set_markers(self, msg: dict) -> dict:
+        """A remote viewer moved, added, reshaped or deleted a marker."""
+        camera_key = str(msg.get('camera_key') or self._current_camera_key)
+        if not camera_key:
+            return {"ok": False, "error": "No camera to put markers on yet"}
+        stored = self.markers.set(camera_key, msg.get('markers', []))
+        self.markers_changed_signal.emit(camera_key, stored)
+        return {"ok": True, "camera_key": camera_key, "markers": stored}
+
     def _handle_get_adjust_values(self, msg: dict) -> dict:
         """Return current adjust specs and values. Called by remote viewers on connect."""
         with self._adjust_lock:
@@ -642,6 +659,12 @@ class LiveODServer(QThread, NetServer):
             current = max(spec['min_val'], min(spec['max_val'], current))
             self._adjust_values[key] = current
         return {"ok": True}
+
+    def update_adjust_spec(self, key: str, min_val: float, max_val: float, step: float):
+        """Update an adjust spec's bounds from the GUI thread (same process as server)."""
+        return self._handle_set_adjust_spec(
+            {'key': key, 'min_val': min_val, 'max_val': max_val, 'step': step}
+        )
 
     def update_adjust_value(self, key: str, value: float):
         """Update an adjust value from the GUI thread (same process as server)."""

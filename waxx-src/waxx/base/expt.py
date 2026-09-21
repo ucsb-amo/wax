@@ -267,6 +267,15 @@ class Expt(Scanner, Dealer, Scribe):
     # Payload serialisation helpers
     # ------------------------------------------------------------------
 
+    def _expt_file_stem(self) -> str:
+        """Name (no extension) of the file that defines this experiment's class,
+        or '' if it cannot be found."""
+        try:
+            import inspect
+            return Path(inspect.getsourcefile(type(self))).stem
+        except Exception:
+            return ""
+
     def _serialize_init_payload(self) -> dict:
         """Build the INIT_RUN payload from current experiment state."""
         cam_params_dict = {
@@ -308,6 +317,8 @@ class Expt(Scanner, Dealer, Scribe):
             'run_date_str': str(self.run_info.run_date_str),
             'run_datetime_str': str(self.run_info.run_datetime_str),
             'expt_class': str(self.run_info.expt_class),
+            # what liveOD calls the run; the file is not passed in until end_wax
+            'expt_file': self._expt_file_stem(),
             'imaging_type': int(self.run_info.imaging_type),
             'save_data_flag': int(self.run_info.save_data),
             'xvarnames': list(self.xvarnames),
