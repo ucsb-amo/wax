@@ -46,6 +46,34 @@ class TweezerMovesLib():
 
         return A*np.sin(2*np.pi*fm*t + np.pi/2)
         
+    def sinusoidal_amplitude_modulation(self,t,
+                                        amplitude,
+                                        modulation_depth,
+                                        modulation_frequency,
+                                        t_mod_depth_ramp=0.) -> TFloat:
+        """A sinusoidal modulation of amplitude vs. time about a fixed
+        amplitude, starting at that amplitude.
+
+        Args:
+            t (float): The time (in s) through the modulation (from zero).
+            amplitude (float): The DDS amplitude (0 to 1) modulated about.
+            modulation_depth (float): The fractional modulation depth (0 to 1):
+            the amplitude swings between amplitude*(1 -/+ modulation_depth).
+            modulation_frequency (float): The frequency (in Hz) of the
+            modulation.
+            t_mod_depth_ramp (float): If nonzero, specifies the time (in s)
+            over which the modulation depth should be linearly ramped from
+            zero to the specified modulation_depth.
+
+        Returns:
+            float or np.array: amplitude vs time.
+        """
+        d = np.ones_like(t) * modulation_depth
+        mask = t<t_mod_depth_ramp
+        d[mask] = d[mask] * (t[mask]/t_mod_depth_ramp)
+
+        return amplitude * (1. + d*np.sin(2*np.pi*modulation_frequency*t))
+
     def linear(self,t,t_move,y0,yf) -> TFloat:
         slope = (yf - y0) / t_move
         return slope * t + y0

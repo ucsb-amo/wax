@@ -279,6 +279,27 @@ class TweezerTrap():
                                    dt = dt,
                                    ramp_type=VAL_TYPE_AMP)
 
+    def compute_sine_amplitude_modulation(self,t_mod,amp_mod_depth,f_mod,
+                                          t_amod_ramp=0.,dt=dv) -> TFloat:
+        """Fills the values list with absolute amplitudes for a sinusoidal
+        amplitude modulation about the current amplitude.
+
+        Returns:
+            TFloat: the last amplitude written by the modulation.
+        """
+        if dt == dv:
+            dt = self.p.t_tweezer_amp_ramp_dt
+        if not (0. <= amp_mod_depth <= 1.):
+            raise ValueError(f"Modulation depth must be between 0 and 1 (got {amp_mod_depth}).")
+        if self.amplitude * (1. + amp_mod_depth) > 1.:
+            raise ValueError(f"Amplitude modulation peak {self.amplitude*(1.+amp_mod_depth)} exceeds 1 (amplitude {self.amplitude}, depth {amp_mod_depth}).")
+        if f_mod * dt > 0.5:
+            raise ValueError(f"Modulation frequency {f_mod} Hz is above the Nyquist frequency {0.5/dt} Hz for the amplitude step time dt = {dt} s.")
+        return self.compute_values(t_mod,self.moves.sinusoidal_amplitude_modulation,
+                                   self.amplitude,amp_mod_depth,f_mod,t_amod_ramp,
+                                   dt = dt,
+                                   ramp_type=VAL_TYPE_AMP)
+
     @kernel
     def cubic_move(self,t_move,x_move,
                    dt=dv,trigger=True,slopes=True):
@@ -327,7 +348,35 @@ class TweezerTrap():
             dt = self.p.t_tweezer_amp_ramp_dt
         amp_last = self.compute_linear_amplitude_ramp(t_ramp,amp_f,dt)
         self.amp_ramp(t_ramp, amp_last, dt=dt, trigger=trigger, slopes=False)
-        
+
+    @kernel
+    def sine_amplitude_modulation(self,t_mod,amp_mod_depth,f_mod,
+                                  t_amod_ramp=0.,
+                                  dt=dv,trigger=True):
+        """Executes a sinusoidal amplitude modulation of this tweezer trap about
+        its current amplitude A0:
+        A(t) = A0*(1 + amp_mod_depth*sin(2*pi*f_mod*t)).
+
+        Amplitudes are written as absolute values each step dt (a staircase).
+        The trap is left at the last amplitude written, A0 at t_mod only when
+        f_mod*t_mod is a multiple of 1/2.
+
+        Args:
+            t_mod (float): the total duration (in s) of the modulation.
+            amp_mod_depth (float): the fractional modulation depth (0 to 1).
+            f_mod (float): the modulation frequency (in Hz).
+            t_amod_ramp (float): if nonzero, the time (in s) to linearly ramp
+            the modulation depth from 0 to amp_mod_depth.
+            dt (float): the amplitude step time (in s). Defaults to
+            ExptParams.t_tweezer_amp_ramp_dt.
+            trigger (bool): whether or not to trigger the modulation start.
+        """
+        if dt == dv:
+            dt = self.p.t_tweezer_amp_ramp_dt
+        amp_last = self.compute_sine_amplitude_modulation(t_mod,amp_mod_depth,f_mod,
+                                                          t_amod_ramp,dt)
+        self.amp_ramp(t_mod, amp_last, dt=dt, trigger=trigger, slopes=False)
+
     @portable
     def x_to_f(self,x) -> TFloat:
         """Converts the given tweezer position x to the required AOD frequency.
@@ -614,6 +663,17 @@ class TweezerController():
             dt = self.params.t_tweezer_amp_ramp_dt
         self.traps[tweezer_idx].linear_amplitude_ramp(t_ramp,amp_f,
                                                       dt=dt,trigger=trigger)
+
+    @kernel
+    def sine_amplitude_modulation(self,tweezer_idx,
+                                  t_mod,amp_mod_depth,f_mod,
+                                  t_amod_ramp=0.,
+                                  dt=dv,trigger=True):
+        if dt == dv:
+            dt = self.params.t_tweezer_amp_ramp_dt
+        self.traps[tweezer_idx].sine_amplitude_modulation(t_mod,amp_mod_depth,f_mod,
+                                                          t_amod_ramp,
+                                                          dt=dt,trigger=trigger)
 
     def save_trap_list(self):
         from copy import deepcopy
