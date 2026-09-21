@@ -1225,7 +1225,7 @@ class atomdata_base():
         sigma, source = cross_section_for_run(getattr(self, 'data', None),
                                               self.xvardims)
         self.atom_cross_section = sigma
-        self._atom_cross_section_source = source
+        self.atom_cross_section_source = source
         dx_pixel = self.camera_params.pixel_size_m / self.camera_params.magnification
 
         self.atom_number_fit_area_x = self.fit_area_x * dx_pixel / sigma
