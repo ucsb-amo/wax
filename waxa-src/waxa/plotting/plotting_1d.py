@@ -165,7 +165,7 @@ def plot_mixOD(ad,
     axislabel_str = f'{label_name}'
     if xvarunit != "":
         axislabel_str += f' ({xvarunit})'    
-    ax.set_title(f"Run ID: {ad.run_info.run_id}")
+    ax.set_title(f"Run ID: {ad.run_info.run_id} (max_od = {max_od:.3g})")
 
     # Set the x-axis limits to show all images
     ax.set_xlim(0, total_width)

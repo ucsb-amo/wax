@@ -137,7 +137,7 @@ def mixOD_grid(ad,
     else:
         plt.figure(figsize=(10, 8))
     plt.imshow(full_image,vmin=0.,vmax=max_od)
-    plt.title(f"Run ID: {ad.run_info.run_id}")
+    plt.title(f"Run ID: {ad.run_info.run_id} (max_od = {max_od:.3g})")
 
     xv0str = ''
     xv1str = ''
