@@ -3,6 +3,9 @@ import time
 
 from waxx.control import AndorEMCCD, BaslerUSB, DummyCamera
 from waxx.control.cameras.camera_param_classes import CameraParams
+from waxx.util.live_od.log import get_logger
+
+logger = get_logger("camera")
 
 CHECK_EVERY = 0.2
 CHECK_PERIOD = 2.0
@@ -41,7 +44,7 @@ class CameraNanny():
                 time.sleep(CHECK_PERIOD)
                 if np.mod(count,N_NOTIFY) == 0:
                     count = 1
-                    print("Can't reach camera. Make it available to continue, or Ctrl+C to stop the process.")
+                    logger.warning(f"Can't reach camera {camera_params.key}. Make it available to continue, or abort the run.")
             else:
                 return camera
 
@@ -86,16 +89,15 @@ class CameraNanny():
                         pass
                 camera.set_exposure(camera_params.exposure_time)
                 camera.set_gain(camera_params.gain)
-                print(f"[CameraNanny] {camera_params.key}: gain set to {camera_params.gain}")
+                logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
             elif camera_type == "andor":
                 camera.set_EMCCD_gain(camera_params.gain)
                 camera.set_exposure(camera_params.exposure_time)
                 camera.set_amp_mode(preamp=camera_params.preamp)
                 camera.set_hsspeed(camera_params.hs_speed)
-                print(f"[CameraNanny] {camera_params.key}: gain set to {camera_params.gain}")
+                logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
         except Exception as e:
-            print(e)
-            print(f"There was an issue opening the requested camera (key: {camera_params.key}).")
+            logger.error(f"Could not apply the run's settings to camera {camera_params.key}: {e}")
             return DummyCamera()
         return camera
 
@@ -124,8 +126,8 @@ class CameraNanny():
 
         except Exception as e:
             camera = DummyCamera()
-            print(e)
-            print(f"There was an issue opening the requested camera (key: {camera_params.key}).")
+            # a warning, not an error: persistent_get_camera retries this every 2 s
+            logger.warning(f"There was an issue opening the requested camera (key: {camera_params.key}): {e}")
         return camera
 
     def close_all(self):
@@ -135,5 +137,4 @@ class CameraNanny():
                 try:
                     obj.close()
                 except Exception as e:
-                    print(e)
-                    print(f"An error occurred closing camera {k}.")
+                    logger.warning(f"An error occurred closing camera {k}: {e}")

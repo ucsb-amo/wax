@@ -13,7 +13,8 @@ Message format — every message is a pickled dict with a 'tag' key:
                              'xvar_values': dict}
     {'tag': 'OD_IMAGE',     'img_atoms': ndarray, 'img_light': ndarray,
                              'img_dark': ndarray, 'od': ndarray,
-                             'sum_od_x': ndarray, 'sum_od_y': ndarray}
+                             'sum_od_x': ndarray, 'sum_od_y': ndarray,
+                             'shot_idx': int or None}
     {'tag': 'RUN_DONE'}
 """
 
@@ -26,6 +27,9 @@ import zmq
 from PyQt6.QtCore import QThread
 from beacon.discovery.server import NetServer
 from waxx.util.comms_server.hardware_id import scoped_server_id
+from waxx.util.live_od.log import get_logger
+
+logger = get_logger("broadcaster")
 
 
 # Heartbeat interval (s) — sent when the broadcaster queue is idle so that
@@ -68,7 +72,7 @@ class LiveODBroadcaster(QThread, NetServer):
         self._waxx_port = actual_port
         self._start_beacon()
         self._running = True
-        print(f"[LiveODBroadcaster] Publishing on tcp://*:{self._port}")
+        logger.info(f"liveOD broadcaster publishing on tcp://*:{self._port}")
         last_send = time.monotonic()
         try:
             while self._running:
@@ -90,7 +94,9 @@ class LiveODBroadcaster(QThread, NetServer):
                         last_send = time.monotonic()
                     continue
                 except Exception as exc:
-                    print(f"[LiveODBroadcaster] send error: {exc}")
+                    # DEBUG: this record is itself broadcast, so anything louder
+                    # would feed a failing socket its own complaints
+                    logger.debug(f"broadcaster send error: {exc}")
         finally:
             socket.close()
             context.term()
@@ -149,6 +155,8 @@ class LiveODBroadcaster(QThread, NetServer):
             'od': np.asarray(od, dtype=np.float32),
             'sum_od_x': np.asarray(sum_od_x, dtype=np.float32),
             'sum_od_y': np.asarray(sum_od_y, dtype=np.float32),
+            # matches the shot to its SHOT_SCALARS; viewers that predate it ignore it
+            'shot_idx': getattr(plot_data, 'shot_idx', None),
         })
 
     def broadcast_run_done(self):
@@ -169,8 +177,20 @@ class LiveODBroadcaster(QThread, NetServer):
         """
         self._enqueue({'tag': 'FK_TOF', **data})
 
-    def broadcast_log_msg(self, text: str):
-        self._enqueue({'tag': 'LOG_MSG', 'text': str(text)})
+    def broadcast_log_msg(self, text: str, level: int = 20):
+        """``level``: a ``logging`` level number (20 = INFO). Viewers that predate
+        it ignore the key."""
+        self._enqueue({'tag': 'LOG_MSG', 'text': str(text), 'level': int(level)})
+
+    def broadcast_markers(self, camera_key: str, markers: list):
+        """The pins on ``camera_key``'s image (see marker_store). Sent when they
+        change and every couple of seconds, so a viewer that joins late has them."""
+        self._enqueue({'tag': 'MARKERS', 'camera_key': str(camera_key),
+                       'markers': [dict(m) for m in markers]})
+
+    def broadcast_run_state(self, state: str, detail: str = ""):
+        """``LiveODServer.run_state_signal``, for remote viewers."""
+        self._enqueue({'tag': 'RUN_STATE', 'state': str(state), 'detail': str(detail)})
 
     def broadcast_camera_state(self, states: dict):
         """Broadcast the current state of every camera button.
