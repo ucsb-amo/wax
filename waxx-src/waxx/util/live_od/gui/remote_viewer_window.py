@@ -31,11 +31,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from waxx.util.live_od.gui.plotter import LiveODPlotter
+from waxx.util.live_od.gui.plotter import LiveODPlotter, ShotPlotData
 from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.live_scalar_plot_window import LiveScalarPlotWindow
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
+from waxx.util.live_od.gui.camera_menu import CameraMenuButton
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +57,9 @@ class LiveODSubscriber(QThread):
     shot_progress_signal = pyqtSignal(int, int, object)  # shot_idx, N_total, xvar_values
     run_started_signal = pyqtSignal(int, object)    # run_id, xvarnames
     run_done_signal = pyqtSignal()
-    log_msg_signal = pyqtSignal(str)
+    log_msg_signal = pyqtSignal(str, int)           # text, logging level number
+    run_state_signal = pyqtSignal(str, str)         # state, detail (LiveODServer.run_state_signal)
+    markers_signal = pyqtSignal(str, list)          # camera_key, markers (pins on the image)
     connection_status_signal = pyqtSignal(str)
     camera_state_signal = pyqtSignal(object)        # dict[camera_key -> state]
     shot_scalars_signal = pyqtSignal(object)        # per-shot scalar dict
@@ -121,10 +124,10 @@ class LiveODSubscriber(QThread):
                         )
                     try:
                         if tag == "OD_IMAGE":
-                            plot_data = (
+                            plot_data = ShotPlotData((
                                 msg["img_atoms"], msg["img_light"], msg["img_dark"],
                                 msg["od"], msg["sum_od_x"], msg["sum_od_y"],
-                            )
+                            ), msg.get("shot_idx"))     # None from a server that predates it
                             self.od_image_signal.emit(plot_data)
                             t_capture = msg.get("t_capture")
                             if t_capture is not None:
@@ -143,7 +146,15 @@ class LiveODSubscriber(QThread):
                         elif tag == "RUN_DONE":
                             self.run_done_signal.emit()
                         elif tag == "LOG_MSG":
-                            self.log_msg_signal.emit(str(msg.get("text", "")))
+                            # no "level": a server that predates it
+                            self.log_msg_signal.emit(str(msg.get("text", "")),
+                                                     int(msg.get("level", 20)))
+                        elif tag == "MARKERS":
+                            self.markers_signal.emit(str(msg.get("camera_key", "")),
+                                                     list(msg.get("markers", [])))
+                        elif tag == "RUN_STATE":
+                            self.run_state_signal.emit(str(msg.get("state", "")),
+                                                       str(msg.get("detail", "")))
                         elif tag == "CAMERA_STATE":
                             states = msg.get("states", {}) or {}
                             self.camera_state_signal.emit(dict(states))
@@ -253,6 +264,8 @@ class RemoteViewerWindow(QWidget):
 
         self.subscriber: LiveODSubscriber | None = None
         self._current_run_id: int = 0
+        self._marker_camera_key: str = ""   # the camera the server's markers belong to
+        self.viewer_window.markers_changed.connect(self._on_viewer_markers_changed)
 
         # Scalar plot window
         self.live_scalar_plot_window = LiveScalarPlotWindow()
@@ -265,9 +278,13 @@ class RemoteViewerWindow(QWidget):
         self.fk_tof_window = FkTofWindow()
         self.viewer_window.fk_tof_requested.connect(self._open_fk_tof)
 
-        # Adjust panel
+        # Adjust panel — connected once here, not per fetch: the specs are
+        # re-fetched on every new run, and re-connecting each time would send one
+        # extra SET request per fetch for every edit.
         self._adjust_panel = AdjustPanel()
         self._adjust_panel.setWindowTitle("Adjust Parameters (Remote)")
+        self._adjust_panel.value_changed_signal.connect(self._on_remote_adjust_value_changed)
+        self._adjust_panel.spec_updated_signal.connect(self._on_remote_spec_updated)
         self._adjust_button = QPushButton("Adjust")
         self._adjust_button.setMinimumHeight(40)
         self._adjust_button.clicked.connect(self._open_adjust_panel)
@@ -340,7 +357,10 @@ class RemoteViewerWindow(QWidget):
         self.subscriber.run_started_signal.connect(self._on_run_started)
         self.subscriber.run_done_signal.connect(self._on_run_done)
         self.subscriber.log_msg_signal.connect(
-            self.viewer_window.output_window.appendPlainText)
+            self.viewer_window.output_window.append_message)
+        self.subscriber.run_state_signal.connect(self._on_run_state)
+        self.subscriber.markers_signal.connect(self._on_markers)
+        self.subscriber.shot_scalars_signal.connect(self.viewer_window.on_shot_scalars)
         self.subscriber.connection_status_signal.connect(self._on_connection_status)
         self.subscriber.camera_state_signal.connect(self._on_camera_state)
         self.subscriber.shot_scalars_signal.connect(self.live_scalar_plot_window.on_shot_scalars)
@@ -382,41 +402,36 @@ class RemoteViewerWindow(QWidget):
         label_col.addWidget(self.connection_label)
         status_bar.addLayout(label_col)
 
-        self.reset_button = QPushButton("Reset")
-        self.reset_button.setMinimumHeight(40)
+        # The server's cameras: the one on the button is the server's current camera,
+        # the arrow drops down the others. Filled in from the first CAMERA_STATE
+        # broadcast, so the remote viewer needs no camera config (or ARTIQ / kexp).
+        self.camera_menu = CameraMenuButton()
+        self.camera_menu.toggle_requested.connect(self._on_camera_button_clicked)
+        self.camera_menu.hide()
+        status_bar.addWidget(self.camera_menu)
+
+        # The server decides what this does: abort the run if one is active,
+        # otherwise skip a run ID (the acquisition window has a button for each).
+        self.reset_button = QPushButton("Abort run / skip ID")
         self.reset_button.setStyleSheet(
-            'background-color: #ffcccc; font-size: 20px; font-weight: bold;'
+            'background-color: #e53935; color: white; font-weight: bold; padding: 4px 14px;'
         )
+        self.reset_button.setToolTip(
+            "Abort the active run and delete its data file; with no run active, "
+            "skip to the next run ID. No confirmation.")
         self.reset_button.clicked.connect(self._on_reset_clicked)
         status_bar.addWidget(self.reset_button)
 
-        self.live_plot_button = QPushButton("Live Plot")
-        self.live_plot_button.setMinimumHeight(40)
-        self.live_plot_button.clicked.connect(self._open_live_scalar_plot)
-        status_bar.addWidget(self.live_plot_button)
-
-        self.fk_tof_button = QPushButton("FK TOF")
-        self.fk_tof_button.setMinimumHeight(40)
-        self.fk_tof_button.clicked.connect(self._open_fk_tof)
-        status_bar.addWidget(self.fk_tof_button)
-        status_bar.addWidget(self._adjust_button)
+        # Live Plot is in the viewer's toolbar; Adjust joins it there.
+        self.live_plot_button = self.viewer_window.live_plot_button
+        self._adjust_button.setMinimumHeight(0)
+        self.viewer_window.add_window_button(self._adjust_button)
 
         self.reconnect_button = QPushButton("Reconnect")
-        self.reconnect_button.setMinimumHeight(40)
         self.reconnect_button.clicked.connect(self._on_reconnect_clicked)
         status_bar.addWidget(self.reconnect_button)
 
         layout.addLayout(status_bar)
-
-        # Camera control row — buttons are created lazily from the first
-        # CAMERA_STATE broadcast received from the server.  This avoids
-        # importing the kexp camera config here so the remote viewer can run
-        # on machines that don't have ARTIQ / kexp installed.
-        self._camera_buttons: dict[str, QPushButton] = {}
-        self._camera_row = QHBoxLayout()
-        self._camera_row.setSpacing(4)
-        layout.addLayout(self._camera_row)
-
         layout.addWidget(self.viewer_window)
         self.setLayout(layout)
 
@@ -433,20 +448,48 @@ class RemoteViewerWindow(QWidget):
         self.run_id_label.setText(f"Run {run_id} — in progress")
         self.connection_label.setText(f"tcp://{self._ip}:{self._port}")
         self.viewer_window.clear_plots()
-        self.viewer_window.output_window.appendPlainText(
-            f"--- Run {run_id} started ---"
-        )
+        self.viewer_window.on_new_run()
+        self.viewer_window.output_window.append_separator(
+            f"Run {run_id}" if run_id else "Run (not saved)")
         self.live_scalar_plot_window.on_new_run(run_id, list(xvarnames) if xvarnames else [])
+        # a new run may adjust a different set of params — refresh the panel
+        threading.Thread(target=self._fetch_adjust_state, daemon=True).start()
         self.fk_tof_window.on_new_run(run_id, {})
 
     def _on_shot_progress(self, shot_idx: int, N_total: int,
                           xvar_values: object):
         self.viewer_window.update_image_count(shot_idx + 1, N_total)
-        # Minimal per-shot log: avoid flooding the text widget
-        if (shot_idx + 1) % max(1, N_total // 20) == 0 or shot_idx == 0:
-            self.viewer_window.output_window.appendPlainText(
-                f"shot {shot_idx + 1}/{N_total}"
-            )
+        # no log line here: the server's own (about one shot in twenty) arrives as LOG_MSG
+
+    def _on_markers(self, camera_key: str, markers: list):
+        """The server's pins for the camera it is on (sent on change and every 2 s)."""
+        self._marker_camera_key = camera_key
+        if camera_key:
+            self.camera_menu.set_current(camera_key)
+        self.viewer_window.set_markers(markers)     # a no-op when nothing changed
+
+    def _on_viewer_markers_changed(self, _viewer_key: str, markers: list):
+        """A pin was edited here: the server keeps them, under its current camera."""
+        threading.Thread(
+            target=self._send_req_to_server,
+            args=({'tag': 'SET_MARKERS', 'camera_key': self._marker_camera_key,
+                   'markers': list(markers)}, "SET_MARKERS"),
+            daemon=True,
+        ).start()
+
+    def _send_req_to_server(self, payload: dict, label: str):
+        ip, port = self._resolve_req_endpoint()
+        if ip is None:
+            print(f"[RemoteViewer] {label} failed: live_od server not discovered")
+            return
+        self._send_req(ip, port, payload, label=label)
+
+    def _on_run_state(self, state: str, detail: str):
+        from waxx.util.live_od.gui.status_strip import STATES
+        text = STATES.get(state, (state,))[0]
+        run = f"Run {self._current_run_id} — " if self._current_run_id else ""
+        self.run_id_label.setText(f"{run}{text}")
+        self.run_id_label.setToolTip(detail)
 
     def _on_od_image(self, plot_data: tuple):
         self.plotting_queue.put(plot_data)
@@ -516,7 +559,7 @@ class RemoteViewerWindow(QWidget):
                 sock.connect(f"tcp://{ip}:{port}")
                 sock.send(pickle.dumps({'tag': 'GET_ADJUST_VALUES'}))
                 reply = pickle.loads(sock.recv())
-                if reply.get('ok') and reply.get('specs'):
+                if reply.get('ok'):          # empty specs too: the panel clears
                     self._adjust_state_fetched_signal.emit(
                         list(reply['specs']), dict(reply.get('values', {}))
                     )
@@ -531,9 +574,9 @@ class RemoteViewerWindow(QWidget):
     def _on_adjust_state_fetched(self, specs: list, values: object):
         """Called on GUI thread after successful GET_ADJUST_VALUES."""
         self._adjust_panel.populate(specs)
-        self._adjust_panel.value_changed_signal.connect(self._on_remote_adjust_value_changed)
-        self._adjust_panel.spec_updated_signal.connect(self._on_remote_spec_updated)
         self._adjust_panel.update_values(dict(values))
+        count = len(specs)
+        self._adjust_button.setText(f"Adjust ({count})" if count else "Adjust")
 
     def _on_remote_adjust_value_changed(self, key: str, value: float):
         threading.Thread(
@@ -593,37 +636,18 @@ class RemoteViewerWindow(QWidget):
     # Camera control
     # ------------------------------------------------------------------
 
-    _STATE_COLORS = {
-        'open':     'green',
-        'closed':   'gray',
-        'failed':   'red',
-        'loading':  'orchid',
-        'grabbing': 'blue',
-    }
-
     def _on_camera_state(self, states: dict):
-        for key, state in states.items():
-            btn = self._camera_buttons.get(key)
-            if btn is None:
-                btn = QPushButton(key)
-                btn.setMinimumHeight(28)
-                btn.clicked.connect(
-                    lambda _=False, k=key: self._on_camera_button_clicked(k))
-                self._camera_buttons[key] = btn
-                self._camera_row.addWidget(btn)
-            color = self._STATE_COLORS.get(state, 'gray')
-            btn.setStyleSheet(f"background-color: {color}")
-            # An incoming state update is the server's authoritative echo —
-            # re-enable any button that was greyed out after a click.
-            if not btn.isEnabled():
-                btn.setEnabled(True)
+        self.camera_menu.set_states(states)
+        self.camera_menu.setVisible(bool(states))
+        # An incoming state update is the server's authoritative echo —
+        # re-enable any camera that was greyed out after a click.
+        for key in states:
+            self.camera_menu.set_camera_enabled(key, True)
 
     def _on_camera_button_clicked(self, camera_key: str):
-        btn = self._camera_buttons.get(camera_key)
-        if btn is not None:
-            # Disable until the server broadcasts the new CAMERA_STATE or the
-            # worker thread's request fails.  Prevents queued duplicate REQs.
-            btn.setEnabled(False)
+        # Disable until the server broadcasts the new CAMERA_STATE or the
+        # worker thread's request fails.  Prevents queued duplicate REQs.
+        self.camera_menu.set_camera_enabled(camera_key, False)
         self.viewer_window.output_window.appendPlainText(
             f"Toggling camera {camera_key}…"
         )
@@ -641,12 +665,9 @@ class RemoteViewerWindow(QWidget):
         the user can retry.  Either way, schedule a fallback re-enable after
         a few seconds in case the broadcast never arrives.
         """
-        btn = self._camera_buttons.get(camera_key)
-        if btn is None:
-            return
         # Fallback: if no CAMERA_STATE arrives within 5 s, re-enable the
-        # button so it doesn't stay greyed out forever.
-        QTimer.singleShot(5000, lambda b=btn: b.setEnabled(True))
+        # camera so it doesn't stay greyed out forever.
+        QTimer.singleShot(5000, lambda k=camera_key: self.camera_menu.set_camera_enabled(k, True))
 
     def _send_camera_control(self, camera_key: str, action: str):
         ip, port = self._resolve_req_endpoint()
@@ -746,6 +767,8 @@ if __name__ == "__main__":
     port = int(sys.argv[2]) if len(sys.argv) > 2 else None
 
     app = QApplication(sys.argv)
+    from waxx.util.live_od.gui import theme
+    theme.apply_theme(True)     # the ⚙ button in the toolbar switches it for this session
     win = RemoteViewerWindow(ip=ip, port=port)
     win.setWindowTitle("LiveOD Viewer")
     win.setWindowIcon(

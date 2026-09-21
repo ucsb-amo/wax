@@ -40,6 +40,10 @@ METRICS = [
     ("fit amp y",              "fit_amp_y",              1.0,  "sum OD"),
 ]
 
+NO_SECOND_METRIC = "(none)"
+COLOR_1 = (100, 180, 255)       # left axis and its points
+COLOR_2 = (255, 160, 60)        # right axis and its points
+
 # Metrics that require Gaussian fits (vs those that only need integrated OD)
 _FIT_KEYS = {
     "atom_number_fit_area_x",
@@ -52,7 +56,14 @@ _FIT_KEYS = {
 
 
 def _metric_tier(key: str) -> str:
-    """Return the compute tier ('atom_number' or 'fits') for a metric key."""
+    """Return the compute tier ('atom_number' or 'fits') for a metric key.
+
+    The tier says what this metric needs, but the Analyzer computes every
+    metric whenever any tier is subscribed -- otherwise switching metric
+    mid-run would leave every earlier shot as a NaN and blank the plot. So
+    the subscription only decides whether scalars are computed at all, which
+    is why closing this window still stops the work.
+    """
     return "fits" if key in _FIT_KEYS else "atom_number"
 
 
@@ -110,6 +121,16 @@ class LiveScalarPlotWindow(QWidget):
         self.metric_combo.currentIndexChanged.connect(self._on_metric_changed)
         ctrl.addWidget(self.metric_combo)
 
+        # an optional second metric, on its own y axis at the right
+        ctrl.addWidget(QLabel("+"))
+        self.metric2_combo = QComboBox()
+        self.metric2_combo.addItem(NO_SECOND_METRIC)
+        for label, *_ in METRICS:
+            self.metric2_combo.addItem(label)
+        self.metric2_combo.setToolTip("A second metric, plotted against the right-hand axis")
+        self.metric2_combo.currentIndexChanged.connect(self._on_metric_changed)
+        ctrl.addWidget(self.metric2_combo)
+
         ctrl.addWidget(QLabel("X axis:"))
         self.xaxis_combo = QComboBox()
         self.xaxis_combo.addItem("shot index")
@@ -138,9 +159,29 @@ class LiveScalarPlotWindow(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self._scatter_item = pg.ScatterPlotItem(
-            size=5, brush=pg.mkBrush(100, 180, 255, 200)
+            size=5, brush=pg.mkBrush(*COLOR_1, 200), pen=None
         )
         self.plot_widget.addItem(self._scatter_item)
+
+        # Second metric: a ViewBox of its own sharing the x axis, read against the
+        # right-hand axis. Each axis is drawn in its points' colour.
+        plot_item = self.plot_widget.getPlotItem()
+        self._vb2 = pg.ViewBox()
+        plot_item.scene().addItem(self._vb2)
+        plot_item.getAxis('right').linkToView(self._vb2)
+        self._vb2.setXLink(plot_item)
+        self._scatter_item2 = pg.ScatterPlotItem(
+            size=6, symbol='s', brush=pg.mkBrush(*COLOR_2, 200), pen=None
+        )
+        self._vb2.addItem(self._scatter_item2)
+        plot_item.vb.sigResized.connect(self._sync_second_viewbox)
+        self._sync_second_viewbox()
+        for axis_name, color in (('left', COLOR_1), ('right', COLOR_2)):
+            axis = plot_item.getAxis(axis_name)
+            axis.setPen(pg.mkPen(color))
+            axis.setTextPen(pg.mkPen(color))
+        plot_item.getAxis('right').setGrid(False)   # one grid (the left axis's) is enough
+        plot_item.hideAxis('right')
         layout.addWidget(self.plot_widget)
 
         self.setLayout(layout)
@@ -197,9 +238,22 @@ class LiveScalarPlotWindow(QWidget):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _second_metric(self):
+        """The METRICS entry chosen for the right-hand axis, or None."""
+        idx = self.metric2_combo.currentIndex() - 1     # 0 is "(none)"
+        return METRICS[idx] if idx >= 0 else None
+
     def _current_tier(self) -> str:
-        key = METRICS[self.metric_combo.currentIndex()][1]
-        return _metric_tier(key)
+        keys = [METRICS[self.metric_combo.currentIndex()][1]]
+        if self._second_metric() is not None:
+            keys.append(self._second_metric()[1])
+        return "fits" if any(_metric_tier(k) == "fits" for k in keys) else "atom_number"
+
+    def _sync_second_viewbox(self):
+        """Keep the second metric's ViewBox exactly over the plot's own."""
+        main_vb = self.plot_widget.getPlotItem().vb
+        self._vb2.setGeometry(main_vb.sceneBoundingRect())
+        self._vb2.linkedViewChanged(main_vb, self._vb2.XAxis)
 
     def _on_metric_changed(self, _idx):
         new_tier = self._current_tier()
@@ -216,6 +270,7 @@ class LiveScalarPlotWindow(QWidget):
         self._data.clear()
         self._unit_cache.clear()
         self._scatter_item.setData([], [])
+        self._scatter_item2.setData([], [])
         self.plot_widget.setTitle("")
 
     def _get_x_unit(self, xvarname: str, values) -> tuple:
@@ -245,23 +300,10 @@ class LiveScalarPlotWindow(QWidget):
 
         return result
 
-    def _refresh_plot(self):
-        if not self._data:
-            self._scatter_item.setData([], [])
-            return
-
-        # Slice to requested window
-        if self.show_all_check.isChecked():
-            data = list(self._data)
-        else:
-            n = self.n_shots_spin.value()
-            data = list(self._data)[-n:]
-
-        metric_idx = self.metric_combo.currentIndex()
-        _label, key, ymult, yunit = METRICS[metric_idx]
-        xaxis_sel = self.xaxis_combo.currentText()
-
-        # Build (x, y) pairs, skipping any NaN/None y values
+    @staticmethod
+    def _series(data, key, ymult, xaxis_sel):
+        """(xs, ys) for one metric, skipping shots where it or the x value is
+        missing or not finite."""
         xs, ys = [], []
         for d in data:
             y_raw = d.get(key)
@@ -282,26 +324,44 @@ class LiveScalarPlotWindow(QWidget):
                     continue
             xs.append(x_val)
             ys.append(y_val)
+        return xs, ys
 
-        if not xs:
+    def _refresh_plot(self):
+        plot_item = self.plot_widget.getPlotItem()
+        second = self._second_metric()
+        plot_item.showAxis('right') if second is not None else plot_item.hideAxis('right')
+
+        if not self._data:
             self._scatter_item.setData([], [])
+            self._scatter_item2.setData([], [])
             return
 
-        x_arr = np.array(xs, dtype=float)
-        y_arr = np.array(ys, dtype=float)
+        # Slice to requested window
+        if self.show_all_check.isChecked():
+            data = list(self._data)
+        else:
+            n = self.n_shots_spin.value()
+            data = list(self._data)[-n:]
 
-        # X-axis unit scaling
-        xlabel = "shot index"
+        xaxis_sel = self.xaxis_combo.currentText()
+        _label, key, ymult, yunit = METRICS[self.metric_combo.currentIndex()]
+        xs, ys = self._series(data, key, ymult, xaxis_sel)
+        xs2, ys2 = self._series(data, second[1], second[2], xaxis_sel) if second is not None else ([], [])
+
+        # X-axis unit scaling (one scale for both series)
+        xlabel, xmult = "shot index", 1.0
         if xaxis_sel != "shot index":
-            unit, xmult = self._get_x_unit(xaxis_sel, xs)
-            x_arr = x_arr * xmult
+            unit, xmult = self._get_x_unit(xaxis_sel, xs or xs2)
             xlabel = f"{xaxis_sel} ({unit})" if unit else xaxis_sel
 
-        ylabel = f"{_label} ({yunit})" if yunit else _label
-
-        self._scatter_item.setData(x_arr, y_arr)
+        self._scatter_item.setData(np.array(xs, dtype=float) * xmult, np.array(ys, dtype=float))
+        self._scatter_item2.setData(np.array(xs2, dtype=float) * xmult, np.array(ys2, dtype=float))
         self.plot_widget.setLabel("bottom", xlabel)
-        self.plot_widget.setLabel("left", ylabel)
+        self.plot_widget.setLabel("left", f"{_label} ({yunit})" if yunit else _label)
+        if second is not None:
+            self.plot_widget.setLabel("right", f"{second[0]} ({second[3]})" if second[3] else second[0])
+            self._vb2.enableAutoRange(axis=pg.ViewBox.YAxis)
+            self._sync_second_viewbox()
 
         n_skipped = len(data) - len(xs)
         title = f"run {self._current_run_id}"

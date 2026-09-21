@@ -1,8 +1,8 @@
 ﻿import sys
+import logging
 from queue import Queue
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle
-from PyQt6.QtGui import QFont
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStyle
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSettings
 import time
 import names
 
@@ -11,6 +11,7 @@ from waxa import ROI
 from waxx.util.live_od.config import get_config, set_config
 from waxx.util.live_od.camera_mother import CameraMother, CameraBaby, DataHandler, CameraNanny
 from waxx.util.live_od.camera_connection_widget import CamConnBar
+from waxx.util.live_od.gui.camera_menu import CameraMenuButton
 from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.analyzer import Analyzer
 from waxx.util.live_od.gui.plotter import LiveODPlotter
@@ -19,12 +20,18 @@ from waxx.util.live_od.live_od_broadcaster import LiveODBroadcaster
 from waxx.util.live_od.gui.live_scalar_plot_window import LiveScalarPlotWindow
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
+from waxx.util.live_od.gui.status_strip import StatusStrip
+from waxx.util.live_od.log import get_logger, setup_logging, install_excepthooks, DEFAULT_LOG_DIR
+
+logger = get_logger("window")
 
 class LiveODWindow(QWidget):
     interrupt = pyqtSignal()
-    def __init__(self, config=None):
+    def __init__(self, config=None, settings=None, log_dir=DEFAULT_LOG_DIR):
         """``config``: the lab's LiveODConfig. Default: the active one
-        (waxx.util.live_od.config.set_config, called by the lab's launcher)."""
+        (waxx.util.live_od.config.set_config, called by the lab's launcher).
+        ``settings``: a QSettings to remember the layout in; None remembers nothing.
+        ``log_dir``: where the rotating log file goes; None for no file."""
 
         # Checked before any Qt object exists, so a missing config is a readable
         # error rather than a half-built window.
@@ -42,6 +49,12 @@ class LiveODWindow(QWidget):
 
         self.config = config
         self.server_talk = self.config.run_id_source
+        self._settings = settings
+
+        # Before anything that logs: the terminal, the log file and the GUI panel
+        # all hang off this, and uncaught exceptions are routed into it too.
+        self._qt_log_handler = setup_logging(log_dir)
+        install_excepthooks()
 
         self.queue = Queue()
         self.camera_nanny = CameraNanny()
@@ -59,6 +72,7 @@ class LiveODWindow(QWidget):
         self._run_was_reset = False  # True when reset() kills an active no-camera run
         self.setup_widgets()
         self.setup_layout()
+        self._qt_log_handler.record_signal.connect(self._on_log_record)
 
         # ZMQ REP server — drives all run lifecycle events.
         self.data_saver = self.config.data_saver
@@ -78,7 +92,13 @@ class LiveODWindow(QWidget):
         self.live_od_server.run_done_signal.connect(self.on_run_done)
         self.live_od_server.reset_signal.connect(self.reset)
         self.live_od_server.camera_control_signal.connect(self.on_remote_camera_control)
+        self.live_od_server.run_state_signal.connect(self.on_run_state)
         self.live_od_server.start()
+
+        # The numbers in the corner of the OD image need the per-shot scalars
+        # whether or not a Live Plot window is open (~4 ms a shot).
+        self.live_od_server.register_scalar_subscription('fits')
+        self.analyzer.shot_scalars_signal.connect(self.viewer_window.on_shot_scalars)
 
         # Give the Analyzer a reference to the server for subscription queries
         self.analyzer.set_server(self.live_od_server)
@@ -89,6 +109,9 @@ class LiveODWindow(QWidget):
         self.live_od_server.run_started_signal.connect(self.broadcaster.broadcast_run_started)
         self.live_od_server.shot_progress_signal.connect(self.broadcaster.broadcast_shot_progress)
         self.live_od_server.run_done_signal.connect(self.broadcaster.broadcast_run_done)
+        self.live_od_server.run_state_signal.connect(self.broadcaster.broadcast_run_state)
+        self.live_od_server.markers_changed_signal.connect(self._on_remote_markers_changed)
+        self.viewer_window.markers_changed.connect(self._on_viewer_markers_changed)
         self.live_od_server.adjust_specs_signal.connect(self._on_adjust_specs)
         self.live_od_server.shot_adjust_values_signal.connect(self.broadcaster.broadcast_adjust_values)
         self.live_od_server.shot_adjust_values_signal.connect(self._adjust_panel.update_values)
@@ -108,6 +131,7 @@ class LiveODWindow(QWidget):
         # state without needing to click anything.
         self._camera_state_timer = QTimer(self)
         self._camera_state_timer.timeout.connect(self._broadcast_camera_states)
+        self._camera_state_timer.timeout.connect(self._rebroadcast_markers)     # same reason
         self._camera_state_timer.start(2000)
         # Initial broadcast (will reach any already-subscribed viewers).
         QTimer.singleShot(500, self._broadcast_camera_states)
@@ -117,7 +141,7 @@ class LiveODWindow(QWidget):
             self.broadcaster.broadcast_camera_state(
                 self.camera_conn_bar.get_states())
         except Exception as e:
-            print(f"[LiveODWindow] camera-state broadcast error: {e}")
+            logger.debug(f"camera-state broadcast error: {e}")
 
     def on_remote_camera_control(self, camera_key: str, action: str):
         """Slot for ``LiveODServer.camera_control_signal``.
@@ -142,26 +166,47 @@ class LiveODWindow(QWidget):
             else:  # toggle
                 btn.button_pressed()
         except Exception as e:
-            self.msg(f"Remote camera control error ({camera_key}/{action}): {e}")
+            self.msg(f"Remote camera control error ({camera_key}/{action}): {e}", logging.ERROR)
         finally:
             self._broadcast_camera_states()
+
+    def _on_camera_toggle_requested(self, camera_key: str):
+        """The status row's camera button, or its drop-down: connect / disconnect."""
+        btn = self.camera_conn_bar.get_button(camera_key)
+        if btn is None:
+            return
+        try:
+            btn.button_pressed()
+        except Exception as e:
+            self.msg(f"Camera {camera_key}: {e}", logging.ERROR)
 
     def update_run_id_label(self):
         try:
             rid = self.server_talk.get_run_id()
-            self.run_id_label.setText(f"Run ID: {rid}")
         except Exception as e:
-            self.run_id_label.setText("Run ID: (unavailable)")
+            rid = None
+        self.status_strip.set_next_run_id(rid)
 
     def setup_widgets(self):
         self.server_talk.check_for_mapped_data_dir()
 
         self.viewer_window = LiveODViewer()
-        self.setup_run_id_label()
-        self.setup_eta_label()
+        # the progress bar in the status strip carries the shot count here
+        self.viewer_window.image_count_label.hide()
+        self.setup_status_strip()
         self.setup_output_window()
-        self.setup_fix_button()
+        self.setup_run_buttons()
+        # CamConnBar owns the cameras (a CameraButton each: open/close, state) but is
+        # not shown: the camera button in the status row shows and drives it
         self.camera_conn_bar = CamConnBar(self.camera_nanny, self.output_window)
+        self.camera_conn_bar.setParent(self)
+        self.camera_conn_bar.hide()
+        self.camera_menu = CameraMenuButton([b.camera_name for b in self.camera_conn_bar.buttons])
+        self.camera_menu.set_states(self.camera_conn_bar.get_states())   # those opened on start
+        for btn in self.camera_conn_bar.buttons:
+            btn.state_changed.connect(self.camera_menu.set_state)
+        self.camera_menu.toggle_requested.connect(self._on_camera_toggle_requested)
+        self.status_strip.add_camera_widget(self.camera_menu)
 
         self.plotting_queue = Queue()
         self.analyzer = Analyzer(self.plotting_queue, self.viewer_window)
@@ -182,42 +227,48 @@ class LiveODWindow(QWidget):
         self._adjust_panel.spec_updated_signal.connect(self._on_adjust_spec_updated)
         self._adjust_button = QPushButton("Adjust")
         self._adjust_button.setMinimumHeight(40)
+        self._adjust_button.setEnabled(False)
         self._adjust_button.clicked.connect(self._open_adjust_panel)
 
-    def setup_screenshot_button(self):
-        pass  # removed
+    def setup_run_buttons(self):
+        """The old 'Reset' button aborted the run if there was one and otherwise
+        skipped a run ID. Skipping an ID by hand is not something anyone does, so the
+        button only aborts. It is never disabled: if this window's idea of whether a
+        run is active were ever wrong, a disabled abort button would be the worst way
+        to find out. (A remote viewer's RESET still reaches reset() unchanged.)"""
+        self.abort_button = QPushButton('Abort')
+        self.abort_button.setToolTip(
+            "Stop the run now and delete its data file. No confirmation: it has to be fast.")
+        self.abort_button.clicked.connect(self._on_abort_clicked)
+        # fixed width: the button turns bold red during a run, and nothing that
+        # happens when a run starts may change the window's width
+        self.abort_button.setFixedWidth(56)
+        self.fix_button = self.abort_button     # the name it had as 'Reset'
+        self._update_run_buttons()
 
-    def setup_eta_label(self):
-        self.eta_label = QLabel("ETA --:--")
-        self.eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        font = QFont()
-        font.setPointSize(11)
-        font.setBold(True)
-        self.eta_label.setFont(font)
-        self.eta_label.setStyleSheet("color: #444;")
+    def _run_is_active(self) -> bool:
+        server = getattr(self, 'live_od_server', None)
+        return (bool(getattr(self, '_run_active', False))
+                or getattr(self, 'the_baby', None) is not None
+                or bool(server is not None and server._run_in_progress))
 
-    def setup_fix_button(self):
-        self.fix_button = QPushButton('Reset')
-        self.fix_button.setMinimumHeight(40)
-        self.fix_button.setStyleSheet('background-color: #ffcccc; font-size: 40px; font-weight: bold;')
-        self.fix_button.clicked.connect(self.reset)
-        self.run_id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    def _on_abort_clicked(self):
+        if self._run_is_active():
+            self.reset()
+        else:
+            self.msg("Abort: there is no run to abort.")
+
+    def _update_run_buttons(self):
+        self.abort_button.setStyleSheet(
+            'background-color: #e53935; color: white; font-weight: bold;'
+            if self._run_is_active() else '')
 
     def setup_output_window(self):
-        font = QFont()
-        font.setPointSize(10)
         self.output_window = self.viewer_window.output_window
-        self.output_window.setFont(font)
-        self.output_window.setReadOnly(True)
 
-    def setup_run_id_label(self):
-        # Add Run ID label
-        self.run_id_label = QLabel()
-        self.run_id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        font = QFont()
-        font.setPointSize(12)
-        font.setBold(True)
-        self.run_id_label.setFont(font)
+    def setup_status_strip(self):
+        self.status_strip = StatusStrip()
+        self.status_strip.title_changed.connect(self._on_status_title)
         self.update_run_id_label()
         # Timer for periodic update
         self.run_id_timer = QTimer(self)
@@ -226,21 +277,92 @@ class LiveODWindow(QWidget):
 
     def setup_layout(self):
         layout = QVBoxLayout()
-        control_bar = QHBoxLayout()
-        cam_bar = QVBoxLayout()
-        run_id_row = QHBoxLayout()
-        run_id_row.addWidget(self.eta_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        run_id_row.addWidget(self.run_id_label, 1, Qt.AlignmentFlag.AlignCenter)
-        cam_bar.addLayout(run_id_row)
-        cam_bar.addWidget(self.camera_conn_bar)
-        control_bar.addLayout(cam_bar)
-        control_bar.addWidget(self._adjust_button)
-        control_bar.addWidget(self.fix_button)
-        layout.addLayout(control_bar)
-        layout.addWidget(self.viewer_window)
+        layout.setContentsMargins(6, 5, 6, 6)
+        layout.setSpacing(3)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(4)
+        status_row.addWidget(self.status_strip, 1)
+        status_row.addWidget(self.abort_button)
+        layout.addLayout(status_row)
+        self._adjust_button.setMinimumHeight(0)     # sized like its toolbar neighbours
+        self._adjust_button.setFixedWidth(72)       # "Adjust (12)" fits: no growth at run start
+        self.viewer_window.add_window_button(self._adjust_button)
+        layout.addWidget(self.viewer_window, 1)
         self.setLayout(layout)
-    
-    # Slot to copy screenshot removed.
+        if self._settings is not None:
+            self.viewer_window.attach_settings(self._settings)
+            geometry = self._settings.value("window/geometry")
+            if geometry is not None:
+                self.restoreGeometry(geometry)
+
+    # ------------------------------------------------------------------
+    # Status, log
+    # ------------------------------------------------------------------
+
+    def on_run_state(self, state: str, detail: str):
+        """Slot for ``LiveODServer.run_state_signal``."""
+        self.status_strip.set_state(state, detail)
+        if state in ("saved", "done", "error"):
+            QApplication.alert(self, 0)     # flash the taskbar entry until focused
+
+    # ------------------------------------------------------------------
+    # Markers: drawn by the viewer, kept per camera by the server, shared with
+    # the remote viewers
+    # ------------------------------------------------------------------
+
+    def _show_markers_for(self, camera_key: str):
+        try:
+            markers = self.live_od_server.markers.get(camera_key) if camera_key else []
+        except Exception as exc:
+            self.msg(f"Could not read the markers for {camera_key}: {exc}", logging.WARNING)
+            markers = []
+        self.viewer_window.set_markers(markers)
+        self.broadcaster.broadcast_markers(camera_key, markers)
+
+    def _on_viewer_markers_changed(self, camera_key: str, markers: list):
+        """A pin was edited in this window."""
+        if not camera_key:
+            return      # no run yet, so no camera to keep them under
+        try:
+            stored = self.live_od_server.set_markers(camera_key, markers)
+        except Exception as exc:
+            self.msg(f"Could not store the markers for {camera_key}: {exc}", logging.WARNING)
+            return
+        self.broadcaster.broadcast_markers(camera_key, stored)
+
+    def _on_remote_markers_changed(self, camera_key: str, markers: list):
+        """A pin was edited in a remote viewer (the server has already stored it)."""
+        if camera_key == self.viewer_window._camera_key:
+            self.viewer_window.set_markers(markers)
+        self.broadcaster.broadcast_markers(camera_key, markers)
+
+    def _rebroadcast_markers(self):
+        camera_key = self.viewer_window._camera_key
+        if camera_key:
+            self.broadcaster.broadcast_markers(camera_key, self.viewer_window.get_markers())
+
+    def _on_status_title(self, text: str):
+        base = self.config.window_title
+        self.setWindowTitle(f"{base} — {text}" if text else base)
+
+    def _on_log_record(self, levelno: int, text: str, created: float):
+        """Every ``waxx.live_od`` record, on the GUI thread: into the panel, and out
+        to the remote viewers."""
+        try:
+            self.output_window.append_record(levelno, text, created)
+            if hasattr(self, 'broadcaster'):
+                self.broadcaster.broadcast_log_msg(text, levelno)
+            if levelno >= logging.ERROR:
+                QApplication.alert(self, 0)
+        except Exception as exc:
+            # not through the logger: an error here would come straight back here
+            print(f"[LiveODWindow] could not show a log record: {exc}", file=sys.stderr)
+
+    def closeEvent(self, event):
+        if self._settings is not None:
+            self._settings.setValue("window/geometry", self.saveGeometry())
+            self.viewer_window.save_settings()
+        super().closeEvent(event)
 
     def _open_live_scalar_plot(self):
         """Show the live scalar plot window, creating it if needed."""
@@ -260,16 +382,17 @@ class LiveODWindow(QWidget):
     def _on_adjust_specs(self, specs: list):
         """Called after INIT_RUN — repopulate with the new run's adjust params (may be empty)."""
         self._adjust_panel.populate(specs)
+        count = len(specs)
+        self._adjust_button.setText(f"Adjust ({count})" if count else "Adjust")
+        self._adjust_button.setEnabled(bool(count))
 
     def _on_adjust_value_changed(self, key: str, value: float):
         """Forward spinbox changes to the server's live adjust dict."""
         self.live_od_server.update_adjust_value(key, value)
 
     def _on_adjust_spec_updated(self, key: str, min_val: float, max_val: float, step: float):
-        """Sync new spec bounds to the server when the cog dialog is accepted."""
-        self.live_od_server._handle_set_adjust_spec(
-            {'key': key, 'min_val': min_val, 'max_val': max_val, 'step': step}
-        )
+        """Sync new spec bounds to the server when the spec dialog is accepted."""
+        self.live_od_server.update_adjust_spec(key, min_val, max_val, step)
 
     def _on_scalar_subscription_changed(self, old_tier, new_tier):
         """Update the server's subscription counters when the plot window changes metric or visibility."""
@@ -305,9 +428,29 @@ class LiveODWindow(QWidget):
 
         # Propagate run metadata to Analyzer and scalar plot window
         self.analyzer.set_camera_params(camera_params or {})
+        # object-plane pixel size (pixel / magnification), for the viewer's µm display
+        try:
+            self.viewer_window.set_pixel_size_m(
+                float(camera_params['pixel_size_m']) / float(camera_params['magnification']))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            self.viewer_window.set_pixel_size_m(None)
         self.analyzer.reset()
         self.viewer_window.set_camera_key(camera_key)
-        self.eta_label.setText("ETA --:--")
+        if capture_images and camera_key:
+            self.camera_menu.set_current(camera_key)
+        self.viewer_window.on_new_run()
+        run_id = self.live_od_server._current_run_id
+        # the experiment file's name (the class name from an older experiment process)
+        expt_class = (self.live_od_server._current_expt_name
+                      or str((run_info_payload or {}).get('expt_class', '')))
+        # this camera's pins, from the server's store
+        self._show_markers_for(camera_key)
+        self.status_strip.start_run(run_id, expt_class=expt_class,
+                                    camera_key=camera_key if capture_images else "",
+                                    save_data=save_data, n_shots=n_shots)
+        self.output_window.append_separator(
+            " · ".join(p for p in (f"Run {run_id}" if run_id else "Run (not saved)", expt_class) if p))
+        self._update_run_buttons()
         xvarnames = list(run_info_payload.get('xvarnames', [])) if run_info_payload else []
         self.live_scalar_plot_window.on_new_run(self.live_od_server._current_run_id, xvarnames)
         self.fk_tof_window.on_new_run(
@@ -322,7 +465,7 @@ class LiveODWindow(QWidget):
         # the new DataHandler has started, so the display never updates.
         if self.data_handler is not None:
             if self.data_handler.isRunning():
-                self.msg("Warning: previous DataHandler still running — interrupting it.")
+                self.msg("Previous DataHandler still running — interrupting it.", logging.WARNING)
                 self.data_handler.interrupted = True
                 self.data_handler.wait(500)
             # Disconnect before replacing so a late SaveWorker from the
@@ -346,7 +489,7 @@ class LiveODWindow(QWidget):
         # the remote machine's hardware) and the grab-loop timed out slowly, or
         # when on_run_done() was called before the baby finished its grab.
         if self.the_baby is not None and self.the_baby.isRunning():
-            self.msg(f"Warning: previous CameraBaby still running — interrupting it.")
+            self.msg("Previous CameraBaby still running — interrupting it.", logging.WARNING)
             try:
                 self.the_baby.interrupted = True
             except Exception:
@@ -402,7 +545,7 @@ class LiveODWindow(QWidget):
         self.the_baby.honorable_death_signal.connect(
             lambda: self.msg(f'Run complete. {name} has died honorably.'))
         self.the_baby.dishonorable_death_signal.connect(
-            lambda: self.msg(f'{name} died dishonorably.'))
+            lambda: self.msg(f'{name} died dishonorably.', logging.WARNING))
 
         self.the_baby.cam_status_signal.connect(
             lambda s: self.live_od_server.on_cam_ready() if s == 2 else None,
@@ -442,8 +585,7 @@ class LiveODWindow(QWidget):
         _reset_requested flag, so the experiment aborts at the next shot
         boundary and the unusable file is deleted.
         """
-        self.msg(f"Data file unusable ({reason}) — aborting run.")
-        print(f"[LiveODWindow] Aborting run: data file unusable: {reason}")
+        self.msg(f"Data file unusable ({reason}) — aborting run.", logging.ERROR)
         self.reset()
 
     def on_run_done(self):
@@ -463,18 +605,17 @@ class LiveODWindow(QWidget):
         # run_id is claimed + incremented atomically at INIT_RUN
         # (server_talk.claim_run_id), so there is nothing to increment here.
         self._run_was_reset = False
-        self.eta_label.setText("ETA --:--")
+        self._update_run_buttons()
 
     def on_shot_timing(self, delta_t: float, eta_str: str):
-        """Update the ETA label."""
-        self.eta_label.setText(f"ETA {eta_str}")
+        """Update Δt and the ETA in the status strip."""
+        self.status_strip.set_timing(delta_t, eta_str)
 
     def on_shot_progress(self, shot_idx: int, N_total: int, xvar_values: object):
         """Update the GUI with per-shot progress from the ZMQ server."""
-        try:
-            self.update_image_count(shot_idx + 1, N_total)
-        except Exception:
-            pass
+        self.status_strip.set_progress(shot_idx + 1, N_total)
+        self.status_strip.set_xvars(xvar_values)
+        self.update_image_count(shot_idx + 1, N_total)
 
     def restart_mother(self):
         """Legacy slot kept for compatibility — no-op in ZMQ mode."""
@@ -513,11 +654,9 @@ class LiveODWindow(QWidget):
         self.img_count_run = 0
         self.analyzer.imgs = []
 
-    def msg(self, msg):
-        print(msg)
-        self.output_window.appendPlainText(msg)
-        if hasattr(self, 'broadcaster'):
-            self.broadcaster.broadcast_log_msg(msg)
+    def msg(self, msg, level=logging.INFO):
+        # to the terminal, the log file, the panel and the remote viewers: see _on_log_record
+        logger.log(level, msg)
 
     def grab_start_msg(self, Nimg, *_):
         self.N_img = Nimg
@@ -548,25 +687,26 @@ class LiveODWindow(QWidget):
         # through _handle_reset first, but this is idempotent).
         if hasattr(self, 'live_od_server'):
             self.live_od_server._reset_requested = True
+            self.live_od_server.note_reset_requested()
         if hasattr(self, 'camera_nanny'):
             try:
                 self.camera_nanny.interrupted = True
             except Exception as e:
-                print(e)
-        
+                logger.warning(f"reset: {e}")
+
         if hasattr(self, 'data_handler') and self.data_handler is not None:
             try:
                 self.data_handler.interrupted = True
             except Exception as e:
-                print(e)
-                
+                logger.warning(f"reset: {e}")
+
         if hasattr(self, 'the_baby') and self.the_baby is not None:
             try:
                 self.the_baby.interrupted = True
                 # self.the_baby.dishonorable_death()
-                self.msg('Acquisition aborted, run ID advanced.')
+                self.msg('Acquisition aborted, run ID advanced.', logging.WARNING)
             except Exception as e:
-                print(e)
+                logger.warning(f"reset: {e}")
         else:
             if getattr(self, '_run_active', False):
                 # A no-camera run (setup_camera=False) is in progress.
@@ -574,14 +714,14 @@ class LiveODWindow(QWidget):
                 # The run_id was already claimed + incremented at INIT_RUN, so
                 # do not increment again here.
                 name = getattr(self, '_run_name', '?')
-                msg = f'Run reset. {name} has died dishonorably.'
+                self.msg(f'Run reset. {name} has died dishonorably.', logging.WARNING)
                 self._run_active = False
                 self._run_was_reset = True
             else:
                 # No run was ever started for this id -> manually skip it.
-                msg = 'No active run. Incrementing Run ID.'
+                self.msg('No active run. Incrementing Run ID.')
                 self.server_talk.update_run_id()
-            self.msg(msg)
+                self.update_run_id_label()
 
         if self.the_baby is not None:
             baby_to_wait_for = self.the_baby
@@ -602,6 +742,7 @@ class LiveODWindow(QWidget):
         self.the_baby = None
         self.data_handler = None
         self.camera_nanny.interrupted = False
+        self._update_run_buttons()
 
 def main(config):
     """Run the liveOD acquisition window with the lab's LiveODConfig. Lab launchers
@@ -614,7 +755,8 @@ def main(config):
     except Exception:
         pass        # not Windows: no taskbar identity to set
     app = QApplication(sys.argv)
-    win = LiveODWindow()
+    # layout, toggles and per-camera OD levels are remembered between sessions
+    win = LiveODWindow(settings=QSettings("waxx", "live_od"))
     win.setWindowTitle(config.window_title)
     win.setWindowIcon(win.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
     win.show()

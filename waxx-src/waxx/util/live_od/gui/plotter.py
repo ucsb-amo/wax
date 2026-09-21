@@ -1,6 +1,19 @@
 from PyQt6.QtCore import QThread, pyqtSignal
 from queue import Queue, Empty
 
+
+class ShotPlotData(tuple):
+    """The analyzer's (atoms, light, dark, od, sum_od_x, sum_od_y), carrying the
+    shot's index in the run so the viewer can match it with that shot's scalars
+    (the plotter drops frames when it falls behind, so counting them won't do).
+    Still unpacks as the plain 6-tuple."""
+
+    def __new__(cls, plot_data, shot_idx=None):
+        self = super().__new__(cls, plot_data)
+        self.shot_idx = shot_idx
+        return self
+
+
 class LiveODPlotter(QThread):
     plot_data_signal = pyqtSignal(object)
     def __init__(self, plotwindow, plotting_queue: Queue):

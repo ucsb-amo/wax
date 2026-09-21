@@ -50,8 +50,11 @@ class CamConnBar(QWidget):
 
     def setup_layout(self):
         self.layout = QVBoxLayout()
+        # no margins of its own: the buttons line up with the rows above and below
+        self.layout.setContentsMargins(0, 0, 0, 0)
         # label = QLabel("Camera connections")
         buttonlayout = QHBoxLayout()
+        buttonlayout.setSpacing(4)
         for button in self.buttons:
             buttonlayout.addWidget(button)
         # self.layout.addWidget(label)

@@ -9,6 +9,10 @@ from queue import Queue
 # than on image arrival.
 from waxx.util.live_od.config import get_config
 from waxx.util.live_od.shot_cross_section import ShotCrossSectionPairing
+from waxx.util.live_od.log import get_logger
+from waxx.util.live_od.gui.plotter import ShotPlotData
+
+logger = get_logger("analyzer")
 
 
 class Analyzer(QThread):
@@ -111,12 +115,14 @@ class Analyzer(QThread):
         self.sum_od_y = cropped_sum_od_y
 
         self.analyzed.emit()
-        plot_data = (self.img_atoms, self.img_light, self.img_dark, self.od, self.sum_od_x, self.sum_od_y)
+        plot_data = ShotPlotData((self.img_atoms, self.img_light, self.img_dark,
+                                  self.od, self.sum_od_x, self.sum_od_y), self._shot_idx)
         self.plotting_queue.put(plot_data)
         self.broadcast_signal.emit(plot_data)
 
         # Compute and emit per-shot scalars if any subscriber is watching
-        self._emit_scalars(cropped_od, self.sum_od_x, self.sum_od_y)
+        self._emit_scalars(cropped_od, self.sum_od_x, self.sum_od_y,
+                           crop_origin_px=(x_slice.start or 0, y_slice.start or 0))
         # For FK TOF: compute per-PWA widths when multiple atom images exist
         self._emit_fk_tof()
         self._shot_idx += 1
@@ -125,11 +131,16 @@ class Analyzer(QThread):
     # Scalar computation
     # ------------------------------------------------------------------
 
-    def _emit_scalars(self, cropped_od, sum_od_x, sum_od_y):
+    def _emit_scalars(self, cropped_od, sum_od_x, sum_od_y, crop_origin_px=(0, 0)):
         """Compute per-shot scalar quantities and emit shot_scalars_signal.
 
         Only runs if at least one subscriber (local or remote) has registered
-        interest via the server's subscription counter.
+        interest via the server's subscription counter.  When someone is
+        watching, every metric is computed regardless of which tier they asked
+        for: the scalar plot keeps the dicts and re-reads them when you change
+        metric, so a shot analyzed without its fits would be a permanent hole
+        in the history. The fits cost ~4 ms against a compute_OD of 10-35 ms,
+        so the tier only decides whether we compute at all.
         """
         requested = self._server.get_requested_metrics() if self._server is not None else set()
         if not requested:
@@ -146,6 +157,18 @@ class Analyzer(QThread):
             'fit_sd_y': nan,
             'fit_amp_x': nan,
             'fit_amp_y': nan,
+            # Where the fits sit on the image, so the viewer can draw them over the
+            # profiles and report a centre: fit centres and offsets are in the fit's
+            # own axis (px_size_m * index within the crop, whose first pixel is
+            # crop_origin_px). px_size_m is 1.0 without a pixel calibration.
+            'fit_center_x': nan,
+            'fit_center_y': nan,
+            'fit_offset_x': nan,
+            'fit_offset_y': nan,
+            'crop_origin_px': tuple(int(v) for v in crop_origin_px),
+            'crop_shape_px': (int(sum_od_x.size), int(sum_od_y.size)),
+            'px_size_m': 1.0,
+            'px_calibrated': False,
         }
 
         # The atom-number entries are left as OD x area (m^2) here; the pairing
@@ -156,13 +179,15 @@ class Analyzer(QThread):
             if cp is not None:
                 dx = cp.pixel_size_m / cp.magnification
                 scalars['atom_number'] = float(np.sum(cropped_od)) * dx * dx
+                scalars['px_size_m'] = float(dx)
+                scalars['px_calibrated'] = True
             else:
                 # No physical calibration — use integrated OD as a relative proxy
                 scalars['atom_number'] = float(np.sum(cropped_od))
         except Exception:
             pass
 
-        if 'fits' in requested and sum_od_x.size > 4 and sum_od_y.size > 4:
+        if sum_od_x.size > 4 and sum_od_y.size > 4:
             self._compute_fits(scalars, sum_od_x, sum_od_y, cp)
 
         for done in self._pairing.add_analysis(self._shot_idx, scalars,
@@ -170,7 +195,12 @@ class Analyzer(QThread):
             self.shot_scalars_signal.emit(done)
 
     def _compute_fits(self, scalars, sum_od_x, sum_od_y, cp):
-        """Gaussian fits on x and y projections; updates scalars dict in-place."""
+        """Gaussian fits on x and y projections; updates scalars dict in-place.
+
+        GaussianFit swallows its own failures and returns NaNs, so print_errors
+        is off: these now run on every shot, and a run with no atoms would
+        otherwise print a fit failure twice a shot.
+        """
         from waxa.fitting.gaussian import GaussianFit
 
         dx = cp.pixel_size_m / cp.magnification if cp is not None else 1.0
@@ -178,18 +208,22 @@ class Analyzer(QThread):
         xaxis_y = dx * np.arange(sum_od_y.size)
 
         try:
-            gx = GaussianFit(xaxis_x, sum_od_x)
+            gx = GaussianFit(xaxis_x, sum_od_x, print_errors=False)
             scalars['fit_sd_x'] = float(gx.sigma)
             scalars['fit_amp_x'] = float(gx.amplitude)
+            scalars['fit_center_x'] = float(gx.x_center)
+            scalars['fit_offset_x'] = float(gx.y_offset)
             if cp is not None:
                 scalars['atom_number_fit_area_x'] = float(gx.area) * dx    # / sigma: see _emit_scalars
         except Exception:
             pass
 
         try:
-            gy = GaussianFit(xaxis_y, sum_od_y)
+            gy = GaussianFit(xaxis_y, sum_od_y, print_errors=False)
             scalars['fit_sd_y'] = float(gy.sigma)
             scalars['fit_amp_y'] = float(gy.amplitude)
+            scalars['fit_center_y'] = float(gy.x_center)
+            scalars['fit_offset_y'] = float(gy.y_offset)
             if cp is not None:
                 scalars['atom_number_fit_area_y'] = float(gy.area) * dx
         except Exception:
@@ -270,39 +304,14 @@ class Analyzer(QThread):
             return od, slice(None), slice(None)
 
         try:
-            # --- Prefer drawn ROI rect over view range ---
-            roi_rect = self.viewer.get_od_roi_rect()
-            if roi_rect is not None:
-                x_min = max(0, int(round(roi_rect[0])))
-                y_min = max(0, int(round(roi_rect[1])))
-                x_max = min(od.shape[1], int(round(roi_rect[2])))
-                y_max = min(od.shape[0], int(round(roi_rect[3])))
-                if x_max > x_min and y_max > y_min:
-                    y_slice = slice(y_min, y_max)
-                    x_slice = slice(x_min, x_max)
-                    return od[y_slice, x_slice], x_slice, y_slice
-                # drawn rect is degenerate — fall through to view range
-
-            # Get the current view range from the viewer's OD plot
-            x_range, y_range = self.viewer.get_od_view_range()
-
-            # Convert view coordinates to array indices
-            # Clamp to valid array bounds
-            x_min = max(0, int(round(x_range[0])))
-            x_max = min(od.shape[1], int(round(x_range[1])))
-            y_min = max(0, int(round(y_range[0])))
-            y_max = min(od.shape[0], int(round(y_range[1])))
-
-            # Create slices for cropping
+            # The viewer owns the rule (ROI rect, else view range), so the profiles
+            # it redraws on pan/zoom are sums over the region analysed here.
+            x_min, x_max, y_min, y_max = self.viewer.get_crop_bounds(od.shape)
             y_slice = slice(y_min, y_max)
             x_slice = slice(x_min, x_max)
-
-            # Crop the OD
-            cropped_od = od[y_slice, x_slice]
-
-            return cropped_od, x_slice, y_slice
+            return od[y_slice, x_slice], x_slice, y_slice
 
         except Exception as e:
             # If anything goes wrong, return the original OD
-            print(f"Warning: Could not crop OD to view range: {e}")
+            logger.warning(f"Could not crop OD to view range: {e}")
             return od, slice(None), slice(None)
