@@ -93,6 +93,43 @@ class Monitor:
 
         self.build_device_lookup()
 
+        self.reconcile_state_file()
+
+    def reconcile_state_file(self):
+        """Match the state file's key set to the device frames before looping.
+
+        The _id files are the source of truth for which devices exist; the JSON
+        holds their live values.  Edit an _id file and the file on disk still
+        carries the old key set, so ``detect_changes`` sees keys it has no
+        kernel for and asks for a restart -- which by itself fixes nothing and
+        leaves the monitor restarting forever.  Rebuilding the schema here (keys
+        from the frames, values from the file, migrated by channel across a
+        rename) is what actually clears it.
+        """
+        try:
+            report = self.generator.reconcile(known={'dds': self.dds_dict,
+                                                     'ttl': self.ttl_dict,
+                                                     'dac': self.dac_dict})
+        except Exception as e:
+            print(f"[Monitor] Could not reconcile the device state file: {e!r}")
+            return
+
+        if report['orphaned']:
+            print(f"[Monitor] WARNING: {report['orphaned']} are listed by the device "
+                  f"frames but are not attributes of them, so the monitor cannot "
+                  f"drive them. Dropped from the device state file.")
+        if not report['changed']:
+            return
+        for old_key, new_key in report['renamed']:
+            print(f"[Monitor] Device state file: {old_key} renamed to {new_key} "
+                  f"(same channel, state carried over).")
+        if report['added']:
+            print(f"[Monitor] Device state file: added {report['added']}.")
+        if report['removed']:
+            print(f"[Monitor] Device state file: removed {report['removed']} "
+                  f"(no longer in the device frames).")
+        print("[Monitor] Device state file rebuilt from the device frames.")
+
     def clear_update_lists(self):
         N = 500
         self.dds_frequency_amplitude_updates = [DEFAULT_UPDATE_2FLOAT] * N
@@ -218,7 +255,8 @@ class Monitor:
         if unknown_dds or unknown_dac or unknown_ttl:
             print(f"[Monitor] JSON has new device keys not known to running monitor — "
                   f"DDS: {unknown_dds}, DAC: {unknown_dac}, TTL: {unknown_ttl}. "
-                  f"Signaling restart.")
+                  f"Signaling restart — the restart reconciles the state file "
+                  f"against the device frames.")
             self._schema_changed = True
             self.last_config_data = current_config
             return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates,

@@ -24,7 +24,28 @@ from typing import Dict, Any, List
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = Path(os.getenv('data'))
 sys.path.insert(0, str(kexp_root))
-    
+
+# Fields holding *live* device state, as opposed to the wiring description that
+# comes from the _id files.  These are the ones carried across a reconcile.
+STATE_FIELDS = {
+    'dds': ('frequency', 'amplitude', 'v_pd', 'sw_state', 'force_update_counter'),
+    'ttl': ('ttl_state', 'force_update_counter'),
+    'dac': ('voltage', 'force_update_counter'),
+}
+
+
+def _identity(device_type: str, config: Dict[str, Any]):
+    """Hardware identity of a device entry, independent of its user-facing key.
+
+    Used to carry live values across a *rename* in an _id file (e.g. the
+    placeholder ``ttl57`` becoming ``quantum_machines_trigger``): same crate
+    channel, same state.
+    """
+    if device_type == 'dds':
+        return (config.get('urukul_idx'), config.get('ch'))
+    return (config.get('ch'),)
+
+
 class Generator():
     def __init__(self,dds_frame,ttl_frame,dac_frame,
                  state_file_path,
@@ -61,6 +82,89 @@ class Generator():
                 return 1
         else:
             print("Device states updated.")
+
+    def reconcile(self, known: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Bring the state file's *key set* in line with the device frames.
+
+        The _id files decide which devices exist; the state file holds their
+        live values.  When an _id file gains, loses, or renames a channel, the
+        file on disk still carries the old key set.  This rewrites the file with
+        the schema taken from the frames and the values taken from the existing
+        file — by key where the key survived, otherwise by hardware channel, so
+        a renamed placeholder keeps its state.
+
+        ``known`` optionally maps ``'dds'/'ttl'/'dac'`` to the set of device keys
+        the caller can actually drive (the monitor's kernel lookups).  Entries
+        outside it are dropped and reported, since nothing could act on them.
+
+        Returns a report ``{'added', 'removed', 'renamed', 'orphaned',
+        'changed'}``.  Does not write when nothing changed.
+        """
+        from waxx.util.device_state.state_file_io import read_state, atomic_write
+
+        self.generate_device_config()
+        fresh = self.config_data
+
+        try:
+            old = read_state(self._state_file)
+        except FileNotFoundError:
+            old = {}
+        except Exception as e:
+            print(f"Could not read existing device state file ({e}); rebuilding it.")
+            old = {}
+        if not isinstance(old, dict):
+            old = {}
+
+        report = {'added': [], 'removed': [], 'renamed': [], 'orphaned': [], 'changed': False}
+
+        for device_type in ('dds', 'ttl', 'dac'):
+            old_section = old.get(device_type, {}) or {}
+            new_section = fresh[device_type]
+
+            drivable = None if known is None else set(known.get(device_type, ()))
+            if drivable is not None:
+                for name in list(new_section.keys()):
+                    if name not in drivable:
+                        report['orphaned'].append(f"{device_type}.{name}")
+                        del new_section[name]
+
+            # Old entries indexed by hardware channel, for rename migration.
+            by_identity = {}
+            for name, config in old_section.items():
+                by_identity.setdefault(_identity(device_type, config), name)
+
+            carried_from = set()
+            for name, config in new_section.items():
+                source_name = None
+                if name in old_section:
+                    source_name = name
+                else:
+                    candidate = by_identity.get(_identity(device_type, config))
+                    if candidate is not None and candidate not in new_section:
+                        source_name = candidate
+                        report['renamed'].append((f"{device_type}.{candidate}",
+                                                  f"{device_type}.{name}"))
+                    else:
+                        report['added'].append(f"{device_type}.{name}")
+                if source_name is None:
+                    continue
+                carried_from.add(source_name)
+                source = old_section[source_name]
+                for field in STATE_FIELDS[device_type]:
+                    if field in source:
+                        config[field] = source[field]
+
+            for name in old_section:
+                if name not in new_section and name not in carried_from:
+                    report['removed'].append(f"{device_type}.{name}")
+
+        report['changed'] = any(fresh.get(device_type) != old.get(device_type)
+                                for device_type in ('dds', 'ttl', 'dac'))
+
+        if report['changed']:
+            atomic_write(self._state_file, fresh)
+
+        return report
 
     def extract_dds_devices(self) -> Dict[str, Dict[str, Any]]:
         """Extract DDS device states from a dds_frame object."""

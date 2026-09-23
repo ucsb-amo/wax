@@ -1,5 +1,6 @@
 import socket
 import json
+import logging
 import time
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
@@ -11,6 +12,16 @@ from waxx.util.comms_server.state_broadcast import StateBroadcaster
 from waxx.util.comms_server.hardware_id import monitor_server_id
 from beacon.discovery.client import discover
 from waxx.util.device_state.state_file_io import read_state, apply_delta
+
+log = logging.getLogger(__name__)
+
+_STATE_NAMES = {STATES.READY: "READY", STATES.LOADING: "LOADING",
+                STATES.NOT_READY: "NOT_READY"}
+
+
+def _state_name(state) -> str:
+    return _STATE_NAMES.get(state, str(state))
+
 
 class Status:
     def __init__(self,state=False):
@@ -128,7 +139,7 @@ class MonitorUDPServer(UdpServer):
             if "ttl_state" in changes:
                 parts.append("on" if changes["ttl_state"] else "off")
         if parts:
-            print(f"[{dtype.upper()}] {name} -> {', '.join(parts)}")
+            log.info("[%s] %s -> %s", dtype.upper(), name, ", ".join(parts))
 
     def _propagate_linked_vpd(self, dtype: str, name: str, changes: dict) -> None:
         """Cross-propagate v_pd <-> voltage for DDS/DAC pairs sharing a channel.
@@ -235,15 +246,37 @@ class MonitorServerGUI(QWidget):
             app.setWindowIcon(eye_icon)
         self.setGeometry(100, 100, 250, 80)
 
+        # Everything the monitor reports goes through logging (stderr, line
+        # buffered) rather than print, so it shows up promptly in the terminal
+        # that launched this GUI as well as in the dashboard log.
+        if not logging.getLogger().handlers:
+            logging.basicConfig(level=logging.INFO,
+                                format="%(asctime)s %(levelname)s %(message)s")
+
         self.monitor_manager = MonitorManager(monitor_expt_path)
-        self.monitor_manager.msg.connect(print) # For debugging
+        self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
+        self.monitor_manager.monitor_stopped.connect(self._on_monitor_stopped)
+
+        log.info("monitor experiment: %s", monitor_expt_path)
+        log.info("device state file: %s", config_file_path)
+        if config_file_path is None:
+            log.error(
+                "No device-state config path was passed: state reads/writes will "
+                "fail with 'no config path'. The launcher could not resolve it "
+                "(usually an unset env var or an unmapped drive)."
+            )
+        for problem in self.monitor_manager.preflight_problems():
+            log.error("Monitor cannot be started as configured: %s", problem)
 
         self.status = Status()
 
         self.setup_ui()
         self.setup_udp_server()
 
-        self.set_status(False) # Initial status is "not ready"
+        # Initial status is "not ready".  (This used to pass False, which equals
+        # STATES.READY == 0 -- so the server briefly advertised READY, and the
+        # button flashed green, while nothing was running.)
+        self.set_status(STATES.NOT_READY)
 
         self.monitor_check_timer = QTimer(self)
         self.monitor_check_timer.setInterval(125)
@@ -294,25 +327,47 @@ class MonitorServerGUI(QWidget):
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                print("Manual monitor restart triggered.")
+                log.info("Manual monitor restart triggered.")
                 self.restart_monitor()
         elif self.status.state == STATES.NOT_READY:
-            print("Manual monitor start triggered.")
+            log.info("Manual monitor start triggered.")
             self.monitor_manager.start()
+
+    def _on_monitor_stopped(self, reason: str) -> None:
+        """Surface the monitor's own failure reason in the terminal and the UI."""
+        log.warning("Monitor is not running: %s", reason)
+        self.status_indicator.setToolTip(f"Monitor is not running: {reason}")
 
     def restart_monitor(self):
         if getattr(self, "_restarting", False):
+            log.info("Monitor restart ignored: a restart is already in progress.")
             return
         self._restarting = True
         try:
             if self.monitor_manager.isRunning():
+                log.info("Restarting monitor experiment...")
                 self.monitor_manager.stop()
+            else:
+                log.info("Starting monitor experiment...")
             self.monitor_manager.start()
-            self.set_status(STATES.LOADING)
+            if self.monitor_manager.isRunning():
+                self.set_status(STATES.LOADING)
+            else:
+                # start() refused (pre-flight failure); it has already said why.
+                self.set_status(STATES.NOT_READY)
         finally:
             self._restarting = False
 
     def set_status(self, status):
+        # Logged only on change: check_monitor_status runs at 8 Hz.
+        previous = getattr(self, "_logged_state", None)
+        if status != previous:
+            if previous is None:
+                log.info("state: %s", _state_name(status))
+            else:
+                log.info("state: %s -> %s", _state_name(previous), _state_name(status))
+            self._logged_state = status
+
         if status == STATES.READY:
             self.status_indicator.setText("READY")
             self.status_indicator.setStyleSheet("background-color: green; color: white;")
@@ -335,19 +390,27 @@ class MonitorServerGUI(QWidget):
             self.set_status(STATES.READY)
 
     def handle_message(self, message):
-        print(f"Message received: {message}")
+        log.info("msg: %s", message)
         if "run complete" in message:
-            print("Run complete message received. Restarting monitor.")
+            log.info("Run complete message received. Restarting monitor.")
             self.restart_monitor()
-            self.set_status(STATES.LOADING)
         elif "monitor ready" in message:
-            print("Monitor ready message received.")
+            log.info("Monitor ready message received.")
             self.set_status(STATES.READY)
         
     def closeEvent(self, event):
-        print("Closing GUI...")
-        self.udp_server.stop()
-        self.server_thread.quit()
-        self.server_thread.wait()
-        self.monitor_manager.stop()
+        # Guarded with getattr: when __init__ aborted early (another monitor
+        # server was already running) none of these exist, and an
+        # AttributeError traceback here would bury the message saying why.
+        log.info("Closing monitor server GUI...")
+        udp_server = getattr(self, "udp_server", None)
+        if udp_server is not None:
+            udp_server.stop()
+        server_thread = getattr(self, "server_thread", None)
+        if server_thread is not None:
+            server_thread.quit()
+            server_thread.wait()
+        monitor_manager = getattr(self, "monitor_manager", None)
+        if monitor_manager is not None:
+            monitor_manager.stop()
         event.accept()
