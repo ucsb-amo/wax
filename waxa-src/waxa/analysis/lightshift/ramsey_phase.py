@@ -182,7 +182,7 @@ class RamseyLightShift:
             ref = self.reference_fits[idx] if self.reference_measured else None
             yield idx, where, self.fits[idx], ref
 
-    def config_line(self, param="omega_lightshift"):
+    def config_line(self, param="frequency_lightshift"):
         """The paste-into-config line of a single-cell (calibration) result."""
         if self.fits.size != 1:
             raise ValueError("config_line is for a single light shift; this result has "
@@ -190,7 +190,8 @@ class RamseyLightShift:
         f, err = float(np.ravel(self.f_lightshift_Hz)[0]), float(np.ravel(self.f_lightshift_err_Hz)[0])
         amp = getattr(self.params, "amp_imaging", None)
         note = f", imaging amp {amp}" if amp is not None else ""
-        return (f"self.p.{param} = 2 * np.pi * {f:.4g}  # rad/s, +/- {err:.2g} Hz{note} "
+        note += f", t_pulse {self.t_pulse * 1e6:.4g} us"
+        return (f"self.{param} = {f:.4g}  # Hz, +/- {err:.2g} Hz{note} "
                 f"#{', '.join(str(r) for r in self.run_ids)}")
 
     def plot_fringes(self, **kwargs):

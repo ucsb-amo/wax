@@ -38,9 +38,12 @@ def plot_fringes(ls, ncols=4, figsize=None):
     for ax in axes.flat[n:]:
         ax.set_visible(False)
 
-    grid = np.linspace(0, 2 * np.pi, 400)
     for i, (idx, where, fit, ref) in enumerate(cells):
         ax = axes.flat[i]
+        # draw the fit across the whole scanned phase window, not just one period
+        scanned = np.concatenate([fit.phase_values] + ([ref.phase_values] if ref is not None else []))
+        scanned = scanned[np.isfinite(scanned)]
+        grid = np.linspace(scanned.min(), scanned.max(), 400)
         ax.errorbar(fit.phase_values, fit.mean, yerr=fit.sem, fmt="o", ms=3, capsize=2,
                     color=COLOR_LIGHT, label="light on: mean, sem")
         if fit.ok:
