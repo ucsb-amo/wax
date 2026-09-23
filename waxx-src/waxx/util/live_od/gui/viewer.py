@@ -60,16 +60,30 @@ def _vline():
 
 class _OverlayLabel(QLabel):
     """Text floating over the OD plot: bold, light on a translucent dark plate.
-    Invisible while empty, and never in the way of the mouse."""
+    Invisible while empty, and never in the way of the mouse -- unless it is
+    ``clickable``, in which case it takes left clicks and emits ``clicked``."""
 
-    def __init__(self, parent):
+    clicked = pyqtSignal()
+
+    def __init__(self, parent, clickable=False):
         super().__init__(parent)
         self.setTextFormat(Qt.TextFormat.RichText)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._clickable = clickable
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setStyleSheet("QLabel { background-color: rgba(0, 0, 0, 170); color: #ffffff; "
                            "font-weight: bold; font-size: 10pt; "
                            "padding: 3px 8px; border-radius: 4px; }")
         self.hide()
+
+    def mousePressEvent(self, event):
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            self.clicked.emit()
+            return
+        super().mousePressEvent(event)
 
     def fix_width_for(self, widest_html):
         """Size the plate once, for the widest thing it will ever say, so it does
@@ -341,7 +355,14 @@ class LiveODViewer(QWidget):
         # --- ROI ---
         self.roi_button = QPushButton('ROI')
         self.roi_button.setCheckable(True)
+        self.roi_button.setToolTip("Crop the OD image and the profiles to a rectangle.\n"
+                                   "Right-click: Auto ROI (the View menu sets how many shots "
+                                   "it looks at).")
         self.roi_button.toggled.connect(self._on_roi_toggled)
+        # right-click runs Auto ROI: a checkable button ignores the right button, so
+        # this cannot also toggle the ROI off
+        self.roi_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.roi_button.customContextMenuRequested.connect(lambda _: self.auto_roi())
 
         # --- other windows (FK TOF's button is gone while nobody uses it; the
         # fk_tof_requested signal stays so the windows' wiring need not change) ---
@@ -556,8 +577,11 @@ class LiveODViewer(QWidget):
             _label_value("center", "8888, 8888 µm"))))
         self.cursor_label.fix_width_for(" &nbsp;&nbsp; ".join((
             _label_value("x, y", "8888, 8888 µm"), _label_value("OD", "−8.88"))))
-        # which units the axes, readouts and ROI are in: bottom left
-        self.units_label = _OverlayLabel(self.od_plot)
+        # which units the axes, readouts and ROI are in: bottom left. Click it to
+        # switch, as the toolbar's µm button does.
+        self.units_label = _OverlayLabel(self.od_plot, clickable=True)
+        self.units_label.setToolTip("Click to switch between camera pixels and µm at the atoms")
+        self.units_label.clicked.connect(self._toggle_length_unit)
         # the shown shot's xvar values: top left
         self.xvar_label = _OverlayLabel(self.od_plot)
         self.od_plot.installEventFilter(self)
@@ -1140,6 +1164,14 @@ class LiveODViewer(QWidget):
         if self.um_checkbox.isChecked() and self._px_size_m is not None:
             return "µm", self._px_size_m * 1e6
         return "px", 1.0
+
+    def _toggle_length_unit(self):
+        """The px/µm plate in the corner of the image: the same switch as the µm
+        button, which is where the units come from."""
+        if not self.um_checkbox.isEnabled():
+            logger.warning("µm: no pixel size yet -- the run's camera parameters supply it")
+            return
+        self.um_checkbox.toggle()
 
     def _apply_units(self):
         """Everything that shows a distance: the axes, the per-shot readout, the ROI

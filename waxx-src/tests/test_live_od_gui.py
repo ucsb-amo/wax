@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtWidgets import QApplication
 
 
@@ -192,6 +193,30 @@ def test_um_button_needs_the_pixel_size(viewer, app):
     viewer.set_pixel_size_m(None)                        # a camera with no calibration
     assert not viewer.um_checkbox.isEnabled()
     assert viewer._length_unit() == ("px", 1.0)
+
+
+def test_units_plate_is_the_um_button(viewer, app):
+    """The px/µm plate in the image's corner switches the units when clicked."""
+    assert not viewer.units_label.testAttribute(
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents)     # the other plates are
+    viewer.units_label.clicked.emit()                        # no pixel size yet: nothing happens
+    assert viewer._length_unit() == ("px", 1.0)
+    viewer.set_pixel_size_m(16e-6 / 8.0)
+    viewer.units_label.clicked.emit()
+    assert viewer.um_checkbox.isChecked() and viewer._length_unit()[0] == "µm"
+    assert viewer.units_label.text() == "µm"
+    viewer.units_label.clicked.emit()
+    assert not viewer.um_checkbox.isChecked() and viewer.units_label.text() == "px"
+
+
+def test_right_clicking_roi_runs_auto_roi(viewer, app):
+    calls = []
+    viewer.auto_roi = lambda *a, **k: calls.append((a, k))
+    assert (viewer.roi_button.contextMenuPolicy()
+            == Qt.ContextMenuPolicy.CustomContextMenu)       # no stock menu in the way
+    viewer.roi_button.customContextMenuRequested.emit(QPoint(3, 3))
+    assert calls == [((), {})]
+    assert not viewer.roi_button.isChecked()                 # the right click did not toggle it
 
 
 def test_overlays_are_readable_plates_in_the_image_corners(viewer, app):
