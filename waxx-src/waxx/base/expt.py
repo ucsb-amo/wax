@@ -81,6 +81,12 @@ class Expt(Scanner, Dealer, Scribe):
         self._shot_complete_count = 0
         self._N_shots_total = 1
 
+        # Extra provenance texts saved as attrs of the run's HDF5 file
+        # ({attr_name: text}), next to expt_file / params_file. Machine-
+        # agnostic: anything (e.g. a generated OPX program) can stash the
+        # exact source it ran from here before end() is called.
+        self._extra_file_texts = {}
+
     def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
         """
         To be called at the end of prepare. 
@@ -452,4 +458,6 @@ class Expt(Scanner, Dealer, Scribe):
             'expt_file_text': expt_text,
             'params_file_text': params_text,
             'base_class_texts': base_class_texts,
+            'extra_file_texts': {str(k): str(v)
+                                 for k, v in self._extra_file_texts.items()},
         }

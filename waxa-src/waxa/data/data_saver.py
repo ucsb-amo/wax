@@ -787,6 +787,10 @@ class DataSaver():
             f.attrs["params_file"] = payload.get("params_file_text", "")
             for key, text in payload.get("base_class_texts", {}).items():
                 f.attrs[key] = text
+            # extra provenance texts (e.g. the generated OPX/QUA program):
+            # {attr_name: text}, written as file attrs like the sources above
+            for key, text in payload.get("extra_file_texts", {}).items():
+                f.attrs[key] = text
 
             # DataVault (payload-derived — safe to rewrite any number of times)
             for key, arr in out["datavault"].items():
