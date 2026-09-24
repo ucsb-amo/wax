@@ -57,11 +57,30 @@ class HMRDummy():
 class HMRClient(NetClient):
     """Client for the HMR2300 magnetometer TCP server."""
 
-    def __init__(self, discovery_timeout: float = 3.0):
+    def __init__(self, discovery_timeout: float = 3.0, timeout: float = 2.0):
         super().__init__("magnetometer", discovery_timeout=discovery_timeout)
+        # Default socket timeout for get_snapshot()/request_shutdown(); the
+        # older per-call ``timeout=`` arguments below are unchanged.
+        self.timeout = float(timeout)
 
     def _request(self, command: str, timeout: float) -> dict:
         return _request(command, self.host, self.port, timeout)
+
+    def get_snapshot(self) -> dict:
+        """Return the server snapshot dict (includes the ``com`` link summary).
+
+        Raises on network failure or a server-side error (the dashboard
+        poller counts either as a failed poll).
+        """
+        result = self._request("GET_SNAPSHOT", self.timeout)
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "GET_SNAPSHOT failed"))
+        return result
+
+    def request_shutdown(self) -> bool:
+        """Ask the server process to exit cleanly (close COM, stop beacon, exit 0)."""
+        result = self._request("SHUTDOWN", self.timeout)
+        return bool(result.get("ok"))
 
     def _ping(self, timeout: float = 2.0) -> dict:
         """Check server connectivity.

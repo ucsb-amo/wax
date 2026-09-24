@@ -11,7 +11,16 @@ from beacon.discovery.client import NetClient
 class PrecilaserGuiClient(NetClient):
     def __init__(self, timeout_s: float = 2.0, discovery_timeout: float = 3.0):
         super().__init__("precilaser", discovery_timeout=discovery_timeout)
-        self.timeout_s = timeout_s
+        self.timeout_s = float(timeout_s)
+
+    @property
+    def timeout(self) -> float:
+        """Socket timeout in seconds (alias of ``timeout_s``; read by the dashboard poller)."""
+        return self.timeout_s
+
+    @timeout.setter
+    def timeout(self, value: float) -> None:
+        self.timeout_s = float(value)
 
     def _send_command(self, command: str) -> str:
         """Send a single command and return a single-line server response.
@@ -46,7 +55,20 @@ class PrecilaserGuiClient(NetClient):
         return json.loads(response)
 
     def get_snapshot(self) -> dict:
+        """Fetch status, sequence state, log cursor and the ``com`` link summary.
+
+        Raises on any network failure (the dashboard poller counts that as a
+        failed poll).
+        """
         return self._send_json_command("GET_SNAPSHOT")
+
+    def request_shutdown(self) -> bool:
+        """Ask the server process to exit cleanly (close COM, stop beacon, exit 0).
+
+        Not the laser power-down sequence — see :meth:`run_shutdown_sequence`.
+        Returns True when the server acknowledged the request.
+        """
+        return self._send_ok_command("SHUTDOWN")
 
     def get_logs_since(self, start_index: int) -> dict:
         return self._send_json_command(f"GET_LOGS {int(start_index)}")

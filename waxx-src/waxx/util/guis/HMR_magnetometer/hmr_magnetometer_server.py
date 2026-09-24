@@ -10,6 +10,11 @@ Protocol (one command per TCP connection, newline-terminated JSON response):
     GET_SINCE <timestamp_s>  â†’ {"ok": true, "readings": [{...}, ...]}
                                Returns all buffered readings with t > timestamp_s,
                                ordered oldest-first.
+    GET_SNAPSHOT             â†’ {"ok": true, "com": {...SerialSnapshot...},
+                                            "connected": bool, "target_connected": bool,
+                                            "latest": {...}|null, "history_len": int}
+    SHUTDOWN                 â†’ {"ok": true}; the server then closes the serial
+                               port, stops its beacon and exits the process (code 0).
 
 Usage:
     python hmr_magnetometer_server.py [--serial-port COM33] [--server-port 50000]
@@ -43,6 +48,12 @@ DEFAULT_SERVER_PORT = 0
 MAX_HISTORY = 10000
 SENSOR_COUNTS_PER_GAUSS = 15000.0
 MAX_STUCK_SAME_VALUES = 20
+
+# Grace period between answering SHUTDOWN and starting to tear down, so the
+# reply is on the wire before the listening socket closes.
+_SHUTDOWN_REPLY_GRACE_S = 0.2
+# If run() has not returned this long after shutdown(), force the exit.
+_SHUTDOWN_FORCE_EXIT_S = 1.5
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +200,12 @@ class MagnetometerServer(NetServer):
         # Set True once we've successfully opened the port at least once;
         # used to keep the very first connection attempt visible.
         self._serial_was_ever_connected = False
+        # Monotonic time of the last parsed sensor reading (for the "com"
+        # snapshot's last_rx_seconds_ago).
+        self._last_rx_monotonic: float | None = None
+        # Listening socket, kept so shutdown() can close it and unblock accept().
+        self._srv: socket.socket | None = None
+        self._shutdown_requested = False
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -215,6 +232,7 @@ class MagnetometerServer(NetServer):
         _srv.listen(16)
         self.server_port = _srv.getsockname()[1]
         self._waxx_port = self.server_port
+        self._srv = _srv
         self._start_beacon()
         logger.info("Starting TCP server on %s:%d", self.server_host, self.server_port)
 
@@ -246,6 +264,7 @@ class MagnetometerServer(NetServer):
             read_thread.join(timeout=2.0)
 
     def shutdown(self):
+        """Stop the beacon, stop the loops, close the serial port.  Idempotent."""
         self._stop_beacon()
         self.stop_event.set()
         if self.reader is not None:
@@ -254,6 +273,92 @@ class MagnetometerServer(NetServer):
             except Exception as exc:
                 logger.warning("shutdown: error closing reader: %s", exc)
             self.reader = None
+        # Unblock _server_loop's accept() immediately instead of waiting for
+        # its 1 s timeout.
+        srv = self._srv
+        self._srv = None
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    def request_shutdown(self):
+        """Graceful process shutdown requested over TCP (dashboard Stop).
+
+        Returns immediately so the reply can be sent; a daemon thread then
+        waits a short grace period and calls :meth:`shutdown`, which closes
+        the serial port, stops the beacon and unblocks ``_server_loop`` so
+        :meth:`run` returns and the launcher exits with code 0.  If the
+        process is still alive shortly after that, the thread forces
+        ``os._exit(0)``.
+        """
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        logger.warning("Process shutdown requested over TCP; stopping magnetometer server")
+
+        def _worker():
+            time.sleep(_SHUTDOWN_REPLY_GRACE_S)
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("shutdown() raised during requested shutdown")
+            time.sleep(_SHUTDOWN_FORCE_EXIT_S)
+            logger.warning("run() did not return after shutdown(); forcing process exit")
+            logging.shutdown()
+            os._exit(0)
+
+        threading.Thread(target=_worker, name="hmr-shutdown", daemon=True).start()
+
+    def _com_snapshot(self) -> dict:
+        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
+
+        ``status`` is derived from the read loop's existing state: the port
+        is open -> connected; operator asked for disconnect -> disconnected;
+        the auto-reconnect loop has a recorded failure -> error; otherwise
+        (first open still pending / retrying with no failure yet) -> connecting.
+        ``reconnect_attempts`` is the current consecutive-failure streak of
+        that loop.
+        """
+        connected = self._is_serial_connected_nolock()
+        failure_sig = self._last_reconnect_failure_sig
+        if connected:
+            status = "connected"
+        elif not self.serial_should_be_connected:
+            status = "disconnected"
+        elif failure_sig is not None:
+            status = "error"
+        else:
+            status = "connecting"
+        last_error = f"{failure_sig[0]}: {failure_sig[1]}" if failure_sig is not None else None
+        last_rx = self._last_rx_monotonic
+        return {
+            "port": self.serial_port,
+            "baud": int(self.baud) if self.baud is not None else None,
+            "status": status,
+            "last_error": last_error,
+            "last_rx_seconds_ago": (
+                None if last_rx is None else round(time.monotonic() - last_rx, 3)
+            ),
+            "reconnect_attempts": int(self._reconnect_failure_streak),
+            "config_valid": True,
+        }
+
+    def get_snapshot(self) -> dict:
+        with self.history_lock:
+            latest = self.history[-1] if self.history else None
+            history_len = len(self.history)
+        return {
+            "ok": True,
+            "com": self._com_snapshot(),
+            "connected": self._is_serial_connected_nolock(),
+            "target_connected": bool(self.serial_should_be_connected),
+            "latest": latest,
+            "history_len": history_len,
+            "poll_interval_s": self.poll_interval,
+            "server_port": self.server_port,
+        }
 
     # ------------------------------------------------------------------
     # Sensor read loop (background thread)
@@ -340,6 +445,7 @@ class MagnetometerServer(NetServer):
                 reading = {"t": time.time(), "Bx": x_G, "By": y_G, "Bz": z_G, "Btot": btot}
                 with self.history_lock:
                     self.history.append(reading)
+                self._last_rx_monotonic = time.monotonic()
 
             except Exception as exc:
                 if self.stop_event.is_set():
@@ -416,6 +522,14 @@ class MagnetometerServer(NetServer):
                 and self.reader.ser.is_open
             )
 
+    def _is_serial_connected_nolock(self):
+        """Lock-free variant for snapshots: must not queue behind a slow read_one()."""
+        reader = self.reader
+        try:
+            return bool(reader is not None and reader.ser is not None and reader.ser.is_open)
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # TCP server loop (main thread)
     # ------------------------------------------------------------------
@@ -436,6 +550,8 @@ class MagnetometerServer(NetServer):
                 except socket.timeout:
                     continue
                 except OSError as exc:
+                    if self.stop_event.is_set():
+                        break   # shutdown() closed the listening socket on purpose
                     logger.warning("_server_loop: accept() raised OSError — shutting down TCP loop: %s", exc)
                     break
                 threading.Thread(
@@ -460,6 +576,13 @@ class MagnetometerServer(NetServer):
     def _dispatch(self, command: str) -> dict:
         if command == "PING":
             return {"ok": True, "message": "pong"}
+
+        if command == "GET_SNAPSHOT":
+            return self.get_snapshot()
+
+        if command == "SHUTDOWN":
+            self.request_shutdown()
+            return {"ok": True, "message": "shutting down"}
 
         if command == "GET_SERIAL_STATUS":
             return {

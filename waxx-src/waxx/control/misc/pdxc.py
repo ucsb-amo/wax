@@ -5,6 +5,12 @@ Serial settings: 115200 baud, 8N1, no flow control (PDXC manual Ch. 6).
 Wire protocol (TCP, newline-terminated JSON):
   -> {"method": "move_in", "args": {}}
   <- {"ok": true, "result": "done"}
+
+Server-level methods (answered without taking the device lock, so they never
+queue behind a move):
+  -> {"method": "get_snapshot"}   <- {"ok": true, "result": {"com": {...}, ...}}
+  -> {"method": "shutdown"}       <- {"ok": true, "result": "shutting down"}
+     then the server closes the COM port, stops its beacon and exits 0.
 """
 
 from __future__ import annotations
@@ -29,7 +35,17 @@ _BAUD = 115200
 _TIMEOUT_S = 2.0
 _MOVE_MARGIN_S = 0.3        # settle margin added to each move's computed duration
 _MOVE_TCP_TIMEOUT = 290.0   # client socket timeout for a full move
+_DEVICE_TCP_TIMEOUT = 10.0  # client socket timeout for other device methods
+                            # (they wait on the device lock, i.e. behind a move)
+_CLIENT_TIMEOUT_S = 2.0     # connect + server-level methods (get_snapshot, shutdown)
 _MOVE_METHODS = ("move_in", "move_out", "move_to")   # long-running: move lock
+_SERVER_METHODS = ("get_snapshot", "shutdown")       # answered by the server itself
+
+# Grace period between answering "shutdown" and tearing down, so the reply is
+# on the wire before the listening socket closes.
+_SHUTDOWN_REPLY_GRACE_S = 0.2
+# If start() has not returned this long after stop(), force the exit.
+_SHUTDOWN_FORCE_EXIT_S = 1.5
 
 MAX_PULSES = 65535          # MOVF/MOVB pulse-count ceiling (manual 6.3.24)
 MIN_PULSES = 1
@@ -90,6 +106,8 @@ class PDXC:
     def __init__(self, port: str = "COM26", baudrate: int = _BAUD,
                  timeout: float = _TIMEOUT_S) -> None:
         self.port = port
+        self.baudrate = int(baudrate)
+        self._last_rx_monotonic: Optional[float] = None   # last non-empty reply
         self._ser = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -138,6 +156,18 @@ class PDXC:
         if self._ser.is_open:
             self._ser.close()
 
+    @property
+    def is_open(self) -> bool:
+        try:
+            return bool(self._ser.is_open)
+        except Exception:
+            return False
+
+    @property
+    def last_rx_seconds_ago(self) -> Optional[float]:
+        t = self._last_rx_monotonic
+        return None if t is None else time.monotonic() - t
+
     def _write(self, cmd: str) -> str:
         """Send a command; return the reply text up to the '>' ready-prompt.
 
@@ -150,6 +180,8 @@ class PDXC:
             cmd += "\r"
         self._ser.write(cmd.encode("ascii"))
         resp = self._ser.read_until(b">").decode("ascii", errors="ignore")
+        if resp:
+            self._last_rx_monotonic = time.monotonic()
         if "CMD_NOT_DEFINED" in resp or "Out-Of-Range" in resp:
             msg = f"PDXC rejected {cmd.strip()!r}: {resp.strip()}"
             print(msg)
@@ -175,6 +207,8 @@ class PDXC:
             cmd += "\r"
         self._ser.write(cmd.encode("ascii"))
         raw = self._ser.read_until(b">").decode("ascii", errors="ignore")
+        if raw:
+            self._last_rx_monotonic = time.monotonic()
         body = raw.split(">")[0].replace("\r", "\n")
         lines = [ln.strip() for ln in body.split("\n")]
         lines = [ln for ln in lines if ln and ln != cmd.strip()]
@@ -488,10 +522,22 @@ class PDXC_Server(NetServer):
         self._running = False
         self._device_lock = threading.Lock()
         self._move_lock = threading.Lock()
+        self._srv: Optional[socket.socket] = None
+        self._com_status = "disconnected"          # for the "com" snapshot
+        self._com_last_error: Optional[str] = None
+        self._shutdown_requested = False
 
     def start(self) -> None:
-        self._device = PDXC(self._com_port)
-        self._device.initialize()
+        self._com_status = "connecting"
+        try:
+            self._device = PDXC(self._com_port)
+            self._device.initialize()
+        except Exception as exc:
+            self._com_status = "error"
+            self._com_last_error = f"{type(exc).__name__}: {exc}"
+            raise
+        self._com_status = "connected"
+        self._com_last_error = None
         self._running = True
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -499,6 +545,7 @@ class PDXC_Server(NetServer):
         srv.bind(("0.0.0.0", 0))          # OS assigns a free port
         srv.listen(5)
         srv.settimeout(1.0)
+        self._srv = srv
         self._waxx_port = srv.getsockname()[1]   # tell beacon the real port
         self._start_beacon()
         print(f"PDXC server listening on port {self._waxx_port}")
@@ -509,6 +556,10 @@ class PDXC_Server(NetServer):
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
+                except OSError:
+                    if self._running:
+                        raise
+                    break   # stop() closed the listening socket on purpose
                 threading.Thread(
                     target=self._handle_client,
                     args=(conn, addr),
@@ -517,14 +568,100 @@ class PDXC_Server(NetServer):
         except KeyboardInterrupt:
             print("\nShutting down PDXC server...")
         finally:
+            self._running = False
             self._stop_beacon()
             srv.close()
-            if self._device is not None:
-                self._device.close()
-            self._running = False
+            self._srv = None
+            self._close_device()
+
+    def _close_device(self) -> None:
+        """Release the COM port.  Idempotent."""
+        device = self._device
+        if device is None:
+            return
+        try:
+            device.close()
+        except Exception as exc:
+            logger.warning("PDXC close raised: %s", exc)
+        self._com_status = "disconnected"
 
     def stop(self) -> None:
+        """Stop accepting; start()'s finally then releases beacon and COM port."""
         self._running = False
+        # Unblock start()'s accept() right away instead of waiting for its
+        # 1 s timeout.
+        srv = self._srv
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    def request_shutdown(self) -> None:
+        """Graceful process shutdown requested over TCP (dashboard Stop).
+
+        Returns immediately so the reply can be sent; a daemon thread then
+        waits a short grace period and calls :meth:`stop`, which unblocks the
+        accept loop so :meth:`start` runs its ``finally`` (beacon off, COM
+        port closed) and returns to the launcher, which exits with code 0.
+        If the process is still alive shortly after that, the thread closes
+        the device itself and forces ``os._exit(0)``.
+        """
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        logger.warning("Process shutdown requested over TCP; stopping PDXC server")
+        print("PDXC server: shutdown requested over TCP")
+
+        def _worker() -> None:
+            time.sleep(_SHUTDOWN_REPLY_GRACE_S)
+            try:
+                self.stop()
+            except Exception:
+                logger.exception("stop() raised during requested shutdown")
+            time.sleep(_SHUTDOWN_FORCE_EXIT_S)
+            logger.warning("start() did not return after stop(); forcing process exit")
+            self._stop_beacon()
+            self._close_device()
+            logging.shutdown()
+            os._exit(0)
+
+        threading.Thread(target=_worker, name="pdxc-shutdown", daemon=True).start()
+
+    def _com_snapshot(self) -> dict:
+        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
+
+        The PDXC server opens its port once in ``start()`` and has no
+        reconnect logic, so ``status`` is: open failed -> error (the process
+        then exits anyway); device present and its port open -> connected;
+        otherwise disconnected.  Read lock-free so it never queues behind a
+        move holding the device lock.
+        """
+        device = self._device
+        if self._com_status == "connected" and (device is None or not device.is_open):
+            status = "disconnected"
+        else:
+            status = self._com_status
+        last_rx = device.last_rx_seconds_ago if device is not None else None
+        return {
+            "port": self._com_port,
+            "baud": int(device.baudrate) if device is not None else _BAUD,
+            "status": status,
+            "last_error": self._com_last_error,
+            "last_rx_seconds_ago": None if last_rx is None else round(last_rx, 3),
+            "reconnect_attempts": 0,   # no auto-reconnect on this server
+            "config_valid": True,
+        }
+
+    def get_snapshot(self) -> dict:
+        device = self._device
+        return {
+            "com": self._com_snapshot(),
+            "com_port": self._com_port,
+            "server_port": self._waxx_port,
+            "position": device.get_position_state() if device is not None else None,
+            "move_in_progress": self._move_lock.locked(),
+        }
 
     def _handle_client(self, sock: socket.socket, addr) -> None:
         logger.debug("PDXC client connected: %s", addr)
@@ -552,6 +689,15 @@ class PDXC_Server(NetServer):
     def _dispatch(self, cmd: dict) -> dict:
         method = cmd.get("method", "")
         args = cmd.get("args", {})
+        # Server-level methods: no device lock, so they answer during a move.
+        if method == "get_snapshot":
+            try:
+                return {"ok": True, "result": self.get_snapshot()}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        if method == "shutdown":
+            self.request_shutdown()
+            return {"ok": True, "result": "shutting down"}
         if method in _MOVE_METHODS:
             acquired = self._move_lock.acquire(timeout=5.0)
             if not acquired:
@@ -583,16 +729,26 @@ class PDXC_Client(NetClient):
     Discovered automatically via UDP broadcast beacon (server_id ``"pdxc"``).
     """
 
-    def __init__(self, discovery_timeout: float = 5.0) -> None:
+    def __init__(self, discovery_timeout: float = 5.0,
+                 timeout: float = _CLIENT_TIMEOUT_S) -> None:
         super().__init__(SERVER_ID, discovery_timeout=discovery_timeout)
+        # TCP connect timeout, and the reply timeout for server-level methods
+        # (get_snapshot / shutdown).  Device methods keep their own longer
+        # reply timeouts because they queue behind moves on the server.
+        self.timeout = float(timeout)
 
     def _send(self, method: str, **kwargs) -> dict:
         payload = (json.dumps({"method": method, "args": kwargs}) + "\n").encode("utf-8")
-        tcp_timeout = _MOVE_TCP_TIMEOUT if method in _MOVE_METHODS else 10.0
+        if method in _MOVE_METHODS:
+            tcp_timeout = _MOVE_TCP_TIMEOUT
+        elif method in _SERVER_METHODS:
+            tcp_timeout = self.timeout
+        else:
+            tcp_timeout = _DEVICE_TCP_TIMEOUT
         for attempt in range(2):
             try:
                 with socket.create_connection(
-                    (self.host, self.port), timeout=10.0
+                    (self.host, self.port), timeout=self.timeout
                 ) as sock:
                     sock.settimeout(tcp_timeout)
                     sock.sendall(payload)
@@ -615,6 +771,19 @@ class PDXC_Client(NetClient):
         if not resp.get("ok"):
             raise RuntimeError(resp.get("error", "unknown error"))
         return resp["result"]
+
+    def get_snapshot(self) -> dict:
+        """Server snapshot dict (``com`` link summary, position, ...).
+
+        Answered by the server without the device lock, so it works during a
+        move.  Raises on network failure or a server-reported error.
+        """
+        result = self._call("get_snapshot")
+        return result if isinstance(result, dict) else {"raw": result}
+
+    def request_shutdown(self) -> bool:
+        """Ask the server process to exit cleanly (close COM, stop beacon, exit 0)."""
+        return bool(self._send("shutdown").get("ok"))
 
     def move_in(self, steps: Optional[int] = None, channel: int = 0) -> str:
         """Move the beamsplitter in (server step size when *steps* is None)."""

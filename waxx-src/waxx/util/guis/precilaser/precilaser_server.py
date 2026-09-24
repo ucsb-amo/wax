@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import inspect
 import json
 import logging
 import logging.handlers
@@ -24,6 +25,17 @@ LOGGER = logging.getLogger("precilaser_server")
 LOGGER.setLevel(logging.INFO)
 CONTROLLER_LOGGER = logging.getLogger("precilaser_controller")
 CONTROLLER_LOGGER.setLevel(logging.INFO)
+
+# Baud rate the controller opens the port with (its constructor default); the
+# server never overrides it, so this is what the "com" snapshot reports before
+# a controller exists.
+_DEFAULT_BAUD = int(inspect.signature(PrecilaserController.__init__).parameters["baudrate"].default)
+
+# Grace period between answering "OK" to SHUTDOWN and starting to tear down,
+# so the reply is on the wire before the listening socket closes.
+_SHUTDOWN_REPLY_GRACE_S = 0.2
+# If main() has not exited this long after stop() finished, force the exit.
+_SHUTDOWN_FORCE_EXIT_S = 1.5
 
 
 class ConnectionState(Enum):
@@ -112,6 +124,17 @@ class PrecilaserLaserServer(NetServer):
         self._log_offset = 0
         self._stopped = False
 
+        # Serial-link bookkeeping for the "com" snapshot (SerialSnapshot shape).
+        self._com_connecting = False
+        self._com_last_error: Optional[str] = None
+        self._com_last_rx_monotonic: Optional[float] = None
+        self._com_reconnect_attempts = 0
+
+        # Set once a graceful SHUTDOWN has been fully processed (stop() done);
+        # main() waits on it and exits 0.
+        self.shutdown_event = threading.Event()
+        self._shutdown_requested = False
+
         self.log_handler = LogBufferHandler(self)
         self.log_handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
@@ -173,10 +196,68 @@ class PrecilaserLaserServer(NetServer):
             self.poll_thread.join(timeout=2.0)
         if self.sequence_thread is not None and self.sequence_thread.is_alive():
             self.sequence_thread.join(timeout=2.0)
-        self.disconnect_laser()
+        self._release_serial_on_stop()
         LOGGER.removeHandler(self.log_handler)
         CONTROLLER_LOGGER.removeHandler(self.log_handler)
         self.log_handler.close()
+
+    def _release_serial_on_stop(self) -> None:
+        """Close the COM port at process stop, even if a sequence is still flagged RUNNING.
+
+        ``disconnect_laser()`` refuses while a sequence runs (correct for an
+        operator request).  At stop the process is going away regardless, so
+        the port must be released anyway; this only closes the serial handle
+        and does not send anything to the laser.
+        """
+        self.disconnect_laser()
+        if self.laser is None:
+            return
+        LOGGER.warning(
+            "Sequence still running at stop; force-closing serial port %s", self.serial_port
+        )
+        acquired = self._laser_lock.acquire(timeout=1.0)
+        try:
+            laser = self.laser
+            if laser is not None:
+                try:
+                    laser.close()
+                except Exception:
+                    pass
+                self.laser = None
+        finally:
+            if acquired:
+                self._laser_lock.release()
+        with self._state_lock:
+            self.status = LaserStatus(connected=False, connection_state=ConnectionState.DISCONNECTED)
+
+    def request_shutdown(self) -> None:
+        """Graceful process shutdown requested over TCP (dashboard Stop).
+
+        Returns immediately so the caller can send its reply; a daemon thread
+        then waits a short grace period, runs :meth:`stop` (which closes the
+        serial port and stops the beacon) and sets :attr:`shutdown_event` so
+        ``main()`` returns and the process exits 0.  If ``main()`` has not
+        exited shortly after that, the thread forces ``os._exit(0)``.
+        """
+        with self._state_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+        LOGGER.warning("Process shutdown requested over TCP; stopping Precilaser server")
+
+        def _worker() -> None:
+            time.sleep(_SHUTDOWN_REPLY_GRACE_S)
+            try:
+                self.stop()
+            except Exception:
+                LOGGER.exception("stop() raised during requested shutdown")
+            self.shutdown_event.set()
+            time.sleep(_SHUTDOWN_FORCE_EXIT_S)
+            LOGGER.warning("main loop did not exit after stop(); forcing process exit")
+            logging.shutdown()
+            os._exit(0)
+
+        threading.Thread(target=_worker, name="precilaser-shutdown", daemon=True).start()
 
     def append_log_entry(self, message: str) -> None:
         with self._log_lock:
@@ -197,12 +278,49 @@ class PrecilaserLaserServer(NetServer):
             "next_index": next_index,
         }
 
+    def _com_snapshot_locked(self) -> dict:
+        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
+
+        Caller must hold ``_state_lock``.  ``status`` is derived from the
+        existing ``LaserStatus.connection_state`` (CONNECTED / ERROR /
+        DISCONNECTED) plus a transient ``connecting`` flag set while a
+        connect or in-place serial recovery is opening the port.
+        ``reconnect_attempts`` counts the server's own serial re-opens
+        (invalid-tail / checksum recovery and mid-sequence reconnects) since
+        the last operator connect.
+        """
+        state = self.status.connection_state
+        if self._com_connecting:
+            status = "connecting"
+        elif state == ConnectionState.CONNECTED:
+            status = "connected"
+        elif state == ConnectionState.ERROR:
+            status = "error"
+        else:
+            status = "disconnected"
+        laser = self.laser
+        baud = getattr(laser, "baudrate", None) if laser is not None else None
+        last_rx = self._com_last_rx_monotonic
+        return {
+            "port": self.serial_port,
+            "baud": int(baud) if baud is not None else _DEFAULT_BAUD,
+            "status": status,
+            "last_error": self._com_last_error,
+            "last_rx_seconds_ago": (
+                None if last_rx is None else round(time.monotonic() - last_rx, 3)
+            ),
+            "reconnect_attempts": int(self._com_reconnect_attempts),
+            "config_valid": True,
+        }
+
     def get_snapshot(self) -> dict:
         with self._state_lock:
             status_dict = asdict(self.status)
             status_dict["connection_state"] = self.status.connection_state.value
             return {
                 "status": status_dict,
+                "serial_port": self.serial_port,
+                "com": self._com_snapshot_locked(),
                 "sequence": {
                     "state": self.sequence_state.value,
                     "type": self.sequence_type,
@@ -312,6 +430,11 @@ class PrecilaserLaserServer(NetServer):
             if command == "DISCONNECT_SERIAL":
                 self.disconnect_laser()
                 return "OK"
+            if command == "SHUTDOWN":
+                # Process-level stop (dashboard).  Distinct from START_SHUTDOWN,
+                # which is the laser's power-down *sequence*.
+                self.request_shutdown()
+                return "OK"
             if command == "START_STARTUP":
                 return "OK" if self.start_startup_sequence() else "ERROR: startup request rejected"
             if command == "START_SHUTDOWN":
@@ -370,6 +493,7 @@ class PrecilaserLaserServer(NetServer):
             )
             with self._state_lock:
                 self.status = updated_status
+                self._com_last_rx_monotonic = time.monotonic()
         except Exception as exc:
             exc_str = str(exc)
             if isinstance(exc, ValueError) and "Invalid frame tail" in exc_str:
@@ -380,8 +504,21 @@ class PrecilaserLaserServer(NetServer):
                 return
             self._handle_serial_error(exc)
 
+    def _note_com_reconnect_started(self) -> None:
+        with self._state_lock:
+            self._com_reconnect_attempts += 1
+            self._com_connecting = True
+
+    def _note_com_reconnect_finished(self, ok: bool) -> None:
+        with self._state_lock:
+            self._com_connecting = False
+            if ok:
+                self._com_last_error = None
+                self._com_last_rx_monotonic = time.monotonic()
+
     def _recover_serial_after_checksum_error_locked(self, exc: Exception) -> None:
         LOGGER.info("Checksum error, restarting COM connection")
+        self._note_com_reconnect_started()
         try:
             if self.laser is not None:
                 try:
@@ -394,12 +531,15 @@ class PrecilaserLaserServer(NetServer):
             with self._state_lock:
                 self.status.connected = True
                 self.status.connection_state = ConnectionState.CONNECTED
+            self._note_com_reconnect_finished(ok=True)
         except Exception as reconnect_exc:
             LOGGER.exception("Serial reconnect after checksum error failed: %s", reconnect_exc)
+            self._note_com_reconnect_finished(ok=False)
             self._handle_serial_error(reconnect_exc)
 
     def _recover_serial_after_invalid_tail_locked(self, exc: Exception) -> None:
         LOGGER.debug("Invalid frame tail detected (%s); reconnecting serial", exc)
+        self._note_com_reconnect_started()
         try:
             if self.laser is not None:
                 try:
@@ -413,8 +553,10 @@ class PrecilaserLaserServer(NetServer):
             with self._state_lock:
                 self.status.connected = True
                 self.status.connection_state = ConnectionState.CONNECTED
+            self._note_com_reconnect_finished(ok=True)
         except Exception as reconnect_exc:
             LOGGER.exception("Serial reconnect after invalid tail failed: %s", reconnect_exc)
+            self._note_com_reconnect_finished(ok=False)
             self._handle_serial_error(reconnect_exc)
 
     def _handle_serial_error(self, exc: Exception) -> None:
@@ -427,12 +569,15 @@ class PrecilaserLaserServer(NetServer):
         self.laser = None
         with self._state_lock:
             self.status = LaserStatus(connected=False, connection_state=ConnectionState.ERROR)
+            self._com_last_error = f"{type(exc).__name__}: {exc}"
 
     def connect_laser(self) -> None:
         with self._laser_lock:
             if self.sequence_state == SequenceState.RUNNING:
                 LOGGER.warning("Cannot connect laser while a sequence is running")
                 return
+            with self._state_lock:
+                self._com_connecting = True
             try:
                 if self.laser is None:
                     self.laser = PrecilaserController(port=self.serial_port)
@@ -443,9 +588,15 @@ class PrecilaserLaserServer(NetServer):
                 with self._state_lock:
                     self.status.connected = True
                     self.status.connection_state = ConnectionState.CONNECTED
+                    self._com_last_error = None
+                    self._com_last_rx_monotonic = time.monotonic()
+                    self._com_reconnect_attempts = 0
             except Exception as exc:
                 self._handle_serial_error(exc)
                 raise
+            finally:
+                with self._state_lock:
+                    self._com_connecting = False
 
     def disconnect_laser(self) -> None:
         with self._laser_lock:
@@ -585,6 +736,7 @@ class PrecilaserLaserServer(NetServer):
                     " — reconnecting and resuming...",
                     sequence_type.lower(), reconnect_attempt, max_reconnect_attempts, exc,
                 )
+                self._note_com_reconnect_started()
                 try:
                     with self._laser_lock:
                         if self.laser is not None:
@@ -598,6 +750,7 @@ class PrecilaserLaserServer(NetServer):
                         with self._state_lock:
                             self.status.connected = True
                             self.status.connection_state = ConnectionState.CONNECTED
+                    self._note_com_reconnect_finished(ok=True)
                     LOGGER.info(
                         "Reconnected on %s; resuming %s sequence",
                         self.serial_port, sequence_type.lower(),
@@ -607,10 +760,12 @@ class PrecilaserLaserServer(NetServer):
                         "Serial reconnect during %s sequence failed: %s",
                         sequence_type.lower(), reconnect_exc,
                     )
+                    self._note_com_reconnect_finished(ok=False)
                     with self._state_lock:
                         self.status = LaserStatus(
                             connected=False, connection_state=ConnectionState.ERROR
                         )
+                        self._com_last_error = f"{type(reconnect_exc).__name__}: {reconnect_exc}"
 
 
 
@@ -648,8 +803,11 @@ def main(
 
     server.start()
     try:
-        while True:
-            time.sleep(1.0)
+        # Wake promptly when a TCP SHUTDOWN has finished stop(); fall through
+        # to the finally (idempotent stop) and return -> exit code 0.
+        while not server.shutdown_event.wait(0.25):
+            pass
+        LOGGER.info("Precilaser server exiting after requested shutdown")
     except KeyboardInterrupt:
         LOGGER.info("Stopping Precilaser server")
     finally:
