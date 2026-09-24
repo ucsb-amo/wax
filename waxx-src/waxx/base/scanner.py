@@ -7,7 +7,9 @@ from waxa.dummy.camera_params import CameraParams
 
 from artiq.language.core import kernel_from_string, now_mu, delay
 from artiq.experiment import RTIOUnderflow
+from artiq.coredevice.exceptions import RTIOOverflow
 
+from waxx.control.exceptions import TriggerTimeout
 from waxx.util.artiq.async_print import aprint
 from waxx.util import console
 
@@ -288,6 +290,12 @@ class Scanner():
         values of the xvars and derived parameters are recomputed. Then, the
         updated host ExptParams values are written into the corresponding kernel
         ExptParams.
+
+        raise_underflow: re-raise an RTIOUnderflow, RTIOOverflow or
+        TriggerTimeout out of scan_kernel (full core-device traceback, no
+        cleanup runs) instead of the default -- abandon the shot, run
+        cleanup_scan_kernel, abort the scan and finish the run with the
+        shots taken so far.
         """
 
         self.pre_scan()
@@ -321,6 +329,30 @@ class Scanner():
             except RTIOUnderflow as e:
                 if raise_underflow:
                     raise e
+                aborted_bool = True
+                self.core.break_realtime()
+            except TriggerTimeout as e_trigger:
+                # A gated wait (line trigger, OPX hand-back) closed with no
+                # edge, so the shot cannot continue. Same exit as an
+                # underflow: cleanup_scan_kernel runs and the scan aborts.
+                # (Own name: the compiler gives a local one type, so it
+                # cannot share `e` with the RTIOUnderflow handler.)
+                if raise_underflow:
+                    raise e_trigger
+                aprint("[scan] shot aborted: a triggered wait saw no edge "
+                       "(TriggerTimeout, see the line above). Cleaning up and "
+                       "ending the run with the shots taken so far.")
+                aborted_bool = True
+                self.core.break_realtime()
+            except RTIOOverflow as e_overflow:
+                # An input FIFO overflowed inside a gated wait (a bouncing or
+                # free-running line on a TTLInOut). Same exit as above.
+                if raise_underflow:
+                    raise e_overflow
+                aprint("[scan] shot aborted: an RTIO input FIFO overflowed "
+                       "(RTIOOverflow) -- a TTL input is toggling far faster "
+                       "than expected. Cleaning up and ending the run with "
+                       "the shots taken so far.")
                 aborted_bool = True
                 self.core.break_realtime()
 
