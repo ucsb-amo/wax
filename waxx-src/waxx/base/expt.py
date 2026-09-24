@@ -204,22 +204,16 @@ class Expt(Scanner, Dealer, Scribe):
                 val = spec.coerce(val, like=getattr(self.params, key, None))
             setattr(self.params, key, val)
 
-    def compute_new_derived(self):
-        pass
-    
     def end_wax(self, expt_filepath,
                 notify=True,
                 restart_monitor=True):
 
-        print(f"[end_wax] called, run_id={self.run_info.run_id}")
         try:
             self.scope_data.close()
         except Exception as _e:
             print(f"[end_wax] WARNING: scope_data.close() raised: {_e} — continuing.")
-        print(f"[end_wax] scope_data closed")
 
         self.cleanup_scanned()
-        print(f"[end_wax] cleanup_scanned complete")
 
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
