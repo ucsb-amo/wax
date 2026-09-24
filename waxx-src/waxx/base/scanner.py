@@ -15,10 +15,6 @@ RPC_DELAY = 10.e-3
 dv = -100.
 dvlist = np.array([])
 
-def nothing():
-    pass
-
-
 class AdjustSpec:
     """Descriptor for a parameter that can be adjusted live between shots."""
     def __init__(self, key, min_val, max_val, step, dtype=float, current_val=None,
@@ -77,7 +73,6 @@ class Scanner():
         self._pending_adjust_values = {}
         
         self.update_nvars()
-        self.compute_new_derived = nothing
 
         from waxx.control.artiq.dummy_core import DummyCore
         self.core = DummyCore()
@@ -215,6 +210,21 @@ class Scanner():
 
     def apply_pending_adjust_values(self):
         """Apply GUI-side adjust values to host params. Overridden in Expt."""
+        pass
+
+    def compute_new_derived(self):
+        """Per-experiment derived-parameter hook, run on the host every shot
+        (from update_params_from_xvars) right after params.compute_derived().
+
+        Override this *as a method* in an experiment class to recompute
+        experiment-local derived quantities from the current shot's xvar
+        values. It must be host-only (an RPC from the scan loop) -- no @kernel.
+
+        Historically this was shadowed by an instance attribute assigned in
+        __init__, which silently disabled method overrides; only the
+        ``self.compute_new_derived = self.my_func`` assignment form worked.
+        Both forms work now.
+        """
         pass
 
     def update_nvars(self):
