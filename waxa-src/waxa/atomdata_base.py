@@ -2680,6 +2680,24 @@ class atomdata_base():
             self._has_images = bool(f.attrs.get('has_images', 'images' in f['data']))
             if ignore_images:
                 self._has_images = False
+            # A run liveOD finalized with frames missing (camera timed out, a
+            # trigger dropped): the file says so, and so must the load.  Frames
+            # are stored by arrival index, so once one is missing every later
+            # frame sits one slot early -- the shot assignment of the images
+            # is not to be trusted.
+            self.run_info.data_complete = bool(f.attrs.get('data_complete', True))
+            self.run_info.incomplete_reason = str(f.attrs.get('incomplete_reason', ''))
+            if not self.run_info.data_complete:
+                n_got = f.attrs.get('images_received', '?')
+                n_exp = f.attrs.get('images_expected', '?')
+                print(
+                    f"\n{'!' * 72}\n"
+                    f"!! RUN {self.run_info.run_id} IS INCOMPLETE: {self.run_info.incomplete_reason}\n"
+                    f"!! {n_got} of {n_exp} images arrived. Images are stored in arrival order,\n"
+                    f"!! so after the first missing frame the shot assignment is shifted and\n"
+                    f"!! the last slots are empty. Do not trust per-shot image data from this run.\n"
+                    f"{'!' * 72}\n"
+                )
             if self._has_images:
                 self.images = f['data']['images'][()]
                 self.image_timestamps = f['data']['image_timestamps'][()]

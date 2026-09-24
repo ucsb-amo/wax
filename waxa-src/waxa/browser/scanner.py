@@ -589,11 +589,13 @@ def find_newer_completed_run_id(data_dir: str, current_latest: int, is_completed
         def is_completed(path):
             try:
                 with h5py.File(path, "r", locking=False) as f:
+                    # numpy.bool_ from h5py: compare by value, not identity
                     rc = f.attrs.get("run_complete", None)
-                    if rc is True:
-                        return True
-                    if rc is False:
-                        return False
+                    if rc is not None:
+                        if bool(rc):
+                            return True
+                        # finalized with missing frames: done, though incomplete
+                        return bool(f.attrs.get("run_finalized", False))
                     return _is_completed_run(f)
             except Exception:
                 return False

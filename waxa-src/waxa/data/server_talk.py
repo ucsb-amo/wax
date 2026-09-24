@@ -245,13 +245,20 @@ class server_talk():
         try:
             with h5py.File(filepath, 'r', locking=False) as f:
                 # Fast path: explicit completion marker (present in new files).
-                # True  → fully written; False → still being written by server.
+                # True  → fully written; False → still being written by server,
+                #         unless run_finalized says the server is done with it:
+                #         a run that lost frames is finalized with
+                #         data_complete=False and run_complete left False
+                #         (atomdata warns when it loads one).
                 # None  → old file without the attr; fall through to xvar check.
+                # h5py hands a bool attr back as numpy.bool_, which `is True`
+                # never matches: until 2026-09-24 this fast path was dead and
+                # every file fell through to the xvar check below.
                 rc = f.attrs.get('run_complete', None)
-                if rc is True:
-                    return True
-                if rc is False:
-                    return False
+                if rc is not None:
+                    if bool(rc):
+                        return True
+                    return bool(f.attrs.get('run_finalized', False))
 
                 raw_xvarnames = f.attrs.get('xvarnames')
                 if raw_xvarnames is None:

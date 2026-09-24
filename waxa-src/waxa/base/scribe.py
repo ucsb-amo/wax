@@ -154,7 +154,17 @@ class Scribe():
                 return
             msg = "Destroying incomplete data."
             count = 0
+            t0 = time.time()
             while True:
+                # Bounded: the open below succeeds from inside the process that
+                # still holds the file (HDF5 shares the handle), and os.remove
+                # then fails with "cannot access" for as long as that handle is
+                # open. Unbounded, this spun forever on a writer that never
+                # closed (2026-09-24, run 80704).
+                if time.time() - t0 > REMOVE_DATA_TIMEOUT:
+                    raise TimeoutError(
+                        f"Could not delete incomplete data within {REMOVE_DATA_TIMEOUT:.0f} s "
+                        f"(still held open by another handle): {self.data_filepath}")
                 try:
                     # The open is only here to confirm no one still holds the
                     # file, so don't require a 'data' group — a file that never

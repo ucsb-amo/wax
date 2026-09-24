@@ -571,7 +571,8 @@ class DataSaver():
         'scan_xvars', 'xvardims', 'data',
     }
 
-    def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None):
+    def save_data_from_payload(self, payload: dict, filepath: str, shot_timestamps=None,
+                               incomplete=None):
         """Write final experiment data to an existing HDF5 file.
 
         This is the server-side counterpart of ``save_data``.  It is
@@ -600,6 +601,15 @@ class DataSaver():
             server-side.  When provided they are reshaped, unshuffled, and
             written as ``data/timestamp_shot_end`` — before ``run_complete``
             is set to ``True``.
+        incomplete:
+            None when every frame the run asked for arrived.  Otherwise a dict
+            (``reason``, ``images_expected``, ``images_received``) from the
+            liveOD server, and the file is finalized *without* ``run_complete``:
+            ``run_finalized=True`` says nothing more will be written, and
+            ``data_complete=False`` / ``incomplete_reason`` say what is missing.
+            Frames are stored by arrival index, so after a dropped trigger the
+            later frames sit one slot early and the last slots are empty; the
+            flag is how a reader learns not to trust the shot assignment.
         """
         inputs = self._retry_io(
             lambda: self._read_end_run_inputs(filepath, payload),
@@ -607,10 +617,13 @@ class DataSaver():
         )
         outputs = self._compute_end_run_outputs(payload, inputs, shot_timestamps)
         self._retry_io(
-            lambda: self._write_end_run_outputs(filepath, payload, outputs),
+            lambda: self._write_end_run_outputs(filepath, payload, outputs, incomplete),
             filepath, "end-of-run write",
         )
-        print("[DataSaver] Parameters saved, data closed.")
+        if incomplete:
+            print(f"[DataSaver] Parameters saved, data closed. RUN INCOMPLETE: {incomplete.get('reason', '')}")
+        else:
+            print("[DataSaver] Parameters saved, data closed.")
 
     # ------------------------------------------------------------------
     # End-of-run save: read / compute / write phases
@@ -753,7 +766,8 @@ class DataSaver():
             "timestamp_shot_end": ts_shot_end,
         }
 
-    def _write_end_run_outputs(self, filepath: str, payload: dict, out: dict) -> None:
+    def _write_end_run_outputs(self, filepath: str, payload: dict, out: dict,
+                               incomplete=None) -> None:
         """Phase 3: write phase-2 results.  Safe to re-run after a failure —
         every value written comes from *out*, never from the file itself."""
         expt_filepath = str(payload.get("expt_filepath", ""))
@@ -833,8 +847,23 @@ class DataSaver():
             if not out["torn"]:
                 f.attrs["unshuffle_applied"] = True
 
-            # --- mark file as fully written ---
-            f.attrs["run_complete"] = True
+            # --- mark the file as finalized ---
+            # run_finalized: the server is done with this file, nothing more
+            # will be written.  data_complete: every frame the run asked for is
+            # in it.  run_complete (the older, single flag) is only set when
+            # both hold; a run that lost frames keeps it False so that code
+            # which knows nothing of the newer attrs skips the file rather than
+            # trusting it.
+            f.attrs["run_finalized"] = True
+            if incomplete:
+                f.attrs["data_complete"] = False
+                f.attrs["incomplete_reason"] = str(incomplete.get("reason", ""))
+                f.attrs["images_expected"] = int(incomplete.get("images_expected", 0))
+                f.attrs["images_received"] = int(incomplete.get("images_received", 0))
+                f.attrs["run_complete"] = False
+            else:
+                f.attrs["data_complete"] = True
+                f.attrs["run_complete"] = True
 
     # ------------------------------------------------------------------
     # End-of-run save: retry plumbing
@@ -1091,11 +1120,14 @@ def pending_save_dir() -> str:
     return path
 
 
-def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=None) -> str:
+def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=None,
+                          incomplete=None) -> str:
     """Pickle an END_RUN payload to local disk before the save is attempted.
 
     Returns the stash path, or ``""`` if stashing failed — a stash failure
-    must never prevent the save itself from being attempted.
+    must never prevent the save itself from being attempted.  ``incomplete``
+    (see ``save_data_from_payload``) travels with it so a retried save marks
+    the file the same way the original would have.
     """
     try:
         stash_path = os.path.join(pending_save_dir(), f"{int(run_id):07d}_endrun.pkl")
@@ -1106,6 +1138,7 @@ def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=
                     "filepath": str(filepath),
                     "payload": payload,
                     "shot_timestamps": list(shot_timestamps or []),
+                    "incomplete": dict(incomplete) if incomplete else None,
                 },
                 fh,
                 protocol=pickle.HIGHEST_PROTOCOL,
@@ -1160,6 +1193,7 @@ def retry_pending_save(stash_path: str, data_saver=None) -> bool:
     data_saver.save_data_from_payload(
         stashed["payload"], filepath,
         shot_timestamps=stashed.get("shot_timestamps") or None,
+        incomplete=stashed.get("incomplete") or None,
     )
     clear_end_run_payload(stash_path)
     print(f"[DataSaver] Pending save for run {stashed['run_id']} completed.")
