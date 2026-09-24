@@ -115,17 +115,32 @@ def load_autostart_set(host_ip: Optional[str]) -> set[str]:
     return set(table.get(host_ip, []) + default)
 
 
-def load_layout_overrides(host_ip: Optional[str]) -> dict:
-    """Return per-host layout override dict, or ``{}`` if none."""
-    if not host_ip or not _LAYOUT_MODULE:
+def load_layout_overrides(host_ip: Optional[str], kind: Optional[str] = None) -> dict:
+    """Return the per-panel layout dict for this host: ``{panel_id: {...}}``.
+
+    Each value may carry ``placement`` ("dock" | "tab"), ``dock_area``
+    ("left" | "right" | "top" | "bottom") and ``tab_group``.  Merged, in
+    increasing priority, from the layout module's ``SERVER_PLACEMENT`` /
+    ``CLIENT_PLACEMENT`` table (selected by *kind*, "server" or "client")
+    and its ``HOST_LAYOUT_OVERRIDES[host_ip]``.  ``{}`` if nothing applies.
+    """
+    if not _LAYOUT_MODULE:
         return {}
     try:
         mod = importlib.import_module(_LAYOUT_MODULE)
     except Exception as exc:
         _LOG.debug("layout module %s not importable: %r", _LAYOUT_MODULE, exc)
         return {}
-    overrides = getattr(mod, "HOST_LAYOUT_OVERRIDES", {})
-    return dict(overrides.get(host_ip, {}))
+    merged: dict[str, dict] = {}
+    if kind:
+        table = getattr(mod, f"{kind.upper()}_PLACEMENT", {}) or {}
+        for pid, cfg in table.items():
+            merged[pid] = dict(cfg)
+    if host_ip:
+        overrides = getattr(mod, "HOST_LAYOUT_OVERRIDES", {}) or {}
+        for pid, cfg in (overrides.get(host_ip, {}) or {}).items():
+            merged.setdefault(pid, {}).update(cfg)
+    return merged
 
 
 __all__ = [

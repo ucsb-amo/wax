@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
 )
 
 
+from waxx.util.dashboard import theme
+
 _LOG = logging.getLogger("waxx.dashboard.generic")
 
 
@@ -51,7 +53,7 @@ class GenericServerStatusPanel(QWidget):
         layout.addWidget(self._table, 1)
 
         self._last_log = QLabel("(no log lines yet)", self)
-        self._last_log.setStyleSheet("QLabel { color: #555; font-family: Consolas, monospace; font-size: 10px; }")
+        self._last_log.setStyleSheet(f"QLabel {{ color: {theme.FG_MUTED}; font-family: Consolas, monospace; font-size: 10px; }}")
         self._last_log.setWordWrap(True)
         layout.addWidget(self._last_log)
 

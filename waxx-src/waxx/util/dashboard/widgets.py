@@ -18,6 +18,8 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
+
+from waxx.util.dashboard import theme
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -41,10 +43,10 @@ _COM_STATUS_DISCONNECTED = "disconnected"
 _COM_STATUS_ERROR = "error"
 
 _COM_PALETTE = {
-    _COM_STATUS_CONNECTED: ("#2e8b57", "white", "\u2713"),
-    _COM_STATUS_CONNECTING: ("#d4a017", "white", "\u22ef"),
-    _COM_STATUS_DISCONNECTED: ("#888", "white", "\u00b7"),
-    _COM_STATUS_ERROR: ("#b22222", "white", "\u2717"),
+    _COM_STATUS_CONNECTED: (theme.OK, "white", "\u2713"),
+    _COM_STATUS_CONNECTING: (theme.WARN, "white", "\u22ef"),
+    _COM_STATUS_DISCONNECTED: (theme.OFF, "white", "\u00b7"),
+    _COM_STATUS_ERROR: (theme.ERR, "white", "\u2717"),
 }
 
 
@@ -133,7 +135,7 @@ class ComStatusButton(QToolButton):
             " font-weight: 600;"
             " font-size: 11px;"
             "}"
-            "QToolButton:disabled { background-color: #aaa; }"
+            f"QToolButton:disabled {{ background-color: {theme.FG_DISABLED}; }}"
             "QToolButton:hover { padding: 2px 9px; }"
         )
         tip = f"{self._label} - {self._status}"
@@ -297,18 +299,18 @@ class ErrorBodyWidget(QWidget):
 
         header = QLabel(
             f"<b>Panel '{panel_id}' failed to load.</b><br>"
-            f"<span style='color:#b22222'>{type(exception).__name__}: {exception}</span>"
+            f"<span style='color:{theme.ERR}'>{type(exception).__name__}: {exception}</span>"
         )
         header.setWordWrap(True)
         header.setStyleSheet(
-            "QLabel { background-color: #ffe4e1; color: #4a0000; padding: 6px; border: 1px solid #b22222; border-radius: 4px; }"
+            f"QLabel {{ background-color: #3a1f1f; color: {theme.FG}; padding: 6px; border: 1px solid {theme.ERR}; border-radius: 4px; }}"
         )
         layout.addWidget(header)
 
         tb_view = QPlainTextEdit(self)
         tb_view.setReadOnly(True)
         tb_view.setPlainText(traceback_text)
-        tb_view.setStyleSheet("QPlainTextEdit { font-family: Consolas, monospace; font-size: 10px; }")
+        tb_view.setStyleSheet(f"QPlainTextEdit {{ font-family: Consolas, monospace; font-size: 10px; background: {theme.BG_SUNKEN}; color: {theme.FG}; }}")
         layout.addWidget(tb_view, 1)
 
         retry = QPushButton("Retry", self)

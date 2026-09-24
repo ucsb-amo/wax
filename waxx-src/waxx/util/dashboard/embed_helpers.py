@@ -36,6 +36,8 @@ from PyQt6 import QtCore
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import QLabel, QWidget
 
+from waxx.util.dashboard import theme
+
 
 _LOG = logging.getLogger("waxx.dashboard.embed")
 
@@ -66,8 +68,8 @@ def replace_status_bar(initial_text: str = "") -> QLabel:
     """
     label = QLabel(initial_text)
     label.setStyleSheet(
-        "QLabel { color: #888; font-size: 11px; padding: 2px 4px; "
-        "border-top: 1px solid #ddd; }"
+        f"QLabel {{ color: {theme.FG_MUTED}; font-size: 11px; padding: 2px 4px; "
+        f"border-top: 1px solid {theme.BORDER}; }}"
     )
     label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     return label

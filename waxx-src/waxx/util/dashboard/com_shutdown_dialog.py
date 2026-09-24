@@ -40,6 +40,8 @@ from PyQt6.QtWidgets import (
 )
 
 
+from waxx.util.dashboard import theme
+
 _LOG = logging.getLogger("waxx.dashboard.com_shutdown_dialog")
 
 RESULT_ALL_CLOSED = "all_closed"
@@ -203,7 +205,7 @@ class ComShutdownDialog(QDialog):
                     status_lbl = self._status_labels.get(idx)
                     if status_lbl is not None:
                         status_lbl.setText(_STATUS_CLOSED)
-                        status_lbl.setStyleSheet("color: #4caf50; font-weight: 600;")
+                        status_lbl.setStyleSheet(f"color: {theme.OK}; font-weight: 600;")
         if all_done:
             self._poll_timer.stop()
             self._result = RESULT_ALL_CLOSED
@@ -228,7 +230,7 @@ class ComShutdownDialog(QDialog):
                     status_lbl = self._status_labels.get(idx)
                     if status_lbl is not None:
                         status_lbl.setText(_STATUS_FORCED)
-                        status_lbl.setStyleSheet("color: #ff7043; font-weight: 600;")
+                        status_lbl.setStyleSheet(f"color: {theme.PENDING}; font-weight: 600;")
             except Exception:
                 _LOG.exception("force_kill failed for %r", getattr(sup, "server_id", "?"))
         self._poll_timer.stop()

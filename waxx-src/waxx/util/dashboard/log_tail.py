@@ -19,6 +19,8 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QTextCharFormat, QColor, QTextCursor
+
+from waxx.util.dashboard import theme
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -32,11 +34,11 @@ from PyQt6.QtWidgets import (
 
 _LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")
 _LEVEL_COLORS = {
-    "DEBUG": QColor("#888"),
-    "INFO": QColor("#205a96"),
-    "WARNING": QColor("#a06000"),
-    "ERROR": QColor("#b22222"),
-    "CRITICAL": QColor("#b22222"),
+    "DEBUG": QColor(theme.FG_MUTED),
+    "INFO": QColor(theme.FG),
+    "WARNING": QColor(theme.WARN),
+    "ERROR": QColor("#ff6b6b"),
+    "CRITICAL": QColor("#ff6b6b"),
 }
 
 
@@ -50,8 +52,8 @@ class LogTailView(QWidget):
         self._editor.setMaximumBlockCount(int(max_lines))
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._editor.setStyleSheet(
-            "QPlainTextEdit { font-family: Consolas, 'Cascadia Mono', monospace;"
-            " font-size: 10px; background: #fafafa; color: #222; }"
+            f"QPlainTextEdit {{ font-family: Consolas, 'Cascadia Mono', monospace;"
+            f" font-size: 10px; background: {theme.BG_SUNKEN}; color: {theme.FG}; }}"
         )
 
         self._copy_btn = QPushButton("Copy")
@@ -79,7 +81,7 @@ class LogTailView(QWidget):
 
         Line color is auto-derived from the level token if present.
         """
-        color = QColor("#222")
+        color = QColor(theme.FG)
         m = _LEVEL_RE.search(line)
         if m:
             color = _LEVEL_COLORS.get(m.group(1), color)

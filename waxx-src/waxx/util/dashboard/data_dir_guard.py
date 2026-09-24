@@ -107,6 +107,25 @@ def is_configured() -> bool:
     return _DATA_DIR is not None or _BAT_PATH is not None
 
 
+def configured_data_dir() -> Optional[str]:
+    """The data dir registered via :func:`configure`, or None."""
+    return _DATA_DIR
+
+
+def data_dir_present() -> Optional[bool]:
+    """Cheap, non-remapping existence check: True/False, or None if unconfigured.
+
+    Safe to call from a worker thread every few seconds; never runs the
+    remap script (that is :func:`ensure_data_dir`'s job).
+    """
+    if not _DATA_DIR:
+        return None
+    try:
+        return os.path.exists(_DATA_DIR)
+    except Exception:
+        return False
+
+
 def _strip_quotes(s: str) -> str:
     s = s.strip()
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':

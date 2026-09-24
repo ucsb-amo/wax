@@ -200,17 +200,26 @@ def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
     file_handler.setLevel(level)
     root.addHandler(file_handler)
 
-    # Console handler - only add one if there isn't a StreamHandler already.
+    # Console handler - only add one if there isn't a StreamHandler already,
+    # and only when there is a console at all (under pythonw.exe sys.stderr
+    # is None; a StreamHandler on it would raise on every record).
     has_console = any(
         isinstance(h, logging.StreamHandler)
         and not isinstance(h, logging.handlers.RotatingFileHandler)
         for h in root.handlers
     )
-    if not has_console:
+    if not has_console and sys.stderr is not None:
         console = logging.StreamHandler(stream=sys.stderr)
         console.setFormatter(_FORMATTER)
         console.setLevel(level)
         root.addHandler(console)
+    if sys.stderr is None:
+        # No console to print tracebacks to: route uncaught exceptions into
+        # the log file so a pythonw-launched dashboard never dies silently.
+        def _log_uncaught(exc_type, exc, tb):  # noqa: ANN001
+            logging.getLogger("uncaught").critical(
+                "uncaught exception", exc_info=(exc_type, exc, tb))
+        sys.excepthook = _log_uncaught
 
     # faulthandler: write native tracebacks to a sibling ``.fault`` file,
     # NOT the rotating log itself.  If we share the file handle with the

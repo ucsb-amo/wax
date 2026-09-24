@@ -10,6 +10,8 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
+from waxx.util.dashboard import theme
+
 
 class PlaceholderBody(QWidget):
     """Compact "Initializing..." widget with an animated dot ticker.
@@ -33,7 +35,7 @@ class PlaceholderBody(QWidget):
         self._label = QLabel(message, self)
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setStyleSheet(
-            "QLabel { color: #777; font-size: 12px; }"
+            f"QLabel {{ color: {theme.FG_MUTED}; font-size: 12px; }}"
         )
         layout.addStretch(1)
         layout.addWidget(self._label)
