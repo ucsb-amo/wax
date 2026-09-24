@@ -24,14 +24,32 @@ class ttl_frame():
         self._write_ttl_keys()
         self.camera = TTL_OUT
         self.populate_attrs()
+        self.populate_typed_lists()
 
     def populate_attrs(self):
         for ttl in self.ttl_list:
             vars(self)[ttl.key] = ttl
 
+    def populate_typed_lists(self):
+        """Splits ttl_list into per-direction lists so kernels can loop over
+        one kind of channel -- in particular clear_input_events() must drain
+        every TTLInOut, whether or not it was assigned a name."""
+        self.ttl_out_list = [ttl for ttl in self.ttl_list if isinstance(ttl, TTL_OUT)]
+        self.ttl_in_list = [ttl for ttl in self.ttl_list if isinstance(ttl, TTL_IN)]
+
+    @kernel
+    def clear_input_events(self):
+        """Drains the input-event FIFO of every TTLInOut channel. A stale edge
+        left over from a previous shot's gate makes the next timestamp_mu
+        return immediately with an old timestamp, which puts the timeline
+        cursor in the past and underflows the next event."""
+        for ttl_in in self.ttl_in_list:
+            ttl_in.clear_input_events()
+
     def populate_ttl_list(self, N_TTL):
         self.ttl_list = [TTL(ch) for ch in range(N_TTL)]
         for ch in range(N_TTL):
+            ttl = self.ttl_list[ch]
             if self._db is not None:
                 cl = self._db[f"ttl{ch}"]["class"]
                 if cl == "TTLOut":

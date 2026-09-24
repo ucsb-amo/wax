@@ -150,6 +150,12 @@ class Expt(Scanner, Dealer, Scribe):
 
     @kernel
     def cleanup_scan_kernel_wax(self):
+        # self.ttl is provided by the machine layer's Devices mixin (a
+        # subclass of waxx.config.ttl_id.ttl_frame). Stale input events left
+        # in a TTLInOut FIFO cause an immediate-return gate and an underflow
+        # on the next shot's trigger wait, so drain them all every shot.
+        self.core.break_realtime()
+        self.ttl.clear_input_events()
         self.data.put_shot_data()
         self._notify_shot_complete()
 
