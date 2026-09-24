@@ -10,25 +10,42 @@ moves smooth even when the server is missing or slow.
 """
 from __future__ import annotations
 
+from collections import deque
 from typing import Callable, Optional
 
+import math
 import time
 
-from PyQt6.QtCore import QRunnable, QThreadPool, QTimer, pyqtSignal
+import pyqtgraph as pg
+from PyQt6.QtCore import QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from waxx.util.dashboard import theme
 from waxx.util.guis.keysight.keysight_client import KeysightClient
 
-T_UPDATE_MS = 500
-FONTSIZE_PT = 14
+T_UPDATE_MS = 250
+FONTSIZE_PT = 12          # value buttons
+CAPTION_PT = 9           # the small '170 A' caption next to each value
+
+# Rolling current-history plot.  Samples are whatever the server's poll
+# worker read.  The buffer holds ``PLOT_RANGE_MAX_S``; the visible window
+# is the "plot range" spinbox (``PLOT_RANGE_DEFAULT_S`` at start).
+PLOT_RANGE_DEFAULT_S = 240
+PLOT_RANGE_MIN_S = 10
+PLOT_RANGE_MAX_S = 3600
+PLOT_MIN_HEIGHT_PX = 90   # the plot grows with the dock; this is the floor
+PLOT_PENS: dict[int, str] = {170: "#4fc3f7", 500: "#ffab40"}
 
 # Stay quiet for this long after construction before surfacing a
 # "server not found" message — the supervised server subprocess often
@@ -43,6 +60,13 @@ RECONNECT_INTERVAL_S = 3.0
 
 # Per-supply over-current alert thresholds (A), keyed by ``max_current``.
 ALERT_THRESHOLDS: dict[int, float] = {500: 100, 170: 50}
+
+# If any supply stays above its alert threshold (button red) for longer
+# than this, the window flashes yellow and the taskbar entry flashes
+# until the current drops back below threshold.
+OVERCURRENT_FLASH_AFTER_S = 60.0
+FLASH_PERIOD_MS = 500
+FLASH_COLOR = "#ffd600"
 
 
 class _BgCall(QRunnable):
@@ -104,22 +128,34 @@ class _SupplyRow(QWidget):
         self._output_on: Optional[bool] = None
         self._status = 0
         self._err_str = ""
+        # True while the last reading was above the alert threshold.
+        self.alert = False
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.value_btn = QPushButton("…")
         self.value_btn.clicked.connect(self._on_click)
+        self.value_btn.setToolTip(
+            f"{self._max_current} A supply at {self._ip}\n"
+            "Click: reconnect when disconnected, turn on when OFF, "
+            "clear protection when faulted."
+        )
         font = QFont()
         font.setPointSize(FONTSIZE_PT)
         font.setBold(True)
-        fixed_w = QFontMetrics(font).horizontalAdvance("000.00 A") + 20
+        fixed_w = QFontMetrics(font).horizontalAdvance("000.00 A") + 18
         self.value_btn.setFixedWidth(fixed_w)
 
-        text_label = QLabel(f"{self._max_current} A supply current = ")
-        text_label.setStyleSheet(f"font-size: {FONTSIZE_PT}pt;")
+        # Small caption instead of "170 A supply current = ": the number is
+        # what people read, the caption only says which supply it belongs to.
+        caption = QLabel(f"{self._max_current} A")
+        caption.setStyleSheet(f"font-size: {CAPTION_PT}pt; color: {theme.FG_MUTED};")
+        caption.setToolTip(f"{self._max_current} A supply, {self._ip}")
 
         self.layout = QHBoxLayout()
-        self.layout.addWidget(text_label)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(4)
+        self.layout.addWidget(caption)
         self.layout.addWidget(self.value_btn)
 
     # ------------------------------------------------------------------ #
@@ -129,6 +165,7 @@ class _SupplyRow(QWidget):
         self._output_on = snap.get("output_on")
         self._status = int(snap.get("status") or 0)
         current = snap.get("current_a")
+        self.alert = False
 
         if not self._connected:
             self._set_value("CXN_ERR", "orange")
@@ -143,18 +180,18 @@ class _SupplyRow(QWidget):
         if current is None:
             self._set_value("…", "")
             return
-        alert = (
+        self.alert = (
             self._alert_threshold is not None
             and float(current) > self._alert_threshold
         )
-        self._set_value(f"{float(current):1.2f} A", "red" if alert else "")
+        self._set_value(f"{float(current):1.2f} A", "red" if self.alert else "")
 
     def _set_value(self, text: str, bg: str) -> None:
         self.value_btn.setText(text)
         self.value_btn.setStyleSheet(
             f"font-weight: bold; font-size: {FONTSIZE_PT}pt; "
-            f"text-align: right; padding-right: 10px; "
-            f"background-color: {bg};"
+            f"text-align: right; padding: 2px 8px 2px 4px; "
+            + (f"background-color: {bg};" if bg else "")
         )
 
     def _on_click(self) -> None:
@@ -173,6 +210,136 @@ class _SupplyRow(QWidget):
                 print(f"[Keysight] RPC failed for {ip}: {exc}")
 
         QThreadPool.globalInstance().start(_BgCall(func, _done))
+
+
+class _CurrentPlot(QWidget):
+    """Collapsible rolling plot of every supply's measured current.
+
+    Fed from the snapshot the window is already polling, so it adds no
+    hardware traffic.  Repeats of a cached sample are dropped using the
+    server's ``seq`` counter; a ``None`` reading becomes a gap (NaN).
+    Expanded by default; the toggle collapses it to just the header row.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._t: dict[str, deque] = {}
+        self._y: dict[str, deque] = {}
+        self._last_seq: dict[str, int] = {}
+        self._curves: dict[str, pg.PlotDataItem] = {}
+        self._dirty = False
+
+        self._toggle = QToolButton()
+        self._toggle.setText("history")
+        self._toggle.setToolTip("Show / hide the rolling current plot")
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setArrowType(pg.QtCore.Qt.ArrowType.DownArrow)
+        self._toggle.setToolButtonStyle(
+            pg.QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._toggle.setAutoRaise(True)
+        self._toggle.toggled.connect(self._on_toggled)
+
+        # "plot range = [  240] s" -- only shown while expanded.
+        self._range = QSpinBox()
+        self._range.setRange(PLOT_RANGE_MIN_S, PLOT_RANGE_MAX_S)
+        self._range.setValue(PLOT_RANGE_DEFAULT_S)
+        self._range.setSuffix(" s")
+        self._range.setSingleStep(30)
+        self._range.setKeyboardTracking(False)
+        self._range.valueChanged.connect(self._on_range_changed)
+        self._range.setToolTip("Visible time span of the history plot")
+        self._range.setMaximumWidth(78)
+        # Only shown while the plot is expanded; lives on the header row.
+        self._range_row = self._range
+
+        self._plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
+        # Grow with the dock instead of a fixed 160 px strip.
+        self._plot.setMinimumHeight(PLOT_MIN_HEIGHT_PX)
+        self._plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._plot.setLabel("left", "A")
+        self._plot.getAxis("left").setWidth(40)
+        self._plot.showGrid(x=True, y=True, alpha=0.2)
+        # Top-left: the newest samples always sit at the right edge, so a
+        # right-side legend would cover them.
+        self._plot.addLegend(offset=(5, 5))
+        self._plot.setMouseEnabled(x=False, y=False)
+        self._plot.getPlotItem().setContentsMargins(0, 0, 4, 0)
+
+        # This widget *is* the plot; the toggle + range are handed to the
+        # window's header row via ``header_widgets()``.
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._plot)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def header_widgets(self) -> tuple[QWidget, QWidget]:
+        """(toggle button, range spinbox) for the caller to place inline."""
+        return self._toggle, self._range_row
+
+    def is_expanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    @property
+    def range_s(self) -> float:
+        return float(self._range.value())
+
+    # ------------------------------------------------------------------ #
+
+    def add_sample(self, ip: str, max_current: int, t: Optional[float],
+                   current: Optional[float], seq: Optional[int]) -> None:
+        if seq is not None and self._last_seq.get(ip) == seq:
+            return  # cached snapshot unchanged since last poll
+        if seq is not None:
+            self._last_seq[ip] = seq
+        if t is None:
+            t = time.time()  # pre-``t`` server: fall back to receive time
+        if ip not in self._t:
+            self._t[ip] = deque()
+            self._y[ip] = deque()
+            pen = pg.mkPen(PLOT_PENS.get(int(max_current), "#ffffff"), width=1.5)
+            self._curves[ip] = self._plot.plot(
+                pen=pen, name=f"{max_current} A", connect="finite",
+            )
+        self._t[ip].append(float(t))
+        self._y[ip].append(math.nan if current is None else float(current))
+        cutoff = t - PLOT_RANGE_MAX_S
+        while self._t[ip] and self._t[ip][0] < cutoff:
+            self._t[ip].popleft()
+            self._y[ip].popleft()
+        self._dirty = True
+        if self._plot.isVisible():
+            self._redraw()
+
+    def _redraw(self) -> None:
+        if not self._dirty:
+            return
+        t_last = None
+        for ip, curve in self._curves.items():
+            curve.setData(list(self._t[ip]), list(self._y[ip]))
+            if self._t[ip]:
+                t_last = self._t[ip][-1] if t_last is None else max(t_last, self._t[ip][-1])
+        if t_last is not None:
+            self._plot.setXRange(t_last - self.range_s, t_last, padding=0.0)
+        self._dirty = False
+
+    def _on_range_changed(self, _value: int) -> None:
+        self._dirty = True
+        if self._plot.isVisible():
+            self._redraw()
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._toggle.setArrowType(
+            pg.QtCore.Qt.ArrowType.DownArrow if checked
+            else pg.QtCore.Qt.ArrowType.RightArrow
+        )
+        self._range_row.setVisible(checked)
+        self._plot.setVisible(checked)
+        if checked:
+            self._dirty = True
+            self._redraw()
 
 
 class KeysightClientWindow(QWidget):
@@ -206,12 +373,43 @@ class KeysightClientWindow(QWidget):
         )
         self._error_label.setMinimumWidth(0)
 
+        # Layout: one header row holding every supply (caption + value) on
+        # the left and the history toggle + range on the right, then the
+        # plot filling whatever height the dock gives us.  The old stacked
+        # layout left most of the panel empty.
         self._root = QVBoxLayout(self)
+        self._root.setContentsMargins(6, 4, 6, 4)
+        self._root.setSpacing(4)
+        self._header = QHBoxLayout()
+        self._header.setSpacing(12)
+        self._header.addStretch(1)
+        self._plot = _CurrentPlot(self)
+        toggle, rng = self._plot.header_widgets()
+        self._header.addWidget(toggle)
+        self._header.addWidget(rng)
+        self._root.addLayout(self._header)
+        self._root.addWidget(self._plot, 1)
         self._root.addWidget(self._error_label)
         self._error_label.hide()
+        # Supply rows are inserted before the header stretch as they appear.
+        self._n_rows = 0
 
         self._snapshot_ready.connect(self._on_snapshot_ready)
         self._snapshot_failed.connect(self._on_snapshot_failed)
+
+        # Over-current attention flash.  ``_alert_since`` holds, per supply,
+        # the monotonic time its reading first went above threshold; it is
+        # dropped as soon as a reading comes back below (or the supply is
+        # off / faulted / disconnected).  A missing server keeps the last
+        # known state -- better to over-warn than to go quiet.
+        self._alert_since: dict[str, float] = {}
+        self._flashing = False
+        self._flash_on = False
+        self.setObjectName("keysightClientWindow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(FLASH_PERIOD_MS)
+        self._flash_timer.timeout.connect(self._flash_tick)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -294,12 +492,59 @@ class KeysightClientWindow(QWidget):
             if not isinstance(snap, dict):
                 continue
             ip = str(snap.get("ip"))
+            max_current = int(snap.get("max_current", 0))
             row = self._rows.get(ip)
             if row is None:
-                row = _SupplyRow(self._client, ip, int(snap.get("max_current", 0)), self)
+                row = _SupplyRow(self._client, ip, max_current, self)
                 self._rows[ip] = row
-                self._root.addLayout(row.layout)
+                # Keep supplies left of the stretch, in arrival order.
+                self._header.insertLayout(self._n_rows, row.layout)
+                self._n_rows += 1
             row.apply_snapshot(snap)
+            if snap.get("connected"):
+                self._plot.add_sample(
+                    ip, max_current, snap.get("t"), snap.get("current_a"),
+                    snap.get("seq"),
+                )
+            if row.alert:
+                self._alert_since.setdefault(ip, time.monotonic())
+            else:
+                self._alert_since.pop(ip, None)
+        self._update_flash()
+
+    # ----- over-current flash ------------------------------------------- #
+
+    def overcurrent_ips(self) -> list[str]:
+        """Supplies above threshold for longer than ``OVERCURRENT_FLASH_AFTER_S``."""
+        now = time.monotonic()
+        return [ip for ip, t0 in self._alert_since.items()
+                if now - t0 > OVERCURRENT_FLASH_AFTER_S]
+
+    def _update_flash(self) -> None:
+        want = bool(self.overcurrent_ips())
+        if want and not self._flashing:
+            self._flashing = True
+            self._flash_timer.start()
+            self._flash_tick()
+        elif not want and self._flashing:
+            self._flashing = False
+            self._flash_timer.stop()
+            self._flash_on = False
+            self.setStyleSheet("")
+
+    def _flash_tick(self) -> None:
+        self._flash_on = not self._flash_on
+        self.setStyleSheet(
+            f"QWidget#keysightClientWindow {{ background-color: {FLASH_COLOR}; }}"
+            if self._flash_on else ""
+        )
+        if self._flash_on:
+            # Flash the taskbar entry of whatever top-level window we live
+            # in (the dashboard when embedded).  Re-issued every period with
+            # a short duration so it stops soon after the alert clears.
+            top = self.window()
+            if top is not None:
+                QApplication.alert(top, 2 * FLASH_PERIOD_MS)
 
     def _maybe_show_error(self, msg: str) -> None:
         # Stay silent until we've actually been connected at least once.
@@ -319,6 +564,7 @@ class KeysightClientWindow(QWidget):
 
     def closeEvent(self, event):  # noqa: N802 - Qt-style
         self._timer.stop()
+        self._flash_timer.stop()
         event.accept()
 
 
