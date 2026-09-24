@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .roi import ROI
     from .config.img_types import img_types
     from .config.expt_params import ExptParams
+    from .climate.client import ClimateClient
 
 _lazy = {
     'atomdata':     '.atomdata',
@@ -20,6 +21,7 @@ _lazy = {
     'ROI':          '.roi',
     'img_types':    '.config.img_types',
     'ExptParams':   '.config.expt_params',
+    'ClimateClient': '.climate.client',
 }
 
 def __getattr__(name):

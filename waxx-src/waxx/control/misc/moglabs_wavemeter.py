@@ -4,8 +4,18 @@ import sys
 import time
 
 from waxx.util.artiq.async_print import aprint
+from waxx.util.link_latch import LinkLatch, T_LINK_RETRY
 
 class WavemeterController(MOGDevice):
+    """MOGLabs FZW wavemeter over TCP.
+
+    Link-failure policy: every query goes through :meth:`ask`, which carries a
+    :class:`~waxx.util.link_latch.LinkLatch`. After a failure the socket is
+    dropped and every query is skipped (raising immediately, so the existing
+    per-method fallbacks return their failure values without waiting on a
+    timeout) for ``T_LINK_RETRY`` seconds; the next query after that
+    reconnects. The socket timeout is ``timeout`` (1 s) per reply.
+    """
     _instances: dict = {}
 
     def __new__(cls, addr, port=None, timeout=1, check=True):
@@ -23,12 +33,43 @@ class WavemeterController(MOGDevice):
             cls._instances[key] = instance
         return cls._instances[key]
 
-    def __init__(self, addr, port=None, timeout=1, check=True):
+    def __init__(self, addr, port=None, timeout=1, check=True,
+                 retry_after=T_LINK_RETRY):
         if self._initialized:
             return
+        # Before super().__init__: it connects and asks 'info' through
+        # self.ask, which needs the latch.
+        self._timeout = timeout
+        self.latch = LinkLatch(f"wavemeter {addr}", retry_after=retry_after)
         super().__init__(addr, port, timeout, check)
         self.set_units()
         self._initialized = True
+
+    @property
+    def link_down(self) -> bool:
+        return self.latch.down
+
+    def _drop_connection(self):
+        try:
+            if self.dev is not None:
+                self.dev.close()
+        except Exception:
+            pass
+        self.dev = None
+
+    def ask(self, cmd):
+        """``MOGDevice.ask`` behind the link latch; reconnects after an outage."""
+        self.latch.raise_if_skipping()
+        try:
+            if not self.connected():
+                self.reconnect(self._timeout, check=False)
+            resp = super().ask(cmd)
+        except Exception as e:
+            self.latch.trip(e)
+            self._drop_connection()
+            raise
+        self.latch.clear()
+        return resp
 
     def check_ch(self) -> int:
         try:
@@ -155,11 +196,31 @@ class WavemeterClient():
         """Get frequency in Hz. Returns 0.0 if error occurs."""
         return self.fzw.get_frequency(self.ch)
 
+    @property
+    def link_down(self) -> bool:
+        """True while the controller's latch says to skip the wavemeter: the
+        link failed and the retry cooldown has not elapsed."""
+        latch = getattr(self.fzw, 'latch', None)
+        return latch is not None and latch.should_skip()
+
     def lock_status(self, frequency_shift=0., robust=True) -> float:
+        """Measured frequency (Hz), with an 'unlocked' warning when it is
+        further than ``locked_tolerance`` from ``target_freq + frequency_shift``.
+        Returns 0. (the failure value) without a lock verdict while the
+        wavemeter link is down and not yet due for a retry.
+        """
+        if self.link_down:
+            return 0.
         if robust:
             self.check_exposure()
+            if self.link_down:
+                return 0.
             self.check_saturation()
+            if self.link_down:
+                return 0.
         self._f = self.get_frequency()
+        if self.link_down:
+            return 0.
 
         f_target = self.target_freq + frequency_shift
         if abs(self._f - f_target) > self.locked_tolerance:
@@ -168,6 +229,8 @@ class WavemeterClient():
         return self._f
         
 class DummyWavemeterController():
+    link_down = False
+
     def check_ch(self) -> int:
         return 0
     
@@ -193,6 +256,8 @@ class DummyWavemeterController():
         pass
 
 class DummyWavemeterClient():
+    link_down = False
+
     def check_exposure(self) -> bool:
         return True
     

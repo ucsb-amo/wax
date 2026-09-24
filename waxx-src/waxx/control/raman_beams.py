@@ -136,7 +136,7 @@ class RamanBeamPair():
 
     @portable(flags={"fast-math"})
     def state_splitting_to_ao_frequency(self,
-                                        frequency_state_splitting):
+                                        frequency_state_splitting) -> TTuple([TFloat, TFloat]):
 
         a0 = self.dds0.aom_order
         a1 = self.dds1.aom_order
@@ -159,8 +159,34 @@ class RamanBeamPair():
 
         df_1 = df_0 * f
 
-        self._dummy[DDS0_IDX] = fc0 + c0 * df_0
-        self._dummy[DDS1_IDX] = fc1 - c0 * a0 * a1 * df_1
+        f0 = fc0 + c0 * df_0
+        f1 = fc1 - c0 * a0 * a1 * df_1
+
+        self._dummy[DDS0_IDX] = f0
+        self._dummy[DDS1_IDX] = f1
+
+        return f0, f1
+
+    def ao_frequencies(self, frequency_transition):
+        """Host-side: the (dds0, dds1) AO frequencies (Hz) that put the pair
+        on a two-photon transition of frequency_transition (Hz; a number or
+        an array, e.g. one value per shot).
+
+        Runs state_splitting_to_ao_frequency itself -- the same code the
+        kernel runs in set() -- so a host consumer (the OPX config, which
+        drives these AOs directly) cannot drift from the ARTIQ split. The
+        kernel's scratch array is restored afterwards.
+        """
+        f = np.asarray(frequency_transition, dtype=float)
+        out = np.empty((f.size, 2))
+        saved = self._dummy.copy()
+        try:
+            for i, x in enumerate(f.ravel()):
+                self.state_splitting_to_ao_frequency(float(x))
+                out[i] = self._dummy[DDS0_IDX], self._dummy[DDS1_IDX]
+        finally:
+            self._dummy[:] = saved
+        return out[:, 0].reshape(f.shape), out[:, 1].reshape(f.shape)
 
     @kernel
     def set_transition_frequency(self,frequency_transition=dv):
