@@ -502,6 +502,12 @@ class LiveODWindow(QWidget):
                 self.data_handler.save_failed_signal.disconnect(self.on_save_failed)
             except Exception:
                 pass
+            # ...and its late frames must not count towards the new run.
+            try:
+                self.data_handler.got_image_from_queue.disconnect(
+                    self.live_od_server.on_image_received)
+            except Exception:
+                pass
             self.data_handler = None
 
         # Interrupt any CameraBaby left over from the previous run.
@@ -552,6 +558,12 @@ class LiveODWindow(QWidget):
             self.analyzer.get_analysis_type)
         self.data_handler.got_image_from_queue.connect(self.analyzer.got_img)
         self.data_handler.got_image_from_queue.connect(self.count_images)
+        # The server counts frames against N_img at END_RUN, and a grab that
+        # ends early tells it why; both from the camera threads directly.
+        self.data_handler.got_image_from_queue.connect(
+            self.live_od_server.on_image_received, Qt.ConnectionType.DirectConnection)
+        self.the_baby.grab_failed_signal.connect(
+            self.live_od_server.on_grab_failed, Qt.ConnectionType.DirectConnection)
 
         self.the_baby.camera_connect.connect(self.check_new_camera)
         self.the_baby.camera_grab_start.connect(self.grab_start_msg)

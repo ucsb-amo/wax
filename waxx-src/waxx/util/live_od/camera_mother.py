@@ -1,4 +1,5 @@
-﻿import time
+﻿import threading
+import time
 import numpy as np
 import names
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -112,6 +113,11 @@ class DataHandler(QThread):
         self.camera_params = CameraParams()
         self.run_info = RunInfo()
         self.interrupted = False
+        # Set by the CameraBaby when its grab is over, however it ended.  The
+        # dispatch loop then drains the queue and exits instead of waiting for
+        # a frame index that will never arrive.
+        self._grab_over = threading.Event()
+        self.images_received = 0
         self._camera_key_hint = ""
 
         # Pre-populate from constructor arguments so HDF5 reads are
@@ -149,6 +155,12 @@ class DataHandler(QThread):
 
     def run(self):
         self.write_image_to_dataset()
+
+    def grab_finished(self):
+        """The CameraBaby's grab is over (all frames in, a camera timeout, an
+        error). Once the queue is drained the dispatch loop exits and the
+        writer closes the file. Safe from any thread."""
+        self._grab_over.set()
 
     def read_params(self):
         """Populate camera/run-info attrs, then emit configuration signals.
@@ -219,12 +231,20 @@ class DataHandler(QThread):
                 try:
                     img, _, idx = self.queue.get(block=False)
                     img_t = time.time()
+                    self.images_received += 1
                     self.got_image_from_queue.emit(img)   # immediate display / OD plot
                     if self.save_data:
                         self.writer.put(img, idx, img_t)   # non-blocking hand-off
                     if idx == (self.N_img - 1):
                         break
                 except Empty:
+                    if self._grab_over.is_set():
+                        # The grab ended and the queue is drained: nothing more
+                        # is coming.  Waiting on for the last index kept the
+                        # writer's file handle open indefinitely after a camera
+                        # timeout, and END_RUN's save then ran on top of it
+                        # (run 80704, 2026-09-24).
+                        break
                     self.msleep(1)
                 except Exception as e:
                     logger.exception(f"DataHandler: unexpected error in image dispatch loop: {e}")
@@ -258,6 +278,7 @@ class CameraBaby(QThread):
     image_type_signal = pyqtSignal(bool)
     honorable_death_signal = pyqtSignal()
     dishonorable_death_signal = pyqtSignal()
+    grab_failed_signal = pyqtSignal(str)    # the grab ended early; why (frames so far are kept)
     done_signal = pyqtSignal()
     break_signal = pyqtSignal()
     cam_status_signal = pyqtSignal(int)
@@ -277,6 +298,13 @@ class CameraBaby(QThread):
         self.dead = False
 
     def run(self):
+        # How the grab ended, other than by an interrupt or all frames in.  A
+        # failure once frames may have arrived (timeout, driver error) keeps
+        # the file: END_RUN saves what came and marks the run incomplete.  A
+        # camera that never opened has nothing to keep, and the experiment
+        # will not send END_RUN for it, so that path still deletes the file.
+        failure = ""
+        keep_file = False
         try:
             self.cam_status_signal.emit(0)
             logger.debug(f"{self.name}: I am born!")
@@ -287,22 +315,30 @@ class CameraBaby(QThread):
             # An expected failure (camera never triggered, experiment aborted
             # or stalled), so one line, no traceback.  Camera drivers raise the
             # builtin TimeoutError with the details in the message.
-            logger.warning(f"{self.name}: camera timed out. {e} "
-                           f"Ending this run's grab; its incomplete data file is discarded.")
+            failure, keep_file = f"camera timed out: {e}", True
+            logger.warning(f"{self.name}: camera timed out. {e} Ending this run's grab. "
+                           f"The frames that arrived are kept; the run will be saved as incomplete.")
         except CameraNotReadyError as e:
             # Also expected, and CameraNanny has already logged why: the run
             # was aborted while waiting for the camera, or opening/configuring
             # it failed.  One line, no traceback.
+            failure = f"camera not ready: {e}"
             if self.interrupted:
                 logger.info(f"{self.name}: run aborted before the camera was ready.")
             else:
                 logger.warning(f"{self.name}: {e}; not starting this run's grab. "
                                f"Check the camera connection and the messages above.")
         except Exception as e:
+            failure, keep_file = f"{type(e).__name__}: {e}", True
             logger.exception(f"CameraBaby {self.name}: fatal error: {e}")
+        # However it ended, the dispatch loop must not wait for frames that
+        # will never come: it drains the queue, and the writer closes the file.
+        self.data_handler.grab_finished()
         if self.interrupted and self.death is not self.honorable_death:
             logger.warning('Grab loop interrupted, shutting down.')
             self.death = self.dishonorable_death
+        elif failure and keep_file and self.death is not self.honorable_death:
+            self.death = lambda: self.failed_death(failure)
         try:
             self.death()
         except Exception as e:
@@ -361,6 +397,22 @@ class CameraBaby(QThread):
             pass
         self.data_handler.writer.discard(delete_data)
         time.sleep(0.1)
+        self.dishonorable_death_signal.emit()
+        self.cam_status_signal.emit(-1)
+        return True
+
+    def failed_death(self, reason: str):
+        """The grab ended early with frames possibly already written: stop the
+        camera, leave the file to END_RUN (which saves it marked incomplete), and
+        tell the server why. Until 2026-09-24 this path tried to delete the file,
+        failed because the writer still held it, and END_RUN then marked the
+        run complete regardless."""
+        try:
+            self.camera.stop_grab()
+        except:
+            pass
+        time.sleep(0.1)
+        self.grab_failed_signal.emit(reason)
         self.dishonorable_death_signal.emit()
         self.cam_status_signal.emit(-1)
         return True

@@ -14,6 +14,7 @@ Typical per-run sequence:
     client.end_run(payload)                   # END_RUN
 """
 
+import logging
 import pickle
 import time
 
@@ -43,6 +44,8 @@ class LiveODClient(NetClient):
         self.last_adjust_values: dict = {}
         # Reset flag from the latest server reply that carried one.
         self.last_reset_requested: bool = False
+        # The END_RUN reply; ``incomplete`` in it means frames were missing.
+        self.last_end_run_reply: dict = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -213,7 +216,61 @@ class LiveODClient(NetClient):
             raise RuntimeError(
                 f"[LiveODClient] END_RUN failed: {reply.get('error')}"
             )
+        self.last_end_run_reply = dict(reply)
+        incomplete = reply.get("incomplete")
+        if incomplete:
+            # The file exists, with what arrived, marked data_complete=False.
+            # Said here as well as in the file: this is the experiment's own
+            # terminal, where the person (or agent) who ran it is looking.
+            print(
+                f"\n{'!' * 72}\n"
+                f"!! RUN SAVED INCOMPLETE: {incomplete.get('reason', '')}\n"
+                f"!! {incomplete.get('images_received', '?')} of "
+                f"{incomplete.get('images_expected', '?')} images arrived. The file is marked\n"
+                f"!! data_complete=False; its images are in arrival order and do not line up\n"
+                f"!! with the shots. Do not analyze it as a complete run.\n"
+                f"{'!' * 72}\n"
+            )
         return True
+
+    def poll(self) -> dict:
+        """The server's POLL reply: run state, run id, shot and frame counts,
+        how the last run ended. Read-only; raises on a network error."""
+        return self._send_recv({"tag": "POLL"})
+
+    def get_log(self, run_id=None, seq=None, since=None,
+                min_level: int = logging.DEBUG, limit: int = 2000) -> dict:
+        """The server's log records for one run, from its in-memory buffer.
+
+        ``run_id``: a run id, ``None`` for the current or last run, or ``"all"``
+        for every buffered record.  ``seq``: the server's own run counter (from
+        ``list_runs``), which tells unsaved runs (all run id 0) apart.  ``since``:
+        epoch seconds, later records only.  ``min_level``: a ``logging`` level.
+        Returns ``{"run": {...}, "records": [{"t", "level", "levelname", "msg",
+        "thread", ...}, ...]}``.  Raises ``LookupError`` when the server has no
+        such run in its buffer (it starts empty when the server starts).
+        """
+        msg = {"tag": "GET_LOG", "min_level": int(min_level), "limit": int(limit)}
+        if run_id is not None:
+            msg["run_id"] = run_id
+        if seq is not None:
+            msg["seq"] = int(seq)
+        if since is not None:
+            msg["since"] = float(since)
+        reply = self._send_recv(msg)
+        if not reply.get("ok"):
+            raise LookupError(f"[LiveODClient] GET_LOG: {reply.get('error')}")
+        return {"run": reply.get("run"), "records": list(reply.get("records", []))}
+
+    def list_runs(self, limit: int = 50) -> list:
+        """The runs this server process has seen, oldest first, each with its
+        ``seq``, ``run_id``, ``name``, start/end times and ``outcome`` (``saved``,
+        ``saved_incomplete``, ``discarded``, ``save_failed``, ``nothing_written``,
+        ``in_progress``)."""
+        reply = self._send_recv({"tag": "GET_LOG", "runs": True, "limit": int(limit)})
+        if not reply.get("ok"):
+            raise LookupError(f"[LiveODClient] GET_LOG runs: {reply.get('error')}")
+        return list(reply.get("runs", []))
 
     def abort_run(self) -> None:
         """Notify the server that the experiment has acknowledged the abort.

@@ -27,7 +27,7 @@ from waxx.util.live_od.config import get_config
 # Everything the server does to the run's data file (reserve, save, delete) is
 # in live_od/data/run_file.py; this module keeps the protocol and the run state.
 from waxx.util.live_od.data.run_file import RunFile, RunFileSaveError
-from waxx.util.live_od.log import get_logger
+from waxx.util.live_od.log import get_logger, get_log_buffer
 from waxx.util.live_od.marker_store import MarkerStore
 
 logger = get_logger("server")
@@ -111,6 +111,17 @@ class LiveODServer(QThread, NetServer):
         self._shot_durations: list = []  # rolling list of last 5 shot durations (excluding first shot)
         self._run_state = "idle"
         self._current_expt_name = ""    # the run's experiment file (class name from an older client)
+        self._current_n_shots = 0
+        # Frames: how many the run asked for (N_img, 0 for a no-camera run) and
+        # how many the DataHandler has taken off the camera queue so far
+        # (on_image_received, from the DataHandler thread).  END_RUN compares
+        # the two; a shortfall marks the file incomplete instead of complete.
+        self._images_expected = 0
+        self._images_received = 0
+        self._images_lock = threading.Lock()
+        self._grab_failure = ""         # the CameraBaby's reason, when its grab ended early
+        self._frame_deficit_warned = 0  # the shortfall already warned about this run
+        self._last_outcome = {}         # how the last run ended, for POLL / GET_LOG
         # pins on the image, per camera; the file is not touched until first used
         self.markers = MarkerStore(marker_path)
 
@@ -179,6 +190,23 @@ class LiveODServer(QThread, NetServer):
         """
         self._run_file.writer_finished()
 
+    def on_image_received(self, *_):
+        """One frame came off the camera queue. Connect to
+        ``DataHandler.got_image_from_queue`` with a DirectConnection."""
+        with self._images_lock:
+            self._images_received += 1
+
+    def on_grab_failed(self, reason: str):
+        """The CameraBaby's grab ended early (timeout, camera error). Connect to
+        ``CameraBaby.grab_failed_signal`` with a DirectConnection. END_RUN puts
+        the reason in the file."""
+        self._grab_failure = str(reason)
+        get_log_buffer().update_run(grab_failure=self._grab_failure)
+
+    def _images_received_now(self) -> int:
+        with self._images_lock:
+            return self._images_received
+
     def stop(self):
         """Request the server loop to stop on the next poll cycle."""
         self._stop_beacon()
@@ -223,6 +251,8 @@ class LiveODServer(QThread, NetServer):
                         reply = self._handle_camera_control(msg)
                     elif tag == "POLL":
                         reply = self._handle_poll(msg)
+                    elif tag == "GET_LOG":
+                        reply = self._handle_get_log(msg)
                     elif tag == "ABORT_RUN":
                         reply = self._handle_abort_run(msg)
                     elif tag == "SUBSCRIBE_SCALARS":
@@ -283,8 +313,24 @@ class LiveODServer(QThread, NetServer):
         self._run_file.discard()
         self._reset_requested = False
         self._run_in_progress = False
+        self._record_outcome("discarded", "reset")
         self._set_run_state("aborted")
         self.run_done_signal.emit()
+
+    def _record_outcome(self, outcome: str, detail: str = ""):
+        """How the current run ended, for the log buffer's run index and POLL."""
+        self._last_outcome = {
+            "run_id": self._current_run_id, "outcome": outcome, "detail": detail,
+            "n_shots": len(self._shot_timestamps),
+            "images_expected": self._images_expected,
+            "images_received": self._images_received_now(),
+        }
+        get_log_buffer().end_run(
+            outcome, detail,
+            n_shots=len(self._shot_timestamps),
+            images_expected=self._images_expected,
+            images_received=self._images_received_now(),
+        )
 
     def _handle_init_run(self, msg: dict) -> dict:
         # If the previous run was reset but the experiment process was killed
@@ -354,6 +400,12 @@ class LiveODServer(QThread, NetServer):
         n_img = int(msg.get('params', {}).get('N_img', 1))
         n_shots = int(msg.get('N_shots_with_repeats', 1))
         n_pwa = int(msg.get('N_pwa_per_shot', 1))
+        self._current_n_shots = n_shots
+        with self._images_lock:
+            self._images_received = 0
+        self._images_expected = n_img if capture_images else 0
+        self._grab_failure = ""
+        self._frame_deficit_warned = 0
 
         params_payload = dict(msg.get('params', {}))
         run_info_payload = {
@@ -371,6 +423,13 @@ class LiveODServer(QThread, NetServer):
         # {name: [min, max]} of the scan, for the units the viewer shows the xvars
         # in; an older experiment process does not send it
         self._current_xvar_ranges = dict(msg.get('xvar_ranges') or {})
+        # From here every log record is this run's (GET_LOG).
+        get_log_buffer().begin_run(
+            run_id, self._current_expt_name,
+            n_shots_expected=n_shots, images_expected=self._images_expected,
+            camera_key=camera_key if capture_images else "", save_data=save_data,
+            filepath=filepath,
+        )
 
         adjust_specs = list(msg.get('adjust_specs', []))
         with self._adjust_lock:
@@ -486,9 +545,37 @@ class LiveODServer(QThread, NetServer):
         line = f"shot {shot_idx + 1}/{N_total} (Δt={delta_t:.1f}s | ETA {eta_str})"
         sparse = shot_idx == 0 or shot_idx + 1 == N_total or (shot_idx + 1) % max(1, N_total // 20) == 0
         logger.log(logging.INFO if sparse else logging.DEBUG, line)
+        self._check_frame_deficit(shot_idx, N_total)
         # Include reset flag so the experiment can abort at shot boundary
         # even if the POLL-based check misses it.
         return {"ok": True, "reset_requested": self._reset_requested, "adjust_values": adjust_values}
+
+    def _check_frame_deficit(self, shot_idx: int, N_total: int):
+        """Warn, during the run, when the camera has delivered fewer frames than
+        the shots so far must have produced.
+
+        SHOT_COMPLETE is an RPC from the kernel, which can run ahead of the
+        hardware by a shot or so, and a frame is in flight for the readout
+        time, so this only counts the shots *before* the one just reported and
+        only speaks up once the shortfall is a whole shot's worth. It cannot
+        abort: a legitimate run with a slow readout could look like this for a
+        moment. END_RUN's count against ``N_img`` is the check that decides
+        whether the file is marked complete.
+        """
+        if not self._images_expected or N_total <= 0:
+            return
+        per_shot = max(1, self._images_expected // N_total)
+        must_have = per_shot * shot_idx           # frames from the shots before this one
+        deficit = must_have - self._images_received_now()
+        if deficit >= per_shot and deficit > self._frame_deficit_warned:
+            self._frame_deficit_warned = deficit
+            logger.warning(
+                f"Camera is {deficit} frame(s) behind after shot {shot_idx + 1}/{N_total} "
+                f"({self._images_received_now()} received, {must_have} due from the shots "
+                f"before it). A trigger the camera was not ready for leaves no gap: "
+                f"every later frame lands one slot early. If this does not clear, the "
+                f"run will be saved as incomplete."
+            )
 
     def _handle_end_run(self, msg: dict) -> dict:
         if self._reset_requested:
@@ -497,19 +584,26 @@ class LiveODServer(QThread, NetServer):
             self._run_file.discard(wait_for_writer=False)
             self._reset_requested = False
             self._run_in_progress = False
+            self._record_outcome("discarded", "reset")
             self._set_run_state("aborted")
             self.run_done_signal.emit()
             return {"ok": True}
+        incomplete = None
         if self._run_file.pending:
             self._set_run_state("saving")
             try:
                 # waits for the image writer, stashes the payload, then saves
-                self._run_file.save(msg, self._current_run_id, self._shot_timestamps)
-                logger.info(f"END_RUN: run_id={self._current_run_id} saved.")
+                incomplete = self._run_file.save(
+                    msg, self._current_run_id, self._shot_timestamps,
+                    images_expected=self._images_expected,
+                    images_received=self._images_received_now(),
+                    grab_failure=self._grab_failure,
+                )
             except RunFileSaveError as exc:
                 error = str(exc)    # the saver's error, plus the way out if the payload was stashed
                 # one record, so the error banner shows the failure and the way out together
                 logger.error(f"END_RUN: save of run {self._current_run_id} failed: {error}")
+                self._record_outcome("save_failed", exc.cause)
                 self._set_run_state("error", f"Save failed: {exc.cause}")
                 # The run is over either way.  Clear the in-progress state
                 # before reporting the failure, otherwise the server rejects
@@ -518,14 +612,31 @@ class LiveODServer(QThread, NetServer):
                 self._run_in_progress = False
                 self.run_done_signal.emit()
                 return {"ok": False, "error": error}
-            self._set_run_state("saved")
+            if incomplete:
+                # An ERROR, not a warning: the file exists but must not be
+                # read as a complete run, and the banner should say so.
+                logger.error(
+                    f"END_RUN: run_id={self._current_run_id} saved INCOMPLETE "
+                    f"({incomplete['reason']}). The file is marked data_complete=False; "
+                    f"its images are in arrival order and do not line up with the shots."
+                )
+                self._record_outcome("saved_incomplete", incomplete["reason"])
+                self._set_run_state("saved", f"INCOMPLETE: {incomplete['reason']}")
+            else:
+                logger.info(f"END_RUN: run_id={self._current_run_id} saved.")
+                self._record_outcome("saved")
+                self._set_run_state("saved")
         else:
             logger.info("END_RUN: save_data=False, nothing written.")
+            self._record_outcome("nothing_written", "save_data=False")
             self._set_run_state("done", "save_data=False, nothing written")
 
         self._run_in_progress = False
         self.run_done_signal.emit()
-        return {"ok": True}
+        reply = {"ok": True}
+        if incomplete:
+            reply["incomplete"] = dict(incomplete)
+        return reply
 
     def note_reset_requested(self):
         """The GUI's own abort button was pressed (the remote path is _handle_reset)."""
@@ -623,12 +734,54 @@ class LiveODServer(QThread, NetServer):
             "n_shots": len(self._shot_timestamps),
             "last_shot_age_s": (now - last_shot) if last_shot else None,
             "init_run_age_s": (now - self._init_run_time) if self._init_run_time else None,
+            # newer keys; a client that predates them ignores them
+            "run_state": self._run_state,
+            "expt_name": self._current_expt_name,
+            "n_shots_expected": self._current_n_shots,
+            "images_expected": self._images_expected,
+            "images_received": self._images_received_now(),
+            "grab_failure": self._grab_failure,
+            "last_outcome": dict(self._last_outcome),
             # which cameras this liveOD holds, and the one the live run is using
             "cameras": self._camera_states(),
             "run_camera_key": (self._current_camera_key
                                if self._run_in_progress and self._current_capture_images
                                else ""),
         }
+
+    def _handle_get_log(self, msg: dict) -> dict:
+        """The server's log for one run, from the in-memory buffer, so a process
+        that was not watching can still find out what became of a run.
+
+        ``run_id`` (default: the current or last run; ``"all"`` for every
+        record), ``seq`` (the buffer's own run counter, unique for unsaved runs
+        that all have run_id 0), ``since`` (epoch seconds, later records only),
+        ``min_level`` (a logging level number, default DEBUG), ``limit`` (the
+        last N matching records, default 2000). With ``runs=True`` it returns
+        the run index instead: one entry per run this process has seen, with
+        how each one ended. Read-only.
+        """
+        buf = get_log_buffer()
+        if msg.get("runs"):
+            return {"ok": True, "runs": buf.runs(limit=int(msg.get("limit", 50)))}
+        run_id = msg.get("run_id", None)
+        seq = msg.get("seq", None)
+        run = None if run_id == "all" else buf.find_run(run_id=run_id, seq=seq)
+        if run_id != "all" and run is None:
+            return {"ok": False, "error": f"No run with run_id={run_id!r} seq={seq!r} in this server's log "
+                                          f"(the buffer starts when the server does)."}
+        current = buf.find_run()
+        if run is not None and current is not None and run["seq"] == current["seq"]:
+            # the live run: the counters the run index only gets at the end
+            run.update(n_shots=len(self._shot_timestamps),
+                       images_received=self._images_received_now(),
+                       run_state=self._run_state, run_in_progress=self._run_in_progress)
+        records = buf.records(
+            run_id=run_id, seq=seq, since=msg.get("since", None),
+            min_level=int(msg.get("min_level", logging.DEBUG)),
+            limit=int(msg.get("limit", 2000)),
+        )
+        return {"ok": True, "run": run, "records": records}
 
     def _handle_subscribe_scalars(self, msg: dict) -> dict:
         """Remote viewer subscribes to scalar compute tier."""

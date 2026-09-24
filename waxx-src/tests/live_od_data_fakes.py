@@ -29,10 +29,11 @@ class FakeSaver:
             f.create_group("data")
         return run_id, filepath
 
-    def save_data_from_payload(self, msg, filepath, shot_timestamps=None):
+    def save_data_from_payload(self, msg, filepath, shot_timestamps=None, incomplete=None):
         if self.fail_save:
             raise OSError("drive went away")
         self.saved.append((filepath, list(shot_timestamps or [])))
+        self.incomplete = incomplete        # what the last save was told is missing
 
 
 def new_data_file(folder):
@@ -42,7 +43,7 @@ def new_data_file(folder):
 
 def patch_payload_stash(monkeypatch, run_file_module, calls, stash_path="stash.pkl"):
     """Replace the stash / clear pair RunFile imported, recording the order of calls."""
-    def stash(msg, filepath, run_id, shot_timestamps=None):
+    def stash(msg, filepath, run_id, shot_timestamps=None, incomplete=None):
         calls.append("stash")
         return stash_path
     monkeypatch.setattr(run_file_module, "stash_end_run_payload", stash)

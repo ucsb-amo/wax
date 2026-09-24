@@ -82,28 +82,55 @@ class RunFile:
         """There is a file that END_RUN still has to save into."""
         return bool(self.save_data and self.filepath)
 
-    def save(self, msg: dict, run_id: int, shot_timestamps: list):
-        """The END_RUN save. Raises RunFileSaveError if it fails."""
+    def save(self, msg: dict, run_id: int, shot_timestamps: list,
+             images_expected: int = 0, images_received: int = 0,
+             grab_failure: str = ""):
+        """The END_RUN save. Raises RunFileSaveError if it fails.
+
+        Returns None when the run's data is all there, else a dict describing
+        what is missing (``reason``, ``images_expected``, ``images_received``),
+        which the saver has written into the file: ``run_complete`` stays False
+        and ``data_complete=False`` / ``incomplete_reason`` say why. A run is
+        incomplete when the image writer never finished, when fewer frames
+        arrived than the run asked for, or when the camera grab reported a
+        failure (``grab_failure``, the CameraBaby's reason).
+        """
         # Wait for the image writer to close its HDF5 handle before we open
         # the same file for the end-of-run save.  Without this wait the
         # two h5py opens race and either corrupt the file or raise OSError.
+        reasons = []
         if not self.writer_done.wait(timeout=DATA_SAVER_TIMEOUT):
             logger.warning(f"DataHandler did not finish within {DATA_SAVER_TIMEOUT:.0f} s — proceeding anyway.")
+            reasons.append(f"image writer did not finish within {DATA_SAVER_TIMEOUT:.0f} s")
+        if images_expected and images_received < images_expected:
+            reasons.append(f"{images_received}/{images_expected} images received")
+        if grab_failure:
+            reasons.append(str(grab_failure))
+        incomplete = None
+        if reasons:
+            incomplete = {
+                "reason": "; ".join(reasons),
+                "images_expected": int(images_expected),
+                "images_received": int(images_received),
+            }
         # Stash the payload on local disk BEFORE touching the data file.
         # The experiment sends its final params exactly once and then
         # drops them, so without this a failed save loses them for good.
         stash_path = stash_end_run_payload(
             msg, self.filepath, run_id,
             shot_timestamps=shot_timestamps,
+            incomplete=incomplete,
         )
         try:
             self._data_saver.save_data_from_payload(
                 msg, self.filepath,
                 shot_timestamps=shot_timestamps,
+                incomplete=incomplete,
             )
             clear_end_run_payload(stash_path)
             # Forget the file so a late RESET cannot delete an already-saved run.
             self.filepath = ""
+            return incomplete
         except Exception as exc:
             logger.debug("END_RUN: save failed", exc_info=True)
             error = str(exc)
