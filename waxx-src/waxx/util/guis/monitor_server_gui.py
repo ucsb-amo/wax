@@ -2,6 +2,7 @@ import socket
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
@@ -23,19 +24,103 @@ def _state_name(state) -> str:
     return _STATE_NAMES.get(state, str(state))
 
 
-class Status:
-    def __init__(self,state=False):
+@dataclass
+class MonitorStatus:
+    """What the monitor server reports about the monitor experiment.
+
+    ``state`` is the :class:`ReadyBit` value clients poll with ``status``;
+    the rest is the detail behind it, served by ``status_json``:
+
+    * ``sub_state`` -- machine-readable reason for the state: ``"starting"``
+      (LOADING), ``"running"`` (READY), and for NOT_READY ``"never_started"``,
+      ``"stopped_on_request"``, or the classification
+      :class:`~waxx.util.device_state.monitor_manager.MonitorManager` made of
+      the last exit (``"interrupted_by_run"``, ``"exited"``, ``"failed"``,
+      ``"preflight_failed"``).
+    * ``reason`` -- human-readable detail, ``""`` when there is none.
+    * ``since`` -- epoch seconds when the current (state, sub_state) began.
+    * ``pid`` -- pid of the monitor experiment process, ``None`` when it is
+      not running.
+    * ``expt_path`` -- the monitor experiment file the server launches.
+
+    The object is written by the owning server (main thread) and read by the
+    TCP responder thread; plain attribute writes are atomic under the GIL and a
+    reader seeing one field a tick stale is harmless.
+    """
+
+    state: int = STATES.NOT_READY
+    sub_state: str = "never_started"
+    reason: str = ""
+    since: float = field(default_factory=time.time)
+    pid: int | None = None
+    expt_path: str = ""
+
+    @property
+    def state_name(self) -> str:
+        return _state_name(self.state)
+
+    def set_state(self, state, sub_state: str | None = None,
+                  reason: str | None = None) -> bool:
+        """Set the state; ``since`` moves only when state or sub_state change.
+
+        ``sub_state=None`` keeps the current sub_state.  ``reason=None`` keeps
+        the current reason unless the (state, sub_state) changed, in which case
+        it is cleared so a stale reason never outlives its state.  Returns
+        whether (state, sub_state) changed.
+        """
+        changed = (state != self.state) or (
+            sub_state is not None and sub_state != self.sub_state)
         self.state = state
+        if sub_state is not None:
+            self.sub_state = sub_state
+        if reason is not None:
+            self.reason = reason
+        elif changed:
+            self.reason = ""
+        if changed:
+            self.since = time.time()
+        return changed
+
+    def to_dict(self) -> dict:
+        """The ``status_json`` reply, keyed exactly as ``MonitorClient.get_status`` documents."""
+        return {
+            "state": int(self.state),
+            "state_name": self.state_name,
+            "sub_state": self.sub_state,
+            "reason": self.reason,
+            "since": self.since,
+            "pid": self.pid,
+            "expt_path": self.expt_path,
+        }
+
+
+# Older code constructs ``Status()`` / reads ``status.state``; keep the name.
+Status = MonitorStatus
+
 
 class MonitorUDPServer(UdpServer):
     """TCP responder + sole writer of the device-state JSON.
 
-    Besides the legacy string commands (``status``/``reset``/``run complete``/
-    ``monitor ready``) it handles structured JSON requests from clients:
+    Plain-text commands (newline framed, one reply line each):
+
+    * ``status`` -- the bare ``ReadyBit`` integer as a string (legacy poll).
+    * ``status_json`` -- the structured status, see :class:`MonitorStatus`.
+      Neither status command is logged or forwarded to ``message_received``;
+      the Device Control GUI polls at 2 Hz.
+    * ``reset`` -- emit ``reset_signal`` (owner restarts the monitor).
+    * ``stop`` -- emit ``stop_signal`` (owner stops the monitor and leaves it
+      stopped until the next ``reset`` / ``run complete``); reply ``OK``.
+    * ``run complete`` / ``monitor ready`` -- forwarded to the owner through
+      ``message_received``; reply is the state integer.
+
+    Structured JSON requests from clients:
 
     * ``{"type": "update", "device_type", "device_name", "changes"}`` — merge a
       delta into the JSON atomically, bump the version, broadcast the change.
     * ``{"type": "get_state"}`` — return the full snapshot + current version.
+    * ``{"type": "get_version"}`` — return just the current version; the monitor
+      experiment polls this at ~10 Hz and only re-reads the JSON from the share
+      when it has moved.
 
     The version starts from the current epoch seconds so that a server restart
     always yields versions higher than any value a client still holds (forcing
@@ -43,11 +128,12 @@ class MonitorUDPServer(UdpServer):
     """
 
     reset_signal = pyqtSignal()
+    stop_signal = pyqtSignal()
 
     def __init__(self, config_file_path=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
-        self.status = Status()
+        self.status = MonitorStatus()
         self._print_connections_bool = False
 
         self.config_file_path = config_file_path
@@ -59,9 +145,14 @@ class MonitorUDPServer(UdpServer):
         if m.startswith("{"):
             # Structured (JSON) requests are fully handled in generate_reply.
             return
+        if m in ('status', 'status_json'):
+            # Polled continuously; never logged, never forwarded.
+            return
         if m == 'reset':
             self.reset_signal.emit()
-        if m == 'status':
+        if m == 'stop':
+            log.info("Stop requested by a client: stopping the monitor experiment.")
+            self.stop_signal.emit()
             return
         self.message_received.emit(message)
 
@@ -69,6 +160,10 @@ class MonitorUDPServer(UdpServer):
         m = message.strip()
         if m.startswith("{"):
             return self._handle_structured(m)
+        if m == 'status_json':
+            return json.dumps(self.status.to_dict())
+        if m == 'stop':
+            return "OK"
         return str(int(self.status.state))
 
     def _handle_structured(self, raw):
@@ -79,6 +174,8 @@ class MonitorUDPServer(UdpServer):
         mtype = obj.get("type")
         if mtype == "get_state":
             return self._reply_get_state()
+        if mtype == "get_version":
+            return json.dumps({"status": "ok", "version": self._version})
         if mtype == "update":
             return self._reply_update(obj)
         return json.dumps({"status": "error", "msg": f"unknown type {mtype}"})
@@ -268,10 +365,12 @@ class MonitorServerGUI(QWidget):
         for problem in self.monitor_manager.preflight_problems():
             log.error("Monitor cannot be started as configured: %s", problem)
 
-        self.status = Status()
-
         self.setup_ui()
         self.setup_udp_server()
+        # One status object, shared with the TCP responder so status_json
+        # always serves what this window shows.
+        self.status = self.udp_server.status
+        self.status.expt_path = str(monitor_expt_path)
 
         # Initial status is "not ready".  (This used to pass False, which equals
         # STATES.READY == 0 -- so the server briefly advertised READY, and the
@@ -315,9 +414,10 @@ class MonitorServerGUI(QWidget):
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
+        self.udp_server.stop_signal.connect(self._stop_monitor)
         self.server_thread.started.connect(self.udp_server.run)
         self.udp_server.message_received.connect(self.handle_message)
-        
+
         self.server_thread.start()
 
     def on_button_clicked(self):
@@ -337,6 +437,36 @@ class MonitorServerGUI(QWidget):
         """Surface the monitor's own failure reason in the terminal and the UI."""
         log.warning("Monitor is not running: %s", reason)
         self.status_indicator.setToolTip(f"Monitor is not running: {reason}")
+        # The signal is queued from the manager thread and may land a tick
+        # before the thread has fully exited; the 8 Hz check picks the same
+        # detail up from the manager as soon as isRunning() drops.
+        if not self.monitor_manager.isRunning():
+            self.set_status(STATES.NOT_READY,
+                            self.monitor_manager.last_stop_kind or "failed", reason)
+
+    def _not_ready_detail(self) -> tuple[str, str]:
+        """(sub_state, reason) for NOT_READY when nothing more specific is known.
+
+        A specific NOT_READY sub_state already recorded (by the stop handler or
+        by ``_on_monitor_stopped``) is kept; otherwise it is the manager's
+        classification of the last exit, or ``never_started``.
+        """
+        if self.status.state == STATES.NOT_READY and self.status.sub_state:
+            return self.status.sub_state, self.status.reason
+        kind = self.monitor_manager.last_stop_kind
+        if kind is None:
+            return "never_started", ""
+        return kind, self.monitor_manager.last_stop_reason or ""
+
+    def _stop_monitor(self):
+        """``stop`` command: stop the monitor and leave it stopped."""
+        if self.monitor_manager.isRunning():
+            log.info("Stopping monitor experiment on request...")
+            self.monitor_manager.stop()
+        else:
+            log.info("Stop requested; the monitor experiment is not running.")
+        self.set_status(STATES.NOT_READY, "stopped_on_request",
+                        "stopped by a client request")
 
     def restart_monitor(self):
         if getattr(self, "_restarting", False):
@@ -351,22 +481,26 @@ class MonitorServerGUI(QWidget):
                 log.info("Starting monitor experiment...")
             self.monitor_manager.start()
             if self.monitor_manager.isRunning():
-                self.set_status(STATES.LOADING)
+                self.set_status(STATES.LOADING, "starting", "")
             else:
-                # start() refused (pre-flight failure); it has already said why.
-                self.set_status(STATES.NOT_READY)
+                # start() refused (pre-flight failure); it has already said why
+                # and _on_monitor_stopped has recorded preflight_failed.
+                self.set_status(STATES.NOT_READY, *self._not_ready_detail())
         finally:
             self._restarting = False
 
-    def set_status(self, status):
+    def set_status(self, status, sub_state=None, reason=None):
+        changed = self.status.set_state(status, sub_state, reason)
+        self.status.pid = self.monitor_manager.pid
         # Logged only on change: check_monitor_status runs at 8 Hz.
-        previous = getattr(self, "_logged_state", None)
-        if status != previous:
+        if changed or getattr(self, "_logged_state", None) is None:
+            previous = getattr(self, "_logged_state", None)
+            current = f"{_state_name(status)} ({self.status.sub_state})"
             if previous is None:
-                log.info("state: %s", _state_name(status))
+                log.info("state: %s", current)
             else:
-                log.info("state: %s -> %s", _state_name(previous), _state_name(status))
-            self._logged_state = status
+                log.info("state: %s -> %s", previous, current)
+            self._logged_state = current
 
         if status == STATES.READY:
             self.status_indicator.setText("READY")
@@ -378,16 +512,14 @@ class MonitorServerGUI(QWidget):
             self.status_indicator.setText("Loading...")
             self.status_indicator.setStyleSheet("background-color: orange; color: white;")
 
-        self.status.state = status
-        self.udp_server.status.state = status
-
     def check_monitor_status(self):
-        if self.monitor_manager.isRunning() and self.status_indicator.text() != "READY":
-            self.set_status(STATES.LOADING)
-        elif not self.monitor_manager.isRunning():
-            self.set_status(STATES.NOT_READY)
+        running = self.monitor_manager.isRunning()
+        if running and self.status.state != STATES.READY:
+            self.set_status(STATES.LOADING, "starting", "")
+        elif not running:
+            self.set_status(STATES.NOT_READY, *self._not_ready_detail())
         else:
-            self.set_status(STATES.READY)
+            self.set_status(STATES.READY, "running", "")
 
     def handle_message(self, message):
         log.info("msg: %s", message)
@@ -396,7 +528,7 @@ class MonitorServerGUI(QWidget):
             self.restart_monitor()
         elif "monitor ready" in message:
             log.info("Monitor ready message received.")
-            self.set_status(STATES.READY)
+            self.set_status(STATES.READY, "running", "")
         
     def closeEvent(self, event):
         # Guarded with getattr: when __init__ aborted early (another monitor

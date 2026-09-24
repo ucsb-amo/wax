@@ -22,7 +22,7 @@ import logging
 from PyQt6.QtCore import QObject, QTimer, QCoreApplication
 
 from waxx.util.device_state.monitor_manager import MonitorManager
-from waxx.util.guis.monitor_server_gui import MonitorUDPServer, Status
+from waxx.util.guis.monitor_server_gui import MonitorUDPServer, MonitorStatus, _state_name
 from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.hardware_id import monitor_server_id
 from beacon.discovery.client import discover
@@ -31,16 +31,24 @@ from PyQt6.QtCore import QThread
 
 log = logging.getLogger(__name__)
 
-
-_STATE_NAMES = {STATES.READY: "READY", STATES.LOADING: "LOADING",
-                STATES.NOT_READY: "NOT_READY"}
-
-
-def _state_name(state) -> str:
-    return _STATE_NAMES.get(state, str(state))
+# Re-exported for callers that imported the old name from here.
+Status = MonitorStatus
 
 
 class HeadlessMonitorServer(QObject):
+    """Owns the MonitorManager and the TCP responder; drives the status.
+
+    State machine as served by ``status`` / ``status_json``:
+
+    * LOADING ``starting``  -- the experiment process is up, ``monitor ready``
+      not yet received.
+    * READY ``running``     -- the monitor loop is applying changes.
+    * NOT_READY             -- ``never_started`` before the first start,
+      ``stopped_on_request`` after a ``stop`` command, otherwise the manager's
+      classification of the exit (``interrupted_by_run``, ``exited``,
+      ``failed``, ``preflight_failed``).
+    """
+
     def __init__(self, monitor_expt_path: str, config_file_path: str | None = None):
         super().__init__()
         self.config_file_path = config_file_path
@@ -48,7 +56,6 @@ class HeadlessMonitorServer(QObject):
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
         self.monitor_manager.monitor_stopped.connect(self._on_monitor_stopped)
-        self.status = Status()
 
         log.info("monitor experiment: %s", monitor_expt_path)
         log.info("device state file: %s", config_file_path)
@@ -66,7 +73,11 @@ class HeadlessMonitorServer(QObject):
             log.error("Monitor cannot be started as configured: %s", problem)
 
         self._setup_udp_server()
-        self._set_status(STATES.NOT_READY)
+        # One status object, shared with the TCP responder so status_json
+        # always serves exactly what this process believes.
+        self.status = self.udp_server.status
+        self.status.expt_path = str(monitor_expt_path)
+        self._set_status(STATES.NOT_READY, "never_started", "")
 
         self._timer = QTimer(self)
         self._timer.setInterval(125)
@@ -85,12 +96,43 @@ class HeadlessMonitorServer(QObject):
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path)
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
+        self.udp_server.stop_signal.connect(self._stop_monitor)
         self.udp_server.message_received.connect(self._handle_message)
         self.server_thread.started.connect(self.udp_server.run)
         self.server_thread.start()
 
     def _on_monitor_stopped(self, reason: str) -> None:
         log.warning("Monitor is not running: %s", reason)
+        # The signal is queued from the manager thread and may land a tick
+        # before the thread has fully exited; the 8 Hz check picks the same
+        # detail up from the manager as soon as isRunning() drops.
+        if not self.monitor_manager.isRunning():
+            self._set_status(STATES.NOT_READY,
+                             self.monitor_manager.last_stop_kind or "failed", reason)
+
+    def _not_ready_detail(self) -> tuple[str, str]:
+        """(sub_state, reason) for NOT_READY when nothing more specific is known.
+
+        A specific NOT_READY sub_state already recorded (by the stop handler or
+        by ``_on_monitor_stopped``) is kept; otherwise it is the manager's
+        classification of the last exit, or ``never_started``.
+        """
+        if self.status.state == STATES.NOT_READY and self.status.sub_state:
+            return self.status.sub_state, self.status.reason
+        kind = self.monitor_manager.last_stop_kind
+        if kind is None:
+            return "never_started", ""
+        return kind, self.monitor_manager.last_stop_reason or ""
+
+    def _stop_monitor(self) -> None:
+        """``stop`` command: stop the monitor and leave it stopped."""
+        if self.monitor_manager.isRunning():
+            log.info("Stopping monitor experiment on request...")
+            self.monitor_manager.stop()
+        else:
+            log.info("Stop requested; the monitor experiment is not running.")
+        self._set_status(STATES.NOT_READY, "stopped_on_request",
+                         "stopped by a client request")
 
     def _restart_monitor(self) -> None:
         if getattr(self, "_restarting", False):
@@ -105,39 +147,43 @@ class HeadlessMonitorServer(QObject):
                 log.info("Starting monitor experiment...")
             self.monitor_manager.start()
             if self.monitor_manager.isRunning():
-                self._set_status(STATES.LOADING)
+                self._set_status(STATES.LOADING, "starting", "")
             else:
-                # start() refused (pre-flight failure); it has already said why.
-                self._set_status(STATES.NOT_READY)
+                # start() refused (pre-flight failure); it has already said why
+                # and _on_monitor_stopped has recorded preflight_failed.
+                self._set_status(STATES.NOT_READY, *self._not_ready_detail())
         finally:
             self._restarting = False
 
-    def _set_status(self, status) -> None:
+    def _set_status(self, status, sub_state: str | None = None,
+                    reason: str | None = None) -> None:
+        changed = self.status.set_state(status, sub_state, reason)
+        self.status.pid = self.monitor_manager.pid
         # Logged only on change: _check_status runs at 8 Hz.
         previous = getattr(self, "_logged_state", None)
-        if status != previous:
+        if changed or previous is None:
+            current = f"{_state_name(status)} ({self.status.sub_state})"
             if previous is None:
-                log.info("state: %s", _state_name(status))
+                log.info("state: %s", current)
             else:
-                log.info("state: %s -> %s", _state_name(previous), _state_name(status))
-            self._logged_state = status
-        self.status.state = status
-        self.udp_server.status.state = status
+                log.info("state: %s -> %s", previous, current)
+            self._logged_state = current
 
     def _check_status(self) -> None:
-        if self.monitor_manager.isRunning() and self.status.state != STATES.READY:
-            self._set_status(STATES.LOADING)
-        elif not self.monitor_manager.isRunning():
-            self._set_status(STATES.NOT_READY)
+        running = self.monitor_manager.isRunning()
+        if running and self.status.state != STATES.READY:
+            self._set_status(STATES.LOADING, "starting", "")
+        elif not running:
+            self._set_status(STATES.NOT_READY, *self._not_ready_detail())
         else:
-            self._set_status(STATES.READY)
+            self._set_status(STATES.READY, "running", "")
 
     def _handle_message(self, message: str) -> None:
         log.info("msg: %s", message)
         if "run complete" in message:
             self._restart_monitor()
         elif "monitor ready" in message:
-            self._set_status(STATES.READY)
+            self._set_status(STATES.READY, "running", "")
 
     def shutdown(self) -> None:
         try:

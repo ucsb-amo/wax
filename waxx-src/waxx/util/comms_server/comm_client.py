@@ -75,11 +75,46 @@ class MonitorClient(CommClient):
         self.send_message("monitor ready")
 
     def check_status(self):
+        """Legacy status poll: the bare ``ReadyBit`` integer as a string, or ``None``."""
         status = self.send_message("status")
         return status
-    
+
+    def get_status(self):
+        """Structured status poll.
+
+        Sends ``status_json`` and returns the parsed dict, or ``None`` on
+        failure.  Keys the server guarantees::
+
+            state        int   ReadyBit value (0 READY, 1 LOADING, 2 NOT_READY)
+            state_name   str   "READY" | "LOADING" | "NOT_READY"
+            sub_state    str   why it is in that state, machine-readable, e.g.
+                               "running", "starting", "never_started",
+                               "interrupted_by_run", "exited", "failed",
+                               "preflight_failed", "stopped_on_request"
+            reason       str   human-readable detail (may be "")
+            since        float epoch seconds when the current state began
+            pid          int|None  pid of the monitor experiment process
+            expt_path    str   monitor experiment file the server launches
+        """
+        import json  # noqa: PLC0415
+        reply = self.send_message("status_json")
+        if reply is None:
+            return None
+        try:
+            obj = json.loads(reply)
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+
     def send_reset(self):
         self.send_message("reset")
+
+    def send_stop(self):
+        """Ask the server to stop the monitor experiment and leave it stopped.
+
+        Returns the raw reply string, or ``None`` on failure.
+        """
+        return self.send_message("stop")
 
     def send_update(self, device_type, device_name, changes):
         """Send a partial device-state delta to the server.

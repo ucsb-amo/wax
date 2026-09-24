@@ -99,6 +99,26 @@ class MonitorManager(QThread):
         # having to scrape the terminal.
         self.last_error: str | None = None
         self.last_exit_code: int | None = None
+        # How the monitor last ended, machine-readable, for the server's
+        # structured status (``status_json`` sub_state).  ``None`` until the
+        # first start.  One of: "interrupted_by_run", "exited", "failed",
+        # "preflight_failed", "stopped_on_request".  ``last_stop_reason`` is
+        # the human-readable string that was emitted with ``monitor_stopped``.
+        self.last_stop_kind: str | None = None
+        self.last_stop_reason: str | None = None
+
+    @property
+    def pid(self) -> int | None:
+        """PID of the running monitor experiment process, or ``None``."""
+        with self._proc_lock:
+            proc = self._proc
+        return proc.pid if proc is not None else None
+
+    def _ended(self, kind: str, reason: str) -> None:
+        """Record how the monitor ended and tell listeners."""
+        self.last_stop_kind = kind
+        self.last_stop_reason = reason
+        self.monitor_stopped.emit(reason)
 
     # ------------------------------------------------------------------
     # Pre-flight
@@ -176,7 +196,7 @@ class MonitorManager(QThread):
                 log.error("  %s", line)
             self.last_error = problems[0]
             self.last_exit_code = None
-            self.monitor_stopped.emit(f"not started: {problems[0]}")
+            self._ended("preflight_failed", f"not started: {problems[0]}")
             return
         super().start(*args, **kwargs)
 
@@ -188,7 +208,7 @@ class MonitorManager(QThread):
             # A crash here would otherwise vanish with the thread.
             log.error("Monitor manager thread crashed:\n%s", traceback.format_exc())
             self.last_error = "monitor manager thread crashed (see traceback above)"
-            self.monitor_stopped.emit(self.last_error)
+            self._ended("failed", self.last_error)
 
     def run_expt(self):
         expt_path = self.monitor_expt_path
@@ -205,6 +225,8 @@ class MonitorManager(QThread):
             with self._proc_lock:
                 if self._stop_requested:
                     log.info("Monitor start aborted: stop was requested before launch.")
+                    self.last_stop_kind = "stopped_on_request"
+                    self.last_stop_reason = "stopped on request before launch"
                     return
                 try:
                     # stderr is merged into stdout so the child's output keeps
@@ -220,7 +242,7 @@ class MonitorManager(QThread):
                     for line in self._environment_report():
                         log.error("  %s", line)
                     self.last_error = f"could not spawn the monitor process: {exc!r}"
-                    self.monitor_stopped.emit(self.last_error)
+                    self._ended("failed", self.last_error)
                     return
             proc = self._proc
             log.info("Monitor experiment started (pid %s).", proc.pid)
@@ -240,7 +262,7 @@ class MonitorManager(QThread):
                 "Monitor experiment supervision failed:\n%s", traceback.format_exc()
             )
             self.last_error = "monitor supervision failed (see traceback above)"
-            self.monitor_stopped.emit(self.last_error)
+            self._ended("failed", self.last_error)
         finally:
             with self._proc_lock:
                 self._proc = None
@@ -255,7 +277,7 @@ class MonitorManager(QThread):
 
         if self._stop_requested:
             log.info("Monitor experiment stopped on request (exit code %s).", returncode)
-            self.monitor_stopped.emit("stopped on request")
+            self._ended("stopped_on_request", "stopped on request")
             return
 
         if _matches(output, _INTERRUPTED_SIGNATURES):
@@ -264,8 +286,9 @@ class MonitorManager(QThread):
                 "was closed. Expected if an experiment was just submitted.",
                 returncode,
             )
-            self.monitor_stopped.emit(
-                "interrupted -- another experiment was probably submitted"
+            self._ended(
+                "interrupted_by_run",
+                "interrupted -- another experiment was probably submitted",
             )
             return
 
@@ -274,7 +297,7 @@ class MonitorManager(QThread):
                 "Monitor experiment exited on its own with code 0 -- the hardware "
                 "is no longer being held in the monitor idle state."
             )
-            self.monitor_stopped.emit("exited with code 0")
+            self._ended("exited", "exited with code 0")
             return
 
         hints = _diagnose(output)
@@ -307,7 +330,7 @@ class MonitorManager(QThread):
         elif tail:
             summary = f"{summary}: {tail[-1]}"
         self.last_error = summary
-        self.monitor_stopped.emit(summary)
+        self._ended("failed", summary)
 
     # ------------------------------------------------------------------
     # Stop

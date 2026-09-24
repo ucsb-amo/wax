@@ -20,6 +20,11 @@ DEFAULT_UPDATE_INT = (-1, 0)
 
 T_MONITOR_UPDATE_INTERVAL = 0.1
 
+# After a failed get_version request, do not ask the server again for this
+# long (the file is read directly meanwhile).  A dead server would otherwise
+# add the client's connect/rediscover timeouts to every loop iteration.
+T_VERSION_PROBE_BACKOFF = 5.0
+
 from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.device_state.generate_state_file import Generator
 
@@ -49,6 +54,12 @@ class Monitor:
         self.expt = expt
 
         self._monitor_client = MonitorClient()
+
+        # Device-state version last seen from the server (``get_version``).
+        # ``detect_changes`` skips the JSON read while it is unchanged; ``None``
+        # forces a read on the next call.
+        self._last_seen_version: Optional[int] = None
+        self._version_probe_retry_after = 0.0
 
         self._schema_changed = False
 
@@ -223,6 +234,29 @@ class Monitor:
         print(f"Failed to load config file {self.config_file} after {max_attempts} attempts due to file being in use.")
         return None
 
+    def _fetch_server_version(self) -> Optional[int]:
+        """Ask the monitor server for its device-state version.
+
+        Returns the integer version, or ``None`` when the request failed or
+        the reply did not parse -- callers then fall back to reading the file.
+        A failure arms a backoff so a dead server is not asked at every loop
+        iteration.
+        """
+        now = time.monotonic()
+        if now < self._version_probe_retry_after:
+            return None
+        try:
+            reply = self._monitor_client.send_message(json.dumps({"type": "get_version"}))
+            if reply is None:
+                raise ValueError("no reply")
+            obj = json.loads(reply)
+            if not isinstance(obj, dict) or obj.get("status") != "ok":
+                raise ValueError(f"bad reply {reply!r}")
+            return int(obj["version"])
+        except Exception:
+            self._version_probe_retry_after = now + T_VERSION_PROBE_BACKOFF
+            return None
+
     def detect_changes(self, verbose: bool = True) -> Tuple[
         List[Tuple[np.int32, float, float]],
         List[Tuple[np.int32, float]],
@@ -231,19 +265,40 @@ class Monitor:
         List[Tuple[np.int32, float]]]:
         """
         Detect changes in the configuration file and populate update lists.
-        
+
+        The JSON lives on a network share and this runs at ~10 Hz, so the file
+        is only read when the server's device-state version has moved since
+        the last read (``get_version``).  The first call always reads the file;
+        so does any call for which the version request fails.  ``end()`` of a
+        finished experiment regenerates the file without going through the
+        server, but the monitor is restarted after every run and its first
+        read picks that up.
+
         Args:
             verbose: If True, print information about detected changes.
-            
+
         Returns:
             Tuple of all update lists.
         """
+        # Version is fetched BEFORE the file read so an update landing in
+        # between is seen as "version moved" next time, never missed.
+        server_version = self._fetch_server_version()
+        if (self.last_config_data is not None
+                and server_version is not None
+                and server_version == self._last_seen_version):
+            self.clear_update_lists()
+            return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates,
+                    self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
+
         current_config = self.load_config_file()
         if current_config is None:
+            # Read again next time regardless of what the server says.
+            self._last_seen_version = None
             if verbose:
                 print("No changes detected (config file could not be loaded).")
-            return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates, 
+            return (self.dds_frequency_amplitude_updates, self.dds_vpd_updates,
                     self.dds_sw_state_updates, self.ttl_updates, self.dac_updates)
+        self._last_seen_version = server_version
 
         self.clear_update_lists()
 
