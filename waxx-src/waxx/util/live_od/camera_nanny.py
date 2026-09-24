@@ -94,8 +94,20 @@ class CameraNanny():
                 camera.set_EMCCD_gain(camera_params.gain)
                 camera.set_exposure(camera_params.exposure_time)
                 camera.set_amp_mode(preamp=camera_params.preamp)
-                camera.set_hsspeed(camera_params.hs_speed)
-                logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
+                # keyword: set_hsspeed(typ, hs_speed) - the old positional call
+                # passed hs_speed as typ (harmless only because both are 0)
+                camera.set_hsspeed(hs_speed=camera_params.hs_speed)
+                # 2026-09-24: the camera stays open between runs, so the
+                # vertical clock was only ever applied at first open (server
+                # start); per-run vs_speed / vs_amp were recorded in the HDF5
+                # but never reached the camera (runs 80702-80706).
+                camera.set_vsspeed(camera_params.vs_speed)
+                camera.set_vsamplitude(camera_params.vs_amp)
+                clamp = getattr(camera_params, 'baseline_clamp', 1)
+                camera.set_baseline_clamp(clamp)
+                logger.info(f"{camera_params.key}: gain set to {camera_params.gain}, "
+                            f"hs_speed={camera_params.hs_speed}, vs_speed={camera_params.vs_speed}, "
+                            f"vs_amp={camera_params.vs_amp}, baseline_clamp={clamp}")
         except Exception as e:
             logger.error(f"Could not apply the run's settings to camera {camera_params.key}: {e}")
             return DummyCamera()
@@ -117,7 +129,8 @@ class CameraNanny():
                                     hs_speed=camera_params.hs_speed,
                                     vs_speed=camera_params.vs_speed,
                                     vs_amp=camera_params.vs_amp,
-                                    preamp=camera_params.preamp)
+                                    preamp=camera_params.preamp,
+                                    baseline_clamp=getattr(camera_params, 'baseline_clamp', 1))
             else:
                 camera = DummyCamera()
 

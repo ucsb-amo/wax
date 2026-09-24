@@ -59,6 +59,7 @@ class AndorParams(CameraParams):
                  exposure_time_abs = 10.e-6, amp_absorption=0.1, em_gain_abs = 300.,
                  exposure_time_dispersive=100.e-6, amp_dispersive = 0.106, em_gain_dispersive = 300.,
                  t_light_only_image_delay=75.e-3, t_dark_image_delay=75.e-3,
+                 hs_speed=0, vs_speed=1, vs_amp=3, preamp=2, baseline_clamp=1,
                  resolution = (512,512,),
                  magnification = 50./3,
                  key = ""):
@@ -70,12 +71,22 @@ class AndorParams(CameraParams):
         self.exposure_delay = 0. # needs to be updated from docs
         self.connection_delay = 8.0
         self.t_camera_trigger = 200.e-9
-        self.t_readout_time = 512 * 3.3e-6
+        # Full-frame (512x512) readout at the fastest EM horizontal clock
+        # (17 MHz), as reported by GetReadOutTime on the DU897_EXF, 2026-09-23.
+        # Keep-clean adds ~3.9 ms before the camera accepts the next trigger.
+        # (Was 512 * 3.3e-6 = 1.7 ms, which is the vertical-transfer time at
+        # the slowest shift speed, not the readout time.)
+        self.t_readout_time = 18.1e-3
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
-        self.hs_speed = 0
-        self.vs_speed = 1
-        self.vs_amp = 3
-        self.preamp = 2
+        # Readout clock indices, see the Andor SDK2 manual (SetHSSpeed,
+        # SetVSSpeed, SetVSAmplitude, SetPreAmpGain, SetBaselineClamp). Applied
+        # when liveOD opens the camera and reapplied per run by
+        # CameraNanny.update_params (since 2026-09-24).
+        self.hs_speed = hs_speed
+        self.vs_speed = vs_speed
+        self.vs_amp = vs_amp
+        self.preamp = preamp
+        self.baseline_clamp = baseline_clamp   # 1 on, 0 off (SDK SetBaselineClamp)
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
         self.__em_gain_fluor = em_gain_fluor
         self.__em_gain_abs = em_gain_abs

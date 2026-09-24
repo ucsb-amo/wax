@@ -3,7 +3,7 @@ import time
 
 from pylablib.devices import Andor
 from pylablib.devices.interface.camera import trim_frames
-from pylablib.devices.Andor.atmcd32d_lib import wlib as lib
+from pylablib.devices.Andor.atmcd32d_lib import wlib as lib, AC_SETFUNC
 from pylablib.core.utils import general as general_utils
 from pylablib.core.devio import interface
 
@@ -21,7 +21,8 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                 hs_speed:int=0,
                 vs_speed:int=2,
                 vs_amp:int=1,
-                preamp = 2):
+                preamp = 2,
+                baseline_clamp:int=1):
         # overwrite a broken method in the parent class
         self._initial_setup_temperature = self._initial_setup_temperature_fixed
         # init the parent class
@@ -31,7 +32,10 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         # self.enable_frame_transfer_mode(enable=True)
         # self.set_emccd_advanced()
         self.set_EM_gain_mode(3)
-        self.set_EMCCD_gain(gain=gain,advanced=True)
+        # advanced=False caps the gain at x300. Nothing in kexp asks for more,
+        # and >x300 accelerates sensor ageing (SDK: SetEMAdvanced).
+        self.set_EMCCD_gain(gain=gain,advanced=False)
+        self.set_baseline_clamp(baseline_clamp)
         self.set_exposure(ExposureTime)
         self.set_trigger_mode("ext")
         self.setup_shutter(mode="open")
@@ -297,3 +301,17 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
 
     def set_EM_gain_mode(self, mode:int=3):
         lib.SetEMGainMode(mode)
+
+    def set_baseline_clamp(self, state:int = 1):
+        '''Turn the baseline clamp on or off (SDK: SetBaselineClamp). With
+        the clamp on the bias level of every frame is held at the same value,
+        so light-minus-dark subtraction does not pick up frame-to-frame offset
+        drift. Skipped silently if the camera does not report the capability.
+
+        Args:
+            state (int, optional): 1 enable, 0 disable. Defaults to 1.
+        '''
+        if not self._has_option("set", AC_SETFUNC.AC_SETFUNCTION_BASELINECLAMP):
+            print("[AndorEMCCD] baseline clamp not supported on this camera; skipped.")
+            return
+        lib.SetBaselineClamp(state)
