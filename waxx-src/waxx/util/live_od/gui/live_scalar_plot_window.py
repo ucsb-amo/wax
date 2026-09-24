@@ -25,6 +25,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+# waxa.units, not waxa.plotting.units: the latter is a shim whose package
+# __init__ pulls in matplotlib and scipy -- ~1 s on the GUI thread.
+from waxa.units import detect_unit
+
 # ---------------------------------------------------------------------------
 # Metric registry
 # ---------------------------------------------------------------------------
@@ -100,6 +104,9 @@ class LiveScalarPlotWindow(QWidget):
         self._subscribed_tier: str | None = None
 
         self._setup_ui()
+        # Create the native window now, while nobody is waiting on it, so the
+        # first click on Plot only has to paint (halves the first open).
+        self.winId()
 
     # ------------------------------------------------------------------
     # UI
@@ -159,7 +166,7 @@ class LiveScalarPlotWindow(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self._scatter_item = pg.ScatterPlotItem(
-            size=5, brush=pg.mkBrush(*COLOR_1, 200), pen=None
+            size=7, brush=pg.mkBrush(*COLOR_1, 200), pen=None
         )
         self.plot_widget.addItem(self._scatter_item)
 
@@ -171,7 +178,7 @@ class LiveScalarPlotWindow(QWidget):
         plot_item.getAxis('right').linkToView(self._vb2)
         self._vb2.setXLink(plot_item)
         self._scatter_item2 = pg.ScatterPlotItem(
-            size=6, symbol='s', brush=pg.mkBrush(*COLOR_2, 200), pen=None
+            size=8, symbol='s', brush=pg.mkBrush(*COLOR_2, 200), pen=None
         )
         self._vb2.addItem(self._scatter_item2)
         plot_item.vb.sigResized.connect(self._sync_second_viewbox)
@@ -193,7 +200,8 @@ class LiveScalarPlotWindow(QWidget):
     def on_shot_scalars(self, scalars: dict):
         """Receive a per-shot scalar dict from Analyzer or ZMQ subscriber."""
         self._data.append(scalars)
-        self._refresh_plot()
+        if self.isVisible():        # a hidden window redraws once, on show
+            self._refresh_plot()
 
     def on_new_run(self, run_id: int, xvarnames: list):
         """Called at the start of each run to reset data and update x-axis choices."""
@@ -222,6 +230,7 @@ class LiveScalarPlotWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._refresh_plot()        # catch up on shots that came in while hidden
         new_tier = self._current_tier()
         if self._subscribed_tier != new_tier:
             self.subscription_changed_signal.emit(self._subscribed_tier, new_tier)
@@ -287,7 +296,6 @@ class LiveScalarPlotWindow(QWidget):
         finite = [v for v in values if math.isfinite(v)]
         if len(finite) >= 3:
             try:
-                from waxa.plotting.units import detect_unit
                 unit, mult, _ = detect_unit(
                     xvarnames=[xvarname],
                     xvar_idx=0,
