@@ -1,8 +1,10 @@
 """Client-side Qt6 GUI for the Bristol wavemeter server.
 
-Compact dark-mode detuning plotter.  Imports ``BristolDetuningDisplay``,
-``DARK_STYLESHEET``, and ``apply_dark_palette`` from the server GUI module
-to avoid duplicating the shared f\u2080 / \u0394 widget.
+Compact dark-mode detuning readout.  The \u0394-vs-t history plot lives in its
+own pop-out window (:class:`BristolPlotWindow`) opened from the panel's
+"Plot" button, so the panel itself stays a few lines tall inside the
+dashboard.  Imports ``DARK_STYLESHEET`` and ``apply_dark_palette`` from the
+server GUI module to avoid duplicating the shared f\u2080 / \u0394 styling.
 """
 from __future__ import annotations
 
@@ -37,6 +39,51 @@ from waxx.util.guis.bristol.bristol_wavemeter_server_gui import (
 
 _POLL_MS = 100
 _MAX_HISTORY_S = 120
+_PLOT_WINDOW_APP_ID = "weldlab.kexp.gui.bristol_wavemeter_plot"
+
+
+class BristolPlotWindow(QMainWindow):
+    """Parentless top-level window hosting the detuning history plot.
+
+    Parentless on purpose, for the same reasons as the dashboard's
+    ``PanelWindow``: a child ``Qt.WindowType.Window`` would be a *tool*
+    window of the dashboard (hidden whenever the dashboard is minimised,
+    no taskbar button, easy to lose behind it).  This window gets its own
+    taskbar entry and Alt-Tab slot and can sit on another monitor.
+
+    Closing the window only **hides** it - the owning
+    :class:`BristolDetuningWidget` keeps the history and re-shows the same
+    window (same geometry) on the next click.  :meth:`shutdown` closes it
+    for real when the owner is torn down.
+    """
+
+    def __init__(self, body: QWidget, title: str):
+        super().__init__(None)  # parentless: own taskbar entry
+        self._shutting_down = False
+        self.setWindowTitle(title)
+        self.setWindowIcon(_make_sine_icon())
+        self.setStyleSheet(DARK_STYLESHEET)
+        self.setCentralWidget(body)
+        self.resize(640, 360)
+        try:
+            from waxx.util.dashboard.panel_window import set_window_app_id  # noqa: PLC0415
+            set_window_app_id(self, _PLOT_WINDOW_APP_ID)  # best effort, Windows only
+        except Exception:  # noqa: BLE001 - purely cosmetic
+            pass
+
+    def shutdown(self) -> None:
+        """Close for real (owner is going away)."""
+        self._shutting_down = True
+        self.close()
+        self.deleteLater()
+
+    def closeEvent(self, event):  # noqa: N802 (Qt override)
+        if self._shutting_down:
+            super().closeEvent(event)
+            return
+        # User closed it: keep the widget (and its history) around, just hide.
+        self.hide()
+        event.ignore()
 
 
 class BristolDetuningWidget(QWidget):
@@ -118,8 +165,17 @@ class BristolDetuningWidget(QWidget):
             self._server_reachable = reachable
 
     def stop(self) -> None:
-        """Signal the poller thread to exit (called on widget/window close)."""
+        """Signal the poller thread to exit and close the plot pop-out.
+
+        Called on widget/window close and from the dashboard panel's
+        ``cleanup()``; the pop-out is parentless, so nothing else would
+        close it when this widget goes away.
+        """
         self._stop_event.set()
+        win = self._plot_win
+        if win is not None:
+            self._plot_win = None
+            win.shutdown()
 
     def closeEvent(self, event):  # noqa: N802 (Qt override)
         self.stop()
@@ -161,6 +217,14 @@ class BristolDetuningWidget(QWidget):
         self._f0_spin.setFixedWidth(150)
         top.addWidget(self._f0_spin)
 
+        self._plot_btn = QPushButton("Plot ⧉")
+        self._plot_btn.setFixedHeight(22)
+        self._plot_btn.setToolTip(
+            "Open the Δ-vs-t history plot in its own window (own taskbar entry)"
+        )
+        self._plot_btn.clicked.connect(self.show_plot_window)
+        top.addWidget(self._plot_btn)
+
         root.addLayout(top)
 
         # ── Row 2: detuning readout on its own line (large) ──────────
@@ -169,14 +233,17 @@ class BristolDetuningWidget(QWidget):
         self._det_lbl.setStyleSheet("color: #ff6464;")
         self._det_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._det_lbl)
+        root.addStretch(1)
 
-        # ── Collapsible plot + averaging controls ────────────────────
-        try:
-            from waxx.util.dashboard.widgets import CollapsibleGroupBox  # noqa: PLC0415
-            plot_box = CollapsibleGroupBox("Plot", expanded=False)
-        except Exception:
-            plot_box = QWidget()
-            QVBoxLayout(plot_box)
+        # ── Pop-out plot window: averaging controls + plot ───────────
+        # Built once, up front, so the N spinbox exists for the readout
+        # even before the window has ever been shown.  History is collected
+        # regardless of whether the window is open; the curve is only
+        # redrawn while it is visible.
+        plot_body = QWidget()
+        plot_layout = QVBoxLayout(plot_body)
+        plot_layout.setContentsMargins(8, 6, 8, 6)
+        plot_layout.setSpacing(4)
 
         ctl_row = QHBoxLayout()
         ctl_row.setSpacing(6)
@@ -208,18 +275,29 @@ class BristolDetuningWidget(QWidget):
         self._plot.addItem(zero_line)
         self._plot.setMinimumHeight(180)
 
-        if hasattr(plot_box, "addWidget"):
-            plot_box.addWidget(ctl_wrap)
-            plot_box.addWidget(self._plot)
-        else:
-            plot_box.layout().addWidget(ctl_wrap)
-            plot_box.layout().addWidget(self._plot)
+        plot_layout.addWidget(ctl_wrap)
+        plot_layout.addWidget(self._plot, 1)
 
-        root.addWidget(plot_box, 1)
+        self._plot_win: BristolPlotWindow | None = BristolPlotWindow(
+            plot_body, "Bristol Wavemeter — Δ history"
+        )
 
         # Hidden average label kept for back-compat with old _clear() code path.
         self._avg_lbl = QLabel("")
         self._avg_lbl.setVisible(False)
+
+    def show_plot_window(self) -> None:
+        """Show (or bring to front) the pop-out plot window."""
+        win = self._plot_win
+        if win is None:  # after stop()
+            return
+        self._redraw_curve()
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _redraw_curve(self) -> None:
+        self._curve.setData(list(self._times), list(self._detunings_ghz))
 
     def _update(self) -> None:
         # Non-blocking: read only the cached values published by the poller
@@ -254,7 +332,9 @@ class BristolDetuningWidget(QWidget):
         self._times.append(t)
         self._detunings_ghz.append(det)
 
-        self._curve.setData(list(self._times), list(self._detunings_ghz))
+        # History is always recorded; only redraw while someone can see it.
+        if self._plot_win is not None and self._plot_win.isVisible():
+            self._redraw_curve()
 
         N = self._n_spin.value()
         recent = [v for v in list(self._detunings_ghz)[-N:] if not np.isnan(v)]
