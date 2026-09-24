@@ -147,60 +147,17 @@ def make_cog_icon(color: str = "#ffffff", teeth: int = 8) -> QIcon:
     return QIcon(pixmap)
 
 
-def parse_name_search_terms(query: str):
-    normalized_query = (query or "").strip().lower()
-    return [term.strip() for term in normalized_query.split("+") if term.strip()]
-
-
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
-
-
-@functools.lru_cache(maxsize=65536)
-def normalize_match_text(value: str):
-    # Memoised: the same xvar/experiment names recur across thousands of runs,
-    # and this runs once per name per filter term on every filter pass.
-    return _NON_ALNUM_RE.sub("", (value or "").lower())
-
-
-def is_subsequence(needle: str, haystack: str):
-    if not needle:
-        return True
-    index = 0
-    for char in haystack:
-        if char == needle[index]:
-            index += 1
-            if index == len(needle):
-                return True
-    return False
-
-
-def name_matches_term(term: str, raw_name: str):
-    raw_name = (raw_name or "").lower()
-    normalized_name = normalize_match_text(raw_name)
-    normalized_term = normalize_match_text(term)
-    if term in raw_name:
-        return True
-    if normalized_term and normalized_term in normalized_name:
-        return True
-    if normalized_term and is_subsequence(normalized_term, normalized_name):
-        return True
-    return False
-
-
-def name_matches_all_terms(raw_name: str, terms: list[str]):
-    if not terms:
-        return True
-    return all(name_matches_term(term, raw_name) for term in terms)
-
-
-def any_name_matches_all_terms(names: list[str], terms: list[str]):
-    if not terms:
-        return True
-    lowered_names = [str(name).lower() for name in names]
-    for term in terms:
-        if not any(name_matches_term(term, name) for name in lowered_names):
-            return False
-    return True
+# The name-search helpers moved to ``waxa.helper.name_search`` (no Qt / plotting
+# imports) so light GUIs can use them without loading this module.  Re-exported
+# here so every existing ``from waxa.browser.browser_window import ...`` works.
+from ..helper.name_search import (  # noqa: E402,F401
+    parse_name_search_terms,
+    normalize_match_text,
+    is_subsequence,
+    name_matches_term,
+    name_matches_all_terms,
+    any_name_matches_all_terms,
+)
 
 
 class DateSeparatorDelegate(QStyledItemDelegate):
