@@ -63,14 +63,16 @@ class TTL_IN(TTL):
         self.t_input_gate_end = np.int64(0)
 
     @kernel
-    def wait_for_line_trigger(self):
+    def wait_for_line_trigger(self,
+                              t_window=T_LINE_TRIGGER_SAMPLE_INTERVAL,
+                              t_delay=T_LINE_TRIGGER_RTIO_DELAY):
         while True:
-            t_end = self.ttl_device.gate_rising(T_LINE_TRIGGER_SAMPLE_INTERVAL)
+            t_end = self.ttl_device.gate_rising(t_window)
             t_edge = self.ttl_device.timestamp_mu(t_end)
             self.t_input_gate_end = t_end
             if t_edge > 0:
                 at_mu(t_edge)
-                delay(T_LINE_TRIGGER_RTIO_DELAY)
+                delay(t_delay)
                 break
 
     @kernel
