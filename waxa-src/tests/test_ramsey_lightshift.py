@@ -72,7 +72,7 @@ def test_on_off_axis_measures_the_reference():
                                      [with_imaging, phases], an))
     assert ls.reference_measured and ls.scan_shape == ()
     assert abs(float(ls.f_lightshift_Hz) - 47e3) < 1.5e3
-    assert "omega_lightshift" in ls.config_line() and "#1" in ls.config_line()
+    assert "frequency_lightshift" in ls.config_line() and "#1" in ls.config_line()
 
 
 def test_nan_padded_vault_cells_are_skipped_not_failed():
