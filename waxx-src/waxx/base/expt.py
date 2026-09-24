@@ -18,6 +18,7 @@ from waxx.config.data_vault import DataVault
 from waxx.base.scanner import Scanner
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
+from waxx.util import console
 
 RPC_DELAY = 10.e-3
 
@@ -26,8 +27,17 @@ class Expt(Scanner, Dealer, Scribe):
                  setup_camera=True,
                  save_data=True,
                  absorption_image=None,
-                 server_talk=None):
-        
+                 server_talk=None,
+                 verbosity=None):
+
+        # Process-wide terminal chattiness (see waxx.util.console):
+        # 0 = warnings only, 1 = milestones (default), 2 = everything.
+        # The kwarg beats the WAX_VERBOSITY env var. _verbosity is the int
+        # copy kernels gate their prints on.
+        if verbosity is not None:
+            console.set_level(verbosity)
+        self._verbosity = int(console.get_level())
+
         if absorption_image != None:
             print("Warning: The argument 'absorption_image' is depreciated -- change it out for 'imaging_type'")
             print("Defaulting to absorption imaging.")
@@ -47,7 +57,7 @@ class Expt(Scanner, Dealer, Scribe):
         self.run_info = RunInfo(self, save_data, server_talk=server_talk,
                                 defer_run_id=True)
         self.scope_data = ScopeData()
-        self._ridstr = " Run ID: "+ str(self.run_info.run_id)
+        self._ridstr = "Run ID: " + str(self.run_info.run_id)
         self._counter = counter()
 
         self.camera_params = CameraParams()
@@ -110,9 +120,9 @@ class Expt(Scanner, Dealer, Scribe):
             response = _client.init_run(payload)
             self.run_info.run_id = response['run_id']
             self.run_info.filepath = response['filepath']
-            self._ridstr = " Run ID: " + str(self.run_info.run_id)
+            self._ridstr = "Run ID: " + str(self.run_info.run_id)
             if response['run_id']:
-                print(f"Run ID: {self.run_info.run_id}")
+                console.info(f"Run ID: {self.run_info.run_id}")
         else:
             if self.run_info.save_data and self.setup_camera:
                 raise RuntimeError(
@@ -169,11 +179,25 @@ class Expt(Scanner, Dealer, Scribe):
             )
         self._pending_adjust_values = getattr(_client, 'last_adjust_values', {})
         self._shot_complete_count += 1
-        print(f"shot {n}/{N} done")
+        if self._progress_worth_printing(n, N):
+            print(f"shot {n}/{N} done")
         if reset_requested:
             _client.abort_run()
             raise TerminationRequested
-    
+
+    @staticmethod
+    def _progress_worth_printing(n, N):
+        """Shot progress on the terminal: every shot at VERBOSE, quarter
+        milestones (and the last shot) at NORMAL, nothing at QUIET -- liveOD
+        already shows live progress."""
+        level = console.get_level()
+        if level >= console.VERBOSE:
+            return True
+        if level < console.NORMAL:
+            return False
+        # True when n crosses a quarter boundary of N (~4 lines per run).
+        return n * 4 // N > (n - 1) * 4 // N
+
     def _shot_conditions(self) -> dict:
         """What this shot recorded about itself, for the live viewer: every
         single-valued DataVault container, as ``{key: float}``.
@@ -248,7 +272,7 @@ class Expt(Scanner, Dealer, Scribe):
         dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         expt_name = self._expt_name_from_filepath(expt_filepath)
         name_str = f"  ({expt_name})" if expt_name else ""
-        print(f'run id {rid} complete at {dt}{name_str}')
+        console.info(f'run id {rid} complete at {dt}{name_str}')
 
     @staticmethod
     def _expt_name_from_filepath(expt_filepath):

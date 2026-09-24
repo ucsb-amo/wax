@@ -9,6 +9,7 @@ from artiq.language.core import kernel_from_string, now_mu, delay
 from artiq.experiment import RTIOUnderflow
 
 from waxx.util.artiq.async_print import aprint
+from waxx.util import console
 
 RPC_DELAY = 10.e-3
 
@@ -581,14 +582,15 @@ class Scanner():
         each pwoa and dark images.
         """                
         N_img = 1
-        msg = ""
+        parts = []
 
         for xvar in self.scan_xvars:
             N_img = N_img * xvar.values.shape[0]
-            msg += f" {xvar.values.shape[0]} values of {xvar.key}."
+            parts.append(f"{xvar.values.shape[0]} x {xvar.key}")
         self.params.N_shots_with_repeats = N_img
 
-        msg += f" {N_img} total shots."
+        # ASCII only: ExptBuilder pipes this through cp1252 on Windows.
+        msg = f"Scan: {', '.join(parts)} -> {N_img} shots"
 
         ### I have no idea what this is for. ###
         if isinstance(self.params.N_repeats,list):
@@ -610,6 +612,6 @@ class Scanner():
         N_img = images_per_shot * N_img # 3 images per value of independent variable (xvar)
 
         if self.setup_camera:
-            msg += f" {N_img} total images expected."
-        print(msg)
+            msg += f" ({N_img} images)"
+        console.info(msg)
         return N_img

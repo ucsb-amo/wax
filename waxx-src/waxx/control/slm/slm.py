@@ -2,6 +2,7 @@ import socket
 from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
 from waxx.config.expt_params import ExptParams
+from waxx.util import console
 import numpy as np
 import json
 di = -1
@@ -74,10 +75,11 @@ class SLM:
             # command = f"{int(dimension)} {phase/np.pi} {x_center} {y_center} {mask}"
             self._send_command(command)
             if verbose:
-                print(f"\nSent: {command}")
-                print(f"-> mask: {mask_type}, dimension = {dimension} um, phase = {phase/np.pi} pi, x-center = {x_center}, y-center = {y_center}\n")
+                console.info(f"[slm] {mask_type}: {dimension} um, "
+                             f"{phase/np.pi:.2f} pi @ ({x_center}, {y_center})")
+                console.info(f"[slm] sent: {command}", level=console.VERBOSE)
         except Exception as e:
-            print(f"Error sending phase spot: {e}")
+            print(f"[slm] Error sending phase mask: {e}")
 
     @kernel
     def write_phase_mask_kernel(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot',initialize=False,

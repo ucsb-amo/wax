@@ -46,6 +46,8 @@ from artiq.experiment import kernel, rpc, delay, TBool, TInt32
 from artiq.coredevice import urukul
 from artiq.coredevice.ad9910 import _AD9910_REG_CFR3, _AD9910_REG_SYNC
 
+from waxx.util import console
+
 DEFAULT_CACHE_KEY = "waxx_ad9910_sync_data"
 
 # CFR3 fields AD9910.init() programs: DRV0, VCO select, charge-pump current,
@@ -208,8 +210,11 @@ class AD9910FastInit:
             why = "cache hit"
         self.report = dict(n_full=n_full, n_channels=n_ch, why=why, t_total_s=t_total,
                            t_check_pass_s=t_check_pass)
-        print(f"[dds init] full init on {n_full} of {n_ch} channels, "
-              f"{n_ch - n_full} skipped ({why}), {t_total * 1e3:.0f} ms")
+        # The all-skipped case is the normal one and worth no terminal line;
+        # a full init on any channel means a slower run, so say so.
+        console.info(f"[dds init] full init on {n_full} of {n_ch} channels, "
+                     f"{n_ch - n_full} skipped ({why}), {t_total * 1e3:.0f} ms",
+                     level=console.NORMAL if n_full else console.VERBOSE)
 
     @rpc(flags={"async"})
     def _record_failure(self, urukul_idx, ch, reason, raw):
