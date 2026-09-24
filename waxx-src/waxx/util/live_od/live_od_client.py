@@ -245,6 +245,87 @@ class LiveODClient(NetClient):
             print(f"[LiveODClient] poll_reset: network error (returning False): {exc}")
             return False
 
+    # ------------------------------------------------------------------
+    # Cameras liveOD holds (remote open / release)
+    # ------------------------------------------------------------------
+
+    def cameras(self) -> dict:
+        """``{camera_key: {"state", "camera_type", "serial_no"}}`` for every camera
+        on liveOD's bar.  ``state`` is the bar's: ``closed``, ``loading``, ``open``,
+        ``grabbing``, ``failed``.  Raises ``LookupError`` against a server that
+        predates camera state in POLL."""
+        reply = self.poll()
+        if not reply.get("ok", False):
+            raise RuntimeError(f"[LiveODClient] POLL: {reply.get('error')}")
+        cams = reply.get("cameras")
+        if cams is None:
+            raise LookupError("[LiveODClient] this liveOD server does not report camera "
+                              "state (restart it with current code)")
+        return dict(cams)
+
+    def camera_control(self, camera_key: str, action: str) -> dict:
+        """Ask liveOD to ``open`` / ``close`` / ``toggle`` a camera.  The GUI does
+        it asynchronously; confirm with ``wait_camera_state``.  Raises
+        ``RuntimeError`` when the server refuses (a run is using that camera, or
+        any open during a run)."""
+        reply = self._send_recv({"tag": "CAMERA_CONTROL", "camera_key": camera_key,
+                                 "action": action})
+        if not reply.get("ok", False):
+            raise RuntimeError(f"[LiveODClient] CAMERA_CONTROL {camera_key} -> {action}: "
+                               f"{reply.get('error')}")
+        return reply
+
+    def wait_camera_state(self, camera_key: str, states, timeout: float = 10.0,
+                          poll_s: float = 0.2) -> str:
+        """Block until liveOD reports ``camera_key`` in one of ``states``; return
+        that state.  ``TimeoutError`` otherwise, ``KeyError`` for an unknown key."""
+        states = (states,) if isinstance(states, str) else tuple(states)
+        deadline = time.monotonic() + timeout
+        while True:
+            cams = self.cameras()
+            if camera_key not in cams:
+                raise KeyError(f"[LiveODClient] liveOD has no camera {camera_key!r}; "
+                               f"it has {sorted(cams)}")
+            state = cams[camera_key].get("state")
+            if state in states:
+                return state
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"[LiveODClient] {camera_key} still {state!r} after "
+                                   f"{timeout:g} s (wanted {states})")
+            time.sleep(poll_s)
+
+    def release_camera(self, camera_key: str, timeout: float = 10.0) -> dict:
+        """Make liveOD close ``camera_key`` so another process (e.g. the beacon
+        Basler server) can open the device.  Returns the camera's entry once
+        closed.  The server refuses while a run is using that camera."""
+        cams = self.cameras()
+        if camera_key not in cams:
+            raise KeyError(f"[LiveODClient] liveOD has no camera {camera_key!r}; "
+                           f"it has {sorted(cams)}")
+        if cams[camera_key].get("state") == "closed":
+            return cams[camera_key]
+        self.camera_control(camera_key, "close")
+        state = self.wait_camera_state(camera_key, ("closed", "failed"), timeout)
+        if state == "failed":
+            raise RuntimeError(f"[LiveODClient] liveOD could not close {camera_key} "
+                               f"(see its log)")
+        return self.cameras()[camera_key]
+
+    def open_camera(self, camera_key: str, timeout: float = 30.0) -> dict:
+        """Make liveOD (re)open ``camera_key``.  Refused during a run."""
+        cams = self.cameras()
+        if camera_key not in cams:
+            raise KeyError(f"[LiveODClient] liveOD has no camera {camera_key!r}; "
+                           f"it has {sorted(cams)}")
+        if cams[camera_key].get("state") in ("open", "grabbing"):
+            return cams[camera_key]
+        self.camera_control(camera_key, "open")
+        state = self.wait_camera_state(camera_key, ("open", "grabbing", "failed"), timeout)
+        if state == "failed":
+            raise RuntimeError(f"[LiveODClient] liveOD could not open {camera_key}: is the "
+                               f"device held by another process (beacon server, a viewer)?")
+        return self.cameras()[camera_key]
+
     def close(self):
         """Release ZMQ resources."""
         if self._socket is not None:

@@ -93,6 +93,7 @@ class LiveODWindow(QWidget):
         self.live_od_server.reset_signal.connect(self.reset)
         self.live_od_server.camera_control_signal.connect(self.on_remote_camera_control)
         self.live_od_server.run_state_signal.connect(self.on_run_state)
+        self.live_od_server.set_camera_state_provider(self._camera_state_report)
         self.live_od_server.start()
 
         # The numbers in the corner of the OD image need the per-shot scalars
@@ -143,14 +144,32 @@ class LiveODWindow(QWidget):
         except Exception as e:
             logger.debug(f"camera-state broadcast error: {e}")
 
+    def _camera_state_report(self) -> dict:
+        """For the server's POLL reply: each camera's button state, plus what a
+        remote tool needs to find the same device on its beacon server (type,
+        serial).  Called from the server thread: plain attribute reads only."""
+        out = {}
+        for btn in self.camera_conn_bar.buttons:
+            p = btn.camera_params
+            ctype = getattr(p, "camera_type", "") or ""
+            serial = getattr(p, "serial_no", "") or ""
+            if isinstance(ctype, bytes):
+                ctype = ctype.decode()
+            if isinstance(serial, bytes):
+                serial = serial.decode()
+            out[btn.camera_name] = {"state": btn.state, "camera_type": str(ctype),
+                                    "serial_no": str(serial)}
+        return out
+
     def on_remote_camera_control(self, camera_key: str, action: str):
         """Slot for ``LiveODServer.camera_control_signal``.
 
         Routes the request to the matching ``CameraButton`` on the local
         ``CamConnBar``.  Runs on the GUI thread (PyQt widget state is not
-        thread-safe), but the server already refuses CAMERA_CONTROL while a
-        run is in progress, so any blocking driver call here cannot stall
-        SHOT_COMPLETE / RESET signals during acquisition.
+        thread-safe).  During a run the server lets through only a *close* of
+        a camera the run is not using (a Basler close is quick; the run's own
+        camera and every open are refused there), so a blocking driver call
+        here cannot stall SHOT_COMPLETE / RESET signals during acquisition.
         """
         btn = self.camera_conn_bar.get_button(camera_key)
         if btn is None:

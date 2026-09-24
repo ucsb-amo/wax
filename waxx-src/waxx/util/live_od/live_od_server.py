@@ -84,6 +84,11 @@ class LiveODServer(QThread, NetServer):
         self._current_capture_images = False
         self._current_run_id = 0
         self._current_camera_key = ""
+        # GUI-supplied callable -> {camera_key: {"state", "camera_type", "serial_no"}}
+        # for POLL, so a remote tool can see which cameras liveOD holds (and
+        # whether a release it asked for has happened).  Plain attribute reads
+        # on the GUI's objects; it is called from this thread.
+        self._camera_state_provider = None
         self._reset_requested = False   # set by RESET; cleared by next INIT_RUN
         self._run_in_progress = False   # True between INIT_RUN and END_RUN/ABORT
         self._shot_timestamps: list = []  # Unix timestamps (s) recorded server-side on each SHOT_COMPLETE
@@ -534,6 +539,20 @@ class LiveODServer(QThread, NetServer):
         self.reset_signal.emit()
         return {"ok": True}
 
+    def set_camera_state_provider(self, provider):
+        """``provider()`` -> ``{camera_key: {"state", "camera_type", "serial_no"}}``,
+        reported in every POLL reply.  The GUI installs its camera bar here."""
+        self._camera_state_provider = provider
+
+    def _camera_states(self) -> dict:
+        if self._camera_state_provider is None:
+            return {}
+        try:
+            return dict(self._camera_state_provider())
+        except Exception as exc:
+            logger.debug(f"camera state provider failed: {exc}")
+            return {}
+
     def _handle_camera_control(self, msg: dict) -> dict:
         camera_key = str(msg.get("camera_key", ""))
         action = str(msg.get("action", "toggle"))
@@ -541,15 +560,30 @@ class LiveODServer(QThread, NetServer):
             return {"ok": False, "error": f"Unknown camera action: {action}"}
         if not camera_key:
             return {"ok": False, "error": "Missing camera_key"}
-        # Refuse camera open/close/toggle during an active run.  Closing a
-        # camera being driven by a CameraBaby crashes the grab loop
-        # (dishonorable_death); opening any camera blocks the GUI thread
-        # (Andor cooler init can take several seconds) and stalls all queued
-        # SHOT_COMPLETE / RESET signals.
+        # During a run: closing the camera a CameraBaby is driving crashes its
+        # grab loop (dishonorable_death), and opening any camera blocks the GUI
+        # thread (Andor cooler init takes seconds) and stalls the queued
+        # SHOT_COMPLETE / RESET signals -- both refused.  Closing a camera the
+        # run is *not* using is allowed: that is how a tool borrows an idle
+        # Basler (frame grab through the beacon server) while a run on another
+        # camera goes on.  A no-camera run uses none of them.
         if self._run_in_progress:
-            logger.warning(f"CAMERA_CONTROL rejected ({camera_key} -> {action}): run in progress")
-            return {"ok": False, "error": "Camera control rejected: run in progress"}
-        logger.info(f"CAMERA_CONTROL: {camera_key} -> {action}")
+            run_cam = self._current_camera_key if self._current_capture_images else ""
+            if action == "close" and camera_key != run_cam:
+                logger.info(f"CAMERA_CONTROL: {camera_key} -> close during run "
+                            f"{self._current_run_id} (which uses {run_cam or 'no camera'})")
+            else:
+                logger.warning(f"CAMERA_CONTROL rejected ({camera_key} -> {action}): "
+                               f"run in progress (uses {run_cam or 'no camera'})")
+                return {"ok": False,
+                        "error": f"Camera control rejected: run {self._current_run_id} in "
+                                 f"progress (uses {run_cam or 'no camera'}); only closing a "
+                                 f"camera the run does not use is allowed",
+                        "run_in_progress": True, "run_camera_key": run_cam}
+        else:
+            logger.info(f"CAMERA_CONTROL: {camera_key} -> {action}")
+        # Asynchronous: the GUI thread does the open/close.  Callers confirm via
+        # POLL's "cameras" (LiveODClient.wait_camera_state).
         self.camera_control_signal.emit(camera_key, action)
         return {"ok": True}
 
@@ -589,6 +623,11 @@ class LiveODServer(QThread, NetServer):
             "n_shots": len(self._shot_timestamps),
             "last_shot_age_s": (now - last_shot) if last_shot else None,
             "init_run_age_s": (now - self._init_run_time) if self._init_run_time else None,
+            # which cameras this liveOD holds, and the one the live run is using
+            "cameras": self._camera_states(),
+            "run_camera_key": (self._current_camera_key
+                               if self._run_in_progress and self._current_capture_images
+                               else ""),
         }
 
     def _handle_subscribe_scalars(self, msg: dict) -> dict:
