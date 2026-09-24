@@ -289,15 +289,18 @@ class EthernetRelay():
 		self.__socket = None
 		self.__board = None
 
-	def connect(self, retries=None, backoff=None):
+	def connect(self, retries=None, backoff=None, timeout=None):
+		# timeout also bounds every recv on this connection (socket-level).
 		if retries is None:
 			retries = self.CONNECT_RETRIES
 		if backoff is None:
 			backoff = self.CONNECT_BACKOFF_S
+		if timeout is None:
+			timeout = self.CONNECT_TIMEOUT_S
 
 		for attempt in range(1, retries + 2):
 			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			sock.settimeout(self.CONNECT_TIMEOUT_S)
+			sock.settimeout(timeout)
 			try:
 				sock.connect(self.__addr)
 			except (ConnectionRefusedError, socket.timeout, OSError) as exc:
@@ -313,7 +316,10 @@ class EthernetRelay():
 					)
 					time.sleep(delay)
 					continue
-				logger.error(
+				# retries=0 is a caller's best-effort probe; it handles
+				# and reports the failure itself.
+				logger.log(
+					logging.DEBUG if retries == 0 else logging.ERROR,
 					"Relay connect failed after %d attempts to %s: %r",
 					retries + 1, self.__addr, exc,
 				)
