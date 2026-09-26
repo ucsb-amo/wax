@@ -789,10 +789,18 @@ class DashboardMainWindow(QMainWindow):
     def _probe_data_dir(self) -> None:
         if self._datadir_probe is not None and self._datadir_probe.isRunning():
             return
-        self._datadir_probe = _DataDirProbe(self)
-        self._datadir_probe.result.connect(self._on_data_dir_probe)
-        self._datadir_probe.finished.connect(self._datadir_probe.deleteLater)
-        self._datadir_probe.start()
+        probe = _DataDirProbe(self)
+        probe.result.connect(self._on_data_dir_probe)
+        # Drop our reference before Qt deletes the C++ object, or the next
+        # tick's isRunning() hits a deleted wrapper.
+        probe.finished.connect(lambda p=probe: self._on_data_dir_probe_finished(p))
+        probe.finished.connect(probe.deleteLater)
+        self._datadir_probe = probe
+        probe.start()
+
+    def _on_data_dir_probe_finished(self, probe: "_DataDirProbe") -> None:
+        if self._datadir_probe is probe:
+            self._datadir_probe = None
 
     def _on_data_dir_probe(self, present) -> None:
         if present is None:
