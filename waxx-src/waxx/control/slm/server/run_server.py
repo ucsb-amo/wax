@@ -4,6 +4,7 @@ import time
 import threading
 import queue
 from slm_server import SLM_server
+from slm_protocol import split_commands, command_seq, Replier
 
 
 SERVER_IP = '192.168.1.102'
@@ -80,15 +81,31 @@ def slm_worker():
                     "angle_deg": task["angle_deg"],
                     "mask": task["mask"]
                 })
+                t0 = time.monotonic()
                 _apply_pattern(last_pattern, fast=True)
-                _touch_activity()  
+                _touch_activity()
+                # Write_image has returned. The SLM still needs its next video
+                # frame and the liquid-crystal response time before the light
+                # sees the new pattern; the client waits that out itself.
+                _reply(task, status="applied",
+                       center=[last_pattern["center_x"], last_pattern["center_y"]],
+                       mask=last_pattern["mask"],
+                       dimension=last_pattern["dimension"],
+                       t_apply_s=round(time.monotonic() - t0, 4))
 
             else:
                 print(f"Unknown task type: {ttype}")
         except Exception as e:
             print(f"Error handling task {ttype}: {e}")
+            _reply(task, status="error", error=str(e))
         finally:
             cmd_q.task_done()
+
+def _reply(task, **msg):
+    """Answer the client that sent `task`, if it asked to be answered."""
+    replier = task.get("replier")
+    if replier is not None:
+        replier.send({"seq": task["seq"], **msg})
 
 def _apply_pattern(pat, fast=True): # Generate and upload a pattern
     img = slmtest.generate_mask(
@@ -156,45 +173,23 @@ def start_server():
             handle_client(conn)
 
 def handle_client(conn):
+    replier = Replier(conn)
+    pending = ""
     with conn:
         while True:
             try:
                 data = conn.recv(BUFFER_SIZE)
-                if not data:
+                at_eof = not data
+                # One recv is not one command: TCP may join two commands or
+                # split one. Cut complete commands out of everything received
+                # so far and keep the rest for the next recv.
+                pending += data.decode('utf-8', errors='replace')
+                commands, pending = split_commands(pending, at_eof=at_eof)
+                for command in commands:
+                    _handle_command(command.strip(), replier)
+                if at_eof:
                     print("Client disconnected.")
                     break
-
-                command = data.decode('utf-8').strip()
-                print(f"Received command: {command}")
-
-                dims = analyze_command(command)
-                if dims is None:
-                    print("Ignoring malformed command.")
-                    continue
-
-                dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask = dims
-
-                task = {
-                    "type": "APPLY",
-                    "dimension": dimension,
-                    "phase": phase,
-                    "center_x": center_x,
-                    "center_y": center_y,
-                    "grating_spacing": grating_spacing,
-                    "angle_deg": angle_deg,
-                    "mask": mask
-                }
-
-                try:
-                    cmd_q.put_nowait(task)
-                except queue.Full:
-                    try:
-                        _ = cmd_q.get_nowait()
-                        cmd_q.task_done()
-                        cmd_q.put_nowait(task)
-                        print("Queue full: dropped one stale task to enqueue latest APPLY.")
-                    except Exception as e:
-                        print(f"Failed to enqueue APPLY: {e}")
 
             except ConnectionResetError:
                 print("SLM_find_spot.py disconnected")
@@ -202,6 +197,48 @@ def handle_client(conn):
             except Exception as e:
                 print(f"Error while handling client: {e}")
                 break
+
+def _handle_command(command, replier):
+    print(f"Received command: {command}")
+    seq = command_seq(command)
+
+    dims = analyze_command(command)
+    if dims is None:
+        print("Ignoring malformed command.")
+        if seq is not None:
+            replier.send({"seq": seq, "status": "error", "error": "malformed command"})
+        return
+
+    dimension, phase, center_x, center_y, grating_spacing, angle_deg, mask = dims
+
+    task = {
+        "type": "APPLY",
+        "dimension": dimension,
+        "phase": phase,
+        "center_x": center_x,
+        "center_y": center_y,
+        "grating_spacing": grating_spacing,
+        "angle_deg": angle_deg,
+        "mask": mask
+    }
+    if seq is not None:
+        task["seq"] = seq
+        task["replier"] = replier
+        # before the put, so it cannot arrive after the worker's "applied"
+        replier.send({"seq": seq, "status": "queued"})
+
+    try:
+        cmd_q.put_nowait(task)
+    except queue.Full:
+        try:
+            dropped = cmd_q.get_nowait()
+            cmd_q.task_done()
+            _reply(dropped, status="dropped")
+            cmd_q.put_nowait(task)
+            print("Queue full: dropped one stale task to enqueue latest APPLY.")
+        except Exception as e:
+            print(f"Failed to enqueue APPLY: {e}")
+            _reply(task, status="error", error=f"could not enqueue: {e}")
 
 def analyze_command(command):
     dimension = 0
