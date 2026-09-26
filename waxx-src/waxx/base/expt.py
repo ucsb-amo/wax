@@ -250,8 +250,7 @@ class Expt(Scanner, Dealer, Scribe):
             line = f"shot 1/{N} done"
             if stride > 1:
                 last = "" if N % stride == 0 else " and the last"
-                line += (f" -- printing every {stride} shots{last}"
-                         f" (Base(verbosity=2) or WAX_VERBOSITY=2: every shot)")
+                line += f" -- printing every {stride} shots{last}"
         else:
             line = f"shot {n}/{N} ({100 * n // N}%)"
             t_first = getattr(self, '_t_first_shot_done', None)

@@ -4,7 +4,8 @@ Before a run takes the core, :func:`pre_run_report` asks the monitor server
 for the device state, whether it is trusted, and its journal since the last
 run ended (every op and channel edit made in between, by whom), and
 evaluates the lab's composite devices for hazards (a coil left at current).
-The experiment prints the warnings and stores the whole report with its data
+The experiment prints the warnings (:func:`report_warnings`; kexp leaves the
+hazards off the terminal) and stores the whole report with its data
 (``Expt._extra_file_texts``), so a run can be traced to the state it started
 from -- as recorded by the server, which is not a measurement of the hardware
 (the report says whether the state was trusted).
@@ -58,9 +59,10 @@ def pre_run_report(monitor, devices=(), params=None, frames=None) -> dict:
     return report
 
 
-def report_warnings(report: dict) -> list[str]:
-    """The lines a person must see before the run: hazards, untrusted state,
-    and why the check could not be made."""
+def report_warnings(report: dict, hazards: bool = True) -> list[str]:
+    """The lines to show before the run: why the check could not be made,
+    untrusted state, and (``hazards=True``) the hazards found. The report
+    itself keeps the hazards either way."""
     lines = []
     if not report.get("server"):
         lines.append("could not read the device state from the monitor server "
@@ -68,8 +70,9 @@ def report_warnings(report: dict) -> list[str]:
         return lines
     trust = report.get("trust") or {}
     if trust.get("trusted") is False:
-        lines.append(f"the device state is UNTRUSTED ({trust.get('reason')}): what follows "
-                     "is the state file, not necessarily the hardware.")
-    for h in report.get("hazards") or []:
-        lines.append(f"{h['title']} is {h['text']} (state file) as this run starts.")
+        lines.append(f"the device state is UNTRUSTED ({trust.get('reason')}): the state "
+                     "file is not necessarily the hardware.")
+    if hazards:
+        for h in report.get("hazards") or []:
+            lines.append(f"{h['title']} is {h['text']} (state file) as this run starts.")
     return lines

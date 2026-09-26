@@ -117,6 +117,9 @@ def test_report_records_state_trust_hazards_and_journal():
         MAX_JOURNAL + 2
     lines = report_warnings(report)
     assert "UNTRUSTED" in lines[0] and "Coil is ON 20.0 A" in lines[1]
+    # hazards=False (what kexp prints): the hazard lines go, the report keeps them
+    assert report_warnings(report, hazards=False) == lines[:1]
+    assert report["hazards"]
 
 
 def test_report_without_a_server_says_nothing_was_checked():
