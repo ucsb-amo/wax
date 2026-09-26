@@ -121,7 +121,13 @@ def describe_entry(e: dict) -> str:
     elif kind == "run_pending":
         text = f"run {e.get('run_id')} ({e.get('expt') or '?'}) starting"
     elif kind == "run_end":
-        text = f"run {e.get('run_id')} ({e.get('expt') or '?'}) end state received"
+        text = f"run {e.get('run_id')} ({e.get('expt') or '?'}) "
+        if e.get("aborted"):
+            text += f"aborted ({e['aborted']}): state at the abort received"
+            if e.get("trusted") is False:
+                text += ", UNTRUSTED"
+        else:
+            text += "end state received"
     elif kind == "run_pending_cleared":
         text = f"run {e.get('run_id')} fence lifted: {e.get('why')}"
     elif kind == "trust":

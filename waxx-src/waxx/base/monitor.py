@@ -202,6 +202,63 @@ class Monitor:
         self._announced = None
         return True
 
+    def report_abort_state(self, dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s, run_id=None,
+                           expt="", cause="", trusted=True, caveat=""):
+        """An aborted run's end state: the channels as scan()'s exception
+        handler found them in the kernel.  (A kernel that raises never writes
+        its attributes back, so the frames on the host still hold their
+        pre-run values -- update_device_states would send those.)  Sent as
+        ``abort_state``; the server marks it trusted only if ``trusted``,
+        else gives ``caveat`` as the reason.  A server running older code
+        refuses the request, and the state stays untrusted."""
+        try:
+            config = self._config_from_snapshot(dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s)
+        except Exception as e:
+            print(f"[Monitor] WARNING: could not build the aborted run's device state: {e!r}")
+            return False
+        reply = self._monitor_client.abort_state(_jsonable(config), run_id=run_id, expt=expt,
+                                                 cause=cause, trusted=trusted, caveat=caveat)
+        if reply is None or reply.get("status") != "ok":
+            msg = None if reply is None else reply.get("msg")
+            hint = (" -- the monitor server runs older code; restart it"
+                    if msg and "unknown type" in msg else "")
+            print(f"[Monitor] WARNING: the monitor server did not accept the aborted run's "
+                  f"device state ({msg}){hint}; the device state stays untrusted.")
+            return False
+        self._announced = None
+        return True
+
+    def _config_from_snapshot(self, dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s) -> dict:
+        """The dds/ttl/dac sections end() would send, with every value taken
+        from a kernel snapshot (see _build_snapshot_kernel) instead of the
+        host frames, which still supply the static fields (channels, links).
+        A DDS's v_pd comes from its linked DAC channel, as in the Generator."""
+        lengths = (len(dds_f), len(dac_v), len(ttl_s))
+        wanted = (len(self._snap_dds_keys), len(self._snap_dac_keys), len(self._snap_ttl_keys))
+        if any(n < w for n, w in zip(lengths, wanted)):
+            raise ValueError(f"snapshot sizes {lengths} do not cover the frames' {wanted}")
+        self.generator.generate_device_config()
+        src = self.generator.config_data
+        config = {k: {name: dict(entry) for name, entry in (src.get(k) or {}).items()}
+                  for k in ('dds', 'ttl', 'dac')}
+        dac_now = {name: float(dac_v[i]) for i, name in enumerate(self._snap_dac_keys)}
+        for name, v in dac_now.items():
+            if name in config['dac']:
+                config['dac'][name]['voltage'] = v
+        for i, name in enumerate(self._snap_dds_keys):
+            entry = config['dds'].get(name)
+            if entry is None:
+                continue
+            entry['frequency'] = float(dds_f[i])
+            entry['amplitude'] = float(dds_a[i])
+            entry['sw_state'] = int(dds_sw[i])
+            link = entry.get('dac_ch_key') or ""
+            entry['v_pd'] = dac_now[link] if link in dac_now else float(dds_v[i])
+        for i, name in enumerate(self._snap_ttl_keys):
+            if name in config['ttl']:
+                config['ttl'][name]['ttl_state'] = int(ttl_s[i])
+        return config
+
     def announce_run(self, run_id=None, expt=""):
         """Tell the monitor server an experiment is about to take the core, so
         composite ops are refused from now until it ends.

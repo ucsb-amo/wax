@@ -7,7 +7,7 @@ from waxa.dummy.camera_params import CameraParams
 
 from artiq.language.core import kernel_from_string, now_mu, delay
 from artiq.experiment import RTIOUnderflow
-from artiq.coredevice.exceptions import RTIOOverflow
+from artiq.coredevice.exceptions import RTIOOverflow, RTIODestinationUnreachable
 
 from waxx.control.exceptions import TriggerTimeout
 from waxx.util.artiq.async_print import aprint
@@ -17,6 +17,15 @@ RPC_DELAY = 10.e-3
 
 dv = -100.
 dvlist = np.array([])
+
+# Exceptions a channel write can raise itself.  A run that ends on one may
+# leave that one channel's cached value and the hardware apart (DAC_CH.set
+# caches before it writes, the ramps only after the last point), so the state
+# it reports is flagged as not trusted (see Expt._report_abort_state).
+WRITE_FAILURES = ("RTIOUnderflow", "RTIODestinationUnreachable", "ValueError")
+
+# Parameters of the channel-snapshot kernel (Monitor._build_snapshot_kernel).
+SNAPSHOT_PARAMS = ["expt", "f", "a", "v", "s", "dv", "ts"]
 
 class AdjustSpec:
     """Descriptor for a parameter that can be adjusted live between shots."""
@@ -92,6 +101,17 @@ class Scanner():
 
         self._dummy_array = np.zeros(10000,dtype=float)
         self._N = 0
+
+        # Where scan() copies every channel's kernel-side state when an
+        # exception ends it.  A no-op until Expt.finish_prepare_wax hands over
+        # the monitor's snapshot kernel and arrays.
+        self._abort_snapshot_kernels = [kernel_from_string(SNAPSHOT_PARAMS, "pass")]
+        self._abort_snap_dds_f = np.zeros(1)
+        self._abort_snap_dds_a = np.zeros(1)
+        self._abort_snap_dds_v = np.zeros(1)
+        self._abort_snap_dds_sw = np.zeros(1, dtype=np.int32)
+        self._abort_snap_dac_v = np.zeros(1)
+        self._abort_snap_ttl_s = np.zeros(1, dtype=np.int32)
 
     def logspace(self,start,end,n):
         return np.logspace(np.log10(start),np.log10(end),int(n))
@@ -282,7 +302,7 @@ class Scanner():
     def scan(self, raise_underflow=False):
         """
         Runs the scan_kernel function for each value of the xvars specified.
-        
+
         The xvars are scanned as if looping over nested for loops, with the last
         xvar as the innermost loop.
 
@@ -296,12 +316,59 @@ class Scanner():
         cleanup runs) instead of the default -- abandon the shot, run
         cleanup_scan_kernel, abort the scan and finish the run with the
         shots taken so far.
+
+        An exception that ends the scan (the liveOD Abort button, an error in
+        a shot or a hook, raise_underflow) first hands the kernel's channel
+        state to the host, which sends it to the monitor server as the run's
+        end state, then leaves the kernel unchanged.  ARTIQ writes kernel
+        attributes back to the host only when a kernel returns, so without
+        this nothing on the host knows what an aborted run left the hardware
+        at.  The handlers bind no names (the compiler gives a local one type).
         """
+        try:
+            self._scan(raise_underflow)
+        except RTIOUnderflow:
+            self._hand_over_abort_state("RTIOUnderflow")
+            raise
+        except RTIOOverflow:
+            self._hand_over_abort_state("RTIOOverflow")
+            raise
+        except RTIODestinationUnreachable:
+            self._hand_over_abort_state("RTIODestinationUnreachable")
+            raise
+        except ValueError:
+            self._hand_over_abort_state("ValueError")
+            raise
+        except:
+            self._hand_over_abort_state("")
+            raise
+
+    @kernel
+    def _hand_over_abort_state(self, what):
+        # Events already on the timeline play out whether or not anyone
+        # waits; waiting makes the snapshot what the hardware is at.
+        self.core.wait_until_mu(now_mu())
+        self._abort_snapshot_kernels[0](self, self._abort_snap_dds_f,
+                                        self._abort_snap_dds_a, self._abort_snap_dds_v,
+                                        self._abort_snap_dds_sw, self._abort_snap_dac_v,
+                                        self._abort_snap_ttl_s)
+        self._report_abort_state(what, self._abort_snap_dds_f, self._abort_snap_dds_a,
+                                 self._abort_snap_dds_v, self._abort_snap_dds_sw,
+                                 self._abort_snap_dac_v, self._abort_snap_ttl_s)
+
+    def _report_abort_state(self, what, dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s):
+        """RPC from scan()'s exception handler.  Overridden in Expt."""
+        pass
+
+    @kernel
+    def _scan(self, raise_underflow):
+        """The scan loop itself (see scan)."""
 
         self.pre_scan()
 
         scanning = True
         aborted_bool = False
+        abort_what = ""
 
         while scanning:
 
@@ -330,6 +397,7 @@ class Scanner():
                 if raise_underflow:
                     raise e
                 aborted_bool = True
+                abort_what = "RTIOUnderflow"
                 self.core.break_realtime()
             except TriggerTimeout as e_trigger:
                 # A gated wait (line trigger, OPX hand-back) closed with no
@@ -343,6 +411,7 @@ class Scanner():
                        "(TriggerTimeout, see the line above). Cleaning up and "
                        "ending the run with the shots taken so far.")
                 aborted_bool = True
+                abort_what = "TriggerTimeout"
                 self.core.break_realtime()
             except RTIOOverflow as e_overflow:
                 # An input FIFO overflowed inside a gated wait (a bouncing or
@@ -354,6 +423,7 @@ class Scanner():
                        "than expected. Cleaning up and ending the run with "
                        "the shots taken so far.")
                 aborted_bool = True
+                abort_what = "RTIOOverflow"
                 self.core.break_realtime()
 
             # overloaded in kexp.Base
@@ -373,7 +443,7 @@ class Scanner():
                 scanning = False
 
         if aborted_bool:
-            self._send_abort_to_server()
+            self._send_abort_to_server(abort_what)
 
         self.post_scan()
 

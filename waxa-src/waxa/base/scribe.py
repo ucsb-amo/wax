@@ -253,9 +253,10 @@ class Scribe():
             if not reset and getattr(self, '_shot_complete_count', 0) == 0:
                 reset = _client.poll_reset()
             if reset and raise_error:
-                if hasattr(self,'monitor'):
-                    self.monitor.update_device_states()
-                    self.monitor.signal_end()
+                # Called from the scan kernel: scan()'s exception handler
+                # reports the device state, from the kernel's values (the host
+                # frames still hold their pre-run values here).
+                self._abort_cause = "the liveOD Abort button"
                 _client.abort_run()
                 raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
             return reset
@@ -268,20 +269,35 @@ class Scribe():
     def _abort_for_reset(self, where=''):
         """A reset was requested: hand the machine back and stop the run. Same
         steps as the abort branch of _check_for_abort_signal; raised from inside
-        an RPC, the exception ends the kernel."""
-        if hasattr(self, 'monitor'):
-            self.monitor.update_device_states()
-            self.monitor.signal_end()
+        an RPC, the exception ends the kernel.
+
+        No device state is sent from here: the host frames still hold their
+        pre-run values while the kernel runs.  Inside a scan, scan()'s
+        exception handler reports the kernel's state; before one (the camera
+        wait in init_kernel) the state stays untrusted."""
+        self._abort_cause = f"the liveOD Abort button {where}".rstrip()
+        self._restart_monitor_once()
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
             _client.abort_run()
         print(f'Run {self.run_info.run_id} reset {where}'.rstrip() + ' -- aborting.')
         raise RuntimeError(f'Acquisition for run {self.run_info.run_id} aborted.')
 
-    def _send_abort_to_server(self):
-        """Notify the liveOD server that the run has been aborted due to
-        an RTIOUnderflow.  Called as an RPC from the scan kernel after the
-        current scan loop iteration completes.
+    def _restart_monitor_once(self):
+        """Ask the monitor server to restart the monitor experiment, so the
+        hardware is held again after an aborted run -- once per run, however
+        many abort paths the exception passes through."""
+        if getattr(self, '_monitor_restart_sent', False) or not hasattr(self, 'monitor'):
+            return
+        self._monitor_restart_sent = True
+        self.monitor.signal_end()
+
+    def _send_abort_to_server(self, what="RTIOUnderflow"):
+        """Notify the liveOD server that the run has been aborted because a
+        shot ended on ``what`` (an RTIOUnderflow, RTIOOverflow or
+        TriggerTimeout, after which cleanup_scan_kernel ran).  Called as an
+        RPC from the scan kernel after the current scan loop iteration
+        completes.
 
         If ``run_info.save_on_underflow`` is set, pads any partially-captured
         scope data to the full shot count and returns normally so that
@@ -290,8 +306,11 @@ class Scribe():
         END_RUN payload to the server.
 
         Otherwise (default), sends ABORT_RUN to the server and raises
-        RuntimeError to prevent ``analyze()`` from executing.
+        RuntimeError to prevent ``analyze()`` from executing; scan()'s
+        exception handler then reports the device state.
         """
+        what = str(what or "RTIOUnderflow")
+        self._shot_abort = what
         save_on_underflow = bool(getattr(self.run_info, 'save_on_underflow', False))
 
         if save_on_underflow and self.run_info.save_data:
@@ -299,15 +318,13 @@ class Scribe():
             if hasattr(self, 'scope_data') and self.scope_data._scope_trace_taken:
                 n_shots = int(getattr(self.params, 'N_shots_with_repeats', 1))
                 self.scope_data.pad_to_n_shots(n_shots)
-            print(f'[Scanner] RTIOUnderflow on run {self.run_info.run_id}: '
+            print(f'[Scanner] {what} on run {self.run_info.run_id}: '
                   f'save_on_underflow=True — proceeding to analyze() to save partial data.')
             return  # let post_scan() -> run() -> analyze() -> end_wax() handle saving
 
+        self._abort_cause = f"{what} in a shot"
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
-            if hasattr(self, 'monitor'):
-                self.monitor.update_device_states()
-                self.monitor.signal_end()
             _client.abort_run()
-        print(f'[Scanner] RTIOUnderflow: run {self.run_info.run_id} aborted.')
-        raise RuntimeError(f'RTIOUnderflow: run {self.run_info.run_id} aborted.')
+        print(f'[Scanner] {what}: run {self.run_info.run_id} aborted.')
+        raise RuntimeError(f'{what}: run {self.run_info.run_id} aborted.')

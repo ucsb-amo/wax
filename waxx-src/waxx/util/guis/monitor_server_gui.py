@@ -145,6 +145,10 @@ class MonitorUDPServer(UdpServer):
     * ``{"type": "replace_state", "config", "run_id"}`` — an experiment's
       end-of-run state (``end()``); replaces the channel sections at once,
       marks the state trusted, broadcasts ``state_reset``.
+    * ``{"type": "abort_state", "config", "run_id", "cause", "trusted",
+      "caveat"}`` — an aborted run's state, from the kernel at the abort
+      (scan()'s exception handler); as ``replace_state``, but trusted only
+      when ``trusted`` is true.
 
     Composite ops (see :mod:`waxx.util.device_state.composite`; bookkeeping in
     :class:`~waxx.util.device_state.op_queue.OpQueue`):
@@ -172,7 +176,8 @@ class MonitorUDPServer(UdpServer):
 
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
-    ``end()`` sends its end state.  A run that dies never does, so from the
+    ``end()`` sends its end state (or, aborted inside its scan, sends
+    ``abort_state``).  A run that dies elsewhere never does, so from the
     interruption until ``replace_state`` (or ``trust_ack``) the state is
     *untrusted*: GUIs say so, and coil ops want a measured current.  It is
     kept in the file's metadata so a server restart does not forget it.
@@ -305,6 +310,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps({"status": "ok"})
         if mtype == "replace_state":
             return self._reply_replace_state(obj)
+        if mtype == "abort_state":
+            return self._reply_abort_state(obj)
         if mtype == "run_pending":
             return self._reply_run_pending(obj)
         if mtype in ("run_withdrawn", "clear_run_pending"):
@@ -706,6 +713,53 @@ class MonitorUDPServer(UdpServer):
         self._broadcaster.send({"type": "trust", "trust": dict(self._trust)})
         if reset is not None:
             self.reset.end_state_received(expt)
+        return json.dumps({"status": "ok", "version": version})
+
+    def _reply_abort_state(self, obj) -> str:
+        """An aborted run's state: every channel as the kernel had it when an
+        exception ended the scan, sent by scan()'s exception handler (a kernel
+        that raises never writes its attributes back, so end() cannot).
+        Trusted only if the client says so (``trusted``); otherwise ``caveat``
+        says which write may not have reached the hardware."""
+        if not self.config_file_path:
+            return json.dumps({"status": "error", "msg": "no config path"})
+        cfg = obj.get("config")
+        if not isinstance(cfg, dict) or not all(isinstance(cfg.get(k), dict)
+                                                for k in ("dds", "ttl", "dac")):
+            return json.dumps({"status": "error", "msg": "abort_state needs dds/ttl/dac"})
+        run_id = obj.get("run_id")
+        expt = str(obj.get("expt") or "")
+        cause = str(obj.get("cause") or "an exception")
+        trusted = obj.get("trusted") is True
+        if trusted:
+            reason = f"state of {_run_name(run_id, expt)} at its abort ({cause})"
+        else:
+            caveat = str(obj.get("caveat") or "")
+            reason = (f"{_run_name(run_id, expt)} aborted ({cause}); the file holds its "
+                      f"last commanded state" + (f", but {caveat}" if caveat else ""))
+        trust = {"trusted": trusted, "reason": reason, "since": time.time()}
+        with self._state_lock:
+            try:
+                data = replace_sections(self.config_file_path,
+                                        {k: cfg[k] for k in ("dds", "ttl", "dac")},
+                                        metadata={"state_trust": trust,
+                                                  "updated_from": "abort of run",
+                                                  "run_id": run_id,
+                                                  "timestamp": time.strftime(
+                                                      "%Y-%m-%dT%H:%M:%S")})
+            except Exception as e:
+                return json.dumps({"status": "error", "msg": str(e)})
+            self._remember_state(data)
+            self._version += 1
+            version = self._version
+        self._trust = trust
+        self._clear_run_pending(f"{_run_name(run_id, expt)} aborted")
+        (log.info if trusted else log.warning)(
+            "Device state %s: %s.", "trusted" if trusted else "UNTRUSTED", reason)
+        self.journal.record("run_end", run_id=run_id, expt=obj.get("expt"), version=version,
+                            aborted=cause, trusted=trusted)
+        self._broadcaster.send({"type": "state_reset", "version": version})
+        self._broadcaster.send({"type": "trust", "trust": dict(self._trust)})
         return json.dumps({"status": "ok", "version": version})
 
     def _log_update(self, dtype: str, name: str, changes: dict, origin: str = "") -> None:

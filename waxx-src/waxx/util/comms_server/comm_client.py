@@ -182,6 +182,13 @@ class MonitorClient(CommClient):
         return self._request({"type": "replace_state", "config": config,
                               "run_id": run_id, "expt": expt})
 
+    def abort_state(self, config, run_id=None, expt="", cause="", trusted=True, caveat=""):
+        """An aborted run's device state, from the kernel at the abort
+        (scan()'s exception handler).  Trusted only if ``trusted``."""
+        return self._request({"type": "abort_state", "config": config, "run_id": run_id,
+                              "expt": expt, "cause": cause, "trusted": bool(trusted),
+                              "caveat": caveat})
+
     def announce_run(self, run_id=None, expt="", client="", token=""):
         """An experiment is about to take the core: fence composite ops.
         ``token`` names this announcement for :meth:`withdraw_run`."""

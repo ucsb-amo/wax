@@ -16,7 +16,7 @@ from waxa import img_types
 from artiq.language.core import kernel_from_string, now_mu, TerminationRequested
 
 from waxx.config.data_vault import DataVault
-from waxx.base.scanner import Scanner
+from waxx.base.scanner import Scanner, WRITE_FAILURES
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
 from waxx.util import console
@@ -128,6 +128,13 @@ class Expt(Scanner, Dealer, Scribe):
         # exact source it ran from here before end() is called.
         self._extra_file_texts = {}
 
+        # Why the run is being stopped, set where host code raises to stop it
+        # (the liveOD Abort button, a shot abandoned on an RTIO error), for
+        # the device-state report of scan()'s exception handler.
+        self._abort_cause = ""
+        self._shot_abort = ""
+        self._monitor_restart_sent = False
+
     def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
         """
         To be called at the end of prepare. 
@@ -149,6 +156,7 @@ class Expt(Scanner, Dealer, Scribe):
 
         if hasattr(self,'monitor'):
             self.monitor.init_monitor()
+            self._adopt_monitor_snapshot()
 
         self.init_xvars(shuffle,N_repeats)
 
@@ -251,6 +259,7 @@ class Expt(Scanner, Dealer, Scribe):
         if stride and (n == 1 or n % stride == 0 or n == N):
             print(self._progress_line(n, N, now, xvar_values, stride))
         if reset_requested:
+            self._abort_cause = "the liveOD Abort button"
             _client.abort_run()
             _arm_exit_hang_dump()
             raise TerminationRequested
@@ -313,6 +322,56 @@ class Expt(Scanner, Dealer, Scribe):
         except Exception:
             pass
         return conditions
+
+    def _adopt_monitor_snapshot(self):
+        """Give scan()'s exception handler the monitor's channel-snapshot
+        kernel and arrays (built from the device frames by init_monitor)."""
+        m = self.monitor
+        self._abort_snapshot_kernels = m._snapshot_kernels
+        self._abort_snap_dds_f = m._snap_dds_f
+        self._abort_snap_dds_a = m._snap_dds_a
+        self._abort_snap_dds_v = m._snap_dds_v
+        self._abort_snap_dds_sw = m._snap_dds_sw
+        self._abort_snap_dac_v = m._snap_dac_v
+        self._abort_snap_ttl_s = m._snap_ttl_s
+
+    def _report_abort_state(self, what, dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s):
+        """RPC from scan()'s exception handler, with every channel's state in
+        the kernel at the abort (``what``: the exception's name when the
+        handler could tell, else '').  Sends it to the monitor server as this
+        run's end state and restarts the monitor, as end() does for a run
+        that finishes.
+
+        The state is trusted unless the run ended on an exception a channel
+        write can raise itself (WRITE_FAILURES) -- then the write that raised
+        may not have reached the hardware, and the state goes in marked
+        untrusted.  Never raises: the exception on its way out of the kernel
+        is the one the terminal must show."""
+        if getattr(self, '_is_monitor', False) or not hasattr(self, 'monitor'):
+            return
+        rid = self.run_info.run_id
+        try:
+            cause = self._abort_cause or what or "an exception (see the traceback)"
+            failed = next((w for w in (what, self._shot_abort) if w in WRITE_FAILURES), "")
+            caveat = (f"a channel write that raised {failed} may not have reached the "
+                      f"hardware, so that channel can differ" if failed else "")
+            accepted = self.monitor.report_abort_state(
+                dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s, run_id=rid,
+                expt=self._expt_file_stem(), cause=cause, trusted=not failed, caveat=caveat)
+            if accepted and failed:
+                print(f"[Monitor] run {rid} aborted ({cause}): its last commanded device "
+                      f"state went to the monitor server, marked UNTRUSTED -- {caveat}. "
+                      f"Check that channel, then Trust state on the Device Control GUI.")
+            elif accepted:
+                print(f"[Monitor] run {rid} aborted ({cause}): its device state at the "
+                      f"abort went to the monitor server (trusted).")
+        except Exception as e:
+            print(f"[Monitor] WARNING: could not report run {rid}'s device state at the "
+                  f"abort ({e!r}); the device state stays untrusted.")
+        try:
+            self._restart_monitor_once()
+        except Exception as e:
+            print(f"[Monitor] WARNING: could not ask for a monitor restart ({e!r}).")
 
     def apply_pending_adjust_values(self):
         """Apply any adjust-panel values received from the last SHOT_COMPLETE reply."""
