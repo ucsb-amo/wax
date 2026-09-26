@@ -1625,6 +1625,9 @@ class DeviceStateGUI(QMainWindow):
         self.composite_panel = None
         self._composite_scroll = None
         self._trust: dict | None = None
+        # The monitor server's reset experiment and its current/last run
+        # (StateReset.info()); None when the server has none.
+        self._reset: dict | None = None
         self._run_pending: dict | None = None
         self._busy_until = 0.0
         self._telemetry_samples: dict = {}
@@ -1680,6 +1683,7 @@ class DeviceStateGUI(QMainWindow):
         self.summary = SummaryStrip()
         self.summary.make_safe_requested.connect(self._make_safe)
         self.summary.trust_requested.connect(self._trust_state)
+        self.summary.reset_requested.connect(self._reset_state)
         self.summary.start_monitor_requested.connect(self.on_start_clicked)
         self.summary.show_device_requested.connect(self._show_composite_device)
         self.summary.clear_fence_requested.connect(self._clear_fence)
@@ -2018,6 +2022,8 @@ class DeviceStateGUI(QMainWindow):
             self.composite_panel.set_monitor_detail(detail)
         if "trust" in detail:
             self._trust = detail.get("trust")
+        if "reset" in detail:
+            self._set_reset(detail.get("reset"))
         if "run_pending" in detail:
             self._run_pending = detail.get("run_pending")
         busy = (detail.get("composite_ops") or {}).get("busy_s")
@@ -2243,11 +2249,8 @@ class DeviceStateGUI(QMainWindow):
     def _refresh_summary(self) -> None:
         """Everything the strip above the tabs shows, from what this GUI knows."""
         samples = self._telemetry_samples
-        self.summary.set_trust(self._trust)
-        live_od = {k.split("/", 1)[1]: s.value for k, s in samples.items()
-                   if k.startswith("live_od/") and getattr(s, "ok", False)
-                   and getattr(s, "age_s", 99.) < 10.}
-        self.summary.set_run(self._run_pending, live_od)
+        self.summary.set_trust(self._trust, self._reset)
+        self.summary.set_run(self._run_pending, self._live_od_status())
         state = samples.get("interlock/state")
         enabled = samples.get("interlock/magnets_enabled")
         fresh = state is not None and state.ok and state.age_s < 15.
@@ -2268,6 +2271,13 @@ class DeviceStateGUI(QMainWindow):
                     f"{int((h['watchdog'] or {}).get('fires_in_s') or 0)} s"
                     for h in hazards if (h.get("watchdog") or {}).get("warned")]
         self.summary.set_watchdog_warnings(warnings)
+
+    def _live_od_status(self) -> dict:
+        """liveOD's fresh telemetry (run_in_progress, run_id, ...); {} when
+        there is none."""
+        return {k.split("/", 1)[1]: s.value for k, s in self._telemetry_samples.items()
+                if k.startswith("live_od/") and getattr(s, "ok", False)
+                and getattr(s, "age_s", 99.) < 10.}
 
     def _show_composite_device(self, key: str) -> None:
         if self.composite_panel is None or self._composite_scroll is None:
@@ -2328,6 +2338,83 @@ class DeviceStateGUI(QMainWindow):
             QMessageBox.warning(self, "Trust the device state",
                                 f"The monitor server did not accept it: {reply.get('msg')}")
         self._refresh_summary()
+
+    def _reset_state(self) -> None:
+        """Ask the monitor server to run its reset experiment (kexp:
+        mot_observe.py).  It takes the core and sets the hardware itself; its
+        end state -- not this click -- is what marks the state trusted."""
+        reset = self._reset or {}
+        if not reset or reset.get("state") == "running":
+            return
+        expt = reset.get("expt") or "the reset experiment"
+        live_od = self._live_od_status()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reset the device state")
+        parts = []
+        if live_od.get("run_in_progress"):
+            shots = ""
+            if live_od.get("n_shots_expected"):
+                shots = f", shot {live_od.get('n_shots') or 0}/{live_od.get('n_shots_expected')}"
+            parts.append(
+                f"liveOD says run {live_od.get('run_id')} "
+                f"({live_od.get('expt_name') or 'experiment'}) is IN PROGRESS{shots}. If it is "
+                "still running, a reset cuts it off and its data ends there. Reset only if "
+                "that run is dead.")
+        elif not live_od:
+            parts.append("liveOD's run status is not available here, so this GUI cannot "
+                         "tell whether a run still holds the core.")
+        parts.append(
+            f"Runs {expt}.py on the experiment PC, as if started with ar. It takes the core "
+            "device: anything still running on it is cut off, and the monitor restarts "
+            "when it ends.")
+        if reset.get("about"):
+            parts.append(str(reset["about"]))
+        parts.append("Its end state replaces the state file and marks it trusted. If it "
+                     "fails, the state stays untrusted and the banner says why.\n\n"
+                     "Recorded in the journal with your name.")
+        box.setText("\n\n".join(parts))
+        yes = box.addButton("Reset anyway" if live_od.get("run_in_progress") else "Reset state",
+                            QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        operator = self.composite_panel.operator_name() if self.composite_panel else ""
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        self._send_request({"type": "reset_state", "operator": operator, "client": host},
+                           self._on_reset_reply)
+
+    def _on_reset_reply(self, reply: dict) -> None:
+        if reply.get("status") == "ok":
+            self._set_reset(reply.get("reset"))
+        else:
+            self._record_line(f"[reset] refused: {reply.get('msg')}")
+            QMessageBox.warning(self, "Reset the device state",
+                                f"The monitor server did not start it: {reply.get('msg')}")
+        self._refresh_summary()
+
+    def _set_reset(self, reset: dict | None) -> None:
+        """New reset info (status poll, snapshot, broadcast or reply): logs a
+        line in the changes log when a reset starts or ends."""
+        previous, self._reset = self._reset, reset
+        if not reset:
+            return
+        key = (reset.get("state"), reset.get("started"))
+        if previous and (previous.get("state"), previous.get("started")) == key:
+            return
+        if previous is None and reset.get("state") != "running":
+            return      # first news of an old reset: nothing new to log
+        state = reset.get("state")
+        if state == "running":
+            who = "@".join(p for p in (reset.get("operator"), reset.get("client")) if p)
+            self._record_line(f"[reset] {reset.get('expt')} started" + (f" by {who}" if who else ""))
+        elif state in ("done", "failed"):
+            self._record_line(f"[reset] {'' if state == 'done' else 'FAILED: '}{reset.get('text')}")
 
     def _clear_fence(self) -> None:
         """An operator asserts the announced run is dead (it never took the
@@ -2611,6 +2698,8 @@ class DeviceStateGUI(QMainWindow):
             self._trust = state.get("trust")
             if panel is not None:
                 panel.set_trust(self._trust)
+        if "reset" in state:
+            self._set_reset(state.get("reset"))
         if "run_pending" in state:
             self._run_pending = state.get("run_pending")
             if panel is not None:
@@ -2667,6 +2756,10 @@ class DeviceStateGUI(QMainWindow):
             self._trust = payload.get("trust")
             if panel is not None:
                 panel.set_trust(self._trust)
+            self._refresh_summary()
+            return
+        if mtype == "reset_run":
+            self._set_reset(payload.get("reset"))
             self._refresh_summary()
             return
         if mtype == "run_pending":

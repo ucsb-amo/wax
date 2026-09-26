@@ -136,6 +136,10 @@ def describe_entry(e: dict) -> str:
         text = f"{e.get('device')} {kind[9:]}"
         if e.get("text"):
             text += f": {e['text']}"
+    elif kind.startswith("state_reset_"):
+        text = f"{e.get('expt') or 'reset'} {kind[12:]}{_who(e)}"
+        if e.get("text") or e.get("msg"):
+            text += f": {e.get('text') or e.get('msg')}"
     else:
         rest = {k: v for k, v in e.items() if k not in ("ts", "t", "kind")}
         text = json.dumps(rest, default=repr)

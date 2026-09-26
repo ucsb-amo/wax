@@ -81,6 +81,23 @@ def _diagnose(text: str) -> list[str]:
     return [why for needles, why in _FAILURE_HINTS if _matches(text, needles)]
 
 
+def ar_command(expt_path) -> str:
+    """The shell command that runs one experiment file, as the lab does."""
+    return r"%kpy% & ar " + str(expt_path)
+
+
+def environment_report() -> list[str]:
+    """Lines describing the launch environment, for failure post-mortems."""
+    lines = []
+    for var in _LAUNCH_ENV_VARS:
+        value = os.environ.get(var)
+        lines.append(f"%{var}% = {value if value else '<UNSET>'}")
+    found = shutil.which("ar") or shutil.which("artiq_run")
+    lines.append(f"'ar'/'artiq_run' on PATH = {found or '<NOT FOUND>'}")
+    lines.append(f"working directory = {os.getcwd()}")
+    return lines
+
+
 class MonitorManager(QThread):
     msg = pyqtSignal(str)
     monitor_stopped = pyqtSignal(str)
@@ -126,7 +143,7 @@ class MonitorManager(QThread):
 
     @property
     def launch_command(self) -> str:
-        return r"%kpy% & ar " + str(self.monitor_expt_path)
+        return ar_command(self.monitor_expt_path)
 
     def preflight_problems(self) -> list[str]:
         """Return fatal reasons the monitor cannot be started, if any.
@@ -161,15 +178,7 @@ class MonitorManager(QThread):
         return problems
 
     def _environment_report(self) -> list[str]:
-        """Lines describing the launch environment, for failure post-mortems."""
-        lines = []
-        for var in _LAUNCH_ENV_VARS:
-            value = os.environ.get(var)
-            lines.append(f"%{var}% = {value if value else '<UNSET>'}")
-        found = shutil.which("ar") or shutil.which("artiq_run")
-        lines.append(f"'ar'/'artiq_run' on PATH = {found or '<NOT FOUND>'}")
-        lines.append(f"working directory = {os.getcwd()}")
-        return lines
+        return environment_report()
 
     # ------------------------------------------------------------------
     # Start / run

@@ -50,10 +50,11 @@ class HeadlessMonitorServer(QObject):
     """
 
     def __init__(self, monitor_expt_path: str, config_file_path: str | None = None,
-                 journal_dir: str | None = None):
+                 journal_dir: str | None = None, reset_expt_path: str | None = None):
         super().__init__()
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
+        self.reset_expt_path = reset_expt_path
         self.monitor_expt_path = monitor_expt_path
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
@@ -61,6 +62,7 @@ class HeadlessMonitorServer(QObject):
 
         log.info("monitor experiment: %s", monitor_expt_path)
         log.info("device state file: %s", config_file_path)
+        log.info("reset experiment: %s", reset_expt_path or "none (no Reset state)")
         if config_file_path is None:
             log.error(
                 "No device-state config path was passed: state reads/writes from "
@@ -96,7 +98,8 @@ class HeadlessMonitorServer(QObject):
     def _setup_udp_server(self) -> None:
         self.server_thread = QThread()
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
-                                           journal_dir=self.journal_dir)
+                                           journal_dir=self.journal_dir,
+                                           reset_expt_path=self.reset_expt_path)
         log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
@@ -206,7 +209,7 @@ class HeadlessMonitorServer(QObject):
 
 
 def run(monitor_expt_path: str, config_file_path: str | None = None,
-        journal_dir: str | None = None) -> int:
+        journal_dir: str | None = None, reset_expt_path: str | None = None) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
@@ -229,7 +232,8 @@ def run(monitor_expt_path: str, config_file_path: str | None = None,
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
     try:
         server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path,
-                                       journal_dir=journal_dir)
+                                       journal_dir=journal_dir,
+                                       reset_expt_path=reset_expt_path)
     except Exception:
         log.exception("Monitor server failed to start")
         return 1

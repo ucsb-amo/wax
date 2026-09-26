@@ -20,6 +20,7 @@ from waxx.util.device_state.state_file_io import (
 from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
+from waxx.util.device_state.state_reset import StateReset
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,15 @@ _STATE_NAMES = {STATES.READY: "READY", STATES.LOADING: "LOADING",
 
 def _state_name(state) -> str:
     return _STATE_NAMES.get(state, str(state))
+
+
+def _run_name(run_id, expt) -> str:
+    """"run 81234 (hf_bec)"; a run without an id (suppress_live_od: 0 or
+    None) is named by its file alone."""
+    expt = str(expt or "")
+    if run_id:
+        return f"run {run_id} ({expt or 'experiment'})"
+    return expt or "an experiment"
 
 
 @dataclass
@@ -151,6 +161,11 @@ class MonitorUDPServer(UdpServer):
       take the core: ops are refused from now until it ends (or 2 min pass
       without it taking the core).
     * ``trust_ack`` — an operator says the hardware matches the state file.
+    * ``reset_state`` — run the reset experiment (``reset_expt_path``, see
+      :class:`~waxx.util.device_state.state_reset.StateReset`): it takes the
+      core, sets the hardware, and its end state marks the state trusted.
+      Refused while a run is starting or a reset is running.  Progress is
+      broadcast as ``reset_run``.
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
@@ -161,6 +176,8 @@ class MonitorUDPServer(UdpServer):
     interruption until ``replace_state`` (or ``trust_ack``) the state is
     *untrusted*: GUIs say so, and coil ops want a measured current.  It is
     kept in the file's metadata so a server restart does not forget it.
+    ``reset_state`` ends it the way a normal run does -- through the reset
+    experiment's own end state, never by itself.
 
     The version starts from the current epoch seconds so that a server restart
     always yields versions higher than any value a client still holds (forcing
@@ -174,7 +191,7 @@ class MonitorUDPServer(UdpServer):
     #: run() never took the core) stops fencing ops after this long.
     RUN_PENDING_TTL_S = 120.0
 
-    def __init__(self, config_file_path=None, journal_dir=None):
+    def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = MonitorStatus()
@@ -207,6 +224,9 @@ class MonitorUDPServer(UdpServer):
                                self._broadcaster_send, journal=self.journal)
         self._runner_stop = threading.Event()
         self._runner_thread = None
+
+        self.reset = StateReset(reset_expt_path, on_change=self._on_reset_change,
+                                journal=self.journal)
 
     def on_message_received(self,message):
         m = message.strip()
@@ -250,7 +270,7 @@ class MonitorUDPServer(UdpServer):
             runner = self.runner.info()
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
                 "run_pending": dict(self._run_pending) if self._run_pending else None,
-                "runner": runner}
+                "runner": runner, "reset": self.reset.info()}
 
     def _handle_structured(self, raw):
         try:
@@ -293,6 +313,8 @@ class MonitorUDPServer(UdpServer):
             who = str(obj.get("operator") or obj.get("client") or "?")
             self._set_trust(True, f"acknowledged on the Device Control GUI by {who}")
             return json.dumps({"status": "ok", "trust": dict(self._trust)})
+        if mtype == "reset_state":
+            return json.dumps(self._reply_reset_state(obj))
         if mtype == "get_journal":
             if obj.get("since"):
                 entries = self.journal.since((str(obj["since"]),))
@@ -458,6 +480,25 @@ class MonitorUDPServer(UdpServer):
         self._run_pending = None
         self._broadcaster.send({"type": "run_pending", "run_pending": None})
 
+    def _reply_reset_state(self, obj: dict) -> dict:
+        """Run the reset experiment.  Refused while a run is starting: the
+        reset would take the core from under it (or it from the reset)."""
+        operator = str(obj.get("operator") or "")
+        client = str(obj.get("client") or "")
+        pending = self._current_run_pending()
+        if pending is not None and not self.reset.running:
+            msg = (f"a run is starting (run {pending.get('run_id')}, "
+                   f"{pending.get('expt') or 'experiment'}) -- a reset would take the core "
+                   "from it. Wait for it to end, or clear its fence if it is dead")
+            log.warning("State reset refused: %s", msg)
+            self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
+                                client=client, msg=msg)
+            return {"status": "error", "msg": msg}
+        return self.reset.start(operator=operator, client=client)
+
+    def _on_reset_change(self, info) -> None:
+        self._broadcaster.send({"type": "reset_run", "reset": info})
+
     def _set_trust(self, trusted: bool, reason: str) -> None:
         self._trust = {"trusted": bool(trusted), "reason": reason, "since": time.time()}
         log.info("Device state %s: %s", "trusted" if trusted else "UNTRUSTED", reason)
@@ -484,8 +525,8 @@ class MonitorUDPServer(UdpServer):
             self.retire_ops(reason or _state_name(state))
             if reason == "interrupted_by_run" and previous != (state, reason):
                 pending = self._run_pending
-                who = (f"run {pending.get('run_id')} ({pending.get('expt') or 'experiment'})"
-                       if pending else "an experiment")
+                who = _run_name(pending.get("run_id"), pending.get("expt")) if pending \
+                    else "an experiment"
                 self._set_trust(False, f"{who} took the core at "
                                        f"{time.strftime('%H:%M:%S')} and has not reported "
                                        f"its end state")
@@ -636,9 +677,13 @@ class MonitorUDPServer(UdpServer):
                                                 for k in ("dds", "ttl", "dac")):
             return json.dumps({"status": "error", "msg": "replace_state needs dds/ttl/dac"})
         run_id = obj.get("run_id")
-        trust = {"trusted": True, "reason": f"end state of run {run_id}"
-                                           if run_id else "end state of an experiment",
-                 "since": time.time()}
+        expt = str(obj.get("expt") or "")
+        reason = "end state of " + _run_name(run_id, expt)
+        reset = self.reset.running_info(expt)
+        if reset is not None:
+            who = "@".join(p for p in (reset.get("operator"), reset.get("client")) if p) or "?"
+            reason += f", the state reset requested by {who}"
+        trust = {"trusted": True, "reason": reason, "since": time.time()}
         with self._state_lock:
             try:
                 data = replace_sections(self.config_file_path,
@@ -654,11 +699,13 @@ class MonitorUDPServer(UdpServer):
             self._version += 1
             version = self._version
         self._trust = trust
-        self._clear_run_pending(f"run {run_id} ended")
-        log.info("End state of run %s received; device state trusted.", run_id)
+        self._clear_run_pending(f"{_run_name(run_id, expt)} ended")
+        log.info("%s received; device state trusted.", reason[0].upper() + reason[1:])
         self.journal.record("run_end", run_id=run_id, expt=obj.get("expt"), version=version)
         self._broadcaster.send({"type": "state_reset", "version": version})
         self._broadcaster.send({"type": "trust", "trust": dict(self._trust)})
+        if reset is not None:
+            self.reset.end_state_received(expt)
         return json.dumps({"status": "ok", "version": version})
 
     def _log_update(self, dtype: str, name: str, changes: dict, origin: str = "") -> None:
@@ -696,11 +743,13 @@ class MonitorServerGUI(QWidget):
     def __init__(self,
                 monitor_expt_path,
                 config_file_path=None,
-                journal_dir=None):
+                journal_dir=None,
+                reset_expt_path=None):
         super().__init__()
 
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
+        self.reset_expt_path = reset_expt_path
 
         # Refuse to start a second monitor server for the same hardware.
         server_id = monitor_server_id()
@@ -740,6 +789,7 @@ class MonitorServerGUI(QWidget):
 
         log.info("monitor experiment: %s", monitor_expt_path)
         log.info("device state file: %s", config_file_path)
+        log.info("reset experiment: %s", reset_expt_path or "none (no Reset state)")
         if config_file_path is None:
             log.error(
                 "No device-state config path was passed: state reads/writes will "
@@ -795,7 +845,8 @@ class MonitorServerGUI(QWidget):
         self.server_thread = QThread()
         
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
-                                           journal_dir=self.journal_dir)
+                                           journal_dir=self.journal_dir,
+                                           reset_expt_path=self.reset_expt_path)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
