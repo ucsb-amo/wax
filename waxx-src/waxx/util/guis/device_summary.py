@@ -4,7 +4,7 @@ It answers "is anything dangerous on, can I trust what the tabs show, and can
 I act right now?" without opening the Composite tab:
 
 * banners -- the monitor is not running (with Start), the device state is
-  untrusted (with Reset state and Trust state), a run is starting or in progress, the
+  untrusted (with Run <reset experiment> and Trust state), a run is starting or in progress, the
   interlock has tripped, the hardware is busy playing out a ramp, a watchdog
   is about to act;
 * hazard chips -- one per device that says it is dangerous to leave on (a
@@ -56,6 +56,18 @@ def _fmt_s(seconds) -> str:
     return f"{h} h {m:02d} min"
 
 
+def reset_title(reset: dict | None) -> str:
+    """What buttons call the monitor server's reset experiment: the title its
+    docstring opens with (the text before the first ':', e.g. "MOT Observe"),
+    else its file name."""
+    reset = reset or {}
+    head = str(reset.get("about") or "").split("\n", 1)[0]
+    title, colon, _ = head.partition(":")
+    if colon and 0 < len(title.strip()) <= 30:
+        return title.strip()
+    return str(reset.get("expt") or "reset experiment").replace("_", " ")
+
+
 class _Banner(QFrame):
     def __init__(self, key: str, parent=None):
         super().__init__(parent)
@@ -68,7 +80,7 @@ class _Banner(QFrame):
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.label, 1)
-        # alt_button sits left of button (the trust banner: Reset state…,
+        # alt_button sits left of button (the trust banner: Run MOT Observe,
         # Trust state…).
         self.alt_button = QPushButton("")
         self.button = QPushButton("")
@@ -121,7 +133,7 @@ class SummaryStrip(QWidget):
         self.banners["trust"].alt_button.clicked.connect(self.reset_requested.emit)
         self.banners["trust"].alt_button.setToolTip(
             "Run the monitor server's reset experiment: it sets the hardware itself, and "
-            "its end state replaces the state file and marks it trusted.")
+            "its end state marks the state trusted.")
         self.banners["run"].button.clicked.connect(self.clear_fence_requested.emit)
 
         self.hazard_row = QFrame()
@@ -176,24 +188,27 @@ class SummaryStrip(QWidget):
         if not (trust and trust.get("trusted") is False):
             b.hide()
             return
-        text = "Device state UNTRUSTED: " + str(trust.get("reason", "")) + "."
+        # Why it is untrusted, and a failed reset's output, go in the tooltip.
+        tip = ["Untrusted since: " + str(trust.get("reason", ""))]
         state = (reset or {}).get("state")
-        expt = (reset or {}).get("expt") or "the reset experiment"
+        title = reset_title(reset)
         if state == "running":
             who = "@".join(p for p in (reset.get("operator"), reset.get("client")) if p)
             started = reset.get("started")
-            elapsed = "" if started is None else f", running for {_fmt_s(time.time() - started)}"
-            b.show_text("warn", text + f" Resetting: {expt}.py started"
-                        + (f" by {who}" if who else "") + elapsed
-                        + ". The state is trusted once its end state arrives.")
+            elapsed = "" if started is None else _fmt_s(time.time() - started)
+            detail = ", ".join(p for p in (who, elapsed) if p)
+            b.show_text("warn", f"Device state untrusted: running {title}"
+                        + (f" ({detail})" if detail else "") + "…")
+            b.label.setToolTip(tip[0])
             return
-        text += (" The tabs show the state file, which may not match the hardware until a "
-                 "run ends normally.")
+        text = "Device state untrusted: the tabs may not match the hardware."
         if state == "failed":
-            text += f" Last reset failed: {reset.get('text')}."
-        b.show_text("error", text, "Trust state…", "Reset state…" if reset else "")
-        tail = (reset or {}).get("tail") if state == "failed" else None
-        b.label.setToolTip("Last lines of the failed reset:\n" + "\n".join(tail) if tail else "")
+            text += f" Last {title} failed."
+            tip.append(str(reset.get("text") or ""))
+            if reset.get("tail"):
+                tip.append("Last lines of its output:\n" + "\n".join(reset["tail"]))
+        b.show_text("error", text, "Trust state…", f"Run {title}" if reset else "")
+        b.label.setToolTip("\n\n".join(tip))
 
     def set_run(self, pending: dict | None, live_od: dict | None) -> None:
         """A fence (a run announced itself and has not yet taken the core)

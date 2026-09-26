@@ -189,11 +189,22 @@ class MonitorClient(CommClient):
                               "expt": expt, "cause": cause, "trusted": bool(trusted),
                               "caveat": caveat})
 
-    def announce_run(self, run_id=None, expt="", client="", token=""):
+    def announce_run(self, run_id=None, expt="", client="", token="", timeout: float = 8.0):
         """An experiment is about to take the core: fence composite ops.
-        ``token`` names this announcement for :meth:`withdraw_run`."""
-        return self._request({"type": "run_pending", "run_id": run_id, "expt": expt,
-                              "client": client, "token": token})
+        ``token`` names this announcement for :meth:`withdraw_run`.  The
+        server releases the connections it holds (the tweezer AWG) before it
+        replies, which can take a few seconds -- hence the longer timeout."""
+        import json  # noqa: PLC0415
+        reply = self.send_message(json.dumps({"type": "run_pending", "run_id": run_id,
+                                              "expt": expt, "client": client,
+                                              "token": token}), timeout=timeout)
+        if reply is None:
+            return None
+        try:
+            parsed = json.loads(reply)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def withdraw_run(self, token, run_id=None, timeout: float = 2.0):
         """The announced run is exiting without having taken the core: lift
@@ -233,16 +244,14 @@ class MonitorClient(CommClient):
         """Monitor experiment: outcomes of ops it took."""
         return self._request({"type": "op_done", "results": results})
 
-    def report_connections(self, connections, timeout=None):
-        """Monitor experiment: the states of the connections it holds
-        (waxx.util.device_state.connections).  ``timeout``: one short try
-        instead of the default two (used at exit)."""
+    def connection_call(self, key, cmd, kwargs=None, timeout: float = 10.0):
+        """A driver command on one of the server's connections (e.g. the
+        tweezer AWG's ``write_traps``).  One try: the command may have run
+        even if the reply was lost, so it is not repeated."""
         import json  # noqa: PLC0415
-        msg = json.dumps({"type": "connections", "connections": connections})
-        if timeout is None:
-            reply = self.send_message(msg)
-        else:
-            reply = self.send_message(msg, timeout=timeout, attempts=1)
+        reply = self.send_message(json.dumps({"type": "connection_call", "key": key,
+                                              "cmd": cmd, "kwargs": kwargs or {}}),
+                                  timeout=timeout, attempts=1)
         if reply is None:
             return None
         try:

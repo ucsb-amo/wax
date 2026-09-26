@@ -592,8 +592,8 @@ class TweezerController(AwgConnection):
     _in_use_advice = (" Close whatever has it open on the PC holding it: a run that is"
                       " still going or hung, a notebook kernel that opened the card (the"
                       " AWG notebooks in kexp/experiments/tools close it only in their"
-                      " last cell), or the monitor (disconnect it on the Composite tab's"
-                      " connection bar).")
+                      " last cell), or the monitor server (disconnect it on the Composite"
+                      " tab's connection bar).")
 
     def __init__(self,
                   awg_ip='TCPIP::192.168.1.83::inst0::INSTR',

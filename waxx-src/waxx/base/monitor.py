@@ -49,17 +49,10 @@ T_UPDATE_SLACK = 2.e-3
 
 # What one poll found, as bits of the int sync_change_list returns.  The
 # channel lists and op slots only cross the link when there is something in
-# them; an idle iteration moves one int.  FLAG_EXIT: the server asked the
-# monitor to leave its loop (it is being stopped or restarted), so the
-# experiment's run() can close its connections before the process ends.
+# them; an idle iteration moves one int.
 FLAG_CHANNELS = 1
 FLAG_OPS = 2
 FLAG_SCHEMA = 4
-FLAG_EXIT = 8
-
-# The connection report sent while the monitor exits gets one short try: the
-# server may be the thing that is going away.
-T_EXIT_REPORT_TIMEOUT = 1.0
 
 # Ops whose events are still queued this far ahead when they finish make the
 # monitor tell the server it is busy (so queued requests do not expire while
@@ -80,7 +73,6 @@ _TOL_AMPLITUDE = 2.e-4      # ASF step ~6e-5
 _TOL_VOLTAGE = 1.e-4        # V
 
 from waxx.util.comms_server.comm_client import MonitorClient
-from waxx.util.device_state.connections import ConnectionManager, error_text
 from waxx.util.device_state.generate_state_file import Generator
 
 
@@ -185,14 +177,6 @@ class Monitor:
         # is accepted; withdrawn at exit otherwise (announce_run).
         self._announced = None
         self._withdraw_registered = False
-
-        # Host-side connections (the tweezer AWG): monitor experiment only,
-        # init_connections().  _poll_extras is what the last poll said about
-        # them (run starting, GUI requests, exit); poll_changes acts on it.
-        self._connections: Optional[ConnectionManager] = None
-        self._poll_extras: Optional[dict] = None
-        self._exit_requested = False
-        self._connections_unsupported_said = False
 
     def update_device_states(self, run_id=None, expt=""):
         """Send the frames' current state (an experiment's end state) to the
@@ -338,11 +322,19 @@ class Monitor:
     def signal_ready(self):
         if self._composites_enabled:
             self._register_ops()
-        if self._connections:
-            # The list, all still closed: they open on the first poll that
-            # says no run is starting (poll_changes).
-            self._connections.flush_report()
         self._monitor_client.send_ready()
+
+    def connection_call(self, key, cmd, **kwargs):
+        """Host side (a composite op's host step): run a driver command on one
+        of the monitor server's connections -- the tweezer AWG is held by the
+        server between runs, not by this process.  Returns the result; raises
+        RuntimeError with the server's reason when it did not run."""
+        reply = self._monitor_client.connection_call(key, cmd, _jsonable(kwargs))
+        if reply is None:
+            raise RuntimeError(f"{key} {cmd}: the monitor server did not answer")
+        if reply.get("status") != "ok":
+            raise RuntimeError(str(reply.get("msg") or f"{key} {cmd} failed"))
+        return reply.get("result")
 
     def schema_changed(self) -> TBool:
         """Return True (and reset the flag) if JSON device keys changed since init."""
@@ -526,90 +518,6 @@ class Monitor:
     @property
     def composites_enabled(self) -> bool:
         return self._composites_enabled
-
-    # ------------------------------------------------------------------
-    # Host-side connections (waxx.util.device_state.connections)
-    # ------------------------------------------------------------------
-
-    def init_connections(self, connections):
-        """Monitor experiment only, in prepare(): the host-side connections
-        it holds while it runs (the tweezer AWG).  Nothing is opened here.
-        They open on the first poll that says no run is starting, close
-        while a run is starting, and must be closed by the experiment's
-        run() in a ``finally`` (:meth:`close_connections`)."""
-        self._connections = ConnectionManager(self.expt, connections,
-                                              report=self._report_connections,
-                                              busy=self._notify_busy_host)
-        if self._connections:
-            names = ", ".join(c.label for c in self._connections.connections)
-            print(f"[Monitor] connections: {names} (opened once the loop is running).")
-
-    def close_connections(self, why="the monitor is exiting"):
-        """Close every connection and say so (one short try, the server may
-        be gone).  For the monitor experiment's ``finally``.  Never raises."""
-        mgr = self._connections
-        if mgr is None:
-            return
-        try:
-            mgr.close_all(why)
-            mgr.flush_report(timeout=T_EXIT_REPORT_TIMEOUT)
-        except Exception:
-            print("[Monitor] WARNING: closing the monitor's connections failed:")
-            traceback.print_exc()
-
-    def _report_connections(self, snapshot, timeout=None) -> bool:
-        reply = self._monitor_client.report_connections(_jsonable(snapshot), timeout=timeout)
-        if reply is not None and reply.get("status") == "ok":
-            return True
-        msg = None if reply is None else reply.get("msg")
-        if msg and "unknown type" in msg and not self._connections_unsupported_said:
-            self._connections_unsupported_said = True
-            print("[Monitor] WARNING: the monitor server does not know connections (it "
-                  "runs older code) -- the Composite tab cannot show them; restart it.")
-        return False
-
-    def _notify_busy_host(self, seconds):
-        try:
-            self._monitor_client.request({"type": "busy", "seconds": float(seconds)})
-        except Exception:
-            pass
-
-    def _service_connections(self):
-        """Act on what the last poll said: a run starting (release), GUI
-        connect/disconnect requests, an exit request.  Then open/close what
-        that implies.  Never raises (it runs inside the loop's RPC)."""
-        extras, self._poll_extras = self._poll_extras, None
-        mgr = self._connections
-        try:
-            if extras is not None:
-                if extras.get("exit"):
-                    self._exit_requested = True
-                if mgr is not None:
-                    if "run_pending" in extras:
-                        mgr.set_run_pending(extras.get("run_pending"))
-                    elif not self._connections_unsupported_said and mgr:
-                        self._connections_unsupported_said = True
-                        print("[Monitor] WARNING: the monitor server does not say when a "
-                              "run is starting (it runs older code), so the monitor will "
-                              "not open its connections -- restart the server.")
-                    for r in extras.get("connection_requests") or []:
-                        who = "@".join(p for p in (str(r.get("operator") or ""),
-                                                   str(r.get("client") or "")) if p)
-                        refusal = mgr.request(r.get("key"), r.get("action"), who)
-                        if refusal:
-                            print(f"[Monitor] connection request {r.get('action')} "
-                                  f"{r.get('key')} refused: {refusal}")
-            if mgr is None:
-                return
-            if self._exit_requested:
-                # run()'s finally closes them; nothing new opens meanwhile.
-                return
-            mgr.service()
-            mgr.flush_report()
-        except Exception as e:
-            print(f"[Monitor] WARNING: servicing the connections failed "
-                  f"({error_text(e)}):")
-            traceback.print_exc()
 
     def disable_composites(self, reason=""):
         """Fall back to channel-only monitoring (ping-only op table, no
@@ -836,14 +744,6 @@ class Monitor:
             print(f"[Monitor] composite op {result['op']} #{seq}: "
                   f"{_composite.status_text(status, result['message']) if status != OP_OK else 'done'}")
             results.append(result)
-        if self._connections:
-            # An op may have changed what a connection shows (AWG tones).
-            try:
-                self._connections.refresh()
-                self._connections.flush_report()
-            except Exception:
-                print("[Monitor] WARNING: refreshing the connections after ops failed:")
-                traceback.print_exc()
         self._send_op_results(results)
 
     def _send_op_results(self, results):
@@ -997,9 +897,8 @@ class Monitor:
         now = time.monotonic()
         if now < self._version_probe_retry_after:
             return None
-        if (self._composites_enabled or self._connections) and self._ops_supported:
-            # One round trip for all of it: the version, queued ops, and what
-            # the connections need to know (poll_changes acts on that).
+        if self._composites_enabled and self._ops_supported:
+            # One round trip for both: the version and any queued ops.
             try:
                 obj = self._monitor_client.poll()
                 if obj is None:
@@ -1016,12 +915,6 @@ class Monitor:
                     return self._fetch_server_version()
                 self._version_probe_retry_after = now + T_VERSION_PROBE_BACKOFF
                 return None
-            self._poll_extras = {k: obj[k] for k in
-                                 ("run_pending", "connection_requests", "exit") if k in obj}
-            if not self._composites_enabled or obj.get("exit"):
-                # (A monitor on its way out must not re-register the ops a
-                # restart has just retired.)
-                return version
             # The server has handed these over; losing them to an exception
             # here would leave the GUI waiting, so report instead of raising.
             try:
@@ -1228,7 +1121,6 @@ class Monitor:
         themselves are fetched only when there is something in them."""
         self._flush_writeback()
         self.detect_changes(verbose=verbose)
-        self._service_connections()
         flags = 0
         if self._have_channel_updates():
             flags |= FLAG_CHANNELS
@@ -1236,8 +1128,6 @@ class Monitor:
             flags |= FLAG_OPS
         if self.schema_changed():
             flags |= FLAG_SCHEMA
-        if self._exit_requested:
-            flags |= FLAG_EXIT
         return flags
 
     def channel_updates(self) -> Tuple[
@@ -1421,11 +1311,6 @@ class Monitor:
 
     @kernel
     def monitor_loop(self, verbose=False):
-        """Returns only on a schema change (after asking the server for a
-        restart) or when the server asks it to exit (FLAG_EXIT, after that
-        iteration's channel updates); the experiment's run() then closes the
-        connections.  Everything else keeps it looping until an experiment
-        takes the core."""
         self.signal_ready()
         while True:
             self.core.wait_until_mu(now_mu())
@@ -1438,7 +1323,4 @@ class Monitor:
                 self.apply_updates()
             if flags & FLAG_OPS:
                 self.apply_ops()
-            if flags & FLAG_EXIT:
-                self.core.wait_until_mu(now_mu())
-                break
             delay(T_MONITOR_UPDATE_INTERVAL)

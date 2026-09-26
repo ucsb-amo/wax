@@ -8,7 +8,7 @@ reports its end state through ``replace_state`` like any run's -- which is
 what marks the state trusted again.
 
 :class:`StateReset` launches that file on request (the Device Control GUI's
-Reset state button, through the monitor server), the same way the monitor
+Run <reset experiment> button, through the monitor server), the same way the monitor
 experiment is launched (``%kpy% & ar <file>``), and follows it to the end.  It
 never marks anything trusted itself: a reset that fails, is killed, or exits
 without reporting its end state leaves the state untrusted and says why.

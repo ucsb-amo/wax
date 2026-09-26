@@ -142,9 +142,6 @@ def describe_entry(e: dict) -> str:
         text = f"{e.get('key')} {e.get('action')} requested{_who(e)}"
     elif kind == "connection_refused":
         text = f"{e.get('key')} {e.get('action')} REFUSED{_who(e)}: {e.get('msg')}"
-    elif kind == "monitor_exit_requested":
-        text = "monitor asked to exit on its own (holds " + \
-               ", ".join(str(h) for h in e.get("holding") or []) + ")"
     elif kind.startswith("scene_"):
         text = f"{e.get('scene')} #{e.get('id')} {kind[6:]}"
         if e.get("text"):

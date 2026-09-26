@@ -23,6 +23,7 @@ from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop
 from waxx.util.device_state import connections as conns
+from waxx.util.device_state.connections import ConnectionService
 
 log = logging.getLogger(__name__)
 
@@ -182,18 +183,18 @@ class MonitorUDPServer(UdpServer):
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
 
-    Host-side connections the monitor holds (the tweezer AWG; see
-    :mod:`waxx.util.device_state.connections`):
+    Host-side connections this server holds between runs (the tweezer AWG;
+    :class:`~waxx.util.device_state.connections.ConnectionService`, each in
+    its own agent process): released before the reply to ``run_pending``, and
+    when a run takes the core; opened again when the monitor is running.
+    Their states are broadcast as ``connections`` and served in
+    ``status_json`` / ``get_state``.
 
-    * ``connections`` — the monitor's report of their states; kept, broadcast
-      as ``connections`` and served in ``status_json`` / ``get_state``.  When
-      the monitor is not running they all read "disconnected".
-    * ``connection`` — a GUI's ``connect`` / ``disconnect`` of one
-      (``key``, ``action``); refused unless the monitor is READY, and a
-      connect while a run is starting.  Handed to the monitor by ``poll``.
-    * ``poll`` also tells the monitor whether a run is starting
-      (``run_pending``: it closes its connections then, the run opens the
-      AWG itself) and whether to ``exit`` (see :meth:`request_monitor_exit`).
+    * ``connection`` — a GUI's ``connect`` / ``disconnect`` of one (``key``,
+      ``action``); a connect is refused while a run is starting or running.
+    * ``connection_call`` — a driver command on an open connection (``key``,
+      ``cmd``, ``kwargs``): the monitor's "Apply traps" writes the AWG tones
+      this way, then pulses the AWG trigger from its kernel.
 
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
@@ -221,7 +222,7 @@ class MonitorUDPServer(UdpServer):
     RUN_PENDING_TTL_S = 120.0
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
-                 run_loops=()):
+                 run_loops=(), connections=()):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = MonitorStatus()
@@ -265,13 +266,15 @@ class MonitorUDPServer(UdpServer):
                                         on_change=self._on_loop_change, journal=self.journal)
                       for spec in run_loops}
 
-        # The monitor's connections as it last reported them, GUI requests
-        # waiting for its next poll, and whether it has been asked to exit.
-        # The responder thread and the owner's Qt thread both touch these.
-        self._conn_lock = threading.Lock()
-        self._connections: dict = {}
-        self._conn_requests: list = []
-        self._monitor_exit = False
+        # Host-side connections (the tweezer AWG), held here between runs.
+        # Bad definitions cost the connections, never the server.
+        try:
+            self.connections = ConnectionService(connections,
+                                                 on_change=self._on_connections_change,
+                                                 log=lambda text: log.info("%s", text))
+        except ValueError as e:
+            log.error("Connection definitions rejected (%s); running without them.", e)
+            self.connections = ConnectionService((), log=lambda text: log.info("%s", text))
 
     def on_message_received(self,message):
         m = message.strip()
@@ -320,7 +323,7 @@ class MonitorUDPServer(UdpServer):
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
                 "run_pending": dict(self._run_pending) if self._run_pending else None,
                 "runner": runner, "reset": self.reset.info(),
-                "connections": self.connections_snapshot(),
+                "connections": self.connections.snapshot(),
                 "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
 
     def _handle_structured(self, raw):
@@ -338,24 +341,13 @@ class MonitorUDPServer(UdpServer):
         if mtype == "update_batch":
             return self._reply_update_batch(obj)
         if mtype == "poll":
-            with self._conn_lock:
-                requests, self._conn_requests = self._conn_requests, []
-                leaving = self._monitor_exit
-            pending = self._current_run_pending()
-            # A monitor asked to exit takes no more ops: they stay queued and
-            # expire (or are retired when it stops) rather than being lost.
             return json.dumps({"status": "ok", "version": self._version,
-                               "ops": [] if leaving else self.ops.pop(),
-                               "registered": self.ops.registered,
-                               "run_pending": None if pending is None else
-                               {"run_id": pending.get("run_id"),
-                                "expt": pending.get("expt", "")},
-                               "connection_requests": requests,
-                               "exit": leaving})
-        if mtype == "connections":
-            return json.dumps(self._reply_connections(obj))
+                               "ops": self.ops.pop(),
+                               "registered": self.ops.registered})
         if mtype == "connection":
             return json.dumps(self._reply_connection_request(obj))
+        if mtype == "connection_call":
+            return json.dumps(self._reply_connection_call(obj))
         if mtype == "op":
             return json.dumps(self._submit_internal(obj, "gui"))
         if mtype == "op_done":
@@ -495,6 +487,7 @@ class MonitorUDPServer(UdpServer):
         self._runner_thread = threading.Thread(target=self._runner_loop, daemon=True,
                                                name="monitor-op-runner")
         self._runner_thread.start()
+        self.connections.start()
         super().run()
 
     # --- run fence and trust ------------------------------------------------------
@@ -508,6 +501,10 @@ class MonitorUDPServer(UdpServer):
         self.journal.record("run_pending", run_id=obj.get("run_id"), expt=obj.get("expt"),
                             client=obj.get("client"))
         self._broadcaster.send({"type": "run_pending", "run_pending": self._public_pending()})
+        # Before replying: the run opens the AWG right after it takes the
+        # core, and the reply is what lets its finish_prepare return.
+        # Bounded (connections.RELEASE_TIMEOUT_S), inside the client's timeout.
+        self.connections.run_starting(_run_name(obj.get("run_id"), obj.get("expt")))
         return json.dumps({"status": "ok"})
 
     def _reply_clear_run_pending(self, obj: dict, by_operator: bool) -> str:
@@ -527,6 +524,7 @@ class MonitorUDPServer(UdpServer):
             why = "the run exited without taking the core"
         log.info("Run %s: fence lifted -- %s.", p.get("run_id"), why)
         self._clear_run_pending(why)
+        self.connections.run_over(why, reopen=True)
         return json.dumps({"status": "ok"})
 
     def _public_pending(self) -> dict | None:
@@ -537,8 +535,10 @@ class MonitorUDPServer(UdpServer):
         p = self._run_pending
         if p is not None and time.monotonic() - p["t0"] > self.RUN_PENDING_TTL_S \
                 and self.status.state == STATES.READY:
-            self._clear_run_pending(f"run {p.get('run_id')} never took the core "
-                                    f"within {self.RUN_PENDING_TTL_S:.0f} s")
+            why = (f"run {p.get('run_id')} never took the core "
+                   f"within {self.RUN_PENDING_TTL_S:.0f} s")
+            self._clear_run_pending(why)
+            self.connections.run_over(why, reopen=True)
             return None
         return p
 
@@ -629,7 +629,6 @@ class MonitorUDPServer(UdpServer):
         previous, self._last_monitor_state = self._last_monitor_state, (state, reason)
         if state == STATES.NOT_READY:
             self.retire_ops(reason or _state_name(state))
-            self._connections_monitor_gone(reason or _state_name(state))
             if reason == "interrupted_by_run" and previous != (state, reason):
                 pending = self._run_pending
                 who = _run_name(pending.get("run_id"), pending.get("expt")) if pending \
@@ -637,7 +636,13 @@ class MonitorUDPServer(UdpServer):
                 self._set_trust(False, f"{who} took the core at "
                                        f"{time.strftime('%H:%M:%S')} and has not reported "
                                        f"its end state")
+                # Connections stay released for the whole run (a run that did
+                # not announce itself is released now).
+                self.connections.run_running(who)
                 self._clear_run_pending("the run took the core")
+        elif state == STATES.READY and (previous is None or previous[0] != STATES.READY):
+            # A running monitor proves no run has the core.
+            self.connections.run_over("the monitor is running", reopen=True)
         if previous is None or previous[0] != state:
             self.journal.record("monitor_state", state=_state_name(state), sub_state=reason)
 
@@ -650,118 +655,56 @@ class MonitorUDPServer(UdpServer):
 
     # --- host-side connections ------------------------------------------------------
 
-    def connections_snapshot(self) -> dict:
-        with self._conn_lock:
-            return {k: dict(v) for k, v in self._connections.items()}
-
-    def _reply_connections(self, obj: dict) -> dict:
-        """The monitor's report of its connections."""
-        raw = obj.get("connections")
-        if not isinstance(raw, dict):
-            return {"status": "error", "msg": "connections must be an object"}
-        clean = {}
-        for key, c in raw.items():
-            if not isinstance(c, dict):
-                continue
-            state = str(c.get("state") or "")
-            try:
-                since = float(c.get("since"))
-            except (TypeError, ValueError):
-                since = time.time()
-            clean[str(key)] = {"label": str(c.get("label") or key),
-                               "state": state if state in conns.STATES else conns.FAILED,
-                               "detail": str(c.get("detail") or ""),
-                               "since": since, "want": bool(c.get("want")),
-                               "tooltip": str(c.get("tooltip") or "")}
-        with self._conn_lock:
-            old = self._connections
-            self._connections = clean
-            snapshot = {k: dict(v) for k, v in clean.items()}
-        for key, c in clean.items():
-            before = old.get(key) or {}
-            if before.get("state") != c["state"] or \
-                    (c["state"] == conns.FAILED and before.get("detail") != c["detail"]):
-                (log.warning if c["state"] == conns.FAILED else log.info)(
-                    "Connection %s: %s%s", c["label"], c["state"],
-                    f" -- {c['detail']}" if c["detail"] else "")
-                self.journal.record("connection", key=key, state=c["state"],
-                                    detail=c["detail"])
+    def _on_connections_change(self, snapshot: dict, changed: list) -> None:
+        """From ConnectionService, on any thread: log, journal, broadcast."""
+        for key in changed:
+            c = snapshot.get(key) or {}
+            state, detail = c.get("state"), c.get("detail") or ""
+            (log.warning if state == conns.FAILED else log.info)(
+                "Connection %s: %s%s", c.get("label", key), state,
+                f" -- {detail}" if detail else "")
+            self.journal.record("connection", key=key, state=state, detail=detail)
         self._broadcaster.send({"type": "connections", "connections": snapshot})
-        return {"status": "ok"}
 
     def _reply_connection_request(self, obj: dict) -> dict:
-        """A GUI's connect / disconnect of one of the monitor's connections;
-        the monitor takes it on its next poll and reports the outcome as a
-        new ``connections`` state."""
+        """A GUI's connect / disconnect of one of this server's connections.
+        The work happens on the connections' own thread; the outcome shows as
+        a new ``connections`` state."""
         key = str(obj.get("key") or "")
         action = str(obj.get("action") or "")
         client = str(obj.get("client") or "")
         operator = str(obj.get("operator") or "")
-        refusal = None
-        with self._conn_lock:
-            known = self._connections.get(key)
+        who = "@".join(p for p in (operator, client) if p)
         if action not in conns.ACTIONS:
             refusal = f"unknown action {action!r}"
-        elif known is None:
-            refusal = f"the monitor has reported no connection {key!r}"
-        elif self.status.state != STATES.READY:
-            state = self.status.state_name.lower().replace("_", " ")
-            refusal = f"the monitor is {state} -- it opens and closes its connections itself"
-        elif action == "connect" and self._current_run_pending() is not None:
-            p = self._run_pending or {}
-            refusal = (f"a run is starting ({conns.describe_pending(p)}) and opens it "
-                       "itself -- the monitor reconnects after the run")
-        label = (known or {}).get("label", key)
-        if refusal is not None:
+        else:
+            refusal = self.connections.request(key, action, who)
+        label = (self.connections.snapshot().get(key) or {}).get("label", key)
+        if refusal:
             log.warning("Connection %s %s refused: %s", label, action, refusal)
             self.journal.record("connection_refused", key=key, action=action, client=client,
                                 operator=operator, msg=refusal)
             return {"status": "error", "msg": refusal}
-        with self._conn_lock:
-            self._conn_requests.append({"key": key, "action": action, "client": client,
-                                        "operator": operator})
-        log.info("Connection %s: %s requested by %s", label, action,
-                 "@".join(p for p in (operator, client) if p) or "?")
+        log.info("Connection %s: %s requested by %s", label, action, who or "?")
         self.journal.record("connection_request", key=key, action=action, client=client,
                             operator=operator)
         return {"status": "ok"}
 
-    def _connections_monitor_gone(self, reason: str) -> None:
-        """The monitor process is gone, and with it whatever it held open."""
-        detail = f"the monitor is not running ({str(reason).replace('_', ' ')})"
-        changed = False
-        with self._conn_lock:
-            self._conn_requests = []
-            self._monitor_exit = False
-            for c in self._connections.values():
-                if c.get("state") != conns.DISCONNECTED or c.get("detail") != detail:
-                    if c.get("state") != conns.DISCONNECTED:
-                        c["since"] = time.time()
-                    c["state"] = conns.DISCONNECTED
-                    c["detail"] = detail
-                    changed = True
-            snapshot = {k: dict(v) for k, v in self._connections.items()}
-        if changed:
-            self._broadcaster.send({"type": "connections", "connections": snapshot})
-
-    def request_monitor_exit(self) -> list[str]:
-        """Ask the running monitor to leave its loop and exit on its own, so
-        its run() closes its connections (a kill would drop them without
-        stopping the device).  Returns the labels of what it holds open --
-        empty (nothing worth waiting for: kill it at once) unless the monitor
-        is READY, i.e. polling, and reports something connected."""
-        with self._conn_lock:
-            holding = [c.get("label", k) for k, c in self._connections.items()
-                       if c.get("state") in (conns.CONNECTED, conns.CONNECTING)]
-            if self.status.state != STATES.READY or not holding:
-                return []
-            self._monitor_exit = True
-        self.journal.record("monitor_exit_requested", holding=holding)
-        return holding
-
-    def clear_monitor_exit(self) -> None:
-        with self._conn_lock:
-            self._monitor_exit = False
+    def _reply_connection_call(self, obj: dict) -> dict:
+        """A driver command on an open connection, from the monitor's op
+        host step (the AWG's write_traps).  Runs here, bounded by the
+        connection's call timeout."""
+        key = str(obj.get("key") or "")
+        cmd = str(obj.get("cmd") or "")
+        kwargs = obj.get("kwargs") or {}
+        if not isinstance(kwargs, dict):
+            return {"status": "error", "msg": "kwargs must be an object"}
+        try:
+            result = self.connections.call(key, cmd, kwargs)
+        except (ConnectionRefusedError, RuntimeError) as e:
+            log.warning("Connection %s %s failed: %s", key, cmd, e)
+            return {"status": "error", "msg": str(e)}
+        return {"status": "ok", "result": result}
 
     # --- device state -----------------------------------------------------------
 
@@ -922,6 +865,10 @@ class MonitorUDPServer(UdpServer):
             version = self._version
         self._trust = trust
         self._clear_run_pending(f"{_run_name(run_id, expt)} ended")
+        # The run let go of the AWG in its post_scan; the connections open
+        # again when the monitor is running (a run loop's next run would
+        # otherwise take them straight back).
+        self.connections.run_over(f"{_run_name(run_id, expt)} ended", reopen=False)
         log.info("%s received; device state trusted.", reason[0].upper() + reason[1:])
         self.journal.record("run_end", run_id=run_id, expt=obj.get("expt"), version=version)
         self._broadcaster.send({"type": "state_reset", "version": version})
@@ -969,6 +916,7 @@ class MonitorUDPServer(UdpServer):
             version = self._version
         self._trust = trust
         self._clear_run_pending(f"{_run_name(run_id, expt)} aborted")
+        self.connections.run_over(f"{_run_name(run_id, expt)} aborted", reopen=False)
         (log.info if trusted else log.warning)(
             "Device state %s: %s.", "trusted" if trusted else "UNTRUSTED", reason)
         self.journal.record("run_end", run_id=run_id, expt=obj.get("expt"), version=version,
@@ -1001,6 +949,9 @@ class MonitorUDPServer(UdpServer):
 
     def stop(self):
         self._runner_stop.set()
+        # Close the connections (bounded) while this process is still here;
+        # their agents would close them anyway once it is gone.
+        self.connections.stop()
         for loop in self.loops.values():
             loop.shutdown()
         try:
@@ -1016,13 +967,15 @@ class MonitorServerGUI(QWidget):
                 config_file_path=None,
                 journal_dir=None,
                 reset_expt_path=None,
-                run_loops=()):
+                run_loops=(),
+                connections=()):
         super().__init__()
 
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
         self.run_loops = tuple(run_loops or ())
+        self.connection_defs = tuple(connections or ())
 
         # Refuse to start a second monitor server for the same hardware.
         server_id = monitor_server_id()
@@ -1062,7 +1015,7 @@ class MonitorServerGUI(QWidget):
 
         log.info("monitor experiment: %s", monitor_expt_path)
         log.info("device state file: %s", config_file_path)
-        log.info("reset experiment: %s", reset_expt_path or "none (no Reset state)")
+        log.info("reset experiment: %s", reset_expt_path or "none (no reset button)")
         if config_file_path is None:
             log.error(
                 "No device-state config path was passed: state reads/writes will "
@@ -1074,10 +1027,6 @@ class MonitorServerGUI(QWidget):
 
         self.setup_ui()
         self.setup_udp_server()
-        # A monitor holding connections (the tweezer AWG) is asked to exit on
-        # its own before a stop/restart kills it, so it closes them.
-        self.monitor_manager.set_graceful_exit(self.udp_server.request_monitor_exit,
-                                               self.udp_server.clear_monitor_exit)
         # One status object, shared with the TCP responder so status_json
         # always serves what this window shows.
         self.status = self.udp_server.status
@@ -1124,7 +1073,8 @@ class MonitorServerGUI(QWidget):
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
                                            journal_dir=self.journal_dir,
                                            reset_expt_path=self.reset_expt_path,
-                                           run_loops=self.run_loops)
+                                           run_loops=self.run_loops,
+                                           connections=self.connection_defs)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
@@ -1261,11 +1211,6 @@ class MonitorServerGUI(QWidget):
         # server was already running) none of these exist, and an
         # AttributeError traceback here would bury the message saying why.
         log.info("Closing monitor server GUI...")
-        # The monitor first, while the responder still answers its polls: it
-        # may be asked to exit on its own and close its connections.
-        monitor_manager = getattr(self, "monitor_manager", None)
-        if monitor_manager is not None:
-            monitor_manager.stop()
         udp_server = getattr(self, "udp_server", None)
         if udp_server is not None:
             udp_server.stop()
@@ -1273,4 +1218,7 @@ class MonitorServerGUI(QWidget):
         if server_thread is not None:
             server_thread.quit()
             server_thread.wait()
+        monitor_manager = getattr(self, "monitor_manager", None)
+        if monitor_manager is not None:
+            monitor_manager.stop()
         event.accept()

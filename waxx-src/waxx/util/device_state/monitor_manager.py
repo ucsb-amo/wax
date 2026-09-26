@@ -23,7 +23,7 @@ import threading
 import traceback
 from collections import deque
 from pathlib import Path
-from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
+from subprocess import PIPE, STDOUT, Popen
 
 from PyQt6.QtCore import pyqtSignal, QThread
 
@@ -70,12 +70,6 @@ _FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
 # Signatures meaning "another experiment took the core device", which is
 # expected every time a run is submitted and is not a failure.
 _INTERRUPTED_SIGNATURES = ("WinError 10054", "forcibly closed by the remote host")
-
-# How long stop() waits for a monitor holding connections (the tweezer AWG)
-# to exit on its own before killing it: its next poll (~0.1 s), closing each
-# connection (the AWG close gives up after 5 s), one short report, and the
-# interpreter's own exit.
-T_GRACEFUL_EXIT_S = 10.0
 
 
 def _matches(text: str, needles: tuple[str, ...]) -> bool:
@@ -129,16 +123,6 @@ class MonitorManager(QThread):
         # the human-readable string that was emitted with ``monitor_stopped``.
         self.last_stop_kind: str | None = None
         self.last_stop_reason: str | None = None
-        # (request, clear, grace_s) -- see set_graceful_exit.
-        self._graceful = None
-
-    def set_graceful_exit(self, request, clear, grace_s: float = T_GRACEFUL_EXIT_S) -> None:
-        """How :meth:`stop` lets a monitor close what it holds before it is
-        killed.  ``request()`` asks the running monitor (through its server)
-        to leave its loop and exit, and returns what it holds open -- falsy
-        means nothing worth waiting for.  ``clear()`` withdraws the request.
-        Without this, stop() kills at once."""
-        self._graceful = (request, clear, float(grace_s))
 
     @property
     def pid(self) -> int | None:
@@ -364,21 +348,16 @@ class MonitorManager(QThread):
     def stop(self, timeout_ms=1500):
         """Gracefully stop the monitor experiment.
 
-        A monitor holding connections (see :meth:`set_graceful_exit`) is
-        first asked to exit on its own, so its run() closes them -- a kill
-        runs no Python, and the AWG would be left running with its
-        connection merely dropped.  Then (or at once) the spawned child
-        process tree (``ar`` + its descendants) is killed, so the blocking
-        read of the child's output returns and ``run()`` exits on its own.
-        This replaces ``QThread.terminate()``, which force-kills the thread
-        while it holds the GIL and crashes the whole dashboard subprocess.
+        Kills the spawned child process tree (``ar`` + its descendants) so the
+        blocking read of the child's output returns and ``run()`` exits on its
+        own.  This replaces ``QThread.terminate()``, which force-kills the
+        thread while it holds the GIL and crashes the whole dashboard
+        subprocess.
         """
         self._stop_requested = True
         with self._proc_lock:
             proc = self._proc
-        if proc is not None and self._graceful is not None and proc.poll() is None:
-            self._exit_gracefully(proc)
-        if proc is not None and proc.poll() is None:
+        if proc is not None:
             pid = proc.pid
             log.info("Stopping monitor experiment (pid %s).", pid)
             killed = False
@@ -401,30 +380,3 @@ class MonitorManager(QThread):
                 "Monitor manager thread did not exit within %d ms -- the monitor "
                 "process may still be alive.", timeout_ms,
             )
-
-    def _exit_gracefully(self, proc) -> None:
-        request, clear, grace_s = self._graceful
-        try:
-            try:
-                holding = request()
-            except Exception:
-                log.exception("Could not ask the monitor to exit on its own; killing it.")
-                return
-            if not holding:
-                return
-            what = ", ".join(str(h) for h in holding) if isinstance(holding, (list, tuple)) \
-                else str(holding)
-            log.info("Asking the monitor experiment to exit on its own first -- it holds "
-                     "%s (up to %.0f s)...", what, grace_s)
-            try:
-                proc.wait(timeout=grace_s)
-                log.info("Monitor experiment exited on its own (exit code %s).",
-                         proc.returncode)
-            except TimeoutExpired:
-                log.warning("Monitor experiment did not exit within %.0f s -- killing it. "
-                            "%s is dropped with the process, not closed.", grace_s, what)
-        finally:
-            try:
-                clear()
-            except Exception:
-                log.exception("Could not withdraw the monitor exit request.")

@@ -51,12 +51,13 @@ class HeadlessMonitorServer(QObject):
 
     def __init__(self, monitor_expt_path: str, config_file_path: str | None = None,
                  journal_dir: str | None = None, reset_expt_path: str | None = None,
-                 run_loops=()):
+                 run_loops=(), connections=()):
         super().__init__()
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
         self.run_loops = tuple(run_loops or ())
+        self.connection_defs = tuple(connections or ())
         self.monitor_expt_path = monitor_expt_path
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
@@ -64,7 +65,7 @@ class HeadlessMonitorServer(QObject):
 
         log.info("monitor experiment: %s", monitor_expt_path)
         log.info("device state file: %s", config_file_path)
-        log.info("reset experiment: %s", reset_expt_path or "none (no Reset state)")
+        log.info("reset experiment: %s", reset_expt_path or "none (no reset button)")
         if config_file_path is None:
             log.error(
                 "No device-state config path was passed: state reads/writes from "
@@ -79,10 +80,6 @@ class HeadlessMonitorServer(QObject):
             log.error("Monitor cannot be started as configured: %s", problem)
 
         self._setup_udp_server()
-        # A monitor holding connections (the tweezer AWG) is asked to exit on
-        # its own before a stop/restart kills it, so it closes them.
-        self.monitor_manager.set_graceful_exit(self.udp_server.request_monitor_exit,
-                                               self.udp_server.clear_monitor_exit)
         # One status object, shared with the TCP responder so status_json
         # always serves exactly what this process believes.
         self.status = self.udp_server.status
@@ -106,10 +103,14 @@ class HeadlessMonitorServer(QObject):
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
                                            journal_dir=self.journal_dir,
                                            reset_expt_path=self.reset_expt_path,
-                                           run_loops=self.run_loops)
+                                           run_loops=self.run_loops,
+                                           connections=self.connection_defs)
         log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
         for spec in self.run_loops:
             log.info("run loop '%s': %s", spec.title, spec.expt_path)
+        for c in self.udp_server.connections.connections:
+            log.info("connection '%s': %s (opens when the monitor is running)", c.label,
+                     c.driver)
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
@@ -215,23 +216,21 @@ class HeadlessMonitorServer(QObject):
             self._set_status(STATES.READY, "running", "")
 
     def shutdown(self) -> None:
-        # The monitor first, while the responder still answers its polls: it
-        # may be asked to exit on its own and close its connections.
-        try:
-            self.monitor_manager.stop()
-        except Exception:
-            log.exception("Error while stopping the monitor experiment")
         try:
             self.udp_server.stop()
         except Exception:
             log.exception("Error while stopping the monitor UDP server")
         self.server_thread.quit()
         self.server_thread.wait()
+        try:
+            self.monitor_manager.stop()
+        except Exception:
+            log.exception("Error while stopping the monitor experiment")
 
 
 def run(monitor_expt_path: str, config_file_path: str | None = None,
         journal_dir: str | None = None, reset_expt_path: str | None = None,
-        run_loops=()) -> int:
+        run_loops=(), connections=()) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
@@ -256,7 +255,7 @@ def run(monitor_expt_path: str, config_file_path: str | None = None,
         server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path,
                                        journal_dir=journal_dir,
                                        reset_expt_path=reset_expt_path,
-                                       run_loops=run_loops)
+                                       run_loops=run_loops, connections=connections)
     except Exception:
         log.exception("Monitor server failed to start")
         return 1

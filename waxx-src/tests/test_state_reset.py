@@ -20,7 +20,7 @@ from waxx.util.device_state.op_journal import OpJournal, describe_entry
 from waxx.util.device_state.state_reset import StateReset, describe_expt
 from waxx.util.guis import device_control_gui as dc
 from waxx.util.guis import monitor_server_gui as msg
-from waxx.util.guis.device_summary import SummaryStrip
+from waxx.util.guis.device_summary import SummaryStrip, reset_title
 
 
 @pytest.fixture(scope="module")
@@ -268,14 +268,23 @@ def test_no_reset_configured(qapp, monkeypatch, tmp_path):
 # --- GUI ---------------------------------------------------------------------------
 
 UNTRUSTED = {"trusted": False, "reason": "run 5 (x) took the core"}
+MOT_ABOUT = "MOT Observe: puts the machine in its MOT-loading idle state.\n\nInner coil ON."
 
 
-def test_trust_banner_offers_reset_only_when_the_server_has_one(qapp):
+def test_reset_title_is_the_docstring_title_else_the_file_name():
+    assert reset_title({"expt": "mot_observe", "about": MOT_ABOUT}) == "MOT Observe"
+    assert reset_title({"expt": "mot_observe", "about": "No title here."}) == "mot observe"
+    assert reset_title({"expt": "mot_observe"}) == "mot observe"
+
+
+def test_trust_banner_is_short_and_offers_reset_only_when_the_server_has_one(qapp):
     strip = SummaryStrip()
     b = strip.banners["trust"]
-    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "idle"})
+    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
     assert not b.isHidden()
-    assert b.alt_button.text() == "Reset state…" and not b.alt_button.isHidden()
+    assert b.label.text() == "Device state untrusted: the tabs may not match the hardware."
+    assert "run 5 (x) took the core" in b.label.toolTip()      # why: tooltip only
+    assert b.alt_button.text() == "Run MOT Observe" and not b.alt_button.isHidden()
     assert b.button.text() == "Trust state…" and not b.button.isHidden()
     strip.set_trust(UNTRUSTED, None)
     assert b.alt_button.isHidden() and not b.button.isHidden()
@@ -287,12 +296,13 @@ def test_trust_banner_while_a_reset_runs_and_after_it_failed(qapp):
     strip = SummaryStrip()
     b = strip.banners["trust"]
     strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "running", "operator": "ada",
-                                "client": "pc2", "started": 0.})
-    assert "Resetting: mot_observe.py started by ada@pc2" in b.label.text()
+                                "client": "pc2", "started": 0., "about": MOT_ABOUT})
+    assert "running MOT Observe (ada@pc2" in b.label.text()
     assert b.alt_button.isHidden() and b.button.isHidden()
-    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "failed",
+    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "failed", "about": MOT_ABOUT,
                                 "text": "mot_observe exited with code 1", "tail": ["boom"]})
-    assert "Last reset failed: mot_observe exited with code 1" in b.label.text()
+    assert b.label.text().endswith("Last MOT Observe failed.")
+    assert "mot_observe exited with code 1" in b.label.toolTip()
     assert "boom" in b.label.toolTip() and not b.alt_button.isHidden()
 
 
@@ -342,6 +352,9 @@ class FakeBox:
     def setText(self, text):
         self.text = text
 
+    def setDetailedText(self, text):
+        self.detailed = text
+
     def addButton(self, text, role):
         button = SimpleNamespace(text=text)
         self.buttons.append(button)
@@ -361,18 +374,42 @@ def test_gui_reset_warns_about_a_live_run_and_sends_the_request(gui, monkeypatch
     monkeypatch.setattr(dc, "QMessageBox", FakeBox)
     sent = []
     monkeypatch.setattr(gui, "_send_request", lambda obj, cb: sent.append(obj))
-    gui._reset = {"expt": "mot_observe", "state": "idle", "about": "Inner coil ON."}
+    gui._reset = {"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT}
     gui._telemetry_samples = {
         "live_od/run_in_progress": SimpleNamespace(value=True, ok=True, age_s=1.),
         "live_od/run_id": SimpleNamespace(value=81000, ok=True, age_s=1.)}
     gui._reset_state()
     box = FakeBox.last
     assert "run 81000" in box.text and "IN PROGRESS" in box.text
-    assert "Inner coil ON." in box.text
-    assert box.buttons[0].text == "Reset anyway" and box.default is box.buttons[1]
+    # the dialog shows the docstring's first paragraph; the rest is under Details
+    assert "MOT-loading idle state" in box.text and "Inner coil ON." not in box.text
+    assert box.detailed == MOT_ABOUT
+    assert box.buttons[0].text == "Run anyway" and box.default is box.buttons[1]
     assert sent and sent[0]["type"] == "reset_state"
+    gui._telemetry_samples = {}
+    sent.clear()
+    gui._reset_state()
+    assert FakeBox.last.buttons[0].text == "Run MOT Observe" and sent
     # nothing is sent while a reset runs
     sent.clear()
     gui._reset = {"expt": "mot_observe", "state": "running"}
     gui._reset_state()
     assert not sent
+
+
+def test_status_row_reset_button_follows_the_server(gui):
+    b = gui.reset_button
+    assert b.isHidden()                                   # no reset info yet
+    gui._set_monitor_state(STATES.READY)
+    gui._set_reset({"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
+    assert not b.isHidden() and b.isEnabled() and b.text() == "Run MOT Observe"
+    gui._set_reset({"expt": "mot_observe", "state": "running", "started": 1.,
+                    "about": MOT_ABOUT})
+    assert b.text() == "Running MOT Observe…" and not b.isEnabled()
+    gui._set_reset({"expt": "mot_observe", "state": "done", "started": 1.,
+                    "about": MOT_ABOUT})
+    assert b.isEnabled()
+    gui.on_connection_failed()
+    assert not b.isEnabled()
+    gui._set_reset(None)
+    assert b.isHidden()
