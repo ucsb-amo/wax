@@ -32,7 +32,8 @@ Usage (host side, in prepare)::
 
     self.dds_initializer = AD9910FastInit(core=self.core,
                                           core_cache=self.get_device("core_cache"),
-                                          dds_list=self.dds.dds_list)
+                                          dds_list=self.dds.dds_list,
+                                          record_to=self._extra_file_texts)
 
 and in the init kernel, after the Urukul CPLDs are initialised::
 
@@ -46,9 +47,15 @@ from artiq.experiment import kernel, rpc, delay, TBool, TInt32
 from artiq.coredevice import urukul
 from artiq.coredevice.ad9910 import _AD9910_REG_CFR3, _AD9910_REG_SYNC
 
+import json
+
 from waxx.util import console
 
 DEFAULT_CACHE_KEY = "waxx_ad9910_sync_data"
+
+#: Key under which the outcome is written into ``record_to`` (an experiment's
+#: ``_extra_file_texts``, saved as an attribute of the run's HDF5 file).
+RECORD_KEY = "dds_init"
 
 # CFR3 fields AD9910.init() programs: DRV0, VCO select, charge-pump current,
 # REFCLK divider bypass / resetb, PFD reset (must read 0), PLL enable, N.
@@ -69,22 +76,30 @@ class AD9910FastInit:
         dds_list: the waxx ``DDS`` wrappers to bring up (``dds_frame.dds_list``).
         cache_key (str): core-device cache key.  Give each crate / dds_list its
             own key if an experiment ever drives more than one.
+        record_to (dict or None): where the outcome is kept with the run --
+            the experiment's ``_extra_file_texts``; ``record_to["dds_init"]``
+            becomes a JSON attribute of the run's HDF5 file.
 
     After a run, ``report`` (dict or None) and ``failures`` (list of dict) hold
-    what happened. Every run prints one line saying how many channels were fully
-    initialised and why -- skipping is invisible otherwise, and whoever is chasing
-    a DDS phase problem needs to see it in an ordinary `ar` log -- plus a WARNING
-    per channel that failed its check. The `art` startup report shows the same. Validated on hardware 2026-09-18 for
-    the all-intact case only (0 of 24 channels, 13 ms); the reboot and power-cycle
-    paths and the phase-coherence comparison below are still owed.
+    what happened, and with ``record_to`` both are stored with the run's data:
+    whoever chases a DDS phase problem can see, for any run, whether its
+    channels were fully initialised or skipped, and why.  On the terminal: one
+    line at NORMAL verbosity when any channel got the full init (a slower run),
+    the all-skipped line only at VERBOSE (it is the normal case), and a WARNING
+    per channel that failed its check, always.  The `art` startup report shows
+    the same.  Validated on hardware 2026-09-18 for the all-intact case only (0
+    of 24 channels, 13 ms); the reboot and power-cycle paths and the
+    phase-coherence comparison below are still owed.
     """
 
     kernel_invariants = {"core", "core_cache", "dds_list", "cache_key"}
 
-    def __init__(self, core, core_cache, dds_list, cache_key=DEFAULT_CACHE_KEY):
+    def __init__(self, core, core_cache, dds_list, cache_key=DEFAULT_CACHE_KEY,
+                 record_to=None):
         self.core = core
         self.core_cache = core_cache
         self.dds_list = dds_list
+        self.record_to = record_to
         # Scoped to the channel count: a cached list of another length (a channel
         # added or removed) can be neither used nor replaced -- a value read back
         # in a kernel is borrowed until the kernel ends -- so under one fixed key
@@ -210,17 +225,31 @@ class AD9910FastInit:
             why = "cache hit"
         self.report = dict(n_full=n_full, n_channels=n_ch, why=why, t_total_s=t_total,
                            t_check_pass_s=t_check_pass)
-        # The all-skipped case is the normal one and worth no terminal line;
-        # a full init on any channel means a slower run, so say so.
+        self._store()
+        # The all-skipped case is the normal one and worth no terminal line
+        # (it is stored with the run); a full init on any channel means a
+        # slower run, so say so.
         console.info(f"[dds init] full init on {n_full} of {n_ch} channels, "
                      f"{n_ch - n_full} skipped ({why}), {t_total * 1e3:.0f} ms",
                      level=console.NORMAL if n_full else console.VERBOSE)
+
+    def _store(self):
+        """The outcome into ``record_to`` (host side; never raises)."""
+        if self.record_to is None:
+            return
+        try:
+            self.record_to[RECORD_KEY] = json.dumps(
+                {"report": self.report, "failures": list(self.failures)}, default=repr)
+        except Exception as e:
+            print(f"[dds init] WARNING: could not store the DDS init outcome with the "
+                  f"run: {e!r}")
 
     @rpc(flags={"async"})
     def _record_failure(self, urukul_idx, ch, reason, raw):
         reason = FAIL_REASONS.get(reason, reason)
         raw = hex(raw & 0xffffffff)
         self.failures.append(dict(urukul=urukul_idx, ch=ch, reason=reason, raw=raw))
+        self._store()       # now, not only with the summary: the kernel may not get there
         # On top of the one-line summary from _record: say which channel and why.
         print(f"[dds init] WARNING: urukul {urukul_idx} ch {ch} failed its check "
               f"({reason}, raw {raw}) -- running the full AD9910 init on it.")

@@ -22,6 +22,8 @@ Modules
 -------
 :mod:`.lightshift`  light shift from the phase jump of a Ramsey fringe
                     (``ramsey_light_shift``).
+:mod:`.rabi`        pi time from a Rabi pulse-length scan (``rabi``, ``fit_rabi``;
+                    ``python -m waxa.analysis.rabi RUN``).
 
 Adding an experiment: give it its own subpackage (``waxa/analysis/<name>/``)
 with the analysis in one module and its plots in ``plotting.py``, a package

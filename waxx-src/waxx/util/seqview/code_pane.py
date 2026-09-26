@@ -18,6 +18,8 @@ _KEYWORDS = ('and as assert async await break class continue def del elif '
              'None nonlocal not or pass raise return True False try while '
              'with yield').split()
 
+CURRENT_COLOR = '#2f65ca'     # current-line tint when no lane colour is given
+
 
 class PythonHighlighter(QSyntaxHighlighter):
     def __init__(self, doc):
@@ -102,6 +104,8 @@ class SourceView(QPlainTextEdit):
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         font.setPointSize(9)
         self.setFont(font)
+        self._gutter_bold = QFont(font)
+        self._gutter_bold.setBold(True)
         self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(' '))
         self.setPlainText(text)
         if language == 'python':
@@ -110,6 +114,7 @@ class SourceView(QPlainTextEdit):
         self.hot = set()         # file lines that emitted anything
         self.current = set()     # strong highlight
         self.related = set()     # soft highlight
+        self.colors = {}         # current line -> accent colour
         self.gutter = _Gutter(self)
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
@@ -149,6 +154,12 @@ class SourceView(QPlainTextEdit):
         while block.isValid() and top <= ev.rect().bottom():
             if block.isVisible() and bottom >= ev.rect().top():
                 line = n + self.first_line
+                if line in self.current:
+                    p.fillRect(0, top, w, bottom - top, QColor('#2c3038'))
+                    p.fillRect(w - 4, top, 4, bottom - top,
+                               QColor(self.colors.get(line, CURRENT_COLOR)))
+                elif line in self.related:
+                    p.fillRect(w - 3, top + 1, 3, bottom - top - 2, QColor('#8a8a8a'))
                 colors = self.chips.get(line)
                 if colors:
                     x = 3
@@ -158,7 +169,8 @@ class SourceView(QPlainTextEdit):
                 strong = line in self.current
                 p.setPen(QColor('#ffffff' if strong else
                                 ('#c8c8c8' if line in self.hot else '#6a6a6a')))
-                p.drawText(0, top, w - 6, fm.height(),
+                p.setFont(self._gutter_bold if strong else self.font())
+                p.drawText(0, top, w - 7, fm.height(),
                            Qt.AlignmentFlag.AlignRight, str(line))
             block = block.next()
             top = bottom
@@ -171,16 +183,23 @@ class SourceView(QPlainTextEdit):
         self.hot = set(self.chips)
         self.gutter.update()
 
-    def set_highlight(self, current=(), related=()):
+    def set_highlight(self, current=(), related=(), colors=None):
+        """`current`: the lines the selection comes from, tinted with their
+        colour in `colors` (line -> colour; the lane colour of the pulse)
+        and marked in the gutter; `related`: the call chain above them,
+        a soft grey band."""
         self.current = set(int(x) for x in current)
-        self.related = set(int(x) for x in related)
+        self.related = set(int(x) for x in related) - self.current
+        self.colors = {int(k): v for k, v in (colors or {}).items()}
         sels = []
-        for line in self.related - self.current:
-            sel = self._sel(line, QColor(255, 255, 255, 22))
+        for line in self.related:
+            sel = self._sel(line, QColor(255, 255, 255, 30))
             if sel:
                 sels.append(sel)
         for line in self.current:
-            sel = self._sel(line, QColor(47, 101, 202, 110))
+            c = QColor(self.colors.get(line, CURRENT_COLOR))
+            c.setAlpha(85)
+            sel = self._sel(line, c)
             if sel:
                 sels.append(sel)
         self.setExtraSelections(sels)
@@ -197,7 +216,18 @@ class SourceView(QPlainTextEdit):
         sel.cursor.clearSelection()
         return sel
 
+    def line_visible(self, line):
+        blk = self.document().findBlockByNumber(int(line) - self.first_line)
+        if not blk.isValid():
+            return False
+        g = self.blockBoundingGeometry(blk).translated(self.contentOffset())
+        return g.top() >= 0 and g.bottom() <= self.viewport().height()
+
     def scroll_to(self, line):
+        """Centre `line` -- only when it is off screen, so clicking through
+        pulses on one screenful of code does not make the text jump."""
+        if self.line_visible(line):
+            return
         blk = self.document().findBlockByNumber(int(line) - self.first_line)
         if not blk.isValid():
             return
@@ -211,7 +241,9 @@ class SourceView(QPlainTextEdit):
 
     def mouseReleaseEvent(self, ev):
         super().mouseReleaseEvent(ev)
-        if ev.button() == Qt.MouseButton.LeftButton:
+        # a drag that selected text (to copy it) is not a line click
+        if (ev.button() == Qt.MouseButton.LeftButton
+                and not self.textCursor().hasSelection()):
             self.lineClicked.emit(self.line_at(ev.pos()))
 
     def mouseDoubleClickEvent(self, ev):
@@ -296,13 +328,14 @@ class CodePane(QTabWidget):
         if v is not None:
             v.set_chips(chips)
 
-    def highlight(self, key, current=(), related=(), scroll=True, raise_tab=False):
+    def highlight(self, key, current=(), related=(), scroll=True, raise_tab=False,
+                  colors=None, scroll_line=None):
         v = self.views.get(key)
         if v is None:
             return
-        v.set_highlight(current, related)
+        v.set_highlight(current, related, colors)
         if scroll and current:
-            v.scroll_to(min(current))
+            v.scroll_to(scroll_line if scroll_line is not None else min(current))
         if raise_tab:
             self.setCurrentWidget(v)
 

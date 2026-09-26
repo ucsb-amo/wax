@@ -53,7 +53,10 @@ class TimeAxis(pg.AxisItem):
         self.update()
 
     def tickStrings(self, values, scale, spacing):
-        unit, mult = unit_for(spacing * 6.)
+        # one unit for every tick level, from the visible span (the rule the
+        # readouts use): picking it per level from the spacing gave the minor
+        # ticks ns next to µs major ones, and the label took the last level's
+        unit, mult = unit_for(self.range[1] - self.range[0])
         out = []
         for v in values:
             x = (v - self.origin) * mult

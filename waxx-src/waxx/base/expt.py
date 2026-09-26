@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import os
+import time
 
 from artiq.experiment import *
 from artiq.experiment import delay, delay_mu
@@ -21,6 +22,19 @@ from waxx.util.artiq.async_print import aprint
 from waxx.util import console
 
 RPC_DELAY = 10.e-3
+
+
+def _fmt_duration(seconds):
+    """'45s', '3m07s', '1h02m' (ASCII, for terminal progress lines)."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
 
 class Expt(Scanner, Dealer, Scribe):
     def __init__(self,
@@ -80,6 +94,7 @@ class Expt(Scanner, Dealer, Scribe):
         # Shot-notification bookkeeping (populated in finish_prepare_wax)
         self._shot_complete_count = 0
         self._N_shots_total = 1
+        self._t_first_shot_done = None   # time.monotonic() at shot 1's end
 
         # Extra provenance texts saved as attrs of the run's HDF5 file
         # ({attr_name: text}), next to expt_file / params_file. Machine-
@@ -115,6 +130,7 @@ class Expt(Scanner, Dealer, Scribe):
 
         # Reset per-run shot counter
         self._shot_complete_count = 0
+        self._t_first_shot_done = None
         try:
             self._N_shots_total = int(np.prod(self.xvardims)) if self.xvardims else 1
         except Exception:
@@ -148,6 +164,16 @@ class Expt(Scanner, Dealer, Scribe):
                 "in saved data."
             )
 
+        # Fence composite ops from here until this run's end state arrives
+        # (the monitor experiment is the one run that must not fence itself).
+        if hasattr(self, 'monitor') and not getattr(self, '_is_monitor', False):
+            try:
+                self.monitor.announce_run(run_id=self.run_info.run_id,
+                                          expt=self._expt_file_stem())
+            except Exception as e:
+                print(f"[Monitor] note: could not announce this run to the monitor "
+                      f"server ({e!r}); composite ops are not fenced for it.")
+
     @kernel
     def cleanup_scan_kernel_wax(self):
         # self.ttl is provided by the machine layer's Devices mixin (a
@@ -163,11 +189,9 @@ class Expt(Scanner, Dealer, Scribe):
         """RPC: notify the liveOD server that one shot has completed."""
         n = self._shot_complete_count + 1
         N = self._N_shots_total
-        _client = getattr(self, 'live_od_client', None)
-        if _client is None:
-            print(f"shot {n}/{N}")
-            self._shot_complete_count += 1
-            return
+        now = time.monotonic()
+        if n == 1:
+            self._t_first_shot_done = now
         try:
             xvar_values = {
                 xv.key: float(xv.values[xv.counter])
@@ -175,6 +199,12 @@ class Expt(Scanner, Dealer, Scribe):
             }
         except Exception:
             xvar_values = {}
+        _client = getattr(self, 'live_od_client', None)
+        if _client is None:
+            # the only progress source without liveOD: every shot
+            self._shot_complete_count += 1
+            print(self._progress_line(n, N, now, xvar_values, stride=1))
+            return
         try:
             reset_requested = _client.shot_complete(
                 self._shot_complete_count,
@@ -191,24 +221,52 @@ class Expt(Scanner, Dealer, Scribe):
             )
         self._pending_adjust_values = getattr(_client, 'last_adjust_values', {})
         self._shot_complete_count += 1
-        if self._progress_worth_printing(n, N):
-            print(f"shot {n}/{N} done")
+        stride = self._progress_stride(N)
+        if stride and (n == 1 or n % stride == 0 or n == N):
+            print(self._progress_line(n, N, now, xvar_values, stride))
         if reset_requested:
             _client.abort_run()
             raise TerminationRequested
 
     @staticmethod
-    def _progress_worth_printing(n, N):
-        """Shot progress on the terminal: every shot at VERBOSE, quarter
-        milestones (and the last shot) at NORMAL, nothing at QUIET -- liveOD
-        already shows live progress."""
+    def _progress_stride(N):
+        """Every how many shots the terminal reports progress (the first
+        and last shot always): every shot at VERBOSE, a quarter of the run
+        at NORMAL, never (0) at QUIET -- liveOD already shows live
+        progress."""
         level = console.get_level()
         if level >= console.VERBOSE:
-            return True
+            return 1
         if level < console.NORMAL:
-            return False
-        # True when n crosses a quarter boundary of N (~4 lines per run).
-        return n * 4 // N > (n - 1) * 4 // N
+            return 0
+        return max(1, -(-int(N) // 4))
+
+    def _progress_line(self, n, N, now, xvar_values, stride):
+        """One terminal progress line for shot n of N. The first says how
+        often the rest are printed; later ones give the mean time per shot
+        since shot 1 completed (compile and init excluded) and the ETA at
+        that rate. ASCII only: ExptBuilder pipes stdout through cp1252."""
+        if n == 1:
+            line = f"shot 1/{N} done"
+            if stride > 1:
+                last = "" if N % stride == 0 else " and the last"
+                line += (f" -- printing every {stride} shots{last}"
+                         f" (Base(verbosity=2) or WAX_VERBOSITY=2: every shot)")
+        else:
+            line = f"shot {n}/{N} ({100 * n // N}%)"
+            t_first = getattr(self, '_t_first_shot_done', None)
+            if t_first is not None:
+                per_shot = (now - t_first) / (n - 1)
+                line += f" | {per_shot:.1f} s/shot"
+                if n < N:
+                    left = per_shot * (N - n)
+                    eta = time.strftime('%H:%M:%S',
+                                        time.localtime(time.time() + left))
+                    line += f" | {_fmt_duration(left)} left, ETA {eta}"
+        if xvar_values and console.get_level() >= console.VERBOSE:
+            line += " | " + ", ".join(f"{k}={v:.6g}"
+                                      for k, v in xvar_values.items())
+        return line
 
     def _shot_conditions(self) -> dict:
         """What this shot recorded about itself, for the live viewer: every
@@ -272,7 +330,10 @@ class Expt(Scanner, Dealer, Scribe):
             send_run_done_email_async(self.run_info.run_id, expt_filepath)
 
         if hasattr(self,'monitor'):
-            self.monitor.update_device_states()
+            # The end state goes through the monitor server (the only writer
+            # of the state file); it marks the state trusted again.
+            self.monitor.update_device_states(run_id=self.run_info.run_id,
+                                              expt=self._expt_name_from_filepath(expt_filepath))
             if restart_monitor:
                 self.monitor.signal_end()
 
@@ -284,7 +345,14 @@ class Expt(Scanner, Dealer, Scribe):
         dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         expt_name = self._expt_name_from_filepath(expt_filepath)
         name_str = f"  ({expt_name})" if expt_name else ""
-        console.info(f'run id {rid} complete at {dt}{name_str}')
+        n, N = self._shot_complete_count, self._N_shots_total
+        if 0 < n < N:
+            # a run that stopped early (save_on_underflow) is never hidden
+            # by the verbosity level
+            print(f'run id {rid} ended at {dt} after {n} of {N} shots{name_str}')
+        else:
+            shots = f', {n} shots' if n else ''
+            console.info(f'run id {rid} complete at {dt}{shots}{name_str}')
 
     @staticmethod
     def _expt_name_from_filepath(expt_filepath):

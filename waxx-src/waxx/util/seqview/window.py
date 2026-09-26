@@ -9,17 +9,23 @@ Interaction (all navigation is plain mouse; measuring takes a modifier):
     wheel               zoom about the cursor        Shift+wheel: pan
     right-click         zoom out about the cursor    Ctrl+wheel: lane height
     left-drag           pan                          left-click: select
-    right-drag          box zoom                     double-click: zoom to pulse
-                                                     (empty space: fit shot)
+    right-drag          box zoom                     Ctrl+click: add / remove
+    double-click        zoom to pulse (empty space: fit shot)
     Shift+left-drag     measure a span (cursors A/B snap to edges; Alt: no snap)
     A / B               drop cursor A / B at the mouse
     Home / F            fit current shot / fit all   Z: zoom to selection
     + / -  ← / →        zoom / pan (Shift: faster)   [ ]: previous / next edge
     , / .  0-9          previous / next shot, jump to shot
-    P                   show / hide the physical port lanes
-    G                   toggle gap dimensions        L: toggle labels
+    P / G / L           port lanes / gap dimensions / labels    T: pulse table
     Esc                 clear selection and cursors  Ctrl+C: copy readout
-    Ctrl+E              export PNG                   Ctrl+Shift+E: export CSV
+    F5                  reload                       Ctrl+E: export PNG
+                                                     Ctrl+Shift+E: export CSV
+
+Pulse table: click selects a row, Ctrl+click adds / removes one, Shift+click
+selects a range, Ctrl+Shift+click adds a range; double-click zooms to it.
+Code pane: click a line to select everything it emitted, double-click to zoom
+to it. With "Snap view" on, a code or table click moves the view to the
+pulses (the nearest shot's) when none of them is on screen.
 """
 
 import html
@@ -28,16 +34,17 @@ import os
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRect, QRectF, pyqtSignal, QObject
 from PyQt6.QtGui import (QAction, QColor, QKeySequence, QCursor, QPen, QBrush,
                          QGuiApplication)
 from PyQt6.QtNetwork import QTcpServer, QHostAddress
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QToolBar, QComboBox, QDockWidget,
                              QTableView, QListWidget, QListWidgetItem,
-                             QStatusBar, QToolTip, QFileDialog, QCheckBox,
+                             QStatusBar, QToolTip, QFileDialog,
                              QLineEdit, QPushButton, QSizePolicy, QMessageBox)
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel
+from PyQt6.QtCore import (QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
+                          QItemSelection, QItemSelectionModel)
 
 from waxx.util.seqview.bundle import Bundle
 from waxx.util.seqview.items import (PulseBarItem, DigitalTraceItem,
@@ -51,6 +58,43 @@ from waxx.util.seqview import launch as _launch
 LABEL_COL_W = 170
 BG = '#1b1d21'
 CURSOR_COLORS = {'A': '#ffd166', 'B': '#7ae582'}
+# Qt expires a tooltip after ~10 s even with the cursor still on it; 24 h is
+# "never" -- the hover tip goes when the mouse leaves the pulse / event
+# (or on a click / wheel, which Qt handles itself)
+TIP_SHOW_MS = 24 * 3600 * 1000
+EVENT_COLOR = '#ff7f7f'
+TOOLBAR_CSS = """
+QToolBar { spacing: 3px; padding: 2px 4px; border: none; }
+QToolBar QToolButton { padding: 2px 8px; border: 1px solid transparent;
+                       border-radius: 3px; }
+QToolBar QToolButton[toggle="true"] { border-color: #3d424b; color: #b0b0b0; }
+QToolBar QToolButton:hover { border-color: #6a707b; }
+QToolBar QToolButton:checked { background: #2f4f86; border-color: #4f7fd0;
+                               color: #ffffff; }
+QToolBar QLabel { color: #9a9a9a; padding-left: 4px; }
+QToolBar::separator { background: #3d424b; width: 1px; margin: 4px 6px; }
+"""
+
+
+def _pulse_key(p):
+    """What identifies a pulse across a re-simulation (with its occurrence
+    count, see SeqViewWindow._selection_state)."""
+    return (p['lane'], p.get('src_line'), p.get('shot'), p.get('macro'), p.get('op'))
+
+
+def _event_key(e):
+    return (e['lane'], e.get('src_line'), e.get('shot'), e.get('kind'))
+
+
+def _occurrence_keys(items, keyf):
+    """id -> (key, n): the n-th item with that key, in bundle order."""
+    seen, out = {}, {}
+    for it in items:
+        k = keyf(it)
+        n = seen.get(k, 0)
+        seen[k] = n + 1
+        out[it['id']] = (k, n)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +102,7 @@ CURSOR_COLORS = {'A': '#ffd166', 'B': '#7ae582'}
 # ---------------------------------------------------------------------------
 
 class LaneViewBox(pg.ViewBox):
-    sigClicked = pyqtSignal(object, object)        # (viewbox, scene pos)
+    sigClicked = pyqtSignal(object, object, object)  # (viewbox, scene pos, modifiers)
     sigDoubleClicked = pyqtSignal(object, object)
     sigRightClicked = pyqtSignal(object, object)
     sigBoxZoom = pyqtSignal(float, float)
@@ -111,7 +155,7 @@ class LaneViewBox(pg.ViewBox):
             if ev.double():
                 self.sigDoubleClicked.emit(self, ev.scenePos())
             else:
-                self.sigClicked.emit(self, ev.scenePos())
+                self.sigClicked.emit(self, ev.scenePos(), ev.modifiers())
             return
         if ev.button() == Qt.MouseButton.RightButton:
             ev.accept()
@@ -336,7 +380,9 @@ class SeqViewWindow(QMainWindow):
         self.lane_by_id = {}
         self.pulse_by_id = {}
         self.t_end = 1.0
-        self.selected = None          # pulse id
+        self.sel_pulses = []          # selected pulse ids, in selection order
+        self.sel_events = []
+        self.selected = None          # the pulse acted on last (readout, Z)
         self.selected_event = None
         self.cursor_x = {'A': None, 'B': None}
         self.origin_mode = 'shot'
@@ -344,6 +390,9 @@ class SeqViewWindow(QMainWindow):
         self.show_physical = False
         self.show_gaps = True
         self.show_labels = True
+        self.snap_view = True         # code / table clicks bring pulses on screen
+        self._ov_bars = []
+        self._table_syncing = False
         self._hover_last = None
         self._server = None
         self._pending_paths = []
@@ -364,50 +413,53 @@ class SeqViewWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # toolbar
+        # toolbar: navigation | shot, time origin | what is drawn | snap |
+        # panels (added with the docks below) ... title
         tb = QToolBar('view')
         tb.setMovable(False)
+        tb.setStyleSheet(TOOLBAR_CSS)
         self.addToolBar(tb)
-        self.act_fit_shot = QAction('Fit shot', self, triggered=self.fit_shot)
-        self.act_fit_all = QAction('Fit all', self, triggered=self.fit_all)
+        self.act_fit_shot = self._action('Fit shot', self.fit_shot,
+                                         tip='Fit the shot under the view (Home)')
+        self.act_fit_all = self._action('Fit all', self.fit_all,
+                                        tip='Show the whole program (F)')
         tb.addAction(self.act_fit_shot)
         tb.addAction(self.act_fit_all)
-        tb.addAction(QAction('－', self, triggered=lambda: self.zoom_by(2.0)))
-        tb.addAction(QAction('＋', self, triggered=lambda: self.zoom_by(0.5)))
+        tb.addAction(self._action('−', lambda: self.zoom_by(2.0),
+                                  tip='Zoom out (-, right-click)'))
+        tb.addAction(self._action('+', lambda: self.zoom_by(0.5),
+                                  tip='Zoom in (+, wheel)'))
         tb.addSeparator()
-        tb.addWidget(QLabel(' shot '))
+        tb.addWidget(QLabel('shot'))
         self.shot_combo = QComboBox()
+        self.shot_combo.setToolTip('Jump to a shot (, and . step, 0-9 jump)')
         self.shot_combo.currentIndexChanged.connect(self._shot_combo_changed)
         tb.addWidget(self.shot_combo)
-        tb.addSeparator()
-        tb.addWidget(QLabel(' origin '))
+        tb.addWidget(QLabel('t = 0 at'))
         self.origin_combo = QComboBox()
         self.origin_combo.addItems(['shot start', 'absolute', 'cursor A'])
+        self.origin_combo.setToolTip('What the time axis and the readouts count from')
         self.origin_combo.currentTextChanged.connect(self._origin_changed)
         tb.addWidget(self.origin_combo)
         tb.addSeparator()
-        self.chk_physical = QCheckBox('physical ports (P)')
-        self.chk_physical.toggled.connect(self.set_physical_visible)
-        tb.addWidget(self.chk_physical)
-        self.chk_gaps = QCheckBox('gaps (G)')
-        self.chk_gaps.setChecked(True)
-        self.chk_gaps.toggled.connect(self.set_gaps_visible)
-        tb.addWidget(self.chk_gaps)
-        self.chk_labels = QCheckBox('labels (L)')
-        self.chk_labels.setChecked(True)
-        self.chk_labels.toggled.connect(self.set_labels_visible)
-        tb.addWidget(self.chk_labels)
+        self.act_physical = self._toggle(
+            'Ports', 'Physical port lanes\tP', False, self.set_physical_visible,
+            'Show the raw digital / analog port lanes under the semantic ones (P)')
+        self.act_gaps = self._toggle(
+            'Gaps', 'Gap dimensions\tG', True, self.set_gaps_visible,
+            'Draw the <-- gap --> dimensions between pulses (G)')
+        self.act_labels = self._toggle(
+            'Labels', 'Pulse labels\tL', True, self.set_labels_visible,
+            'Write the pulse text on bars wide enough to hold it (L)')
+        for a in (self.act_physical, self.act_gaps, self.act_labels):
+            tb.addAction(a)
         tb.addSeparator()
-        tb.addAction(QAction('Export PNG', self, triggered=self.export_png))
-        tb.addAction(QAction('Export CSV', self, triggered=self.export_csv))
-        tb.addAction(QAction('Reload', self, triggered=self.reload_file))
-        tb.addAction(QAction('?', self, triggered=self.show_help))
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
-        self.title_label = QLabel('')
-        self.title_label.setStyleSheet('color:#dddddd; padding-right:8px;')
-        tb.addWidget(self.title_label)
+        self.act_snap = self._toggle(
+            'Snap view', 'Snap view to code / table clicks', True, self.set_snap_view,
+            'On: clicking a code line or a pulse-table row moves the view to its '
+            'pulses when none of them is on screen.\nOff: those clicks only '
+            'select; double-click still zooms.')
+        tb.addAction(self.act_snap)
 
         # overview strip
         self.overview = pg.PlotWidget()
@@ -476,7 +528,8 @@ class SeqViewWindow(QMainWindow):
         self.table = QTableView()
         self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        # click / Ctrl+click / Shift+click / Ctrl+Shift+click, as in a file list
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         tl.addWidget(self.table)
@@ -498,11 +551,52 @@ class SeqViewWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.lane_dock)
         self.lane_dock.hide()
 
+        # panels: the dock toggles, in the toolbar and the View menu
+        panels = ((self.code_dock, 'Code', 'Code panel',
+                   'Sequence source, generated QUA, parameters'),
+                  (self.table_dock, 'Pulses', 'Pulse table\tT',
+                   'Every pulse as a sortable, filterable table (T)'),
+                  (self.lane_dock, 'Lanes', 'Lane list', 'Show / hide single lanes'),
+                  (self.warn_dock, 'Diagnostics', 'Diagnostics',
+                   'Warnings from matching the program to the simulation'))
+        tb.addSeparator()
+        for dock, short, text, tip in panels:
+            a = dock.toggleViewAction()
+            a.setText(text)
+            a.setIconText(short)
+            a.setToolTip(tip)
+            if dock is not self.warn_dock:        # that one has the status-bar badge
+                tb.addAction(a)
+        for a in tb.actions():                    # outline the toggles (TOOLBAR_CSS)
+            btn = tb.widgetForAction(a) if a.isCheckable() else None
+            if btn is not None:
+                btn.setProperty('toggle', True)
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        self.title_label = QLabel('')
+        self.title_label.setStyleSheet('color:#dddddd; padding-right:8px;')
+        tb.addWidget(self.title_label)
+
+        file_menu = self.menuBar().addMenu('File')
+        file_menu.addAction(self._action('Reload', self.reload_file, shortcut='F5'))
+        file_menu.addSeparator()
+        file_menu.addAction(self._action('Export PNG…', self.export_png,
+                                         shortcut='Ctrl+E'))
+        file_menu.addAction(self._action('Export CSV (pulses in view)…',
+                                         self.export_csv, shortcut='Ctrl+Shift+E'))
         view_menu = self.menuBar().addMenu('View')
-        for d in (self.code_dock, self.table_dock, self.warn_dock, self.lane_dock):
-            view_menu.addAction(d.toggleViewAction())
+        for a in (self.act_physical, self.act_gaps, self.act_labels):
+            view_menu.addAction(a)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_snap)
+        view_menu.addSeparator()
+        for dock, *_ in panels:
+            view_menu.addAction(dock.toggleViewAction())
         help_menu = self.menuBar().addMenu('Help')
-        help_menu.addAction(QAction('Keys and mouse', self, triggered=self.show_help))
+        help_menu.addAction(self._action('Keys and mouse\t?', self.show_help))
 
         # hover throttle
         self._hover_timer = QTimer(self)
@@ -510,6 +604,26 @@ class SeqViewWindow(QMainWindow):
         self._hover_timer.setInterval(16)
         self._hover_timer.timeout.connect(self._do_hover)
         self._hover_pos = None
+
+    def _action(self, text, slot, tip='', shortcut=None):
+        a = QAction(text, self)
+        a.triggered.connect(slot)
+        if tip:
+            a.setToolTip(tip)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        return a
+
+    def _toggle(self, short, text, checked, slot, tip):
+        """A checkable action: `short` on the toolbar button, `text` in the
+        View menu (after a tab: the key, shown but handled in keyPressEvent)."""
+        a = QAction(text, self)
+        a.setIconText(short)
+        a.setToolTip(tip)
+        a.setCheckable(True)
+        a.setChecked(checked)
+        a.toggled.connect(slot)
+        return a
 
     # ------------------------------------------------------------------
     # loading
@@ -584,8 +698,6 @@ class SeqViewWindow(QMainWindow):
         if state is not None:
             self._restore_state(state)
         else:
-            self.show_physical = False
-            self.chk_physical.setChecked(False)
             self.set_physical_visible(False)
             self.fit_shot(0)
         self._x_range_changed()
@@ -597,11 +709,14 @@ class SeqViewWindow(QMainWindow):
             pass
         self.glw.ci.clear()
         self.lanes = []
+        self.sel_pulses = []
+        self.sel_events = []
         self.selected = None
         self.selected_event = None
         self.cursor_x = {'A': None, 'B': None}
         self._cursor_lines = {}
         self.overview.clear()
+        self._ov_bars = []
 
     def _wire_vb(self, vb):
         vb.sigClicked.connect(self._vb_clicked)
@@ -677,6 +792,7 @@ class SeqViewWindow(QMainWindow):
             bars = PulseBarItem(pulses, self.t_end, style='bar', rows=False,
                                 labels=False, y0=y0 + 0.02, y1=y1 - 0.02)
             ov.addItem(bars, ignoreBounds=True)
+            self._ov_bars.append(bars)       # shows the selection across the run
         self.region.setBounds((0., self.t_end))
         ov.addItem(self.region, ignoreBounds=True)
 
@@ -693,7 +809,13 @@ class SeqViewWindow(QMainWindow):
         self.table_proxy = _SortProxy()
         self.table_proxy.setSourceModel(self.table_model)
         self.table.setModel(self.table_proxy)
-        self.table.selectionModel().currentRowChanged.connect(self._table_row)
+        self._row_of = {p['id']: i for i, p in enumerate(self.bundle.pulses)}
+        self.table.selectionModel().selectionChanged.connect(
+            self._table_selection_changed)
+        try:
+            self.table.doubleClicked.disconnect()
+        except Exception:
+            pass
         self.table.doubleClicked.connect(self._table_double)
         try:
             self.table_filter.textChanged.disconnect()
@@ -779,17 +901,28 @@ class SeqViewWindow(QMainWindow):
             'visible': {ln.id: ln.visible for ln in self.lanes},
             'heights': {ln.id: ln.height for ln in self.lanes},
             'physical': self.show_physical,
-            'selected': self._selection_key(),
+            'selection': self._selection_state(),
             'cursors': dict(self.cursor_x),
             'origin_mode': self.origin_mode,
         }
 
-    def _selection_key(self):
-        p = self.pulse_by_id.get(self.selected) if self.selected is not None else None
-        if p is None:
-            return None
-        return (p['lane'], p.get('src_line'), p.get('shot'), p.get('macro'),
-                p.get('op'))
+    def _selection_state(self):
+        """The selection as bundle-independent keys: (key, n) = the n-th
+        pulse / event with that key, so a re-simulation maps it back."""
+        pk = _occurrence_keys(self.bundle.pulses, _pulse_key)
+        ek = _occurrence_keys(self.bundle.events, _event_key)
+        return {'pulses': [pk[i] for i in self.sel_pulses],
+                'events': [ek[i] for i in self.sel_events],
+                'current': pk.get(self.selected)}
+
+    def _restore_selection(self, sel):
+        pid_of = {v: k for k, v in _occurrence_keys(self.bundle.pulses, _pulse_key).items()}
+        eid_of = {v: k for k, v in _occurrence_keys(self.bundle.events, _event_key).items()}
+        pids = [pid_of[k] for k in sel.get('pulses', []) if k in pid_of]
+        eids = [eid_of[k] for k in sel.get('events', []) if k in eid_of]
+        if pids or eids:
+            self.set_selection(pids, eids, current=pid_of.get(sel.get('current')),
+                               scroll_code=False)
 
     def _restore_state(self, st):
         for ln in self.lanes:
@@ -797,21 +930,13 @@ class SeqViewWindow(QMainWindow):
                 ln.visible = st['visible'][ln.id]
             if ln.id in st['heights']:
                 ln.height = st['heights'][ln.id]
-        self.show_physical = st['physical']
-        self.chk_physical.blockSignals(True)
-        self.chk_physical.setChecked(self.show_physical)
-        self.chk_physical.blockSignals(False)
+        self.set_physical_visible(st['physical'])
         self._build_lane_list()
         self._layout_lanes()
         x0, x1 = st['xrange']
         self.set_x_range(x0, min(x1, self.t_end * 1.02))
-        key = st.get('selected')
-        if key is not None:
-            for p in self.bundle.pulses:
-                if (p['lane'], p.get('src_line'), p.get('shot'), p.get('macro'),
-                        p.get('op')) == key:
-                    self.select_pulse(p['id'], scroll_code=False)
-                    break
+        if st.get('selection'):
+            self._restore_selection(st['selection'])
         for name, x in (st.get('cursors') or {}).items():
             if x is not None:
                 self.place_cursor(name, x, snap=False)
@@ -909,10 +1034,12 @@ class SeqViewWindow(QMainWindow):
         if self.origin_mode == 'shot':
             s = self.current_shot()
             t = s['t0'] if s else 0.
-            if t != self.origin_t:
+            name = f"shot {s['index']}" if s else ''
+            if t != self.origin_t or name != self.axis.origin_name:
                 self.origin_t = t
-                self.axis.set_origin(t, f"shot {s['index']}" if s else '')
+                self.axis.set_origin(t, name)
                 self._update_cursor_label()
+                self._refresh_table_times()
         self.shot_combo.blockSignals(True)
         s = self.current_shot()
         if s is not None:
@@ -952,8 +1079,16 @@ class SeqViewWindow(QMainWindow):
             self.origin_t = s['t0'] if s else 0.
             self.axis.set_origin(self.origin_t, f"shot {s['index']}" if s else '')
         self._update_cursor_label()
-        if hasattr(self, 'table_model'):
-            self.table_model.layoutChanged.emit()
+        self._refresh_table_times()
+
+    def _refresh_table_times(self):
+        """The start / end columns count from the origin: repaint them.
+        (dataChanged, not layoutChanged -- a bare layoutChanged scrambles
+        the proxy's selection.)"""
+        m = getattr(self, 'table_model', None)
+        if m is not None and m.rowCount():
+            m.dataChanged.emit(m.index(0, 2), m.index(m.rowCount() - 1, 3),
+                               [Qt.ItemDataRole.DisplayRole])
 
     def _height_wheel(self, vb, delta):
         for lane in self.lanes:
@@ -966,28 +1101,47 @@ class SeqViewWindow(QMainWindow):
     # ------------------------------------------------------------------
     # toggles
     # ------------------------------------------------------------------
+    # Each setter can be called directly or from its action; a direct call
+    # sets the action, whose toggled signal comes back here once.
     def set_physical_visible(self, on):
-        self.show_physical = bool(on)
-        if self.chk_physical.isChecked() != self.show_physical:
-            self.chk_physical.blockSignals(True)
-            self.chk_physical.setChecked(self.show_physical)
-            self.chk_physical.blockSignals(False)
+        on = bool(on)
+        if self.act_physical.isChecked() != on:
+            self.act_physical.setChecked(on)
+            return
+        self.show_physical = on
+        if self.bundle is None:
+            return
         self._layout_lanes()
         self._x_range_changed()
 
     def set_gaps_visible(self, on):
-        self.show_gaps = bool(on)
+        on = bool(on)
+        if self.act_gaps.isChecked() != on:
+            self.act_gaps.setChecked(on)
+            return
+        self.show_gaps = on
         for lane in self.lanes:
             if lane.gaps is not None:
                 lane.gaps.enabled = self.show_gaps
                 lane.gaps.update()
 
     def set_labels_visible(self, on):
-        self.show_labels = bool(on)
+        on = bool(on)
+        if self.act_labels.isChecked() != on:
+            self.act_labels.setChecked(on)
+            return
+        self.show_labels = on
         for lane in self.lanes:
             if lane.bars is not None and lane.kind not in ('digital', 'analog'):
                 lane.bars.labels_enabled = self.show_labels
                 lane.bars.update()
+
+    def set_snap_view(self, on):
+        on = bool(on)
+        if self.act_snap.isChecked() != on:
+            self.act_snap.setChecked(on)
+            return
+        self.snap_view = on
 
     # ------------------------------------------------------------------
     # hover / click / selection
@@ -1017,6 +1171,7 @@ class SeqViewWindow(QMainWindow):
                 t = self.header_vb.mapSceneToView(pos).x()
                 self.hover_label.setText(self._time_readout(t))
             self._set_hover(None, None)
+            QToolTip.hideText()
             return
         t = lane.vb.mapSceneToView(pos).x()
         tol = 4. * lane.vb.viewPixelSize()[0]
@@ -1041,9 +1196,11 @@ class SeqViewWindow(QMainWindow):
                          f" (Δ {fmt_duration(t - ne) if t >= ne else '-' + fmt_duration(ne - t)})")
         self.hover_label.setText('   |   '.join(parts))
         if pid is not None:
-            QToolTip.showText(QCursor.pos(), self._pulse_tooltip(pid), self.glw)
+            QToolTip.showText(QCursor.pos(), self._pulse_tooltip(pid), self.glw,
+                              QRect(), TIP_SHOW_MS)
         elif eid is not None:
-            QToolTip.showText(QCursor.pos(), self._event_tooltip(eid), self.glw)
+            QToolTip.showText(QCursor.pos(), self._event_tooltip(eid), self.glw,
+                              QRect(), TIP_SHOW_MS)
         else:
             QToolTip.hideText()
 
@@ -1127,21 +1284,33 @@ class SeqViewWindow(QMainWindow):
                         + (f" · QUA line {e['qua_line']}" if e.get('qua_line') else ''))
         return '<br>'.join(rows)
 
-    def _vb_clicked(self, vb, scene_pos):
+    def _vb_clicked(self, vb, scene_pos, mods=Qt.KeyboardModifier.NoModifier):
+        """Click selects what is under the mouse (empty space clears);
+        Ctrl+click adds it to the selection or takes it out."""
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         lane = next((ln for ln in self.lanes if ln.vb is vb), None)
-        if lane is None:
-            self.clear_selection()
+        pid = eid = None
+        if lane is not None:
+            t = lane.vb.mapSceneToView(scene_pos).x()
+            px = lane.vb.viewPixelSize()[0]
+            eid = lane.events.hit(t, 5. * px) if lane.events else None
+            pid = lane.bars.hit(t, 4. * px) if lane.bars is not None else None
+            if eid is not None and (pid is None or lane.kind in ('analog', 'digital')):
+                pid = None
+            else:
+                eid = None
+        if not ctrl:
+            self.set_selection([] if pid is None else [pid],
+                               [] if eid is None else [eid], source='timeline')
             return
-        t = lane.vb.mapSceneToView(scene_pos).x()
-        tol = 4. * lane.vb.viewPixelSize()[0]
-        eid = lane.events.hit(t, 5. * lane.vb.viewPixelSize()[0]) if lane.events else None
-        pid = lane.bars.hit(t, tol) if lane.bars is not None else None
-        if eid is not None and (pid is None or lane.kind in ('analog', 'digital')):
-            self.select_event(eid)
-        elif pid is not None:
-            self.select_pulse(pid)
+        pids, eids = list(self.sel_pulses), list(self.sel_events)
+        if pid is not None:
+            pids = [x for x in pids if x != pid] if pid in pids else pids + [pid]
+        elif eid is not None:
+            eids = [x for x in eids if x != eid] if eid in eids else eids + [eid]
         else:
-            self.clear_selection()
+            return                   # Ctrl+click on empty space keeps the selection
+        self.set_selection(pids, eids, current=pid, source='timeline')
 
     def _vb_double_clicked(self, vb, scene_pos):
         lane = next((ln for ln in self.lanes if ln.vb is vb), None)
@@ -1160,145 +1329,214 @@ class SeqViewWindow(QMainWindow):
         t = vb.mapSceneToView(scene_pos).x()
         self.zoom_by(2.0, about=t)
 
-    def select_pulse(self, pid, scroll_code=True):
-        p = self.pulse_by_id.get(pid)
-        if p is None:
+    # --- the selection: one state, shown by the lanes, the overview, the
+    # --- pulse table and the code pane
+
+    def set_selection(self, pids=(), eids=(), current=None, source=None,
+                      code_line=None, scroll_code=True):
+        """The one place the selection changes.
+
+        pids / eids: selected pulse / event ids, in selection order.
+        current: the pulse acted on last (status readout, Z, which code
+        line to scroll to); default the last one. source: 'timeline',
+        'table' or 'code' -- the widget the click came from is not written
+        back to (that is what made the table fight the user). code_line:
+        (source key, line) of a code click, highlighted along with the
+        pulses' own lines."""
+        if self.bundle is None:
             return
-        self.selected = pid
-        self.selected_event = None
-        line = p.get('src_line')
-        related = set()
-        if line is not None:
-            related = {q['id'] for q in self.bundle.pulses
-                       if q.get('src_line') == line and q['id'] != pid}
+        pids = [int(i) for i in dict.fromkeys(pids) if int(i) in self.pulse_by_id]
+        eids = [int(i) for i in dict.fromkeys(eids) if int(i) in self.event_by_id]
+        self.sel_pulses, self.sel_events = pids, eids
+        if current not in pids:
+            current = pids[-1] if pids else None
+        self.selected = current
+        self.selected_event = eids[-1] if eids else None
+        psel, esel = set(pids), set(eids)
+        # pulses from the same emitting line: dotted outline
+        lines = {self.pulse_by_id[i].get('src_line') for i in pids} - {None}
+        related = ({q['id'] for q in self.bundle.pulses
+                    if q.get('src_line') in lines} - psel) if lines else set()
+        dim = bool(psel or esel)
+        for bars in [ln.bars for ln in self.lanes if ln.bars is not None] + self._ov_bars:
+            bars.selected = psel
+            bars.related = related
+            bars.dim_others = dim
+            bars.update()
         for lane in self.lanes:
-            if lane.bars is not None:
-                lane.bars.selected = {pid}
-                lane.bars.related = related
-                lane.bars.dim_others = True
-                lane.bars.update()
             if lane.events is not None:
-                lane.events.selected = set()
+                lane.events.selected = esel
                 lane.events.update()
-        if line is not None:
-            self.code.highlight('seq', current=[line],
-                                related=[x for x in p.get('src_lines', []) if x != line],
-                                scroll=scroll_code)
-        else:
-            self.code.highlight('seq', current=[], related=[], scroll=False)
-        if p.get('qua_line'):
-            self.code.highlight('qua', current=[p['qua_line']], scroll=scroll_code)
-        else:
-            self.code.highlight('qua', current=[], scroll=False)
-        self._sync_table_selection(pid)
+        self._highlight_code(pids, eids, current, code_line,
+                             scroll=scroll_code and source != 'code')
+        if source != 'table':
+            self._sync_table_selection(pids, current)
         self._update_cursor_label()
+
+    def select_pulse(self, pid, scroll_code=True):
+        self.set_selection([pid], current=pid, scroll_code=scroll_code)
 
     def select_event(self, eid):
-        e = self.event_by_id.get(eid)
-        if e is None:
-            return
-        self.selected = None
-        self.selected_event = eid
-        for lane in self.lanes:
-            if lane.bars is not None:
-                lane.bars.selected = set()
-                lane.bars.related = set()
-                lane.bars.dim_others = False
-                lane.bars.update()
-            if lane.events is not None:
-                lane.events.selected = {eid}
-                lane.events.update()
-        if e.get('src_line'):
-            self.code.highlight('seq', current=[e['src_line']],
-                                related=e.get('src_lines', []))
-        if e.get('qua_line'):
-            self.code.highlight('qua', current=[e['qua_line']])
-        self._update_cursor_label()
+        self.set_selection([], [eid])
 
     def clear_selection(self):
-        self.selected = None
-        self.selected_event = None
-        for lane in self.lanes:
-            if lane.bars is not None:
-                lane.bars.selected = set()
-                lane.bars.related = set()
-                lane.bars.dim_others = False
-                lane.bars.update()
-            if lane.events is not None:
-                lane.events.selected = set()
-                lane.events.update()
-        self.code.clear_highlights()
-        self._update_cursor_label()
+        self.set_selection([], [])
+
+    def _highlight_code(self, pids, eids, current, code_line, scroll):
+        """Tint the lines the selection was emitted from with their lane
+        colour; the call chain above them gets a grey band."""
+        items = ([self.pulse_by_id[i] for i in pids]
+                 + [self.event_by_id[i] for i in eids])
+        cur = {'seq': set(), 'qua': set()}
+        colors = {'seq': {}, 'qua': {}}
+        chain = set()
+        for it in items:
+            col = it.get('color') or EVENT_COLOR
+            for key, field in (('seq', 'src_line'), ('qua', 'qua_line')):
+                if it.get(field):
+                    ln = int(it[field])
+                    cur[key].add(ln)
+                    colors[key].setdefault(ln, col)
+            chain.update(int(x) for x in it.get('src_lines') or [])
+        if code_line is not None and code_line[0] in cur:
+            cur[code_line[0]].add(int(code_line[1]))
+        focus = (self.pulse_by_id.get(current) if current is not None else
+                 (self.event_by_id.get(eids[-1]) if eids else None)) or {}
+        for key, field in (('seq', 'src_line'), ('qua', 'qua_line')):
+            self.code.highlight(key, cur[key], chain if key == 'seq' else (),
+                                scroll=scroll and bool(focus.get(field)),
+                                colors=colors[key], scroll_line=focus.get(field))
+
+    def _items_from_line(self, key, line):
+        """Pulse and event ids emitted by a code line (for the sequence
+        source: also by calls that pass through it)."""
+        field = {'seq': 'src_line', 'qua': 'qua_line'}.get(key)
+        if field is None:
+            return None, None
+
+        def hit(it):
+            return it.get(field) == line or (
+                key == 'seq' and line in (it.get('src_lines') or []))
+        return ([p['id'] for p in self.bundle.pulses if hit(p)],
+                [e['id'] for e in self.bundle.events if hit(e)])
 
     def _code_line_clicked(self, key, line):
-        field = 'src_line' if key == 'seq' else ('qua_line' if key == 'qua' else None)
-        if field is None:
+        ids, eids = self._items_from_line(key, line)
+        if ids is None:
             return
-        ids = [p['id'] for p in self.bundle.pulses if p.get(field) == line]
-        if key == 'seq':
-            ids += [p['id'] for p in self.bundle.pulses
-                    if line in (p.get('src_lines') or []) and p['id'] not in ids]
-        eids = [e['id'] for e in self.bundle.events if e.get(field) == line]
         if not ids and not eids:
             self.clear_selection()
+            self.hover_label.setText(f"line {line}: emitted nothing")
             return
-        self.selected = None
-        for lane in self.lanes:
-            if lane.bars is not None:
-                lane.bars.selected = set()
-                lane.bars.related = set(ids)
-                lane.bars.dim_others = True
-                lane.bars.update()
-            if lane.events is not None:
-                lane.events.selected = set(eids)
-                lane.events.update()
-        self.code.highlight(key, current=[line], scroll=False)
-        # bring one into view if none is visible
-        x0, x1 = self.view_range()
-        ts = [self.pulse_by_id[i]['t0'] for i in ids] + [self.event_by_id[i]['t'] for i in eids]
-        if ts and not any(x0 <= t <= x1 for t in ts):
-            w = x1 - x0
-            self.set_x_range(ts[0] - 0.1 * w, ts[0] + 0.9 * w)
-        self.hover_label.setText(f"{len(ids)} pulse(s), {len(eids)} event(s) from line {line}")
+        self.set_selection(ids, eids, current=ids[0] if ids else None,
+                           source='code', code_line=(key, line))
+        if self.snap_view:
+            self._bring_into_view(ids, eids)
+        self.hover_label.setText(f"line {line}: {len(ids)} pulse(s), "
+                                 f"{len(eids)} event(s)")
 
     def _code_line_double_clicked(self, key, line):
-        field = 'src_line' if key == 'seq' else 'qua_line'
-        ids = [p['id'] for p in self.bundle.pulses if p.get(field) == line]
-        if ids:
-            ps = [self.pulse_by_id[i] for i in ids]
-            t0 = min(p['t0'] for p in ps)
-            t1 = max(p['t1'] for p in ps)
-            w = max(t1 - t0, 16.)
-            self.set_x_range(t0 - 0.2 * w, t1 + 0.2 * w)
+        ids, eids = self._items_from_line(key, line)
+        if ids or eids:
+            self._fit_items(ids, eids)
 
-    def _sync_table_selection(self, pid):
+    # --- moving the view to a selection
+
+    def _spans(self, pids=(), eids=()):
+        ps = [self.pulse_by_id[i] for i in pids]
+        es = [self.event_by_id[i] for i in eids]
+        return ([(p['t0'], p['t1'], p.get('shot')) for p in ps]
+                + [(e['t'], e['t'], e.get('shot')) for e in es])
+
+    def _nearest_group(self, spans):
+        """The spans in the shot of the one nearest the view centre (a line
+        in the shot body emits once per shot: show one shot's worth)."""
+        x0, x1 = self.view_range()
+        c = 0.5 * (x0 + x1)
+        near = min(spans, key=lambda s: 0. if s[0] <= c <= s[1]
+                   else min(abs(s[0] - c), abs(s[1] - c)))
+        if near[2] is None:
+            return [near]
+        return [s for s in spans if s[2] == near[2]]
+
+    def _fit_span(self, a, b):
+        w = max(b - a, 16.)
+        self.set_x_range(a - 0.15 * w, b + 0.15 * w)
+
+    def _fit_items(self, pids=(), eids=(), group=True):
+        spans = self._spans(pids, eids)
+        if spans:
+            grp = self._nearest_group(spans) if group else spans
+            self._fit_span(min(s[0] for s in grp), max(s[1] for s in grp))
+
+    def _bring_into_view(self, pids=(), eids=()):
+        """Leave the view alone when any of the items is on screen; else
+        centre the nearest shot's worth of them at the current zoom, or
+        zoom out to fit them when they do not fit."""
+        spans = self._spans(pids, eids)
+        if not spans:
+            return
+        x0, x1 = self.view_range()
+        if any(a <= x1 and b >= x0 for a, b, _ in spans):
+            return
+        grp = self._nearest_group(spans)
+        a, b = min(s[0] for s in grp), max(s[1] for s in grp)
+        w = x1 - x0
+        if b - a <= 0.8 * w:
+            c = 0.5 * (a + b)
+            self.set_x_range(c - 0.5 * w, c + 0.5 * w)
+        else:
+            self._fit_span(a, b)
+
+    # --- pulse table
+
+    def _proxy_index(self, pid):
+        row = self._row_of.get(pid) if hasattr(self, '_row_of') else None
+        if row is None:
+            return QModelIndex()
+        return self.table_proxy.mapFromSource(self.table_model.index(row, 0))
+
+    def _sync_table_selection(self, pids, current=None):
+        """Show the selection in the table, without it echoing back."""
         if not hasattr(self, 'table_model'):
             return
-        row = next((i for i, p in enumerate(self.bundle.pulses) if p['id'] == pid), None)
-        if row is None:
-            return
-        src = self.table_model.index(row, 0)
-        prox = self.table_proxy.mapFromSource(src)
+        rows = sorted(ix.row() for ix in map(self._proxy_index, pids) if ix.isValid())
+        sel = QItemSelection()
+        ncol = self.table_proxy.columnCount() - 1
+        k = 0
+        while k < len(rows):            # contiguous runs -> one range each
+            j = k
+            while j + 1 < len(rows) and rows[j + 1] == rows[j] + 1:
+                j += 1
+            sel.select(self.table_proxy.index(rows[k], 0),
+                       self.table_proxy.index(rows[j], ncol))
+            k = j + 1
         sm = self.table.selectionModel()
-        sm.blockSignals(True)
-        self.table.setCurrentIndex(prox)
-        self.table.scrollTo(prox)
-        sm.blockSignals(False)
+        F = QItemSelectionModel.SelectionFlag
+        self._table_syncing = True
+        try:
+            sm.select(sel, F.ClearAndSelect | F.Rows)
+            ix = self._proxy_index(current) if current is not None else QModelIndex()
+            if ix.isValid():
+                sm.setCurrentIndex(ix, F.NoUpdate)
+                self.table.scrollTo(ix)
+        finally:
+            self._table_syncing = False
 
-    def _table_row(self, current, previous):
-        if not current.isValid():
+    def _table_selection_changed(self, *a):
+        if self._table_syncing:
             return
-        src = self.table_proxy.mapToSource(current)
-        p = self.bundle.pulses[src.row()]
-        self.select_pulse(p['id'])
-        x0, x1 = self.view_range()
-        if not (x0 <= p['t0'] <= x1 or x0 <= p['t1'] <= x1):
-            w = x1 - x0
-            c = 0.5 * (p['t0'] + p['t1'])
-            if p['t1'] - p['t0'] > w:
-                self.zoom_to_pulse(p['id'])
-            else:
-                self.set_x_range(c - w / 2., c + w / 2.)
+        sm = self.table.selectionModel()
+        rows = sorted(sm.selectedRows(), key=lambda ix: ix.row())
+        pids = [self.bundle.pulses[self.table_proxy.mapToSource(ix).row()]['id']
+                for ix in rows]
+        cur = sm.currentIndex()
+        current = None
+        if cur.isValid() and sm.isRowSelected(cur.row(), QModelIndex()):
+            current = self.bundle.pulses[self.table_proxy.mapToSource(cur).row()]['id']
+        self.set_selection(pids, [], current=current, source='table')
+        if current is not None and self.snap_view:
+            self._bring_into_view([current])
 
     def _table_double(self, idx):
         src = self.table_proxy.mapToSource(idx)
@@ -1360,11 +1598,23 @@ class SeqViewWindow(QMainWindow):
             d = b - a
             parts.append(f"Δ = {fmt_duration(abs(d))}"
                          + (f" ({1e3 / abs(d):.4g} MHz)" if d else ''))
-        if self.selected is not None:
+        n_p, n_e = len(self.sel_pulses), len(self.sel_events)
+        if n_p + n_e > 1:
+            spans = self._spans(self.sel_pulses, self.sel_events)
+            what = ', '.join(x for x in (f"{n_p} pulses" if n_p else '',
+                                         f"{n_e} events" if n_e else '') if x)
+            parts.append(f"selected: {what} "
+                         f"[{fmt_time(min(s[0] for s in spans) - self.origin_t, u)} → "
+                         f"{fmt_time(max(s[1] for s in spans) - self.origin_t, u)}]")
+        elif self.selected is not None:
             p = self.pulse_by_id[self.selected]
             parts.append(f"selected: {p.get('text') or p.get('pulse_name')} "
                          f"[{fmt_time(p['t0'] - self.origin_t, u)} → "
                          f"{fmt_time(p['t1'] - self.origin_t, u)}]")
+        elif self.selected_event is not None:
+            e = self.event_by_id[self.selected_event]
+            parts.append(f"selected: {e.get('label', e['kind'])} "
+                         f"@ {fmt_time(e['t'] - self.origin_t, u)}")
         self.cursor_label.setText('   '.join(parts))
 
     def copy_readout(self):
@@ -1381,13 +1631,13 @@ class SeqViewWindow(QMainWindow):
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         if ctrl and k == Qt.Key.Key_C:
             self.copy_readout()
-        elif ctrl and k == Qt.Key.Key_E:
-            self.export_csv() if shift else self.export_png()
         elif k in (Qt.Key.Key_Home, Qt.Key.Key_F) and not ctrl:
             self.fit_all() if k == Qt.Key.Key_F else self.fit_shot()
         elif k == Qt.Key.Key_Z:
-            if self.selected is not None:
-                self.zoom_to_pulse(self.selected)
+            if len(self.sel_pulses) == 1 and not self.sel_events:
+                self.zoom_to_pulse(self.sel_pulses[0])
+            elif self.sel_pulses or self.sel_events:
+                self._fit_items(self.sel_pulses, self.sel_events, group=False)
             elif self.cursor_x['A'] is not None and self.cursor_x['B'] is not None:
                 a, b = sorted((self.cursor_x['A'], self.cursor_x['B']))
                 w = max(b - a, 16.)
@@ -1420,9 +1670,9 @@ class SeqViewWindow(QMainWindow):
         elif k == Qt.Key.Key_P:
             self.set_physical_visible(not self.show_physical)
         elif k == Qt.Key.Key_G:
-            self.chk_gaps.setChecked(not self.show_gaps)
+            self.set_gaps_visible(not self.show_gaps)
         elif k == Qt.Key.Key_L:
-            self.chk_labels.setChecked(not self.show_labels)
+            self.set_labels_visible(not self.show_labels)
         elif k == Qt.Key.Key_T:
             self.table_dock.setVisible(not self.table_dock.isVisible())
         elif k == Qt.Key.Key_Question or (k == Qt.Key.Key_H and not ctrl):

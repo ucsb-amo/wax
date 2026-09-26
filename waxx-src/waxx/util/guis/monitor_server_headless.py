@@ -49,9 +49,11 @@ class HeadlessMonitorServer(QObject):
       ``failed``, ``preflight_failed``).
     """
 
-    def __init__(self, monitor_expt_path: str, config_file_path: str | None = None):
+    def __init__(self, monitor_expt_path: str, config_file_path: str | None = None,
+                 journal_dir: str | None = None):
         super().__init__()
         self.config_file_path = config_file_path
+        self.journal_dir = journal_dir
         self.monitor_expt_path = monitor_expt_path
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
@@ -93,7 +95,9 @@ class HeadlessMonitorServer(QObject):
 
     def _setup_udp_server(self) -> None:
         self.server_thread = QThread()
-        self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path)
+        self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
+                                           journal_dir=self.journal_dir)
+        log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
@@ -139,6 +143,7 @@ class HeadlessMonitorServer(QObject):
             log.info("Monitor restart ignored: a restart is already in progress.")
             return
         self._restarting = True
+        self.udp_server.retire_ops("monitor restarting")
         try:
             if self.monitor_manager.isRunning():
                 log.info("Restarting monitor experiment...")
@@ -159,6 +164,8 @@ class HeadlessMonitorServer(QObject):
                     reason: str | None = None) -> None:
         changed = self.status.set_state(status, sub_state, reason)
         self.status.pid = self.monitor_manager.pid
+        # NOT_READY retires the composite-op registration.
+        self.udp_server.on_monitor_state(status, self.status.sub_state)
         # Logged only on change: _check_status runs at 8 Hz.
         previous = getattr(self, "_logged_state", None)
         if changed or previous is None:
@@ -198,7 +205,8 @@ class HeadlessMonitorServer(QObject):
             log.exception("Error while stopping the monitor experiment")
 
 
-def run(monitor_expt_path: str, config_file_path: str | None = None) -> int:
+def run(monitor_expt_path: str, config_file_path: str | None = None,
+        journal_dir: str | None = None) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
@@ -220,7 +228,8 @@ def run(monitor_expt_path: str, config_file_path: str | None = None) -> int:
     log.info("Starting monitor server '%s'.", server_id)
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
     try:
-        server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path)
+        server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path,
+                                       journal_dir=journal_dir)
     except Exception:
         log.exception("Monitor server failed to start")
         return 1

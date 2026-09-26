@@ -14,7 +14,7 @@ class CommClient(NetClient):
         super().__init__(server_id, discovery_timeout=discovery_timeout)
         self.server_address = (self.host, self.port)
         
-    def send_message(self, message):
+    def send_message(self, message, timeout: float = 5.0, attempts: int = 2):
         """
         Sends a newline-framed message to the server and returns the reply.
 
@@ -24,11 +24,13 @@ class CommClient(NetClient):
         timeout guarantees the call can never hang the caller indefinitely.
 
         :param message: The message to send (string).
+        :param timeout: Socket timeout per attempt (s).
+        :param attempts: Tries; a failed first try rediscovers the server.
         :returns: The decoded reply string, or ``None`` on failure.
         """
-        for attempt in range(2):
+        for attempt in range(max(int(attempts), 1)):
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)
+            self.sock.settimeout(timeout)
             try:
                 self.sock.connect(self.server_address)
                 self.sock.sendall((message + "\n").encode())
@@ -40,7 +42,7 @@ class CommClient(NetClient):
                     buf += chunk
                 return buf.split(b"\n", 1)[0].decode()
             except Exception:
-                if attempt == 0:
+                if attempt == 0 and attempts > 1:
                     # Rediscover server in case it restarted at a new IP/port.
                     if self._rediscover(timeout=2.0):
                         self.server_address = (self.host, self.port)
@@ -145,14 +147,93 @@ class MonitorClient(CommClient):
         or ``None`` on failure.  This is how clients obtain their initial state
         and resync after a missed broadcast — no shared-drive access required.
         """
+        return self._request({"type": "get_state"})
+
+    def _request(self, obj):
+        """Send a structured request; the parsed reply dict, or ``None``."""
         import json  # noqa: PLC0415
-        reply = self.send_message(json.dumps({"type": "get_state"}))
+        reply = self.send_message(json.dumps(obj))
         if reply is None:
             return None
         try:
-            return json.loads(reply)
+            parsed = json.loads(reply)
         except Exception:
             return None
+        return parsed if isinstance(parsed, dict) else None
+
+    # --- composite ops (waxx.util.device_state.composite) ---------------------
+
+    def send_op(self, op, sig, args, payload=None, client="", operator="", rid=None):
+        """Request a composite op.  Reply ``{"status": "ok", "seq": N}`` or an
+        error dict; ``None`` if the server is unreachable.  ``rid`` (made here
+        if not given) lets the server drop the copy a retry after a lost reply
+        would otherwise queue."""
+        import uuid  # noqa: PLC0415
+        return self._request({"type": "op", "op": op, "sig": sig, "args": args,
+                              "payload": payload or {}, "client": client,
+                              "operator": operator, "rid": rid or uuid.uuid4().hex})
+
+    def request(self, obj):
+        """Any structured request; the parsed reply or ``None``."""
+        return self._request(obj)
+
+    def replace_state(self, config, run_id=None, expt=""):
+        """An experiment's end-of-run device state (its ``end()``)."""
+        return self._request({"type": "replace_state", "config": config,
+                              "run_id": run_id, "expt": expt})
+
+    def announce_run(self, run_id=None, expt="", client="", token=""):
+        """An experiment is about to take the core: fence composite ops.
+        ``token`` names this announcement for :meth:`withdraw_run`."""
+        return self._request({"type": "run_pending", "run_id": run_id, "expt": expt,
+                              "client": client, "token": token})
+
+    def withdraw_run(self, token, run_id=None, timeout: float = 2.0):
+        """The announced run is exiting without having taken the core: lift
+        its fence.  One short try (it is sent from a dying process)."""
+        import json  # noqa: PLC0415
+        reply = self.send_message(json.dumps({"type": "run_withdrawn", "token": token,
+                                              "run_id": run_id}),
+                                  timeout=timeout, attempts=1)
+        if reply is None:
+            return None
+        try:
+            parsed = json.loads(reply)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def get_journal(self, n=200, since=None):
+        obj = {"type": "get_journal", "n": int(n)}
+        if since:
+            obj["since"] = since
+        return self._request(obj)
+
+    def op_status(self, seq):
+        """``{"status": "ok", "state": "queued"|"running"|"done"|"unknown",
+        "result": {...}}`` for one request, or ``None``."""
+        return self._request({"type": "op_status", "seq": int(seq)})
+
+    def register_ops(self, registration):
+        """Monitor experiment: announce the compiled op table."""
+        return self._request(registration)
+
+    def poll(self):
+        """Monitor experiment: version + queued ops, one round trip."""
+        return self._request({"type": "poll"})
+
+    def report_ops(self, results):
+        """Monitor experiment: outcomes of ops it took."""
+        return self._request({"type": "op_done", "results": results})
+
+    def send_update_batch(self, updates, origin=""):
+        """Several deltas in one round trip: ``updates`` is a list of
+        ``(device_type, device_name, changes)``."""
+        return self._request({
+            "type": "update_batch", "origin": origin,
+            "updates": [{"device_type": t, "device_name": n, "changes": c}
+                        for t, n, c in updates],
+        })
 
 # if __name__ == '__main__':
 #     # Example usage:

@@ -1,11 +1,12 @@
 import logging
+import socket
 import threading
 from collections import deque
 from typing import Dict, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
-    QLineEdit, QMessageBox, QSizePolicy, QMenu, QListWidget,
+    QLineEdit, QMessageBox, QSizePolicy, QMenu, QListWidget, QComboBox,
     QScrollArea, QGraphicsOpacityEffect
 )
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker, QSettings, QByteArray
@@ -19,6 +20,8 @@ from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.state_broadcast import StateListener
 from waxx.util.dashboard import theme
+from waxx.util.device_state.op_journal import describe_entry
+from waxx.util.guis.device_summary import MakeSafeDialog, SummaryStrip
 from waxa.helper.name_search import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -58,6 +61,8 @@ TTL_PULSE_ACK_TIMEOUT_S = 2.0        # give up waiting for the "on" ack, send "o
 STATUS_POLL_S = 1.0                  # monitor status poll
 STATUS_RETRY_S = 2.0                 # back-off after a failed status poll
 RECONCILE_MS = 10000                 # periodic full-snapshot safety reconcile
+TELEMETRY_PULL_MS = 1000             # measured values into the cards and the strip
+JOURNAL_LOAD_N = 1000                # server journal records the changes window loads
 
 _SETTINGS_ORG = "waxx"
 _SETTINGS_APP = "device_control_gui"
@@ -295,7 +300,9 @@ class DDSWidget(DeviceWidget):
         self.instant_apply = False
         self._force_update_pending = False
         # Display units.  ``_freq_unit`` is "MHz" or "Γ"; ``_amp_unit`` is
-        # "Amp" or "V" (the two replace the old unit combo boxes).
+        # "Amp" or "V".  Chosen with the unit combo boxes (on every card; a
+        # channel that cannot switch gets a single entry) or the spinbox
+        # right-click menu.
         self._freq_unit = "MHz"
         self._amp_unit = "Amp"
         # Store previous values for undo functionality
@@ -314,6 +321,42 @@ class DDSWidget(DeviceWidget):
     def _has_dac(self) -> bool:
         return self.device_config.get("dac_ch", -1) != -1
 
+    def _dds_obj(self):
+        """This channel's DDS object in the frame (does the MHz <-> Γ
+        conversion), or None when there is no frame or no such channel."""
+        if self.dds_frame_obj is None:
+            return None
+        try:
+            return self.dds_frame_obj.dds_array[self.device_config["urukul_idx"]][self.device_config["ch"]]
+        except Exception:
+            return None
+
+    def _can_detune(self) -> bool:
+        """Γ is offered only when the channel has a transition *and* a DDS
+        object to convert with; otherwise the display could claim Γ while
+        holding an MHz value."""
+        return self._has_transition() and self._dds_obj() is not None
+
+    @staticmethod
+    def _unit_combo(units) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(units)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        return combo
+
+    def _size_unit_combos(self) -> None:
+        """Give both unit combos one width (the widest entry, "MHz" / "Amp",
+        is in every combo, so this is the same on every card and the cards
+        line up) and the spinbox height, so a card with combos is no taller
+        than one without.  Called once the widgets are parented to the card:
+        size hints before that use the default font, not the card's."""
+        combos = (self.freq_unit_combo, self.amp_unit_combo)
+        width = max(c.sizeHint().width() for c in combos)
+        height = self.freq_spinbox.sizeHint().height()
+        for c in combos:
+            c.setFixedSize(width, height)
+
     def setup_ui(self):
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 3, 4, 3)  # inset from the card frame
@@ -325,8 +368,8 @@ class DDSWidget(DeviceWidget):
         self.device_label.setToolTip(self.device_name)
         layout.addWidget(self.device_label)
 
-        # Frequency controls.  Unit (MHz / Γ) is chosen from a right-click
-        # menu on the spinbox and shown as the spinbox suffix.
+        # Frequency controls.  Every card has a unit combo beside the
+        # spinbox: MHz / Γ on a channel with a transition, MHz alone otherwise.
         freq_layout = QHBoxLayout()
 
         self.freq_spinbox = QDoubleSpinBox()
@@ -335,22 +378,29 @@ class DDSWidget(DeviceWidget):
         self.freq_spinbox.setValue(self.device_config["frequency"] / 1e6)  # Convert Hz to MHz
         self.freq_spinbox.setMinimum(0.)
         self.freq_spinbox.setMaximum(400.)
-        self.freq_spinbox.setSuffix(" MHz")
         self.freq_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
         self.freq_spinbox.valueChanged.connect(self.on_freq_spinbox_value_changed)
         self._install_context_menu(self.freq_spinbox, self._show_freq_unit_menu)
         freq_layout.addWidget(self.freq_spinbox)
+        if self._can_detune():
+            self.freq_unit_combo = self._unit_combo(["MHz", "Γ"])
+            self.freq_unit_combo.setToolTip("Frequency unit: MHz, or detuning in Γ")
+        else:
+            self.freq_unit_combo = self._unit_combo(["MHz"])
+            self.freq_unit_combo.setToolTip("MHz only: no transition defined for this channel")
+        self.freq_unit_combo.currentTextChanged.connect(self._choose_freq_unit)
+        freq_layout.addWidget(self.freq_unit_combo)
         layout.addLayout(freq_layout)
 
         # Amplitude controls (amp spinbox or v_pd spinbox, one visible at a
-        # time; right-click chooses).
+        # time).  Every card has a unit combo: Amp / V on a channel with a
+        # VVA/PID DAC, Amp alone otherwise.
         amp_layout = QHBoxLayout()
 
         self.amp_spinbox = QDoubleSpinBox()
         self.amp_spinbox.setRange(0, 1)
         self.amp_spinbox.setDecimals(3)
         self.amp_spinbox.setSingleStep(0.005)
-        self.amp_spinbox.setSuffix(" amp")
         self.amp_spinbox.setValue(self.device_config["amplitude"])
         self.amp_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
         self.amp_spinbox.valueChanged.connect(self.on_amp_spinbox_value_changed)
@@ -360,7 +410,6 @@ class DDSWidget(DeviceWidget):
         self.vpd_spinbox.setRange(0, 10)
         self.vpd_spinbox.setDecimals(2)
         self.vpd_spinbox.setSingleStep(0.05)
-        self.vpd_spinbox.setSuffix(" V")
         self.vpd_spinbox.setValue(self.device_config.get("v_pd", 5.0))
         self.vpd_spinbox.lineEdit().returnPressed.connect(self.on_update_clicked)
         self.vpd_spinbox.valueChanged.connect(self.on_vpd_spinbox_value_changed)
@@ -370,6 +419,14 @@ class DDSWidget(DeviceWidget):
         self.power_control_widget.addWidget(self.amp_spinbox)
         self.power_control_widget.addWidget(self.vpd_spinbox)
         amp_layout.addLayout(self.power_control_widget)
+        if self._has_dac():
+            self.amp_unit_combo = self._unit_combo(["Amp", "V"])
+            self.amp_unit_combo.setToolTip("Power setpoint: DDS amplitude, or v_pd (V) on the VVA/PID DAC")
+        else:
+            self.amp_unit_combo = self._unit_combo(["Amp"])
+            self.amp_unit_combo.setToolTip("Amplitude only: no VVA/PID DAC on this channel")
+        self.amp_unit_combo.currentTextChanged.connect(self._choose_amp_unit)
+        amp_layout.addWidget(self.amp_unit_combo)
         layout.addLayout(amp_layout)
 
         # sw state + default/undo row
@@ -387,6 +444,7 @@ class DDSWidget(DeviceWidget):
         layout.addLayout(state_button_row)
 
         self.setLayout(layout)
+        self._size_unit_combos()
         self.update_from_config(self.device_config)
 
         # Restore per-device unit preferences (only if still valid for this
@@ -398,7 +456,7 @@ class DDSWidget(DeviceWidget):
             saved_amp = "Amp"
         self.on_amp_unit_changed(saved_amp)
         saved_freq = _setting(f"freq_unit/{self.device_name}", "MHz", str)
-        if saved_freq == "Γ" and self._has_transition():
+        if saved_freq == "Γ" and self._can_detune():
             self.on_freq_unit_changed("Γ")
 
         self._refresh_default_tooltip()
@@ -418,16 +476,15 @@ class DDSWidget(DeviceWidget):
     def _show_freq_unit_menu(self, global_pos) -> None:
         menu = QMenu(self)
         actions = {}
-        units = ["MHz"] + (["Γ"] if self._has_transition() else [])
+        units = ["MHz"] + (["Γ"] if self._can_detune() else [])
         for unit in units:
             act = menu.addAction(unit)
             act.setCheckable(True)
             act.setChecked(unit == self._freq_unit)
             actions[act] = unit
         chosen = menu.exec(global_pos)
-        if chosen is not None and actions[chosen] != self._freq_unit:
-            self.on_freq_unit_changed(actions[chosen])
-            _save_setting(f"freq_unit/{self.device_name}", self._freq_unit)
+        if chosen is not None:
+            self._choose_freq_unit(actions[chosen])
 
     def _show_amp_unit_menu(self, global_pos) -> None:
         menu = QMenu(self)
@@ -439,9 +496,27 @@ class DDSWidget(DeviceWidget):
             act.setChecked(unit == self._amp_unit)
             actions[act] = unit
         chosen = menu.exec(global_pos)
-        if chosen is not None and actions[chosen] != self._amp_unit:
-            self.on_amp_unit_changed(actions[chosen])
+        if chosen is not None:
+            self._choose_amp_unit(actions[chosen])
+
+    # --- user unit choice (combo box or right-click menu) ----------------------
+
+    def _choose_freq_unit(self, unit: str) -> None:
+        if unit != self._freq_unit:
+            self.on_freq_unit_changed(unit)
+            _save_setting(f"freq_unit/{self.device_name}", self._freq_unit)
+
+    def _choose_amp_unit(self, unit: str) -> None:
+        if unit != self._amp_unit:
+            self.on_amp_unit_changed(unit)
             _save_setting(f"amp_unit/{self.device_name}", self._amp_unit)
+
+    @staticmethod
+    def _sync_combo(combo, text: str) -> None:
+        """Show *text* in a unit combo without re-entering the change handler."""
+        if combo.currentText() != text:
+            with QSignalBlocker(combo):
+                combo.setCurrentText(text)
 
     # --- default / undo ------------------------------------------------------
 
@@ -500,12 +575,13 @@ class DDSWidget(DeviceWidget):
                 self.prev_vpd = self.vpd_spinbox.value()
                 self.prev_sw_state = self.state_button.isChecked()
                 # If this channel is defined by detuning (has a transition),
-                # show the default in Γ units; otherwise show it in MHz.
-                if getattr(dds, "transition", "None") != "None":
-                    self.on_freq_unit_changed("Γ")
+                # show the default in Γ units; otherwise show it in MHz.  The
+                # value follows the unit actually in effect (Γ can be refused).
+                has_transition = getattr(dds, "transition", "None") != "None"
+                self.on_freq_unit_changed("Γ" if has_transition else "MHz")
+                if self._freq_unit == "Γ":
                     self.freq_spinbox.setValue(dds.frequency_to_detuning(dds.frequency))
                 else:
-                    self.on_freq_unit_changed("MHz")
                     self.freq_spinbox.setValue(dds.frequency/1.e6)
                 self.amp_spinbox.setValue(dds.amplitude)
                 # self.state_button.setChecked(dds.sw_state)
@@ -568,62 +644,36 @@ class DDSWidget(DeviceWidget):
         """Handle frequency unit change between MHz and Γ.
 
         Converts the displayed value in place; a unit change is not a value
-        change, so the spinbox signals are blocked while converting.
+        change, so the spinbox signals are blocked while converting.  The
+        unit only changes once the conversion succeeds, so the combo can
+        never read Γ over an MHz value.
         """
-        suffix = " Γ" if unit == "Γ" else " MHz"
-        if unit == self._freq_unit:
-            # Already displaying this unit — nothing to convert.  (The old
-            # combo box did not emit on a same-text setCurrentText either.)
-            self.freq_spinbox.setSuffix(suffix)
-            return
-        current_value = self.freq_spinbox.value()
-        self._freq_unit = unit
-        self.freq_spinbox.setSuffix(suffix)
-
-        if unit == "Γ":
-            # Convert MHz to Γ
-            if self.dds_frame_obj:
-                try:
-                    uru_idx = self.device_config["urukul_idx"]
-                    ch = self.device_config["ch"]
-                    dds_obj = self.dds_frame_obj.dds_array[uru_idx][ch]
-                    freq_hz = current_value * 1e6
-                    Γ_value = dds_obj.frequency_to_detuning(freq_hz)
-                    with QSignalBlocker(self.freq_spinbox):
-                        self.freq_spinbox.setMinimum(-100.)
-                        self.freq_spinbox.setMaximum(100.)
-                        self.freq_spinbox.setValue(Γ_value)
-                except Exception as e:
-                    _LOG.warning("DDS %s: MHz→Γ conversion failed: %s", self.device_name, e)
-        elif unit == "MHz":
-            # Convert Γ to MHz
-            if self.dds_frame_obj:
-                try:
-                    uru_idx = self.device_config["urukul_idx"]
-                    ch = self.device_config["ch"]
-                    dds_obj = self.dds_frame_obj.dds_array[uru_idx][ch]
-                    freq_hz = dds_obj.detuning_to_frequency(current_value)
-                    with QSignalBlocker(self.freq_spinbox):
-                        self.freq_spinbox.setMinimum(0.)
-                        self.freq_spinbox.setMaximum(400.)
-                        self.freq_spinbox.setValue(freq_hz / 1e6)
-                except Exception as e:
-                    _LOG.warning("DDS %s: Γ→MHz conversion failed: %s", self.device_name, e)
+        if unit == "Γ" and not self._can_detune():
+            unit = "MHz"
+        if unit != self._freq_unit:
+            current_value = self.freq_spinbox.value()
+            try:
+                dds_obj = self._dds_obj()
+                if unit == "Γ":
+                    new_value, lo, hi = dds_obj.frequency_to_detuning(current_value * 1e6), -100., 100.
+                else:
+                    new_value, lo, hi = dds_obj.detuning_to_frequency(current_value) / 1e6, 0., 400.
+            except Exception as e:
+                _LOG.warning("DDS %s: %s→%s conversion failed: %s",
+                             self.device_name, self._freq_unit, unit, e)
+            else:
+                with QSignalBlocker(self.freq_spinbox):
+                    self.freq_spinbox.setRange(lo, hi)
+                    self.freq_spinbox.setValue(new_value)
+                self._freq_unit = unit
+        self._sync_combo(self.freq_unit_combo, self._freq_unit)
 
     def on_amp_unit_changed(self, unit):
         """Handle amplitude unit change between Amp and V"""
-        if not self._has_dac():
-            self._amp_unit = "Amp"
-            self.amp_spinbox.setVisible(True)
-            self.vpd_spinbox.setVisible(False)
-            return
-        self._amp_unit = "V" if unit == "V" else "Amp"
-        if self._amp_unit == "V":
-            self.amp_spinbox.setVisible(False)
-            self.vpd_spinbox.setVisible(True)
-        else:
-            self.amp_spinbox.setVisible(True)
-            self.vpd_spinbox.setVisible(False)
+        self._amp_unit = "V" if (unit == "V" and self._has_dac()) else "Amp"
+        self.amp_spinbox.setVisible(self._amp_unit == "Amp")
+        self.vpd_spinbox.setVisible(self._amp_unit == "V")
+        self._sync_combo(self.amp_unit_combo, self._amp_unit)
 
     def on_value_changed(self):
         """Mark that values have changed but not yet submitted"""
@@ -1247,6 +1297,10 @@ class _StateRequestWorker(QThread):
             self.state_loaded.emit({
                 "version": state.get("version"),
                 "config": state.get("config", {}) or {},
+                "composite_state": state.get("composite_state"),
+                "trust": state.get("trust"),
+                "run_pending": state.get("run_pending"),
+                "runner": state.get("runner"),
             })
         else:
             # Force a fresh discovery (+ construction) on the next request.
@@ -1284,6 +1338,25 @@ class _MonitorCommandWorker(QThread):
             self.succeeded.emit(self._command)
         except Exception as e:
             self.failed.emit(self._command, str(e))
+
+
+class _RequestWorker(QThread):
+    """One structured request to the monitor server off the GUI thread
+    (trust acknowledgement, journal fetch)."""
+
+    done = pyqtSignal(dict)
+
+    def __init__(self, obj: dict, parent=None):
+        super().__init__(parent)
+        self._obj = dict(obj)
+
+    def run(self):
+        try:
+            reply = MonitorClient(discovery_timeout=1.0).request(self._obj)
+        except Exception as e:
+            reply = {"status": "error", "msg": str(e)}
+        self.done.emit(reply if isinstance(reply, dict)
+                       else {"status": "error", "msg": "monitor server unreachable"})
 
 
 class MonitorStatusChecker(QThread):
@@ -1389,6 +1462,7 @@ class ChangesLogWindow(QWidget):
 
     closed = pyqtSignal()
     clear_requested = pyqtSignal()
+    journal_requested = pyqtSignal()
 
     _GEOMETRY_KEY = "ui/changes_geometry"
 
@@ -1397,6 +1471,8 @@ class ChangesLogWindow(QWidget):
         self.setWindowTitle("Device changes")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setStyleSheet(f"background: {theme.BG};")
+        self._session_lines = list(lines)
+        self._journal_mode = False
 
         box = QVBoxLayout(self)
         box.setContentsMargins(6, 6, 6, 6)
@@ -1407,6 +1483,13 @@ class ChangesLogWindow(QWidget):
         self.count_label = QLabel()
         self.count_label.setStyleSheet(f"color: {theme.FG_MUTED};")
         head.addWidget(self.count_label, 1)
+        self.journal_button = QPushButton("Server journal")
+        self.journal_button.setCheckable(True)
+        self.journal_button.setToolTip(
+            "Show the monitor server's journal instead: every op (with its values and who "
+            "sent it), channel update, run start/end and trust change, from every GUI.")
+        self.journal_button.toggled.connect(self._on_journal_toggled)
+        head.addWidget(self.journal_button)
         self.copy_button = QPushButton("Copy")
         self.copy_button.setToolTip("Copy every line to the clipboard.")
         self.copy_button.clicked.connect(self._copy_all)
@@ -1442,16 +1525,48 @@ class ChangesLogWindow(QWidget):
                 pass
 
     def append_line(self, line: str) -> None:
+        self._session_lines.append(line)
+        del self._session_lines[:-CHANGES_LOG_MAX_ROWS]
+        if self._journal_mode:
+            return
         self.list.addItem(line)
         while self.list.count() > CHANGES_LOG_MAX_ROWS:
             self.list.takeItem(0)
         self._refresh_count()
         self.list.scrollToBottom()
 
+    def _on_journal_toggled(self, on: bool) -> None:
+        self._journal_mode = bool(on)
+        self.list.clear()
+        if on:
+            self.count_label.setText("Loading the server journal…")
+            self.clear_button.setEnabled(False)
+            self.journal_requested.emit()
+        else:
+            for line in self._session_lines:
+                self.list.addItem(line)
+            self._refresh_count()
+            self.list.scrollToBottom()
+
+    def show_journal(self, reply: dict) -> None:
+        if not self._journal_mode:
+            return
+        self.list.clear()
+        if reply.get("status") != "ok":
+            self.count_label.setText(f"Server journal unavailable: {reply.get('msg')}")
+            return
+        entries = reply.get("entries") or []
+        for e in entries:
+            self.list.addItem(describe_entry(e))
+        where = reply.get("path") or "memory only (no journal directory configured)"
+        self.count_label.setText(f"Server journal: last {len(entries)} records · {where}")
+        self.copy_button.setEnabled(bool(entries))
+        self.list.scrollToBottom()
+
     def _refresh_count(self) -> None:
         n = self.list.count()
         self.count_label.setText(
-            f"{n} change{'s' if n != 1 else ''}  (last {CHANGES_LOG_MAX_ROWS} kept)")
+            f"{n} change{'s' if n != 1 else ''} seen by this GUI  (last {CHANGES_LOG_MAX_ROWS} kept)")
         self.copy_button.setEnabled(n > 0)
         self.clear_button.setEnabled(n > 0)
 
@@ -1462,6 +1577,9 @@ class ChangesLogWindow(QWidget):
             app.clipboard().setText(text)
 
     def _clear(self) -> None:
+        if self._journal_mode:
+            return                      # the server journal is not this window's to clear
+        self._session_lines = []
         self.list.clear()
         self._refresh_count()
         self.clear_requested.emit()
@@ -1473,17 +1591,44 @@ class ChangesLogWindow(QWidget):
 
 
 class DeviceStateGUI(QMainWindow):
-    """Main GUI application for device state management"""
+    """Main GUI application for device state management.
+
+    ``composite_devices`` (a sequence of
+    :class:`waxx.util.device_state.composite.CompositeDevice`) adds the
+    Composite tab; ``composite_params`` / ``composite_frames`` are handed to
+    the definitions' readbacks, defaults and checks (the lab's ExptParams and
+    frames); ``composite_scenes`` adds the Scenes card;
+    ``composite_telemetry`` (a
+    :class:`waxx.util.device_state.telemetry.TelemetryHub`) supplies
+    measured values, polled only while this window is visible.
+    """
 
     def __init__(self,
                   dds_frame=None,
-                  dac_frame=None):
+                  dac_frame=None,
+                  composite_devices=None,
+                  composite_params=None,
+                  composite_frames=None,
+                  composite_scenes=None,
+                  composite_telemetry=None):
         super().__init__()
         self.config_data = {}
         self.device_widgets = {}
 
         self.dds_frame_obj = dds_frame
         self.dac_frame_obj = dac_frame
+        self._composite_devices = tuple(composite_devices or ())
+        self._composite_params = composite_params
+        self._composite_frames = composite_frames
+        self._composite_scenes = tuple(composite_scenes or ())
+        self._telemetry = composite_telemetry
+        self.composite_panel = None
+        self._composite_scroll = None
+        self._trust: dict | None = None
+        self._run_pending: dict | None = None
+        self._busy_until = 0.0
+        self._telemetry_samples: dict = {}
+        self._workers: list = []
 
         self.connection_failed = False
         # Last known monitor state (STATES.*), structured status dict (if the
@@ -1515,6 +1660,7 @@ class DeviceStateGUI(QMainWindow):
         self.request_state()        # initial async snapshot load
         self.setup_timer()          # periodic safety reconcile
         self.setup_status_checker()
+        self._setup_telemetry()
         self.running = False
 
     def setup_ui(self):
@@ -1529,6 +1675,15 @@ class DeviceStateGUI(QMainWindow):
         central_widget_layout = QVBoxLayout()
 
         central_widget_layout.addLayout(self._build_status_row())
+
+        # Hazards, trust, runs, interlock: above every tab.
+        self.summary = SummaryStrip()
+        self.summary.make_safe_requested.connect(self._make_safe)
+        self.summary.trust_requested.connect(self._trust_state)
+        self.summary.start_monitor_requested.connect(self.on_start_clicked)
+        self.summary.show_device_requested.connect(self._show_composite_device)
+        self.summary.clear_fence_requested.connect(self._clear_fence)
+        central_widget_layout.addWidget(self.summary)
 
         # Create tab widget
         self.tab_widget = QTabWidget()
@@ -1629,6 +1784,8 @@ class DeviceStateGUI(QMainWindow):
         self.dds_container.setLayout(self.dds_layout)
         self._style_grid_container(self.dds_container, "dds_container")
         dds_tab_layout.addWidget(self.dds_container)
+        # Spare height goes below the grid; the cards keep their natural size.
+        dds_tab_layout.addStretch(1)
         self.dds_tab.setLayout(dds_tab_layout)
 
         # Connect DDS step size controls to update all DDS widgets (+ persist)
@@ -1685,6 +1842,7 @@ class DeviceStateGUI(QMainWindow):
         self.dac_container.setLayout(self.dac_layout)
         self._style_grid_container(self.dac_container, "dac_container")
         dac_tab_layout.addWidget(self.dac_container)
+        dac_tab_layout.addStretch(1)
         self.dac_tab.setLayout(dac_tab_layout)
 
         # Connect DAC step size controls to update all DAC widgets
@@ -1704,7 +1862,31 @@ class DeviceStateGUI(QMainWindow):
         self.ttl_container.setLayout(self.ttl_layout)
         self._style_grid_container(self.ttl_container, "ttl_container")
         ttl_tab_layout.addWidget(self.ttl_container)
+        ttl_tab_layout.addStretch(1)
         self.ttl_tab.setLayout(ttl_tab_layout)
+
+        # Composite tab (lab-defined multi-channel devices driven through the
+        # monitor).  Last, so the saved active-tab index of the others holds.
+        if self._composite_devices:
+            from waxx.util.guis.composite_panel import CompositePanel  # noqa: PLC0415
+            self.composite_panel = CompositePanel(
+                self._composite_devices,
+                params=self._composite_params,
+                frames=self._composite_frames,
+                channel_sender=self._send_channel_from_panel,
+                log_line=self._record_line,
+                scenes=self._composite_scenes)
+            self.composite_panel.set_config(self.config_data)
+            self.composite_panel.hazards_changed.connect(self._refresh_summary)
+            # Scrolls on its own: a tab widget's minimum size is its largest
+            # page's, so an unscrolled Composite page (~1650 px tall) would set
+            # the minimum height of the whole window and stretch every DDS card.
+            composite_scroll = QScrollArea()
+            composite_scroll.setWidget(self.composite_panel)
+            composite_scroll.setWidgetResizable(True)
+            composite_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            self._composite_scroll = composite_scroll
+            self.tab_widget.addTab(composite_scroll, "Composite")
 
         # Restore + persist the active tab.
         saved_tab = int(_setting("ui/active_tab", 0, int))
@@ -1812,6 +1994,11 @@ class DeviceStateGUI(QMainWindow):
             self.status_pill.setText("Monitor not running")
             self._style_pill(theme.ERR)
         self._refresh_status_buttons()
+        if self.composite_panel is not None:
+            self.composite_panel.set_monitor_state(state, reachable=True)
+        sub = str((self._monitor_status or {}).get("sub_state") or "")
+        self.summary.set_monitor(state, True, _SUB_STATE_TEXT.get(sub, sub.replace("_", " ")))
+        self._refresh_summary()
 
     def _on_status_updated(self, status: int) -> None:
         """Legacy integer status from an older server (no detail available)."""
@@ -1827,6 +2014,15 @@ class DeviceStateGUI(QMainWindow):
             state = int(detail.get("state", STATES.NOT_READY))
         except (TypeError, ValueError):
             state = STATES.NOT_READY
+        if self.composite_panel is not None:
+            self.composite_panel.set_monitor_detail(detail)
+        if "trust" in detail:
+            self._trust = detail.get("trust")
+        if "run_pending" in detail:
+            self._run_pending = detail.get("run_pending")
+        busy = (detail.get("composite_ops") or {}).get("busy_s")
+        if isinstance(busy, (int, float)) and busy > 0:
+            self._busy_until = max(self._busy_until, time.monotonic() + busy)
         self._set_monitor_state(state)
         since = detail.get("since")
         try:
@@ -1859,6 +2055,10 @@ class DeviceStateGUI(QMainWindow):
         self._style_pill(UNREACHABLE_COLOR)
         self.status_detail_label.setText("click the status to retry")
         self._refresh_status_buttons()
+        if self.composite_panel is not None:
+            self.composite_panel.set_monitor_state(None, reachable=False)
+        self.summary.set_monitor(None, False)
+        self._refresh_summary()
 
     def on_status_pill_clicked(self):
         """Clicking the pill does nothing unless the server is unreachable,
@@ -1944,6 +2144,7 @@ class DeviceStateGUI(QMainWindow):
             win = ChangesLogWindow(list(self._changes))
             win.setWindowIcon(self.windowIcon())
             win.clear_requested.connect(self._clear_changes)
+            win.journal_requested.connect(self._load_journal)
             win.closed.connect(self._on_changes_window_closed)
             self._changes_window = win
         self._changes_window.show()
@@ -2007,11 +2208,211 @@ class DeviceStateGUI(QMainWindow):
         text = self._describe_change(dtype, old, changes)
         if not text:
             return
-        line = f"{time.strftime('%H:%M:%S')}  {dtype} {name}  {text}"
+        self._record_line(f"{dtype} {name}  {text}")
+
+    def _record_line(self, text: str) -> None:
+        """Append one timestamped line to the changes log (also used by the
+        Composite tab for op outcomes)."""
+        line = f"{time.strftime('%H:%M:%S')}  {text}"
         self._changes.append(line)
         self._refresh_changes_button()
         if self._changes_window is not None:
             self._changes_window.append_line(line)
+
+    # ------------------------------------------------------------------
+    # Composite tab
+    # ------------------------------------------------------------------
+
+    def _send_channel_from_panel(self, dtype: str, name: str, changes: dict) -> None:
+        """A single-channel toggle on the Composite tab: the ordinary update
+        path, plus the channel tab's widget so both tabs agree at once."""
+        self.on_device_value_changed(dtype, name, dict(changes))
+        widget = self.device_widgets.get(f"{dtype}.{name}")
+        cfg = self.config_data.get(dtype, {}).get(name)
+        if widget is not None and cfg is not None:
+            widget.update_from_config(cfg)
+
+    def _refresh_composite(self) -> None:
+        if self.composite_panel is not None:
+            self.composite_panel.set_config(self.config_data)
+
+    # ------------------------------------------------------------------
+    # Summary strip, trust, make safe, telemetry
+    # ------------------------------------------------------------------
+
+    def _refresh_summary(self) -> None:
+        """Everything the strip above the tabs shows, from what this GUI knows."""
+        samples = self._telemetry_samples
+        self.summary.set_trust(self._trust)
+        live_od = {k.split("/", 1)[1]: s.value for k, s in samples.items()
+                   if k.startswith("live_od/") and getattr(s, "ok", False)
+                   and getattr(s, "age_s", 99.) < 10.}
+        self.summary.set_run(self._run_pending, live_od)
+        state = samples.get("interlock/state")
+        enabled = samples.get("interlock/magnets_enabled")
+        fresh = state is not None and state.ok and state.age_s < 15.
+        self.summary.set_interlock(state.value if fresh else None,
+                                   enabled.value if fresh and enabled is not None
+                                   and enabled.ok else None)
+        self.summary.set_busy(max(self._busy_until - time.monotonic(), 0.))
+        panel = self.composite_panel
+        if panel is None:
+            self.summary.set_hazards([])
+            self.summary.set_watchdog_warnings([])
+            return
+        hazards = panel.hazards()
+        self.summary.set_hazards(hazards)
+        allowed, why = panel.ops_allowed()
+        self.summary.set_make_safe_enabled(allowed, "" if allowed else f"Cannot send: {why}.")
+        warnings = [f"{h['title']}: watchdog acts in "
+                    f"{int((h['watchdog'] or {}).get('fires_in_s') or 0)} s"
+                    for h in hazards if (h.get("watchdog") or {}).get("warned")]
+        self.summary.set_watchdog_warnings(warnings)
+
+    def _show_composite_device(self, key: str) -> None:
+        if self.composite_panel is None or self._composite_scroll is None:
+            return
+        self.tab_widget.setCurrentWidget(self._composite_scroll)
+        self.composite_panel.show_device(key)
+
+    def _make_safe(self) -> None:
+        panel = self.composite_panel
+        if panel is None:
+            return
+        plans = []
+        for h in panel.hazards():
+            plan = panel.safe_plan(h["key"])
+            plans.append({"key": h["key"], "title": h["title"], "text": h["text"],
+                          "action": plan[2] if plan else "", "action_ok": plan is not None})
+        if not plans:
+            return
+        dialog = MakeSafeDialog(plans, self)
+        if dialog.exec() != MakeSafeDialog.DialogCode.Accepted:
+            return
+        refused = panel.make_safe(dialog.selected())
+        if refused:
+            self._record_line("[make safe] not sent for: " + ", ".join(refused) +
+                              " (see their cards)")
+        self._show_composite_device(dialog.selected()[0] if dialog.selected() else "")
+
+    def _trust_state(self) -> None:
+        reason = (self._trust or {}).get("reason", "")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Trust the device state")
+        box.setText(
+            "The device state is untrusted: " + str(reason) + ".\n\n"
+            "Trust it only if you know the hardware is as the tabs show it (for example "
+            "you checked the coils and switches, or you just set every channel again). "
+            "Trusting changes nothing on the hardware; it is recorded in the journal "
+            "with your name.")
+        yes = box.addButton("Trust the state file", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        operator = self.composite_panel.operator_name() if self.composite_panel else ""
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        self._send_request({"type": "trust_ack", "operator": operator, "client": host},
+                           self._on_trust_reply)
+
+    def _on_trust_reply(self, reply: dict) -> None:
+        if reply.get("status") == "ok":
+            self._trust = reply.get("trust") or {"trusted": True}
+            if self.composite_panel is not None:
+                self.composite_panel.set_trust(self._trust)
+        else:
+            QMessageBox.warning(self, "Trust the device state",
+                                f"The monitor server did not accept it: {reply.get('msg')}")
+        self._refresh_summary()
+
+    def _clear_fence(self) -> None:
+        """An operator asserts the announced run is dead (it never took the
+        core): lift its fence.  Names the fence by its token, so a newer run's
+        fence is never lifted by a stale click."""
+        pending = self._run_pending or {}
+        token = pending.get("token")
+        if not token:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Clear the run fence")
+        box.setText(
+            f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) announced "
+            "itself and has not taken the core.\n\n"
+            "Clear the fence only if that run is dead (it stopped before its kernel "
+            "started: a compile error, an exception, a closed console). If it is still "
+            "starting, a composite op sent now can be cut off half-way when it takes the "
+            "core.\n\nRecorded in the journal with your name.")
+        yes = box.addButton("Clear the fence", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        operator = self.composite_panel.operator_name() if self.composite_panel else ""
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        self._send_request({"type": "clear_run_pending", "token": token,
+                            "operator": operator, "client": host}, self._on_fence_reply)
+
+    def _on_fence_reply(self, reply: dict) -> None:
+        if reply.get("status") == "ok":
+            self._run_pending = None
+            if self.composite_panel is not None:
+                self.composite_panel.set_run_pending(None)
+        else:
+            # typically: the run took the core or ended meanwhile
+            self._record_line(f"[fence] not cleared: {reply.get('msg')}")
+            self.request_state()
+        self._refresh_summary()
+
+    def _send_request(self, obj: dict, callback) -> None:
+        worker = _RequestWorker(obj, self)
+        worker.done.connect(callback)
+        worker.finished.connect(lambda w=worker: self._workers.remove(w)
+                                if w in self._workers else None)
+        worker.finished.connect(worker.deleteLater)
+        self._workers.append(worker)
+        worker.start()
+
+    def _load_journal(self) -> None:
+        win = self._changes_window
+        if win is None:
+            return
+        self._send_request({"type": "get_journal", "n": JOURNAL_LOAD_N},
+                           lambda reply: (self._changes_window.show_journal(reply)
+                                          if self._changes_window is not None else None))
+
+    def _setup_telemetry(self) -> None:
+        self._telemetry_timer = QTimer(self)
+        self._telemetry_timer.timeout.connect(self._pull_telemetry)
+        self._telemetry_timer.start(TELEMETRY_PULL_MS)
+        if self._telemetry is not None:
+            try:
+                self._telemetry.start()
+            except Exception:
+                _LOG.exception("telemetry hub failed to start; no measured values")
+                self._telemetry = None
+
+    def _pull_telemetry(self) -> None:
+        """Measured values into the cards and the strip -- and polled at all
+        only while this window (or the dashboard panel it is embedded in) is
+        visible."""
+        hub = self._telemetry
+        if hub is not None:
+            central = self.centralWidget()
+            hub.set_active(bool(central is not None and central.isVisible()))
+            self._telemetry_samples = hub.samples()
+            if self.composite_panel is not None:
+                self.composite_panel.set_telemetry(self._telemetry_samples)
+        if self.composite_panel is not None:
+            self.composite_panel.set_busy(max(self._busy_until - time.monotonic(), 0.))
+        self._refresh_summary()
 
     # ------------------------------------------------------------------
 
@@ -2171,7 +2572,12 @@ class DeviceStateGUI(QMainWindow):
                 scroll.ensureWidgetVisible(first_match)
 
     def _apply_active_search(self, query: str) -> None:
-        """Apply *query* to the currently visible tab's devices only."""
+        """Apply *query* to the currently visible tab's devices only (on the
+        Composite tab: its cards, by title, group, ops and fields)."""
+        if self._composite_scroll is not None \
+                and self.tab_widget.currentWidget() is self._composite_scroll:
+            self.composite_panel.apply_search(query)
+            return
         prefixes = ["dds", "dac", "ttl"]
         idx = self.tab_widget.currentIndex()
         if 0 <= idx < len(prefixes):
@@ -2198,6 +2604,21 @@ class DeviceStateGUI(QMainWindow):
         else:
             # Reconcile incrementally so we never clobber busy widgets.
             self._reconcile_config(new_config)
+        panel = self.composite_panel
+        if panel is not None and state.get("composite_state") is not None:
+            panel.set_device_state(state.get("composite_state"))
+        if "trust" in state and state.get("trust") is not None:
+            self._trust = state.get("trust")
+            if panel is not None:
+                panel.set_trust(self._trust)
+        if "run_pending" in state:
+            self._run_pending = state.get("run_pending")
+            if panel is not None:
+                panel.set_run_pending(self._run_pending)
+        if panel is not None and isinstance(state.get("runner"), dict):
+            panel.set_runner(state["runner"])
+        self._refresh_composite()
+        self._refresh_summary()
 
     def _on_state_failed(self) -> None:
         """Snapshot fetch failed — surface as a connection problem."""
@@ -2229,8 +2650,51 @@ class DeviceStateGUI(QMainWindow):
                     widget.update_from_config(cfg)
 
     def _on_state_broadcast(self, payload: dict) -> None:
-        """Handle a UDP ``state_update`` pushed by the server."""
-        if payload.get("type") != "state_update":
+        """Handle a UDP broadcast pushed by the server: channel updates, op
+        results, end-of-run states, trust, the run fence, scenes, watchdogs
+        and busy notices."""
+        mtype = payload.get("type")
+        panel = self.composite_panel
+        if mtype == "op_result":
+            if panel is not None:
+                panel.on_op_result(payload)
+            return
+        if mtype == "state_reset":
+            # an experiment's end state replaced the file: resync everything
+            self.request_state()
+            return
+        if mtype == "trust":
+            self._trust = payload.get("trust")
+            if panel is not None:
+                panel.set_trust(self._trust)
+            self._refresh_summary()
+            return
+        if mtype == "run_pending":
+            self._run_pending = payload.get("run_pending")
+            if panel is not None:
+                panel.set_run_pending(self._run_pending)
+            self._refresh_summary()
+            return
+        if mtype == "busy":
+            try:
+                seconds = float(payload.get("seconds", 0.))
+            except (TypeError, ValueError):
+                seconds = 0.
+            self._busy_until = max(self._busy_until, time.monotonic() + seconds)
+            if panel is not None:
+                panel.set_busy(seconds)
+            self._refresh_summary()
+            return
+        if mtype == "scene":
+            if panel is not None:
+                panel.on_scene(payload)
+            return
+        if mtype == "watchdog":
+            if panel is not None:
+                panel.on_watchdog(payload)
+            self._refresh_summary()
+            return
+        if mtype != "state_update":
             return
         version = payload.get("version")
         if version is None:
@@ -2263,6 +2727,7 @@ class DeviceStateGUI(QMainWindow):
         else:
             self._record_change(dtype, name, dict(dev), changes)
         dev.update(changes)
+        self._refresh_composite()
         widget = self.device_widgets.get(f"{dtype}.{name}")
         if widget is None:
             # Unknown device → rebuild so a widget gets created.
@@ -2394,6 +2859,15 @@ class DeviceStateGUI(QMainWindow):
         if win is not None:
             self._changes_window = None
             win.close()
+        if self.composite_panel is not None:
+            self.composite_panel.shutdown()
+        timer = getattr(self, "_telemetry_timer", None)
+        if timer is not None:
+            timer.stop()
+        if self._telemetry is not None:
+            self._telemetry.stop()
+        for worker in list(self._workers):
+            worker.wait(2000)
         checker = getattr(self, "status_checker", None)
         if checker is not None:
             checker.stop()
@@ -2454,6 +2928,9 @@ class DeviceStateGUI(QMainWindow):
 
         # Hand off to the background sender (coalesces rapid same-device edits).
         self._update_sender.enqueue(device_type, device_name, updated_config)
+        # The server's echo of our own edit is dropped as already applied, so
+        # the Composite tab's lamps follow the optimistic value from here.
+        self._refresh_composite()
 
     def _on_update_ack(self, device_type: str, device_name: str, ack: dict) -> None:
         """Server accepted our delta."""
