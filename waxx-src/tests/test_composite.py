@@ -93,6 +93,50 @@ def test_validate_rejects_payload_without_host_and_unknown_layout():
         OpTable([CompositeDevice(key="monitor", title="m")])
 
 
+def _switch(**kw):
+    return CompositeDevice(key="sw", title="Switch",
+                           ops=(Op("on", "On", code="pass"), Op("off", "Off", code="pass"),
+                                Op("zero", "Zero", code="pass")), **kw)
+
+
+def test_lamp_click_ops():
+    raw = cmp.Lamp("switch", "ttl", "sw")
+    routed = cmp.Lamp("igbt", "ttl", "igbt", ops=("", "off"))
+    assert raw.click_op(True) is None and raw.click_op(False) is None   # flip the channel
+    assert routed.click_op(True) == "off"
+    assert routed.click_op(False) == ""                                 # no click
+
+
+def test_pill_ops_default_to_on_off_then_safe_op():
+    assert _switch().pill_click_ops() == ("on", "off")
+    no_off = CompositeDevice(key="c", title="c", ops=(Op("ramp_down", "Down", code="pass"),),
+                             safe_op="ramp_down")
+    assert no_off.pill_click_ops() == ("", "ramp_down")
+    assert _switch(pill_ops=("", "zero")).pill_click_ops() == ("", "zero")
+
+
+@pytest.mark.parametrize("kw, match", [
+    (dict(lamps=(cmp.Lamp("l", "ttl", "x", ops=("on",)),)), "op when off"),
+    (dict(lamps=(cmp.Lamp("l", "ttl", "x", ops=("on", "nope")),)), "unknown op 'nope'"),
+    (dict(pill_ops=("on",)), "pill_ops must be"),
+    (dict(pill_ops=("", "nope")), "unknown op 'nope'"),
+])
+def test_validate_rejects_bad_click_ops(kw, match):
+    with pytest.raises(DefinitionError, match=match):
+        _switch(**kw).validate()
+
+
+def test_cross_device_click_refs_are_checked_by_the_table():
+    other = _switch(lamps=(cmp.Lamp("coil", "ttl", "igbt", ops=("", "coil.off")),))
+    coil = CompositeDevice(key="coil", title="Coil", ops=(Op("off", "Off", code="pass"),))
+    OpTable([other, coil])                                  # resolves
+    with pytest.raises(DefinitionError, match="unknown op 'coil.off'"):
+        OpTable([other])
+    bad = _switch(lamps=(cmp.Lamp("coil", "ttl", "igbt", ops=("", "coil.nope")),))
+    with pytest.raises(DefinitionError, match="unknown op 'coil.nope'"):
+        OpTable([bad, coil])
+
+
 def test_arg_checks_hard_soft_and_custom():
     v = Arg("v", "Volts", unit="V", minimum=0., maximum=5., warn_above=4.,
             check=lambda value, ctx: Check.warn("custom") if value == 3. else None)

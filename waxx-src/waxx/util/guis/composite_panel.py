@@ -12,6 +12,14 @@ experiment) set it.  Measured values (telemetry: a supply's output current,
 the interlock state) are separate chips next to them, dashed, never in place
 of a setpoint.
 
+Lamps and the state pill are buttons.  A lamp flips its channel through the
+ordinary channel path, or sends the op its definition names instead
+(``Lamp.ops``: a coil's IGBT lamp ramps the coil down rather than opening the
+IGBT under current).  The pill sends the device's "off" op while anything is
+on and its "on" op while off (``CompositeDevice.pill_ops``); switching on
+from the pill always names the values it sends first, since a collapsed card
+does not show them.
+
 Fields: a value typed but not yet applied is shown with an orange fill and
 is not overwritten by incoming state; it stays so until an op that sends it
 *succeeds* (Esc reverts it to the hardware value).  The wheel only changes a
@@ -179,9 +187,21 @@ def _pill_button_css(color: str, border: str, background: str = theme.BG_BUTTON)
 
 
 def _state_pill_css(level: str) -> str:
+    """The state pill is a button; disabled it looks the same (it still
+    shows the state), only the hover outline is gone."""
     bg = _PILL_BG.get(level, "#454545")
-    return (f"QLabel {{ background: {bg}; color: white; border-radius: 9px;"
-            f" padding: 2px 10px; font-size: 12px; font-weight: 600; }}")
+    base = (f"background: {bg}; color: white; border: 1px solid {bg}; border-radius: 9px;"
+            f" padding: 2px 10px; font-size: 12px; font-weight: 600;")
+    return (f"QPushButton {{ {base} }}"
+            f"QPushButton:hover {{ border-color: {theme.FG_STRONG}; }}"
+            f"QPushButton:disabled {{ {base} }}")
+
+
+def _lamp_button_css(border: str) -> str:
+    return (f"QPushButton {{ background: {CHIP_BG}; border: 1px solid {border};"
+            f" border-radius: 10px; padding: 0px; }}"
+            f"QPushButton:hover {{ background: {theme.BG_BUTTON_HOVER}; }}"
+            f"QPushButton:disabled {{ background: {CHIP_BG}; }}")
 
 
 def _card_css(accent: str) -> str:
@@ -785,6 +805,64 @@ class _Lamp(QLabel):
         self.setToolTip(tooltip)
 
 
+class _LampButton(QPushButton):
+    """A lamp that is a button: coloured dot, name, state word, as a chip.
+    What a click does is the card's business (``CompositeCard._lamp_clicked``).
+    The rich text sits in a label the clicks pass through, because a
+    QPushButton cannot colour parts of its own text."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._label = QLabel(text)
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._label.setStyleSheet(f"color: {theme.FG_MUTED}; background: transparent;"
+                                  f" border: none; font-size: 12px;")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 3, 10, 3)
+        row.addWidget(self._label)
+        self._css = ""
+        self._set_css(CHIP_BORDER)
+
+    def text(self) -> str:
+        """What the chip shows (the button's own text stays empty)."""
+        return self._label.text()
+
+    def sizeHint(self):
+        return self.layout().sizeHint()
+
+    def minimumSizeHint(self):
+        return self.layout().sizeHint()
+
+    def _set_css(self, border: str) -> None:
+        css = _lamp_button_css(border)
+        if css != self._css:
+            self._css = css
+            self.setStyleSheet(css)
+
+    def set_state(self, label: str, on: bool | None, on_text: str, off_text: str,
+                  on_level: str, tooltip: str = "") -> None:
+        if on is None:
+            color, word = theme.FG_DISABLED, "?"
+        elif on:
+            color, word = _LEVEL_COLOR.get(on_level, OK_TEXT), on_text
+        else:
+            color, word = theme.OFF, off_text
+        word_color = color if on else theme.FG_MUTED
+        text = (f"<span style='color:{color}'>●</span> {label} "
+                f"<span style='color:{word_color}'>{word}</span>")
+        if text != self._label.text():
+            self._label.setText(text)
+            self.updateGeometry()
+        self._set_css(color if on else CHIP_BORDER)
+        self.setToolTip(tooltip)
+
+    def set_clickable(self, clickable: bool) -> None:
+        self.setEnabled(clickable)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if clickable
+                       else Qt.CursorShape.ArrowCursor)
+
+
 # --- card ------------------------------------------------------------------------
 
 class _HoverWatcher(QObject):
@@ -818,7 +896,8 @@ class CompositeCard(QFrame):
         self.tables: dict[str, _TableEditor] = {}
         self.op_buttons: dict[str, list[QPushButton]] = {}
         self.menu_actions: dict[str, QPushButton] = {}
-        self.lamps: list[tuple[cmp.Lamp, _Lamp]] = []
+        self.lamps: list[tuple[cmp.Lamp, _LampButton]] = []
+        self._lamp_on: dict[int, bool | None] = {}   # id(lamp) -> on, at the last refresh
         self.readouts: list[tuple[cmp.Readout, QLabel]] = []
         self.measured: list[tuple[cmp.Measured, _Lamp]] = []
         self.infos: list[tuple[cmp.Info, QLabel]] = []
@@ -875,8 +954,10 @@ class CompositeCard(QFrame):
         self.summary = QLabel("")
         self.summary.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 11px;")
         head.addWidget(self.summary)
-        self.state_pill = QLabel("")
+        self.state_pill = QPushButton("")
+        self.state_pill.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.state_pill.setStyleSheet(_state_pill_css("unknown"))
+        self.state_pill.clicked.connect(self._pill_clicked)
         head.addWidget(self.state_pill)
         head.addWidget(self._menu_button())
         box.addLayout(head)
@@ -890,7 +971,8 @@ class CompositeCard(QFrame):
         if d.lamps or d.readouts or d.measured:
             chips = FlowLayout(hspacing=5, vspacing=5)
             for lamp in d.lamps:
-                w = _Lamp(lamp.label)
+                w = _LampButton(lamp.label)
+                w.clicked.connect(lambda _=False, lp=lamp: self._lamp_clicked(lp))
                 chips.addWidget(w)
                 self.lamps.append((lamp, w))
             for readout in d.readouts:
@@ -1175,7 +1257,6 @@ class CompositeCard(QFrame):
         level = "hazard" if self.hazard else status.level
         text = status.text or ("" if status.level == "unknown" else status.level)
         self.state_pill.setText(text)
-        self.state_pill.setToolTip(status.detail or text)
         pill = _state_pill_css(level)
         if self.state_pill.styleSheet() != pill:
             self.state_pill.setStyleSheet(pill)
@@ -1183,6 +1264,7 @@ class CompositeCard(QFrame):
         self._set_accent(_ACCENT.get(level, theme.BORDER))
         for lamp, widget in self.lamps:
             on = ctx.is_on(lamp.dtype, lamp.name)
+            self._lamp_on[id(lamp)] = on
             widget.set_state(lamp.label, on, lamp.on_text, lamp.off_text, lamp.on_level,
                              lamp.tooltip or f"{lamp.dtype}.{lamp.name}")
         for readout, widget in self.readouts:
@@ -1334,6 +1416,79 @@ class CompositeCard(QFrame):
                 b.setToolTip(f"{tip}\n\n{why}".strip() if not allowed else tip)
         for key, item in self.menu_actions.items():
             item.setEnabled(allowed and key not in self._pending_ops)
+        self._refresh_clicks(allowed, why)
+
+    # -- lamps and the state pill as buttons ------------------------------------------
+
+    def pill_action(self) -> str:
+        """The op reference a click on the state pill sends now: the "on" op
+        while off, the "off" op while anything is on; ``""`` when the state
+        is unknown or the device has no op for it."""
+        level = "hazard" if self.hazard else self.status.level
+        if level == "unknown":
+            return ""
+        on_ref, off_ref = self.device.pill_click_ops()
+        return on_ref if level == "off" else off_ref
+
+    def _op_click(self, ref: str, allowed: bool, why: str) -> tuple[bool, str]:
+        """(clickable, tooltip line) for a click that sends op ``ref``."""
+        if not ref:
+            return False, "No click in this state -- use the card's buttons."
+        card, key = self.panel.resolve_ref(self, ref)
+        if card is None:
+            return False, f"{ref}: no such card on this tab"
+        op = card.device.get_op(key)
+        where = "" if card is self else f"{card.device.title}: "
+        if not allowed:
+            return False, f"Click: {where}{op.label} -- not now: {why}"
+        if key in card._pending_ops:
+            return False, f"{where}{op.label} is already in flight"
+        return True, f"Click: {where}{op.label}" + (f"\n{op.tooltip}" if op.tooltip else "")
+
+    def _refresh_clicks(self, allowed: bool, why: str) -> None:
+        for lamp, widget in self.lamps:
+            on = self._lamp_on.get(id(lamp))
+            base = lamp.tooltip or f"{lamp.dtype}.{lamp.name}"
+            ref = None if on is None else lamp.click_op(on)
+            if on is None:
+                ok, line = False, "State unknown -- no click."
+            elif ref is None:
+                ok = True
+                line = (f"Click: {lamp.off_text if on else lamp.on_text} -- flips "
+                        f"{lamp.dtype}.{lamp.name} directly, as the {lamp.dtype.upper()} "
+                        f"tab does.")
+            else:
+                ok, line = self._op_click(ref, allowed, why)
+            widget.set_clickable(ok)
+            widget.setToolTip(f"{base}\n\n{line}")
+        ref = self.pill_action()
+        ok, line = self._op_click(ref, allowed, why) if ref else (False, "")
+        self.state_pill.setEnabled(ok)
+        self.state_pill.setCursor(Qt.CursorShape.PointingHandCursor if ok
+                                  else Qt.CursorShape.ArrowCursor)
+        detail = self.status.detail or self.state_pill.text()
+        self.state_pill.setToolTip(f"{detail}\n\n{line}".strip())
+
+    def _pill_clicked(self) -> None:
+        ref = self.pill_action()
+        if not ref:
+            return
+        # Switching on from the header sends the fields' values, which a
+        # collapsed card does not show: that click always says them first.
+        turning_on = ("hazard" if self.hazard else self.status.level) == "off"
+        self.panel.trigger_ref(self, ref, ask=turning_on)
+
+    def _lamp_clicked(self, lamp: cmp.Lamp) -> None:
+        on = self.ctx().is_on(lamp.dtype, lamp.name)
+        if on is None:
+            return
+        ref = lamp.click_op(on)
+        if ref is None:
+            key = "ttl_state" if lamp.dtype == "ttl" else "sw_state"
+            self.panel.send_channel(lamp.dtype, lamp.name, {key: 0 if on else 1})
+            self.refresh()
+        elif ref:
+            self.panel.trigger_ref(self, ref)
 
     # -- ops ------------------------------------------------------------------------
 
@@ -1377,10 +1532,13 @@ class CompositeCard(QFrame):
                 parts.append(f"{spec.title} {spec.format(args[name])}")
         return ", ".join(parts)
 
-    def trigger(self, key: str, overrides: dict | None = None, confirmed: bool = False) -> bool:
+    def trigger(self, key: str, overrides: dict | None = None, confirmed: bool = False,
+                ask: bool = False) -> bool:
         """Collect, check, confirm and send op ``key``.  Returns whether sent.
-        Refusals are shown on the card, not in a pop-up."""
+        Refusals are shown on the card, not in a pop-up.  ``ask`` confirms
+        even a clean op when it sends values, naming them."""
         op = self.device.get_op(key)
+        ask = ask and bool(op.args)
         entry = self.panel.table.get(f"{self.device.key}.{key}")
         allowed, why = self.panel.ops_allowed()
         if not allowed:
@@ -1393,7 +1551,7 @@ class CompositeCard(QFrame):
             self.set_footer(f"✕ {op.label} not sent: {text}", "error")
             return False
         warnings = [c.message for c in checks if c.level == "warn"]
-        if not confirmed and (warnings or op.confirm or op.danger):
+        if not confirmed and (warnings or op.confirm or op.danger or ask):
             lines = []
             if op.confirm:
                 lines.append(op.confirm)
@@ -2336,6 +2494,27 @@ class CompositePanel(QWidget):
             if card.device.key == key:
                 return card
         return None
+
+    def resolve_ref(self, card: CompositeCard, ref: str) -> tuple[CompositeCard | None, str]:
+        """(card, op key) of a lamp / pill op reference: ``"key"`` on
+        ``card``, ``"device.key"`` on another card."""
+        if "." in ref:
+            key, op = ref.split(".", 1)
+            return self._card(key), op
+        return card, ref
+
+    def trigger_ref(self, card: CompositeCard, ref: str, ask: bool = False) -> bool:
+        """Send the op a lamp or pill of ``card`` names, through the owning
+        card's ordinary path (checks, confirmations, its footer)."""
+        target, key = self.resolve_ref(card, ref)
+        if target is None:
+            card.set_footer(f"✕ {ref}: no such card on this tab", "error")
+            return False
+        sent = target.trigger(key, ask=ask)
+        if sent and target is not card:
+            card.set_footer(f"→ {target.device.title}: {target.device.get_op(key).label} "
+                            f"sent (that card shows the result)", "partial")
+        return sent
 
     def _on_requested(self, req: int, reply: dict) -> None:
         callback = self._requests.pop(req, None)

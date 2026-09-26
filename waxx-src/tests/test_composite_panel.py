@@ -304,6 +304,113 @@ def test_channel_toggle_uses_the_channel_path(panel):
     assert panel.channel_sends[-1] == ("ttl", "hold", {"ttl_state": 1})
 
 
+def test_lamp_is_a_button_that_flips_its_channel(panel):
+    card = _card(panel)
+    lamp, button = card.lamps[0]
+    assert isinstance(button, cp.QPushButton) and button.isEnabled()
+    assert "Click: off" in button.toolTip()
+    button.click()
+    assert panel.channel_sends[-1] == ("ttl", "sw", {"ttl_state": 0})
+    assert panel._sender.sent == []                                 # no op for a bare lamp
+    # a bare flip goes the channel path, which works without the monitor too
+    panel.set_monitor_state(STATES.NOT_READY, reachable=True)
+    assert button.isEnabled()
+
+
+def test_state_pill_is_a_button_off_while_on_and_on_naming_its_values(panel):
+    card = _card(panel)
+    assert card.state_pill.text() == "ON" and card.state_pill.isEnabled()
+    assert "Click: Off" in card.state_pill.toolTip()
+    card.state_pill.click()
+    assert panel._sender.sent[-1]["op"] == "beam.off"
+    assert panel.confirm_answers == []                              # switching off: no question
+    panel.config["ttl"]["sw"]["ttl_state"] = 0
+    card._pending_ops.clear()
+    panel.refresh()
+    assert card.state_pill.text() == "off" and "Click: On" in card.state_pill.toolTip()
+    panel.answer = False
+    card.state_pill.click()
+    assert panel._sender.sent[-1]["op"] == "beam.off"               # cancelled: nothing new
+    assert "Setpoint 2.00 V" in panel.confirm_answers[-1][3]        # the values it would send
+    panel.answer = True
+    card.state_pill.click()
+    assert panel._sender.sent[-1]["op"] == "beam.on"
+    assert panel._sender.sent[-1]["args"] == {"v": pytest.approx(2.0)}
+
+
+def test_state_pill_is_not_clickable_when_unknown_or_ops_are_refused(panel):
+    card = _card(panel)
+    panel.set_monitor_state(STATES.NOT_READY, reachable=True)
+    assert not card.state_pill.isEnabled()
+    assert "not now" in card.state_pill.toolTip()
+    panel.set_monitor_state(STATES.READY, reachable=True)
+    del panel.config["ttl"]["sw"]
+    panel.refresh()
+    assert not card.state_pill.isEnabled()
+    assert not card.lamps[0][1].isEnabled()                         # state unknown
+
+
+ROUTED = CompositeDevice(
+    key="magnet", title="Magnet",
+    ops=(Op("off", "Off (ramp down)", code="expt.magnet.off()"),
+         Op("flip", "Flip", code="expt.magnet.flip()", confirm="Flip it?")),
+    lamps=(Lamp("IGBT", "ttl", "igbt", "closed", "open", "warn", ops=("", "off")),
+           Lamp("polarity", "ttl", "pol", ops=("flip", "flip")),
+           Lamp("other", "ttl", "igbt2", ops=("", "beam.off"))),
+    state=lambda ctx: Status("on" if ctx.is_on("ttl", "igbt") else "off", "x"),
+)
+
+
+@pytest.fixture
+def routed(qapp):
+    p = cp.CompositePanel([ROUTED, DEVICE])
+    p.confirm_answers = []
+    p.confirm = lambda title, text, verb="Send", danger=False: (
+        p.confirm_answers.append((title, text, danger, verb)) or True)
+    cfg = {k: {n: dict(c) for n, c in v.items()} for k, v in CONFIG.items()}
+    cfg["ttl"].update({"igbt": {"ch": 5, "ttl_state": 1}, "pol": {"ch": 6, "ttl_state": 0},
+                       "igbt2": {"ch": 7, "ttl_state": 1}})
+    p.set_config(cfg)
+    p.set_monitor_state(STATES.READY, reachable=True)
+    p.set_monitor_detail({"composite_ops": {"registered": True, "hash": p.table.hash,
+                                            "count": len(p.table)}})
+    p.refresh()
+    yield p
+    p.shutdown()
+
+
+def test_routed_lamps_send_their_ops_not_a_channel_flip(routed):
+    card = routed.cards[0]
+    igbt, pol, other = (b for _, b in card.lamps)
+    assert "Click: Off (ramp down)" in igbt.toolTip()
+    igbt.click()
+    assert routed._sender.sent[-1]["op"] == "magnet.off"
+    pol.click()                                                    # the op's own confirm
+    assert routed._sender.sent[-1]["op"] == "magnet.flip"
+    assert routed.confirm_answers[-1][1] == "Flip it?"
+    other.click()                                                  # another card's op
+    assert routed._sender.sent[-1]["op"] == "beam.off"
+    assert "Beam: Off sent" in card.footer.text()
+
+
+def test_routed_lamp_offers_no_click_where_it_names_no_op(routed):
+    card = routed.cards[0]
+    routed.config["ttl"]["igbt"]["ttl_state"] = 0                  # IGBT open
+    routed.refresh()
+    igbt = card.lamps[0][1]
+    assert not igbt.isEnabled() and "No click in this state" in igbt.toolTip()
+    n = len(routed._sender.sent)
+    card._lamp_clicked(card.lamps[0][0])                           # even if it got a click
+    assert len(routed._sender.sent) == n
+
+
+def test_routed_lamps_wait_for_the_monitor(routed):
+    card = routed.cards[0]
+    routed.set_monitor_state(STATES.NOT_READY, reachable=True)
+    assert not card.lamps[0][1].isEnabled()
+    assert "not now" in card.lamps[0][1].toolTip()
+
+
 def test_table_add_row_and_payload(panel):
     card = _card(panel)
     table = card.tables["rows"]
@@ -382,6 +489,27 @@ def test_broadcasts_reach_the_panel(gui):
     assert any("[op] beam.off #3" in line for line in gui._changes)
     gui.on_connection_failed()
     assert not panel.ops_allowed()[0]
+
+
+def test_lamp_click_updates_the_ttl_tab_too(gui):
+    sent = []
+
+    class Sender:
+        def enqueue(self, *a):
+            sent.append(a)
+
+        def stop(self):
+            pass
+
+        def wait(self, *a):
+            return True
+
+    gui._update_sender = Sender()
+    gui.composite_panel.refresh()                      # (set_config coalesces)
+    lamp = gui.composite_panel.cards[0].lamps[0][1]
+    lamp.click()
+    assert sent[-1] == ("ttl", "sw", {"ttl_state": 0})
+    assert not gui.device_widgets["ttl.sw"].state_button.isChecked()
 
 
 def test_panel_toggle_updates_the_ttl_tab_too(gui, monkeypatch):

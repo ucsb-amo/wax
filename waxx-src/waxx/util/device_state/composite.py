@@ -483,7 +483,15 @@ class Op:
 @dataclass(frozen=True)
 class Lamp:
     """On/off of one channel: a DDS RF switch (``sw_state``) or a TTL.
-    ``on_level`` is how "on" is coloured: ``"ok"``, ``"warn"`` or ``"err"``."""
+    ``on_level`` is how "on" is coloured: ``"ok"``, ``"warn"`` or ``"err"``.
+
+    A lamp is also a button.  Without ``ops`` a click flips the channel
+    through the ordinary channel path, as the DDS/TTL tabs do.  ``ops`` =
+    ``(op when off, op when on)`` sends that op instead, with its checks and
+    confirmations -- for a line whose bare flip would skip what the device's
+    ops guard (a coil's IGBT, an H-bridge).  Each is an op key of this device,
+    ``"device.op"`` of another, or ``""`` for no click in that state, so
+    ``("", "")`` leaves the lamp an indicator only."""
 
     label: str
     dtype: str
@@ -492,6 +500,14 @@ class Lamp:
     off_text: str = "off"
     on_level: str = "ok"
     tooltip: str = ""
+    ops: tuple = ()
+
+    def click_op(self, on: bool) -> str | None:
+        """What a click does in this state: an op reference, ``""`` (nothing)
+        or None (flip the channel)."""
+        if not self.ops:
+            return None
+        return self.ops[1] if on else self.ops[0]
 
 
 @dataclass(frozen=True)
@@ -622,6 +638,9 @@ class CompositeDevice:
     * ``max_on_s`` -- after this long hazardous, GUIs warn; with the
       watchdog armed, the server then sends ``safe_op`` itself.
     * ``measured`` -- :class:`Measured` chips from telemetry sources.
+    * ``pill_ops`` -- ``(op when off, op when on)`` of a click on the state
+      pill, references as in :attr:`Lamp.ops`.  None: ``"on"`` / ``"off"``
+      where the device has them, else its ``safe_op`` to switch off.
     """
 
     key: str
@@ -642,6 +661,21 @@ class CompositeDevice:
     safe_args: Any = None               # {arg: SI value}
     max_on_s: float | None = None
     measured: tuple = ()
+    pill_ops: tuple | None = None
+
+    def pill_click_ops(self) -> tuple:
+        """(op when off, op when on) for the state pill; ``""`` = no click."""
+        if self.pill_ops is not None:
+            return tuple(self.pill_ops)
+        keys = {op.key for op in self.ops}
+        return ("on" if "on" in keys else "",
+                "off" if "off" in keys else self.safe_op)
+
+    def click_refs(self) -> list[tuple[str, str]]:
+        """(where, op reference) of every lamp and pill click, for validation."""
+        refs = [(f"lamp {lamp.label!r}", ref) for lamp in self.lamps for ref in lamp.ops]
+        refs += [("pill_ops", ref) for ref in self.pill_click_ops()]
+        return [(where, ref) for where, ref in refs if ref]
 
     def hazard_text(self, ctx: "Context") -> str | None:
         if self.hazard is None:
@@ -800,6 +834,18 @@ class CompositeDevice:
             if not isinstance(m, Measured) or "/" not in m.source:
                 raise DefinitionError(f"{where}: measured entries must be Measured with a "
                                       f"'provider/key' source")
+        for lamp in self.lamps:
+            if lamp.ops and (len(lamp.ops) != 2 or not all(isinstance(r, str) for r in lamp.ops)):
+                raise DefinitionError(f"{where}: lamp {lamp.label!r} ops must be "
+                                      f"(op when off, op when on), got {lamp.ops!r}")
+        if self.pill_ops is not None and (
+                len(self.pill_ops) != 2 or not all(isinstance(r, str) for r in self.pill_ops)):
+            raise DefinitionError(f"{where}: pill_ops must be (op when off, op when on), "
+                                  f"got {self.pill_ops!r}")
+        for what, ref in self.click_refs():
+            # "device.op" references are checked by OpTable, which knows the others
+            if "." not in ref and ref not in op_keys:
+                raise DefinitionError(f"{where}: {what} names unknown op {ref!r}")
         for row in self.layout:
             refs_ops, refs_fields = (), ()
             if isinstance(row, (Buttons, Menu)):
@@ -942,6 +988,12 @@ class OpTable:
                                        op_signature(name, body, d, op)))
         self.entries = tuple(entries)
         self._by_name = {e.name: e for e in self.entries}
+        for d in self.devices:
+            for what, ref in d.click_refs():
+                entry = self._by_name.get(ref) if "." in ref else None
+                if "." in ref and (entry is None or entry.op is None):
+                    raise DefinitionError(f"composite device {d.key!r}: {what} names "
+                                          f"unknown op {ref!r}")
         self.hash = hashlib.sha1(
             "".join(e.signature for e in self.entries).encode()).hexdigest()[:16]
 
