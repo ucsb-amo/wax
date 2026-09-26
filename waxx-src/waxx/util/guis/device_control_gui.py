@@ -2771,6 +2771,10 @@ class DeviceStateGUI(QMainWindow):
             if panel is not None:
                 panel.on_op_result(payload)
             return
+        if mtype == "run_loop":
+            if panel is not None:
+                panel.on_run_loop(payload.get("loop"))
+            return
         if mtype == "state_reset":
             # an experiment's end state replaced the file: resync everything
             self.request_state()

@@ -2061,6 +2061,146 @@ class ConnectionBar(QFrame):
 
 # --- panel -----------------------------------------------------------------------
 
+# --- run loops ---------------------------------------------------------------------
+
+#: state -> (pill text, pill level)
+_LOOP_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
+              "stopping": ("stopping", "partial"), "stopped": ("stopped", "off"),
+              "latched": ("LATCHED OFF", "warn")}
+
+
+def _label_pill_css(level: str) -> str:
+    bg = _PILL_BG.get(level, "#454545")
+    return (f"QLabel {{ background: {bg}; color: white; border-radius: 9px;"
+            f" padding: 2px 10px; font-size: 12px; font-weight: 600; }}")
+
+
+def _clock(epoch) -> str:
+    try:
+        return time.strftime("%H:%M", time.localtime(float(epoch)))
+    except (TypeError, ValueError):
+        return "?"
+
+
+class RunLoopsCard(QFrame):
+    """The experiments the monitor server can run back to back (its run
+    loops, :mod:`waxx.util.device_state.run_loop`): per loop Start / Stop,
+    the run in progress, and how it last ended.  Hidden until the server
+    says it has any; everything shown is the server's (every GUI sees the same
+    loop)."""
+
+    def __init__(self, panel: "CompositePanel"):
+        super().__init__()
+        self.panel = panel
+        self.setObjectName("composite_card")
+        self.setStyleSheet(_card_css(theme.ACCENT))
+        self._box = QVBoxLayout(self)
+        self._box.setContentsMargins(12, 8, 12, 8)
+        self._box.setSpacing(6)
+        self.rows: dict[str, dict] = {}
+        self.infos: dict[str, dict] = {}
+        self.hide()
+
+    def set_loops(self, loops: dict | None) -> None:
+        for info in (loops or {}).values():
+            self.update_loop(info)
+
+    def update_loop(self, info: dict | None) -> None:
+        if not isinstance(info, dict) or not info.get("key"):
+            return
+        key = info["key"]
+        if key not in self.rows:
+            self._add_row(key)
+        self.infos[key] = info
+        self._show(key)
+        self.show()
+
+    def _add_row(self, key: str) -> None:
+        if self.rows:
+            self._box.addWidget(_hline())
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel(key)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(11)
+        title.setFont(font)
+        title.setStyleSheet(f"color: {theme.FG_STRONG};")
+        head.addWidget(title)
+        pill = QLabel("")
+        head.addWidget(pill)
+        head.addStretch(1)
+        start = QPushButton("Start")
+        stop = QPushButton("Stop")
+        for b in (start, stop):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
+            head.addWidget(b)
+        start.clicked.connect(lambda _=False, k=key: self.panel.start_loop(k))
+        stop.clicked.connect(lambda _=False, k=key: self.panel.stop_loop(k))
+        stop.setToolTip("Let the run in progress finish and save, then end the loop and "
+                        "start the monitor.")
+        self._box.addLayout(head)
+        status = _small("")
+        status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._box.addWidget(status)
+        tail = QLabel("")
+        tail.setStyleSheet(f"color: {theme.FG_MUTED}; font-family: Consolas, monospace;"
+                           f" font-size: 10px;")
+        tail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        tail.setWordWrap(True)
+        tail.hide()
+        self._box.addWidget(tail)
+        self.rows[key] = {"title": title, "pill": pill, "start": start, "stop": stop,
+                          "status": status, "tail": tail, "message": ""}
+
+    def set_message(self, key: str, text: str) -> None:
+        """A local note (a refused Start) shown until the next change."""
+        if key in self.rows:
+            self.rows[key]["message"] = text
+            self._show(key)
+
+    def _show(self, key: str) -> None:
+        row, info = self.rows[key], self.infos.get(key) or {}
+        state = info.get("state") or "idle"
+        row["title"].setText(info.get("title") or key)
+        about = info.get("about") or ""
+        row["title"].setToolTip("\n\n".join(p for p in (about, info.get("path") or "") if p))
+        text, level = _LOOP_PILL.get(state, (state, "unknown"))
+        row["pill"].setText(text)
+        row["pill"].setStyleSheet(_label_pill_css(level))
+        parts = [info.get("text") or ""]
+        runs = int(info.get("runs") or 0)
+        if state in ("running", "stopping"):
+            parts.append(f"{runs} saved since {_clock(info.get('started'))}")
+        elif state in ("stopped", "latched") and info.get("ended"):
+            parts.append(f"{runs} saved · ended {_clock(info.get('ended'))}")
+        last = info.get("last") or {}
+        if last.get("outcome") == "saved" and state not in ("running", "stopping"):
+            parts.append(f"last saved: run {last.get('run_id')}")
+        if row["message"]:
+            parts.insert(0, row["message"])
+            row["message"] = ""
+        row["status"].setText(" · ".join(p for p in parts if p))
+        color = WARN_TEXT if state == "latched" else (OK_TEXT if state == "running"
+                                                      else theme.FG_MUTED)
+        row["status"].setStyleSheet(f"color: {color}; font-size: 11px;")
+        tail = info.get("tail") if state == "latched" else None
+        row["tail"].setText("\n".join(tail or []))
+        row["tail"].setVisible(bool(tail))
+        self.refresh_buttons(key)
+
+    def refresh_buttons(self, key: str | None = None) -> None:
+        reachable = self.panel._reachable
+        for k in ([key] if key else list(self.rows)):
+            row, state = self.rows[k], (self.infos.get(k) or {}).get("state") or "idle"
+            active = state in ("running", "stopping")
+            row["start"].setEnabled(reachable and not active)
+            row["stop"].setEnabled(reachable and state == "running")
+            row["stop"].setText("Stopping…" if state == "stopping" else "Stop")
+            row["start"].setToolTip("" if reachable else "the monitor server is unreachable")
+
+
 class CompositePanel(QWidget):
     """The Composite tab: header (op-path status, operator, Ping), then the
     cards in groups, then the scenes.
@@ -2157,6 +2297,11 @@ class CompositePanel(QWidget):
             box.addWidget(_small(f"Connection definitions are invalid: {e}", ERR_TEXT))
         self.connection_bar = ConnectionBar(self, definitions)
         box.addWidget(self.connection_bar)
+
+        # Experiments the monitor server runs back to back (hidden until it
+        # reports any).
+        self.loops_card = RunLoopsCard(self)
+        box.addWidget(self.loops_card)
 
         try:
             self.table = cmp.OpTable(devices)
@@ -2295,6 +2440,8 @@ class CompositePanel(QWidget):
             self.set_runner(detail["runner"])
         if isinstance(detail.get("connections"), dict):
             self.set_connections(detail["connections"])
+        if isinstance(detail.get("run_loops"), dict):
+            self.loops_card.set_loops(detail["run_loops"])
 
     def set_runner(self, runner: dict) -> None:
         dogs = runner.get("watchdogs") or {}
@@ -2345,6 +2492,7 @@ class CompositePanel(QWidget):
         if self.scenes_card is not None:
             self.scenes_card.show_progress(self.scenes_card.running)
         self.connection_bar.refresh()
+        self.loops_card.refresh_buttons()
 
     def relayout(self) -> None:
         """Heights changed (a card collapsed or opened): restack.  The masonry
@@ -2699,6 +2847,49 @@ class CompositePanel(QWidget):
         running = self.scenes_card.running if self.scenes_card is not None else None
         self.send_request({"type": "cancel_scene",
                            "id": (running or {}).get("id")})
+
+    # -- run loops ----------------------------------------------------------------------
+
+    def start_loop(self, key: str) -> bool:
+        info = self.loops_card.infos.get(key) or {}
+        title = info.get("title") or key
+        lines = [info["about"]] if info.get("about") else []
+        lines.append("It runs back to back on the monitor server, whether or not this window "
+                     "stays open, until Stop. It stops by itself (latched off) on an Abort in "
+                     "liveOD, a run that fails or saves incomplete, someone else's run, or the "
+                     "monitor being started. Stop lets the run in progress finish and save, "
+                     "then starts the monitor.")
+        if info.get("path"):
+            lines.append(f"File: {info['path']}")
+        if not self.confirm(title, "\n\n".join(lines), verb=f"Start {title}"):
+            return False
+
+        def done(reply):
+            if reply.get("status") == "ok":
+                self.loops_card.update_loop(reply.get("loop"))
+            else:
+                self.loops_card.set_message(key, f"✕ not started: {reply.get('msg')}")
+        self.send_request({"type": "run_loop", "action": "start", "loop": key}, done)
+        return True
+
+    def stop_loop(self, key: str) -> None:
+        def done(reply):
+            if reply.get("status") == "ok":
+                self.loops_card.update_loop(reply.get("loop"))
+            else:
+                self.loops_card.set_message(key, f"✕ Stop: {reply.get('msg')}")
+        self.send_request({"type": "run_loop", "action": "stop", "loop": key}, done)
+
+    def on_run_loop(self, info: dict | None) -> None:
+        """A loop's change, as the server broadcast it."""
+        if not isinstance(info, dict) or not info.get("key"):
+            return
+        before = (self.loops_card.infos.get(info["key"]) or {}).get("state")
+        self.loops_card.update_loop(info)
+        if info.get("state") in ("stopped", "latched") and before != info.get("state") \
+                and self._log_line is not None:
+            self._log_line(f"[loop] {info.get('title')}: {info.get('state')} -- "
+                           f"{info.get('text')}")
 
     # -- replies -----------------------------------------------------------------------
 

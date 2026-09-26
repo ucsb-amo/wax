@@ -50,11 +50,13 @@ class HeadlessMonitorServer(QObject):
     """
 
     def __init__(self, monitor_expt_path: str, config_file_path: str | None = None,
-                 journal_dir: str | None = None, reset_expt_path: str | None = None):
+                 journal_dir: str | None = None, reset_expt_path: str | None = None,
+                 run_loops=()):
         super().__init__()
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
+        self.run_loops = tuple(run_loops or ())
         self.monitor_expt_path = monitor_expt_path
         self.monitor_manager = MonitorManager(monitor_expt_path)
         self.monitor_manager.msg.connect(lambda m: log.info("monitor: %s", m))
@@ -103,11 +105,15 @@ class HeadlessMonitorServer(QObject):
         self.server_thread = QThread()
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
                                            journal_dir=self.journal_dir,
-                                           reset_expt_path=self.reset_expt_path)
+                                           reset_expt_path=self.reset_expt_path,
+                                           run_loops=self.run_loops)
         log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
+        for spec in self.run_loops:
+            log.info("run loop '%s': %s", spec.title, spec.expt_path)
         self.udp_server.moveToThread(self.server_thread)
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
+        self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
         self.udp_server.message_received.connect(self._handle_message)
         self.server_thread.started.connect(self.udp_server.run)
         self.server_thread.start()
@@ -144,6 +150,15 @@ class HeadlessMonitorServer(QObject):
             log.info("Stop requested; the monitor experiment is not running.")
         self._set_status(STATES.NOT_READY, "stopped_on_request",
                          "stopped by a client request")
+
+    def _start_monitor_unless_running(self, why: str) -> None:
+        """A run loop ended: bring the monitor back -- unless it already is
+        (an aborted run's ``run complete`` has usually started it)."""
+        if self.monitor_manager.isRunning():
+            log.info("%s -- the monitor is already running.", why)
+            return
+        log.info("%s -- starting the monitor.", why)
+        self._restart_monitor()
 
     def _restart_monitor(self) -> None:
         if getattr(self, "_restarting", False):
@@ -215,7 +230,8 @@ class HeadlessMonitorServer(QObject):
 
 
 def run(monitor_expt_path: str, config_file_path: str | None = None,
-        journal_dir: str | None = None, reset_expt_path: str | None = None) -> int:
+        journal_dir: str | None = None, reset_expt_path: str | None = None,
+        run_loops=()) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
@@ -239,7 +255,8 @@ def run(monitor_expt_path: str, config_file_path: str | None = None,
     try:
         server = HeadlessMonitorServer(monitor_expt_path, config_file_path=config_file_path,
                                        journal_dir=journal_dir,
-                                       reset_expt_path=reset_expt_path)
+                                       reset_expt_path=reset_expt_path,
+                                       run_loops=run_loops)
     except Exception:
         log.exception("Monitor server failed to start")
         return 1

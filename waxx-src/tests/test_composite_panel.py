@@ -411,6 +411,53 @@ def test_routed_lamps_wait_for_the_monitor(routed):
     assert "not now" in card.lamps[0][1].toolTip()
 
 
+LOOP = {"key": "auto_tof", "title": "BEC TOF loop", "expt": "auto_tof",
+        "path": "C:/code/auto_tof.py", "about": "BEC TOF loop: t_tof 1-4 ms.",
+        "state": "idle", "text": "not started", "runs": 0, "run_id": None, "last": None}
+
+
+def test_run_loop_card_starts_and_stops_through_the_server(panel):
+    card = panel.loops_card
+    assert card.isHidden()                                  # until the server has loops
+    panel.set_monitor_detail({"composite_ops": panel._monitor_ops, "run_loops": {"auto_tof": LOOP}})
+    assert not card.isHidden()
+    row = card.rows["auto_tof"]
+    assert row["pill"].text() == "idle"
+    assert row["start"].isEnabled() and not row["stop"].isEnabled()
+    row["start"].click()
+    title, text, _, verb = panel.confirm_answers[-1]
+    assert "t_tof 1-4 ms" in text and "Stop lets the run in progress finish" in text
+    assert verb == "Start BEC TOF loop"
+    req = panel._sender.requests[-1]
+    assert (req["type"], req["action"], req["loop"]) == ("run_loop", "start", "auto_tof")
+    panel._sender.requested.emit(req["req"], {"status": "ok", "loop": dict(
+        LOOP, state="running", run_id=81000, started=time.time(),
+        text="run 81000 in progress (1st of the loop)")})
+    assert row["pill"].text() == "RUNNING" and "run 81000" in row["status"].text()
+    assert row["stop"].isEnabled() and not row["start"].isEnabled()
+    row["stop"].click()
+    assert panel._sender.requests[-1]["action"] == "stop"
+    panel.on_run_loop(dict(LOOP, state="latched", runs=1, ended=time.time(),
+                           text="run 81001 was aborted in liveOD (Abort): its file was discarded",
+                           tail=["RuntimeError: Acquisition for run 81001 aborted."]))
+    assert row["pill"].text() == "LATCHED OFF" and "aborted in liveOD" in row["status"].text()
+    assert not row["tail"].isHidden()
+    assert row["start"].isEnabled()
+    assert any(line.startswith("[loop] BEC TOF loop: latched") for line in panel.lines)
+    panel.set_monitor_state(None, reachable=False)
+    assert not row["start"].isEnabled()
+
+
+def test_a_refused_loop_start_says_why(panel):
+    panel.set_monitor_detail({"run_loops": {"auto_tof": LOOP}})
+    panel.loops_card.rows["auto_tof"]["start"].click()
+    req = panel._sender.requests[-1]
+    panel._sender.requested.emit(req["req"], {"status": "error",
+                                              "msg": "run 7 (rabi) is in progress in liveOD"})
+    status = panel.loops_card.rows["auto_tof"]["status"].text()
+    assert "✕ not started: run 7 (rabi) is in progress in liveOD" in status
+
+
 def test_table_add_row_and_payload(panel):
     card = _card(panel)
     table = card.tables["rows"]

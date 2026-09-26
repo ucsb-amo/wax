@@ -21,6 +21,7 @@ from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
+from waxx.util.device_state.run_loop import RunLoop, active_loop
 from waxx.util.device_state import connections as conns
 
 log = logging.getLogger(__name__)
@@ -171,6 +172,12 @@ class MonitorUDPServer(UdpServer):
       core, sets the hardware, and its end state marks the state trusted.
       Refused while a run is starting or a reset is running.  Progress is
       broadcast as ``reset_run``.
+    * ``run_loop`` (``action`` ``start`` / ``stop``, ``loop``) — run one of
+      the server's ``run_loops`` back to back (see
+      :mod:`waxx.util.device_state.run_loop`); one loop at a time.  Changes
+      are broadcast as ``run_loop``; ``status_json`` has ``run_loops``.  A
+      ``reset`` (monitor restart) request ends a running loop; the loop's
+      end asks for the monitor through ``start_monitor_signal``.
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
@@ -205,12 +212,16 @@ class MonitorUDPServer(UdpServer):
 
     reset_signal = pyqtSignal()
     stop_signal = pyqtSignal()
+    #: A run loop ended: start the monitor unless it is running (the owner
+    #: decides; the argument says why).
+    start_monitor_signal = pyqtSignal(str)
 
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
     RUN_PENDING_TTL_S = 120.0
 
-    def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None):
+    def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
+                 run_loops=()):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = MonitorStatus()
@@ -247,6 +258,13 @@ class MonitorUDPServer(UdpServer):
         self.reset = StateReset(reset_expt_path, on_change=self._on_reset_change,
                                 journal=self.journal)
 
+        # Experiments the GUIs may run back to back -- only these files.
+        self.loops = {spec.key: RunLoop(spec, fence=self._current_run_pending,
+                                        busy=self._loop_busy,
+                                        start_monitor=self.start_monitor_signal.emit,
+                                        on_change=self._on_loop_change, journal=self.journal)
+                      for spec in run_loops}
+
         # The monitor's connections as it last reported them, GUI requests
         # waiting for its next poll, and whether it has been asked to exit.
         # The responder thread and the owner's Qt thread both touch these.
@@ -264,6 +282,10 @@ class MonitorUDPServer(UdpServer):
             # Polled continuously; never logged, never forwarded.
             return
         if m == 'reset':
+            loop = active_loop(self.loops.values())
+            if loop is not None:
+                loop.note_external("a client asked to (re)start the monitor, which takes "
+                                   "the core")
             self.reset_signal.emit()
         if m == 'stop':
             log.info("Stop requested by a client: stopping the monitor experiment.")
@@ -298,7 +320,8 @@ class MonitorUDPServer(UdpServer):
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
                 "run_pending": dict(self._run_pending) if self._run_pending else None,
                 "runner": runner, "reset": self.reset.info(),
-                "connections": self.connections_snapshot()}
+                "connections": self.connections_snapshot(),
+                "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
 
     def _handle_structured(self, raw):
         try:
@@ -360,6 +383,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps({"status": "ok", "trust": dict(self._trust)})
         if mtype == "reset_state":
             return json.dumps(self._reply_reset_state(obj))
+        if mtype == "run_loop":
+            return json.dumps(self._reply_run_loop(obj))
         if mtype == "get_journal":
             if obj.get("since"):
                 entries = self.journal.since((str(obj["since"]),))
@@ -530,6 +555,14 @@ class MonitorUDPServer(UdpServer):
         reset would take the core from under it (or it from the reset)."""
         operator = str(obj.get("operator") or "")
         client = str(obj.get("client") or "")
+        loop = active_loop(self.loops.values())
+        if loop is not None:
+            msg = (f"{loop.spec.title} is running -- a reset would take the core from its run. "
+                   "Stop it first")
+            log.warning("State reset refused: %s", msg)
+            self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
+                                client=client, msg=msg)
+            return {"status": "error", "msg": msg}
         pending = self._current_run_pending()
         if pending is not None and not self.reset.running:
             msg = (f"a run is starting (run {pending.get('run_id')}, "
@@ -543,6 +576,34 @@ class MonitorUDPServer(UdpServer):
 
     def _on_reset_change(self, info) -> None:
         self._broadcaster.send({"type": "reset_run", "reset": info})
+
+    # --- run loops ------------------------------------------------------------------
+
+    def _reply_run_loop(self, obj: dict) -> dict:
+        loop = self.loops.get(str(obj.get("loop") or ""))
+        if loop is None:
+            return {"status": "error",
+                    "msg": f"no run loop {obj.get('loop')!r} on this monitor server "
+                           f"(offered: {', '.join(self.loops) or 'none'})"}
+        operator = str(obj.get("operator") or "")
+        client = str(obj.get("client") or "")
+        action = obj.get("action")
+        if action == "stop":
+            return loop.stop(operator=operator, client=client)
+        if action != "start":
+            return {"status": "error", "msg": f"unknown run loop action {action!r}"}
+        other = active_loop(self.loops.values())
+        if other is not None and other is not loop:
+            return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
+                                              "a time"}
+        return loop.start(operator=operator, client=client)
+
+    def _loop_busy(self) -> str:
+        """Why something of this server's own holds the core, for the loops."""
+        return "a state reset is running" if self.reset.running else ""
+
+    def _on_loop_change(self, info) -> None:
+        self._broadcaster.send({"type": "run_loop", "loop": info})
 
     def _set_trust(self, trusted: bool, reason: str) -> None:
         self._trust = {"trusted": bool(trusted), "reason": reason, "since": time.time()}
@@ -940,6 +1001,8 @@ class MonitorUDPServer(UdpServer):
 
     def stop(self):
         self._runner_stop.set()
+        for loop in self.loops.values():
+            loop.shutdown()
         try:
             self._broadcaster.close()
         except Exception:
@@ -952,12 +1015,14 @@ class MonitorServerGUI(QWidget):
                 monitor_expt_path,
                 config_file_path=None,
                 journal_dir=None,
-                reset_expt_path=None):
+                reset_expt_path=None,
+                run_loops=()):
         super().__init__()
 
         self.config_file_path = config_file_path
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
+        self.run_loops = tuple(run_loops or ())
 
         # Refuse to start a second monitor server for the same hardware.
         server_id = monitor_server_id()
@@ -1058,11 +1123,13 @@ class MonitorServerGUI(QWidget):
         
         self.udp_server = MonitorUDPServer(config_file_path=self.config_file_path,
                                            journal_dir=self.journal_dir,
-                                           reset_expt_path=self.reset_expt_path)
+                                           reset_expt_path=self.reset_expt_path,
+                                           run_loops=self.run_loops)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
+        self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
         self.server_thread.started.connect(self.udp_server.run)
         self.udp_server.message_received.connect(self.handle_message)
 
@@ -1115,6 +1182,15 @@ class MonitorServerGUI(QWidget):
             log.info("Stop requested; the monitor experiment is not running.")
         self.set_status(STATES.NOT_READY, "stopped_on_request",
                         "stopped by a client request")
+
+    def _start_monitor_unless_running(self, why: str) -> None:
+        """A run loop ended: bring the monitor back -- unless it already is
+        (an aborted run's ``run complete`` has usually started it)."""
+        if self.monitor_manager.isRunning():
+            log.info("%s -- the monitor is already running.", why)
+            return
+        log.info("%s -- starting the monitor.", why)
+        self.restart_monitor()
 
     def restart_monitor(self):
         if getattr(self, "_restarting", False):
