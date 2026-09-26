@@ -97,8 +97,12 @@ class TTL_IN(TTL):
         the edge timestamp, or -1 on timeout.
 
         t_delay is the slack the caller's next events get: it must cover the
-        kernel CPU's reaction time (an edge is known ~3 us after it happens
-        and each event submitted then costs ~1 us), so keep it >= 10 us.
+        kernel CPU's reaction time (learning of the edge, then submitting
+        the caller's first events), so keep it comfortably above that
+        time. It has not been measured on this machine: ~4-7 us is
+        expected, and Control.wait_for_quantum_machines_handback prints the
+        slack left after its critical events at VERBOSE -- that print is
+        the measurement.
 
         The cursor is placed with at_mu rather than delay() on purpose: this
         ARTIQ's I/O-delay estimator crashes on a kernel whose delay depends

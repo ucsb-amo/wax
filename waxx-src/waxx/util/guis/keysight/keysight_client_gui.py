@@ -45,6 +45,7 @@ PLOT_RANGE_DEFAULT_S = 240
 PLOT_RANGE_MIN_S = 10
 PLOT_RANGE_MAX_S = 3600
 PLOT_MIN_HEIGHT_PX = 90   # the plot grows with the dock; this is the floor
+PLOT_Y_MAX_FLOOR_A = 30.0  # y axis never zooms in tighter than [0, 30] A
 PLOT_PENS: dict[int, str] = {170: "#4fc3f7", 500: "#ffab40"}
 
 # Stay quiet for this long after construction before surfacing a
@@ -322,7 +323,18 @@ class _CurrentPlot(QWidget):
             if self._t[ip]:
                 t_last = self._t[ip][-1] if t_last is None else max(t_last, self._t[ip][-1])
         if t_last is not None:
-            self._plot.setXRange(t_last - self.range_s, t_last, padding=0.0)
+            t_first = t_last - self.range_s
+            self._plot.setXRange(t_first, t_last, padding=0.0)
+            # Fit y to the visible window, but never tighter than
+            # [0, PLOT_Y_MAX_FLOOR_A] so idle supplies don't blow up noise.
+            visible = [
+                y for ip in self._curves
+                for t, y in zip(self._t[ip], self._y[ip])
+                if t >= t_first and math.isfinite(y)
+            ]
+            y_lo = min([0.0, *visible])
+            y_hi = max([PLOT_Y_MAX_FLOOR_A / 1.05, *visible]) * 1.05
+            self._plot.setYRange(y_lo, y_hi, padding=0.0)
         self._dirty = False
 
     def _on_range_changed(self, _value: int) -> None:
