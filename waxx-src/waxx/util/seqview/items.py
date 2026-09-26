@@ -29,6 +29,7 @@ from waxx.util.seqview.timefmt import fmt_duration
 LABEL_MIN_PX = 40        # bar width below which no label is drawn
 GAP_MIN_PX = 44          # gap width below which no dimension is drawn
 CLUSTER_PX = 2           # bars narrower than this are drawn as 1 px ticks
+SELECT_CARET_PX = 8      # selected bars narrower than this get a caret on top
 MAX_LABELS = 400
 
 
@@ -196,7 +197,11 @@ class PulseBarItem(ViewItem):
             y = ya + rows[k] * rowh
             rect = QRectF(x0c[k], y + 1., w, max(rowh - 2., 2.))
             brush, pen = self.brushes[i], self.pens[i]
-            if dim and pid not in self.selected and pid not in self.related:
+            if pid in self.selected:
+                c = QColor(brush.color())
+                c.setAlpha(210)
+                brush = QBrush(c)
+            elif dim and pid not in self.related:
                 c = QColor(brush.color())
                 c.setAlpha(45)
                 brush = QBrush(c)
@@ -237,6 +242,13 @@ class PulseBarItem(ViewItem):
                 p.setPen(pen)
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(rect)
+                if pid in self.selected and w < SELECT_CARET_PX:
+                    # too thin to see the outline: a caret over it
+                    xc = x0c[k] + 0.5 * w
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor('#ffffff')))
+                    p.drawPolygon(QPolygonF([QPointF(xc - 4., y), QPointF(xc + 4., y),
+                                             QPointF(xc, y + 6.)]))
         # labels
         if self.labels_enabled and self.style == 'bar':
             p.setFont(self.font)

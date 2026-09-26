@@ -184,9 +184,13 @@ def test_window_smoke(qapp):
     w._do_hover()
     assert 't = ' in w.hover_label.text()
     assert 'x · 4 µs' in w._pulse_tooltip(1)
-    # code line click selects every pulse from that line
+    # code line click selects every pulse from that line and, snap view on,
+    # brings it on screen (pulse 2 is in shot 1, off screen)
     w._code_line_clicked('seq', 13)
-    assert w.lane_by_id['light:x'].bars.related == {2}
+    assert w.lane_by_id['light:x'].bars.selected == {2}
+    assert w.code.views['seq'].current == {13}
+    x0, x1 = w.view_range()
+    assert x0 <= 8000. and 9000. <= x1
     # event tooltip
     assert 'phase reset' in w._event_tooltip(0)
     # analog value readout
@@ -207,4 +211,167 @@ def test_window_smoke(qapp):
     assert x0 < 7000. < 12000. < x1
     # warning badge
     assert 'warning' in w.warn_button.text()
+    w.close()
+
+
+# ---------------------------------------------------------------------------
+# selection: pulse table, timeline, code pane
+# ---------------------------------------------------------------------------
+
+def _many_pulse_bundle():
+    """synthetic_bundle plus eight short pulses on light:x in shot 0, each
+    emitted from its own source line (20..27)."""
+    b = synthetic_bundle()
+    m = b.meta
+    lane = m['lanes'][1]
+    for k in range(8):
+        pid = 3 + k
+        m['pulses'].append(dict(m['pulses'][1], id=pid, t0=5200. + 200. * k,
+                                t1=5300. + 200. * k, src_line=20 + k,
+                                src_lines=[20 + k]))
+        lane['pulses'].append(pid)
+    return b.validate()
+
+
+def _table_window(qapp):
+    from PyQt6.QtCore import Qt
+    from waxx.util.seqview.window import SeqViewWindow
+    w = SeqViewWindow(_many_pulse_bundle(), serve=False)
+    w.resize(1400, 900)
+    w.show()
+    w.table_dock.show()
+    w.table.sortByColumn(2, Qt.SortOrder.AscendingOrder)     # by start time
+    qapp.processEvents()
+    return w
+
+
+def _row_of_pid(w):
+    px = w.table_proxy
+    return {w.bundle.pulses[px.mapToSource(px.index(r, 0)).row()]['id']: r
+            for r in range(px.rowCount())}
+
+
+def _table_rows(w):
+    return sorted(ix.row() for ix in w.table.selectionModel().selectedRows())
+
+
+def _click_row(qapp, w, r, mods=None):
+    """Click table row r; returns the selected rows after checking that the
+    lanes show the same pulses."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    ix = w.table_proxy.index(r, 1)
+    QTest.mouseClick(w.table.viewport(), Qt.MouseButton.LeftButton,
+                     mods or Qt.KeyboardModifier.NoModifier,
+                     w.table.visualRect(ix).center())
+    qapp.processEvents()
+    rows = _table_rows(w)
+    row_of = _row_of_pid(w)
+    assert sorted(row_of[p] for p in w.sel_pulses) == rows
+    # every lane holds the whole selection and draws its own pulses of it
+    assert w.lane_by_id['light:x'].bars.selected == set(w.sel_pulses)
+    return rows
+
+
+def test_table_selection_modifiers(qapp):
+    """Click selects one row, Ctrl+click adds / removes one, Shift+click a
+    range, Ctrl+Shift+click adds a range; the lanes follow every step."""
+    from PyQt6.QtCore import Qt
+    M = Qt.KeyboardModifier
+    w = _table_window(qapp)
+    assert _click_row(qapp, w, 1) == [1]
+    assert _click_row(qapp, w, 3, M.ShiftModifier) == [1, 2, 3]
+    assert _click_row(qapp, w, 5, M.ControlModifier) == [1, 2, 3, 5]
+    assert _click_row(qapp, w, 7, M.ControlModifier | M.ShiftModifier) == [1, 2, 3, 5, 6, 7]
+    assert _click_row(qapp, w, 2, M.ControlModifier) == [1, 3, 5, 6, 7]
+    assert _click_row(qapp, w, 0) == [0]
+    assert _click_row(qapp, w, 0, M.ControlModifier) == []
+    assert w.lane_by_id['light:x'].bars.dim_others is False
+    w.close()
+
+
+def test_selection_sync_highlight_and_snap(qapp):
+    from PyQt6.QtCore import Qt, QPointF
+    w = _table_window(qapp)
+    row_of = _row_of_pid(w)
+    # a timeline selection shows in the table
+    w.select_pulse(5)
+    assert _table_rows(w) == [row_of[5]]
+    # the code pane tints the emitting line with the lane colour
+    assert w.code.views['seq'].current == {22}
+    assert w.code.views['seq'].colors == {22: '#e69f00'}
+    # Ctrl+click on the timeline adds, and again removes
+    lane = w.lane_by_id['light:x']
+    at = lane.vb.mapViewToScene(QPointF(3000., 0.5))          # pulse 1
+    w._vb_clicked(lane.vb, at, Qt.KeyboardModifier.ControlModifier)
+    assert w.sel_pulses == [5, 1]
+    assert _table_rows(w) == sorted([row_of[5], row_of[1]])
+    w._vb_clicked(lane.vb, at, Qt.KeyboardModifier.ControlModifier)
+    assert w.sel_pulses == [5]
+    # a plain click replaces the selection
+    w._vb_clicked(lane.vb, at, Qt.KeyboardModifier.NoModifier)
+    assert w.sel_pulses == [1]
+    # snap off: a code click selects but leaves the view alone
+    w.set_x_range(0., 3000.)
+    w.set_snap_view(False)
+    assert not w.act_snap.isChecked() and not w.snap_view
+    w._code_line_clicked('seq', 13)                           # pulse 2, shot 1
+    assert w.sel_pulses == [2]
+    assert tuple(round(x) for x in w.view_range()) == (0, 3000)
+    # snap on (from the toolbar): the same click brings it on screen
+    w.act_snap.trigger()
+    assert w.snap_view
+    w._code_line_clicked('seq', 13)
+    x0, x1 = w.view_range()
+    assert x0 <= 8000. and 9000. <= x1
+    # a line that emitted nothing clears the selection and the highlight
+    w._code_line_clicked('seq', 2)
+    assert w.sel_pulses == [] and w.code.views['seq'].current == set()
+    assert _table_rows(w) == []
+    w.close()
+
+
+def test_code_click_vs_text_drag(qapp):
+    """A click on a code line selects its pulses; a drag that selects text
+    (to copy it) does not."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QTextCursor
+    from PyQt6.QtTest import QTest
+    w = _table_window(qapp)
+    w.code.setCurrentWidget(w.code.views['seq'])
+    v = w.code.views['seq']
+    qapp.processEvents()
+    got = []
+    v.lineClicked.connect(got.append)
+
+    def pos(line):
+        return v.cursorRect(QTextCursor(v.document().findBlockByNumber(line - 1))).center()
+    QTest.mouseClick(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     pos(22))
+    assert got == [22]
+    assert w.sel_pulses == [5]
+    QTest.mousePress(v.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     pos(3))
+    QTest.mouseMove(v.viewport(), pos(6))
+    QTest.mouseRelease(v.viewport(), Qt.MouseButton.LeftButton,
+                       Qt.KeyboardModifier.NoModifier, pos(6))
+    assert v.textCursor().hasSelection()
+    assert got == [22] and w.sel_pulses == [5]
+    w.close()
+
+
+def test_reload_keeps_multiselection_and_toggles(qapp):
+    w = _table_window(qapp)
+    w.set_selection([4, 6, 2], current=6)
+    w.set_gaps_visible(False)
+    assert not w.act_gaps.isChecked() and not w.show_gaps
+    w.act_physical.trigger()
+    assert w.show_physical and w.act_physical.isChecked()
+    w.load_bundle(_many_pulse_bundle(), keep_view=True)
+    qapp.processEvents()
+    assert w.sel_pulses == [4, 6, 2] and w.selected == 6
+    row_of = _row_of_pid(w)
+    assert _table_rows(w) == sorted(row_of[p] for p in (4, 6, 2))
+    assert w.show_physical and w.act_physical.isChecked()
+    assert not w.show_gaps and not w.act_gaps.isChecked()
     w.close()

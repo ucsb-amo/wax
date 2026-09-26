@@ -51,6 +51,13 @@ def apply_delta(path, device_type: str, device_name: str, changes: dict) -> dict
     *different* devices merge piece-by-piece instead of clobbering each other.
     Returns the full updated config dict.
     """
+    return apply_deltas(path, [(device_type, device_name, changes)])
+
+
+def apply_deltas(path, deltas, metadata: dict | None = None) -> dict:
+    """Merge several ``(device_type, device_name, changes)`` deltas (and
+    optionally update the ``metadata`` section) in ONE atomic write: either
+    all of them land or none.  Returns the full updated config dict."""
     with _write_lock:
         try:
             data = read_state(path)
@@ -58,8 +65,35 @@ def apply_delta(path, device_type: str, device_name: str, changes: dict) -> dict
             data = {}
         if not isinstance(data, dict):
             data = {}
-        section = data.setdefault(device_type, {})
-        device = section.setdefault(device_name, {})
-        device.update(changes)
+        for device_type, device_name, changes in deltas:
+            section = data.setdefault(device_type, {})
+            device = section.setdefault(device_name, {})
+            device.update(changes)
+        if metadata:
+            meta = data.get("metadata")
+            if not isinstance(meta, dict):
+                meta = data["metadata"] = {}
+            meta.update(metadata)
+        atomic_write(path, data)
+        return data
+
+
+def replace_sections(path, sections: dict, metadata: dict | None = None) -> dict:
+    """Replace whole sections (``dds``/``ttl``/``dac``) at once, keeping the
+    rest of the file; atomic.  Used for an experiment's end-of-run state."""
+    with _write_lock:
+        try:
+            data = read_state(path)
+        except FileNotFoundError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for key, value in sections.items():
+            data[key] = value
+        if metadata:
+            meta = data.get("metadata")
+            if not isinstance(meta, dict):
+                meta = data["metadata"] = {}
+            meta.update(metadata)
         atomic_write(path, data)
         return data
