@@ -23,6 +23,32 @@ from waxx.util import console
 
 RPC_DELAY = 10.e-3
 
+# An aborted run's process exits within a second or two. If it is still alive
+# this long after the abort, every thread's stack is printed (see
+# _arm_exit_hang_dump).
+T_ABORT_EXIT_HANG_DUMP = 30.
+# The same after a normal end(). Exit may wait up to 20 s for the run-done
+# mail (waxx.util.notifications._EXIT_WAIT_S), so this is longer.
+T_END_EXIT_HANG_DUMP = 60.
+
+
+def _arm_exit_hang_dump(seconds=T_ABORT_EXIT_HANG_DUMP, announce=True):
+    """If this process is still alive ``seconds`` from now, print every
+    thread's Python stack to stderr (once). The run is over by then, so those
+    stacks show what is holding the exit up. Nothing prints on a clean exit:
+    the process is gone first. ``announce`` says so in the terminal first.
+    Never raises."""
+    try:
+        import faulthandler
+        import sys
+        if announce:
+            print(f"[abort] if this process has not exited in {seconds:g} s, its thread "
+                  f"stacks will be printed here to show what is holding it up.",
+                  file=sys.stderr)
+        faulthandler.dump_traceback_later(seconds, exit=False)
+    except Exception:
+        pass
+
 
 def _fmt_duration(seconds):
     """'45s', '3m07s', '1h02m' (ASCII, for terminal progress lines)."""
@@ -226,6 +252,7 @@ class Expt(Scanner, Dealer, Scribe):
             print(self._progress_line(n, N, now, xvar_values, stride))
         if reset_requested:
             _client.abort_run()
+            _arm_exit_hang_dump()
             raise TerminationRequested
 
     @staticmethod
@@ -337,6 +364,11 @@ class Expt(Scanner, Dealer, Scribe):
                 self.monitor.signal_end()
 
         self._run_done_printout(expt_filepath)
+
+        # Runs have hung after this point (2026-09-26, run 83102) with nothing
+        # left to show why: if the process outlives this by a minute, its
+        # thread stacks print here. Silent when the process exits normally.
+        _arm_exit_hang_dump(T_END_EXIT_HANG_DUMP, announce=False)
 
     def _run_done_printout(self, expt_filepath):
         rid = self.run_info.run_id
