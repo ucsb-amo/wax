@@ -491,6 +491,36 @@ def test_broadcasts_reach_the_panel(gui):
     assert not panel.ops_allowed()[0]
 
 
+def test_pill_and_tabs_read_one_dict(gui):
+    """The Composite tab holds the very dict the channel tabs are built from."""
+    panel = gui.composite_panel
+    assert panel.config is gui.config_data
+    gui._version = 10
+    gui._on_state_broadcast({"type": "state_update", "version": 11, "device_type": "ttl",
+                             "device_name": "sw", "changes": {"ttl_state": 0}})
+    panel.refresh()
+    assert panel.cards[0].state_pill.text() == "off"
+    assert not gui.device_widgets["ttl.sw"].state_button.isChecked()
+
+
+def test_a_busy_channel_widget_catches_up_with_the_pill(gui):
+    panel = gui.composite_panel
+    gui._version = 10
+    gui._pending[("ttl", "sw")] = time.time()          # an edit of its own in flight
+    gui._on_state_broadcast({"type": "state_update", "version": 11, "device_type": "ttl",
+                             "device_name": "sw", "changes": {"ttl_state": 0}})
+    panel.refresh()
+    widget = gui.device_widgets["ttl.sw"]
+    assert panel.cards[0].state_pill.text() == "off"   # the dict has the change...
+    assert widget.state_button.isChecked()             # ...the busy widget waits
+    assert ("ttl", "sw") in gui._stale_widgets
+    gui._flush_stale_widgets()
+    assert widget.state_button.isChecked()             # still busy: still waits
+    gui._pending.clear()
+    gui._flush_stale_widgets()
+    assert not widget.state_button.isChecked() and not gui._stale_widgets
+
+
 def test_lamp_click_updates_the_ttl_tab_too(gui):
     sent = []
 

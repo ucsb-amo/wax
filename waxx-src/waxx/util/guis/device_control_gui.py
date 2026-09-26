@@ -61,6 +61,7 @@ TTL_PULSE_ACK_TIMEOUT_S = 2.0        # give up waiting for the "on" ack, send "o
 STATUS_POLL_S = 1.0                  # monitor status poll
 STATUS_RETRY_S = 2.0                 # back-off after a failed status poll
 RECONCILE_MS = 10000                 # periodic full-snapshot safety reconcile
+STALE_WIDGET_RETRY_MS = 500          # re-sync a widget skipped while it was busy
 TELEMETRY_PULL_MS = 1000             # measured values into the cards and the strip
 JOURNAL_LOAD_N = 1000                # server journal records the changes window loads
 
@@ -1647,6 +1648,16 @@ class DeviceStateGUI(QMainWindow):
         # avoid clobbering an in-flight edit with an incoming broadcast).
         self._version = None
         self._pending: Dict[tuple, float] = {}
+        # Channel widgets an incoming change skipped because they were busy
+        # (focused, unsaved, edit in flight).  config_data -- which the
+        # Composite tab reads -- already has the change; these catch up as
+        # soon as they are free (_flush_stale_widgets), or the tab and the
+        # Composite pill would disagree until the channel changed again.
+        self._stale_widgets: set = set()
+        self._stale_timer = QTimer(self)
+        self._stale_timer.setSingleShot(True)
+        self._stale_timer.setInterval(STALE_WIDGET_RETRY_MS)
+        self._stale_timer.timeout.connect(self._flush_stale_widgets)
         # (device_type, device_name) -> (old_config, sent_changes) for edits
         # made in this GUI, so the recent-changes strip can log old → new once
         # the server confirms them.
@@ -2735,7 +2746,11 @@ class DeviceStateGUI(QMainWindow):
                 section[name] = cfg
                 key = (dtype, name)
                 widget = self.device_widgets.get(f"{dtype}.{name}")
-                if widget is not None and not self._widget_busy(widget, key):
+                if widget is None:
+                    continue
+                if self._widget_busy(widget, key):
+                    self._mark_stale(key)
+                else:
                     widget.update_from_config(cfg)
 
     def _on_state_broadcast(self, payload: dict) -> None:
@@ -2827,8 +2842,32 @@ class DeviceStateGUI(QMainWindow):
             self.update_device_widgets()
             return
         if self._widget_busy(widget, (dtype, name)):
+            self._mark_stale((dtype, name))
             return
         widget.update_from_config(dev)
+
+    def _mark_stale(self, key: tuple) -> None:
+        self._stale_widgets.add(key)
+        if not self._stale_timer.isActive():
+            self._stale_timer.start()
+
+    def _flush_stale_widgets(self) -> None:
+        """Bring every widget a change skipped while it was busy up to
+        config_data, once it is no longer busy.  A widget holding an unsaved
+        edit stays busy, and so keeps what the operator typed."""
+        for key in list(self._stale_widgets):
+            dtype, name = key
+            widget = self.device_widgets.get(f"{dtype}.{name}")
+            cfg = self.config_data.get(dtype, {}).get(name)
+            if widget is None or cfg is None:
+                self._stale_widgets.discard(key)
+                continue
+            if self._widget_busy(widget, key):
+                continue
+            widget.update_from_config(cfg)
+            self._stale_widgets.discard(key)
+        if self._stale_widgets:
+            self._stale_timer.start()
 
     @staticmethod
     def _is_descendant(child, parent) -> bool:
@@ -2863,6 +2902,7 @@ class DeviceStateGUI(QMainWindow):
         # Clear existing widgets
         self.clear_layouts()
         self.device_widgets.clear()
+        self._stale_widgets.clear()             # rebuilt from config_data below
 
         # Add DDS widgets organized by urukul_idx (columns) and ch (rows).
         # No row/column headers: the urukul/channel is in each card's tooltip.
