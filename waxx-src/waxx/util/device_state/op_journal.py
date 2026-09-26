@@ -134,6 +134,17 @@ def describe_entry(e: dict) -> str:
         text = ("trusted" if e.get("trusted") else "UNTRUSTED") + f": {e.get('reason')}"
     elif kind == "monitor_state":
         text = f"monitor {e.get('state')} ({e.get('sub_state') or ''})"
+    elif kind == "connection":
+        text = f"{e.get('key')} {e.get('state')}"
+        if e.get("detail"):
+            text += f": {e['detail']}"
+    elif kind == "connection_request":
+        text = f"{e.get('key')} {e.get('action')} requested{_who(e)}"
+    elif kind == "connection_refused":
+        text = f"{e.get('key')} {e.get('action')} REFUSED{_who(e)}: {e.get('msg')}"
+    elif kind == "monitor_exit_requested":
+        text = "monitor asked to exit on its own (holds " + \
+               ", ".join(str(h) for h in e.get("holding") or []) + ")"
     elif kind.startswith("scene_"):
         text = f"{e.get('scene')} #{e.get('id')} {kind[6:]}"
         if e.get("text"):

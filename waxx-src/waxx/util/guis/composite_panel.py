@@ -35,6 +35,12 @@ Cards are grouped (``CompositeDevice.group``), groups are laid out in balanced
 columns (card_layout.MasonryLayout), and every card can be collapsed to its
 header.  Every card starts collapsed, and opening or collapsing one never
 moves a card to another column (the arrangement is pinned; see card_layout).
+
+Under the header, the connection bar shows the host-side connections the
+monitor holds (the tweezer AWG; :mod:`waxx.util.device_state.connections`),
+one pill each in liveOD's camera-button colours: grey not connected, purple
+connecting, green connected, red failed.  A click asks the monitor to connect
+it, or (confirmed) to disconnect it.
 """
 
 from __future__ import annotations
@@ -62,7 +68,11 @@ from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.comms_server.comm_server import STATES
 from waxx.util.dashboard import theme
 from waxx.util.device_state import composite as cmp
+from waxx.util.device_state import connections as conns
 from waxx.util.guis.card_layout import FlowLayout, MasonryLayout
+# liveOD's camera connect button colours (grey / purple / green / red), so a
+# connection reads the same here as a camera does there.
+from waxx.util.live_od.gui.camera_menu import STATES as _CAMERA_STATES
 
 _LOG = logging.getLogger("waxx.device_control.composite")
 
@@ -118,6 +128,12 @@ _PILL_BG = {
 _ACCENT = {
     "on": theme.OK, "partial": theme.WARN, "warn": theme.WARN, "hazard": HAZARD,
 }
+
+#: connection state -> liveOD camera button state (its colour and word)
+_CONNECTION_LOOK = {conns.CONNECTED: "open", conns.CONNECTING: "loading",
+                    conns.DISCONNECTED: "closed", conns.FAILED: "failed"}
+#: Longest detail text shown beside a pill (the rest is in its tooltip).
+CONNECTION_DETAIL_CHARS = 90
 
 _SETTINGS_ORG = "waxx"
 _SETTINGS_APP = "device_control_gui"
@@ -202,6 +218,13 @@ def _lamp_button_css(border: str) -> str:
             f" border-radius: 10px; padding: 0px; }}"
             f"QPushButton:hover {{ background: {theme.BG_BUTTON_HOVER}; }}"
             f"QPushButton:disabled {{ background: {CHIP_BG}; }}")
+
+
+def _connection_pill_css(color: str) -> str:
+    # the same style as waxx.util.live_od.gui.camera_menu's buttons
+    return (f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; "
+            f"border: none; border-radius: 8px; padding: 1px 8px; }} "
+            f"QPushButton:disabled {{ color: rgba(255, 255, 255, 140); }}")
 
 
 def _card_css(accent: str) -> str:
@@ -1910,6 +1933,132 @@ class ScenesCard(QFrame):
             b.setEnabled(allowed and not info)
 
 
+# --- connection bar ----------------------------------------------------------------
+
+class ConnectionBar(QFrame):
+    """The monitor's host-side connections, one pill each (see the module
+    docstring).  ``definitions`` (:class:`~connections.Connection`) give the
+    order, labels and tooltips before the monitor has reported anything; a
+    connection the monitor reports that is not defined here is shown too."""
+
+    def __init__(self, panel: "CompositePanel", definitions=()):
+        # Parented at once: refresh() below sets the visibility, and a
+        # parentless widget made visible would flash up as its own window.
+        super().__init__(panel)
+        self.panel = panel
+        self.setObjectName("composite_connections")
+        self.setStyleSheet(f"QFrame#composite_connections {{ background: {theme.BG_RAISED};"
+                           f" border: 1px solid {theme.BORDER}; border-radius: 6px; }}")
+        self._order = [c.key for c in definitions]
+        self._defs = {c.key: c for c in definitions}
+        self._states: dict = {}
+        self._pills: dict[str, tuple[QPushButton, QLabel]] = {}
+        self._row = QHBoxLayout(self)
+        self._row.setContentsMargins(10, 4, 6, 4)
+        self._row.setSpacing(8)
+        title = _small("Monitor connections:")
+        title.setWordWrap(False)
+        self._row.addWidget(title)
+        self._pill_host = QHBoxLayout()
+        self._pill_host.setSpacing(6)
+        self._row.addLayout(self._pill_host)
+        self._row.addStretch(1)
+        self.message = _small("")
+        self.message.setWordWrap(False)
+        self._row.addWidget(self.message)
+        for key in self._order:
+            self._add(key)
+        self.refresh()
+
+    def keys(self) -> list[str]:
+        return list(self._order)
+
+    def label(self, key: str) -> str:
+        c = self._defs.get(key)
+        return c.label if c is not None else str(self._states.get(key, {}).get("label") or key)
+
+    def state(self, key: str) -> str:
+        return str((self._states.get(key) or {}).get("state") or conns.DISCONNECTED)
+
+    def _add(self, key: str) -> None:
+        pill = QPushButton(self.label(key))
+        pill.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        pill.clicked.connect(lambda _=False, k=key: self._clicked(k))
+        detail = _small("")
+        detail.setWordWrap(False)
+        self._pill_host.addWidget(pill)
+        self._pill_host.addWidget(detail)
+        self._pills[key] = (pill, detail)
+
+    def set_states(self, states: dict | None) -> None:
+        self._states = {str(k): dict(v) for k, v in (states or {}).items()
+                        if isinstance(v, dict)}
+        for key in self._states:
+            if key not in self._pills:
+                self._order.append(key)
+                self._add(key)
+        self.refresh()
+
+    def set_message(self, text: str, level: str = "off") -> None:
+        self.message.setText(text)
+        self.message.setToolTip(text)
+        self.message.setStyleSheet(
+            f"color: {_LEVEL_COLOR.get(level, theme.FG_MUTED)}; font-size: 11px;")
+
+    def refresh(self) -> None:
+        reachable = self.panel.reachable
+        for key, (pill, detail_label) in self._pills.items():
+            entry = self._states.get(key) or {}
+            state = self.state(key)
+            if not reachable:
+                state, detail = conns.DISCONNECTED, "monitor server unreachable"
+            elif not entry:
+                detail = "not reported by the monitor (is it running?)"
+            else:
+                detail = str(entry.get("detail") or "")
+            color, word = _CAMERA_STATES[_CONNECTION_LOOK.get(state, "failed")]
+            pill.setText(self.label(key))
+            pill.setStyleSheet(_connection_pill_css(color))
+            action = "disconnect" if state in (conns.CONNECTED, conns.CONNECTING) else "connect"
+            allowed, why = self.panel.connections_allowed(action)
+            pill.setEnabled(allowed)
+            shown = detail if len(detail) <= CONNECTION_DETAIL_CHARS \
+                else detail[:CONNECTION_DETAIL_CHARS - 1] + "…"
+            detail_label.setText(shown)
+            detail_label.setStyleSheet(
+                f"color: {ERR_TEXT if state == conns.FAILED else theme.FG_MUTED};"
+                f" font-size: 11px;")
+            tip = [f"{self.label(key)}: {word}." + (f" {detail}" if detail else "")]
+            since = entry.get("since")
+            if isinstance(since, (int, float)) and reachable and entry:
+                tip.append(f"since {time.strftime('%H:%M:%S', time.localtime(since))}")
+            tip.append(f"Click to {action}." if allowed else f"Cannot {action}: {why}.")
+            definition = self._defs.get(key)
+            extra = (definition.tooltip if definition is not None
+                     else str(entry.get("tooltip") or ""))
+            if extra:
+                tip.append(extra)
+            pill.setToolTip("\n".join(tip))
+            detail_label.setToolTip(detail)
+        self.setVisible(bool(self._pills))
+
+    def _clicked(self, key: str) -> None:
+        label = self.label(key)
+        if self.state(key) in (conns.CONNECTED, conns.CONNECTING):
+            definition = self._defs.get(key)
+            text = f"The monitor closes its connection to the {label}."
+            if definition is not None and definition.confirm:
+                text += "\n\n" + definition.confirm
+            text += ("\n\nIt stays closed until you connect it again here (or the "
+                     "monitor restarts).")
+            if not self.panel.confirm(f"Disconnect {label}?", text, verb="Disconnect"):
+                return
+            self.panel.request_connection(key, "disconnect")
+        else:
+            self.panel.request_connection(key, "connect")
+
+
 # --- panel -----------------------------------------------------------------------
 
 class CompositePanel(QWidget):
@@ -1921,6 +2070,9 @@ class CompositePanel(QWidget):
     op outcomes in the host GUI's changes log.  ``telemetry`` is a
     :class:`~waxx.util.device_state.telemetry.TelemetryHub` (or None); the
     host GUI feeds its samples in with :meth:`set_telemetry`.
+    ``connections`` (:class:`~waxx.util.device_state.connections.Connection`)
+    are the monitor's host-side connections shown on the connection bar; the
+    host GUI feeds their states in with :meth:`set_connections`.
     """
 
     hazards_changed = pyqtSignal()
@@ -1928,12 +2080,13 @@ class CompositePanel(QWidget):
     def __init__(self, devices, params=None, frames=None,
                  channel_sender: Callable | None = None,
                  log_line: Callable[[str], None] | None = None,
-                 parent=None, start_sender: bool = True, scenes=()):
+                 parent=None, start_sender: bool = True, scenes=(), connections=()):
         super().__init__(parent)
         self.params = params
         self.frames = frames
         self.config: dict = {}
         self.device_state: dict = {}
+        self.connections: dict = {}
         self.telemetry: dict = {}
         self.trust: dict = {"trusted": True, "reason": ""}
         self.run_pending: dict | None = None
@@ -1996,6 +2149,15 @@ class CompositePanel(QWidget):
         head.addWidget(self.collapse_button)
         box.addWidget(bar)
 
+        # The monitor's host-side connections (hidden when there are none).
+        try:
+            definitions = conns.validate_connections(connections or ())
+        except ValueError as e:
+            definitions = ()
+            box.addWidget(_small(f"Connection definitions are invalid: {e}", ERR_TEXT))
+        self.connection_bar = ConnectionBar(self, definitions)
+        box.addWidget(self.connection_bar)
+
         try:
             self.table = cmp.OpTable(devices)
             self.scenes = tuple(scenes or ())
@@ -2056,7 +2218,8 @@ class CompositePanel(QWidget):
         host = (self.device_state.get(device_key, {}) if device_key
                 else dict(self.device_state))
         return cmp.Context(self.config, self.params, self.frames, fields=fields,
-                           host_state=host, telemetry=self.telemetry, trust=self.trust)
+                           host_state=host, telemetry=self.telemetry, trust=self.trust,
+                           connections=self.connections)
 
     # -- inputs from the host GUI -------------------------------------------------
 
@@ -2072,6 +2235,15 @@ class CompositePanel(QWidget):
     def set_device_state(self, state: dict | None) -> None:
         self.device_state = dict(state or {})
         self.request_refresh()
+
+    def set_connections(self, states: dict | None) -> None:
+        """The monitor's connections as the server last heard of them
+        (``connections`` broadcast, ``status_json``, ``get_state``)."""
+        states = {str(k): dict(v) for k, v in (states or {}).items() if isinstance(v, dict)}
+        if states != self.connections:
+            self.connections = states
+            self.connection_bar.set_states(states)
+            self.request_refresh()
 
     def set_telemetry(self, samples: dict) -> None:
         self.telemetry = dict(samples or {})
@@ -2121,6 +2293,8 @@ class CompositePanel(QWidget):
             self.set_run_pending(detail.get("run_pending"))
         if isinstance(detail.get("runner"), dict):
             self.set_runner(detail["runner"])
+        if isinstance(detail.get("connections"), dict):
+            self.set_connections(detail["connections"])
 
     def set_runner(self, runner: dict) -> None:
         dogs = runner.get("watchdogs") or {}
@@ -2170,6 +2344,7 @@ class CompositePanel(QWidget):
             card._refresh_enabled()
         if self.scenes_card is not None:
             self.scenes_card.show_progress(self.scenes_card.running)
+        self.connection_bar.refresh()
 
     def relayout(self) -> None:
         """Heights changed (a card collapsed or opened): restack.  The masonry
@@ -2297,6 +2472,44 @@ class CompositePanel(QWidget):
             return False, (f"run {self.run_pending.get('run_id')} is starting -- ops are "
                            "refused until it ends")
         return True, ""
+
+    @property
+    def reachable(self) -> bool:
+        return self._reachable
+
+    def connections_allowed(self, action: str = "connect") -> tuple[bool, str]:
+        """Whether a connection pill may send ``action`` (the server checks
+        the same)."""
+        if not self._reachable:
+            return False, "the monitor server is unreachable"
+        if self._monitor_state != STATES.READY:
+            return False, "the monitor is not running -- it opens its connections when it starts"
+        if action == "connect" and self.run_pending:
+            return False, (f"{conns.describe_pending(self.run_pending)} is starting and "
+                           "opens it itself -- the monitor reconnects after the run")
+        return True, ""
+
+    def request_connection(self, key: str, action: str) -> None:
+        """Ask the monitor (through its server) to connect / disconnect one of
+        its connections.  The outcome shows as the pill's new state."""
+        bar = self.connection_bar
+        label = bar.label(key)
+        allowed, why = self.connections_allowed(action)
+        if not allowed:
+            bar.set_message(f"✕ {label}: {why}", "error")
+            return
+        bar.set_message(f"{label}: {action} sent…", "partial")
+
+        def done(reply):
+            if reply.get("status") == "ok":
+                bar.set_message(f"{label}: {action} requested", "off")
+            else:
+                bar.set_message(f"✕ {label} {action}: {reply.get('msg')}", "error")
+            if self._log_line is not None:
+                outcome = "requested" if reply.get("status") == "ok" \
+                    else f"refused: {reply.get('msg')}"
+                self._log_line(f"[connection] {label} {action} {outcome}")
+        self.send_request({"type": "connection", "key": key, "action": action}, done)
 
     def _refresh_header(self) -> None:
         allowed, why = self.ops_allowed()

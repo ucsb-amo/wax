@@ -1601,7 +1601,10 @@ class DeviceStateGUI(QMainWindow):
     frames); ``composite_scenes`` adds the Scenes card;
     ``composite_telemetry`` (a
     :class:`waxx.util.device_state.telemetry.TelemetryHub`) supplies
-    measured values, polled only while this window is visible.
+    measured values, polled only while this window is visible;
+    ``composite_connections``
+    (:class:`waxx.util.device_state.connections.Connection`) are the
+    monitor's host-side connections shown on the tab's connection bar.
     """
 
     def __init__(self,
@@ -1611,7 +1614,8 @@ class DeviceStateGUI(QMainWindow):
                   composite_params=None,
                   composite_frames=None,
                   composite_scenes=None,
-                  composite_telemetry=None):
+                  composite_telemetry=None,
+                  composite_connections=None):
         super().__init__()
         self.config_data = {}
         self.device_widgets = {}
@@ -1622,6 +1626,7 @@ class DeviceStateGUI(QMainWindow):
         self._composite_params = composite_params
         self._composite_frames = composite_frames
         self._composite_scenes = tuple(composite_scenes or ())
+        self._composite_connections = tuple(composite_connections or ())
         self._telemetry = composite_telemetry
         self.composite_panel = None
         self._composite_scroll = None
@@ -1890,7 +1895,8 @@ class DeviceStateGUI(QMainWindow):
                 frames=self._composite_frames,
                 channel_sender=self._send_channel_from_panel,
                 log_line=self._record_line,
-                scenes=self._composite_scenes)
+                scenes=self._composite_scenes,
+                connections=self._composite_connections)
             self.composite_panel.set_config(self.config_data)
             self.composite_panel.hazards_changed.connect(self._refresh_summary)
             # Scrolls on its own: a tab widget's minimum size is its largest
@@ -2717,6 +2723,8 @@ class DeviceStateGUI(QMainWindow):
                 panel.set_run_pending(self._run_pending)
         if panel is not None and isinstance(state.get("runner"), dict):
             panel.set_runner(state["runner"])
+        if panel is not None and isinstance(state.get("connections"), dict):
+            panel.set_connections(state["connections"])
         self._refresh_composite()
         self._refresh_summary()
 
@@ -2801,6 +2809,10 @@ class DeviceStateGUI(QMainWindow):
             if panel is not None:
                 panel.on_watchdog(payload)
             self._refresh_summary()
+            return
+        if mtype == "connections":
+            if panel is not None:
+                panel.set_connections(payload.get("connections"))
             return
         if mtype != "state_update":
             return

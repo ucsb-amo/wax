@@ -21,6 +21,7 @@ from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
+from waxx.util.device_state import connections as conns
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +175,19 @@ class MonitorUDPServer(UdpServer):
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
 
+    Host-side connections the monitor holds (the tweezer AWG; see
+    :mod:`waxx.util.device_state.connections`):
+
+    * ``connections`` — the monitor's report of their states; kept, broadcast
+      as ``connections`` and served in ``status_json`` / ``get_state``.  When
+      the monitor is not running they all read "disconnected".
+    * ``connection`` — a GUI's ``connect`` / ``disconnect`` of one
+      (``key``, ``action``); refused unless the monitor is READY, and a
+      connect while a run is starting.  Handed to the monitor by ``poll``.
+    * ``poll`` also tells the monitor whether a run is starting
+      (``run_pending``: it closes its connections then, the run opens the
+      AWG itself) and whether to ``exit`` (see :meth:`request_monitor_exit`).
+
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
     ``end()`` sends its end state (or, aborted inside its scan, sends
@@ -233,6 +247,14 @@ class MonitorUDPServer(UdpServer):
         self.reset = StateReset(reset_expt_path, on_change=self._on_reset_change,
                                 journal=self.journal)
 
+        # The monitor's connections as it last reported them, GUI requests
+        # waiting for its next poll, and whether it has been asked to exit.
+        # The responder thread and the owner's Qt thread both touch these.
+        self._conn_lock = threading.Lock()
+        self._connections: dict = {}
+        self._conn_requests: list = []
+        self._monitor_exit = False
+
     def on_message_received(self,message):
         m = message.strip()
         if m.startswith("{"):
@@ -275,7 +297,8 @@ class MonitorUDPServer(UdpServer):
             runner = self.runner.info()
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
                 "run_pending": dict(self._run_pending) if self._run_pending else None,
-                "runner": runner, "reset": self.reset.info()}
+                "runner": runner, "reset": self.reset.info(),
+                "connections": self.connections_snapshot()}
 
     def _handle_structured(self, raw):
         try:
@@ -292,9 +315,24 @@ class MonitorUDPServer(UdpServer):
         if mtype == "update_batch":
             return self._reply_update_batch(obj)
         if mtype == "poll":
+            with self._conn_lock:
+                requests, self._conn_requests = self._conn_requests, []
+                leaving = self._monitor_exit
+            pending = self._current_run_pending()
+            # A monitor asked to exit takes no more ops: they stay queued and
+            # expire (or are retired when it stops) rather than being lost.
             return json.dumps({"status": "ok", "version": self._version,
-                               "ops": self.ops.pop(),
-                               "registered": self.ops.registered})
+                               "ops": [] if leaving else self.ops.pop(),
+                               "registered": self.ops.registered,
+                               "run_pending": None if pending is None else
+                               {"run_id": pending.get("run_id"),
+                                "expt": pending.get("expt", "")},
+                               "connection_requests": requests,
+                               "exit": leaving})
+        if mtype == "connections":
+            return json.dumps(self._reply_connections(obj))
+        if mtype == "connection":
+            return json.dumps(self._reply_connection_request(obj))
         if mtype == "op":
             return json.dumps(self._submit_internal(obj, "gui"))
         if mtype == "op_done":
@@ -530,6 +568,7 @@ class MonitorUDPServer(UdpServer):
         previous, self._last_monitor_state = self._last_monitor_state, (state, reason)
         if state == STATES.NOT_READY:
             self.retire_ops(reason or _state_name(state))
+            self._connections_monitor_gone(reason or _state_name(state))
             if reason == "interrupted_by_run" and previous != (state, reason):
                 pending = self._run_pending
                 who = _run_name(pending.get("run_id"), pending.get("expt")) if pending \
@@ -547,6 +586,121 @@ class MonitorUDPServer(UdpServer):
         info = self.ops.info()
         if info["registered"] or info["queued"] or info["running"]:
             self._broadcast_results(self.ops.unregister(reason))
+
+    # --- host-side connections ------------------------------------------------------
+
+    def connections_snapshot(self) -> dict:
+        with self._conn_lock:
+            return {k: dict(v) for k, v in self._connections.items()}
+
+    def _reply_connections(self, obj: dict) -> dict:
+        """The monitor's report of its connections."""
+        raw = obj.get("connections")
+        if not isinstance(raw, dict):
+            return {"status": "error", "msg": "connections must be an object"}
+        clean = {}
+        for key, c in raw.items():
+            if not isinstance(c, dict):
+                continue
+            state = str(c.get("state") or "")
+            try:
+                since = float(c.get("since"))
+            except (TypeError, ValueError):
+                since = time.time()
+            clean[str(key)] = {"label": str(c.get("label") or key),
+                               "state": state if state in conns.STATES else conns.FAILED,
+                               "detail": str(c.get("detail") or ""),
+                               "since": since, "want": bool(c.get("want")),
+                               "tooltip": str(c.get("tooltip") or "")}
+        with self._conn_lock:
+            old = self._connections
+            self._connections = clean
+            snapshot = {k: dict(v) for k, v in clean.items()}
+        for key, c in clean.items():
+            before = old.get(key) or {}
+            if before.get("state") != c["state"] or \
+                    (c["state"] == conns.FAILED and before.get("detail") != c["detail"]):
+                (log.warning if c["state"] == conns.FAILED else log.info)(
+                    "Connection %s: %s%s", c["label"], c["state"],
+                    f" -- {c['detail']}" if c["detail"] else "")
+                self.journal.record("connection", key=key, state=c["state"],
+                                    detail=c["detail"])
+        self._broadcaster.send({"type": "connections", "connections": snapshot})
+        return {"status": "ok"}
+
+    def _reply_connection_request(self, obj: dict) -> dict:
+        """A GUI's connect / disconnect of one of the monitor's connections;
+        the monitor takes it on its next poll and reports the outcome as a
+        new ``connections`` state."""
+        key = str(obj.get("key") or "")
+        action = str(obj.get("action") or "")
+        client = str(obj.get("client") or "")
+        operator = str(obj.get("operator") or "")
+        refusal = None
+        with self._conn_lock:
+            known = self._connections.get(key)
+        if action not in conns.ACTIONS:
+            refusal = f"unknown action {action!r}"
+        elif known is None:
+            refusal = f"the monitor has reported no connection {key!r}"
+        elif self.status.state != STATES.READY:
+            state = self.status.state_name.lower().replace("_", " ")
+            refusal = f"the monitor is {state} -- it opens and closes its connections itself"
+        elif action == "connect" and self._current_run_pending() is not None:
+            p = self._run_pending or {}
+            refusal = (f"a run is starting ({conns.describe_pending(p)}) and opens it "
+                       "itself -- the monitor reconnects after the run")
+        label = (known or {}).get("label", key)
+        if refusal is not None:
+            log.warning("Connection %s %s refused: %s", label, action, refusal)
+            self.journal.record("connection_refused", key=key, action=action, client=client,
+                                operator=operator, msg=refusal)
+            return {"status": "error", "msg": refusal}
+        with self._conn_lock:
+            self._conn_requests.append({"key": key, "action": action, "client": client,
+                                        "operator": operator})
+        log.info("Connection %s: %s requested by %s", label, action,
+                 "@".join(p for p in (operator, client) if p) or "?")
+        self.journal.record("connection_request", key=key, action=action, client=client,
+                            operator=operator)
+        return {"status": "ok"}
+
+    def _connections_monitor_gone(self, reason: str) -> None:
+        """The monitor process is gone, and with it whatever it held open."""
+        detail = f"the monitor is not running ({str(reason).replace('_', ' ')})"
+        changed = False
+        with self._conn_lock:
+            self._conn_requests = []
+            self._monitor_exit = False
+            for c in self._connections.values():
+                if c.get("state") != conns.DISCONNECTED or c.get("detail") != detail:
+                    if c.get("state") != conns.DISCONNECTED:
+                        c["since"] = time.time()
+                    c["state"] = conns.DISCONNECTED
+                    c["detail"] = detail
+                    changed = True
+            snapshot = {k: dict(v) for k, v in self._connections.items()}
+        if changed:
+            self._broadcaster.send({"type": "connections", "connections": snapshot})
+
+    def request_monitor_exit(self) -> list[str]:
+        """Ask the running monitor to leave its loop and exit on its own, so
+        its run() closes its connections (a kill would drop them without
+        stopping the device).  Returns the labels of what it holds open --
+        empty (nothing worth waiting for: kill it at once) unless the monitor
+        is READY, i.e. polling, and reports something connected."""
+        with self._conn_lock:
+            holding = [c.get("label", k) for k, c in self._connections.items()
+                       if c.get("state") in (conns.CONNECTED, conns.CONNECTING)]
+            if self.status.state != STATES.READY or not holding:
+                return []
+            self._monitor_exit = True
+        self.journal.record("monitor_exit_requested", holding=holding)
+        return holding
+
+    def clear_monitor_exit(self) -> None:
+        with self._conn_lock:
+            self._monitor_exit = False
 
     # --- device state -----------------------------------------------------------
 
@@ -855,6 +1009,10 @@ class MonitorServerGUI(QWidget):
 
         self.setup_ui()
         self.setup_udp_server()
+        # A monitor holding connections (the tweezer AWG) is asked to exit on
+        # its own before a stop/restart kills it, so it closes them.
+        self.monitor_manager.set_graceful_exit(self.udp_server.request_monitor_exit,
+                                               self.udp_server.clear_monitor_exit)
         # One status object, shared with the TCP responder so status_json
         # always serves what this window shows.
         self.status = self.udp_server.status
@@ -1027,6 +1185,11 @@ class MonitorServerGUI(QWidget):
         # server was already running) none of these exist, and an
         # AttributeError traceback here would bury the message saying why.
         log.info("Closing monitor server GUI...")
+        # The monitor first, while the responder still answers its polls: it
+        # may be asked to exit on its own and close its connections.
+        monitor_manager = getattr(self, "monitor_manager", None)
+        if monitor_manager is not None:
+            monitor_manager.stop()
         udp_server = getattr(self, "udp_server", None)
         if udp_server is not None:
             udp_server.stop()
@@ -1034,7 +1197,4 @@ class MonitorServerGUI(QWidget):
         if server_thread is not None:
             server_thread.quit()
             server_thread.wait()
-        monitor_manager = getattr(self, "monitor_manager", None)
-        if monitor_manager is not None:
-            monitor_manager.stop()
         event.accept()

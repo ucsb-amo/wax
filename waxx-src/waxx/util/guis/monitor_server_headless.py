@@ -77,6 +77,10 @@ class HeadlessMonitorServer(QObject):
             log.error("Monitor cannot be started as configured: %s", problem)
 
         self._setup_udp_server()
+        # A monitor holding connections (the tweezer AWG) is asked to exit on
+        # its own before a stop/restart kills it, so it closes them.
+        self.monitor_manager.set_graceful_exit(self.udp_server.request_monitor_exit,
+                                               self.udp_server.clear_monitor_exit)
         # One status object, shared with the TCP responder so status_json
         # always serves exactly what this process believes.
         self.status = self.udp_server.status
@@ -196,16 +200,18 @@ class HeadlessMonitorServer(QObject):
             self._set_status(STATES.READY, "running", "")
 
     def shutdown(self) -> None:
+        # The monitor first, while the responder still answers its polls: it
+        # may be asked to exit on its own and close its connections.
+        try:
+            self.monitor_manager.stop()
+        except Exception:
+            log.exception("Error while stopping the monitor experiment")
         try:
             self.udp_server.stop()
         except Exception:
             log.exception("Error while stopping the monitor UDP server")
         self.server_thread.quit()
         self.server_thread.wait()
-        try:
-            self.monitor_manager.stop()
-        except Exception:
-            log.exception("Error while stopping the monitor experiment")
 
 
 def run(monitor_expt_path: str, config_file_path: str | None = None,

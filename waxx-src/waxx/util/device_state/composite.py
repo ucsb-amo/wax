@@ -186,12 +186,15 @@ class Context:
     device's last host-side state reported by the monitor; ``telemetry``
     measured values by source key (:class:`Sample`); ``trust`` whether the
     device-state file is known to match the hardware (``{"trusted": bool,
-    "reason": str}`` -- False after a run that never reported its end state).
+    "reason": str}`` -- False after a run that never reported its end state);
+    ``connections`` the monitor's host-side connections by key, as it last
+    reported them (see :mod:`waxx.util.device_state.connections`).
     """
 
     def __init__(self, config: Mapping | None = None, params=None, frames=None,
                  fields: Mapping | None = None, host_state: Mapping | None = None,
-                 telemetry: Mapping | None = None, trust: Mapping | None = None):
+                 telemetry: Mapping | None = None, trust: Mapping | None = None,
+                 connections: Mapping | None = None):
         self.config = config or {}
         self.params = params
         self.frames = frames
@@ -199,10 +202,17 @@ class Context:
         self.host_state = dict(host_state or {})
         self.telemetry = telemetry or {}
         self.trust = dict(trust or {"trusted": True, "reason": ""})
+        self.connections = connections or {}
 
     @property
     def trusted(self) -> bool:
         return bool(self.trust.get("trusted", True))
+
+    def connection(self, key: str) -> dict | None:
+        """``{"state", "detail", ...}`` of one monitor connection, or None
+        when the monitor has not reported it."""
+        entry = self.connections.get(key)
+        return entry if isinstance(entry, dict) else None
 
     def measured(self, source: str, max_age_s: float | None = None) -> Sample | None:
         """The latest sample of a telemetry source, or None when there is none

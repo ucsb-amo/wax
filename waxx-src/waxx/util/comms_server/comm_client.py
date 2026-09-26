@@ -233,6 +233,24 @@ class MonitorClient(CommClient):
         """Monitor experiment: outcomes of ops it took."""
         return self._request({"type": "op_done", "results": results})
 
+    def report_connections(self, connections, timeout=None):
+        """Monitor experiment: the states of the connections it holds
+        (waxx.util.device_state.connections).  ``timeout``: one short try
+        instead of the default two (used at exit)."""
+        import json  # noqa: PLC0415
+        msg = json.dumps({"type": "connections", "connections": connections})
+        if timeout is None:
+            reply = self.send_message(msg)
+        else:
+            reply = self.send_message(msg, timeout=timeout, attempts=1)
+        if reply is None:
+            return None
+        try:
+            parsed = json.loads(reply)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     def send_update_batch(self, updates, origin=""):
         """Several deltas in one round trip: ``updates`` is a list of
         ``(device_type, device_name, changes)``."""
