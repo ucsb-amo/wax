@@ -21,7 +21,7 @@ from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.state_broadcast import StateListener
 from waxx.util.dashboard import theme
 from waxx.util.device_state.op_journal import describe_entry
-from waxx.util.guis.device_summary import MakeSafeDialog, SummaryStrip
+from waxx.util.guis.device_summary import MakeSafeDialog, SummaryStrip, reset_title
 from waxa.helper.name_search import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -1604,7 +1604,7 @@ class DeviceStateGUI(QMainWindow):
     measured values, polled only while this window is visible;
     ``composite_connections``
     (:class:`waxx.util.device_state.connections.Connection`) are the
-    monitor's host-side connections shown on the tab's connection bar.
+    monitor server's host-side connections shown on the tab's connection bar.
     """
 
     def __init__(self,
@@ -1714,7 +1714,8 @@ class DeviceStateGUI(QMainWindow):
         # Content is preserved when switching tabs; filtering is re-applied
         # whenever the text changes OR the active tab changes.
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search channels  (Ctrl+F)")
+        self.search_bar.setPlaceholderText("Search…")
+        self.search_bar.setToolTip("Search channels (Ctrl+F)")
         self.search_bar.setClearButtonEnabled(True)
         self.search_bar.setMinimumWidth(220)
         self.search_bar.setMaximumHeight(22)
@@ -1899,6 +1900,7 @@ class DeviceStateGUI(QMainWindow):
                 connections=self._composite_connections)
             self.composite_panel.set_config(self.config_data)
             self.composite_panel.hazards_changed.connect(self._refresh_summary)
+            self.composite_panel.reset_requested.connect(self._reset_state)
             # Scrolls on its own: a tab widget's minimum size is its largest
             # page's, so an unscrolled Composite page (~1650 px tall) would set
             # the minimum height of the whole window and stretch every DDS card.
@@ -1969,6 +1971,15 @@ class DeviceStateGUI(QMainWindow):
         self._refresh_changes_button()
         row.addWidget(self.changes_button)
 
+        # The monitor server's reset experiment (kexp: "Run MOT Observe");
+        # labelled and shown by _refresh_status_buttons once the server says
+        # it has one -- only without a Composite tab, which has its card.
+        self.reset_button = QPushButton("")
+        self.reset_button.setMaximumHeight(25)
+        self.reset_button.clicked.connect(self._reset_state)
+        self.reset_button.hide()
+        row.addWidget(self.reset_button)
+
         self.start_button = QPushButton("Start monitor")
         self.start_button.setToolTip("Start the monitor experiment (it is not running).")
         self.start_button.clicked.connect(self.on_start_clicked)
@@ -1990,7 +2001,8 @@ class DeviceStateGUI(QMainWindow):
         )
 
     def _refresh_status_buttons(self) -> None:
-        """Enable Start / Restart / Stop according to the monitor state."""
+        """Enable Start / Restart / Stop according to the monitor state, and
+        the reset button according to the server's reset experiment."""
         reachable = not self.connection_failed and self._monitor_state is not None
         busy = self._command_in_flight
         st = self._monitor_state
@@ -1998,6 +2010,16 @@ class DeviceStateGUI(QMainWindow):
         live = reachable and not busy and st in (STATES.READY, STATES.LOADING)
         self.restart_button.setEnabled(live)
         self.stop_button.setEnabled(live)
+        reset = self._reset
+        self.reset_button.setVisible(bool(reset) and self.composite_panel is None)
+        if reset:
+            title = reset_title(reset)
+            running = reset.get("state") == "running"
+            self.reset_button.setText(f"Running {title}…" if running else f"Run {title}")
+            self.reset_button.setEnabled(reachable and not busy and not running)
+            self.reset_button.setToolTip(
+                f"Run {reset.get('expt')}.py through the monitor server. It takes the core; "
+                "its end state marks the device state trusted.")
 
     def _set_monitor_state(self, state: int) -> None:
         """Apply a monitor state (STATES.*) to the pill; track when it began."""
@@ -2332,19 +2354,17 @@ class DeviceStateGUI(QMainWindow):
             "Trust it only if you know the hardware is as the tabs show it (for example "
             "you checked the coils and switches, or you just set every channel again). "
             "Trusting changes nothing on the hardware; it is recorded in the journal "
-            "with your name.")
+            "with this machine's name.")
         yes = box.addButton("Trust the state file", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is not yes:
             return
-        operator = self.composite_panel.operator_name() if self.composite_panel else ""
         try:
             host = socket.gethostname()
         except Exception:
             host = ""
-        self._send_request({"type": "trust_ack", "operator": operator, "client": host},
-                           self._on_trust_reply)
+        self._send_request({"type": "trust_ack", "client": host}, self._on_trust_reply)
 
     def _on_trust_reply(self, reply: dict) -> None:
         if reply.get("status") == "ok":
@@ -2364,10 +2384,12 @@ class DeviceStateGUI(QMainWindow):
         if not reset or reset.get("state") == "running":
             return
         expt = reset.get("expt") or "the reset experiment"
+        title = reset_title(reset)
+        about = str(reset.get("about") or "")
         live_od = self._live_od_status()
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Reset the device state")
+        box.setWindowTitle(f"Run {title}")
         parts = []
         if live_od.get("run_in_progress"):
             shots = ""
@@ -2375,43 +2397,33 @@ class DeviceStateGUI(QMainWindow):
                 shots = f", shot {live_od.get('n_shots') or 0}/{live_od.get('n_shots_expected')}"
             parts.append(
                 f"liveOD says run {live_od.get('run_id')} "
-                f"({live_od.get('expt_name') or 'experiment'}) is IN PROGRESS{shots}. If it is "
-                "still running, a reset cuts it off and its data ends there. Reset only if "
-                "that run is dead.")
-        elif not live_od:
-            parts.append("liveOD's run status is not available here, so this GUI cannot "
-                         "tell whether a run still holds the core.")
-        parts.append(
-            f"Runs {expt}.py on the experiment PC, as if started with ar. It takes the core "
-            "device: anything still running on it is cut off, and the monitor restarts "
-            "when it ends.")
-        if reset.get("about"):
-            parts.append(str(reset["about"]))
-        parts.append("Its end state replaces the state file and marks it trusted. If it "
-                     "fails, the state stays untrusted and the banner says why.\n\n"
-                     "Recorded in the journal with your name.")
+                f"({live_od.get('expt_name') or 'experiment'}) is IN PROGRESS{shots}: this "
+                "cuts it off.")
+        if about:
+            parts.append(about.split("\n\n", 1)[0])
+        parts.append(f"Runs {expt}.py, which takes the core; the monitor restarts when it ends.")
         box.setText("\n\n".join(parts))
-        yes = box.addButton("Reset anyway" if live_od.get("run_in_progress") else "Reset state",
+        if about:
+            box.setDetailedText(about)
+        yes = box.addButton("Run anyway" if live_od.get("run_in_progress") else f"Run {title}",
                             QMessageBox.ButtonRole.AcceptRole)
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
         if box.clickedButton() is not yes:
             return
-        operator = self.composite_panel.operator_name() if self.composite_panel else ""
         try:
             host = socket.gethostname()
         except Exception:
             host = ""
-        self._send_request({"type": "reset_state", "operator": operator, "client": host},
-                           self._on_reset_reply)
+        self._send_request({"type": "reset_state", "client": host}, self._on_reset_reply)
 
     def _on_reset_reply(self, reply: dict) -> None:
         if reply.get("status") == "ok":
             self._set_reset(reply.get("reset"))
         else:
             self._record_line(f"[reset] refused: {reply.get('msg')}")
-            QMessageBox.warning(self, "Reset the device state",
+            QMessageBox.warning(self, f"Run {reset_title(self._reset)}",
                                 f"The monitor server did not start it: {reply.get('msg')}")
         self._refresh_summary()
 
@@ -2419,6 +2431,9 @@ class DeviceStateGUI(QMainWindow):
         """New reset info (status poll, snapshot, broadcast or reply): logs a
         line in the changes log when a reset starts or ends."""
         previous, self._reset = self._reset, reset
+        self._refresh_status_buttons()
+        if self.composite_panel is not None:
+            self.composite_panel.set_reset(reset)
         if not reset:
             return
         key = (reset.get("state"), reset.get("started"))
@@ -2450,19 +2465,18 @@ class DeviceStateGUI(QMainWindow):
             "Clear the fence only if that run is dead (it stopped before its kernel "
             "started: a compile error, an exception, a closed console). If it is still "
             "starting, a composite op sent now can be cut off half-way when it takes the "
-            "core.\n\nRecorded in the journal with your name.")
+            "core.\n\nRecorded in the journal with this machine's name.")
         yes = box.addButton("Clear the fence", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is not yes:
             return
-        operator = self.composite_panel.operator_name() if self.composite_panel else ""
         try:
             host = socket.gethostname()
         except Exception:
             host = ""
-        self._send_request({"type": "clear_run_pending", "token": token,
-                            "operator": operator, "client": host}, self._on_fence_reply)
+        self._send_request({"type": "clear_run_pending", "token": token, "client": host},
+                           self._on_fence_reply)
 
     def _on_fence_reply(self, reply: dict) -> None:
         if reply.get("status") == "ok":

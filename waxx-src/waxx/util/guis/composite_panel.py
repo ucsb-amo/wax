@@ -37,10 +37,11 @@ header.  Every card starts collapsed, and opening or collapsing one never
 moves a card to another column (the arrangement is pinned; see card_layout).
 
 Under the header, the connection bar shows the host-side connections the
-monitor holds (the tweezer AWG; :mod:`waxx.util.device_state.connections`),
-one pill each in liveOD's camera-button colours: grey not connected, purple
-connecting, green connected, red failed.  A click asks the monitor to connect
-it, or (confirmed) to disconnect it.
+monitor server holds between runs (the tweezer AWG;
+:mod:`waxx.util.device_state.connections`), one pill each in liveOD's
+camera-button colours: grey not connected, purple connecting, green
+connected, red failed.  A click asks the server to connect it, or
+(confirmed) to disconnect it.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ from PyQt6.QtCore import QEvent, QObject, QSettings, QSignalBlocker, QThread, QT
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
+    QHeaderView, QLabel, QMenu, QMessageBox, QPushButton, QSizePolicy,
     QTableWidget, QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
@@ -70,6 +71,7 @@ from waxx.util.dashboard import theme
 from waxx.util.device_state import composite as cmp
 from waxx.util.device_state import connections as conns
 from waxx.util.guis.card_layout import FlowLayout, MasonryLayout
+from waxx.util.guis.device_summary import reset_title
 # liveOD's camera connect button colours (grey / purple / green / red), so a
 # connection reads the same here as a camera does there.
 from waxx.util.live_od.gui.camera_menu import STATES as _CAMERA_STATES
@@ -1936,10 +1938,10 @@ class ScenesCard(QFrame):
 # --- connection bar ----------------------------------------------------------------
 
 class ConnectionBar(QFrame):
-    """The monitor's host-side connections, one pill each (see the module
-    docstring).  ``definitions`` (:class:`~connections.Connection`) give the
-    order, labels and tooltips before the monitor has reported anything; a
-    connection the monitor reports that is not defined here is shown too."""
+    """The monitor server's host-side connections, one pill each (see the
+    module docstring).  ``definitions`` (:class:`~connections.Connection`)
+    give the order, labels and tooltips before the server has reported
+    anything; a connection it reports that is not defined here is shown too."""
 
     def __init__(self, panel: "CompositePanel", definitions=()):
         # Parented at once: refresh() below sets the visibility, and a
@@ -2014,7 +2016,7 @@ class ConnectionBar(QFrame):
             if not reachable:
                 state, detail = conns.DISCONNECTED, "monitor server unreachable"
             elif not entry:
-                detail = "not reported by the monitor (is it running?)"
+                detail = "not reported by the monitor server (older code?)"
             else:
                 detail = str(entry.get("detail") or "")
             color, word = _CAMERA_STATES[_CONNECTION_LOOK.get(state, "failed")]
@@ -2047,11 +2049,10 @@ class ConnectionBar(QFrame):
         label = self.label(key)
         if self.state(key) in (conns.CONNECTED, conns.CONNECTING):
             definition = self._defs.get(key)
-            text = f"The monitor closes its connection to the {label}."
+            text = f"The monitor server closes its connection to the {label}."
             if definition is not None and definition.confirm:
                 text += "\n\n" + definition.confirm
-            text += ("\n\nIt stays closed until you connect it again here (or the "
-                     "monitor restarts).")
+            text += "\n\nIt stays closed until someone connects it again here."
             if not self.panel.confirm(f"Disconnect {label}?", text, verb="Disconnect"):
                 return
             self.panel.request_connection(key, "disconnect")
@@ -2201,9 +2202,103 @@ class RunLoopsCard(QFrame):
             row["start"].setToolTip("" if reachable else "the monitor server is unreachable")
 
 
+#: reset state -> (pill text, pill level)
+_RESET_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
+               "done": ("done", "off"), "failed": ("FAILED", "hazard")}
+
+
+class ResetCard(QFrame):
+    """The monitor server's reset experiment (kexp: MOT Observe,
+    :mod:`waxx.util.device_state.state_reset`) in the style of
+    :class:`RunLoopsCard`: Run, the run in progress, and how it last ended.
+    Hidden until the server says it has one.  Run emits the panel's
+    ``reset_requested``; the host GUI confirms and sends it."""
+
+    def __init__(self, panel: "CompositePanel"):
+        super().__init__()
+        self.panel = panel
+        self.info: dict | None = None
+        self.setObjectName("composite_card")
+        self.setStyleSheet(_card_css(theme.ACCENT))
+        box = QVBoxLayout(self)
+        box.setContentsMargins(12, 8, 12, 8)
+        box.setSpacing(6)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.title = QLabel("")
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(11)
+        self.title.setFont(font)
+        self.title.setStyleSheet(f"color: {theme.FG_STRONG};")
+        head.addWidget(self.title)
+        self.pill = QLabel("")
+        head.addWidget(self.pill)
+        head.addStretch(1)
+        self.run_button = QPushButton("Run")
+        self.run_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.run_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
+        self.run_button.clicked.connect(lambda _=False: panel.reset_requested.emit())
+        head.addWidget(self.run_button)
+        box.addLayout(head)
+        self.status = _small("")
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(self.status)
+        self.tail = QLabel("")
+        self.tail.setStyleSheet(f"color: {theme.FG_MUTED}; font-family: Consolas, monospace;"
+                                f" font-size: 10px;")
+        self.tail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.tail.setWordWrap(True)
+        self.tail.hide()
+        box.addWidget(self.tail)
+        self.hide()
+
+    def set_reset(self, info: dict | None) -> None:
+        self.info = dict(info) if isinstance(info, dict) else None
+        self.setVisible(self.info is not None)
+        if self.info is None:
+            return
+        info = self.info
+        state = info.get("state") or "idle"
+        self.title.setText(reset_title(info))
+        self.title.setToolTip(str(info.get("about") or ""))
+        text, level = _RESET_PILL.get(state, (state, "unknown"))
+        self.pill.setText(text)
+        self.pill.setStyleSheet(_label_pill_css(level))
+        who = "@".join(p for p in (info.get("operator"), info.get("client")) if p)
+        if state == "running":
+            parts = [f"started {_clock(info.get('started'))}" + (f" by {who}" if who else ""),
+                     info.get("text") or ""]
+        elif state in ("done", "failed"):
+            parts = [info.get("text") or "", f"ended {_clock(info.get('ended'))}"]
+        else:
+            parts = ["not run since the monitor server started"]
+        self.status.setText(" · ".join(p for p in parts if p))
+        color = ERR_TEXT if state == "failed" else (OK_TEXT if state == "running"
+                                                    else theme.FG_MUTED)
+        self.status.setStyleSheet(f"color: {color}; font-size: 11px;")
+        tail = info.get("tail") if state == "failed" else None
+        self.tail.setText("\n".join(tail or []))
+        self.tail.setVisible(bool(tail))
+        self.refresh_button()
+
+    def refresh_button(self) -> None:
+        info = self.info or {}
+        running = info.get("state") == "running"
+        reachable = self.panel.reachable
+        self.run_button.setText("Running…" if running else "Run")
+        self.run_button.setEnabled(reachable and not running)
+        self.run_button.setToolTip(
+            f"Run {info.get('expt')}.py through the monitor server. It takes the core; its "
+            "end state marks the device state trusted." if reachable
+            else "the monitor server is unreachable")
+
+
 class CompositePanel(QWidget):
-    """The Composite tab: header (op-path status, operator, Ping), then the
-    cards in groups, then the scenes.
+    """The Composite tab: Expand all (and a warning when the monitor's
+    composite ops are wrong), the connection bar, the run loops and reset
+    experiment, then the cards in groups, then the scenes.
 
     ``channel_sender(dtype, name, changes)`` is how single-channel toggles
     are sent (the host GUI's ordinary update path); ``log_line(text)`` records
@@ -2211,11 +2306,13 @@ class CompositePanel(QWidget):
     :class:`~waxx.util.device_state.telemetry.TelemetryHub` (or None); the
     host GUI feeds its samples in with :meth:`set_telemetry`.
     ``connections`` (:class:`~waxx.util.device_state.connections.Connection`)
-    are the monitor's host-side connections shown on the connection bar; the
-    host GUI feeds their states in with :meth:`set_connections`.
+    are the monitor server's host-side connections shown on the connection
+    bar; the host GUI feeds their states in with :meth:`set_connections`.
     """
 
     hazards_changed = pyqtSignal()
+    #: The reset card's Run: the host GUI confirms and asks the server.
+    reset_requested = pyqtSignal()
 
     def __init__(self, devices, params=None, frames=None,
                  channel_sender: Callable | None = None,
@@ -2240,7 +2337,6 @@ class CompositePanel(QWidget):
         self._by_req: dict[int, tuple] = {}
         self._by_seq: dict[int, tuple] = {}
         self._requests: dict[int, Callable[[dict], None]] = {}
-        self._ping_req: int | None = None
         self._hazard_seen: dict[str, float] = {}
         self._last_hazards: tuple = ()
         self.cards: list[CompositeCard] = []
@@ -2252,42 +2348,22 @@ class CompositePanel(QWidget):
         box.setContentsMargins(CARD_GAP, 10, CARD_GAP, CARD_GAP)
         box.setSpacing(10)
 
-        # Header bar: where the op path stands, who is operating, Ping.
-        bar = QFrame()
-        bar.setObjectName("composite_header")
-        bar.setStyleSheet(f"QFrame#composite_header {{ background: {theme.BG_RAISED};"
-                          f" border: 1px solid {theme.BORDER}; border-radius: 6px; }}")
-        head = QHBoxLayout(bar)
-        head.setContentsMargins(10, 5, 6, 5)
+        # Top row: Expand all, and a warning only when the monitor's composite
+        # ops are wrong in a way the strip above the tabs does not report.
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(8)
-        self.path_dot = QLabel("●")
-        head.addWidget(self.path_dot)
-        self.path_label = _small("Composite ops: waiting for the monitor server…")
-        head.addWidget(self.path_label, 1)
-        self.operator = QLineEdit(str(_setting("composite/operator", "") or ""))
-        self.operator.setPlaceholderText("operator")
-        self.operator.setToolTip("Your name: recorded with every op in the monitor "
-                                 "server's journal and shown to other GUIs.")
-        self.operator.setMaximumWidth(120)
-        self.operator.setStyleSheet(f"QLineEdit {{ background: {theme.BG_SUNKEN};"
-                                    f" color: {theme.FG}; border: 1px solid {theme.BORDER};"
-                                    f" border-radius: 4px; padding: 1px 6px; }}")
-        self.operator.editingFinished.connect(
-            lambda: _save_setting("composite/operator", self.operator.text().strip()))
-        head.addWidget(self.operator)
-        self.ping_button = QPushButton("Ping")
-        self.ping_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.ping_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
-        self.ping_button.setToolTip("Send a no-op through the whole op path (server -> "
-                                    "monitor kernel -> back) and time it. Touches no hardware.")
-        self.ping_button.clicked.connect(self.ping)
-        head.addWidget(self.ping_button)
+        self.ops_warning = _small("", WARN_TEXT)
+        self.ops_warning.setWordWrap(True)
+        self.ops_warning.hide()
+        head.addWidget(self.ops_warning, 1)
+        head.addStretch(1)
         self.collapse_button = QPushButton("Expand all")
         self.collapse_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.collapse_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
         self.collapse_button.clicked.connect(self._toggle_all)
         head.addWidget(self.collapse_button)
-        box.addWidget(bar)
+        box.addLayout(head)
 
         # The monitor's host-side connections (hidden when there are none).
         try:
@@ -2302,6 +2378,9 @@ class CompositePanel(QWidget):
         # reports any).
         self.loops_card = RunLoopsCard(self)
         box.addWidget(self.loops_card)
+        # The server's reset experiment (hidden until it reports one).
+        self.reset_card = ResetCard(self)
+        box.addWidget(self.reset_card)
 
         try:
             self.table = cmp.OpTable(devices)
@@ -2493,6 +2572,12 @@ class CompositePanel(QWidget):
             self.scenes_card.show_progress(self.scenes_card.running)
         self.connection_bar.refresh()
         self.loops_card.refresh_buttons()
+        self.reset_card.refresh_button()
+
+    def set_reset(self, info: dict | None) -> None:
+        """The server's reset experiment (``StateReset.info()``; None: it has
+        none)."""
+        self.reset_card.set_reset(info)
 
     def relayout(self) -> None:
         """Heights changed (a card collapsed or opened): restack.  The masonry
@@ -2630,16 +2715,14 @@ class CompositePanel(QWidget):
         the same)."""
         if not self._reachable:
             return False, "the monitor server is unreachable"
-        if self._monitor_state != STATES.READY:
-            return False, "the monitor is not running -- it opens its connections when it starts"
         if action == "connect" and self.run_pending:
             return False, (f"{conns.describe_pending(self.run_pending)} is starting and "
-                           "opens it itself -- the monitor reconnects after the run")
+                           "opens it itself -- it is opened again when the monitor runs")
         return True, ""
 
     def request_connection(self, key: str, action: str) -> None:
-        """Ask the monitor (through its server) to connect / disconnect one of
-        its connections.  The outcome shows as the pill's new state."""
+        """Ask the monitor server to connect / disconnect one of its
+        connections.  The outcome shows as the pill's new state."""
         bar = self.connection_bar
         label = bar.label(key)
         allowed, why = self.connections_allowed(action)
@@ -2660,28 +2743,24 @@ class CompositePanel(QWidget):
         self.send_request({"type": "connection", "key": key, "action": action}, done)
 
     def _refresh_header(self) -> None:
-        allowed, why = self.ops_allowed()
+        """Warn about the monitor's composite ops only where nothing else does:
+        unreachable / not running / a run fence are in the strip above the
+        tabs, and a disabled button's tooltip says which of them applies."""
         info = self._monitor_ops or {}
-        if not allowed:
-            text, color = f"Composite ops unavailable: {why}.", WARN_TEXT
-        elif info.get("hash") and info.get("hash") != self.table.hash:
-            text = (f"Monitor ready, but it was built from different composite definitions "
-                    f"({info.get('hash')} vs this GUI's {self.table.hash}): ops whose code "
-                    f"changed are refused -- restart the monitor to load these.")
-            color = WARN_TEXT
-        else:
-            n = info.get("count", len(self.table)) - 1
-            text = f"Composite ops ready · {n} ops · definitions {self.table.hash}"
-            color = OK_TEXT
-        self.path_label.setText(text)
-        self.path_label.setStyleSheet(f"color: {theme.FG}; font-size: 11px;")
-        self.path_dot.setStyleSheet(f"color: {color}; font-size: 13px;")
-        self.ping_button.setEnabled(allowed)
+        text = ""
+        if self._reachable and self._monitor_state == STATES.READY and info:
+            if not info.get("registered"):
+                text = ("The running monitor registered no composite ops (an older monitor "
+                        "experiment, or its ops were rejected or did not compile -- see the "
+                        "monitor log).")
+            elif info.get("hash") and info.get("hash") != self.table.hash:
+                text = (f"The monitor was built from different composite definitions "
+                        f"({info.get('hash')} vs this GUI's {self.table.hash}): ops whose "
+                        f"code changed are refused -- restart the monitor to load these.")
+        self.ops_warning.setText(text)
+        self.ops_warning.setVisible(bool(text))
 
     # -- sending ---------------------------------------------------------------------
-
-    def operator_name(self) -> str:
-        return self.operator.text().strip()
 
     def send_op(self, card: CompositeCard | None, entry: cmp.OpEntry,
                 args: dict, payload: dict) -> int:
@@ -2690,8 +2769,7 @@ class CompositePanel(QWidget):
         self._by_req[req] = (card, entry, time.monotonic(), dict(args), dict(payload))
         if card is not None:
             card.op_sent(entry)
-        self._sender.submit(req, entry.name, entry.signature, args, payload,
-                            operator=self.operator_name())
+        self._sender.submit(req, entry.name, entry.signature, args, payload)
         return req
 
     def send_request(self, obj: dict, on_reply: Callable[[dict], None] | None = None) -> int:
@@ -2699,16 +2777,10 @@ class CompositePanel(QWidget):
         req = self._req
         obj = dict(obj)
         obj.setdefault("client", self._sender.client_name)
-        obj.setdefault("operator", self.operator_name())
         if on_reply is not None:
             self._requests[req] = on_reply
         self._sender.request(req, obj)
         return req
-
-    def ping(self) -> None:
-        entry = self.table.get(cmp.PING_OP)
-        self._ping_req = self.send_op(None, entry, {}, {})
-        self.path_label.setText("Ping sent…")
 
     def send_channel(self, dtype: str, name: str, changes: dict) -> None:
         if self._channel_sender is not None:
@@ -2980,12 +3052,6 @@ class CompositePanel(QWidget):
 
     def _finish(self, card, entry, req, ok: bool, text: str, seq: int | None = None,
                 args: dict | None = None, payload: dict | None = None) -> None:
-        if req == self._ping_req:
-            self._ping_req = None
-            self._refresh_header()
-            self.path_label.setText(
-                f"Ping: {text}" if not ok else f"Ping round trip {text} ✓ (op path works)")
-            return
         if card is not None:
             card.op_finished(entry, ok, text, args, payload)
         if self._log_line is not None:

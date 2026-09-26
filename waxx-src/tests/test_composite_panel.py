@@ -216,18 +216,24 @@ def test_ops_disabled_and_refused_when_monitor_not_ready(panel):
     assert not card.op_buttons["on"][0].isEnabled()
     assert not card.trigger("on")
     assert panel._sender.sent == []
-    assert "not running" in panel.path_label.text()
+    assert "not running" in card.op_buttons["on"][0].toolTip()
     panel.set_monitor_state(STATES.READY, reachable=True)
     assert card.op_buttons["on"][0].isEnabled()
 
 
-def test_header_flags_a_monitor_built_from_other_definitions(panel):
-    assert "ready" in panel.path_label.text()
+def test_header_warns_only_about_the_monitors_composite_ops(panel):
+    warning = panel.ops_warning
+    assert warning.isHidden()                               # ready, same definitions
     panel.set_monitor_detail({"composite_ops": {"registered": True, "hash": "0" * 16,
                                                 "count": 3}})
-    assert "different composite definitions" in panel.path_label.text()
+    assert not warning.isHidden()
+    assert "different composite definitions" in warning.text()
     panel.set_monitor_detail({"composite_ops": {"registered": False}})
     assert not panel.ops_allowed()[0]
+    assert "registered no composite ops" in warning.text()
+    # a monitor that is not running is the strip's to report, not this line's
+    panel.set_monitor_state(STATES.NOT_READY, reachable=True)
+    assert warning.isHidden()
 
 
 def test_result_flow_updates_footer_and_log(panel):
@@ -285,15 +291,6 @@ def test_other_clients_results_are_logged(panel):
     panel.on_op_result({"type": "op_result", "seq": 99, "op": "beam.on", "ok": True,
                         "text": "done", "client": "kong"})
     assert panel.lines[-1] == "[op] beam.on #99: done (from kong)"
-
-
-def test_ping(panel):
-    panel.ping()
-    sent = panel._sender.sent[-1]
-    assert sent["op"] == cmp.PING_OP and sent["args"] == {}
-    panel._sender.replied.emit(sent["req"], {"status": "ok", "seq": 5})
-    panel.on_op_result({"seq": 5, "ok": True, "elapsed": 0.12})
-    assert "Ping round trip 0.12 s" in panel.path_label.text()
 
 
 def test_channel_toggle_uses_the_channel_path(panel):
@@ -456,6 +453,36 @@ def test_a_refused_loop_start_says_why(panel):
                                               "msg": "run 7 (rabi) is in progress in liveOD"})
     status = panel.loops_card.rows["auto_tof"]["status"].text()
     assert "✕ not started: run 7 (rabi) is in progress in liveOD" in status
+
+
+RESET = {"expt": "mot_observe", "state": "idle",
+         "about": "MOT Observe: puts the machine in its MOT-loading idle state."}
+
+
+def test_reset_card_runs_through_the_host_and_shows_how_it_ended(panel):
+    card = panel.reset_card
+    assert card.isHidden()                                  # until the server has one
+    panel.set_reset(RESET)
+    assert not card.isHidden()
+    assert card.title.text() == "MOT Observe" and card.pill.text() == "idle"
+    assert card.run_button.isEnabled() and card.run_button.text() == "Run"
+    asked = []
+    panel.reset_requested.connect(lambda: asked.append(1))
+    card.run_button.click()
+    assert asked == [1]                                     # the host confirms and sends
+    panel.set_reset(dict(RESET, state="running", started=time.time(), operator="",
+                         client="kong", text="mot_observe started"))
+    assert card.pill.text() == "RUNNING" and "by kong" in card.status.text()
+    assert not card.run_button.isEnabled() and card.run_button.text() == "Running…"
+    panel.set_reset(dict(RESET, state="failed", ended=time.time(), tail=["boom"],
+                         text="mot_observe exited with code 1 without reporting its end state"))
+    assert card.pill.text() == "FAILED" and "exited with code 1" in card.status.text()
+    assert not card.tail.isHidden() and "boom" in card.tail.text()
+    assert card.run_button.isEnabled()
+    panel.set_monitor_state(None, reachable=False)
+    assert not card.run_button.isEnabled()
+    panel.set_reset(None)
+    assert card.isHidden()
 
 
 def test_table_add_row_and_payload(panel):
@@ -889,7 +916,7 @@ def test_strip_trust_run_hazards_and_broadcasts(gui):
     gui._on_state_broadcast({"type": "trust", "trust": {"trusted": False,
                                                         "reason": "run 5 never reported"}})
     assert strip.banners["trust"].isVisibleTo(strip)
-    assert "run 5 never reported" in strip.banners["trust"].label.text()
+    assert "run 5 never reported" in strip.banners["trust"].label.toolTip()
     gui._on_state_broadcast({"type": "run_pending", "run_pending": {"run_id": 6, "expt": "e"}})
     assert strip.banners["run"].isVisibleTo(strip)
     assert "Run 6" in strip.banners["run"].label.text()
@@ -929,6 +956,12 @@ class _AcceptingBox:
             self._yes = button
         return button
 
+    def setDetailedText(self, text):
+        pass
+
+    def setDefaultButton(self, button):
+        pass
+
     def exec(self):
         return 0
 
@@ -950,15 +983,31 @@ def test_the_run_banner_offers_to_clear_a_fence(gui, monkeypatch):
     sent = []
     monkeypatch.setattr(dc, "QMessageBox", _AcceptingBox)
     gui._send_request = lambda obj, callback: sent.append((obj, callback))
-    gui.composite_panel.operator.setText("ada")
     banner.button.click()
     obj, callback = sent[-1]
     assert obj["type"] == "clear_run_pending" and obj["token"] == "tok"
-    assert obj["operator"] == "ada"
+    assert "client" in obj and "operator" not in obj
     assert "81000" in _AcceptingBox.texts[-1]
     callback({"status": "ok"})
     assert gui._run_pending is None and gui.composite_panel.run_pending is None
     assert "Run 81000" in banner.label.text() and not banner.button.isVisibleTo(strip)
+
+
+def test_reset_lives_on_the_composite_tab_not_the_status_row(gui, monkeypatch):
+    gui._set_monitor_state(STATES.READY)
+    gui._set_reset(dict(RESET))
+    card = gui.composite_panel.reset_card
+    assert gui.reset_button.isHidden() and not card.isHidden()
+    sent = []
+    monkeypatch.setattr(dc, "QMessageBox", _AcceptingBox)
+    gui._send_request = lambda obj, callback: sent.append(obj)
+    card.run_button.click()
+    assert sent and sent[-1]["type"] == "reset_state" and "operator" not in sent[-1]
+
+
+def test_search_bar_placeholder_is_short(gui):
+    assert gui.search_bar.placeholderText() == "Search…"
+    assert "Ctrl+F" in gui.search_bar.toolTip()
 
 
 def test_strip_interlock_and_live_od_from_telemetry(gui):
