@@ -6,8 +6,6 @@ from artiq.language.core import now_mu
 from artiq.coredevice.core import Core
 from artiq.experiment import rpc, kernel, delay, parallel, TFloat, portable, TArray, TInt32
 
-import atexit
-import time
 import spcm
 from spcm import units
 
@@ -23,42 +21,15 @@ T_AWG_RPC_DELAY = 25.e-3
 VAL_TYPE_FREQ = 0
 VAL_TYPE_AMP = 1
 
-# Driver error texts that mean "the card is there, but the connection could not
-# be made right now" -- usually the previous run has not let go of it yet. The
-# AWG is a network device and accepts only one connection at a time.
-RETRYABLE_AWG_ERROR_TEXTS = ('in use','locked','network','timeout','not found','no connection')
-
-class AwgConnectionError(Exception):
-    """Raised when the connection to the tweezer AWG could not be opened."""
-    pass
-
-def awg_driver_error_text(handle=None):
-    """Returns the driver's description of the last error.
-
-    Passing no handle asks the driver for the last error overall, which is how
-    the reason for a failed open is read back (there is no handle to ask).
-    """
-    try:
-        error = spcm.SpcmError()
-        error._handle = handle
-        error.get_info()
-        text = str(error).strip()
-    except Exception:
-        text = ""
-    return text or "no reason reported by the driver"
-
-def awg_error_text(e):
-    """Returns a readable message for an exception raised by the spcm driver."""
-    text = str(e).strip()
-    if text and text != "None":
-        return text
-    return awg_driver_error_text()
-
-def is_retryable_awg_error(e):
-    if isinstance(e,AwgConnectionError):
-        return True
-    text = awg_error_text(e).lower()
-    return any(s in text for s in RETRYABLE_AWG_ERROR_TEXTS)
+# The connection to the card (open with retries, bounded close, exit handler)
+# lives in awg_connection; its names are re-exported here for old imports.
+from waxx.control.tweezer.awg_connection import (
+    AwgConnection, AwgConnectionError,
+    awg_driver_error_text, awg_error_text, awg_holder, awg_holder_text,
+    is_retryable_awg_error, is_awg_in_use_error,
+    RETRYABLE_AWG_ERROR_TEXTS, AWG_IN_USE_ERROR_TEXTS,
+    T_AWG_IN_USE_WAIT, T_AWG_RETRY_INTERVAL, N_AWG_RETRIES,
+    T_AWG_CLOSE_TIMEOUT, T_AWG_EXIT_CLOSE_TIMEOUT, T_AWG_CLOSE_SLOW)
 
 class TweezerTrap():
     def __init__(self,
@@ -613,7 +584,16 @@ class TweezerTrap():
         self.dds.exec_at_trg()
         self.dds.write()
 
-class TweezerController():
+class TweezerController(AwgConnection):
+    """Controls the tweezers: the trap list, their moves and ramps, and the
+    AWG card that makes them (the connection itself is AwgConnection's)."""
+
+    _awg_label = "tweezer awg"
+    _in_use_advice = (" Close whatever has it open on the PC holding it: a run that is"
+                      " still going or hung, a notebook kernel that opened the card (the"
+                      " AWG notebooks in kexp/experiments/tools close it only in their"
+                      " last cell), or the monitor (disconnect it on the Composite tab's"
+                      " connection bar).")
 
     def __init__(self,
                   awg_ip='TCPIP::192.168.1.83::inst0::INSTR',
@@ -622,10 +602,10 @@ class TweezerController():
                   expt_params=ExptParams(),
                   core=Core):
         """Controls the tweezers.
-        """        
+        """
+        AwgConnection.__init__(self, awg_ip)
         self.awg_trg_ttl = awg_trg_ttl
         self.params = expt_params
-        self._awg_ip = awg_ip
         self.core = core
 
         self.tweezer_xmesh = tweezer_xmesh
@@ -821,105 +801,61 @@ class TweezerController():
     def get_trap_position(self,idx) -> TFloat:
         return self.traps_saved[idx].position
     
-    def _open_card(self):
-        """Opens the connection to the AWG and returns the card.
-
-        spcm.Card.open stores whatever spcm_hOpen hands back, including a null
-        handle when the connection fails, and marks the card as open anyway. If
-        we do not check here, the failure only shows up at the first register
-        access (card_mode), which makes it look like a card mode problem.
+    def awg_init(self,two_d = False,t_wait_in_use = T_AWG_IN_USE_WAIT):
+        """Connects to the spectrum AWG and sets it up for the tweezers (see
+        _setup_dds). While another connection holds the card, keeps trying for
+        t_wait_in_use seconds (AwgConnection.connect).
         """
-        card = spcm.Card(self._awg_ip)
-        card.open(self._awg_ip)
-        if not card.handle():
-            # Nothing to stop or close -- otherwise Device.__del__ raises on
-            # the null handle while it is being garbage collected.
-            card._closed = True
-            raise AwgConnectionError(
-                f"Could not connect to the tweezer AWG at {self._awg_ip}: {awg_driver_error_text()}")
-        return card
+        self.connect(lambda: self._setup_dds(two_d), t_wait_in_use)
 
-    def awg_init(self,two_d = False):
-        """Connects to spectrum AWG, sets full-scale voltage amplitude, initializes trigger mode.
-        """
-        max_retries = 3
-        retry_delay = 2.
+    def _setup_dds(self, two_d=False):
+        """Sets up the freshly opened card: DDS mode, full-scale voltage
+        amplitude, trigger on ext0, DDS commands by DMA, then starts it with
+        the trigger engine enabled. Its DDS reset leaves no tones."""
+        # self.card.reset()
 
-        # If this process already holds the card (a second init_kernel in the
-        # same run, e.g. after a warm-up dry run), let go of it first -- the
-        # card takes one connection at a time.
-        self.close()
+        # setup card for DDS
+        self.card.card_mode(spcm.SPC_REP_STD_DDS)
 
-        for attempt in range(max_retries):
-            try:
-                self.card = self._open_card()
+        # Setup the channels
+        channels = spcm.Channels(self.card)
+        channels.enable(True)
+        channels.output_load(50 * units.ohm)
+        channels.amp(0.428 * units.V)
+        # channels.amp(1. * units.V)
+        self.card.write_setup()
 
-                # self.card.reset()
+        # trigger mode
+        trigger = spcm.Trigger(self.card)
+        trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
+        trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
+        trigger.ext0_level0(1.5 * units.V) # Trigger level is 1.5 V (1500 mV)
+        trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
+        self.card.write_setup()
 
-                # setup card for DDS
-                self.card.card_mode(spcm.SPC_REP_STD_DDS)
+        # Setup DDS functionality
+        self.dds = spcm.DDSCommandList(self.card)
+        self.dds.reset()
 
-                # Setup the channels
-                channels = spcm.Channels(self.card)
-                channels.enable(True)
-                channels.output_load(50 * units.ohm)
-                channels.amp(0.428 * units.V)
-                # channels.amp(1. * units.V)
-                self.card.write_setup()
+        for trap in self.traps:
+            trap.dds = self.dds
 
-                # trigger mode
-                trigger = spcm.Trigger(self.card)
-                trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
-                trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
-                trigger.ext0_level0(1.5 * units.V) # Trigger level is 1.5 V (1500 mV)
-                trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
-                self.card.write_setup()
+        self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
+        self.dds.mode = self.dds.WRITE_MODE.WAIT_IF_FULL
 
-                # Setup DDS functionality
-                self.dds = spcm.DDSCommandList(self.card)
-                self.dds.reset()
+        self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
 
-                for trap in self.traps:
-                    trap.dds = self.dds
+        # thanks jp
+        self.core_list = [hex(2**n) for n in range(20)]
 
-                self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
-                self.dds.mode = self.dds.WRITE_MODE.WAIT_IF_FULL
+        # assign dds cores to channel
+        if two_d:
+            self.dds.cores_on_channel(1, spcm.SPCM_DDS_CORE8,spcm.SPCM_DDS_CORE9,spcm.SPCM_DDS_CORE10,spcm.SPCM_DDS_CORE11)
 
-                self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+        self.dds.write_to_card()
 
-                # thanks jp
-                self.core_list = [hex(2**n) for n in range(20)]
-
-                # assign dds cores to channel
-                if two_d:
-                    self.dds.cores_on_channel(1, spcm.SPCM_DDS_CORE8,spcm.SPCM_DDS_CORE9,spcm.SPCM_DDS_CORE10,spcm.SPCM_DDS_CORE11)
-
-                self.dds.write_to_card()
-
-                # Start command including enable of trigger engine
-                self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
-                self._register_awg_atexit()
-                break
-
-            except (AwgConnectionError, spcm.SpcmException) as e:
-                reason = str(e) if isinstance(e, AwgConnectionError) else awg_error_text(e)
-
-                # Drop this attempt's connection before trying again, otherwise
-                # the retry adds a second connection to a card that only
-                # accepts one.
-                self.close()
-
-                if is_retryable_awg_error(e) and attempt < max_retries - 1:
-                    print(f"tweezer awg connection failed ({reason}), retrying in {retry_delay} s")
-                    time.sleep(retry_delay)
-                    continue
-
-                # ARTIQ carries only the type and message of an exception back
-                # from the kernel, and SpcmException never passes its message
-                # to Exception.__init__ -- so print the reason here, where it
-                # reaches the terminal, and re-raise with it in the message.
-                print(f"tweezer awg init failed: {reason}")
-                raise RuntimeError(f"tweezer awg init failed: {reason}") from e
+        # Start command including enable of trigger engine
+        self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
 
     def set_static_tweezers(self, freq_list=[0.], amp_list=[0.], phase_list=[0.]):
         """Sets a static tweezer array. If no arguments are provided,
@@ -1013,40 +949,5 @@ class TweezerController():
     @kernel
     def trigger(self):
         self.awg_trg_ttl.pulse(1.e-6)
-
-    def _register_awg_atexit(self):
-        """Releases the AWG connection when the process ends.
-
-        A run that crashes never reaches post_scan, so without this the card
-        stays claimed until the interpreter happens to garbage collect it, and
-        the next run cannot connect.
-        """
-        if getattr(self,'_awg_atexit_registered',False):
-            return
-        atexit.register(self.close)
-        self._awg_atexit_registered = True
-
-    def close(self):
-        """Stops the card and closes the connection to it.
-
-        Stopping alone leaves the connection claimed. Each step is guarded
-        because close() also runs on the failure path, where the card may be
-        half set up.
-        """
-        card = getattr(self,'card',None)
-        if card is None:
-            return
-        try:
-            card.stop()
-        except Exception as e:
-            print(f"tweezer awg: stop failed while closing ({awg_error_text(e)})")
-        try:
-            card.close(card.handle())
-        except Exception as e:
-            print(f"tweezer awg: close failed ({awg_error_text(e)})")
-        # Keeps Device.__del__ from stopping/closing the handle a second time.
-        card._closed = True
-        card._handle = None
-        self.card = None
 
     
