@@ -352,6 +352,20 @@ def test_run_acquisition_delivers_hardware_indices_and_stops_after_n(backend):
     assert be.retrieve(0.05) == []
 
 
+def test_the_last_run_frame_is_read_before_the_run_is_stopped(make_backend):
+    """kong 2026-09-27, run 83174 (host mode): the run stopped at n_frames, then
+    read -- and after AbortAcquisition the last frame could not be read: 14/15,
+    lost silently. The fake models that SDK (unreadable_after_abort)."""
+    be, fake = make_backend(sdk_kwargs=dict(unreadable_after_abort=True))
+    be.apply(RUN, "run")
+    be.start_acquisition("run", n_frames=3)
+    fake.trigger(2)
+    assert [f.hw_idx for f in be.retrieve(0.5)] == [0, 1]
+    fake.trigger(1)                           # the run's last frame
+    assert [f.hw_idx for f in be.retrieve(0.5)] == [2]
+    assert not be.acquisition_state()["acquiring"]     # and the run is stopped
+
+
 def test_run_lost_frames_keep_their_index(make_backend):
     be, fake = make_backend(sdk_kwargs=dict(buffer_size=4))
     be.apply(RUN, "run")

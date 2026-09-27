@@ -522,11 +522,26 @@ class EMCCDBackend:
             state["frames_lost"] = self._live_lost
         return state
 
-    def _stop_run_if_complete(self, cam):
+    def _stop_run_if_complete(self, cam) -> bool:
         # A run stops by itself after n_frames: nothing beyond them is acquired.
         if self._mode == "run" and cam.acquisition_in_progress():
             if cam.get_acquisition_progress().frames_done >= self._n_frames:
                 cam.stop_acquisition()
+                return True
+        return False
+
+    def _read_then_stop(self, cam) -> list:
+        # Read BEFORE stopping a complete run: after AbortAcquisition pylablib
+        # serves none of the frames already acquired (the SDK's progress count no
+        # longer covers them), so a frame read only after the stop was lost, and
+        # silently -- kong 2026-09-27, run 83174: 14/15, the last frame missing.
+        new = self._read_new(cam)
+        if self._stop_run_if_complete(cam):
+            try:
+                new += self._read_new(cam)      # one that landed between the read and the stop
+            except Exception:
+                pass
+        return new
 
     def _read_new(self, cam) -> list:
         # Every frame from the next expected hardware index on; the ones the
@@ -550,15 +565,13 @@ class EMCCDBackend:
 
     def retrieve(self, timeout_s: float) -> list:
         cam = self._require_open()
-        self._stop_run_if_complete(cam)
-        new = self._read_new(cam)
+        new = self._read_then_stop(cam)
         if not new and timeout_s > 0 and cam.acquisition_in_progress():
             try:
                 cam.wait_for_frame(since="lastread", nframes=1, timeout=timeout_s)
             except cam.TimeoutError:
                 return []
-            self._stop_run_if_complete(cam)
-            new = self._read_new(cam)
+            new = self._read_then_stop(cam)
         if self._mode == "snap" and new:
             cam.stop_acquisition()
             first = [f for f in new if f.hw_idx == 0]

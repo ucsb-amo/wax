@@ -84,8 +84,13 @@ class FakeSDK2Lib(AndorSDK2Lib):
                  has_shutter=True, has_baseline_clamp=True,
                  temperature_during_acquisition=False,
                  trigger_modes_available=(0, 1, 6, 7, 10),
-                 min_image_length=1, em_gain_floor=0):
+                 min_image_length=1, em_gain_floor=0, unreadable_after_abort=False):
         super().__init__()
+        # AbortAcquisition hides the frames already acquired: GetAcquisitionProgress
+        # reads 0 afterwards, so pylablib serves none of them (kong, run 83174:
+        # the frame read only after the stop was lost, silently)
+        self.unreadable_after_abort = bool(unreadable_after_abort)
+        self._aborted = False
         # the camera raises a lower EM gain to this (kong's DU897, 2026-09-27:
         # 1 requested, 4 read back)
         self.em_gain_floor = int(em_gain_floor)
@@ -618,6 +623,7 @@ class FakeSDK2Lib(AndorSDK2Lib):
     @_sdk
     def StartAcquisition(self):
         self.acquiring = True
+        self._aborted = False
         self.acq_gen += 1
         self.n_acquired = 0
         self.frames.clear()
@@ -629,9 +635,12 @@ class FakeSDK2Lib(AndorSDK2Lib):
         if not self.acquiring:
             self._err("AbortAcquisition", D.DRV_IDLE)
         self.acquiring = False
+        self._aborted = True
 
     @_sdk
     def GetAcquisitionProgress(self):
+        if self.unreadable_after_abort and self._aborted:
+            return (0, 0)
         return (0, self.n_acquired)
 
     @_sdk
