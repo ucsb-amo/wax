@@ -24,6 +24,21 @@ BASLER_TRIGGER_SOURCE_DEFAULT = "Line1"
 _RLOCK_TYPE = type(threading.RLock())
 
 
+def _driver_attr(obj, name):
+    """``obj.<name>``, or None when the camera driver does not have it.
+
+    Never ``getattr(obj, name, None)`` / ``hasattr(obj, name)`` on a camera:
+    pypylon's InstantCamera (BaslerUSB) looks any name its class lacks up as a
+    GenICam node, and a missing node raises LogicalErrorException, not
+    AttributeError, which getattr/hasattr let through. (2026-09-27: that skipped
+    the Basler close at liveOD shutdown -- "Node not existing", camera left open.)
+    """
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
 class CameraNanny():
     def __init__(self):
         self.interrupted = False
@@ -51,7 +66,7 @@ class CameraNanny():
         per camera key. None for a DummyCamera: nothing to guard."""
         if self._is_dummy_or_none(camera):
             return None
-        grab_lock = getattr(camera, "grab_lock", None)
+        grab_lock = _driver_attr(camera, "grab_lock")
         if callable(grab_lock):
             try:
                 lock = grab_lock()
@@ -79,7 +94,8 @@ class CameraNanny():
     def _is_camera(obj):
         """A camera handle this nanny opened (not a DummyCamera, not a setting)."""
         return (obj is not None and not isinstance(obj, DummyCamera)
-                and hasattr(obj, "is_opened") and hasattr(obj, "Close"))
+                and callable(_driver_attr(obj, "is_opened"))
+                and callable(_driver_attr(obj, "Close")))
 
     def _is_dummy_or_none(self, camera):
         return camera is None or isinstance(camera, DummyCamera)
@@ -171,7 +187,8 @@ class CameraNanny():
                 # Go through stop_grab() rather than StopGrabbing() directly: it
                 # is a no-op when another thread still owns the grab loop, so a
                 # new baby's setup cannot tear down a grab in progress.
-                if hasattr(camera, 'IsGrabbing') and camera.IsGrabbing():
+                is_grabbing = _driver_attr(camera, 'IsGrabbing')
+                if callable(is_grabbing) and is_grabbing():
                     try:
                         camera.stop_grab()
                     except Exception:
@@ -181,22 +198,24 @@ class CameraNanny():
                 trigger_source = getattr(camera_params, "trigger_source", BASLER_TRIGGER_SOURCE_DEFAULT)
                 if isinstance(trigger_source, bytes):
                     trigger_source = trigger_source.decode()
-                if hasattr(camera, "configure_trigger"):
-                    camera.configure_trigger(trigger_source)
+                configure_trigger = _driver_attr(camera, "configure_trigger")
+                if callable(configure_trigger):
+                    configure_trigger(trigger_source)
                 else:
                     self._warn_missing(camera_key, "configure_trigger", "the trigger (mode, source, line)")
                 logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
             elif camera_type == "andor":
                 camera.set_EMCCD_gain(camera_params.gain)
                 camera.set_exposure(camera_params.exposure_time)
-                if hasattr(camera, "set_amp_mode_checked"):
+                set_amp_mode_checked = _driver_attr(camera, "set_amp_mode_checked")
+                if callable(set_amp_mode_checked):
                     # One call for the whole amplifier mode, refused (nothing
                     # sent) if the camera does not offer it. As two calls, the
                     # preamp was set at the old hs_speed first, and pylablib
                     # silently substitutes a preamp that combination lacks.
-                    camera.set_amp_mode_checked(channel=0, oamp=0,
-                                                hsspeed=camera_params.hs_speed,
-                                                preamp=camera_params.preamp)
+                    set_amp_mode_checked(channel=0, oamp=0,
+                                         hsspeed=camera_params.hs_speed,
+                                         preamp=camera_params.preamp)
                 else:
                     self._warn_missing(camera_key, "set_amp_mode_checked",
                                        "the amplifier mode (hs_speed with preamp) as one checked setting")
@@ -218,19 +237,21 @@ class CameraNanny():
                               for k, v in ANDOR_RUN_FIELD_DEFAULTS.items()}
                 if isinstance(run_fields["trigger_mode"], bytes):
                     run_fields["trigger_mode"] = run_fields["trigger_mode"].decode()
-                if hasattr(camera, "apply_run_fields"):
+                apply_run_fields = _driver_attr(camera, "apply_run_fields")
+                if callable(apply_run_fields):
                     # validates (refusing anything but ext / FT off / full frame)
                     # and sets trigger, FT, image area and shutter open
-                    camera.apply_run_fields(run_fields["trigger_mode"],
-                                            run_fields["frame_transfer"],
-                                            run_fields["sensor_roi"])
+                    apply_run_fields(run_fields["trigger_mode"],
+                                     run_fields["frame_transfer"],
+                                     run_fields["sensor_roi"])
                 else:
                     self._warn_missing(camera_key, "apply_run_fields",
                                        "the trigger mode, frame transfer, sensor area and shutter")
                 logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
             # what the driver could not set as asked (Basler exposure/gain limits)
-            if hasattr(camera, "last_clamps"):
-                clamps = dict(camera.last_clamps() or {})
+            last_clamps = _driver_attr(camera, "last_clamps")
+            if callable(last_clamps):
+                clamps = dict(last_clamps() or {})
         except Exception as e:
             logger.error(f"Could not apply the run's settings to camera {camera_params.key}: {e}")
             if report is not None:
@@ -289,12 +310,13 @@ class CameraNanny():
                 continue
             errors = []
             try:
-                if hasattr(obj, "stop_grab"):
-                    obj.stop_grab()
+                stop_grab = _driver_attr(obj, "stop_grab")
+                if callable(stop_grab):
+                    stop_grab()
             except Exception as e:
                 errors.append(f"stop_grab(): {e}")
             try:
-                closer = getattr(obj, "close_safely", None)
+                closer = _driver_attr(obj, "close_safely")
                 if callable(closer):
                     errors += [str(e) for e in (closer() or [])]
                 else:

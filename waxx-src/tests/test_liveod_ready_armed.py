@@ -385,6 +385,44 @@ def test_close_all_closes_safely_and_forgets_the_camera():
     assert nanny.interrupted is False                           # settings are not cameras
 
 
+class NodeNotExisting(Exception):
+    """Stands in for pypylon's genicam LogicalErrorException: NOT an AttributeError."""
+
+
+class PylonLikeBasler(FakeBasler):
+    """As pypylon's InstantCamera (BaslerUSB's base): a name the driver lacks is
+    looked up as a GenICam node, and a missing node raises NodeNotExisting, which
+    getattr(obj, name, None) and hasattr() let through."""
+
+    def __getattr__(self, name):
+        if name in type(self).absent:
+            raise NodeNotExisting(f"Node not existing: {name}")
+        return super().__getattr__(name)
+
+
+def test_close_all_closes_a_pylon_like_basler():
+    """2026-09-27, liveOD shutdown: getattr(obj, "close_safely", None) raised
+    "Node not existing" on the real x_basler, so Close() never ran."""
+    from waxx.util.live_od.camera_nanny import CameraNanny
+    nanny = CameraNanny()
+    nanny.x_basler = cam = PylonLikeBasler()
+    results = nanny.close_all()
+    assert results["x_basler"] == ""
+    assert names(cam) == ["stop_grab", "Close"]
+    assert not hasattr(nanny, "x_basler")
+
+
+def test_run_settings_reach_a_pylon_like_basler_without_optional_methods():
+    from waxx.util.live_od.camera_nanny import CameraNanny
+
+    class OldPylonBasler(PylonLikeBasler):
+        absent = ("close_safely", "configure_trigger", "last_clamps")
+    cam, report = OldPylonBasler(), {}
+    assert CameraNanny().update_params(cam, basler_params(), report=report) is cam
+    assert "error" not in report
+    assert "set_gain" in names(cam) and "configure_trigger" not in names(cam)
+
+
 def test_close_all_reports_step_errors_and_keeps_a_camera_still_open():
     from waxx.util.live_od.camera_nanny import CameraNanny
 
