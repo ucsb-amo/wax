@@ -121,7 +121,8 @@ class LogBuffer(logging.Handler):
 
     def end_run(self, outcome: str, detail: str = "", **info):
         """How the current run ended: ``saved``, ``saved_incomplete``,
-        ``discarded``, ``save_failed`` or ``nothing_written``."""
+        ``discarded``, ``save_failed``, ``nothing_written`` or ``exited`` (the
+        experiment's process exited without END_RUN; its file is left as it was)."""
         with self._lock_:
             if self._current is None:
                 return

@@ -34,6 +34,8 @@ STATES = {
     "done":               ("Done", "#2e7d32"),
     "aborting":           ("Aborting", "#fb8c00"),
     "aborted":            ("Aborted", "#fb8c00"),
+    "no_reply":           ("No reply", "#d84315"),
+    "exited":             ("Exited", "#c62828"),
     "stalled":            ("Stalled", "#f9a825"),
     "error":              ("Error", "#c62828"),
 }
@@ -41,8 +43,15 @@ STATE_TIPS = {
     "waiting_camera": "Waiting for the camera to report ready",
     "waiting_grab_drain": "Waiting for the previous run's grab loop to let go of the camera",
     "done": "Finished; nothing was saved",
+    "aborting": ("Abort requested; waiting for the experiment to stop. It checks at the "
+                 "end of each shot, so this can take up to a shot."),
+    "no_reply": ("Abort requested, and the experiment has not answered. Its process may "
+                 "be gone (console closed, killed) or hung."),
+    "exited": "The experiment's process exited without ending the run (no END_RUN)",
 }
-ACTIVE_STATES = ("waiting_camera", "waiting_grab_drain", "running", "saving", "aborting")
+# no_reply: the run has not been seen to end, so its clock keeps going
+ACTIVE_STATES = ("waiting_camera", "waiting_grab_drain", "running", "saving", "aborting",
+                 "no_reply")
 
 STALL_FACTOR = 3.0      # no shot for this many average shot periods ...
 STALL_MIN_S = 10.0      # ... and at least this long -> "Stalled"

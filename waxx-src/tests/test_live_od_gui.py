@@ -631,6 +631,35 @@ def test_status_strip_run_and_stall(app, monkeypatch):
     assert strip.run_label.text() == "unsaved · scope_test"
 
 
+def test_status_strip_an_abort_nobody_answers(app):
+    """An abort the experiment never acknowledges ends in "No reply", which says so
+    and keeps the run's clock going (the run has not been seen to end); a process
+    that exits without END_RUN is "Exited" and the clock stops."""
+    from waxx.util.live_od.gui import status_strip
+    strip = status_strip.StatusStrip()
+    titles = []
+    strip.title_changed.connect(titles.append)
+    strip.start_run(83110, "hf_bec_event_count", "andor", save_data=True, n_shots=1)
+    strip.set_state("running")
+    strip.set_progress(1, 1)
+    strip.set_state("aborting")
+    assert strip.pill.text() == "Aborting" and "end of each shot" in strip.pill.toolTip()
+    strip.set_state("no_reply", "Abort requested at 16:48:47; no answer in 70 s")
+    assert strip.pill.text() == "No reply" and strip.state() == "no_reply"
+    assert "has not answered" in strip.pill.toolTip()
+    assert "16:48:47" in strip.pill.toolTip()                   # the server's detail
+    assert strip._run_end is None                              # still counting
+    assert titles[-1] == "Run 83110 — No reply — 1/1"
+    strip.set_state("aborted")                                 # a late acknowledgement
+    assert strip.pill.text() == "Aborted" and strip._run_end is not None
+
+    strip.start_run(83111, "hf_bec_event_count", "andor", save_data=True, n_shots=1)
+    strip.set_state("running")
+    strip.set_state("exited", "uncaught RuntimeError: boom")
+    assert strip.pill.text() == "Exited" and "no END_RUN" in strip.pill.toolTip()
+    assert "boom" in strip.pill.toolTip() and strip._run_end is not None
+
+
 def test_status_strip_never_asks_for_more_width(app):
     """A run starting must not widen the window: whatever the strip is told, the
     least width it will accept stays what it was when idle."""
@@ -717,26 +746,85 @@ def test_camera_button_shows_one_camera_and_drops_down_the_others(app):
 
 
 def test_camera_button_stylesheets_parse(app):
-    """Qt drops a stylesheet it can't parse and only says so on the console."""
+    """Qt drops a stylesheet it can't parse and only says so on the console.
+    Also for Persist (shown, hidden) and for the camera host's control, dialog and
+    live view in every state they have."""
     from PyQt6.QtCore import qInstallMessageHandler
     from waxx.util.live_od.gui.camera_menu import CameraMenuButton, STATES
+    from waxx.util.live_od.gui.camera_control import CameraControl, HOST_STATES, LEGACY_STATE
     messages = []
     previous = qInstallMessageHandler(lambda _mode, _ctx, msg: messages.append(msg))
+    widgets = []
     try:
         menu = CameraMenuButton(["cam_a", "cam_b"])
         for state in STATES:
-            menu.set_state("cam_a", state)
-            menu.set_state("cam_b", state)
-            menu.show()
-            menu.ensurePolished()
-            for _action, button in menu._menu_actions.values():
-                button.ensurePolished()
-            app.processEvents()
+            for persist in ({}, {"cam_a": True}, {"cam_b": True}, {"cam_a": True, "cam_b": True}):
+                menu.set_state("cam_a", state)
+                menu.set_state("cam_b", state)
+                menu.set_persist({"cam_a": False, "cam_b": False, **persist})
+                menu.show()
+                menu.ensurePolished()
+                for _action, button in menu._menu_actions.values():
+                    button.ensurePolished()
+                app.processEvents()
         menu.hide()
         empty = CameraMenuButton()
         empty.ensurePolished()
+
+        control = CameraControl(["cam_a", "cam_b"])
+        widgets.append(control)
+        control.show()
+        for host_state in HOST_STATES:
+            for persist in (False, True):
+                control.set_snapshot({"cameras": {
+                    k: {"key": k, "category": "basler_usb", "host_state": host_state,
+                        "state": LEGACY_STATE[host_state], "persist": persist and k == "cam_b",
+                        "n_subs": 3} for k in ("cam_a", "cam_b")}})
+                control.ensurePolished()
+                app.processEvents()
+        control._unknown = True
+        control._render()
+        app.processEvents()
+
+        from PyQt6.QtWidgets import QWidget
+        from cam_ctrl_fakes import FakeHost, make_stream
+        from waxx.util.live_od.gui.camera_settings_dialog import CameraSettingsDialog
+        from waxx.util.live_od.gui.live_view_window import LiveViewWindow
+
+        class StubViewer(QWidget):          # no frame thread: only the window's styles matter here
+            def __init__(self, _source):
+                super().__init__()
+
+            def open_camera(self):
+                pass
+
+            def shutdown(self):
+                return None
+        host = FakeHost()
+        dialog = CameraSettingsDialog("andor", host, confirm=lambda t, x: True, async_calls=False)
+        widgets.append(dialog)
+        dialog.show()
+        dialog.persist_box.click()                        # Persist on: red header, marks
+        host.set_state("andor", "acquiring", run_id=80713)
+        dialog.set_snapshot(host.snapshot())              # locked
+        dialog._stale = {"gain": 55}
+        dialog._show_chip()
+        dialog.show_message("a message", "warn")
+        app.processEvents()
+        window = LiveViewWindow(host, stream_factory=make_stream, viewer_factory=StubViewer)
+        widgets.append(window)
+        window.show()
+        window.show_camera("xy_basler")
+        for source, tag in (("live", None), ("run", "80713:abcd"), ("run", "0:abcd")):
+            window._on_seen("xy_basler", source, tag)
+            app.processEvents()
+        window._on_note("xy_basler", "a note")
+        app.processEvents()
     finally:
         qInstallMessageHandler(previous)
+        for w in widgets:
+            w.hide()
+        _keep_alive.extend(widgets)
     assert not [m for m in messages if "stylesheet" in m.lower()]
 
 
