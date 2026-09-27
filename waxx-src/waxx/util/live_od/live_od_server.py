@@ -10,11 +10,14 @@ on the GUI machine. All HDF5 I/O stays on the server side; the experiment
 client never needs the data drive mounted.
 """
 
+import collections
+import json
 import logging
 import pickle
 import os
 import threading
 import time
+import uuid
 
 from waxx.config.timeouts import DATA_SAVER_TIMEOUT
 
@@ -29,8 +32,17 @@ from waxx.util.live_od.config import get_config
 from waxx.util.live_od.data.run_file import RunFile, RunFileSaveError
 from waxx.util.live_od.log import get_logger, get_log_buffer
 from waxx.util.live_od.marker_store import MarkerStore
+from waxx.util.live_od import frame_alignment
 
 logger = get_logger("server")
+
+
+def _safe_repr(value) -> str:
+    """``repr(value)``, or a stand-in when even that raises."""
+    try:
+        return repr(value)
+    except Exception:
+        return f"<{type(value).__name__}: repr failed>"
 
 
 class LiveODServer(QThread, NetServer):
@@ -122,8 +134,50 @@ class LiveODServer(QThread, NetServer):
         self._grab_failure = ""         # the CameraBaby's reason, when its grab ended early
         self._frame_deficit_warned = 0  # the shortfall already warned about this run
         self._last_outcome = {}         # how the last run ended, for POLL / GET_LOG
+        # The server's name for the current run: issued at INIT_RUN, sent back by
+        # the client with every message about the run. A message carrying another
+        # token belongs to a run that a later INIT_RUN superseded, and is ignored
+        # (see _run_msg_ok). "" until the first INIT_RUN.
+        self._run_token = ""
+        # Every token this process has issued (bounded): a message whose token is
+        # not among them is from a run before a liveOD restart, not a superseded one.
+        self._issued_run_tokens = collections.deque(maxlen=512)
+        # (report, token) of the camera-thread reports of replaced runs already
+        # warned about (_report_is_current): one WARNING each, not one per frame
+        self._stale_reports_warned = set()
+        # Camera settings the current run got that differ from its camera_params
+        # (clamps reported by the camera thread): {field: {requested, applied,
+        # origin}}. Recorded in the run file as the root attribute camera_overrides.
+        self._camera_overrides: dict = {}
+        self._camera_overrides_key = ""
+        self._camera_overrides_lock = threading.Lock()
+        # For END_RUN's frame-alignment check, all on time.monotonic(): when each
+        # frame came off the camera queue (under _images_lock), when each
+        # SHOT_COMPLETE arrived, and when the experiment was first told the
+        # camera was ready.
+        self._frame_times: list = []
+        self._shot_mono: list = []
+        self._t_ready_mono = None
         # pins on the image, per camera; the file is not touched until first used
         self.markers = MarkerStore(marker_path)
+        # The camera host (LiveODConfig.use_camera_host; the window hands it in with
+        # set_camera_host). None: cameras through CameraNanny, as before, and none of
+        # the host state below is used.
+        self._camera_host = None
+        self._host_run_token = ""       # the run whose camera lock the host holds
+        self._host_run_start = None     # what begin_run found (profile, persist overrides)
+        self._host_arm_future = None    # started by the run's first WAIT_CAM_READY
+        self._host_camera_params = {}
+        self._host_n_img = 0
+        # the token of each camera run whose camera thread the window has not yet
+        # spawned (new_run_signal is queued; a second INIT_RUN may come first).
+        # Bounded: a server without a window (tests, tools) takes none of them.
+        self._spawn_tokens = collections.deque(maxlen=64)
+        # host mode: (token, RunStart, camera_params, n_img) of an INIT_RUN whose
+        # camera is locked but which is not accepted yet (_host_commit_run)
+        self._host_pending = None
+        # when Persist was turned on, for the overrides record of the current run
+        self._camera_overrides_persist_since = None
 
     def set_markers(self, camera_key: str, markers) -> list:
         """Store one camera's markers (from the GUI; remote viewers use SET_MARKERS)."""
@@ -148,14 +202,17 @@ class LiveODServer(QThread, NetServer):
     # Public slots (safe to call from any thread)
     # ------------------------------------------------------------------
 
-    def on_cam_ready(self):
+    def on_cam_ready(self, run_token=None):
         """Set camera-ready event.
 
         Connect this to ``CameraBaby.cam_status_signal`` filtered to
         status == 2 using ``Qt.ConnectionType.DirectConnection`` so the
         threading.Event is set from the CameraBaby thread immediately.
+        ``run_token``: the run the camera thread works for (_report_is_current).
         """
-        self._cam_ready_event.set()
+        with self._images_lock:
+            if self._report_is_current("camera ready (status 2)", run_token):
+                self._cam_ready_event.set()
 
     def on_basler_baby_done(self):
         """Called when a Basler CameraBaby's thread has fully finished.
@@ -181,31 +238,503 @@ class LiveODServer(QThread, NetServer):
             if self._basler_babies_live <= 1:
                 self._basler_prev_grab_done_event.set()
 
-    def on_data_handler_done(self):
+    def on_data_handler_done(self, run_token=None):
         """Set the data-handler-done event.
 
         Connect to ``DataHandler.done_writing_signal`` with
         ``Qt.ConnectionType.DirectConnection`` so the event is set from
         the DataHandler thread immediately after it closes the HDF5 file.
+        ``run_token``: the run the image writer worked for; a replaced run's
+        writer must not open the new run's END_RUN save (_report_is_current).
         """
-        self._run_file.writer_finished()
-
-    def on_image_received(self, *_):
-        """One frame came off the camera queue. Connect to
-        ``DataHandler.got_image_from_queue`` with a DirectConnection."""
         with self._images_lock:
-            self._images_received += 1
+            if self._report_is_current("an image writer's end", run_token):
+                self._run_file.writer_finished()
 
-    def on_grab_failed(self, reason: str):
+    def wait_for_image_writer(self, timeout: float) -> bool:
+        """True once the current run's image writer has closed the run's file
+        (at once when there is none). For the window's shutdown."""
+        return self._run_file.writer_done.wait(timeout)
+
+    def on_image_received(self, *_, run_token=None):
+        """One frame came off the camera queue. Connect to
+        ``DataHandler.got_image_from_queue`` with a DirectConnection.
+        ``run_token``: the run the image dispatcher works for (_report_is_current)."""
+        with self._images_lock:
+            if not self._report_is_current("a frame", run_token):
+                return
+            self._images_received += 1
+            self._frame_times.append(time.monotonic())
+
+    def on_grab_failed(self, reason: str, run_token=None):
         """The CameraBaby's grab ended early (timeout, camera error). Connect to
         ``CameraBaby.grab_failed_signal`` with a DirectConnection. END_RUN puts
-        the reason in the file."""
-        self._grab_failure = str(reason)
-        get_log_buffer().update_run(grab_failure=self._grab_failure)
+        the reason in the file. ``run_token``: see _report_is_current."""
+        with self._images_lock:
+            if not self._report_is_current("a grab failure", run_token):
+                return
+            self._grab_failure = str(reason)
+            get_log_buffer().update_run(grab_failure=self._grab_failure)
 
     def _images_received_now(self) -> int:
         with self._images_lock:
             return self._images_received
+
+    # ------------------------------------------------------------------
+    # Run identity
+    # ------------------------------------------------------------------
+
+    def _adopt_run_token(self, token: str):
+        """The INIT_RUN is accepted: ``token`` names the current run from now on.
+        Replaced under _images_lock, the lock the camera threads' reports are
+        checked under (_report_is_current)."""
+        with self._images_lock:
+            self._run_token = token
+            self._issued_run_tokens.append(token)
+            self._stale_reports_warned.clear()
+
+    def _report_is_current(self, what: str, run_token) -> bool:
+        """Is a camera thread's report about the current run? ``run_token`` is
+        the token of the run the thread was spawned for (LiveODWindow.spawn_baby
+        stamps its threads with it); None is a caller that does not stamp, taken
+        as before.
+
+        Call with _images_lock held. INIT_RUN replaces the token under that lock
+        and resets what these reports set only after it, so a report either
+        lands before the new run's reset (which clears it) or is checked against
+        the new token and dropped. Without the check, a thread of the previous
+        run still got through between INIT_RUN (this thread) and the window's
+        spawn_baby (the GUI thread; new_run_signal is queued): its status 2
+        marked the new run's camera ready, its grab failure marked the new run
+        incomplete, its frames counted as the new run's."""
+        if run_token is None or str(run_token) == self._run_token:
+            return True
+        key = (what, str(run_token))
+        if key not in self._stale_reports_warned:
+            self._stale_reports_warned.add(key)
+            logger.warning(f"Ignored {what} from a camera thread of an earlier run (token "
+                           f"{str(run_token)[:8]}...): the current run's token is "
+                           f"{self._run_token[:8]}...")
+        return False
+
+    def _run_msg_ok(self, msg: dict) -> bool:
+        """Is this run message about the current run? A message without a
+        token comes from experiment code that predates tokens and is taken as
+        before; one with another run's token is not."""
+        token = msg.get("run_token")
+        return not token or str(token) == self._run_token
+
+    def _stale_run_reply(self, tag: str, msg: dict) -> dict:
+        """The reply to a message about a run that is not the current one: a run
+        a later INIT_RUN superseded, or one this liveOD never issued a token for
+        (``unknown_run``: liveOD was restarted after that run's INIT_RUN).
+        Nothing is changed: no save, no delete, no run state."""
+        token = str(msg.get("run_token"))
+        if token in self._issued_run_tokens:
+            logger.warning(f"{tag} carries the token of a superseded run ({token[:8]}...); the "
+                           f"current run is {self._current_run_id} ({self._run_token[:8]}...). "
+                           f"Ignored.")
+            return {"ok": False, "stale_run": True,
+                    "error": f"{tag} for superseded run (token {token}); ignored"}
+        logger.warning(f"{tag} carries a run token unknown to this liveOD ({token[:8]}...): "
+                       f"was liveOD restarted after that run's INIT_RUN? Ignored.")
+        return {"ok": False, "stale_run": True, "unknown_run": True,
+                "error": f"{tag} for a run unknown to this liveOD (restarted?) "
+                         f"(token {token}); ignored"}
+
+    # ------------------------------------------------------------------
+    # Camera settings that differ from the request
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _plain(value):
+        """A JSON-able copy of a driver value (numpy scalars, tuples)."""
+        if hasattr(value, "item") and not isinstance(value, (list, tuple, dict)):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        if isinstance(value, (list, tuple)):
+            return [LiveODServer._plain(v) for v in value]
+        if isinstance(value, bytes):
+            return value.decode(errors="replace")
+        return value
+
+    def on_camera_overrides(self, camera_key: str, clamps: dict, run_token=None):
+        """The run's camera applied values other than those requested
+        (``{field: (requested, applied)}``, from the driver's clamps). Connect to
+        ``CameraBaby.camera_overrides_signal`` with a DirectConnection. Logged
+        now, one WARNING per field; recorded in the file at END_RUN.
+        ``run_token``: see _report_is_current."""
+        fields = {}
+        for key, pair in dict(clamps or {}).items():
+            try:
+                requested, applied = pair
+            except (TypeError, ValueError):
+                logger.warning(f"{camera_key}: unreadable clamp report for {key}: {pair!r}")
+                continue
+            fields[str(key)] = {"requested": self._plain(requested),
+                                "applied": self._plain(applied), "origin": "clamped"}
+        if not fields:
+            return
+        with self._images_lock:
+            if not self._report_is_current("a camera settings report", run_token):
+                return
+            with self._camera_overrides_lock:
+                self._camera_overrides.update(fields)
+                self._camera_overrides_key = str(camera_key)
+        for key, f in fields.items():
+            logger.warning(f"CAMERA OVERRIDE: run {self._current_run_id} on {camera_key}: "
+                           f"{key} requested {f['requested']!r} -> applied {f['applied']!r} "
+                           f"({f['origin']}); camera_params in the file stay the request")
+
+    def camera_overrides_record(self) -> dict:
+        """The current run's overrides record (INTERFACES section 4), or {} if
+        every applied value is the requested one. Plain JSON values only: a value
+        JSON cannot hold (an array, a driver's object, an odd persisted value) is
+        its repr, so the record can always be written and sent."""
+        with self._camera_overrides_lock:
+            if not self._camera_overrides:
+                return {}
+            record = {"schema": 1, "camera_key": self._camera_overrides_key,
+                      "persist_since": self._camera_overrides_persist_since,
+                      "fields": {k: dict(v) for k, v in self._camera_overrides.items()}}
+        return self._json_safe_record(record)
+
+    @staticmethod
+    def _json_safe_record(record: dict) -> dict:
+        """``record`` with every value JSON cannot hold replaced by its repr. If
+        even that fails (a self-reference, a key of an odd type), every field's
+        requested / applied value is its repr."""
+        try:
+            return json.loads(json.JSONEncoder(default=_safe_repr).encode(record))
+        except Exception:
+            fields = {}
+            for key, f in dict(record.get("fields") or {}).items():
+                f = f if isinstance(f, dict) else {"applied": f}
+                fields[str(key)] = {"requested": _safe_repr(f.get("requested")),
+                                    "applied": _safe_repr(f.get("applied")),
+                                    "origin": str(f.get("origin", "?"))}
+            since = record.get("persist_since")
+            return {"schema": 1, "camera_key": str(record.get("camera_key", "")),
+                    "persist_since": None if since is None else str(since), "fields": fields}
+
+    def _with_camera_overrides(self, msg: dict) -> dict:
+        """The END_RUN payload, plus the root attribute ``camera_overrides`` in its
+        extra file texts when the run's camera applied anything other than the
+        request. The payload itself is not modified. The record never blocks the
+        save: if it cannot be added, the run is saved without it and an ERROR
+        says what the camera ran with."""
+        try:
+            return self._add_camera_overrides(msg)
+        except Exception as exc:
+            with self._camera_overrides_lock:
+                fields = dict(self._camera_overrides)
+            logger.error(f"END_RUN: run {self._current_run_id}: the camera_overrides record "
+                         f"could not be added ({type(exc).__name__}: {exc}); the run is saved "
+                         f"WITHOUT it, so nothing in the file says its camera_params are only "
+                         f"the request. The camera ran with: {_safe_repr(fields)}")
+            return msg
+
+    def _add_camera_overrides(self, msg: dict) -> dict:
+        record = self.camera_overrides_record()
+        if not record:
+            return msg
+        texts = dict(msg.get("extra_file_texts") or {})
+        if "camera_overrides" in texts:
+            logger.warning("END_RUN: the experiment sent its own 'camera_overrides' text; "
+                           "liveOD's record replaces it.")
+        texts["camera_overrides"] = json.dumps(record)
+        out = dict(msg)
+        out["extra_file_texts"] = texts
+        return out
+
+    # ------------------------------------------------------------------
+    # Who may open / close a camera now
+    # ------------------------------------------------------------------
+
+    def camera_action_allowed(self, camera_key: str, action: str):
+        """``(ok, reason)``: may ``camera_key`` be opened / closed / toggled now?
+        The one rule for the remote CAMERA_CONTROL and the window's own camera
+        button.
+
+        During a run: closing the camera a CameraBaby is driving crashes its
+        grab loop (dishonorable_death), and opening any camera blocks the GUI
+        thread (Andor cooler init takes seconds) and stalls the queued
+        SHOT_COMPLETE / RESET signals -- both refused.  Closing a camera the
+        run is *not* using is allowed: that is how a tool borrows an idle
+        Basler (frame grab through the beacon server) while a run on another
+        camera goes on.  A no-camera run uses none of them.
+        """
+        if action not in ("open", "close", "toggle"):
+            return False, f"Unknown camera action: {action}"
+        if not camera_key:
+            return False, "Missing camera_key"
+        if not self._run_in_progress:
+            return True, ""
+        run_cam = self._current_camera_key if self._current_capture_images else ""
+        if action == "close" and camera_key != run_cam:
+            return True, ""
+        return False, (f"Camera control rejected: run {self._current_run_id} in "
+                       f"progress (uses {run_cam or 'no camera'}); only closing a "
+                       f"camera the run does not use is allowed")
+
+    # ------------------------------------------------------------------
+    # Frame alignment
+    # ------------------------------------------------------------------
+
+    def _check_frame_alignment(self):
+        """At END_RUN: do the frames sit in their shots' slots, judging by when
+        they arrived? Proof that they do not (frame_alignment.assess: a frame
+        that came before its shot could have been triggered) is a grab failure,
+        so the run is saved incomplete. What the times cannot decide is only
+        logged."""
+        if self._reset_requested or not self._images_expected:
+            return
+        n_shots = int(self._current_n_shots or 0)
+        if n_shots < 1 or self._images_expected % n_shots:
+            logger.info(f"Frame alignment not checked: {self._images_expected} images "
+                        f"do not divide into {n_shots} shots.")
+            return
+        per_shot = self._images_expected // n_shots
+        with self._images_lock:
+            frame_t = list(self._frame_times)
+        # A camera whose readout outlasts the SHOT_COMPLETE RPC (the Andor) also has
+        # each shot's last slot checked (frame_alignment.readout_outlasts_rpc). Its
+        # own try: a camera table that cannot say only turns that part off.
+        try:
+            slow_readout = frame_alignment.readout_outlasts_rpc(
+                get_config().resolve_camera_params(self._current_camera_key))
+        except Exception as exc:
+            logger.warning(f"Frame alignment: could not look up camera "
+                           f"{self._current_camera_key!r} ({exc}); its last-slot check is off.")
+            slow_readout = False
+        try:
+            result = frame_alignment.assess(frame_t, list(self._shot_mono), per_shot,
+                                            t_start=self._t_ready_mono,
+                                            dark_after_shot_complete=slow_readout)
+        except Exception as exc:
+            logger.warning(f"Frame alignment check failed ({exc}); not checked.")
+            return
+        for note in result.notes:
+            logger.warning(f"Frame alignment (not conclusive): {note}")
+        if result.issues:
+            reason = "FRAME ALIGNMENT SUSPECT: " + "; ".join(result.issues)
+            logger.error(f"Run {self._current_run_id}: {reason}")
+            self._grab_failure = f"{self._grab_failure}; {reason}" if self._grab_failure else reason
+            get_log_buffer().update_run(grab_failure=self._grab_failure)
+
+    # ------------------------------------------------------------------
+    # The camera host (LiveODConfig.use_camera_host; PLAN C3 / C5)
+    # ------------------------------------------------------------------
+
+    def set_camera_host(self, host):
+        """Run cameras through ``host`` (a CameraHost) from now on: INIT_RUN locks
+        the run's camera, the first WAIT_CAM_READY arms it, END_RUN / ABORT_RUN /
+        a superseding INIT_RUN release it, CAMERA_CONTROL goes to the host."""
+        self._camera_host = host
+
+    @property
+    def camera_host(self):
+        return self._camera_host
+
+    def _needs_grab_drain(self, camera_key: str) -> bool:
+        """The Basler grab-drain gate. Not for a host camera: its worker is the
+        only thread on the camera, and the gate would wait for a camera thread
+        that itself waits for the arm."""
+        return self._camera_host is None and get_config().camera_needs_grab_drain(camera_key)
+
+    def take_spawn_token(self) -> str:
+        """The run token for the camera thread the window is spawning now: the
+        oldest camera run not yet spawned, in INIT_RUN order (the current run's
+        when none is waiting: a spawn without an INIT_RUN)."""
+        try:
+            return self._spawn_tokens.popleft()
+        except IndexError:
+            return self._run_token
+
+    def _refuse_init_run(self, error: str, state_detail: str) -> dict:
+        """The reply to a refused INIT_RUN. It changes nothing of the run in
+        progress, if there is one: its token (its messages still count), its
+        camera, its state. The status strip shows the refusal only when no run
+        is in progress."""
+        if self._run_in_progress:
+            logger.warning(f"The refused INIT_RUN changed nothing: run {self._current_run_id}, "
+                           f"in progress, is left as it was.")
+        else:
+            self._set_run_state("error", state_detail)
+        return {"ok": False, "error": error}
+
+    def _host_begin_run(self, msg: dict, camera_key: str, capture_images: bool, camera_params,
+                        token: str):
+        """INIT_RUN in host mode, before the run file is reserved: this run's
+        camera is locked with ``token``, which stays provisional until the
+        INIT_RUN is accepted (_host_commit_run). Returns None, or the refusal
+        reply: no run id is used, and the run in progress keeps its token and
+        state (the host itself ends an older run on the same camera to lock it)."""
+        host = self._camera_host
+        if host is None:
+            return None
+        params = dict(camera_params or {})
+        try:
+            start = host.begin_run(token, camera_key, capture_images, camera_params=params,
+                                   images_shape=msg.get('images_shape'))
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.error(f"INIT_RUN refused before a run id was reserved: camera "
+                         f"{camera_key}: {reason}")
+            return self._refuse_init_run(
+                f"INIT_RUN refused (no run id used): camera {camera_key}: {reason}",
+                f"Camera {camera_key}: {exc}")
+        self._host_pending = (token, start, params, int(msg.get('params', {}).get('N_img', 1)))
+        return None
+
+    def _host_commit_run(self, token: str):
+        """Host mode, the INIT_RUN that locked its camera with ``token`` is
+        accepted: the previous run's hold on its camera ends (T10), and this run
+        is the one the host state here is about."""
+        pending, self._host_pending = self._host_pending, None
+        if self._camera_host is None or pending is None or pending[0] != token:
+            return
+        if self._host_run_token and self._host_run_token != token:
+            self._host_end_run("superseded by a new INIT_RUN", record=False)
+        _, start, params, n_img = pending
+        self._host_run_token = token
+        self._host_run_start = start
+        self._host_camera_params = params
+        self._host_n_img = n_img
+        self._host_arm_future = None
+
+    def _host_abandon_run(self, token: str, reason: str):
+        """Host mode, the INIT_RUN that locked its camera with ``token`` is refused
+        after all (its data file was not created): that lock goes, and nothing
+        else changes."""
+        pending, self._host_pending = self._host_pending, None
+        host = self._camera_host
+        if host is None or pending is None or pending[0] != token:
+            return
+        try:
+            host.end_run(token, reason)
+        except Exception as exc:
+            logger.warning(f"camera host: giving back the refused INIT_RUN's camera lock "
+                           f"failed: {exc}")
+
+    def _host_after_reserve(self, run_id: int):
+        """INIT_RUN in host mode, once the run id is known: the lock is named
+        after the run, and a run whose camera Persist changes is announced (one
+        WARNING, on the run's log) and recorded (camera_overrides, origin
+        "persist")."""
+        host, start = self._camera_host, self._host_run_start
+        if host is None:
+            return
+        self._camera_overrides_persist_since = None
+        if start is None or not self._host_run_token:
+            return
+        host.note_run_id(self._host_run_token, run_id)
+        for key, why in dict(start.refused or {}).items():
+            logger.warning(f"Persisted {start.camera_key} value NOT used in run {run_id}: {why}")
+        if not start.persist_on:
+            return
+        if not start.overrides:
+            logger.info(f"Persist is on for {start.camera_key} (since {start.persist_since}), "
+                        f"but every persisted value equals the run's camera_params: nothing "
+                        f"overridden.")
+            return
+        logger.warning(start.persist_warning(run_id))
+        with self._camera_overrides_lock:
+            self._camera_overrides.update({k: dict(v) for k, v in start.overrides.items()})
+            self._camera_overrides_key = str(start.camera_key)
+            self._camera_overrides_persist_since = start.persist_since
+
+    def _note_spawn_token(self, capture_images: bool):
+        """A camera run's token, for the camera threads the window spawns for it
+        (take_spawn_token): their reports carry it (_report_is_current), and in
+        host mode their nanny locks with it."""
+        if capture_images:
+            self._spawn_tokens.append(self._run_token)
+
+    def _host_start_arm(self):
+        """WAIT_CAM_READY in host mode: the run's first one arms its camera.
+        Returns the error text of an arm that failed, else None."""
+        host = self._camera_host
+        if host is None or not self._host_run_token:
+            return None
+        if self._host_arm_future is None:
+            self._host_arm_future = host.arm_run(self._host_run_token, self._host_camera_params,
+                                                 self._host_n_img)
+        return self._host_arm_error()
+
+    def _host_arm_error(self):
+        fut = self._host_arm_future
+        if fut is None or not fut.done():
+            return None
+        exc = fut.exception()
+        if exc is None:
+            return None
+        return f"camera {self._current_camera_key} could not be armed: {type(exc).__name__}: {exc}"
+
+    def _wait_cam_ready_event(self, deadline: float) -> bool:
+        """Wait for the camera thread's "armed" (status 2) until ``deadline``; in
+        host mode in short slices, so that an arm that failed ends the wait."""
+        fut = self._host_arm_future if self._camera_host is not None else None
+        if fut is None:
+            return self._cam_ready_event.wait(timeout=max(0.0, deadline - time.time()))
+        while True:
+            left = deadline - time.time()
+            if self._cam_ready_event.wait(timeout=max(0.0, min(0.02, left))):
+                return True
+            if fut.done() and fut.exception() is not None:
+                return False
+            if left <= 0:
+                return False
+
+    def _merge_camera_overrides(self, camera_key: str, fields: dict, persist_since=None):
+        """Overrides the host recorded (persist, clamps) that are not in the run's
+        record yet; each new one is logged."""
+        new = {}
+        with self._camera_overrides_lock:
+            for key, f in dict(fields or {}).items():
+                if key not in self._camera_overrides:
+                    self._camera_overrides[key] = dict(f)
+                    new[key] = f
+            if self._camera_overrides:
+                self._camera_overrides_key = self._camera_overrides_key or str(camera_key)
+            if persist_since and not self._camera_overrides_persist_since:
+                self._camera_overrides_persist_since = persist_since
+        for key, f in new.items():
+            logger.warning(f"CAMERA OVERRIDE: run {self._current_run_id} on {camera_key}: "
+                           f"{key} requested {f.get('requested')!r} -> applied "
+                           f"{f.get('applied')!r} ({f.get('origin')}); camera_params in the file "
+                           f"stay the request")
+
+    def _host_end_run(self, reason: str, record: bool = True):
+        """The current run's hold on its camera ends (END_RUN, ABORT_RUN, a
+        superseding INIT_RUN). With ``record``: the host's overrides go into the
+        run's record, and what it saw that the frame count cannot show (frames
+        the camera reported lost, a camera fault) into the grab failure."""
+        host, token = self._camera_host, self._host_run_token
+        if host is None or not token:
+            return None
+        self._host_run_token = ""
+        self._host_arm_future = None
+        self._host_run_start = None
+        try:
+            summary = host.end_run(token, reason)
+        except Exception as exc:
+            logger.exception(f"camera host: ending the run's hold on its camera failed: {exc}")
+            return None
+        if not record:
+            return summary
+        if summary.overrides:
+            self._merge_camera_overrides(summary.camera_key, summary.overrides,
+                                         summary.persist_since)
+        problems = summary.problems
+        if problems and not self._reset_requested:
+            text = "camera host: " + "; ".join(problems)
+            if text not in (self._grab_failure or ""):
+                self._grab_failure = f"{self._grab_failure}; {text}" if self._grab_failure else text
+                get_log_buffer().update_run(grab_failure=self._grab_failure)
+        return summary
 
     def stop(self):
         """Request the server loop to stop on the next poll cycle."""
@@ -333,19 +862,63 @@ class LiveODServer(QThread, NetServer):
         )
 
     def _handle_init_run(self, msg: dict) -> dict:
+        # The new run's name, provisional until this INIT_RUN is accepted: one
+        # that is refused leaves the run in progress as it was (its token, so
+        # its messages still count; its camera; its state).
+        token = uuid.uuid4().hex
+        save_data = bool(msg.get("save_data", False))
+        capture_images = bool(msg.get("capture_images", False))
+        camera_key = str(msg.get("camera_key", ""))
+        imaging_type = int(msg.get("imaging_type", 0))
+        camera_params = msg.get('camera_params', {})
+
+        # host mode: the run's camera is locked here, before a run id is used;
+        # a refusal (profile, persist, camera held elsewhere) is the reply
+        host_refusal = self._host_begin_run(msg, camera_key, capture_images, camera_params,
+                                            token)
+        if host_refusal is not None:
+            return host_refusal
+
+        run_id = 0
+        filepath = ""
+
+        if save_data:
+            # Synchronous on purpose, and a small write: see RunFile.reserve. Only
+            # the new file is made here: the run in progress keeps its own, and
+            # the RunFile state for it, until this INIT_RUN is accepted below.
+            _t_create = time.time()
+            try:
+                run_id, filepath = self._data_saver.reserve_run_id_and_path(msg)
+            except Exception as exc:
+                logger.exception(f"INIT_RUN: could not create data file: {exc}")
+                # host mode: nor will this run use the camera it locked
+                self._host_abandon_run(token, "INIT_RUN refused: the data file was not created")
+                return self._refuse_init_run(f"Data file creation failed: {exc}",
+                                             f"Data file creation failed: {exc}")
+            _dt_create = time.time() - _t_create
+            if _dt_create > 2.0:
+                logger.warning(f"Data file creation took {_dt_create:.1f} s — is the data drive slow?")
+
+        # The INIT_RUN is accepted: from here the new run takes over. Any message
+        # that carries the previous run's token is ignored from now on --
+        # including the rest of a run this INIT_RUN takes over from (which it
+        # does, as before).
+        if self._run_in_progress and not self._reset_requested:
+            logger.warning(f"INIT_RUN while run {self._current_run_id} is still in progress: "
+                           f"that run is superseded; its further messages will be ignored.")
         # If the previous run was reset but the experiment process was killed
         # before sending ABORT_RUN, finalize that reset now. This keeps the
         # next run start non-blocking and stateless.  The GUI was already
         # notified by the original _handle_reset call, so don't re-emit
         # reset_signal — that would race with this INIT_RUN and cause the
-        # new run to abort on its first poll.
+        # new run to abort on its first poll. (Before the new token: until
+        # then the reset run's camera threads still count as its own. Before
+        # begin() below: the reset run's file is still the one RunFile knows.)
         if self._reset_requested:
             self._finalize_reset_run(notify_gui=False)
-
-        save_data = bool(msg.get("save_data", False))
-        capture_images = bool(msg.get("capture_images", False))
-        camera_key = str(msg.get("camera_key", ""))
-        imaging_type = int(msg.get("imaging_type", 0))
+        self._adopt_run_token(token)
+        # host mode: the previous run's hold on its camera ends; this run's stays
+        self._host_commit_run(token)
         self._current_camera_key = camera_key
 
         # For Basler cameras: if a previous baby is still running its grab
@@ -353,7 +926,7 @@ class LiveODServer(QThread, NetServer):
         # block until that grab loop fully exits and on_basler_baby_done() fires.
         # ("Basler": which cameras need this is the lab's call --
         # LiveODConfig.camera_needs_grab_drain; by default any key containing "basler".)
-        if get_config().camera_needs_grab_drain(camera_key) and capture_images:
+        if self._needs_grab_drain(camera_key) and capture_images:
             with self._basler_lock:
                 self._basler_babies_live += 1
                 stale = self._basler_babies_live - 1
@@ -362,33 +935,12 @@ class LiveODServer(QThread, NetServer):
             if stale > 0:
                 logger.warning(f"INIT_RUN: {stale} Basler grab loop(s) not yet done — WAIT_CAM_READY will block until they exit.")
 
-        camera_params = msg.get('camera_params', {})
         self._cam_ready_event.clear()
         self._current_capture_images = capture_images
         # Gates the END_RUN save on the image writer finishing (a run without a
-        # camera has none).
+        # camera has none); the file reserved above is this run's from now on.
         self._run_file.begin(save_data, has_writer=capture_images)
-
-        run_id = 0
-        filepath = ""
-
-        if save_data:
-            # Synchronous on purpose, and a small write: see RunFile.reserve.
-            _t_create = time.time()
-            try:
-                run_id, filepath = self._run_file.reserve(msg)
-            except Exception as exc:
-                logger.exception(f"INIT_RUN: could not create data file: {exc}")
-                # No CameraBaby will be spawned, so give back the Basler
-                # slot claimed above — otherwise the count never returns to zero
-                # and every later run blocks in WAIT_CAM_READY.
-                self._release_basler_slot()
-                self._run_in_progress = False
-                self._set_run_state("error", f"Data file creation failed: {exc}")
-                return {"ok": False, "error": f"Data file creation failed: {exc}"}
-            _dt_create = time.time() - _t_create
-            if _dt_create > 2.0:
-                logger.warning(f"Data file creation took {_dt_create:.1f} s — is the data drive slow?")
+        self._run_file.filepath = filepath
 
         self._current_run_id = run_id
         self._reset_requested = False
@@ -403,9 +955,15 @@ class LiveODServer(QThread, NetServer):
         self._current_n_shots = n_shots
         with self._images_lock:
             self._images_received = 0
+            self._frame_times = []
         self._images_expected = n_img if capture_images else 0
         self._grab_failure = ""
         self._frame_deficit_warned = 0
+        self._shot_mono = []
+        self._t_ready_mono = None
+        with self._camera_overrides_lock:
+            self._camera_overrides = {}
+            self._camera_overrides_key = ""
 
         params_payload = dict(msg.get('params', {}))
         run_info_payload = {
@@ -431,6 +989,9 @@ class LiveODServer(QThread, NetServer):
             filepath=filepath,
         )
 
+        # host mode: the lock takes the run's name; Persist is announced on its log
+        self._host_after_reserve(run_id)
+
         adjust_specs = list(msg.get('adjust_specs', []))
         with self._adjust_lock:
             self._adjust_specs = adjust_specs
@@ -442,6 +1003,7 @@ class LiveODServer(QThread, NetServer):
                 "in the Adjust panel will NOT be reflected in saved data."
             )
 
+        self._note_spawn_token(capture_images)
         self.run_started_signal.emit(run_id, list(run_info_payload.get('xvarnames', [])))
         self.new_run_signal.emit(filepath, camera_key, capture_images, save_data, imaging_type, n_img, n_shots, n_pwa, camera_params, params_payload, run_info_payload)
         self._run_state = "idle"    # so the new run's first state is always emitted
@@ -451,7 +1013,13 @@ class LiveODServer(QThread, NetServer):
             f"{n_shots} shots, save={save_data}, "
             f"camera={camera_key if capture_images else 'none'}"
         )
-        return {"ok": True, "run_id": run_id, "filepath": filepath}
+        reply = {"ok": True, "run_id": run_id, "filepath": filepath, "run_token": self._run_token}
+        # camera settings this run will get that differ from its camera_params
+        # (Persist, host mode); the client prints them as a banner
+        overrides = self.camera_overrides_record()
+        if overrides:
+            reply["camera_overrides"] = overrides
+        return reply
 
     def _handle_wait_cam_ready(self, msg: dict) -> dict:
         """Wait up to ``timeout`` s for the camera.
@@ -461,9 +1029,19 @@ class LiveODServer(QThread, NetServer):
         cannot even be received, and a reset camera never becomes ready. Every
         reply carries ``reset_requested`` so the experiment can abort at once;
         ``timed_out`` marks "not ready yet" apart from a real failure.
+
+        "Ready" is the camera thread's status 2, sent once the driver reports
+        acquisition running (CameraBaby's on_armed). A camera whose grab failed
+        before that will never be ready: that is reported at once, without
+        ``timed_out``, so the experiment stops instead of waiting out its timeout.
         """
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("WAIT_CAM_READY", msg)
         if self._reset_requested:
             return {"ok": True, "ready": False, "reset_requested": True}
+        if self._grab_failure and not self._cam_ready_event.is_set():
+            return {"ok": False, "ready": False, "reset_requested": False,
+                    "error": f"camera failed before it was ready: {self._grab_failure}"}
 
         timeout = float(msg.get("timeout", 60.0))
         deadline = time.time() + timeout
@@ -472,7 +1050,9 @@ class LiveODServer(QThread, NetServer):
         # before reporting camera-ready to the experiment.  This prevents the
         # experiment from arming the hardware while the old grab is still
         # blocking in RetrieveResult() and the camera is not yet free.
-        if get_config().camera_needs_grab_drain(self._current_camera_key):
+        # (not for a camera-host camera: its worker is the only thread on it)
+        host = getattr(self, "_camera_host", None)
+        if host is None and get_config().camera_needs_grab_drain(self._current_camera_key):
             if not self._basler_prev_grab_done_event.is_set():
                 self._set_run_state("waiting_grab_drain")
             remaining = deadline - time.time()
@@ -484,18 +1064,42 @@ class LiveODServer(QThread, NetServer):
 
         if not self._cam_ready_event.is_set():
             self._set_run_state("waiting_camera")
-        remaining = deadline - time.time()
-        ready = self._cam_ready_event.wait(timeout=max(0.0, remaining))
+        if host is None:
+            remaining = deadline - time.time()
+            ready = self._cam_ready_event.wait(timeout=max(0.0, remaining))
+        else:
+            # host mode: the run's first WAIT_CAM_READY arms its camera; an arm
+            # that failed is reported at once, without timed_out, so the
+            # experiment stops
+            arm_error = self._host_start_arm()
+            ready = False if arm_error else self._wait_cam_ready_event(deadline)
+            if not ready and not arm_error:
+                arm_error = self._host_arm_error()
+            if arm_error:
+                return {"ok": False, "ready": False, "reset_requested": self._reset_requested,
+                        "error": arm_error}
         if not ready:
             return {"ok": False, "ready": False, "timed_out": True,
                     "reset_requested": self._reset_requested,
                     "error": "Camera ready timeout"}
         if not self._reset_requested:
             self._set_run_state("running")
-        return {"ok": True, "ready": True, "reset_requested": self._reset_requested}
+        if self._t_ready_mono is None:
+            # no shot can trigger the camera before the experiment has this reply
+            self._t_ready_mono = time.monotonic()
+        reply = {"ok": True, "ready": True, "reset_requested": self._reset_requested}
+        overrides = self.camera_overrides_record()
+        if overrides:
+            reply["camera_overrides"] = overrides
+        return reply
 
     def _handle_shot_complete(self, msg: dict) -> dict:
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("SHOT_COMPLETE", msg)
         now = time.time()
+        # Taken first: the experiment schedules nothing of the next shot until
+        # this reply, so no frame of it can come before this moment.
+        self._shot_mono.append(time.monotonic())
         shot_idx = int(msg.get("shot_idx", 0))
         N_total = int(msg.get("N_shots_total", 1))
         xvar_values = msg.get("xvar_values", {})
@@ -548,7 +1152,15 @@ class LiveODServer(QThread, NetServer):
         self._check_frame_deficit(shot_idx, N_total)
         # Include reset flag so the experiment can abort at shot boundary
         # even if the POLL-based check misses it.
-        return {"ok": True, "reset_requested": self._reset_requested, "adjust_values": adjust_values}
+        reply = {"ok": True, "reset_requested": self._reset_requested, "adjust_values": adjust_values}
+        # (getattr: k-exp's cross-section test runs this on a stand-in without it)
+        grab_failure = getattr(self, "_grab_failure", "")
+        if grab_failure:
+            # The camera's grab has ended (a lost frame, a timeout): no frame of
+            # this run is recorded from here on. The experiment is told (its client
+            # warns once); stopping the run is left to the person running it.
+            reply["grab_failure"] = grab_failure
+        return reply
 
     def _check_frame_deficit(self, shot_idx: int, N_total: int):
         """Warn, during the run, when the camera has delivered fewer frames than
@@ -578,6 +1190,15 @@ class LiveODServer(QThread, NetServer):
             )
 
     def _handle_end_run(self, msg: dict) -> dict:
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("END_RUN", msg)
+        # host mode: the run's hold on its camera ends before the save (the camera
+        # stays idle at the run's settings); its overrides join the record below
+        self._host_end_run("END_RUN")
+        # camera settings that differed from the request go into the file too
+        msg = self._with_camera_overrides(msg)
+        # frames that provably are not in their shots' slots mark the run incomplete
+        self._check_frame_alignment()
         if self._reset_requested:
             logger.warning(f"END_RUN: run {self._current_run_id} was reset — discarding data.")
             # As before the move: this path does not wait for the image writer.
@@ -657,7 +1278,8 @@ class LiveODServer(QThread, NetServer):
 
     def _camera_states(self) -> dict:
         if self._camera_state_provider is None:
-            return {}
+            host = self._camera_host
+            return host.poll_cameras() if host is not None else {}
         try:
             return dict(self._camera_state_provider())
         except Exception as exc:
@@ -667,32 +1289,31 @@ class LiveODServer(QThread, NetServer):
     def _handle_camera_control(self, msg: dict) -> dict:
         camera_key = str(msg.get("camera_key", ""))
         action = str(msg.get("action", "toggle"))
-        if action not in ("open", "close", "toggle"):
-            return {"ok": False, "error": f"Unknown camera action: {action}"}
-        if not camera_key:
-            return {"ok": False, "error": "Missing camera_key"}
-        # During a run: closing the camera a CameraBaby is driving crashes its
-        # grab loop (dishonorable_death), and opening any camera blocks the GUI
-        # thread (Andor cooler init takes seconds) and stalls the queued
-        # SHOT_COMPLETE / RESET signals -- both refused.  Closing a camera the
-        # run is *not* using is allowed: that is how a tool borrows an idle
-        # Basler (frame grab through the beacon server) while a run on another
-        # camera goes on.  A no-camera run uses none of them.
+        # the rule is camera_action_allowed's, shared with the window's own button
+        ok, reason = self.camera_action_allowed(camera_key, action)
+        if not ok:
+            if action not in ("open", "close", "toggle") or not camera_key:
+                return {"ok": False, "error": reason}
+            run_cam = self._current_camera_key if self._current_capture_images else ""
+            logger.warning(f"CAMERA_CONTROL rejected ({camera_key} -> {action}): "
+                           f"run in progress (uses {run_cam or 'no camera'})")
+            return {"ok": False, "error": reason,
+                    "run_in_progress": True, "run_camera_key": run_cam}
         if self._run_in_progress:
             run_cam = self._current_camera_key if self._current_capture_images else ""
-            if action == "close" and camera_key != run_cam:
-                logger.info(f"CAMERA_CONTROL: {camera_key} -> close during run "
-                            f"{self._current_run_id} (which uses {run_cam or 'no camera'})")
-            else:
-                logger.warning(f"CAMERA_CONTROL rejected ({camera_key} -> {action}): "
-                               f"run in progress (uses {run_cam or 'no camera'})")
-                return {"ok": False,
-                        "error": f"Camera control rejected: run {self._current_run_id} in "
-                                 f"progress (uses {run_cam or 'no camera'}); only closing a "
-                                 f"camera the run does not use is allowed",
-                        "run_in_progress": True, "run_camera_key": run_cam}
+            logger.info(f"CAMERA_CONTROL: {camera_key} -> close during run "
+                        f"{self._current_run_id} (which uses {run_cam or 'no camera'})")
         else:
             logger.info(f"CAMERA_CONTROL: {camera_key} -> {action}")
+        host = self._camera_host
+        if host is not None:
+            # host mode: the host does it on its own threads; callers confirm via
+            # POLL's "cameras", as before
+            try:
+                host.request(camera_key, action, origin="CAMERA_CONTROL")
+            except (KeyError, ValueError) as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True}
         # Asynchronous: the GUI thread does the open/close.  Callers confirm via
         # POLL's "cameras" (LiveODClient.wait_camera_state).
         self.camera_control_signal.emit(camera_key, action)
@@ -700,7 +1321,12 @@ class LiveODServer(QThread, NetServer):
 
     def _handle_abort_run(self, msg: dict) -> dict:
         """Experiment has acknowledged the abort — clean up and close out the run."""
+        if not self._run_msg_ok(msg):
+            # a superseded run's abort must not discard the current run's file
+            return self._stale_run_reply("ABORT_RUN", msg)
         logger.warning("Experiment acknowledged: run aborted.")
+        # host mode: the aborted run's hold on its camera ends (a RESET alone keeps it)
+        self._host_end_run("ABORT_RUN", record=False)
         # If _reset_requested is True, the viewer's _handle_reset already
         # emitted reset_signal and the GUI ran main_window.reset().  Re-emitting
         # reset_signal here would queue a second main_window.reset() that races
@@ -747,6 +1373,9 @@ class LiveODServer(QThread, NetServer):
             "run_camera_key": (self._current_camera_key
                                if self._run_in_progress and self._current_capture_images
                                else ""),
+            # the current (or last) run's camera settings that differ from its
+            # camera_params; {} when none do
+            "camera_overrides": self.camera_overrides_record(),
         }
 
     def _handle_get_log(self, msg: dict) -> dict:

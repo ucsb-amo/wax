@@ -60,6 +60,23 @@ class LiveODConfig:
     # camera key -> saved-ROI id to start from, or None for no default.
     default_roi_id_for: Callable[[str], Optional[str]] = lambda key: None
 
+    # ---- camera host (k-jam/jpagett/camera_host/PLAN.md, section C3) ---------
+    # True: liveOD's cameras are owned by its camera host (waxx.util.live_od.
+    # camera_host): one worker thread per camera, runs locked and armed by the
+    # server, served to other programs as camera_server:<host>:liveod. False: the
+    # cameras are opened through CameraNanny, as before. Read once, when the window
+    # starts; reverting is flipping it back and restarting liveOD.
+    use_camera_host: bool = False
+    # Camera keys the host opens as soon as it starts (host mode only).
+    camera_host_claim_on_start: tuple = ()
+    # Lab rules on top of a camera category's own, {category name: (schema.Constraint, ...)},
+    # e.g. a readout-clock combination a sensor cannot read out. Passed explicitly
+    # (and logged when the host starts), never registered as an import side effect.
+    camera_constraints: dict = field(default_factory=dict)
+    # config -> the camera host; None builds waxx's CameraHost(config). Tests hand in
+    # one built on fake cameras.
+    camera_host_factory: Optional[Callable[[Any], Any]] = None
+
     # ---- run bookkeeping -----------------------------------------------------
     params_factory: Callable[[], Any] = ImageCounts
 

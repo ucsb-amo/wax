@@ -12,6 +12,11 @@ Typical per-run sequence:
     for each shot:
         client.shot_complete(idx, N, xvars)   # SHOT_COMPLETE
     client.end_run(payload)                   # END_RUN
+
+The INIT_RUN reply names the run (``run_token``); the client sends it back with
+WAIT_CAM_READY, SHOT_COMPLETE, END_RUN and ABORT_RUN. If another INIT_RUN has
+taken liveOD over in the meantime, the server ignores those messages and says so
+(``stale_run``) instead of letting them save into, or delete, the newer run's file.
 """
 
 import logging
@@ -46,6 +51,12 @@ class LiveODClient(NetClient):
         self.last_reset_requested: bool = False
         # The END_RUN reply; ``incomplete`` in it means frames were missing.
         self.last_end_run_reply: dict = {}
+        # The server's name for this run (INIT_RUN reply), sent back on every
+        # message about the run so a superseded run's messages cannot act on
+        # the run that replaced it. "" against a server that issues none.
+        self._run_token: str = ""
+        # This run's "the camera stopped recording" warning has been printed.
+        self._grab_failure_warned: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -102,12 +113,69 @@ class LiveODClient(NetClient):
             if rcvtimeo_ms is not None:
                 self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
 
+    def _for_this_run(self, payload: dict) -> dict:
+        """``payload`` with this run's token added (when the server gave one)."""
+        token = getattr(self, "_run_token", "")
+        if token:
+            payload["run_token"] = token
+        return payload
+
+    @staticmethod
+    def _print_camera_overrides(reply: dict) -> None:
+        """The server applied camera settings that differ from the run's
+        camera_params (a clamp, or persisted settings): say so where the person
+        who ran the experiment is looking. ASCII only: ExptBuilder pipes stdout
+        through cp1252."""
+        record = reply.get("camera_overrides") or {}
+        fields = record.get("fields") or {}
+        if not fields:
+            return
+        lines = [f"!! CAMERA SETTINGS DIFFER FROM camera_params ({record.get('camera_key', '?')}):"]
+        for key, f in fields.items():
+            lines.append(f"!!   {key}: requested {f.get('requested')!r} -> applied "
+                         f"{f.get('applied')!r} ({f.get('origin', '?')})")
+        lines.append("!! The run file records this in its root attribute camera_overrides;")
+        lines.append("!! camera_params/ in the file is the request, not what the camera ran.")
+        bar = "!" * 72
+        print("\n" + bar + "\n" + "\n".join(lines) + "\n" + bar + "\n")
+
+    @staticmethod
+    def _print_grab_failure(reason) -> None:
+        """liveOD's camera grab for this run has ended early (a lost frame, a
+        camera timeout): nothing of the run is recorded from here on. Said once,
+        where the person who ran the experiment is looking; ASCII only
+        (ExptBuilder pipes stdout through cp1252)."""
+        reason = str(reason).encode("ascii", "replace").decode("ascii")
+        bar = "!" * 72
+        print(f"\n{bar}\n"
+              f"!! liveOD: THE CAMERA STOPPED RECORDING THIS RUN\n"
+              f"!!   {reason}\n"
+              f"!! The frames of the shots from here on are NOT recorded. The run is not\n"
+              f"!! stopped by this: END_RUN will save what arrived, marked\n"
+              f"!! data_complete=False. Abort the run if its images matter.\n"
+              f"{bar}\n")
+
+    @staticmethod
+    def _wait_not_ready_yet(reply: dict) -> bool:
+        """Is a WAIT_CAM_READY reply "not ready yet, ask again" rather than a
+        failure to raise at once? A server that says ``timed_out`` decides it. A
+        server that answers ``reset_requested`` or ``stale_run`` but no
+        ``timed_out`` is one whose failures come without it: a failure, whatever
+        its text (a camera error may well say "timeout"). Only a reply with none
+        of these, from a server older than all of them, is judged by its text."""
+        if "timed_out" in reply:
+            return bool(reply["timed_out"])
+        if "reset_requested" in reply or "stale_run" in reply:
+            return False
+        return "timeout" in str(reply.get("error", "")).lower()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def init_run(self, payload: dict) -> dict:
-        """Send INIT_RUN.  Returns ``{"run_id": int, "filepath": str}``.
+        """Send INIT_RUN.  Returns ``{"run_id": int, "filepath": str, "run_token": str}``
+        (no ``run_token`` from an older server).
 
         The server creates and fully populates the HDF5 data file before
         replying, so this can take a while on a slow/mapped data drive — hence
@@ -115,11 +183,15 @@ class LiveODClient(NetClient):
         """
         payload["tag"] = "INIT_RUN"
         self.last_reset_requested = False    # the server clears its flag on INIT_RUN
+        self._run_token = ""
+        self._grab_failure_warned = False
         reply = self._send_recv(payload, rcvtimeo_ms=60_000)
         if not reply.get("ok"):
             raise RuntimeError(
                 f"[LiveODClient] INIT_RUN failed: {reply.get('error')}"
             )
+        self._run_token = str(reply.get("run_token") or "")
+        self._print_camera_overrides(reply)
         return reply
 
     def wait_cam_ready(self, timeout: float = 60.0) -> bool:
@@ -134,7 +206,9 @@ class LiveODClient(NetClient):
         a RESET from the remote viewer for the whole wait, and a camera that was
         reset never becomes ready: a reset used to cost the full ``timeout``.
         An older server (no ``timed_out`` / ``reset_requested`` in its replies)
-        still works: its slice timeouts are recognised by their error text.
+        still works: its slice timeouts are recognised by their error text
+        (_wait_not_ready_yet). A newer server's failure raises at once, whatever
+        its text.
         """
         deadline = time.monotonic() + timeout
         last_error = None       # which wait the server was stuck in
@@ -148,22 +222,31 @@ class LiveODClient(NetClient):
                 )
             slice_s = min(CAM_READY_SLICE_S, max(remaining, 0.0))
             asked = True
+            t_asked = time.monotonic()
             reply = self._send_recv(
-                {"tag": "WAIT_CAM_READY", "timeout": slice_s},
+                self._for_this_run({"tag": "WAIT_CAM_READY", "timeout": slice_s}),
                 rcvtimeo_ms=int((slice_s + 5.0) * 1000),
             )
             if reply.get("reset_requested"):
                 self.last_reset_requested = True
                 return False
             if reply.get("ok") and reply.get("ready"):
+                # settings the camera was clamped to are known once it is armed
+                self._print_camera_overrides(reply)
                 return True
-            not_ready_yet = (reply.get("timed_out")
-                             or "timeout" in str(reply.get("error", "")).lower())
-            if not not_ready_yet:
+            # A newer INIT_RUN took liveOD over (stale_run), or the camera failed:
+            # not a slice timeout, so it falls through to the raise below.
+            if not self._wait_not_ready_yet(reply):
                 raise ValueError(
                     f"[LiveODClient] Camera ready failed: {reply.get('error')}"
                 )
             last_error = reply.get("error")
+            # A "not ready" that came straight back was not a slice the server
+            # waited out (an old server failing fast with "timeout" in its text):
+            # wait the slice out here instead of asking again at once.
+            spent = time.monotonic() - t_asked
+            if spent < 0.5 * slice_s:
+                time.sleep(max(0.0, min(slice_s - spent, deadline - time.monotonic())))
 
     def shot_complete(
         self, shot_idx: int, N_shots_total: int, xvar_values: dict,
@@ -182,7 +265,7 @@ class LiveODClient(NetClient):
         does not include ``reset_requested`` (older server builds that
         pre-date the field).
         """
-        reply = self._send_recv(
+        reply = self._send_recv(self._for_this_run(
             {
                 "tag": "SHOT_COMPLETE",
                 "shot_idx": shot_idx,
@@ -190,7 +273,21 @@ class LiveODClient(NetClient):
                 "xvar_values": xvar_values,
                 "shot_conditions": dict(shot_conditions or {}),
             }
-        )
+        ))
+        if reply.get("stale_run"):
+            # liveOD has started another run since this one's INIT_RUN (or was
+            # restarted since, and does not know it), and no longer records this
+            # one: stop it like a reset would.
+            why = ("liveOD does not know this run (was it restarted?)" if reply.get("unknown_run")
+                   else "liveOD is serving a newer run")
+            print(f"[LiveODClient] {reply.get('error')} -- {why}; "
+                  f"this run is stopped and nothing more of it is recorded.")
+            self.last_reset_requested = True
+            return True
+        if reply.get("grab_failure") and not getattr(self, "_grab_failure_warned", False):
+            # the camera's grab ended early: said once per run; the run goes on
+            self._grab_failure_warned = True
+            self._print_grab_failure(reply["grab_failure"])
         self.last_adjust_values = reply.get('adjust_values', {})
         if "reset_requested" in reply:
             # cached for Scribe._check_for_abort_signal (top of the scan loop)
@@ -211,7 +308,7 @@ class LiveODClient(NetClient):
         retry budget), or the client gives up on a save that is still running.
         """
         payload["tag"] = "END_RUN"
-        reply = self._send_recv(payload, rcvtimeo_ms=600_000)
+        reply = self._send_recv(self._for_this_run(payload), rcvtimeo_ms=600_000)
         if not reply.get("ok"):
             raise RuntimeError(
                 f"[LiveODClient] END_RUN failed: {reply.get('error')}"
@@ -276,10 +373,12 @@ class LiveODClient(NetClient):
         """Notify the server that the experiment has acknowledged the abort.
 
         Best-effort — all errors are suppressed because the experiment is
-        already in the process of terminating and must not block.
+        already in the process of terminating and must not block. Carries the
+        run's token, so an abort from a run that liveOD has since replaced is
+        ignored instead of discarding the newer run's file.
         """
         try:
-            self._send_recv({"tag": "ABORT_RUN"})
+            self._send_recv(self._for_this_run({"tag": "ABORT_RUN"}))
         except Exception:
             pass
 

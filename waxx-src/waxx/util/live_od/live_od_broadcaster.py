@@ -192,16 +192,21 @@ class LiveODBroadcaster(QThread, NetServer):
         """``LiveODServer.run_state_signal``, for remote viewers."""
         self._enqueue({'tag': 'RUN_STATE', 'state': str(state), 'detail': str(detail)})
 
-    def broadcast_camera_state(self, states: dict):
+    def broadcast_camera_state(self, states: dict, persist: dict = None):
         """Broadcast the current state of every camera button.
 
         ``states`` is a dict mapping camera_key -> one of
         ``'open' | 'closed' | 'loading' | 'failed' | 'grabbing'``.
+        ``persist`` (camera host mode): camera_key -> whether Persist is on;
+        sent only when given, so older viewers see the message they know.
         """
-        self._enqueue({
+        msg = {
             'tag': 'CAMERA_STATE',
             'states': {str(k): str(v) for k, v in states.items()},
-        })
+        }
+        if persist is not None:
+            msg['persist'] = {str(k): bool(v) for k, v in persist.items()}
+        self._enqueue(msg)
 
     def broadcast_adjust_values(self, values: dict):
         """Broadcast current adjust-parameter values to remote viewers."""

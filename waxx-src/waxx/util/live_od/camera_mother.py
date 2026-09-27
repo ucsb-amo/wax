@@ -1,4 +1,5 @@
-﻿import threading
+﻿import inspect
+import threading
 import time
 import numpy as np
 import names
@@ -27,9 +28,24 @@ from queue import Queue, Empty
 def nothing():
     pass
 
+# A camera thread waiting for another thread's hold on its camera (the camera
+# lock, CameraNanny.camera_lock) checks its own stop this often (s).
+CAMERA_LOCK_POLL_S = 0.1
+
 class CameraNotReadyError(ValueError):
     """The handshake got no open camera.  A ValueError because it used to be a
     bare ``ValueError("Camera not ready")``."""
+
+
+def _takes_on_armed(start_grab) -> bool:
+    """Does this driver's ``start_grab`` accept ``on_armed=`` (called once the
+    acquisition is running)? Drivers from before 2026-09-26 do not."""
+    try:
+        params = inspect.signature(start_grab).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "on_armed" or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params)
 
 class CameraMother(QThread):
     """Legacy stub kept for import compatibility.
@@ -282,6 +298,9 @@ class CameraBaby(QThread):
     done_signal = pyqtSignal()
     break_signal = pyqtSignal()
     cam_status_signal = pyqtSignal(int)
+    # camera_key, {field: (requested, applied)}: values the driver could not set
+    # as the run asked (emitted once, after the run's settings were applied)
+    camera_overrides_signal = pyqtSignal(str, object)
 
     def __init__(self,data_handler:DataHandler,
                  name,output_queue:Queue,
@@ -296,6 +315,26 @@ class CameraBaby(QThread):
         self.data_handler = data_handler
         self.interrupted = False
         self.dead = False
+        # This baby's own stop, for when a newer run has replaced its run
+        # (request_stop). Unlike an interrupt it discards nothing: the old run
+        # may already be saved.
+        self._stop = threading.Event()
+        # what the thread says when it goes (request_stop)
+        self._stop_reason = "its run was replaced by a newer one"
+        self._ready_reported = False
+        # the camera's lock while this thread applies its run's settings and
+        # grabs (create_camera .. the end of grab_loop), else None
+        self._camera_lock = None
+        # why the run's settings could not be applied (the nanny's report)
+        self._not_ready_reason = ""
+
+    def request_stop(self, reason: str = "its run was replaced by a newer one"):
+        """A newer run took over, or liveOD is shutting down: end the grab (or the
+        wait for the camera) soon, and quietly -- no file is touched and nothing
+        is reported. ``reason`` is what the thread says as it goes. Safe from any
+        thread."""
+        self._stop_reason = str(reason)
+        self._stop.set()
 
     def run(self):
         # How the grab ended, other than by an interrupt or all frames in.  A
@@ -309,8 +348,12 @@ class CameraBaby(QThread):
             self.cam_status_signal.emit(0)
             logger.debug(f"{self.name}: I am born!")
             self.data_handler.read_params()
-            self.handshake()
-            self.grab_loop()
+            try:
+                self.handshake()
+                self.grab_loop()
+            finally:
+                # held from applying the settings to the end of the grab
+                self._release_camera_lock()
         except TimeoutError as e:
             # An expected failure (camera never triggered, experiment aborted
             # or stalled), so one line, no traceback.  Camera drivers raise the
@@ -323,11 +366,16 @@ class CameraBaby(QThread):
             # was aborted while waiting for the camera, or opening/configuring
             # it failed.  One line, no traceback.
             failure = f"camera not ready: {e}"
-            if self.interrupted:
+            if self.interrupted or self._stop.is_set():
                 logger.info(f"{self.name}: run aborted before the camera was ready.")
             else:
                 logger.warning(f"{self.name}: {e}; not starting this run's grab. "
                                f"Check the camera connection and the messages above.")
+                # This run's camera will never be ready: the server's
+                # WAIT_CAM_READY now answers "camera failed before it was
+                # ready: <this>" at once, instead of the experiment waiting
+                # out its whole ready timeout (90 s) for nothing.
+                self.grab_failed_signal.emit(failure)
         except Exception as e:
             failure, keep_file = f"{type(e).__name__}: {e}", True
             logger.exception(f"CameraBaby {self.name}: fatal error: {e}")
@@ -337,6 +385,9 @@ class CameraBaby(QThread):
         if self.interrupted and self.death is not self.honorable_death:
             logger.warning('Grab loop interrupted, shutting down.')
             self.death = self.dishonorable_death
+        elif self._stop.is_set() and self.death is not self.honorable_death:
+            # replaced by a newer run: its file is not this baby's to discard
+            self.death = self.superseded_death
         elif failure and keep_file and self.death is not self.honorable_death:
             self.death = lambda: self.failed_death(failure)
         try:
@@ -349,15 +400,20 @@ class CameraBaby(QThread):
             self.done_signal.emit()
 
     def handshake(self):
-        """Connect camera and signal readiness via cam_status_signal.
+        """Connect the camera and apply the run's settings.
 
-        Status codes
+        Status codes (cam_status_signal)
         ------------
         0  baby born
         1  camera opened
         2  camera ready (triggers LiveODServer._cam_ready_event via
            a DirectConnection in LiveODWindow.spawn_baby)
         3  (legacy: ready-ack; kept for status-light compatibility)
+
+        2 and 3 are no longer sent from here but from grab_loop, once the
+        driver reports its acquisition running (``_report_ready``). Sent here,
+        before the grab had started, a trigger in between was lost and every
+        later frame landed one slot early.
         """
         self.create_camera()
         self.cam_status_signal.emit(1)
@@ -365,19 +421,85 @@ class CameraBaby(QThread):
             key = self.data_handler.camera_params.key
             if isinstance(key, bytes):
                 key = key.decode()
+            if self._not_ready_reason:
+                raise CameraNotReadyError(f"Camera {key}: the run's settings were not "
+                                          f"applied ({self._not_ready_reason})")
             raise CameraNotReadyError(f"Camera {key} is not open")
-        # Status 2 → triggers server._cam_ready_event via DirectConnection
+
+    def _report_ready(self):
+        """Status 2 (the server's camera-ready event), then 3 (status lights).
+        The driver's ``on_armed``: called once acquisition is running, before
+        the first frame is waited for. Once per grab, however often it is called."""
+        if self._ready_reported:
+            return
+        self._ready_reported = True
         self.cam_status_signal.emit(2)
-        # Status 3 kept for the status-lights widget
         self.cam_status_signal.emit(3)
 
     def create_camera(self):
-        self.camera = self.camera_nanny.persistent_get_camera(self.data_handler.camera_params)
-        self.camera = self.camera_nanny.update_params(self.camera,self.data_handler.camera_params)
+        # this baby's own break_check: the nanny's shared flag is cleared for
+        # every new run, so it cannot stop a baby that a newer run replaced
+        self.camera = self.camera_nanny.persistent_get_camera(self.data_handler.camera_params,
+                                                              break_check=self.break_check)
+        # From here to the end of the grab this thread holds the camera's lock
+        # (released in run): a superseded run's thread still applying its
+        # settings or grabbing is waited for, and a stopped thread applies
+        # nothing -- its setters cannot interleave with the next run's.
+        if not self._hold_camera_lock():
+            self.camera = DummyCamera()       # stopped: nothing was applied
+            return
+        report = {}
+        self.camera = self.camera_nanny.update_params(self.camera, self.data_handler.camera_params,
+                                                      report=report)
+        if self.break_check():
+            # Superseded while applying: grab nothing. The next run's thread
+            # applies its own settings once this one lets go of the lock.
+            self.camera = DummyCamera()
+            return
+        self._not_ready_reason = str(report.get("error") or "")
         camera_select = self.data_handler.camera_params.key
-        if type(camera_select) == bytes: 
+        if type(camera_select) == bytes:
             camera_select = camera_select.decode()
+        if report.get("clamps"):
+            self.camera_overrides_signal.emit(camera_select, dict(report["clamps"]))
         self.camera_connect.emit(camera_select)
+
+    def _hold_camera_lock(self) -> bool:
+        """Take the camera's lock (the nanny's ``camera_lock``), waiting in
+        CAMERA_LOCK_POLL_S slices while another thread holds it. False if this
+        thread was stopped first (then nothing is held). Nothing to hold for a
+        DummyCamera, or with a nanny that has no ``camera_lock`` (the camera
+        host's: its worker is the only thread on the camera)."""
+        if self.break_check():
+            return False
+        get_lock = getattr(self.camera_nanny, "camera_lock", None)
+        lock = None
+        if get_lock is not None and not isinstance(self.camera, DummyCamera):
+            lock = get_lock(self.camera, self.data_handler.camera_params)
+        if lock is None:
+            return True
+        said = False
+        while not lock.acquire(timeout=CAMERA_LOCK_POLL_S):
+            if self.break_check():
+                return False
+            if not said:
+                said = True
+                logger.info(f"{self.name}: waiting for another camera thread (a previous "
+                            f"run's) to let go of the camera before applying this run's "
+                            f"settings.")
+        if self.break_check():
+            lock.release()
+            return False
+        self._camera_lock = lock
+        return True
+
+    def _release_camera_lock(self):
+        lock, self._camera_lock = self._camera_lock, None
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError as e:
+                logger.warning(f"{self.name}: releasing the camera lock failed: {e}")
 
     def honorable_death(self):
         try:
@@ -398,6 +520,21 @@ class CameraBaby(QThread):
         self.data_handler.writer.discard(delete_data)
         time.sleep(0.1)
         self.dishonorable_death_signal.emit()
+        self.cam_status_signal.emit(-1)
+        return True
+
+    def superseded_death(self):
+        """A newer run replaced this baby's run (request_stop): just go. Nothing
+        is discarded -- the old run may be saved already -- and its signals to
+        the server were disconnected when the new run started.
+
+        No stop_grab: by the time this runs, the baby's grab (if it started one)
+        has returned, and both drivers stop their own acquisition in start_grab's
+        ``finally``, so a stop here would never have anything of this baby's to
+        stop. The grab lock makes it a no-op while the new run's baby holds the
+        camera (since 2026-09-26 from its update_params on, see camera_lock), but
+        a stop would still be a second thread calling the camera's SDK."""
+        logger.warning(f"{self.name}: {self._stop_reason}; grab ended.")
         self.cam_status_signal.emit(-1)
         return True
 
@@ -422,10 +559,21 @@ class CameraBaby(QThread):
         N_shots = int(self.data_handler.params.N_shots)
         N_pwa_per_shot = int(self.data_handler.params.N_pwa_per_shot)
         self.camera_grab_start.emit(N_img,N_shots,N_pwa_per_shot)
-        self.camera.start_grab(N_img,output_queue=self.queue,
-                    check_interrupt_method=self.break_check)
-        if not self.interrupted:
+        if _takes_on_armed(self.camera.start_grab):
+            # ready is reported by the driver, once acquisition is running
+            self.camera.start_grab(N_img,output_queue=self.queue,
+                        check_interrupt_method=self.break_check,
+                        on_armed=self._report_ready)
+        else:
+            logger.warning(f"{self.name}: this camera driver's start_grab() has no on_armed "
+                           f"callback, so the run is told the camera is ready before its "
+                           f"acquisition has started; a trigger in between is lost and "
+                           f"shifts every later frame (update the driver).")
+            self._report_ready()
+            self.camera.start_grab(N_img,output_queue=self.queue,
+                        check_interrupt_method=self.break_check)
+        if not self.interrupted and not self._stop.is_set():
             self.death = self.honorable_death
 
     def break_check(self):
-        return self.interrupted
+        return self.interrupted or self._stop.is_set()
