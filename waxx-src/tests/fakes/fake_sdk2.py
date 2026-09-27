@@ -84,8 +84,11 @@ class FakeSDK2Lib(AndorSDK2Lib):
                  has_shutter=True, has_baseline_clamp=True,
                  temperature_during_acquisition=False,
                  trigger_modes_available=(0, 1, 6, 7, 10),
-                 min_image_length=1):
+                 min_image_length=1, em_gain_floor=0):
         super().__init__()
+        # the camera raises a lower EM gain to this (kong's DU897, 2026-09-27:
+        # 1 requested, 4 read back)
+        self.em_gain_floor = int(em_gain_floor)
         self.detector = tuple(detector)                # (width, height)
         self.buffer_size = int(buffer_size)
         self.serial = serial
@@ -449,7 +452,7 @@ class FakeSDK2Lib(AndorSDK2Lib):
         top = 1000 if self.hw["em_advanced"] else 300
         if not 0 <= gain <= top:
             self._err("SetEMCCDGain", D.DRV_P1INVALID)
-        self.hw["em_gain"] = int(gain)
+        self.hw["em_gain"] = max(int(gain), self.em_gain_floor)
 
     @_sdk
     def GetEMCCDGain(self):

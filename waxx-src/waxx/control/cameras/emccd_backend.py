@@ -420,7 +420,15 @@ class EMCCDBackend:
         rb["readout_time"] = Readback(None if readout is None else float(readout), "hw")
         rb["keepclean_time"] = Readback(float(cam.get_keepclean_time()), "hw")
         gain, advanced = cam.get_EMCCD_gain()
-        rb["gain"] = Readback(int(gain), "hw")
+        # An EM gain the camera did not take as asked is a clamp, recorded (for a
+        # run: camera_overrides), not a refusal -- as AndorEMCCD.set_EMCCD_gain
+        # records it on liveOD's own path. (2026-09-27, kong: 1 requested, 4 read
+        # back at EM gain mode 3 -- the host's open failed on it.)
+        req_gain = None if p is None else int(p["gain"])
+        if req_gain is not None and int(gain) != req_gain:
+            rb["gain"] = Readback(int(gain), "hw", origin="clamped", requested=req_gain)
+        else:
+            rb["gain"] = Readback(int(gain), "hw")
         rb["em_advanced"] = Readback(int(advanced), "hw")
         clamp = cam.get_baseline_clamp()
         rb["baseline_clamp"] = (Readback(int(clamp), "hw") if clamp is not None
@@ -457,7 +465,7 @@ class EMCCDBackend:
         want = {
             "trigger_mode": p["trigger_mode"], "frame_transfer": p["frame_transfer"],
             "sensor_roi": p["sensor_roi"], "hs_speed": p["hs_speed"], "preamp": p["preamp"],
-            "vs_speed": p["vs_speed"], "gain": p["gain"], "baseline_clamp": p["baseline_clamp"],
+            "vs_speed": p["vs_speed"], "baseline_clamp": p["baseline_clamp"],   # gain: a clamp
             "acquisition_mode": FIXED["acquisition_mode"], "output_amp": FIXED["output_amp"],
             "read_mode": FIXED["read_mode"], "em_advanced": FIXED["em_advanced"],
             "ext_trigger_edge": FIXED["ext_trigger_edge"],

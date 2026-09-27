@@ -293,6 +293,19 @@ def test_exposure_readback_tolerance(make_backend):
     assert req == 10e-6 and got == pytest.approx(12e-6, rel=1e-5)
 
 
+def test_an_em_gain_the_camera_raises_is_a_clamp_not_a_refusal(make_backend):
+    """2026-09-27, kong: the host opened the Andor at live EM gain 1, the camera
+    read back 4, and the open failed ("read-back differs"). Now it is recorded as
+    a clamp, for live and run profiles alike."""
+    be, fake = make_backend(sdk_kwargs=dict(em_gain_floor=4))
+    rb = be.apply(dict(LIVE, gain=1), "live")
+    assert rb["gain"] == Readback(4, "hw", origin="clamped", requested=1)
+    assert clamps(rb)["gain"] == (1, 4)
+    rb = be.apply(RUN, "run")                 # 300: taken as asked
+    assert rb["gain"] == Readback(300, "hw")
+    assert "gain" not in clamps(rb)
+
+
 def test_a_small_exposure_quantisation_is_accepted_and_marked(make_backend):
     be, fake = make_backend(sdk_kwargs=dict(exposure_quantum=0.3e-6))
     rb = be.apply(RUN, "run")                 # 10 us -> 10.2 us: within 5 %
