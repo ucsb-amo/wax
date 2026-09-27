@@ -16,9 +16,8 @@ Lamps and the state pill are buttons.  A lamp flips its channel through the
 ordinary channel path, or sends the op its definition names instead
 (``Lamp.ops``: a coil's IGBT lamp ramps the coil down rather than opening the
 IGBT under current).  The pill sends the device's "off" op while anything is
-on and its "on" op while off (``CompositeDevice.pill_ops``); switching on
-from the pill always names the values it sends first, since a collapsed card
-does not show them.
+on and its "on" op while off (``CompositeDevice.pill_ops``), with the same
+checks and confirmations as the card's own buttons.
 
 Fields: a value typed but not yet applied is shown with an orange fill and
 is not overwritten by incoming state; it stays so until an op that sends it
@@ -36,12 +35,18 @@ columns (card_layout.MasonryLayout), and every card can be collapsed to its
 header.  Every card starts collapsed, and opening or collapsing one never
 moves a card to another column (the arrangement is pinned; see card_layout).
 
-Under the header, the connection bar shows the host-side connections the
-monitor server holds between runs (the tweezer AWG;
+The connection bar (:class:`ConnectionBar`) shows the host-side connections
+the monitor server holds between runs (the tweezer AWG;
 :mod:`waxx.util.device_state.connections`), one pill each in liveOD's
 camera-button colours: grey not connected, purple connecting, green
-connected, red failed.  A click asks the server to connect it, or
-(confirmed) to disconnect it.
+connected, red failed; the bar has no text, each pill's tooltip says the
+rest.  A click asks the server to connect it, or
+(confirmed) to disconnect it.  The panel builds and drives it, but it is not
+on this tab: the host GUI shows it in its status row above the tabs, since it
+matters whichever tab is open.
+
+The experiments the monitor server runs itself (its run loops and reset
+experiment) have their own tab: :mod:`waxx.util.guis.sequences_panel`.
 """
 
 from __future__ import annotations
@@ -71,7 +76,6 @@ from waxx.util.dashboard import theme
 from waxx.util.device_state import composite as cmp
 from waxx.util.device_state import connections as conns
 from waxx.util.guis.card_layout import FlowLayout, MasonryLayout
-from waxx.util.guis.device_summary import reset_title
 # liveOD's camera connect button colours (grey / purple / green / red), so a
 # connection reads the same here as a camera does there.
 from waxx.util.live_od.gui.camera_menu import STATES as _CAMERA_STATES
@@ -134,8 +138,6 @@ _ACCENT = {
 #: connection state -> liveOD camera button state (its colour and word)
 _CONNECTION_LOOK = {conns.CONNECTED: "open", conns.CONNECTING: "loading",
                     conns.DISCONNECTED: "closed", conns.FAILED: "failed"}
-#: Longest detail text shown beside a pill (the rest is in its tooltip).
-CONNECTION_DETAIL_CHARS = 90
 
 _SETTINGS_ORG = "waxx"
 _SETTINGS_APP = "device_control_gui"
@@ -1496,12 +1498,8 @@ class CompositeCard(QFrame):
 
     def _pill_clicked(self) -> None:
         ref = self.pill_action()
-        if not ref:
-            return
-        # Switching on from the header sends the fields' values, which a
-        # collapsed card does not show: that click always says them first.
-        turning_on = ("hazard" if self.hazard else self.status.level) == "off"
-        self.panel.trigger_ref(self, ref, ask=turning_on)
+        if ref:
+            self.panel.trigger_ref(self, ref)
 
     def _lamp_clicked(self, lamp: cmp.Lamp) -> None:
         on = self.ctx().is_on(lamp.dtype, lamp.name)
@@ -1557,13 +1555,10 @@ class CompositeCard(QFrame):
                 parts.append(f"{spec.title} {spec.format(args[name])}")
         return ", ".join(parts)
 
-    def trigger(self, key: str, overrides: dict | None = None, confirmed: bool = False,
-                ask: bool = False) -> bool:
+    def trigger(self, key: str, overrides: dict | None = None, confirmed: bool = False) -> bool:
         """Collect, check, confirm and send op ``key``.  Returns whether sent.
-        Refusals are shown on the card, not in a pop-up.  ``ask`` confirms
-        even a clean op when it sends values, naming them."""
+        Refusals are shown on the card, not in a pop-up."""
         op = self.device.get_op(key)
-        ask = ask and bool(op.args)
         entry = self.panel.table.get(f"{self.device.key}.{key}")
         allowed, why = self.panel.ops_allowed()
         if not allowed:
@@ -1576,7 +1571,7 @@ class CompositeCard(QFrame):
             self.set_footer(f"✕ {op.label} not sent: {text}", "error")
             return False
         warnings = [c.message for c in checks if c.level == "warn"]
-        if not confirmed and (warnings or op.confirm or op.danger or ask):
+        if not confirmed and (warnings or op.confirm or op.danger):
             lines = []
             if op.confirm:
                 lines.append(op.confirm)
@@ -1954,20 +1949,13 @@ class ConnectionBar(QFrame):
         self._order = [c.key for c in definitions]
         self._defs = {c.key: c for c in definitions}
         self._states: dict = {}
-        self._pills: dict[str, tuple[QPushButton, QLabel]] = {}
-        self._row = QHBoxLayout(self)
-        self._row.setContentsMargins(10, 4, 6, 4)
-        self._row.setSpacing(8)
-        title = _small("Monitor connections:")
-        title.setWordWrap(False)
-        self._row.addWidget(title)
-        self._pill_host = QHBoxLayout()
+        # Pills only: each one's state detail is in its tooltip.
+        self._pills: dict[str, QPushButton] = {}
+        self._pill_host = QHBoxLayout(self)
+        self._pill_host.setContentsMargins(6, 1, 6, 1)
         self._pill_host.setSpacing(6)
-        self._row.addLayout(self._pill_host)
-        self._row.addStretch(1)
-        self.message = _small("")
-        self.message.setWordWrap(False)
-        self._row.addWidget(self.message)
+        # In the host's status row: as wide as its content, never wider.
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         for key in self._order:
             self._add(key)
         self.refresh()
@@ -1987,11 +1975,8 @@ class ConnectionBar(QFrame):
         pill.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         pill.setCursor(Qt.CursorShape.PointingHandCursor)
         pill.clicked.connect(lambda _=False, k=key: self._clicked(k))
-        detail = _small("")
-        detail.setWordWrap(False)
         self._pill_host.addWidget(pill)
-        self._pill_host.addWidget(detail)
-        self._pills[key] = (pill, detail)
+        self._pills[key] = pill
 
     def set_states(self, states: dict | None) -> None:
         self._states = {str(k): dict(v) for k, v in (states or {}).items()
@@ -2002,15 +1987,9 @@ class ConnectionBar(QFrame):
                 self._add(key)
         self.refresh()
 
-    def set_message(self, text: str, level: str = "off") -> None:
-        self.message.setText(text)
-        self.message.setToolTip(text)
-        self.message.setStyleSheet(
-            f"color: {_LEVEL_COLOR.get(level, theme.FG_MUTED)}; font-size: 11px;")
-
     def refresh(self) -> None:
         reachable = self.panel.reachable
-        for key, (pill, detail_label) in self._pills.items():
+        for key, pill in self._pills.items():
             entry = self._states.get(key) or {}
             state = self.state(key)
             if not reachable:
@@ -2025,12 +2004,6 @@ class ConnectionBar(QFrame):
             action = "disconnect" if state in (conns.CONNECTED, conns.CONNECTING) else "connect"
             allowed, why = self.panel.connections_allowed(action)
             pill.setEnabled(allowed)
-            shown = detail if len(detail) <= CONNECTION_DETAIL_CHARS \
-                else detail[:CONNECTION_DETAIL_CHARS - 1] + "…"
-            detail_label.setText(shown)
-            detail_label.setStyleSheet(
-                f"color: {ERR_TEXT if state == conns.FAILED else theme.FG_MUTED};"
-                f" font-size: 11px;")
             tip = [f"{self.label(key)}: {word}." + (f" {detail}" if detail else "")]
             since = entry.get("since")
             if isinstance(since, (int, float)) and reachable and entry:
@@ -2042,7 +2015,6 @@ class ConnectionBar(QFrame):
             if extra:
                 tip.append(extra)
             pill.setToolTip("\n".join(tip))
-            detail_label.setToolTip(detail)
         self.setVisible(bool(self._pills))
 
     def _clicked(self, key: str) -> None:
@@ -2060,15 +2032,7 @@ class ConnectionBar(QFrame):
             self.panel.request_connection(key, "connect")
 
 
-# --- panel -----------------------------------------------------------------------
-
-# --- run loops ---------------------------------------------------------------------
-
-#: state -> (pill text, pill level)
-_LOOP_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
-              "stopping": ("stopping", "partial"), "stopped": ("stopped", "off"),
-              "latched": ("LATCHED OFF", "warn")}
-
+# --- small helpers shared with the Sequences tab -------------------------------------
 
 def _label_pill_css(level: str) -> str:
     bg = _PILL_BG.get(level, "#454545")
@@ -2083,222 +2047,13 @@ def _clock(epoch) -> str:
         return "?"
 
 
-class RunLoopsCard(QFrame):
-    """The experiments the monitor server can run back to back (its run
-    loops, :mod:`waxx.util.device_state.run_loop`): per loop Start / Stop,
-    the run in progress, and how it last ended.  Hidden until the server
-    says it has any; everything shown is the server's (every GUI sees the same
-    loop)."""
-
-    def __init__(self, panel: "CompositePanel"):
-        super().__init__()
-        self.panel = panel
-        self.setObjectName("composite_card")
-        self.setStyleSheet(_card_css(theme.ACCENT))
-        self._box = QVBoxLayout(self)
-        self._box.setContentsMargins(12, 8, 12, 8)
-        self._box.setSpacing(6)
-        self.rows: dict[str, dict] = {}
-        self.infos: dict[str, dict] = {}
-        self.hide()
-
-    def set_loops(self, loops: dict | None) -> None:
-        for info in (loops or {}).values():
-            self.update_loop(info)
-
-    def update_loop(self, info: dict | None) -> None:
-        if not isinstance(info, dict) or not info.get("key"):
-            return
-        key = info["key"]
-        if key not in self.rows:
-            self._add_row(key)
-        self.infos[key] = info
-        self._show(key)
-        self.show()
-
-    def _add_row(self, key: str) -> None:
-        if self.rows:
-            self._box.addWidget(_hline())
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        title = QLabel(key)
-        font = QFont()
-        font.setBold(True)
-        font.setPointSize(11)
-        title.setFont(font)
-        title.setStyleSheet(f"color: {theme.FG_STRONG};")
-        head.addWidget(title)
-        pill = QLabel("")
-        head.addWidget(pill)
-        head.addStretch(1)
-        start = QPushButton("Start")
-        stop = QPushButton("Stop")
-        for b in (start, stop):
-            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            b.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
-            head.addWidget(b)
-        start.clicked.connect(lambda _=False, k=key: self.panel.start_loop(k))
-        stop.clicked.connect(lambda _=False, k=key: self.panel.stop_loop(k))
-        stop.setToolTip("Let the run in progress finish and save, then end the loop and "
-                        "start the monitor.")
-        self._box.addLayout(head)
-        status = _small("")
-        status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._box.addWidget(status)
-        tail = QLabel("")
-        tail.setStyleSheet(f"color: {theme.FG_MUTED}; font-family: Consolas, monospace;"
-                           f" font-size: 10px;")
-        tail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        tail.setWordWrap(True)
-        tail.hide()
-        self._box.addWidget(tail)
-        self.rows[key] = {"title": title, "pill": pill, "start": start, "stop": stop,
-                          "status": status, "tail": tail, "message": ""}
-
-    def set_message(self, key: str, text: str) -> None:
-        """A local note (a refused Start) shown until the next change."""
-        if key in self.rows:
-            self.rows[key]["message"] = text
-            self._show(key)
-
-    def _show(self, key: str) -> None:
-        row, info = self.rows[key], self.infos.get(key) or {}
-        state = info.get("state") or "idle"
-        row["title"].setText(info.get("title") or key)
-        about = info.get("about") or ""
-        row["title"].setToolTip("\n\n".join(p for p in (about, info.get("path") or "") if p))
-        text, level = _LOOP_PILL.get(state, (state, "unknown"))
-        row["pill"].setText(text)
-        row["pill"].setStyleSheet(_label_pill_css(level))
-        parts = [info.get("text") or ""]
-        runs = int(info.get("runs") or 0)
-        if state in ("running", "stopping"):
-            parts.append(f"{runs} saved since {_clock(info.get('started'))}")
-        elif state in ("stopped", "latched") and info.get("ended"):
-            parts.append(f"{runs} saved · ended {_clock(info.get('ended'))}")
-        last = info.get("last") or {}
-        if last.get("outcome") == "saved" and state not in ("running", "stopping"):
-            parts.append(f"last saved: run {last.get('run_id')}")
-        if row["message"]:
-            parts.insert(0, row["message"])
-            row["message"] = ""
-        row["status"].setText(" · ".join(p for p in parts if p))
-        color = WARN_TEXT if state == "latched" else (OK_TEXT if state == "running"
-                                                      else theme.FG_MUTED)
-        row["status"].setStyleSheet(f"color: {color}; font-size: 11px;")
-        tail = info.get("tail") if state == "latched" else None
-        row["tail"].setText("\n".join(tail or []))
-        row["tail"].setVisible(bool(tail))
-        self.refresh_buttons(key)
-
-    def refresh_buttons(self, key: str | None = None) -> None:
-        reachable = self.panel._reachable
-        for k in ([key] if key else list(self.rows)):
-            row, state = self.rows[k], (self.infos.get(k) or {}).get("state") or "idle"
-            active = state in ("running", "stopping")
-            row["start"].setEnabled(reachable and not active)
-            row["stop"].setEnabled(reachable and state == "running")
-            row["stop"].setText("Stopping…" if state == "stopping" else "Stop")
-            row["start"].setToolTip("" if reachable else "the monitor server is unreachable")
-
-
-#: reset state -> (pill text, pill level)
-_RESET_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
-               "done": ("done", "off"), "failed": ("FAILED", "hazard")}
-
-
-class ResetCard(QFrame):
-    """The monitor server's reset experiment (kexp: MOT Observe,
-    :mod:`waxx.util.device_state.state_reset`) in the style of
-    :class:`RunLoopsCard`: Run, the run in progress, and how it last ended.
-    Hidden until the server says it has one.  Run emits the panel's
-    ``reset_requested``; the host GUI confirms and sends it."""
-
-    def __init__(self, panel: "CompositePanel"):
-        super().__init__()
-        self.panel = panel
-        self.info: dict | None = None
-        self.setObjectName("composite_card")
-        self.setStyleSheet(_card_css(theme.ACCENT))
-        box = QVBoxLayout(self)
-        box.setContentsMargins(12, 8, 12, 8)
-        box.setSpacing(6)
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        self.title = QLabel("")
-        font = QFont()
-        font.setBold(True)
-        font.setPointSize(11)
-        self.title.setFont(font)
-        self.title.setStyleSheet(f"color: {theme.FG_STRONG};")
-        head.addWidget(self.title)
-        self.pill = QLabel("")
-        head.addWidget(self.pill)
-        head.addStretch(1)
-        self.run_button = QPushButton("Run")
-        self.run_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.run_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
-        self.run_button.clicked.connect(lambda _=False: panel.reset_requested.emit())
-        head.addWidget(self.run_button)
-        box.addLayout(head)
-        self.status = _small("")
-        self.status.setWordWrap(True)
-        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        box.addWidget(self.status)
-        self.tail = QLabel("")
-        self.tail.setStyleSheet(f"color: {theme.FG_MUTED}; font-family: Consolas, monospace;"
-                                f" font-size: 10px;")
-        self.tail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.tail.setWordWrap(True)
-        self.tail.hide()
-        box.addWidget(self.tail)
-        self.hide()
-
-    def set_reset(self, info: dict | None) -> None:
-        self.info = dict(info) if isinstance(info, dict) else None
-        self.setVisible(self.info is not None)
-        if self.info is None:
-            return
-        info = self.info
-        state = info.get("state") or "idle"
-        self.title.setText(reset_title(info))
-        self.title.setToolTip(str(info.get("about") or ""))
-        text, level = _RESET_PILL.get(state, (state, "unknown"))
-        self.pill.setText(text)
-        self.pill.setStyleSheet(_label_pill_css(level))
-        who = "@".join(p for p in (info.get("operator"), info.get("client")) if p)
-        if state == "running":
-            parts = [f"started {_clock(info.get('started'))}" + (f" by {who}" if who else ""),
-                     info.get("text") or ""]
-        elif state in ("done", "failed"):
-            parts = [info.get("text") or "", f"ended {_clock(info.get('ended'))}"]
-        else:
-            parts = ["not run since the monitor server started"]
-        self.status.setText(" · ".join(p for p in parts if p))
-        color = ERR_TEXT if state == "failed" else (OK_TEXT if state == "running"
-                                                    else theme.FG_MUTED)
-        self.status.setStyleSheet(f"color: {color}; font-size: 11px;")
-        tail = info.get("tail") if state == "failed" else None
-        self.tail.setText("\n".join(tail or []))
-        self.tail.setVisible(bool(tail))
-        self.refresh_button()
-
-    def refresh_button(self) -> None:
-        info = self.info or {}
-        running = info.get("state") == "running"
-        reachable = self.panel.reachable
-        self.run_button.setText("Running…" if running else "Run")
-        self.run_button.setEnabled(reachable and not running)
-        self.run_button.setToolTip(
-            f"Run {info.get('expt')}.py through the monitor server. It takes the core; its "
-            "end state marks the device state trusted." if reachable
-            else "the monitor server is unreachable")
-
+# --- panel -----------------------------------------------------------------------
 
 class CompositePanel(QWidget):
-    """The Composite tab: Expand all (and a warning when the monitor's
-    composite ops are wrong), the connection bar, the run loops and reset
-    experiment, then the cards in groups, then the scenes.
+    """The Composite tab: a warning when the monitor's composite ops are
+    wrong, then the cards in groups, then the scenes.  It also builds the
+    connection bar (``connection_bar``), which the host GUI shows above its
+    tabs.
 
     ``channel_sender(dtype, name, changes)`` is how single-channel toggles
     are sent (the host GUI's ordinary update path); ``log_line(text)`` records
@@ -2311,8 +2066,6 @@ class CompositePanel(QWidget):
     """
 
     hazards_changed = pyqtSignal()
-    #: The reset card's Run: the host GUI confirms and asks the server.
-    reset_requested = pyqtSignal()
 
     def __init__(self, devices, params=None, frames=None,
                  channel_sender: Callable | None = None,
@@ -2348,39 +2101,21 @@ class CompositePanel(QWidget):
         box.setContentsMargins(CARD_GAP, 10, CARD_GAP, CARD_GAP)
         box.setSpacing(10)
 
-        # Top row: Expand all, and a warning only when the monitor's composite
-        # ops are wrong in a way the strip above the tabs does not report.
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(8)
+        # A warning only when the monitor's composite ops are wrong in a way
+        # the strip above the tabs does not report.
         self.ops_warning = _small("", WARN_TEXT)
         self.ops_warning.setWordWrap(True)
         self.ops_warning.hide()
-        head.addWidget(self.ops_warning, 1)
-        head.addStretch(1)
-        self.collapse_button = QPushButton("Expand all")
-        self.collapse_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.collapse_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
-        self.collapse_button.clicked.connect(self._toggle_all)
-        head.addWidget(self.collapse_button)
-        box.addLayout(head)
+        box.addWidget(self.ops_warning)
 
-        # The monitor's host-side connections (hidden when there are none).
+        # The monitor server's host-side connections (hidden when there are
+        # none).  Not laid out here: the host GUI puts it above its tabs.
         try:
             definitions = conns.validate_connections(connections or ())
         except ValueError as e:
             definitions = ()
             box.addWidget(_small(f"Connection definitions are invalid: {e}", ERR_TEXT))
         self.connection_bar = ConnectionBar(self, definitions)
-        box.addWidget(self.connection_bar)
-
-        # Experiments the monitor server runs back to back (hidden until it
-        # reports any).
-        self.loops_card = RunLoopsCard(self)
-        box.addWidget(self.loops_card)
-        # The server's reset experiment (hidden until it reports one).
-        self.reset_card = ResetCard(self)
-        box.addWidget(self.reset_card)
 
         try:
             self.table = cmp.OpTable(devices)
@@ -2519,8 +2254,6 @@ class CompositePanel(QWidget):
             self.set_runner(detail["runner"])
         if isinstance(detail.get("connections"), dict):
             self.set_connections(detail["connections"])
-        if isinstance(detail.get("run_loops"), dict):
-            self.loops_card.set_loops(detail["run_loops"])
 
     def set_runner(self, runner: dict) -> None:
         dogs = runner.get("watchdogs") or {}
@@ -2571,13 +2304,6 @@ class CompositePanel(QWidget):
         if self.scenes_card is not None:
             self.scenes_card.show_progress(self.scenes_card.running)
         self.connection_bar.refresh()
-        self.loops_card.refresh_buttons()
-        self.reset_card.refresh_button()
-
-    def set_reset(self, info: dict | None) -> None:
-        """The server's reset experiment (``StateReset.info()``; None: it has
-        none)."""
-        self.reset_card.set_reset(info)
 
     def relayout(self) -> None:
         """Heights changed (a card collapsed or opened): restack.  The masonry
@@ -2660,7 +2386,7 @@ class CompositePanel(QWidget):
         if w is not None:
             w.ensureWidgetVisible(card)
 
-    # -- search / collapse ----------------------------------------------------------
+    # -- search ---------------------------------------------------------------------
 
     def apply_search(self, query: str) -> None:
         terms = _search_terms(query)
@@ -2678,15 +2404,6 @@ class CompositePanel(QWidget):
         self.relayout()
         if first is not None and first.is_collapsed():
             first.set_collapsed(False)
-
-    def _collapsibles(self) -> list:
-        return list(self.cards) + ([self.scenes_card] if self.scenes_card is not None else [])
-
-    def _toggle_all(self) -> None:
-        collapse = not all(c.is_collapsed() for c in self._collapsibles())
-        for card in self._collapsibles():
-            card.set_collapsed(collapse)
-        self.collapse_button.setText("Expand all" if collapse else "Collapse all")
 
     # -- op path status ---------------------------------------------------------------
 
@@ -2722,20 +2439,18 @@ class CompositePanel(QWidget):
 
     def request_connection(self, key: str, action: str) -> None:
         """Ask the monitor server to connect / disconnect one of its
-        connections.  The outcome shows as the pill's new state."""
-        bar = self.connection_bar
-        label = bar.label(key)
+        connections.  The outcome shows as the pill's new state; a refusal
+        as a warning box (the bar carries no text)."""
+        label = self.connection_bar.label(key)
         allowed, why = self.connections_allowed(action)
         if not allowed:
-            bar.set_message(f"✕ {label}: {why}", "error")
+            self.refused(f"{label}: {action}", f"Not sent: {why}.")
             return
-        bar.set_message(f"{label}: {action} sent…", "partial")
 
         def done(reply):
-            if reply.get("status") == "ok":
-                bar.set_message(f"{label}: {action} requested", "off")
-            else:
-                bar.set_message(f"✕ {label} {action}: {reply.get('msg')}", "error")
+            if reply.get("status") != "ok":
+                self.refused(f"{label}: {action}",
+                             f"The monitor server refused it: {reply.get('msg')}")
             if self._log_line is not None:
                 outcome = "requested" if reply.get("status") == "ok" \
                     else f"refused: {reply.get('msg')}"
@@ -2798,6 +2513,10 @@ class CompositePanel(QWidget):
         box.setDefaultButton(no)
         box.exec()
         return box.clickedButton() is yes
+
+    def refused(self, title: str, text: str) -> None:
+        """Tell the operator a request they made was not carried out."""
+        QMessageBox.warning(self, title, text)
 
     # -- watchdogs and scenes -------------------------------------------------------
 
@@ -2920,49 +2639,6 @@ class CompositePanel(QWidget):
         self.send_request({"type": "cancel_scene",
                            "id": (running or {}).get("id")})
 
-    # -- run loops ----------------------------------------------------------------------
-
-    def start_loop(self, key: str) -> bool:
-        info = self.loops_card.infos.get(key) or {}
-        title = info.get("title") or key
-        lines = [info["about"]] if info.get("about") else []
-        lines.append("It runs back to back on the monitor server, whether or not this window "
-                     "stays open, until Stop. It stops by itself (latched off) on an Abort in "
-                     "liveOD, a run that fails or saves incomplete, someone else's run, or the "
-                     "monitor being started. Stop lets the run in progress finish and save, "
-                     "then starts the monitor.")
-        if info.get("path"):
-            lines.append(f"File: {info['path']}")
-        if not self.confirm(title, "\n\n".join(lines), verb=f"Start {title}"):
-            return False
-
-        def done(reply):
-            if reply.get("status") == "ok":
-                self.loops_card.update_loop(reply.get("loop"))
-            else:
-                self.loops_card.set_message(key, f"✕ not started: {reply.get('msg')}")
-        self.send_request({"type": "run_loop", "action": "start", "loop": key}, done)
-        return True
-
-    def stop_loop(self, key: str) -> None:
-        def done(reply):
-            if reply.get("status") == "ok":
-                self.loops_card.update_loop(reply.get("loop"))
-            else:
-                self.loops_card.set_message(key, f"✕ Stop: {reply.get('msg')}")
-        self.send_request({"type": "run_loop", "action": "stop", "loop": key}, done)
-
-    def on_run_loop(self, info: dict | None) -> None:
-        """A loop's change, as the server broadcast it."""
-        if not isinstance(info, dict) or not info.get("key"):
-            return
-        before = (self.loops_card.infos.get(info["key"]) or {}).get("state")
-        self.loops_card.update_loop(info)
-        if info.get("state") in ("stopped", "latched") and before != info.get("state") \
-                and self._log_line is not None:
-            self._log_line(f"[loop] {info.get('title')}: {info.get('state')} -- "
-                           f"{info.get('text')}")
-
     # -- replies -----------------------------------------------------------------------
 
     def _card(self, key) -> CompositeCard | None:
@@ -2979,14 +2655,14 @@ class CompositePanel(QWidget):
             return self._card(key), op
         return card, ref
 
-    def trigger_ref(self, card: CompositeCard, ref: str, ask: bool = False) -> bool:
+    def trigger_ref(self, card: CompositeCard, ref: str) -> bool:
         """Send the op a lamp or pill of ``card`` names, through the owning
         card's ordinary path (checks, confirmations, its footer)."""
         target, key = self.resolve_ref(card, ref)
         if target is None:
             card.set_footer(f"✕ {ref}: no such card on this tab", "error")
             return False
-        sent = target.trigger(key, ask=ask)
+        sent = target.trigger(key)
         if sent and target is not card:
             card.set_footer(f"→ {target.device.title}: {target.device.get_op(key).label} "
                             f"sent (that card shows the result)", "partial")

@@ -3,15 +3,18 @@
 It answers "is anything dangerous on, can I trust what the tabs show, and can
 I act right now?" without opening the Composite tab:
 
-* banners -- the monitor is not running (with Start), the device state is
-  untrusted (with Run <reset experiment> and Trust state), a run is starting or in progress, the
-  interlock has tripped, the hardware is busy playing out a ramp, a watchdog
-  is about to act;
+* banners -- the device state is untrusted (with Run <reset experiment> and
+  Trust state), a run is starting or in progress, the interlock has tripped,
+  the hardware is busy playing out a ramp, a watchdog is about to act;
 * hazard chips -- one per device that says it is dangerous to leave on (a
   coil at current), with how long this GUI has seen it so; a click shows the
   card;
 * Make safe -- opens :class:`MakeSafeDialog`, which lists each hazardous
   device's safe op with its values and sends the ticked ones.
+
+Whether the monitor applies edits at all is not a banner: it is
+:class:`MonitorNotice`, one short line beside the monitor pill in the status
+row.
 
 It only displays what it is given (``set_*``) and emits requests; the host
 GUI does the talking.
@@ -41,6 +44,12 @@ _BANNER_COLORS = {
     "warn": ("#46391a", WARN_TEXT),
     "info": ("#1d3247", INFO_TEXT),
 }
+
+#: What :class:`MonitorNotice` says -- short on purpose; the reason in full is
+#: its tooltip.
+NOTICE_UNREACHABLE = "Monitor server unreachable: edits do not reach the hardware"
+NOTICE_INTERRUPTED = "Monitor interrupted: an experiment was likely submitted"
+NOTICE_NOT_RUNNING = "Monitor not running: edits are not applied until it is started"
 
 
 def _fmt_s(seconds) -> str:
@@ -109,11 +118,69 @@ class _Banner(QFrame):
         self.show()
 
 
+class MonitorNotice(QFrame):
+    """The monitor's state in one short line, for the status row beside the
+    monitor pill: shown only while edits are not applied (the server
+    unreachable, the monitor interrupted by a run or not running), with Start
+    while the monitor can be started.  Hidden while it runs or starts."""
+
+    start_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("monitor_notice")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 1, 3, 1)
+        row.setSpacing(6)
+        self.label = QLabel("")
+        row.addWidget(self.label)
+        self.button = QPushButton("Start")
+        self.button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.button.setToolTip("Start the monitor experiment.")
+        self.button.clicked.connect(self.start_requested.emit)
+        row.addWidget(self.button)
+        self.level = ""
+        self.hide()
+
+    def set_monitor(self, state, reachable: bool, sub_state: str = "",
+                    reason: str = "") -> None:
+        if not reachable:
+            level, text, start = "error", NOTICE_UNREACHABLE, False
+            reason = reason or "Click the status to retry now."
+        elif state == STATES.NOT_READY:
+            start = True
+            if sub_state == "interrupted_by_run":
+                level, text = "info", NOTICE_INTERRUPTED
+            else:
+                level, text = "warn", NOTICE_NOT_RUNNING
+        else:
+            self.level = ""
+            self.hide()
+            return
+        if level != self.level:
+            self.level = level
+            bg, fg = _BANNER_COLORS[level]
+            self.setStyleSheet(f"QFrame#monitor_notice {{ background: {bg};"
+                               f" border: 1px solid {fg}; border-radius: 5px; }}"
+                               f"QLabel {{ color: {fg}; font-size: 12px; }}"
+                               f"QPushButton {{ color: {fg}; background: transparent;"
+                               f" border: 1px solid {fg}; border-radius: 9px; padding: 1px 10px; }}"
+                               f"QPushButton:hover {{ background: {theme.BG_BUTTON_HOVER}; }}"
+                               f"QPushButton:disabled {{ color: {theme.FG_DISABLED};"
+                               f" border-color: {theme.FG_DISABLED}; }}")
+        self.label.setText(text)
+        self.label.setToolTip(reason)
+        self.button.setVisible(start)
+        self.show()
+
+    def set_start_enabled(self, enabled: bool) -> None:
+        self.button.setEnabled(enabled)
+
+
 class SummaryStrip(QWidget):
     make_safe_requested = pyqtSignal()
     trust_requested = pyqtSignal()
     reset_requested = pyqtSignal()
-    start_monitor_requested = pyqtSignal()
     show_device_requested = pyqtSignal(str)
     clear_fence_requested = pyqtSignal()
 
@@ -123,12 +190,11 @@ class SummaryStrip(QWidget):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(4)
         self.banners: dict[str, _Banner] = {}
-        for key in ("monitor", "trust", "run", "interlock", "watchdog", "busy"):
+        for key in ("trust", "run", "interlock", "watchdog", "busy"):
             banner = _Banner(key)
             banner.hide()
             self.banners[key] = banner
             box.addWidget(banner)
-        self.banners["monitor"].button.clicked.connect(self.start_monitor_requested.emit)
         self.banners["trust"].button.clicked.connect(self.trust_requested.emit)
         self.banners["trust"].alt_button.clicked.connect(self.reset_requested.emit)
         self.banners["trust"].alt_button.setToolTip(
@@ -167,19 +233,6 @@ class SummaryStrip(QWidget):
         self._hazard_key = None
 
     # -- inputs -------------------------------------------------------------------
-
-    def set_monitor(self, state, reachable: bool, detail: str = "") -> None:
-        b = self.banners["monitor"]
-        if not reachable:
-            b.show_text("error", "Monitor server unreachable: nothing typed here reaches "
-                                 "the hardware, and the tabs may be out of date.")
-        elif state == STATES.NOT_READY:
-            b.show_text("warn", "The monitor is not running"
-                                + (f" ({detail})" if detail else "")
-                                + ": channel edits and composite ops are not applied "
-                                  "until it runs.", "Start monitor")
-        else:
-            b.hide()
 
     def set_trust(self, trust: dict | None, reset: dict | None = None) -> None:
         """*reset* is the monitor server's reset experiment (``None``: it has

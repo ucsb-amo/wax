@@ -26,6 +26,10 @@ One run at a time:
   already (its abort path sends ``run complete``).
 
 The loop only ever sends liveOD read-only POLLs, and never kills a run.
+
+Every run's terminal output is kept (``RunLoop.output``, an
+:class:`~waxx.util.device_state.output_log.OutputLog`) for the GUIs' log view,
+with a line of the loop's own before each run and at the end.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from typing import Callable, Iterable, Mapping
 
 from waxx.util.device_state.monitor_manager import (
     _INTERRUPTED_SIGNATURES, _diagnose, _matches, ar_command, environment_report)
+from waxx.util.device_state.output_log import OutputLog
 from waxx.util.device_state.state_reset import describe_expt
 
 log = logging.getLogger(__name__)
@@ -145,6 +150,8 @@ class RunLoop:
         self._about, self._about_mtime = "", None
         self._s: dict = {"state": "idle", "text": "not started", "runs": 0,
                          "run_id": None, "last": None}
+        #: The runs' terminal output, for the GUIs (the server log has it too).
+        self.output = OutputLog()
 
     # -- state ------------------------------------------------------------------
 
@@ -311,6 +318,7 @@ class RunLoop:
             for line in environment_report():
                 log.error("  %s", line)
             return "latched", f"could not start {self.expt}: {exc!r}", True
+        self.output.mark(f"{_nth(n)} run of the loop: {self.expt}", self._clock)
         self._set(run_id=None, run_started=self._clock(), tail=None,
                   text=f"run {n} of the loop starting ({self.expt})")
         lines: queue.Queue = queue.Queue()
@@ -336,6 +344,7 @@ class RunLoop:
             if not line:
                 continue
             tail.append(line)
+            self.output.append(line)
             log.info("[%s] %s", self.spec.key, line)
             m = RUN_ID_RE.search(line)
             if m and run_id is None:
@@ -419,6 +428,8 @@ class RunLoop:
         (log.info if state == "stopped" else log.warning)(
             "%s %s after %s: %s", self.spec.title,
             "stopped" if state == "stopped" else "LATCHED OFF", _n_runs(runs), why)
+        self.output.mark(f"{'stopped' if state == 'stopped' else 'LATCHED OFF'} after "
+                         f"{_n_runs(runs)}: {why}", self._clock)
         self._record("run_loop_end", state=state, why=why, runs=runs,
                      start_monitor=bool(start_monitor))
         self._notify()

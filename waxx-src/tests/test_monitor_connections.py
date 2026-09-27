@@ -15,7 +15,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from waxx.base import monitor as wmon
 from waxx.util.comms_server.comm_server import STATES
@@ -474,27 +474,46 @@ def _pill(panel):
 
 
 def test_bar_shows_each_connection_before_the_server_reports(panel):
-    pill, detail = _pill(panel)
+    pill = _pill(panel)
     assert panel.connection_bar.isVisibleTo(panel)
     assert pill.text() == "Tweezer AWG" and GREY in pill.styleSheet()
-    assert "not reported" in detail.text()
+    assert "not reported" in pill.toolTip()
+
+
+def test_bar_is_pills_only(panel):
+    labels = [w for w in panel.connection_bar.findChildren(QLabel)]
+    assert labels == []                                         # no title, detail or message
 
 
 def test_bar_colours_follow_the_reported_state(panel):
-    pill, detail = _pill(panel)
+    pill = _pill(panel)
     panel.set_connections(REPORT)
-    assert GREEN in pill.styleSheet() and detail.text() == "no tones"
+    assert GREEN in pill.styleSheet() and "no tones" in pill.toolTip()
     assert "Click to disconnect" in pill.toolTip() and "netbox" in pill.toolTip()
     panel.set_connections({"awg": dict(REPORT["awg"], state=conns.FAILED, detail="x" * 300)})
-    assert RED in pill.styleSheet()
-    assert len(detail.text()) <= 90 and detail.text().endswith("…")
-    assert detail.toolTip() == "x" * 300
+    assert RED in pill.styleSheet() and "x" * 300 in pill.toolTip()
     panel.set_connections({"awg": dict(REPORT["awg"], state=conns.DISCONNECTED)})
     assert GREY in pill.styleSheet()
 
 
+def test_a_refused_connect_is_a_warning_and_a_log_line(panel):
+    shown, lines = [], []
+    panel.refused = lambda title, text: shown.append((title, text))
+    panel._log_line = lines.append
+    _pill(panel).click()
+    req = panel._sender.requests[-1]
+    panel._sender.requested.emit(req["req"], {"status": "ok"})
+    assert shown == []                                          # accepted: the pill says it
+    _pill(panel).click()
+    req = panel._sender.requests[-1]
+    panel._sender.requested.emit(req["req"], {"status": "error", "msg": "a run is starting"})
+    assert shown == [("Tweezer AWG: connect",
+                      "The monitor server refused it: a run is starting")]
+    assert lines[-1] == "[connection] Tweezer AWG connect refused: a run is starting"
+
+
 def test_pill_click_sends_connect_or_confirmed_disconnect(panel):
-    pill, _ = _pill(panel)
+    pill = _pill(panel)
     pill.click()
     assert panel._sender.requests[-1]["type"] == "connection"
     assert panel._sender.requests[-1]["action"] == "connect"
@@ -511,7 +530,7 @@ def test_pill_click_sends_connect_or_confirmed_disconnect(panel):
 
 
 def test_pills_work_without_the_monitor_but_not_while_a_run_starts(panel):
-    pill, detail = _pill(panel)
+    pill = _pill(panel)
     panel.set_monitor_state(STATES.NOT_READY, reachable=True)
     assert pill.isEnabled()                                     # the server holds it
     panel.set_run_pending({"run_id": 81234, "expt": "hf_bec"})
@@ -520,7 +539,7 @@ def test_pills_work_without_the_monitor_but_not_while_a_run_starts(panel):
     assert pill.isEnabled()                                     # disconnect still allowed
     panel.set_run_pending(None)
     panel.set_monitor_state(None, reachable=False)
-    assert not pill.isEnabled() and detail.text() == "monitor server unreachable"
+    assert not pill.isEnabled() and "monitor server unreachable" in pill.toolTip()
 
 
 def test_status_detail_and_context_carry_the_connections(panel):

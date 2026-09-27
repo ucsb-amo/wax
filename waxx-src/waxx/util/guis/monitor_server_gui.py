@@ -179,6 +179,11 @@ class MonitorUDPServer(UdpServer):
       are broadcast as ``run_loop``; ``status_json`` has ``run_loops``.  A
       ``reset`` (monitor restart) request ends a running loop; the loop's
       end asks for the monitor through ``start_monitor_signal``.
+    * ``output`` (``kind`` ``run_loop`` with ``key``, or ``reset``;
+      ``after``) — the terminal output of a loop's runs or of the reset
+      experiment after line ``after`` (see
+      :class:`~waxx.util.device_state.output_log.OutputLog`); the Sequences
+      tab's log view polls it while open.  Not logged or journaled.
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
@@ -377,6 +382,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_reset_state(obj))
         if mtype == "run_loop":
             return json.dumps(self._reply_run_loop(obj))
+        if mtype == "output":
+            return json.dumps(self._reply_output(obj))
         if mtype == "get_journal":
             if obj.get("since"):
                 entries = self.journal.since((str(obj["since"]),))
@@ -597,6 +604,24 @@ class MonitorUDPServer(UdpServer):
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
         return loop.start(operator=operator, client=client)
+
+    def _reply_output(self, obj: dict) -> dict:
+        """A loop's or the reset experiment's terminal output after line
+        ``after`` (OutputLog.since)."""
+        kind = obj.get("kind")
+        if kind == "reset":
+            if not self.reset.configured:
+                return {"status": "error", "msg": "no reset experiment on this monitor server"}
+            source = self.reset.output
+        elif kind == "run_loop":
+            loop = self.loops.get(str(obj.get("key") or ""))
+            if loop is None:
+                return {"status": "error",
+                        "msg": f"no run loop {obj.get('key')!r} on this monitor server"}
+            source = loop.output
+        else:
+            return {"status": "error", "msg": f"unknown output kind {kind!r}"}
+        return dict(source.since(obj.get("after", 0)), status="ok")
 
     def _loop_busy(self) -> str:
         """Why something of this server's own holds the core, for the loops."""

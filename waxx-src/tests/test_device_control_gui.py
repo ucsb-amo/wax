@@ -42,6 +42,15 @@ def fake_settings(monkeypatch):
     return FakeSettings
 
 
+@pytest.fixture(autouse=True)
+def no_sequences_requests(monkeypatch):
+    """The Sequences tab's request thread is a fake: nothing reaches the
+    network (this machine may run the real monitor server)."""
+    from test_composite_panel import FakeSender
+    from waxx.util.guis import sequences_panel
+    monkeypatch.setattr(sequences_panel, "_OpSender", FakeSender)
+
+
 @pytest.fixture
 def gui(qapp, monkeypatch):
     for name in ("_setup_update_sender", "_setup_state_listener", "_setup_state_worker",
@@ -243,7 +252,8 @@ def test_tall_composite_page_scrolls_on_its_own(qapp, monkeypatch):
         monkeypatch.setattr(dc.DeviceStateGUI, name, lambda self, *a, **k: None)
     g = dc.DeviceStateGUI(composite_devices=[object()])
     try:
-        page = g.tab_widget.widget(g.tab_widget.count() - 1)
+        tabs = [g.tab_widget.tabText(i) for i in range(g.tab_widget.count())]
+        page = g.tab_widget.widget(tabs.index("Composite"))
         assert isinstance(page, QScrollArea) and page.widget() is g.composite_panel
         assert g.tab_widget.minimumSizeHint().height() < 1000
     finally:
@@ -345,12 +355,13 @@ def test_failed_conversion_keeps_unit(qapp):
 
 def test_no_recent_changes_strip(gui):
     assert not hasattr(gui, "recent_list")
-    assert gui.changes_button.text() == "Changes"
+    assert gui.changes_button.text() == "Log"
 
 
 def test_changes_popout_window(loaded, qapp):
     loaded._record_change("dac", "dac_ch0", {"voltage": 1.0}, {"voltage": 1.5})
-    assert loaded.changes_button.text() == "Changes (1)"
+    assert loaded.changes_button.text() == "Log"                # the count is in the tooltip
+    assert "1 entry." in loaded.changes_button.toolTip()
     assert loaded._changes_window is None
 
     loaded.show_changes_log()
@@ -361,14 +372,14 @@ def test_changes_popout_window(loaded, qapp):
 
     loaded._record_change("ttl", "a", {"ttl_state": 0}, {"ttl_state": 1})
     assert win.list.count() == 2
-    assert loaded.changes_button.text() == "Changes (2)"
+    assert "2 entries." in loaded.changes_button.toolTip()
 
     loaded.show_changes_log()
     assert loaded._changes_window is win        # raised, not duplicated
 
     win._clear()
     assert len(loaded._changes) == 0
-    assert loaded.changes_button.text() == "Changes"
+    assert "entr" not in loaded.changes_button.toolTip()
 
     loaded._record_change("dds", "imaging", {"frequency": 110e6}, {"frequency": 111e6})
     win.close()

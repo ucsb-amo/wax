@@ -21,7 +21,8 @@ from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.state_broadcast import StateListener
 from waxx.util.dashboard import theme
 from waxx.util.device_state.op_journal import describe_entry
-from waxx.util.guis.device_summary import MakeSafeDialog, SummaryStrip, reset_title
+from waxx.util.guis.device_summary import (
+    MakeSafeDialog, MonitorNotice, SummaryStrip, reset_title)
 from waxa.helper.name_search import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -1438,6 +1439,11 @@ class _ClickableLabel(QLabel):
         super().mouseReleaseEvent(event)
 
 
+# Sub-states the pill or the monitor notice already say in words; the status
+# detail then shows only how long it has been so.
+_SUB_STATES_SAID = ("running", "starting", "never_started", "interrupted_by_run",
+                    "stopped_on_request")
+
 # Human-readable text for the machine-readable ``sub_state`` values.
 _SUB_STATE_TEXT = {
     "running": "running",
@@ -1604,7 +1610,16 @@ class DeviceStateGUI(QMainWindow):
     measured values, polled only while this window is visible;
     ``composite_connections``
     (:class:`waxx.util.device_state.connections.Connection`) are the
-    monitor server's host-side connections shown on the tab's connection bar.
+    monitor server's host-side connections, shown as pills in the status row.
+
+    The Sequences tab (:mod:`waxx.util.guis.sequences_panel`) is always
+    there: the experiments the monitor server runs itself (its run loops and
+    reset experiment), each with its terminal output.
+
+    Starting and stopping the monitor *server* belongs to whatever runs it
+    (the lab's dashboard puts Start / Stop / Restart on this panel's header).
+    The monitor *experiment* is started from the notice beside the status
+    pill, and started / restarted / stopped from the pill's right-click menu.
     """
 
     def __init__(self,
@@ -1630,6 +1645,8 @@ class DeviceStateGUI(QMainWindow):
         self._telemetry = composite_telemetry
         self.composite_panel = None
         self._composite_scroll = None
+        self.sequences_panel = None
+        self._sequences_scroll = None
         self._trust: dict | None = None
         # The monitor server's reset experiment and its current/last run
         # (StateReset.info()); None when the server has none.
@@ -1700,7 +1717,6 @@ class DeviceStateGUI(QMainWindow):
         self.summary.make_safe_requested.connect(self._make_safe)
         self.summary.trust_requested.connect(self._trust_state)
         self.summary.reset_requested.connect(self._reset_state)
-        self.summary.start_monitor_requested.connect(self.on_start_clicked)
         self.summary.show_device_requested.connect(self._show_composite_device)
         self.summary.clear_fence_requested.connect(self._clear_fence)
         central_widget_layout.addWidget(self.summary)
@@ -1900,7 +1916,10 @@ class DeviceStateGUI(QMainWindow):
                 connections=self._composite_connections)
             self.composite_panel.set_config(self.config_data)
             self.composite_panel.hazards_changed.connect(self._refresh_summary)
-            self.composite_panel.reset_requested.connect(self._reset_state)
+            # Its connection bar goes in the status row: it matters on every tab.
+            bar = getattr(self.composite_panel, "connection_bar", None)
+            if bar is not None:
+                self._connections_slot.addWidget(bar)
             # Scrolls on its own: a tab widget's minimum size is its largest
             # page's, so an unscrolled Composite page (~1650 px tall) would set
             # the minimum height of the whole window and stretch every DDS card.
@@ -1910,6 +1929,19 @@ class DeviceStateGUI(QMainWindow):
             composite_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             self._composite_scroll = composite_scroll
             self.tab_widget.addTab(composite_scroll, "Composite")
+
+        # Sequences tab: what the monitor server runs itself (run loops, the
+        # reset experiment).  Scrolls on its own for the same reason: an open
+        # log makes it tall.
+        from waxx.util.guis.sequences_panel import SequencesPanel  # noqa: PLC0415
+        self.sequences_panel = SequencesPanel(log_line=self._record_line)
+        self.sequences_panel.reset_requested.connect(self._reset_state)
+        sequences_scroll = QScrollArea()
+        sequences_scroll.setWidget(self.sequences_panel)
+        sequences_scroll.setWidgetResizable(True)
+        sequences_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._sequences_scroll = sequences_scroll
+        self.tab_widget.addTab(sequences_scroll, "Sequences")
 
         # Restore + persist the active tab.
         saved_tab = int(_setting("ui/active_tab", 0, int))
@@ -1941,7 +1973,7 @@ class DeviceStateGUI(QMainWindow):
         _prev_tab.activated.connect(lambda: self._cycle_tab(-1))
 
     # ------------------------------------------------------------------
-    # Status row (monitor state + Start / Restart / Stop)
+    # Status row (monitor state, connections, changes, monitor notice)
     # ------------------------------------------------------------------
 
     def _build_status_row(self) -> QHBoxLayout:
@@ -1956,43 +1988,39 @@ class DeviceStateGUI(QMainWindow):
         self.status_pill.setFont(pill_font)
         self.status_pill.setMinimumHeight(25)
         self.status_pill.clicked.connect(self.on_status_pill_clicked)
+        self.status_pill.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.status_pill.customContextMenuRequested.connect(self._status_pill_menu)
+        self.status_pill.setToolTip("Right-click: start, restart or stop the monitor "
+                                    "experiment.")
         self._style_pill(theme.OFF)
         row.addWidget(self.status_pill)
 
         self.status_detail_label = QLabel("")
         self.status_detail_label.setStyleSheet(f"color: {theme.FG_MUTED};")
-        row.addWidget(self.status_detail_label, 1)
+        row.addWidget(self.status_detail_label)
+
+        # Why edits are not applied right now (not running, interrupted,
+        # server unreachable), with Start; hidden while the monitor runs.
+        # In the free middle of the row: the stretch after it takes up its
+        # appearing, so the connections and Log never move.
+        self.monitor_notice = MonitorNotice()
+        self.monitor_notice.start_requested.connect(self.on_start_clicked)
+        row.addWidget(self.monitor_notice)
+        row.addStretch(1)
+
+        # The monitor server's connections (the Composite tab's connection
+        # bar, placed here once that tab is built).
+        self._connections_slot = QHBoxLayout()
+        self._connections_slot.setContentsMargins(0, 0, 0, 0)
+        row.addLayout(self._connections_slot)
 
         # The changes log lives in its own pop-out window (see
         # ChangesLogWindow) instead of a strip under the grids.
-        self.changes_button = QPushButton("Changes")
+        self.changes_button = QPushButton("Log")
         self.changes_button.setMaximumHeight(25)
         self.changes_button.clicked.connect(self.show_changes_log)
         self._refresh_changes_button()
         row.addWidget(self.changes_button)
-
-        # The monitor server's reset experiment (kexp: "Run MOT Observe");
-        # labelled and shown by _refresh_status_buttons once the server says
-        # it has one -- only without a Composite tab, which has its card.
-        self.reset_button = QPushButton("")
-        self.reset_button.setMaximumHeight(25)
-        self.reset_button.clicked.connect(self._reset_state)
-        self.reset_button.hide()
-        row.addWidget(self.reset_button)
-
-        self.start_button = QPushButton("Start monitor")
-        self.start_button.setToolTip("Start the monitor experiment (it is not running).")
-        self.start_button.clicked.connect(self.on_start_clicked)
-        self.restart_button = QPushButton("Restart")
-        self.restart_button.setToolTip("Restart the monitor experiment.")
-        self.restart_button.clicked.connect(self.on_restart_clicked)
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.setToolTip("Stop the monitor experiment and leave it stopped.")
-        self.stop_button.clicked.connect(self.on_stop_clicked)
-        for btn in (self.start_button, self.restart_button, self.stop_button):
-            btn.setEnabled(False)
-            btn.setMaximumHeight(25)
-            row.addWidget(btn)
         return row
 
     def _style_pill(self, bg: str) -> None:
@@ -2000,26 +2028,36 @@ class DeviceStateGUI(QMainWindow):
             f"QLabel {{ background: {bg}; color: white; border-radius: 6px; padding: 2px 10px; }}"
         )
 
-    def _refresh_status_buttons(self) -> None:
-        """Enable Start / Restart / Stop according to the monitor state, and
-        the reset button according to the server's reset experiment."""
+    def _monitor_commands_allowed(self) -> tuple[bool, bool]:
+        """(Start allowed, Restart / Stop allowed) for the monitor experiment."""
         reachable = not self.connection_failed and self._monitor_state is not None
         busy = self._command_in_flight
         st = self._monitor_state
-        self.start_button.setEnabled(reachable and not busy and st == STATES.NOT_READY)
-        live = reachable and not busy and st in (STATES.READY, STATES.LOADING)
-        self.restart_button.setEnabled(live)
-        self.stop_button.setEnabled(live)
-        reset = self._reset
-        self.reset_button.setVisible(bool(reset) and self.composite_panel is None)
-        if reset:
-            title = reset_title(reset)
-            running = reset.get("state") == "running"
-            self.reset_button.setText(f"Running {title}…" if running else f"Run {title}")
-            self.reset_button.setEnabled(reachable and not busy and not running)
-            self.reset_button.setToolTip(
-                f"Run {reset.get('expt')}.py through the monitor server. It takes the core; "
-                "its end state marks the device state trusted.")
+        return (reachable and not busy and st == STATES.NOT_READY,
+                reachable and not busy and st in (STATES.READY, STATES.LOADING))
+
+    def _refresh_status_buttons(self) -> None:
+        """Enable the notice's Start according to the monitor state."""
+        self.monitor_notice.set_start_enabled(self._monitor_commands_allowed()[0])
+
+    def _status_pill_menu(self, pos) -> None:
+        """Right-click on the pill: the monitor experiment's Start / Restart /
+        Stop (the notice has Start; the server process is the dashboard's)."""
+        can_start, live = self._monitor_commands_allowed()
+        menu = QMenu(self)
+        start = menu.addAction("Start monitor experiment")
+        start.setEnabled(can_start)
+        restart = menu.addAction("Restart monitor experiment…")
+        restart.setEnabled(live)
+        stop = menu.addAction("Stop monitor experiment…")
+        stop.setEnabled(live)
+        chosen = menu.exec(self.status_pill.mapToGlobal(pos))
+        if chosen is start:
+            self.on_start_clicked()
+        elif chosen is restart:
+            self.on_restart_clicked()
+        elif chosen is stop:
+            self.on_stop_clicked()
 
     def _set_monitor_state(self, state: int) -> None:
         """Apply a monitor state (STATES.*) to the pill; track when it began."""
@@ -2036,11 +2074,14 @@ class DeviceStateGUI(QMainWindow):
         else:  # STATES.NOT_READY
             self.status_pill.setText("Monitor not running")
             self._style_pill(theme.ERR)
+        status = self._monitor_status or {}
+        self.monitor_notice.set_monitor(state, True, str(status.get("sub_state") or ""),
+                                        str(status.get("reason") or "").strip())
         self._refresh_status_buttons()
         if self.composite_panel is not None:
             self.composite_panel.set_monitor_state(state, reachable=True)
-        sub = str((self._monitor_status or {}).get("sub_state") or "")
-        self.summary.set_monitor(state, True, _SUB_STATE_TEXT.get(sub, sub.replace("_", " ")))
+        if self.sequences_panel is not None:
+            self.sequences_panel.set_reachable(True)
         self._refresh_summary()
 
     def _on_status_updated(self, status: int) -> None:
@@ -2063,6 +2104,8 @@ class DeviceStateGUI(QMainWindow):
             self._trust = detail.get("trust")
         if "reset" in detail:
             self._set_reset(detail.get("reset"))
+        if isinstance(detail.get("run_loops"), dict) and self.sequences_panel is not None:
+            self.sequences_panel.set_loops(detail["run_loops"])
         if "run_pending" in detail:
             self._run_pending = detail.get("run_pending")
         busy = (detail.get("composite_ops") or {}).get("busy_s")
@@ -2079,7 +2122,8 @@ class DeviceStateGUI(QMainWindow):
         sub = str(detail.get("sub_state") or "")
         reason = str(detail.get("reason") or "").strip()
         parts = []
-        text = reason or _SUB_STATE_TEXT.get(sub, sub.replace("_", " "))
+        text = reason or ("" if sub in _SUB_STATES_SAID
+                          else _SUB_STATE_TEXT.get(sub, sub.replace("_", " ")))
         if text:
             parts.append(text)
         if self._state_since:
@@ -2099,10 +2143,12 @@ class DeviceStateGUI(QMainWindow):
         self.status_pill.setText("Monitor server unreachable")
         self._style_pill(UNREACHABLE_COLOR)
         self.status_detail_label.setText("click the status to retry")
+        self.monitor_notice.set_monitor(None, False)
         self._refresh_status_buttons()
         if self.composite_panel is not None:
             self.composite_panel.set_monitor_state(None, reachable=False)
-        self.summary.set_monitor(None, False)
+        if self.sequences_panel is not None:
+            self.sequences_panel.set_reachable(False)
         self._refresh_summary()
 
     def on_status_pill_clicked(self):
@@ -2120,6 +2166,25 @@ class DeviceStateGUI(QMainWindow):
         self.request_state()
 
     def on_start_clicked(self):
+        """Start the monitor experiment -- asking first when an experiment
+        probably holds the core (the monitor was interrupted by a run, or
+        liveOD has one in progress): starting takes the core from it."""
+        sub = str((self._monitor_status or {}).get("sub_state") or "")
+        live_od = self._live_od_status()
+        if sub == "interrupted_by_run" or live_od.get("run_in_progress"):
+            run = ""
+            if live_od.get("run_in_progress"):
+                run = (f" liveOD says run {live_od.get('run_id')} "
+                       f"({live_od.get('expt_name') or 'experiment'}) is in progress.")
+            reply = QMessageBox.question(
+                self, "Start monitor",
+                "An experiment probably holds the core device (it interrupted the monitor)."
+                + run + " Starting the monitor takes the core and cuts that experiment off.\n\n"
+                "Start the monitor anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self._send_monitor_command("reset")
 
     def on_restart_clicked(self):
@@ -2204,11 +2269,12 @@ class DeviceStateGUI(QMainWindow):
         self._refresh_changes_button()
 
     def _refresh_changes_button(self) -> None:
+        # The count is in the tooltip, not the text: a growing label would
+        # shift the connection pills beside it.
         n = len(self._changes)
-        self.changes_button.setText(f"Changes ({n})" if n else "Changes")
         tip = "Open the log of device changes in its own window."
         if n:
-            tip += f"\nLast: {self._changes[-1]}"
+            tip += f"\n{n} entr{'y' if n == 1 else 'ies'}. Last: {self._changes[-1]}"
         self.changes_button.setToolTip(tip)
 
     @staticmethod
@@ -2431,9 +2497,8 @@ class DeviceStateGUI(QMainWindow):
         """New reset info (status poll, snapshot, broadcast or reply): logs a
         line in the changes log when a reset starts or ends."""
         previous, self._reset = self._reset, reset
-        self._refresh_status_buttons()
-        if self.composite_panel is not None:
-            self.composite_panel.set_reset(reset)
+        if self.sequences_panel is not None:
+            self.sequences_panel.set_reset(reset)
         if not reset:
             return
         key = (reset.get("state"), reset.get("started"))
@@ -2731,6 +2796,8 @@ class DeviceStateGUI(QMainWindow):
                 panel.set_trust(self._trust)
         if "reset" in state:
             self._set_reset(state.get("reset"))
+        if isinstance(state.get("run_loops"), dict) and self.sequences_panel is not None:
+            self.sequences_panel.set_loops(state["run_loops"])
         if "run_pending" in state:
             self._run_pending = state.get("run_pending")
             if panel is not None:
@@ -2786,8 +2853,8 @@ class DeviceStateGUI(QMainWindow):
                 panel.on_op_result(payload)
             return
         if mtype == "run_loop":
-            if panel is not None:
-                panel.on_run_loop(payload.get("loop"))
+            if self.sequences_panel is not None:
+                self.sequences_panel.on_run_loop(payload.get("loop"))
             return
         if mtype == "state_reset":
             # an experiment's end state replaced the file: resync everything
@@ -3024,6 +3091,8 @@ class DeviceStateGUI(QMainWindow):
             win.close()
         if self.composite_panel is not None:
             self.composite_panel.shutdown()
+        if self.sequences_panel is not None:
+            self.sequences_panel.shutdown()
         timer = getattr(self, "_telemetry_timer", None)
         if timer is not None:
             timer.stop()

@@ -308,6 +308,9 @@ def test_trust_banner_while_a_reset_runs_and_after_it_failed(qapp):
 
 @pytest.fixture
 def gui(qapp, monkeypatch):
+    from test_composite_panel import FakeSender
+    from waxx.util.guis import sequences_panel
+    monkeypatch.setattr(sequences_panel, "_OpSender", FakeSender)    # nothing on the network
     monkeypatch.setattr(dc, "QSettings", lambda *a, **k: SimpleNamespace(
         value=lambda key, default=None, type=None: default, setValue=lambda *a: None))
     for name in ("_setup_update_sender", "_setup_state_listener", "_setup_state_worker",
@@ -397,19 +400,37 @@ def test_gui_reset_warns_about_a_live_run_and_sends_the_request(gui, monkeypatch
     assert not sent
 
 
-def test_status_row_reset_button_follows_the_server(gui):
-    b = gui.reset_button
-    assert b.isHidden()                                   # no reset info yet
+def test_the_sequences_tab_reset_card_follows_the_server(gui):
+    card = gui.sequences_panel.reset_card
+    b = card.start_button
+    assert card.isHidden()                                # no reset info yet
     gui._set_monitor_state(STATES.READY)
     gui._set_reset({"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
-    assert not b.isHidden() and b.isEnabled() and b.text() == "Run MOT Observe"
+    assert not card.isHidden() and b.isEnabled() and b.text() == "Run"
+    assert card.title.text() == "MOT Observe"
     gui._set_reset({"expt": "mot_observe", "state": "running", "started": 1.,
                     "about": MOT_ABOUT})
-    assert b.text() == "Running MOT Observe…" and not b.isEnabled()
+    assert b.text() == "Running…" and not b.isEnabled()
     gui._set_reset({"expt": "mot_observe", "state": "done", "started": 1.,
                     "about": MOT_ABOUT})
     assert b.isEnabled()
     gui.on_connection_failed()
     assert not b.isEnabled()
     gui._set_reset(None)
-    assert b.isHidden()
+    assert card.isHidden()
+
+
+def test_the_resets_output_is_served_to_the_gui(server):
+    server.reset._spawn = lambda command: FakeProc(["compiling", "Done!"], 0)
+    assert _ask(server, {"type": "reset_state", "operator": "ada",
+                         "client": "pc2"})["status"] == "ok"
+    server.reset.join(2)
+    reply = _ask(server, {"type": "output", "kind": "reset", "after": 0})
+    assert reply["status"] == "ok"
+    lines = reply["lines"]
+    assert lines[0].startswith("── ") and "mot_observe started by ada@pc2" in lines[0]
+    assert lines[1:3] == ["compiling", "Done!"]
+    assert ("FAILED: mot_observe exited with code 0 without reporting its end state"
+            in lines[-1])                                 # it never sent its end state
+    again = _ask(server, {"type": "output", "kind": "reset", "after": reply["next"] - 1})
+    assert again["lines"] == [] and not again["more"]

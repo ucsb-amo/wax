@@ -17,6 +17,7 @@ from waxx.util.device_state.composite import (
 )
 from waxx.util.guis import composite_panel as cp
 from waxx.util.guis import device_control_gui as dc
+from waxx.util.guis import sequences_panel as sp
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +77,7 @@ def fakes(monkeypatch):
     monkeypatch.setattr(cp, "QSettings", FakeSettings)
     monkeypatch.setattr(dc, "QSettings", FakeSettings)
     monkeypatch.setattr(cp, "_OpSender", FakeSender)
+    monkeypatch.setattr(sp, "_OpSender", FakeSender)     # the GUI's Sequences tab
 
 
 def _state(ctx):
@@ -314,7 +316,7 @@ def test_lamp_is_a_button_that_flips_its_channel(panel):
     assert button.isEnabled()
 
 
-def test_state_pill_is_a_button_off_while_on_and_on_naming_its_values(panel):
+def test_state_pill_is_a_button_off_while_on_and_on_while_off(panel):
     card = _card(panel)
     assert card.state_pill.text() == "ON" and card.state_pill.isEnabled()
     assert "Click: Off" in card.state_pill.toolTip()
@@ -325,14 +327,10 @@ def test_state_pill_is_a_button_off_while_on_and_on_naming_its_values(panel):
     card._pending_ops.clear()
     panel.refresh()
     assert card.state_pill.text() == "off" and "Click: On" in card.state_pill.toolTip()
-    panel.answer = False
-    card.state_pill.click()
-    assert panel._sender.sent[-1]["op"] == "beam.off"               # cancelled: nothing new
-    assert "Setpoint 2.00 V" in panel.confirm_answers[-1][3]        # the values it would send
-    panel.answer = True
     card.state_pill.click()
     assert panel._sender.sent[-1]["op"] == "beam.on"
     assert panel._sender.sent[-1]["args"] == {"v": pytest.approx(2.0)}
+    assert panel.confirm_answers == []                              # switching on: no question either
 
 
 def test_state_pill_is_not_clickable_when_unknown_or_ops_are_refused(panel):
@@ -408,83 +406,6 @@ def test_routed_lamps_wait_for_the_monitor(routed):
     assert "not now" in card.lamps[0][1].toolTip()
 
 
-LOOP = {"key": "auto_tof", "title": "BEC TOF loop", "expt": "auto_tof",
-        "path": "C:/code/auto_tof.py", "about": "BEC TOF loop: t_tof 1-4 ms.",
-        "state": "idle", "text": "not started", "runs": 0, "run_id": None, "last": None}
-
-
-def test_run_loop_card_starts_and_stops_through_the_server(panel):
-    card = panel.loops_card
-    assert card.isHidden()                                  # until the server has loops
-    panel.set_monitor_detail({"composite_ops": panel._monitor_ops, "run_loops": {"auto_tof": LOOP}})
-    assert not card.isHidden()
-    row = card.rows["auto_tof"]
-    assert row["pill"].text() == "idle"
-    assert row["start"].isEnabled() and not row["stop"].isEnabled()
-    row["start"].click()
-    title, text, _, verb = panel.confirm_answers[-1]
-    assert "t_tof 1-4 ms" in text and "Stop lets the run in progress finish" in text
-    assert verb == "Start BEC TOF loop"
-    req = panel._sender.requests[-1]
-    assert (req["type"], req["action"], req["loop"]) == ("run_loop", "start", "auto_tof")
-    panel._sender.requested.emit(req["req"], {"status": "ok", "loop": dict(
-        LOOP, state="running", run_id=81000, started=time.time(),
-        text="run 81000 in progress (1st of the loop)")})
-    assert row["pill"].text() == "RUNNING" and "run 81000" in row["status"].text()
-    assert row["stop"].isEnabled() and not row["start"].isEnabled()
-    row["stop"].click()
-    assert panel._sender.requests[-1]["action"] == "stop"
-    panel.on_run_loop(dict(LOOP, state="latched", runs=1, ended=time.time(),
-                           text="run 81001 was aborted in liveOD (Abort): its file was discarded",
-                           tail=["RuntimeError: Acquisition for run 81001 aborted."]))
-    assert row["pill"].text() == "LATCHED OFF" and "aborted in liveOD" in row["status"].text()
-    assert not row["tail"].isHidden()
-    assert row["start"].isEnabled()
-    assert any(line.startswith("[loop] BEC TOF loop: latched") for line in panel.lines)
-    panel.set_monitor_state(None, reachable=False)
-    assert not row["start"].isEnabled()
-
-
-def test_a_refused_loop_start_says_why(panel):
-    panel.set_monitor_detail({"run_loops": {"auto_tof": LOOP}})
-    panel.loops_card.rows["auto_tof"]["start"].click()
-    req = panel._sender.requests[-1]
-    panel._sender.requested.emit(req["req"], {"status": "error",
-                                              "msg": "run 7 (rabi) is in progress in liveOD"})
-    status = panel.loops_card.rows["auto_tof"]["status"].text()
-    assert "✕ not started: run 7 (rabi) is in progress in liveOD" in status
-
-
-RESET = {"expt": "mot_observe", "state": "idle",
-         "about": "MOT Observe: puts the machine in its MOT-loading idle state."}
-
-
-def test_reset_card_runs_through_the_host_and_shows_how_it_ended(panel):
-    card = panel.reset_card
-    assert card.isHidden()                                  # until the server has one
-    panel.set_reset(RESET)
-    assert not card.isHidden()
-    assert card.title.text() == "MOT Observe" and card.pill.text() == "idle"
-    assert card.run_button.isEnabled() and card.run_button.text() == "Run"
-    asked = []
-    panel.reset_requested.connect(lambda: asked.append(1))
-    card.run_button.click()
-    assert asked == [1]                                     # the host confirms and sends
-    panel.set_reset(dict(RESET, state="running", started=time.time(), operator="",
-                         client="kong", text="mot_observe started"))
-    assert card.pill.text() == "RUNNING" and "by kong" in card.status.text()
-    assert not card.run_button.isEnabled() and card.run_button.text() == "Running…"
-    panel.set_reset(dict(RESET, state="failed", ended=time.time(), tail=["boom"],
-                         text="mot_observe exited with code 1 without reporting its end state"))
-    assert card.pill.text() == "FAILED" and "exited with code 1" in card.status.text()
-    assert not card.tail.isHidden() and "boom" in card.tail.text()
-    assert card.run_button.isEnabled()
-    panel.set_monitor_state(None, reachable=False)
-    assert not card.run_button.isEnabled()
-    panel.set_reset(None)
-    assert card.isHidden()
-
-
 def test_table_add_row_and_payload(panel):
     card = _card(panel)
     table = card.tables["rows"]
@@ -528,9 +449,9 @@ def gui(qapp, monkeypatch):
     g.close()
 
 
-def test_composite_tab_is_added_last(gui):
-    assert gui.tab_widget.tabText(gui.tab_widget.count() - 1) == "Composite"
-    assert [gui.tab_widget.tabText(i) for i in range(3)] == ["DDS", "DAC", "TTL"]
+def test_composite_tab_comes_after_the_channel_tabs_then_sequences(gui):
+    tabs = [gui.tab_widget.tabText(i) for i in range(gui.tab_widget.count())]
+    assert tabs == ["DDS", "DAC", "TTL", "Composite", "Sequences"]
 
 
 def test_no_composite_tab_without_definitions(qapp, monkeypatch):
@@ -538,7 +459,8 @@ def test_no_composite_tab_without_definitions(qapp, monkeypatch):
                  "setup_status_checker", "setup_timer", "request_state"):
         monkeypatch.setattr(dc.DeviceStateGUI, name, lambda self, *a, **k: None)
     g = dc.DeviceStateGUI()
-    assert g.composite_panel is None and g.tab_widget.count() == 3
+    tabs = [g.tab_widget.tabText(i) for i in range(g.tab_widget.count())]
+    assert g.composite_panel is None and tabs == ["DDS", "DAC", "TTL", "Sequences"]
     g.close()
 
 
@@ -703,15 +625,16 @@ def test_everything_starts_collapsed_every_time(panel2, qapp):
     card = panel2.cards[1]
     assert all(c.is_collapsed() for c in panel2.cards) and panel2.scenes_card.is_collapsed()
     assert card.body.isHidden() and card.chevron.text() == "▸"
-    assert panel2.collapse_button.text() == "Expand all"
     card.set_collapsed(False)
     again = cp.CompositePanel([DEVICE, COIL], params=Params(), scenes=[SCENE])
     assert all(c.is_collapsed() for c in again.cards) and again.scenes_card.is_collapsed()
-    again._toggle_all()
-    assert not any(c.is_collapsed() for c in again.cards)
-    assert not again.scenes_card.is_collapsed()
-    assert again.collapse_button.text() == "Collapse all"
     again.shutdown()
+
+
+def test_there_is_no_expand_all_button(panel2):
+    from PyQt6.QtWidgets import QPushButton
+    texts = {b.text() for b in panel2.findChildren(QPushButton)}
+    assert not texts & {"Expand all", "Collapse all"}
 
 
 def test_opening_and_collapsing_never_moves_a_group_to_another_column(qapp):
@@ -733,9 +656,11 @@ def test_opening_and_collapsing_never_moves_a_group_to_another_column(qapp):
     for card in p.cards[::2]:
         card.set_collapsed(False)                           # uneven heights now
         assert columns() == before
-    p._toggle_all()
+    for card in p.cards:
+        card.set_collapsed(False)                           # all open
     assert columns() == before
-    p._toggle_all()
+    for card in p.cards:
+        card.set_collapsed(True)                            # all collapsed again
     assert columns() == before
     p.shutdown()
 
@@ -991,18 +916,6 @@ def test_the_run_banner_offers_to_clear_a_fence(gui, monkeypatch):
     callback({"status": "ok"})
     assert gui._run_pending is None and gui.composite_panel.run_pending is None
     assert "Run 81000" in banner.label.text() and not banner.button.isVisibleTo(strip)
-
-
-def test_reset_lives_on_the_composite_tab_not_the_status_row(gui, monkeypatch):
-    gui._set_monitor_state(STATES.READY)
-    gui._set_reset(dict(RESET))
-    card = gui.composite_panel.reset_card
-    assert gui.reset_button.isHidden() and not card.isHidden()
-    sent = []
-    monkeypatch.setattr(dc, "QMessageBox", _AcceptingBox)
-    gui._send_request = lambda obj, callback: sent.append(obj)
-    card.run_button.click()
-    assert sent and sent[-1]["type"] == "reset_state" and "operator" not in sent[-1]
 
 
 def test_search_bar_placeholder_is_short(gui):

@@ -339,3 +339,32 @@ def test_info_describes_the_experiment_and_specs_skip_unset_paths(expt):
     assert info["expt"] == "auto_tof" and info["state"] == "idle"
     assert loop_specs({"a": ("A", str(expt)), "b": ("B", None)}) == \
         [LoopSpec("a", "A", str(expt))]
+
+
+def test_the_runs_output_is_kept_with_a_line_per_run_and_one_at_the_end(expt):
+    live = FakeLive()
+    loop = _loop(expt, live, [FakeProc(live, 101, ["compiling", "shot 1/9"]),
+                              FakeProc(live, 102, ["RuntimeError: boom"], code=1, outcome="")])
+    loop.start()
+    loop.join(5)
+    out = loop.output.since(0)
+    lines = out["lines"]
+    assert lines[0].startswith("── ") and "1st run of the loop: auto_tof" in lines[0]
+    assert lines[1:4] == ["Run ID: 101", "compiling", "shot 1/9"]
+    second = next(i for i, line in enumerate(lines) if "2nd run of the loop" in line)
+    assert lines[second + 1:second + 3] == ["Run ID: 102", "RuntimeError: boom"]
+    assert "LATCHED OFF after 1 saved run" in lines[-1]
+    assert loop.output.since(out["next"] - 1)["lines"] == []
+
+
+def test_server_serves_the_output_of_its_own_loops_only(server):
+    server.loops["auto_tof"].output.append("hello")
+    reply = server.ask({"type": "output", "kind": "run_loop", "key": "auto_tof", "after": 0})
+    assert reply["status"] == "ok" and reply["lines"] == ["hello"] and reply["next"] == 2
+    reply = server.ask({"type": "output", "kind": "run_loop", "key": "auto_tof", "after": 1})
+    assert reply["lines"] == [] and reply["next"] == 2
+    reply = server.ask({"type": "output", "kind": "run_loop", "key": "../../evil"})
+    assert reply["status"] == "error" and "no run loop" in reply["msg"]
+    reply = server.ask({"type": "output", "kind": "reset"})
+    assert reply["status"] == "error" and "no reset experiment" in reply["msg"]
+    assert server.ask({"type": "output", "kind": "shell"})["status"] == "error"

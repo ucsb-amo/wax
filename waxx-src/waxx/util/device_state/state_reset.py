@@ -12,6 +12,9 @@ Run <reset experiment> button, through the monitor server), the same way the mon
 experiment is launched (``%kpy% & ar <file>``), and follows it to the end.  It
 never marks anything trusted itself: a reset that fails, is killed, or exits
 without reporting its end state leaves the state untrusted and says why.
+
+Its terminal output is kept (``StateReset.output``, an
+:class:`~waxx.util.device_state.output_log.OutputLog`) for the GUIs' log view.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from subprocess import PIPE, STDOUT, Popen
 
 from waxx.util.device_state.monitor_manager import (
     _diagnose, ar_command, environment_report)
+from waxx.util.device_state.output_log import OutputLog
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +111,8 @@ class StateReset:
         self._thread: threading.Thread | None = None
         self._about = ""
         self._about_mtime = None
+        #: Every reset's terminal output, for the GUIs (the server log has it too).
+        self.output = OutputLog()
 
     # -- state ------------------------------------------------------------------
 
@@ -177,6 +183,8 @@ class StateReset:
                              "started": self._clock(), "ended": None, "end_state": False,
                              "exit_code": None, "text": f"{self.expt} started"}
         command = ar_command(self.expt_path)
+        who = "@".join(p for p in (operator, client) if p)
+        self.output.mark(f"{self.expt} started" + (f" by {who}" if who else ""), self._clock)
         try:
             proc = self._spawn(command)
         except OSError as exc:
@@ -213,6 +221,7 @@ class StateReset:
                     line = raw.rstrip()
                     if line:
                         tail.append(line)
+                        self.output.append(line)
                         log.info("[reset] %s", line)
             code = proc.wait()
         except Exception as exc:
@@ -277,6 +286,7 @@ class StateReset:
                 cur["tail"] = tail[-_TAIL_SHOWN:]
             elapsed = cur["ended"] - cur["started"]
             operator, client = cur.get("operator", ""), cur.get("client", "")
+        self.output.mark(f"{'done' if state == 'done' else 'FAILED'}: {text}", self._clock)
         if state == "done":
             log.info("State reset: %s (%.1f s).", text, elapsed)
         else:
