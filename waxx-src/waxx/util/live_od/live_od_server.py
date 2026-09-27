@@ -36,6 +36,13 @@ from waxx.util.live_od import frame_alignment
 
 logger = get_logger("server")
 
+# An Abort the experiment has not answered after this long is shown as "no_reply".
+# The experiment checks for an abort at the end of each shot, so its answer is due
+# within about one shot period (plus its cleanup): a few of the run's longest
+# recent periods, never less than the minimum.
+ABORT_REPLY_MIN_S = 30.0
+ABORT_REPLY_SHOT_FACTOR = 3.0
+
 
 def _safe_repr(value) -> str:
     """``repr(value)``, or a stand-in when even that raises."""
@@ -102,6 +109,9 @@ class LiveODServer(QThread, NetServer):
         # on the GUI's objects; it is called from this thread.
         self._camera_state_provider = None
         self._reset_requested = False   # set by RESET; cleared by next INIT_RUN
+        # when the current run's Abort was requested (time.time()); None when no
+        # abort is waiting for the experiment's answer (_check_abort_reply)
+        self._abort_requested_at = None
         self._run_in_progress = False   # True between INIT_RUN and END_RUN/ABORT
         self._shot_timestamps: list = []  # Unix timestamps (s) recorded server-side on each SHOT_COMPLETE
         self._scalar_subscriber_count: dict = {}  # tier -> subscriber count
@@ -757,6 +767,12 @@ class LiveODServer(QThread, NetServer):
         logger.info(f"liveOD server listening on tcp://0.0.0.0:{self._port}")
         try:
             while self._running:
+                # every pass, not only on a poll timeout: viewers' POLLs can keep
+                # the socket busy for as long as an unanswered abort waits
+                try:
+                    self._check_abort_reply()
+                except Exception:
+                    logger.exception("abort reply check failed")
                 try:
                     raw = socket.recv()
                 except zmq.Again:
@@ -784,6 +800,8 @@ class LiveODServer(QThread, NetServer):
                         reply = self._handle_get_log(msg)
                     elif tag == "ABORT_RUN":
                         reply = self._handle_abort_run(msg)
+                    elif tag == "RUN_EXITED":
+                        reply = self._handle_run_exited(msg)
                     elif tag == "SUBSCRIBE_SCALARS":
                         reply = self._handle_subscribe_scalars(msg)
                     elif tag == "UNSUBSCRIBE_SCALARS":
@@ -841,6 +859,7 @@ class LiveODServer(QThread, NetServer):
         # let go of it.
         self._run_file.discard()
         self._reset_requested = False
+        self._abort_requested_at = None
         self._run_in_progress = False
         self._record_outcome("discarded", "reset")
         self._set_run_state("aborted")
@@ -944,6 +963,7 @@ class LiveODServer(QThread, NetServer):
 
         self._current_run_id = run_id
         self._reset_requested = False
+        self._abort_requested_at = None
         self._run_in_progress = True
         self._shot_timestamps = []       # reset per-run timestamp list
         self._init_run_time = time.time()
@@ -1204,6 +1224,7 @@ class LiveODServer(QThread, NetServer):
             # As before the move: this path does not wait for the image writer.
             self._run_file.discard(wait_for_writer=False)
             self._reset_requested = False
+            self._abort_requested_at = None
             self._run_in_progress = False
             self._record_outcome("discarded", "reset")
             self._set_run_state("aborted")
@@ -1253,6 +1274,7 @@ class LiveODServer(QThread, NetServer):
             self._set_run_state("done", "save_data=False, nothing written")
 
         self._run_in_progress = False
+        self._abort_requested_at = None
         self.run_done_signal.emit()
         reply = {"ok": True}
         if incomplete:
@@ -1260,9 +1282,95 @@ class LiveODServer(QThread, NetServer):
         return reply
 
     def note_reset_requested(self):
-        """The GUI's own abort button was pressed (the remote path is _handle_reset)."""
+        """The GUI's own abort button was pressed (the remote path is _handle_reset).
+        Starts the wait for the experiment's answer (_check_abort_reply); pressing
+        Abort again neither restarts it nor turns "no_reply" back into "aborting"."""
         if self._run_in_progress:
-            self._set_run_state("aborting")
+            if self._abort_requested_at is None:
+                self._abort_requested_at = time.time()
+            if self._run_state != "no_reply":
+                self._set_run_state("aborting")
+
+    def _abort_reply_limit(self) -> float:
+        """How long an Abort may wait for the experiment's answer before it is shown
+        as "no_reply": ABORT_REPLY_SHOT_FACTOR times the run's longest recent shot
+        period (the first shot's, from INIT_RUN, before there are two), never less
+        than ABORT_REPLY_MIN_S; the minimum before any shot."""
+        if self._shot_durations:
+            period = max(self._shot_durations)
+        elif self._shot_timestamps and self._init_run_time:
+            period = self._shot_timestamps[0] - self._init_run_time
+        else:
+            return ABORT_REPLY_MIN_S
+        return max(ABORT_REPLY_MIN_S, ABORT_REPLY_SHOT_FACTOR * float(period))
+
+    def _check_abort_reply(self, now=None):
+        """An Abort nobody answered within _abort_reply_limit() becomes "no_reply".
+        Nothing else changes: a live experiment is still told to stop (its next
+        POLL or SHOT_COMPLETE answers as before), its file is untouched, and a late
+        ABORT_RUN / END_RUN / RUN_EXITED, or the next INIT_RUN, closes the run out
+        as for any abort. Run 83110 (2026-09-26): its process had died, and the
+        pill sat on "Aborting" until the next run started."""
+        t0 = self._abort_requested_at
+        if t0 is None or not self._run_in_progress or not self._reset_requested:
+            return
+        if self._run_state == "no_reply":
+            return                      # said once
+        now = time.time() if now is None else float(now)
+        limit = self._abort_reply_limit()
+        waited = now - t0
+        if waited <= limit:
+            return
+        detail = (f"Abort requested {waited:.0f} s ago and no answer from the experiment "
+                  f"(limit {limit:.0f} s, from the shot period): its process may be gone "
+                  f"or hung. It is still told to stop; the next run start discards its "
+                  f"file, as for any abort.")
+        logger.warning(f"Run {self._current_run_id}: {detail}")
+        self._set_run_state("no_reply", detail)
+
+    def _handle_run_exited(self, msg: dict) -> dict:
+        """The experiment's process is exiting with its run still open -- no END_RUN,
+        and no ABORT_RUN that reached liveOD (LiveODClient.notify_exit, an atexit
+        handler). ``reason``: the uncaught exception, "" when none was reported.
+
+        * During an abort: that is the abort's answer, taken exactly as ABORT_RUN.
+        * With camera frames still due: the camera thread still owns the run's
+          file, so the run stays open (as after a crash until now); only the state
+          says what happened.
+        * Otherwise the run is over: state and outcome "exited", and its file is
+          left as it was -- not saved, not deleted, and forgotten, so no later
+          reset can delete it.
+        A superseded run's notice changes nothing; one after the run ended is ignored."""
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("RUN_EXITED", msg)
+        if not self._run_in_progress:
+            return {"ok": True, "ignored": True}
+        why = str(msg.get("reason") or "") or "no exception reported"
+        run_id = self._current_run_id
+        if self._reset_requested:
+            logger.warning(f"RUN_EXITED: the experiment of run {run_id} exited during its "
+                           f"abort ({why}); taken as the abort's acknowledgement.")
+            return self._handle_abort_run(msg)
+        received, expected = self._images_received_now(), self._images_expected
+        if self._current_capture_images and received < expected:
+            detail = (f"The experiment's process exited without END_RUN ({why}) with "
+                      f"{received}/{expected} frames in. The camera thread still owns the "
+                      f"run's file, so the run stays open until the next run start or a reset.")
+            logger.warning(f"RUN_EXITED: run {run_id}: {detail}")
+            self._set_run_state("exited", detail)
+            return {"ok": True}
+        detail = (f"The experiment's process exited without END_RUN ({why}). Its file is "
+                  f"left as it was: not saved, not deleted.")
+        logger.warning(f"RUN_EXITED: run {run_id}: {detail}")
+        self._host_end_run("RUN_EXITED", record=False)
+        # forgotten: a reset pressed later must not delete an exited run's file
+        self._run_file.filepath = ""
+        self._run_in_progress = False
+        self._abort_requested_at = None
+        self._record_outcome("exited", why)
+        self._set_run_state("exited", detail)
+        self.run_done_signal.emit()
+        return {"ok": True}
 
     def _handle_reset(self, msg: dict) -> dict:
         logger.warning("RESET requested by remote viewer.")

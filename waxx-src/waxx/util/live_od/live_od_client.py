@@ -17,10 +17,17 @@ The INIT_RUN reply names the run (``run_token``); the client sends it back with
 WAIT_CAM_READY, SHOT_COMPLETE, END_RUN and ABORT_RUN. If another INIT_RUN has
 taken liveOD over in the meantime, the server ignores those messages and says so
 (``stale_run``) instead of letting them save into, or delete, the newer run's file.
+
+A process that exits with its run still open (no END_RUN, and no ABORT_RUN that
+reached liveOD) tells liveOD so from an atexit handler (``notify_exit`` ->
+RUN_EXITED); without it the run sat "in progress", or an abort on "Aborting",
+until the next run started (run 83110, 2026-09-26).
 """
 
+import atexit
 import logging
 import pickle
+import sys
 import time
 
 import zmq
@@ -31,6 +38,13 @@ from waxx.util.comms_server.hardware_id import resolve_scoped_server_id
 
 # wait_cam_ready asks in slices this long, so a reset is noticed within one slice.
 CAM_READY_SLICE_S = 0.5
+# The exit notice's one request may take this long; the process is exiting.
+EXIT_NOTICE_TIMEOUT_MS = 2000
+
+
+def _ascii(text) -> str:
+    """ExptBuilder pipes stdout through cp1252: print ASCII only."""
+    return str(text).encode("ascii", "replace").decode("ascii")
 
 
 class LiveODClient(NetClient):
@@ -57,6 +71,11 @@ class LiveODClient(NetClient):
         self._run_token: str = ""
         # This run's "the camera stopped recording" warning has been printed.
         self._grab_failure_warned: bool = False
+        # A run is open: INIT_RUN answered, and neither END_RUN nor ABORT_RUN has
+        # reached liveOD since (notify_exit tells liveOD at exit).
+        self._run_open: bool = False
+        self._exit_notified: bool = False
+        self._exit_hook_registered: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -112,6 +131,61 @@ class LiveODClient(NetClient):
         finally:
             if rcvtimeo_ms is not None:
                 self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+
+    def _send_once(self, payload: dict, timeout_ms: int) -> dict:
+        """One request on a fresh socket that gives up after ``timeout_ms``: for
+        the exit notice, which must neither reuse a socket an interrupted call
+        left mid-request, nor rediscover, nor linger at interpreter exit."""
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.REQ)
+        try:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.SNDTIMEO, int(timeout_ms))
+            sock.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
+            sock.connect(f"tcp://{self._ip}:{self._port}")
+            sock.send(pickle.dumps(payload))
+            return pickle.loads(sock.recv())
+        finally:
+            sock.close()
+            ctx.term()
+
+    @staticmethod
+    def _uncaught_reason() -> str:
+        """The exception the process is exiting on ("uncaught <type>: <message>"),
+        "" when it is exiting without one."""
+        exc = getattr(sys, "last_exc", None)
+        if exc is None:
+            exc = getattr(sys, "last_value", None)
+        if exc is None:
+            return ""
+        return _ascii(f"uncaught {type(exc).__name__}: {exc}")
+
+    def notify_exit(self) -> None:
+        """atexit handler (registered by init_run): if this process is exiting with
+        its run still open, tell liveOD (RUN_EXITED). Once; never raises.
+
+        liveOD takes it as the answer to a pending abort, else marks the run
+        "exited" and leaves its file as it is (see LiveODServer._handle_run_exited)."""
+        if not getattr(self, "_run_open", False) or getattr(self, "_exit_notified", False):
+            return
+        self._exit_notified = True
+        reason = self._uncaught_reason()
+        payload = self._for_this_run({"tag": "RUN_EXITED", "reason": reason})
+        try:
+            reply = self._send_once(payload, EXIT_NOTICE_TIMEOUT_MS)
+            if reply.get("ok"):
+                outcome = "liveOD was told."
+            elif reply.get("stale_run"):
+                outcome = "liveOD had already moved on to another run."
+            else:
+                outcome = (f"liveOD did not take it ({reply.get('error')}; a liveOD older "
+                           f"than RUN_EXITED needs a restart).")
+            print(_ascii(f"[LiveODClient] exiting without END_RUN"
+                         f"{' (' + reason + ')' if reason else ''}; {outcome}"))
+        except Exception as exc:
+            print(_ascii(f"[LiveODClient] exiting without END_RUN, and could not tell liveOD "
+                         f"({type(exc).__name__}: {exc}); its run stays open until the next "
+                         f"run starts or someone resets it."))
 
     def _for_this_run(self, payload: dict) -> dict:
         """``payload`` with this run's token added (when the server gave one)."""
@@ -191,6 +265,11 @@ class LiveODClient(NetClient):
                 f"[LiveODClient] INIT_RUN failed: {reply.get('error')}"
             )
         self._run_token = str(reply.get("run_token") or "")
+        self._run_open = True
+        self._exit_notified = False
+        if not getattr(self, "_exit_hook_registered", False):
+            atexit.register(self.notify_exit)
+            self._exit_hook_registered = True
         self._print_camera_overrides(reply)
         return reply
 
@@ -309,6 +388,7 @@ class LiveODClient(NetClient):
         """
         payload["tag"] = "END_RUN"
         reply = self._send_recv(self._for_this_run(payload), rcvtimeo_ms=600_000)
+        self._run_open = False               # liveOD answered: the run is closed there
         if not reply.get("ok"):
             raise RuntimeError(
                 f"[LiveODClient] END_RUN failed: {reply.get('error')}"
@@ -379,6 +459,7 @@ class LiveODClient(NetClient):
         """
         try:
             self._send_recv(self._for_this_run({"tag": "ABORT_RUN"}))
+            self._run_open = False           # it reached liveOD; else notify_exit still tells it
         except Exception:
             pass
 
