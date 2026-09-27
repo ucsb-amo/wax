@@ -311,14 +311,20 @@ class Scanner():
         updated host ExptParams values are written into the corresponding kernel
         ExptParams.
 
-        raise_underflow: re-raise an RTIOUnderflow, RTIOOverflow or
-        TriggerTimeout out of scan_kernel (full core-device traceback, no
-        cleanup runs) instead of the default -- abandon the shot, run
-        cleanup_scan_kernel, abort the scan and finish the run with the
-        shots taken so far.
+        A shot that raises RTIOUnderflow, RTIOOverflow or TriggerTimeout is
+        cleaned up (cleanup_scan_kernel) and the run is aborted; the original
+        exception is then re-raised, so the host prints its core-device
+        traceback (for an underflow: channel, timestamp, kernel line).  With
+        run_info.save_on_underflow the run instead ends normally and saves the
+        shots taken (no traceback).  Any other exception out of scan_kernel
+        runs cleanup_abort_kernel (the machine's safe state, no data write)
+        and is re-raised.
+
+        raise_underflow: ignored since 2026-09-27 (it used to re-raise without
+        cleanup to get the traceback, which the default now gives).
 
         An exception that ends the scan (the liveOD Abort button, an error in
-        a shot or a hook, raise_underflow) first hands the kernel's channel
+        a shot or a hook) first hands the kernel's channel
         state to the host, which sends it to the monitor server as the run's
         end state, then leaves the kernel unchanged.  ARTIQ writes kernel
         attributes back to the host only when a kernel returns, so without
@@ -360,9 +366,29 @@ class Scanner():
         """RPC from scan()'s exception handler.  Overridden in Expt."""
         pass
 
+    def _note_raise_underflow_ignored(self):
+        print("[scan] scan(raise_underflow=True) is no longer needed and is ignored: "
+              "an aborted shot is always cleaned up, and the original exception is "
+              "re-raised with its traceback (2026-09-27).")
+
+    # _abort_shot(what) -> bool, the RPC the scan-loop handlers call after
+    # cleanup, is defined in waxa Scribe (no stub here: Scanner precedes
+    # Scribe in Expt's MRO and would shadow it).
+
+    @kernel
+    def cleanup_abort_kernel(self):
+        """Run by the scan loop when scan_kernel raises anything other than
+        RTIOUnderflow, RTIOOverflow or TriggerTimeout, before the exception is
+        re-raised: put the hardware in a safe state.  No data write, no shot
+        notification.  Overload per machine (kexp.Base)."""
+        pass
+
     @kernel
     def _scan(self, raise_underflow):
         """The scan loop itself (see scan)."""
+
+        if raise_underflow:
+            self._note_raise_underflow_ignored()
 
         self.pre_scan()
 
@@ -390,44 +416,69 @@ class Scanner():
 
             self.core.break_realtime()
 
-            # overloaded by user per experiment
+            # overloaded by user per experiment.
+            #
+            # A shot that raises is cleaned up INSIDE its handler and then
+            # re-raised with a bare `raise`, which resumes the original
+            # exception: the host prints its own message (for an underflow,
+            # the channel and timestamp) and the kernel stack down to the
+            # line that failed.  An exception cannot be passed to an RPC, and
+            # a caught one is freed when its except block ends, so this is
+            # the only place the traceback can be kept.  The handlers bind no
+            # names (the compiler gives a local one type).
+            cleaned = False
             try:
                 self.scan_kernel()
-            except RTIOUnderflow as e:
-                if raise_underflow:
-                    raise e
+            except RTIOUnderflow:
+                self.core.break_realtime()
+                self.cleanup_scan_kernel()
+                if not self._abort_shot("RTIOUnderflow"):
+                    raise
+                # save_on_underflow: finish the run with the shots taken
                 aborted_bool = True
                 abort_what = "RTIOUnderflow"
-                self.core.break_realtime()
-            except TriggerTimeout as e_trigger:
+                cleaned = True
+            except TriggerTimeout:
                 # A gated wait (line trigger, OPX hand-back) closed with no
-                # edge, so the shot cannot continue. Same exit as an
-                # underflow: cleanup_scan_kernel runs and the scan aborts.
-                # (Own name: the compiler gives a local one type, so it
-                # cannot share `e` with the RTIOUnderflow handler.)
-                if raise_underflow:
-                    raise e_trigger
+                # edge, so the shot cannot continue. Same exit as an underflow.
                 aprint("[scan] shot aborted: a triggered wait saw no edge "
                        "(TriggerTimeout, see the line above). Cleaning up and "
-                       "ending the run with the shots taken so far.")
+                       "ending the run.")
+                self.core.break_realtime()
+                self.cleanup_scan_kernel()
+                if not self._abort_shot("TriggerTimeout"):
+                    raise
                 aborted_bool = True
                 abort_what = "TriggerTimeout"
-                self.core.break_realtime()
-            except RTIOOverflow as e_overflow:
+                cleaned = True
+            except RTIOOverflow:
                 # An input FIFO overflowed inside a gated wait (a bouncing or
                 # free-running line on a TTLInOut). Same exit as above.
-                if raise_underflow:
-                    raise e_overflow
                 aprint("[scan] shot aborted: an RTIO input FIFO overflowed "
                        "(RTIOOverflow) -- a TTL input is toggling far faster "
-                       "than expected. Cleaning up and ending the run with "
-                       "the shots taken so far.")
+                       "than expected. Cleaning up and ending the run.")
+                self.core.break_realtime()
+                self.cleanup_scan_kernel()
+                if not self._abort_shot("RTIOOverflow"):
+                    raise
                 aborted_bool = True
                 abort_what = "RTIOOverflow"
+                cleaned = True
+            except:
+                # Anything else (a ValueError from a DAC/DDS value, a lost
+                # DRTIO link, an exception from an RPC): put the hardware in
+                # its safe state, then let the exception end the run as
+                # before.  cleanup_abort_kernel is the machine's safety part
+                # of cleanup (kexp: coils off and discharged, 1064 beams off,
+                # raman shutter closed) without the shot's data write, so the
+                # failed shot is not recorded as a shot.
                 self.core.break_realtime()
+                self.cleanup_abort_kernel()
+                raise
 
             # overloaded in kexp.Base
-            self.cleanup_scan_kernel()
+            if not cleaned:
+                self.cleanup_scan_kernel()
 
             # Banked as timeline slack (not spun out on the kernel CPU) so the
             # next iteration's host RPCs overlap it instead of following it.

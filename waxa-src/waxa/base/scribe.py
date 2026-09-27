@@ -292,6 +292,29 @@ class Scribe():
         self._monitor_restart_sent = True
         self.monitor.signal_end()
 
+    def _abort_shot(self, what="RTIOUnderflow") -> bool:
+        """RPC from a scan-loop handler (waxx Scanner._scan), after
+        cleanup_scan_kernel ran for a shot that ended on ``what``
+        (RTIOUnderflow, RTIOOverflow or TriggerTimeout).
+
+        With ``run_info.save_on_underflow`` (and save_data) returns True: the
+        handler lets the scan end, and _send_abort_to_server / analyze() save
+        the shots taken.  Otherwise sends ABORT_RUN to the liveOD server and
+        returns False; the handler then re-raises the original exception, so
+        the host prints its own traceback (for an underflow: the channel, the
+        timestamp and the kernel line)."""
+        what = str(what or "RTIOUnderflow")
+        if bool(getattr(self.run_info, 'save_on_underflow', False)) and self.run_info.save_data:
+            return True
+        self._shot_abort = what
+        self._abort_cause = f"{what} in a shot"
+        _client = getattr(self, 'live_od_client', None)
+        if _client is not None:
+            _client.abort_run()
+        print(f'[Scanner] {what}: run {self.run_info.run_id} aborted after cleanup; '
+              f'the original exception and its traceback follow.')
+        return False
+
     def _send_abort_to_server(self, what="RTIOUnderflow"):
         """Notify the liveOD server that the run has been aborted because a
         shot ended on ``what`` (an RTIOUnderflow, RTIOOverflow or
