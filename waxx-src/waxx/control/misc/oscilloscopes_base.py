@@ -98,39 +98,43 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
 
         self.write(":WAVeform:STARt 0")
         self.write(f":WAVeform:SOURce {channel_type}{src_channel+1}")
+        # Set every transfer setting the parse depends on, before the preamble:
+        # the scope keeps whatever an earlier program left (e.g. WIDTh WORD,
+        # INTerval 2, a small POINt). The time axis assumes interval 1.
+        points = int(float(self.query(":ACQuire:POINts?").strip()))
+        one_piece_num = int(float(self.query(":WAVeform:MAXPoint?").strip()))
+        self.write(":WAVeform:INTerval 1")
+        self.write(":WAVeform:POINt {}".format(one_piece_num))
+        self.write(":WAVeform:WIDTh BYTE")
+        bytes_per_point = 1
         if preamble == None:
             preamble = self.get_waveform_preamble()
         adc_bit = preamble[-1]
-
-        points = self.query(":ACQuire:POINts?").strip()
-        points = float(self.query(":ACQuire:POINts?").strip())
-        one_piece_num = float(self.query(":WAVeform:MAXPoint?").strip())
-        if points > one_piece_num:
-            self.write(":WAVeform:POINt {}".format(one_piece_num))
         if adc_bit > 8:
+            # more than 8 bits must be sent as WORD (guide p.669)
             self.write(":WAVeform:WIDTh WORD")
+            bytes_per_point = 2
+            preamble = self.get_waveform_preamble()
 
         read_times = int(np.ceil(points / one_piece_num))
-        recv_all = []
+        recv_all = bytearray()
         for i in range(0, read_times):
             start = i * one_piece_num
             self.write(":WAVeform:STARt {}".format(start))
             self.write("WAV:DATA?")
             recv_rtn = self.read_raw()
+            # block: '#', n, n digits giving the byte count, data, then 0A 0A
             block_start = recv_rtn.find(b'#')
             data_digit = int(recv_rtn[block_start + 1:block_start + 2])
-            data_start = block_start + 2 + data_digit + 1
-
-            if adc_bit == 8:
-                recv = list(recv_rtn[data_start:-2:2])
-            elif adc_bit == 16:
-                recv = list(recv_rtn[data_start:-1])
-            recv_all += recv
+            data_start = block_start + 2 + data_digit
+            n_bytes = int(recv_rtn[block_start + 2:data_start])
+            recv_all += recv_rtn[data_start:data_start + n_bytes]
+        if len(recv_all) != points * bytes_per_point:
+            raise ValueError(f"scope sent {len(recv_all)} bytes, expected "
+                             f"{points * bytes_per_point} ({points} points)")
 
         v = self.convert_to_voltage(recv_all, preamble)
-        # Build time axis from the actual number of voltage points received, not
-        # from preamble[0] (point_num), to avoid length mismatches caused by
-        # the ::2 stride, off-by-one byte trimming, or multi-chunk rounding.
+        # one sample per point, spaced by the sampling interval
         _, _, _, interval, trdl, tdiv, _, _ = preamble
         t = float(trdl) - (float(tdiv) * self.grid / 2) + np.arange(len(v)) * interval
         return np.array([t, v])
@@ -187,16 +191,22 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
             preamble = self.get_waveform_preamble()
         _, vdiv, ofst, _, _, _, vcode_per, adc_bit = preamble
 
-        # handle >8 bit numbers if given by scope (adc_bit > 8)
-        raw_array = np.array(raw_array)
+        # raw bytes as sent (a list of ints 0..255 also works)
+        raw_array = np.frombuffer(bytes(raw_array), dtype=np.uint8).astype(np.int64)
         if adc_bit > 8:
-            d = np.zeros(int(len(raw_array)/2))
+            # WORD: low byte first, code left aligned in 16 bits, low bits zero
+            # (guide p.674). Not yet seen on this scope, so check both.
             d = raw_array[1::2] * 256 + raw_array[::2]
+            d[d > 32767] -= 65536
+            if np.any(d & ((1 << (16 - adc_bit)) - 1)):
+                raise ValueError("WORD data is not left aligned (guide p.674)")
+            if not 8 < 2 ** adc_bit / vcode_per < 9:
+                raise ValueError(f"code_per_div {vcode_per} does not fit adc_bit {adc_bit}")
+            d = d >> (16 - adc_bit)
         else:
+            # BYTE: signed 8-bit codes
             d = raw_array
-        # handle int overflow
-        mask = d > pow(2, adc_bit - 1) - 1
-        d[mask] = d[mask] - pow(2, adc_bit)
+            d[d > 127] -= 256
 
         volt_value = np.array(d) / vcode_per * float(vdiv) - float(ofst)
 
@@ -460,8 +470,20 @@ class SiglentSDS2000X_Base(vxi11.Instrument, Scope_Base):
                                     # oscope
 
         resp = self.query("CHAN{}:VIS?".format(str(channel)))
-                          
+
         return ( True if resp == "ON" else False )
+
+    def is_channel_on(self, channel : int) -> bool:
+        """Whether the channel is switched on (acquiring).
+
+        Not the same as is_channel_visible: on the SDS2104X Plus a switched-off
+        channel still answers VISible? with ON (seen 2026-09-27 on C2/C3).
+
+        :param channel: 0 to (# analog channels) - 1
+        """
+        channel += 1
+        assert 1 <= channel <= 4
+        return self.query(":CHANnel{}:SWITch?".format(channel)).strip().upper() == "ON"
         
     # def set_waveform_format_width(self, waveform_width : SiglentWaveformWidth):
     #     """The command sets the current output format for the transfer of waveform

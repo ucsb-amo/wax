@@ -39,8 +39,9 @@ class ScopeData:
                 else:
                     scope.scope.set_normal_trigger()
                     scope.scope.set_trigger_run()
-            except: pass
-        
+            except Exception as e:
+                print(f"[ScopeData.arm_rpc] ERROR arming '{scope.label}': {e}")
+
     @kernel
     def arm(self):
         self.arm_rpc()
@@ -169,23 +170,50 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         
         self.scope = SiglentSDS2000X_Base(device_id)
         super().__init__(device_id=device_id,label=label,arm=arm,scope_data=scope_data)
-    
+        self._npts = {}             # channel -> length of its last good capture
+        self.failed_captures = []   # (shot index, channel, error) this run
+
     def read_sweep(self,channels) -> bool:
+        """Read the given channels (0-indexed) of this shot's acquisition.
+
+        A requested channel that cannot be read (switched off, short or failed
+        transfer, ...) is stored as NaN, t and v alike, and reported, so one
+        bad shot neither shifts the channel order nor makes the run's traces
+        ragged (a ragged run loses all its scope data at save time: run 83178).
+        The NaN placeholder takes the length of that channel's last good
+        capture, else the scope's current acquisition length.
+        """
         channels = np.atleast_1d(channels)
         self._scopedata._scope_trace_taken = True
-
-        preamble = self.scope.get_waveform_preamble()
-        Npts = preamble[0]
-        data = []
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
+        shot = len(self._data)
+        data = []
         for ch in range(4):
-            if self.scope.is_channel_visible(ch) and (ch in channels):
-                try:
-                    (t,v) = self.scope.read_sweep(ch)
-                    data.append([t,v])
-                except Exception as e:
-                    print(f"[SiglentScope read_sweep] ch={ch} failed: {e}")
+            if ch not in channels:
+                continue
+            try:
+                if not self.scope.is_channel_on(ch):
+                    raise RuntimeError(f"C{ch+1} is switched off")
+                (t,v) = self.scope.read_sweep(ch)
+                self._npts[ch] = len(v)
+                data.append([t,v])
+            except Exception as e:
+                self.failed_captures.append((shot, ch, repr(e)))
+                npts = self._npts.get(ch)
+                if not npts:
+                    try:
+                        npts = int(float(self.scope.query(":ACQuire:POINts?").strip()))
+                    except Exception:
+                        npts = None
+                if npts:
+                    print(f"[SiglentScope read_sweep] ERROR shot {shot} ch={ch}: "
+                          f"{e} -- stored as NaN ({npts} pts)")
+                    data.append(np.full((2, npts), np.nan))
+                else:
+                    print(f"[SiglentScope read_sweep] ERROR shot {shot} ch={ch}: "
+                          f"{e} -- no length to size a NaN placeholder; this "
+                          f"run's traces will be ragged")
         self._data.append(np.array(data))
         return True
 
