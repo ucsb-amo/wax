@@ -216,6 +216,7 @@ def test_tall_composite_page_scrolls_on_its_own(qapp, monkeypatch):
 
     class TallPanel(QWidget):
         hazards_changed = pyqtSignal()
+        reset_requested = pyqtSignal()
 
         def __init__(self, *a, **k):
             super().__init__()
