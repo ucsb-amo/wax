@@ -160,7 +160,6 @@ class Monitor:
         self.op_kernels = []
         self._op_host_before = []
         self._op_host_after = []
-        self.op_updates = [DEFAULT_OP] * N_OP_SLOTS
         self._op_seq_buf = np.zeros(N_OP_SLOTS, dtype=np.int32)
         self._op_status_buf = np.zeros(N_OP_SLOTS, dtype=np.int32)
 
@@ -1169,22 +1168,24 @@ class Monitor:
     @kernel
     def sync_change_list(self, verbose=True) -> TInt32:
         """
-        Synchronize kernel variables with the non-kernel update lists.
-        Returns the FLAG_* bits of what was found.
+        Poll the host for changes.  Returns the FLAG_* bits of what was found;
+        apply_updates / apply_ops fetch the lists themselves.
+
+        Not here, and never into an attribute: the lists an RPC returns live
+        in the stack frame of the kernel function that called it, until that
+        function returns, and the compiler does not stop one being stored
+        somewhere that outlives it (m-labs/artiq#1497).  Fetched here and
+        read after this returned, the op slots were overwritten by the host
+        step's RPC and the next slot read back index 2216 (monitor crash,
+        2026-09-26, tweezer.awg_apply).
         """
-        flags = self.poll_changes(verbose)
-        if flags & FLAG_CHANNELS:
-            (self.dds_frequency_amplitude_updates, self.dds_vpd_updates, \
-              self.dds_sw_state_updates, self.ttl_updates, self.dac_updates) = self.channel_updates()
-        if flags & FLAG_OPS:
-            self.op_updates = self.fetch_ops()
-        return flags
+        return self.poll_changes(verbose)
 
     @kernel
     def apply_updates(self):
         """
-        Apply the detected updates to the hardware devices.  A write that
-        raises (an underflow, a value the channel refuses) is reported and
+        Fetch and apply the detected updates to the hardware devices.  A write
+        that raises (an underflow, a value the channel refuses) is reported and
         skipped; the loop -- and every other channel -- carries on.
         """
         index = -1
@@ -1196,10 +1197,14 @@ class Monitor:
         v = 0.
         t0 = 8.e-9
 
+        # valid until this function returns (see sync_change_list)
+        (dds_frequency_amplitude_updates, dds_vpd_updates, dds_sw_state_updates,
+         ttl_updates, dac_updates) = self.channel_updates()
+        self.core.break_realtime()
         delay(T_UPDATE_SLACK)
 
-        for i in range(len(self.dds_frequency_amplitude_updates)):
-            index, f, a = self.dds_frequency_amplitude_updates[i]
+        for i in range(len(dds_frequency_amplitude_updates)):
+            index, f, a = dds_frequency_amplitude_updates[i]
             if index == -1:
                 break
             try:
@@ -1209,8 +1214,8 @@ class Monitor:
                 self.channel_update_failed(0, index)
             delay(t0)
 
-        for i in range(len(self.dds_vpd_updates)):
-            index, v_pd = self.dds_vpd_updates[i]
+        for i in range(len(dds_vpd_updates)):
+            index, v_pd = dds_vpd_updates[i]
             if index == -1:
                 break
             try:
@@ -1220,8 +1225,8 @@ class Monitor:
                 self.channel_update_failed(1, index)
             delay(t0)
 
-        for i in range(len(self.dds_sw_state_updates)):
-            index, sw_state = self.dds_sw_state_updates[i]
+        for i in range(len(dds_sw_state_updates)):
+            index, sw_state = dds_sw_state_updates[i]
             if index == -1:
                 break
             try:
@@ -1231,8 +1236,8 @@ class Monitor:
                 self.channel_update_failed(2, index)
             delay(t0)
 
-        for i in range(len(self.ttl_updates)):
-            index, ttl_state = self.ttl_updates[i]
+        for i in range(len(ttl_updates)):
+            index, ttl_state = ttl_updates[i]
             if index == -1:
                 break
             try:
@@ -1242,8 +1247,8 @@ class Monitor:
                 self.channel_update_failed(3, index)
             delay(t0)
 
-        for i in range(len(self.dac_updates)):
-            index, v = self.dac_updates[i]
+        for i in range(len(dac_updates)):
+            index, v = dac_updates[i]
             if index == -1:
                 break
             try:
@@ -1255,7 +1260,7 @@ class Monitor:
 
     @kernel
     def apply_ops(self):
-        """Run the composite ops fetched this iteration, in request order.
+        """Fetch and run this iteration's composite ops, in request order.
 
         A failing op is caught and reported rather than ending the monitor
         (which would leave the hardware in whatever state the op reached, with
@@ -1264,9 +1269,12 @@ class Monitor:
         the ops, one snapshot of every channel goes to the host, which writes
         the changed ones back to the device-state file before reporting.
         """
+        # valid until this function returns (see sync_change_list)
+        op_updates = self.fetch_ops()
+        self.core.break_realtime()
         n = 0
-        for i in range(len(self.op_updates)):
-            index, seq, a0, a1, a2, a3, a4, a5, a6, a7 = self.op_updates[i]
+        for i in range(len(op_updates)):
+            index, seq, a0, a1, a2, a3, a4, a5, a6, a7 = op_updates[i]
             if index < 0:
                 break
             status = OP_OK
