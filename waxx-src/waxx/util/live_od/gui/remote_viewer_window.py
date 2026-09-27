@@ -62,6 +62,7 @@ class LiveODSubscriber(QThread):
     markers_signal = pyqtSignal(str, list)          # camera_key, markers (pins on the image)
     connection_status_signal = pyqtSignal(str)
     camera_state_signal = pyqtSignal(object)        # dict[camera_key -> state]
+    camera_persist_signal = pyqtSignal(object)      # dict[camera_key -> Persist on] (camera host)
     shot_scalars_signal = pyqtSignal(object)        # per-shot scalar dict
     fk_tof_signal = pyqtSignal(object)              # per-shot FK TOF width dict
     adjust_values_signal = pyqtSignal(object)       # dict[key -> current_val]
@@ -158,6 +159,9 @@ class LiveODSubscriber(QThread):
                         elif tag == "CAMERA_STATE":
                             states = msg.get("states", {}) or {}
                             self.camera_state_signal.emit(dict(states))
+                            # additive: only a camera-host liveOD sends it
+                            if isinstance(msg.get("persist"), dict):
+                                self.camera_persist_signal.emit(dict(msg["persist"]))
                         elif tag == "SHOT_SCALARS":
                             self.shot_scalars_signal.emit(dict(msg))
                         elif tag == "FK_TOF":
@@ -363,6 +367,7 @@ class RemoteViewerWindow(QWidget):
         self.subscriber.shot_scalars_signal.connect(self.viewer_window.on_shot_scalars)
         self.subscriber.connection_status_signal.connect(self._on_connection_status)
         self.subscriber.camera_state_signal.connect(self._on_camera_state)
+        self.subscriber.camera_persist_signal.connect(self.camera_menu.set_persist)
         self.subscriber.shot_scalars_signal.connect(self.live_scalar_plot_window.on_shot_scalars)
         self.subscriber.fk_tof_signal.connect(self.fk_tof_window.on_pwa_data)
         self.subscriber.adjust_values_signal.connect(self._adjust_panel.update_values)
