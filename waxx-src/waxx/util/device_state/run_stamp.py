@@ -5,7 +5,8 @@ for the device state, whether it is trusted, and its journal since the last
 run ended (every op and channel edit made in between, by whom), and
 evaluates the lab's composite devices for hazards (a coil left at current).
 The experiment prints the warnings (:func:`report_warnings`; kexp leaves the
-hazards off the terminal) and stores the whole report with its data
+hazards and the untrusted state off the terminal, since a run sets the state
+it needs) and stores the whole report with its data
 (``Expt._extra_file_texts``), so a run can be traced to the state it started
 from -- as recorded by the server, which is not a measurement of the hardware
 (the report says whether the state was trusted).
@@ -59,17 +60,18 @@ def pre_run_report(monitor, devices=(), params=None, frames=None) -> dict:
     return report
 
 
-def report_warnings(report: dict, hazards: bool = True) -> list[str]:
+def report_warnings(report: dict, hazards: bool = True,
+                    untrusted: bool = True) -> list[str]:
     """The lines to show before the run: why the check could not be made,
-    untrusted state, and (``hazards=True``) the hazards found. The report
-    itself keeps the hazards either way."""
+    (``untrusted=True``) untrusted state, and (``hazards=True``) the hazards
+    found. The report itself keeps the trust and the hazards either way."""
     lines = []
     if not report.get("server"):
         lines.append("could not read the device state from the monitor server "
                      f"({report.get('error')}); nothing was checked before this run.")
         return lines
     trust = report.get("trust") or {}
-    if trust.get("trusted") is False:
+    if untrusted and trust.get("trusted") is False:
         lines.append(f"the device state is UNTRUSTED ({trust.get('reason')}): the state "
                      "file is not necessarily the hardware.")
     if hazards:
