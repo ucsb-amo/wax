@@ -661,6 +661,14 @@ class Scanner():
         self.generate_assignment_kernels()
 
     def prepare_image_array(self):
+        # Check and normalise the run-owned camera fields first (AndorParams:
+        # trigger, frame transfer, sensor_roi -> resolution).  This runs inside
+        # init_xvars, i.e. in finish_prepare before INIT_RUN, so a refused
+        # value raises here without reserving a run id.  getattr: a bare
+        # CameraParams placeholder may not have the method.
+        prepare_for_run = getattr(self.camera_params, "prepare_for_run", None)
+        if callable(prepare_for_run):
+            prepare_for_run()
         if self.run_info.save_data:
             # print(self.camera_params.camera_type)
             if self.camera_params.camera_type == 'andor':

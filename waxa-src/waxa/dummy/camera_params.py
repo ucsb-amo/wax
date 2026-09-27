@@ -35,3 +35,8 @@ class CameraParams():
 
     def select_imaging_type(self,imaging_type):
         pass
+
+    def prepare_for_run(self):
+        """Checks run-owned camera fields before the run is announced; nothing
+        to check for a camera with none (see waxx AndorParams)."""
+        pass
