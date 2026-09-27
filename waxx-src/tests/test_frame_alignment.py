@@ -123,68 +123,98 @@ def test_a_good_slow_readout_run_has_no_note():
     assert out.issues == [] and out.notes == []
 
 
+def test_a_sequence_that_runs_on_after_its_last_image_is_not_noted():
+    """Run 83129 (2026-09-26): a correct Andor run whose sequence runs 0.66 s past
+    its dark frame, so every dark arrived 0.66 s BEFORE SHOT_COMPLETE (frames
+    checked by eye: beam in atoms + light, none in dark, every shot). The old
+    rule noted all 5 shots; the gaps say nothing is wrong."""
+    frames = timed_frames(n=5)
+    shot_t = [shot_start(k) + TRIGGERS_S[-1] + 0.018 + 0.66 for k in range(5)]
+    out = fa.assess(frames, shot_t, PER_SHOT, t_start=0.0, dark_after_shot_complete=True)
+    assert out.issues == [] and out.notes == []
+
+
 def test_a_stray_edge_after_ready_is_noted_but_is_not_an_issue():
     # the stray edge between "ready" and shot 0: every frame one slot late, count N/N
     frames = [0.5] + timed_frames()[:-1]
     shot_t = timed_shots()
-    without = fa.assess(frames, shot_t, PER_SHOT, t_start=0.0)
-    assert without.issues == [] and without.notes == []      # the other checks cannot see it
-    out = fa.assess(frames, shot_t, PER_SHOT, t_start=0.0, dark_after_shot_complete=True)
+    out = fa.assess(frames, shot_t, PER_SHOT, t_start=0.0)
     assert out.issues == []                                  # a note only, never incomplete-marking
     assert fa.check(frames, shot_t, PER_SHOT, 0.0) == []
     assert len(out.notes) == 1
     note = out.notes[0]
-    assert note.startswith(f"possible one-slot shift: in {N_SHOTS}/{N_SHOTS} shots the last slot "
-                           f"arrived before SHOT_COMPLETE")
-    assert "shots 0..3, every shot from there to the end" in note
-    assert "shot 0's 15.0 ms before" in note                # the light frame: 48 ms vs 63 ms
+    assert note.startswith("possible one-slot shift: in 3/3 shots the long gap between shots "
+                           "falls before slot 1, not slot 0")
+    assert "shots 1..3, every shot from there to the end" in note
+    assert "one slot late" in note
 
 
-def test_a_stray_edge_mid_run_is_noted_from_that_shot_on():
+def test_a_missed_trigger_is_noted_as_one_slot_early():
+    # shot 1's atoms trigger missed: from there every frame one slot early
     good = timed_frames()
-    frames = good[:6] + [shot_start(2) - 1.0] + good[6:-1]    # stray between shots 1 and 2
-    out = fa.assess(frames, timed_shots(), PER_SHOT, 0.0, dark_after_shot_complete=True)
+    frames = good[:3] + good[4:]
+    out = fa.assess(frames, timed_shots(), PER_SHOT, 0.0)
     assert out.issues == []
-    assert len(out.notes) == 1 and "in 2/4 shots" in out.notes[0]
-    assert "shots 2..3, every shot from there to the end" in out.notes[0]
+    shift = [n for n in out.notes if n.startswith("possible one-slot shift")]
+    assert len(shift) == 1 and "falls before slot 2" in shift[0]
+    assert "one slot early" in shift[0]
 
 
-def test_one_late_recorded_shot_complete_looks_the_same_for_one_shot():
-    """A good run whose SHOT_COMPLETE for shot 1 waited 50 ms in the server's
-    queue: noted (the times cannot tell), for that shot alone -- which is why it
-    is never an issue."""
+def test_a_stray_edge_mid_run_is_noted_from_the_next_shot_on():
+    # a stray 1 s before shot 2 lands in shot 2's first slot, where the long gap
+    # still precedes slot 0; from shot 3 on the gap sits before slot 1
+    good = timed_frames()
+    frames = good[:6] + [shot_start(2) - 1.0] + good[6:-1]
+    out = fa.assess(frames, timed_shots(), PER_SHOT, 0.0)
+    assert out.issues == []
+    assert len(out.notes) == 1 and "in 1/3 shots" in out.notes[0]
+    assert "shots 3..3, every shot from there to the end" in out.notes[0]
+
+
+def test_a_late_recorded_shot_complete_is_not_noted():
+    """SHOT_COMPLETE times no longer matter to the note: a shot whose message waited
+    50 ms in the server's queue is not noted (the old rule noted it)."""
     shot_t = timed_shots()
     shot_t[1] += 0.050
     out = fa.assess(timed_frames(), shot_t, PER_SHOT, 0.0, dark_after_shot_complete=True)
-    assert out.issues == []
-    assert len(out.notes) == 1 and "in 1/4 shots" in out.notes[0]
-    assert "shots 1..1" in out.notes[0] and "to the end" not in out.notes[0]
+    assert out.issues == [] and out.notes == []
 
 
-def test_a_fast_readout_camera_with_the_option_off_is_not_checked():
-    # Basler-like: 1 ms readout, 3 ms RPC. Option off: nothing, good run or
-    # shifted (the blind spot stays blind for this camera).
-    frames, shot_t = timed_frames(readout_s=0.001), timed_shots()
-    good = fa.assess(frames, shot_t, PER_SHOT, 0.0)
-    assert good.issues == [] and good.notes == []
+def test_a_fast_readout_camera_is_checked_too():
+    # Basler-like: 1 ms readout. A good run is quiet whatever the RPC time; a
+    # shifted one is noted (the old rule was blind here).
+    for rpc_s in (0.003, 0.010):
+        frames, shot_t = timed_frames(readout_s=0.001), timed_shots(rpc_s=rpc_s)
+        good = fa.assess(frames, shot_t, PER_SHOT, 0.0)
+        assert good.issues == [] and good.notes == []
+    # (with a 10 ms RPC the shifted run is already an issue: each moved dark frame
+    # arrives before the shot it is filed under could start)
+    frames, shot_t = timed_frames(readout_s=0.001), timed_shots(rpc_s=0.003)
     shifted = fa.assess([0.5] + frames[:-1], shot_t, PER_SHOT, 0.0)
-    assert shifted.issues == [] and shifted.notes == []
+    assert shifted.issues == [] and "in 3/3 shots" in shifted.notes[0]
 
 
-def test_why_the_option_is_off_for_a_fast_readout_camera():
-    # with a 10 ms RPC a good Basler-like run's dark frame arrives 9 ms before
-    # SHOT_COMPLETE: the option would note a run that is fine
-    frames, shot_t = timed_frames(readout_s=0.001), timed_shots(rpc_s=0.010)
-    assert fa.assess(frames, shot_t, PER_SHOT, 0.0).notes == []
-    out = fa.assess(frames, shot_t, PER_SHOT, 0.0, dark_after_shot_complete=True)
-    assert out.issues == [] and "in 4/4 shots" in out.notes[0]
+def test_a_stalled_dispatcher_does_not_fake_a_shift():
+    # shot 2's light + dark stamped late by 2 s, or by 12 s (longer than a shot):
+    # the stall lengthens one gap and shortens the next, so no gap dominates
+    for stall_s in (2.0, 12.0):
+        frames = timed_frames()
+        frames[7:9] = [t + stall_s for t in frames[7:9]]
+        out = fa.assess(frames, timed_shots(), PER_SHOT, 0.0, late_s=100.0)
+        assert out.issues == [] and out.notes == []
+
+
+def test_shots_without_a_decisive_gap_and_single_frame_cameras_say_nothing():
+    evenly = [float(i) for i in range(12)]                  # every gap 1 s: nothing decisive
+    assert fa.assess(evenly, timed_shots(), PER_SHOT, None).notes == []
+    assert fa.assess(timed_frames()[::3], timed_shots(), 1, 0.0).notes == []
 
 
 def test_only_shots_reported_and_filled_are_counted():
     frames = [0.5] + timed_frames()[:-1]
     out = fa.assess(frames[:7], timed_shots()[:2], PER_SHOT, 0.0, dark_after_shot_complete=True)
     assert out.issues == []
-    assert any("in 2/2 shots" in n for n in out.notes)
+    assert any("in 1/1 shots" in n for n in out.notes)
 
 
 def test_which_cameras_read_out_slower_than_the_rpc():

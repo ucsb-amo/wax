@@ -45,36 +45,34 @@ each frame pushed into the next shot's first slot is a dark frame, which arrives
 just after that boundary -- none of it is early. What does change is the LAST
 slot of each shot: it now holds that shot's light frame instead of its dark.
 
-``dark_after_shot_complete=True`` (per camera; the caller decides) looks at that
-slot. It holds only for a camera whose readout outlasts the SHOT_COMPLETE RPC:
-the dark trigger is the shot's last camera event, ``put_shot_data`` waits for the
-timeline to pass it, and the RPC then reaches the server in ~3 ms, while the
-dark frame needs the exposure plus the readout (the Andor at the lab's clocks:
-~18 ms) to reach the host. With triggers at 0/30/60 ms, an 18 ms readout and a
-3 ms RPC, a good shot's dark frame arrives at 78 ms and SHOT_COMPLETE at 63 ms;
-shifted by one, the last slot holds the light frame, at 48 ms. So in a good run
-every shot's last slot arrives after its SHOT_COMPLETE; a last slot that arrived
-more than ``margin_s`` before it is counted, and ``k`` such shots out of ``N``
-give a NOTE ("possible one-slot shift"), never an issue:
+What does show it is where the long gaps fall. A shot's frames come within tens
+of milliseconds of each other; shots are seconds apart. So in a good run the long
+gap before each shot's frames is the one before its FIRST slot. After a stray
+edge it moves to the gap before slot 1 (the first slot now holds the previous
+shot's last frame); after a missed trigger, to the gap before the last slot. For
+every shot after the first, the slot with the longest gap before it is found;
+where that gap is decisive (at least ``GAP_DOMINANCE`` times the shot's next
+longest) and is not before slot 0, the shot is counted, and ``k`` such shots out
+of ``N`` give a NOTE ("possible one-slot shift"), never an issue:
 
-* A SHOT_COMPLETE recorded late fakes it: the server's REP loop is single
-  threaded, so a shot's message can wait behind another request (a long
-  WAIT_CAM_READY slice, a slow reply) and be stamped after its dark frame.
-* The premise fails for a sequence that keeps the timeline busy after its last
-  image (long delays or other hardware after the dark trigger, in the same
-  shot): its dark frame legitimately arrives before SHOT_COMPLETE.
-* For a camera that reads out faster than the RPC (the Baslers, a few ms) the
-  dark frame may arrive either side; leave it off there -- with it on, a good
-  Basler run would be noted.
+* Timing alone decides it, not SHOT_COMPLETE, so a sequence that runs on after
+  its last image, or a SHOT_COMPLETE stamped late behind another request, does
+  not fake it. (2026-09-27: the earlier rule -- "the last slot must arrive after
+  SHOT_COMPLETE" -- noted every shot of a correct Andor run, 83129, whose
+  sequence runs 0.66 s past its dark frame.)
+* A stalled image dispatcher stamps frames late: that lengthens one gap and
+  shortens the next, so it does not make a gap dominate (tested for stalls of 2
+  and 12 s). Were it ever to, the note names the shots, and a real shift runs on
+  to the end or until a missed trigger undoes it.
+* A sequence whose own frames are seconds apart within a shot (longer than the
+  gap between shots) would be noted; no lab sequence does that today.
 
-It cannot see a shift whose extra and missing frames cancel inside one shot,
-nor tell which shot the stray edge came in: it reports how many shots look
-shifted, the first and last of them, and whether they run to the end of the
-run (a shift persists until a missed trigger undoes it; a late-stamped
-SHOT_COMPLETE touches one shot). Frame times are taken when the image
-dispatcher takes a frame off the camera queue, so a stalled dispatcher stamps
-frames late: that can hide a shift (the light frame then looks later than
-SHOT_COMPLETE), never fake one. A clean result here proves nothing either.
+It cannot see a shift whose extra and missing frames cancel inside one shot, a
+shift in shot 0 alone (no gap before its first frame to compare), or a camera
+with one frame per shot. A clean result here proves nothing either.
+
+``dark_after_shot_complete`` is accepted and ignored (the gap check runs for
+every camera); ``readout_outlasts_rpc`` stays for callers.
 
 Both lists of times must come from one monotonic clock in one process (liveOD
 uses ``time.monotonic()``: QueryPerformanceCounter on Windows, 100 ns). The
@@ -92,10 +90,12 @@ from typing import List, Optional, Sequence
 DEFAULT_MARGIN_S = 0.005
 # A frame this long after its shot was reported complete is noted (never an issue).
 DEFAULT_LATE_S = 1.0
-# Camera types whose readout outlasts the SHOT_COMPLETE RPC, so that in a good
-# run each shot's dark frame reaches the host after the server has recorded the
-# shot complete (the Andor EMCCD's full-frame readout, ~18 ms, against ~3 ms).
+# Camera types whose readout outlasts the SHOT_COMPLETE RPC (the Andor EMCCD's
+# full-frame readout, ~18 ms, against ~3 ms). No longer used by the check itself.
 SLOW_READOUT_CAMERA_TYPES = ("andor",)
+# A shot counts as shifted only when its longest gap is at least this many times
+# its next longest: a shot whose gaps are all alike says nothing.
+GAP_DOMINANCE = 3.0
 
 
 def readout_outlasts_rpc(camera_params) -> bool:
@@ -127,9 +127,8 @@ def assess(frame_t: Sequence[float], shot_t: Sequence[float], per_shot: int,
     ``shot_t``: when each shot was reported complete, in order.
     ``per_shot``: frames per shot. ``t_start``: when the experiment was told the
     camera was ready (None: shot 0's frames are not checked against a start).
-    ``dark_after_shot_complete``: this camera's readout outlasts the
-    SHOT_COMPLETE RPC (see the module docstring and ``readout_outlasts_rpc``);
-    shots whose last slot arrived before SHOT_COMPLETE are then noted.
+    ``dark_after_shot_complete``: accepted and ignored; the one-slot-shift note
+    (module docstring) comes from the gaps between frames, for every camera.
     """
     out = Assessment()
     per_shot = int(per_shot)
@@ -188,35 +187,43 @@ def assess(frame_t: Sequence[float], shot_t: Sequence[float], per_shot: int,
         out.notes.append(
             f"frame {i} is filed as shot {s}'s, the shot after the last one reported "
             f"complete ({len(after_last)} such frame(s))")
-    if dark_after_shot_complete:
-        note = _last_slot_before_shot_complete(frame_t, shot_t, per_shot, margin_s)
-        if note:
-            out.notes.append(note)
+    note = _long_gap_off_slot_zero(frame_t, shot_t, per_shot)
+    if note:
+        out.notes.append(note)
     return out
 
 
-def _last_slot_before_shot_complete(frame_t, shot_t, per_shot, margin_s) -> str:
-    """The one-slot-shift note (module docstring), or "" when no shot's last
-    slot arrived before that shot was reported complete. Only shots that were
-    reported complete and whose last slot was filled are counted."""
-    n_checked = min(len(shot_t), len(frame_t) // per_shot)
-    before = []     # (shot, seconds its last slot arrived before SHOT_COMPLETE)
-    for s in range(n_checked):
-        t_last = frame_t[s * per_shot + per_shot - 1]
-        if t_last < shot_t[s] - margin_s:
-            before.append((s, shot_t[s] - t_last))
-    if not before:
+def _long_gap_off_slot_zero(frame_t, shot_t, per_shot) -> str:
+    """The one-slot-shift note (module docstring), or "" when every decisive shot
+    has its long gap before slot 0. Shots 1.. that were reported complete and
+    whose slots were all filled are checked."""
+    if per_shot < 2:
         return ""
-    first, dt = before[0]
-    last = before[-1][0]
-    to_the_end = [s for s, _ in before] == list(range(first, n_checked))
-    return (f"possible one-slot shift: in {len(before)}/{n_checked} shots the last slot "
-            f"arrived before SHOT_COMPLETE (shots {first}..{last}"
-            f"{', every shot from there to the end' if to_the_end else ''}; shot {first}'s "
-            f"{dt * 1e3:.1f} ms before). With this camera's readout a good shot's last "
-            f"frame (the dark) arrives after it; one stray trigger edge would put the "
-            f"frame before it in the last slot, but a SHOT_COMPLETE recorded late, or a "
-            f"sequence that runs on after its last image, looks the same")
+    n_filled = min(len(shot_t), len(frame_t) // per_shot)
+    checked, shifted = [], []   # shot indices; (shot, slot, gap in s)
+    for s in range(1, n_filled):
+        gaps = [frame_t[s * per_shot + p] - frame_t[s * per_shot + p - 1]
+                for p in range(per_shot)]
+        order = sorted(range(per_shot), key=lambda p: gaps[p], reverse=True)
+        top, second = gaps[order[0]], max(gaps[order[1]], 0.0)
+        if top <= 0 or top < GAP_DOMINANCE * second:
+            continue            # no decisive long gap in this shot: says nothing
+        checked.append(s)
+        if order[0] != 0:
+            shifted.append((s, order[0], top))
+    if not shifted:
+        return ""
+    first, slot, gap = shifted[0]
+    last = shifted[-1][0]
+    to_the_end = [s for s, _, _ in shifted] == [s for s in checked if s >= first]
+    direction = ("one slot late: an extra frame (a stray trigger edge) came earlier"
+                 if slot == 1 else
+                 "one slot early: a trigger was missed earlier" if slot == per_shot - 1
+                 else f"{slot} slot(s) off")
+    return (f"possible one-slot shift: in {len(shifted)}/{len(checked)} shots the long gap "
+            f"between shots falls before slot {slot}, not slot 0 (shots {first}..{last}"
+            f"{', every shot from there to the end' if to_the_end else ''}; shot {first}'s gap "
+            f"{gap:.3f} s) -- frames {direction}, or a stalled image dispatcher stamped them late")
 
 
 def check(frame_t: Sequence[float], shot_t: Sequence[float], per_shot: int,

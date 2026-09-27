@@ -403,9 +403,19 @@ def test_after_a_restart_every_old_token_is_unknown(server, capsys):
 LAST_SLOT_EARLY = [9.90, 9.93, 9.96, 19.90, 19.93, 19.96]
 
 
-@pytest.mark.parametrize("camera_type, noted", [("andor", True), ("basler", False)])
-def test_the_last_slot_note_is_for_a_slow_readout_camera_only(server, records, monkeypatch,
-                                                              camera_type, noted):
+# 2026-09-27: the one-slot-shift note comes from the gaps between frames, for
+# every camera. LAST_SLOT_EARLY is a correct run whose sequence runs on after its
+# dark frame (the old SHOT_COMPLETE rule noted it for the Andor: run 83129);
+# SHIFTED: a run whose dark frames arrive just after SHOT_COMPLETE, after a stray
+# edge before shot 0 (with LAST_SLOT_EARLY's timing the moved dark frame would
+# arrive before its shot could start: a provable issue, not a note).
+SHIFTED = [0.5, 9.90, 9.93, 10.02, 19.90, 19.93]
+
+
+@pytest.mark.parametrize("camera_type", ["andor", "basler"])
+@pytest.mark.parametrize("frames, noted", [(LAST_SLOT_EARLY, False), (SHIFTED, True)])
+def test_the_shift_note_comes_from_the_gaps_for_every_camera(server, records, monkeypatch,
+                                                             camera_type, frames, noted):
     from waxx.util.live_od import config as live_od_config
     monkeypatch.setattr(live_od_config, "_active", live_od_config.LiveODConfig(
         resolve_camera_params=lambda key: types.SimpleNamespace(key=key, camera_type=camera_type)))
@@ -413,9 +423,9 @@ def test_the_last_slot_note_is_for_a_slow_readout_camera_only(server, records, m
     srv._handle_init_run(_init_msg(capture_images=True, camera_key="cam_a",
                                    params={"N_img": 6}, N_shots_with_repeats=2))
     srv.on_data_handler_done()
-    for _ in LAST_SLOT_EARLY:
+    for _ in frames:
         srv.on_image_received(None)
-    srv._frame_times[:] = LAST_SLOT_EARLY
+    srv._frame_times[:] = frames
     for i in range(2):
         srv._handle_shot_complete({"shot_idx": i, "N_shots_total": 2})
     srv._shot_mono[:] = [10.0, 20.0]
