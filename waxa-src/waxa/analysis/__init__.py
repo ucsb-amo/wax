@@ -24,6 +24,9 @@ Modules
                     (``ramsey_light_shift``).
 :mod:`.rabi`        pi time from a Rabi pulse-length scan (``rabi``, ``fit_rabi``;
                     ``python -m waxa.analysis.rabi RUN``).
+:mod:`.readout`     a spin-state readout signal calibrated against a Rabi flop:
+                    endpoints, S_z response, single-pulse noise, run agreement
+                    (``calibrate_readout``).
 
 Adding an experiment: give it its own subpackage (``waxa/analysis/<name>/``)
 with the analysis in one module and its plots in ``plotting.py``, a package
