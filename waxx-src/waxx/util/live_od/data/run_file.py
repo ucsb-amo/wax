@@ -9,6 +9,7 @@ import threading
 
 from waxx.config.timeouts import DATA_SAVER_TIMEOUT
 from waxa.data.data_saver import clear_end_run_payload, stash_end_run_payload
+from waxx.util.live_od.data.image_writer import take_write_report
 from waxx.util.live_od.log import get_logger
 
 logger = get_logger("server")
@@ -92,8 +93,11 @@ class RunFile:
         which the saver has written into the file: ``run_complete`` stays False
         and ``data_complete=False`` / ``incomplete_reason`` say why. A run is
         incomplete when the image writer never finished, when fewer frames
-        arrived than the run asked for, or when the camera grab reported a
-        failure (``grab_failure``, the CameraBaby's reason).
+        arrived than the run asked for, when the frames are not the shape or
+        dtype the run declared (all written all the same), when a frame that
+        arrived did not reach the file (a write error, or a shape or dtype
+        change mid-run: the image writer's WriteReport), or when the camera
+        grab reported a failure (``grab_failure``, the CameraBaby's reason).
         """
         # Wait for the image writer to close its HDF5 handle before we open
         # the same file for the end-of-run save.  Without this wait the
@@ -104,6 +108,18 @@ class RunFile:
             reasons.append(f"image writer did not finish within {DATA_SAVER_TIMEOUT:.0f} s")
         if images_expected and images_received < images_expected:
             reasons.append(f"{images_received}/{images_expected} images received")
+        # what the image writer did (no report: no writer was started for this
+        # run -- no camera, or save_data=False)
+        report = take_write_report(self.filepath)
+        if report is not None:
+            written, not_written, mismatches = report.snapshot()
+            reasons += mismatches
+            if not_written or written < images_received:
+                what = (f"{written}/{images_expected or images_received} images written "
+                        f"to the file")
+                if not_written:
+                    what += f" ({len(not_written)} not written; first: {not_written[0]})"
+                reasons.append(what)
         if grab_failure:
             reasons.append(str(grab_failure))
         incomplete = None
@@ -152,6 +168,7 @@ class RunFile:
         The file may already be gone, for camera runs whose CameraBaby called
         dishonorable_death.
         """
+        take_write_report(self.filepath)        # the run is gone; so is its report
         if not (self.filepath and os.path.exists(self.filepath)):
             return
         if wait_for_writer:

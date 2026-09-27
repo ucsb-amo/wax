@@ -548,20 +548,24 @@ class DataSaver():
         self._run_info_proxy_to_h5(f, ri)
 
         # params initial snapshot
+        # A value h5py cannot store (None, a dict, a mixed list) is left out of
+        # the group, so it is missing when the run is loaded: say which one.
         params_grp = f.create_group("params")
         for key, val in payload.get("params", {}).items():
             try:
                 params_grp.create_dataset(key, data=val)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[DataSaver] WARNING: params/{key} not stored "
+                      f"({type(val).__name__} value): {exc}")
 
         # camera_params group
         cam_grp = f.create_group("camera_params")
         for key, val in payload.get("camera_params", {}).items():
             try:
                 cam_grp.create_dataset(key, data=val)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[DataSaver] WARNING: camera_params/{key} not stored "
+                      f"({type(val).__name__} value): {exc}")
 
     # Params that must never be unshuffled — they describe the scan itself
     # rather than per-shot results.

@@ -17,6 +17,7 @@ class FakeSaver:
         self.fail_reserve = fail_reserve
         self.fail_save = fail_save
         self.saved = []             # (filepath, shot_timestamps) per END_RUN save
+        self.payloads = []          # the END_RUN payload of each save
         self._next_run_id = 101
 
     def reserve_run_id_and_path(self, msg):
@@ -33,6 +34,7 @@ class FakeSaver:
         if self.fail_save:
             raise OSError("drive went away")
         self.saved.append((filepath, list(shot_timestamps or [])))
+        self.payloads.append(msg)
         self.incomplete = incomplete        # what the last save was told is missing
 
 

@@ -447,6 +447,71 @@ def unpack_group(file,group_key,obj):
     for k in keys:
         vars(obj)[k] = g[k][()]
 
+def read_camera_overrides(attrs) -> dict:
+    """liveOD's record of the camera settings a run got that differ from what
+    it asked for (a driver clamp, or settings persisted in liveOD), from the
+    file's root attribute ``camera_overrides`` (JSON). ``{}`` when the file has
+    none: every applied value was the requested one, or the file predates the
+    record. A record that cannot be parsed comes back as ``{"unreadable": ...}``
+    rather than as nothing."""
+    import json
+    if 'camera_overrides' not in attrs:
+        return {}
+    raw = attrs['camera_overrides']
+    if isinstance(raw, bytes):
+        raw = raw.decode(errors='replace')
+    try:
+        record = json.loads(str(raw))
+        if not isinstance(record, dict):
+            raise ValueError(f"not a JSON object: {type(record).__name__}")
+        return record
+    except Exception as exc:
+        return {"unreadable": f"{type(exc).__name__}: {exc}", "raw": str(raw)}
+
+def incomplete_banner(run_id, reason, n_got, n_exp) -> str:
+    """The ``!!`` block printed when a run file says data_complete=False.
+
+    Only a run that got fewer images than it expected has empty last slots and,
+    after the first missing frame, a shifted shot assignment; a run flagged for
+    another reason (a frame-alignment suspicion, frames not the declared shape,
+    a grab error) may have every image. ``n_got`` / ``n_exp``: the file's
+    images_received / images_expected, or None where the file does not say.
+    """
+    bar = '!' * 72
+    lines = [f"!! RUN {run_id} IS INCOMPLETE: {reason}"]
+    try:
+        got, exp = int(n_got), int(n_exp)
+    except (TypeError, ValueError):
+        got = exp = None
+    if got is None:
+        lines += ["!! The file does not record how many images arrived. Do not trust",
+                  "!! per-shot image data from this run until the reason is understood."]
+    elif got < exp:
+        lines += [f"!! {got} of {exp} images arrived. Images are stored in arrival order,",
+                  "!! so after the first missing frame the shot assignment is shifted and",
+                  "!! the last slots are empty. Do not trust per-shot image data from this run."]
+    else:
+        lines += [f"!! All {exp} images arrived, but the run was flagged (reason above): do not",
+                  "!! trust per-shot image data from this run until the reason is understood."]
+    return "\n".join([bar] + lines + [bar])
+
+def camera_overrides_banner(run_id, record) -> str:
+    """The one-line ``!!`` notice for a run whose camera settings differ from
+    its camera_params, or ``""`` when they do not."""
+    if not record:
+        return ""
+    if 'unreadable' in record:
+        return (f"!! run {run_id}: the file's camera_overrides record could not be read "
+                f"({record['unreadable']}); the camera's settings may differ from "
+                f"ad.camera_params (the request)")
+    fields = record.get('fields') or {}
+    if not fields:
+        return ""
+    parts = [f"{key} {f.get('requested')} -> {f.get('applied')} ({f.get('origin', '?')})"
+             for key, f in fields.items()]
+    return (f"!! run {run_id}: camera settings differ from ad.camera_params "
+            f"(the request): " + ", ".join(parts))
+
 class analysis_tags():
     """A simple container to hold analysis tags for analysis logic.
     """    
@@ -1316,6 +1381,20 @@ class atomdata_base():
                 indices.append(idx)
             return np.array(indices, dtype=int)
 
+    @property
+    def camera_overrides(self) -> dict:
+        """The camera settings this run got that differ from ``camera_params``
+        (which is the request): liveOD's record, the file's root attribute
+        ``camera_overrides`` -- ``{"schema", "camera_key", "persist_since",
+        "fields": {name: {"requested", "applied", "origin"}}}``, origin
+        "clamped" or "persist". ``{}`` when every applied value was the
+        requested one, or for a file from before the record existed."""
+        return vars(self).get('_camera_overrides') or {}
+
+    @camera_overrides.setter
+    def camera_overrides(self, value):
+        self._camera_overrides = dict(value or {})
+
     def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False,
                        xvar_value=None, xvar_tolerance=0.05):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
@@ -1625,7 +1704,7 @@ class atomdata_base():
         ad._has_images = getattr(self, '_has_images', True)
 
         for attr in (
-            'experiment_code',
+            'experiment_code', '_camera_overrides',
             'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
             'axis_camera_px_x', 'axis_camera_px_y',
         ):
@@ -1724,6 +1803,7 @@ class atomdata_base():
         ad_out.images = self.images
         ad_out.image_timestamps = self.image_timestamps
         ad_out.experiment_code = self.experiment_code
+        ad_out.camera_overrides = self.camera_overrides
 
         ad_out.params = deepcopy(self.params)
         ad_out.p = ad_out.params
@@ -2688,16 +2768,16 @@ class atomdata_base():
             self.run_info.data_complete = bool(f.attrs.get('data_complete', True))
             self.run_info.incomplete_reason = str(f.attrs.get('incomplete_reason', ''))
             if not self.run_info.data_complete:
-                n_got = f.attrs.get('images_received', '?')
-                n_exp = f.attrs.get('images_expected', '?')
-                print(
-                    f"\n{'!' * 72}\n"
-                    f"!! RUN {self.run_info.run_id} IS INCOMPLETE: {self.run_info.incomplete_reason}\n"
-                    f"!! {n_got} of {n_exp} images arrived. Images are stored in arrival order,\n"
-                    f"!! so after the first missing frame the shot assignment is shifted and\n"
-                    f"!! the last slots are empty. Do not trust per-shot image data from this run.\n"
-                    f"{'!' * 72}\n"
-                )
+                print("\n" + incomplete_banner(self.run_info.run_id, self.run_info.incomplete_reason,
+                                               f.attrs.get('images_received', None),
+                                               f.attrs.get('images_expected', None)) + "\n")
+            # Camera settings that differed from what the run asked for, which
+            # liveOD records only when something did. camera_params (above) is
+            # the request, and stays so.
+            self.camera_overrides = read_camera_overrides(f.attrs)
+            _banner = camera_overrides_banner(self.run_info.run_id, self.camera_overrides)
+            if _banner:
+                print(_banner)
             if self._has_images:
                 self.images = f['data']['images'][()]
                 self.image_timestamps = f['data']['image_timestamps'][()]

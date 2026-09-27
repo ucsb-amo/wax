@@ -425,6 +425,7 @@ class AtomdataVault(atomdata_base):
         )
 
         self._warn_param_mismatches(chunks)
+        self._note_camera_differences(chunks)
 
         # Concatenate xvar values (axis 0).
         xvar_values = np.concatenate(
@@ -1042,6 +1043,7 @@ class AtomdataVault(atomdata_base):
         )
 
         self._warn_param_mismatches(chunks)
+        self._note_camera_differences(chunks)
         key, values = self._resolve_stack_key(chunks, promote_xvar, structure)
         if sort:
             order = np.argsort(values, kind='stable')
@@ -1166,6 +1168,59 @@ class AtomdataVault(atomdata_base):
                 f"AtomdataVault.{method_name} is not available on a vault "
                 "stacked from multi-axis runs; work on "
                 "vault.atomdata(run_id) or rebuild the vault instead."
+            )
+
+    def _note_camera_differences(self, chunks):
+        """The vault keeps the first run's ``camera_params`` (the request) for
+        all of them. Say so when the runs asked their cameras for different
+        things, or when any run's camera applied something other than it asked
+        (liveOD's ``camera_overrides`` record). Records
+        ``self.camera_param_disagreements`` ({key: {run_id: value}}) and
+        ``self.camera_overrides_by_run`` ({run_id: record}, {} for runs without
+        one); ``self.camera_overrides`` is the first run's, like camera_params."""
+        first = chunks[0]
+        first_cam = vars(first.camera_params)
+
+        def _same(a_val, b_val):
+            try:
+                if isinstance(a_val, np.ndarray) or isinstance(b_val, np.ndarray):
+                    a, b = np.asarray(a_val), np.asarray(b_val)
+                    return a.shape == b.shape and np.array_equal(a, b)
+                return bool(a_val == b_val)
+            except Exception:
+                return True         # not comparable: not reported
+
+        disagreements = {}
+        for key, first_val in first_cam.items():
+            if key.startswith('_'):
+                continue
+            if any(not _same(first_val, vars(c.camera_params).get(key, first_val))
+                   for c in chunks[1:]):
+                disagreements[key] = {int(c.run_info.run_id): vars(c.camera_params).get(key, None)
+                                      for c in chunks}
+        self.camera_param_disagreements = disagreements
+        if disagreements:
+            warnings.warn(
+                "AtomdataVault: the runs' camera_params differ (the vault uses the "
+                "first run's): " + ", ".join(sorted(disagreements))
+                + ". See vault.camera_param_disagreements.",
+                stacklevel=3,
+            )
+
+        by_run = {int(c.run_info.run_id): dict(getattr(c, 'camera_overrides', {}) or {})
+                  for c in chunks}
+        self.camera_overrides_by_run = by_run
+        self.camera_overrides = getattr(first, 'camera_overrides', {})
+        with_overrides = sorted(rid for rid, rec in by_run.items() if rec)
+        if with_overrides:
+            fields_seen = {json_key for rec in by_run.values()
+                           for json_key in (rec.get('fields') or {})}
+            warnings.warn(
+                "AtomdataVault: in run(s) " + ", ".join(str(r) for r in with_overrides)
+                + " the camera applied settings other than camera_params ("
+                + (", ".join(sorted(fields_seen)) or "unreadable record")
+                + "). See vault.camera_overrides_by_run.",
+                stacklevel=3,
             )
 
     def _warn_param_mismatches(self, chunks):
@@ -2301,6 +2356,7 @@ class AtomdataVault(atomdata_base):
         ad_out.images = self.images
         ad_out.image_timestamps = self.image_timestamps
         ad_out.experiment_code = getattr(self, 'experiment_code', None)
+        ad_out.camera_overrides = getattr(self, 'camera_overrides', {})
 
         ad_out.params = copy.deepcopy(self.params)
         ad_out.p = ad_out.params
