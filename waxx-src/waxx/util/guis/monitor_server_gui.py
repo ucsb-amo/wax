@@ -16,7 +16,7 @@ import os
 import threading
 
 from waxx.util.device_state.state_file_io import (
-    read_state, apply_delta, apply_deltas, replace_sections)
+    read_state, apply_delta, apply_deltas, replace_sections, atomic_write)
 from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
@@ -213,6 +213,15 @@ class MonitorUDPServer(UdpServer):
       operator's reinit now, refused unless the machine is idle; (``action``
       ``status``) — the snapshot.
 
+    * ``regenerate_state`` (``operator``, ``client``) — rebuild the state file
+      from the lab's device definitions, every channel at its default
+      (``state_generator``, a callable the lab passes; ``status_json`` has
+      ``state_generator`` true when there is one).  The current file is copied
+      to ``<journal_dir>/state_backups/`` first; a running monitor applies the
+      new file at once.  Refused while the monitor is starting, a run is
+      starting or holds the core, or a reset or run loop is running.  Replies
+      with the backup path and the channels whose values changed.
+
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
     ``end()`` sends its end state (or, aborted inside its scan, sends
@@ -239,8 +248,12 @@ class MonitorUDPServer(UdpServer):
     RUN_PENDING_TTL_S = 120.0
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
-                 run_loops=(), connections=(), slm_reinit=None):
+                 run_loops=(), connections=(), slm_reinit=None, state_generator=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
+        # regenerate_state: a callable -> {"dds", "ttl", "dac"} with every
+        # channel at the lab's defaults (from its device frames); None: not offered.
+        self._state_generator = state_generator
+        self._journal_dir = journal_dir
 
         self.status = MonitorStatus()
         self._print_connections_bool = False
@@ -352,6 +365,7 @@ class MonitorUDPServer(UdpServer):
                 "connections": self.connections.snapshot(),
                 "slm_reinit": (self.slm_reinit.snapshot() if self.slm_reinit is not None
                                else None),
+                "state_generator": self._state_generator is not None,
                 "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
 
     def _handle_structured(self, raw):
@@ -407,6 +421,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_run_loop(obj))
         if mtype == "slm_reinit":
             return json.dumps(self._reply_slm_reinit(obj))
+        if mtype == "regenerate_state":
+            return json.dumps(self._reply_regenerate_state(obj))
         if mtype == "output":
             return json.dumps(self._reply_output(obj))
         if mtype == "get_journal":
@@ -1025,6 +1041,142 @@ class MonitorUDPServer(UdpServer):
         self._broadcaster.send({"type": "trust", "trust": dict(self._trust)})
         return json.dumps({"status": "ok", "version": version})
 
+    # --- regenerating the state file -------------------------------------------------
+
+    #: The fields that hold a channel's value (the rest describe its wiring).
+    _VALUE_FIELDS = {"dds": ("frequency", "amplitude", "v_pd", "sw_state"),
+                     "ttl": ("ttl_state",), "dac": ("voltage",)}
+
+    def _regenerate_blocker(self) -> str:
+        """Why the state file may not be regenerated now ("" when it may)."""
+        if self.status.state == STATES.LOADING:
+            return "the monitor is starting (it reconciles the file itself as it starts)"
+        if self.status.state == STATES.NOT_READY and self.status.sub_state == "interrupted_by_run":
+            return ("a run has taken the core from the monitor -- its end state replaces the "
+                    "file; start the monitor once it has ended")
+        p = self._current_run_pending()
+        if p is not None:
+            return f"{_run_name(p.get('run_id'), p.get('expt'))} is starting"
+        if self.reset.running:
+            return "a state reset is running"
+        loop = active_loop(self.loops.values())
+        if loop is not None:
+            return f"{loop.spec.title} is running"
+        return ""
+
+    @classmethod
+    def _changed_channels(cls, old: dict, fresh: dict) -> list[str]:
+        """"dds.imaging", ... for every channel whose value, or presence, differs."""
+        changed = []
+        for dtype, fields in cls._VALUE_FIELDS.items():
+            before = old.get(dtype) if isinstance(old.get(dtype), dict) else {}
+            after = fresh.get(dtype) or {}
+            for name in sorted(set(before) | set(after)):
+                a, b = before.get(name), after.get(name)
+                if not isinstance(a, dict) or not isinstance(b, dict) \
+                        or any(a.get(f) != b.get(f) for f in fields):
+                    changed.append(f"{dtype}.{name}")
+        return changed
+
+    def _backup_state_file(self) -> str:
+        """Copy the current state file aside ("" when there is none); raises
+        if it cannot -- nothing is regenerated without a backup."""
+        import shutil  # noqa: PLC0415
+        src = self.config_file_path
+        if not os.path.exists(src):
+            return ""
+        folder = (os.path.join(self._journal_dir, "state_backups") if self._journal_dir
+                  else os.path.dirname(os.path.abspath(src)))
+        os.makedirs(folder, exist_ok=True)
+        stem, ext = os.path.splitext(os.path.basename(src))
+        dst = os.path.join(folder, f"{stem}.before-regenerate-{time.strftime('%Y%m%d-%H%M%S')}"
+                                   f"{ext or '.json'}")
+        n = 1
+        while os.path.exists(dst):
+            base, ext2 = os.path.splitext(dst)
+            dst, n = f"{base}-{n}{ext2}", n + 1
+        shutil.copy2(src, dst)
+        return dst
+
+    def _reply_regenerate_state(self, obj: dict) -> dict:
+        """Rebuild the state file from the lab's device definitions: every
+        channel at its default (``state_generator``).  The current file is
+        copied aside first; a running monitor applies the new one at once
+        (it reloads when the version moves).  The trust flag is left as it
+        was: this says nothing about what the hardware is at."""
+        operator = str(obj.get("operator") or "")
+        client = str(obj.get("client") or "")
+        who = " on ".join(p for p in (operator, client) if p) or "a client"
+
+        def refuse(msg: str) -> dict:
+            log.warning("State file regeneration requested by %s refused: %s", who, msg)
+            self.journal.record("state_regenerate_refused", by=who, msg=msg)
+            return {"status": "error", "msg": msg}
+
+        if not self.config_file_path:
+            return refuse("no config path")
+        if self._state_generator is None:
+            return refuse("this monitor server has no state generator configured")
+        why = self._regenerate_blocker()
+        if why:
+            return refuse(why)
+        try:
+            fresh = self._state_generator()
+        except Exception as e:
+            log.exception("The state generator failed")
+            return refuse(f"could not build the defaults: {e}")
+        if not isinstance(fresh, dict) or not all(isinstance(fresh.get(k), dict)
+                                                  for k in ("dds", "ttl", "dac")):
+            return refuse("the state generator returned no dds/ttl/dac sections")
+        with self._state_lock:
+            why = self._regenerate_blocker()          # again: it took a moment
+            if why:
+                return refuse(why)
+            unreadable = False
+            try:
+                old = read_state(self.config_file_path)
+            except FileNotFoundError:
+                old = {}
+            except Exception as e:                    # unreadable: regenerate, but say so
+                log.warning("The current state file could not be read (%s); it is backed "
+                            "up as it is.", e)
+                old, unreadable = {}, True
+            if not isinstance(old, dict):
+                old, unreadable = {}, True
+            try:
+                backup = self._backup_state_file()
+            except Exception as e:
+                return refuse(f"could not back up the current file ({e}); nothing changed")
+            changed = self._changed_channels(old, fresh)
+            sections = {k: fresh[k] for k in ("dds", "ttl", "dac")}
+            meta = {"updated_from": "regenerated from the device definitions",
+                    "regenerated_by": who, "regenerate_backup": backup,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            try:
+                if unreadable:
+                    # nothing to keep from it; the trust flag is the server's own
+                    data = dict(sections, metadata=dict(meta, state_trust=dict(self._trust)))
+                    atomic_write(self.config_file_path, data)
+                else:
+                    data = replace_sections(self.config_file_path, sections, metadata=meta)
+            except Exception as e:
+                return refuse(f"could not write the file: {e} (backup: {backup or 'none'})")
+            self._remember_state(data)
+            self._version += 1
+            version = self._version
+        monitor = self.status.state_name
+        log.warning("State file regenerated from the device definitions by %s: %d channel(s) "
+                    "changed%s; backup %s. The monitor is %s%s.", who, len(changed),
+                    f" ({', '.join(changed[:12])}{', ...' if len(changed) > 12 else ''})"
+                    if changed else "", backup or "none (there was no file)", monitor,
+                    " and applies it now" if self.status.state == STATES.READY else "")
+        self.journal.record("state_regenerated", by=who, n_changed=len(changed),
+                            changed=changed[:200], backup=backup, version=version,
+                            monitor=monitor)
+        self._broadcaster.send({"type": "state_reset", "version": version})
+        return {"status": "ok", "version": version, "backup": backup, "changed": changed,
+                "monitor": monitor}
+
     def _log_update(self, dtype: str, name: str, changes: dict, origin: str = "") -> None:
         """Print a formatted confirmation of an accepted device-state update."""
         parts = []
@@ -1071,7 +1223,8 @@ class MonitorServerGUI(QWidget):
                 reset_expt_path=None,
                 run_loops=(),
                 connections=(),
-                slm_reinit=None):
+                slm_reinit=None,
+                state_generator=None):
         super().__init__()
 
         self.config_file_path = config_file_path
@@ -1080,6 +1233,7 @@ class MonitorServerGUI(QWidget):
         self.run_loops = tuple(run_loops or ())
         self.connection_defs = tuple(connections or ())
         self.slm_reinit_config = slm_reinit
+        self.state_generator = state_generator
 
         # Refuse to start a second monitor server for the same hardware.
         server_id = monitor_server_id()
@@ -1179,7 +1333,8 @@ class MonitorServerGUI(QWidget):
                                            reset_expt_path=self.reset_expt_path,
                                            run_loops=self.run_loops,
                                            connections=self.connection_defs,
-                                           slm_reinit=self.slm_reinit_config)
+                                           slm_reinit=self.slm_reinit_config,
+                                           state_generator=self.state_generator)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)

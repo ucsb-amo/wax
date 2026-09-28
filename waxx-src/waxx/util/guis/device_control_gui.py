@@ -1348,13 +1348,18 @@ class _RequestWorker(QThread):
 
     done = pyqtSignal(dict)
 
-    def __init__(self, obj: dict, parent=None):
+    def __init__(self, obj: dict, parent=None, timeout: float | None = None,
+                 attempts: int | None = None):
         super().__init__(parent)
         self._obj = dict(obj)
+        # None: the client's defaults (5 s, a retry). A request that must not
+        # run twice passes attempts=1.
+        self._kw = {k: v for k, v in (("timeout", timeout), ("attempts", attempts))
+                    if v is not None}
 
     def run(self):
         try:
-            reply = MonitorClient(discovery_timeout=1.0).request(self._obj)
+            reply = MonitorClient(discovery_timeout=1.0).request(self._obj, **self._kw)
         except Exception as e:
             reply = {"status": "error", "msg": str(e)}
         self.done.emit(reply if isinstance(reply, dict)
@@ -2056,7 +2061,16 @@ class DeviceStateGUI(QMainWindow):
 
     def _status_pill_menu(self, pos) -> None:
         """Right-click on the pill: the monitor experiment's Start / Restart /
-        Stop (the notice has Start; the server process is the dashboard's)."""
+        Stop (the notice has Start; the server process is the dashboard's),
+        and Regenerate state file."""
+        menu, actions = self._build_status_menu()
+        chosen = menu.exec(self.status_pill.mapToGlobal(pos))
+        handler = actions.get(chosen)
+        if handler is not None:
+            handler()
+
+    def _build_status_menu(self):
+        """The status pill's menu and {action: handler} (separate for tests)."""
         can_start, live = self._monitor_commands_allowed()
         menu = QMenu(self)
         start = menu.addAction("Start monitor experiment")
@@ -2065,13 +2079,100 @@ class DeviceStateGUI(QMainWindow):
         restart.setEnabled(live)
         stop = menu.addAction("Stop monitor experiment…")
         stop.setEnabled(live)
-        chosen = menu.exec(self.status_pill.mapToGlobal(pos))
-        if chosen is start:
-            self.on_start_clicked()
-        elif chosen is restart:
-            self.on_restart_clicked()
-        elif chosen is stop:
-            self.on_stop_clicked()
+        menu.addSeparator()
+        regen = menu.addAction("Regenerate state file…")
+        regen.setObjectName("regenerate_state")
+        allowed, why = self._regenerate_allowed()
+        regen.setEnabled(allowed)
+        if not allowed:
+            menu.addAction(f"    not now: {why}").setEnabled(False)
+        return menu, {start: self.on_start_clicked, restart: self.on_restart_clicked,
+                      stop: self.on_stop_clicked, regen: self._regenerate_state_file}
+
+    def _regenerate_allowed(self) -> tuple[bool, str]:
+        """Whether "Regenerate state file" may be sent (the server checks again)."""
+        status = self._monitor_status
+        if self.connection_failed or status is None:
+            return False, "the monitor server is unreachable (or too old to say)"
+        if not status.get("state_generator"):
+            return False, ("this monitor server does not offer it (older code, or no state "
+                           "generator configured)")
+        if self._monitor_state == STATES.LOADING:
+            return False, "the monitor is starting"
+        if self._monitor_state == STATES.NOT_READY \
+                and status.get("sub_state") == "interrupted_by_run":
+            return False, "a run has taken the core from the monitor"
+        if self._run_pending:
+            return False, f"run {self._run_pending.get('run_id')} is starting"
+        if (self._reset or {}).get("state") == "running":
+            return False, "a state reset is running"
+        return True, ""
+
+    def _regenerate_state_file(self) -> None:
+        """Ask the monitor server to rebuild the state file from the lab's
+        device definitions (every channel at its default).  It keeps a backup
+        and refuses while a run is starting or holds the core."""
+        allowed, why = self._regenerate_allowed()
+        if not allowed:
+            QMessageBox.warning(self, "Regenerate state file", f"Not sent: {why}.")
+            return
+        live_od = self._live_od_status()
+        parts = []
+        if live_od.get("run_in_progress"):
+            parts.append(f"liveOD says run {live_od.get('run_id')} "
+                         f"({live_od.get('expt_name') or 'experiment'}) is IN PROGRESS: its end "
+                         "state replaces the file when it ends.")
+        parts.append("Rebuilds the device state file from the lab's device definitions (the "
+                     "_id files): every DDS, DAC and TTL channel goes back to its default "
+                     "frequency, amplitude, voltage and switch state. Every change made here "
+                     "since is lost.")
+        if self._monitor_state == STATES.READY:
+            parts.append("The monitor is running: it applies the defaults to the HARDWARE at "
+                         "once.")
+        else:
+            parts.append("The monitor is not running: it applies the defaults to the hardware "
+                         "when it next starts.")
+        parts.append("The monitor server copies the current file aside first (the reply "
+                      "says where).")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Regenerate state file")
+        box.setText("\n\n".join(parts))
+        yes = box.addButton("Regenerate", QMessageBox.ButtonRole.AcceptRole)
+        yes.setStyleSheet(f"color: {theme.ERR}; font-weight: 600;")
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        # attempts=1: never sent twice; the frames take a few seconds to build
+        self._send_request({"type": "regenerate_state", "client": host},
+                           self._on_regenerate_reply, timeout=30.0, attempts=1)
+
+    def _on_regenerate_reply(self, reply: dict) -> None:
+        if reply.get("status") != "ok":
+            self._record_line(f"[state] regeneration refused: {reply.get('msg')}")
+            QMessageBox.warning(self, "Regenerate state file",
+                                f"The monitor server did not regenerate it: {reply.get('msg')}")
+            return
+        changed = list(reply.get("changed") or [])
+        backup = reply.get("backup") or "none (there was no file)"
+        shown = ", ".join(changed[:40]) + (f", … ({len(changed)} in all)"
+                                           if len(changed) > 40 else "")
+        self._record_line(f"[state] regenerated from the device definitions: "
+                          f"{len(changed)} channel(s) changed; backup {backup}")
+        if changed:
+            self._record_line(f"[state] changed: {shown}")
+        QMessageBox.information(
+            self, "Regenerate state file",
+            f"Regenerated: {len(changed)} channel(s) changed"
+            + (f":\n{shown}" if changed else ".")
+            + f"\n\nBackup of the previous file:\n{backup}")
+        self.request_state()
 
     def _set_monitor_state(self, state: int) -> None:
         """Apply a monitor state (STATES.*) to the pill; track when it began."""
@@ -2626,8 +2727,9 @@ class DeviceStateGUI(QMainWindow):
             self.request_state()
         self._refresh_summary()
 
-    def _send_request(self, obj: dict, callback) -> None:
-        worker = _RequestWorker(obj, self)
+    def _send_request(self, obj: dict, callback, timeout: float | None = None,
+                      attempts: int | None = None) -> None:
+        worker = _RequestWorker(obj, self, timeout=timeout, attempts=attempts)
         worker.done.connect(callback)
         worker.finished.connect(lambda w=worker: self._workers.remove(w)
                                 if w in self._workers else None)

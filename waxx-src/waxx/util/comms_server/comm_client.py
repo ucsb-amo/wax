@@ -149,10 +149,11 @@ class MonitorClient(CommClient):
         """
         return self._request({"type": "get_state"})
 
-    def _request(self, obj):
-        """Send a structured request; the parsed reply dict, or ``None``."""
+    def _request(self, obj, timeout: float = 5.0, attempts: int = 2):
+        """Send a structured request; the parsed reply dict, or ``None``.
+        ``attempts=1`` for a request that must not run twice."""
         import json  # noqa: PLC0415
-        reply = self.send_message(json.dumps(obj))
+        reply = self.send_message(json.dumps(obj), timeout=timeout, attempts=attempts)
         if reply is None:
             return None
         try:
@@ -173,9 +174,9 @@ class MonitorClient(CommClient):
                               "payload": payload or {}, "client": client,
                               "operator": operator, "rid": rid or uuid.uuid4().hex})
 
-    def request(self, obj):
+    def request(self, obj, timeout: float = 5.0, attempts: int = 2):
         """Any structured request; the parsed reply or ``None``."""
-        return self._request(obj)
+        return self._request(obj, timeout=timeout, attempts=attempts)
 
     def replace_state(self, config, run_id=None, expt=""):
         """An experiment's end-of-run device state (its ``end()``)."""

@@ -156,6 +156,12 @@ def describe_entry(e: dict) -> str:
             text += f", asked for by {e['by']}"
         elif isinstance(e.get("due_for_s"), (int, float)):
             text += f", due for {e['due_for_s'] / 60:.0f} min"
+    elif kind == "state_regenerated":
+        n = e.get("n_changed")
+        text = (f"state file REGENERATED from the device definitions by {e.get('by')}: "
+                f"{n} channel(s) changed; backup {e.get('backup') or 'none'}")
+    elif kind == "state_regenerate_refused":
+        text = f"state file regeneration by {e.get('by')} REFUSED: {e.get('msg')}"
     elif kind == "slm_reinit_manual":
         text = f"SLM reinit asked for by {e.get('by')}"
     elif kind == "slm_reinit_refused":
