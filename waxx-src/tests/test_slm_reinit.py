@@ -5,7 +5,8 @@
   ``SLMCTL`` control lines, and the old parser dropping them;
 * ``slm_link.exchange`` and the experiment's ``SLM`` client: waits for
   "applied", raises when it cannot say the mask is up, falls back once for a
-  server that never replies;
+  server that never replies; before a run starts it has a due reinit done and
+  waits for it (``reinit_if_due``);
 * ``SlmReinitService`` with a fake link and clock: asks only while idle, never
   once a run has announced itself, and the run's announcement waits for a
   request being sent;
@@ -398,6 +399,122 @@ def test_kernel_wrapper_resyncs_the_timeline_after_the_rpc():
     i_brk = body.index("self.core.break_realtime()")
     i_dly = body.index("delay(SLM_RPC_DELAY)")
     assert i_rpc < i_brk < i_dly
+
+
+# --- the run-start reinit (SLM.reinit_if_due) --------------------------------------------
+
+def _due(host):
+    with host.rs._reinit_lock:
+        host.rs._reinit["due_since"] = time.monotonic()
+
+
+def test_run_start_with_no_reinit_due_asks_once_and_goes(slm_host):
+    rec = _slm(slm_host.port).reinit_if_due(poll_s=0.02)
+    assert rec["result"] == "not_due" and rec["error"] == ""
+    assert rec["before"]["pattern_epoch"] == 0 and rec["after"] is None
+    assert slm_host.inits == 1                              # only the start-up one
+
+
+def test_run_start_asks_for_a_due_reinit_and_waits_until_it_is_done(slm_host):
+    _apply(slm_host, 11, 12)
+    _due(slm_host)
+    slm_host.init_s = 0.3
+    t0 = time.monotonic()
+    rec = _slm(slm_host.port).reinit_if_due(by="run start (test)", poll_s=0.02)
+    assert time.monotonic() - t0 >= 0.3                    # returned only once it was done
+    assert rec["result"] == "reinit_done" and rec["t_s"] >= 0.3
+    assert rec["before"]["reinit_due"] is True and rec["after"]["pattern_epoch"] == 1
+    assert slm_host.inits == 2
+    assert slm_host.uploads[-1] == (11, 12, 10)            # the pattern is back
+    st = _status(slm_host)
+    assert st["reinit_due"] is False and st["reinit_in_progress"] is False
+
+
+def test_run_start_waits_for_a_reinit_already_running_and_asks_for_no_second(slm_host):
+    _due(slm_host)
+    slm_host.init_s = 0.5
+    with socket.create_connection(("127.0.0.1", slm_host.port)) as s:
+        s.sendall(control_line({"cmd": "reinit", "seq": 1}).encode())
+    assert _wait(lambda: _status(slm_host)["reinit_in_progress"])
+    rec = _slm(slm_host.port).reinit_if_due(poll_s=0.02)
+    assert rec["result"] == "waited" and rec["after"]["pattern_epoch"] == 1
+    assert slm_host.inits == 2                              # start-up + the one it waited for
+
+
+def test_a_failed_run_start_reinit_stops_a_run_that_uses_the_slm_only(slm_host, capsys):
+    from waxx.control.slm.slm import SLMWriteError
+    _due(slm_host)
+    slm_host.fail_init = "SDK said no"
+    with pytest.raises(SLMWriteError, match="SDK said no"):
+        _slm(slm_host.port).reinit_if_due(required=True, poll_s=0.02)
+    assert "so it does not start" in capsys.readouterr().out
+    # still due, with the last failure's text on the server: a second failure
+    # is told from a reinit not yet started by the queue, not by the text
+    rec = _slm(slm_host.port).reinit_if_due(required=False, poll_s=0.02)
+    assert rec["result"] == "failed" and "SDK said no" in rec["error"]
+    assert "starts anyway" in capsys.readouterr().out
+    assert slm_host.inits == 3
+
+
+def test_a_run_start_reinit_that_does_not_finish_in_time(slm_host):
+    _due(slm_host)
+    slm_host.init_s = 1.0
+    rec = _slm(slm_host.port).reinit_if_due(timeout_s=0.3, poll_s=0.02)
+    assert rec["result"] == "timeout" and rec["after"]["reinit_in_progress"] is True
+
+
+def test_run_start_never_stopped_by_an_old_or_unreachable_server(monkeypatch, capsys):
+    from waxx.control.slm import slm as slm_mod
+    monkeypatch.setattr(slm_mod, "SLM_FIRST_REPLY_S", 0.3)
+    old = ScriptedServer(lambda msg: [])
+    try:
+        rec = _slm(old.port).reinit_if_due(required=True)
+        assert rec["result"] == "no_control"
+        assert "BLANK mask" in capsys.readouterr().out
+    finally:
+        old.close()
+    rec = _slm(_free_port()).reinit_if_due(required=True)
+    assert rec["result"] == "unreachable"
+
+
+def test_run_start_counts_a_new_server_process_as_reinitialised(monkeypatch):
+    from waxx.control.slm import slm as slm_mod
+    from waxx.control.slm.slm import SLMWriteError
+
+    def fake_link(statuses):
+        sent = []
+
+        def exchange(host, port, payload, **kw):
+            if payload["cmd"] == "status":
+                return statuses.pop(0) if len(statuses) > 1 else statuses[0]
+            sent.append(payload)
+            return {"status": "queued"}
+        return exchange, sent
+
+    due = {"status": "ok", "reinit_due": True, "reinit_in_progress": False,
+           "instance": "a", "pattern_epoch": 4, "queue_len": 0, "slm_ready": True}
+    new = {"status": "ok", "reinit_due": False, "reinit_in_progress": False,
+           "instance": "b", "pattern_epoch": 0, "queue_len": 0, "slm_ready": True,
+           "pattern": {"mask": "spot", "dimension": 5, "center_x": 1, "center_y": 2}}
+    exchange, sent = fake_link([dict(due), dict(new)])
+    monkeypatch.setattr(slm_mod.slm_link, "exchange", exchange)
+    rec = _slm(1).reinit_if_due(by="run start (x)", poll_s=0.01)
+    assert rec["result"] == "restarted" and rec["after"]["instance"] == "b"
+    assert sent == [{"cmd": "reinit", "by": "run start (x)"}]
+
+    broken = dict(new, slm_ready=False, slm_not_ready="the LUT did not load")
+    exchange, _ = fake_link([dict(due), broken])
+    monkeypatch.setattr(slm_mod.slm_link, "exchange", exchange)
+    with pytest.raises(SLMWriteError, match="LUT did not load"):
+        _slm(1).reinit_if_due(required=True, poll_s=0.01)
+
+
+def test_the_run_start_hook_comes_before_init_run():
+    """The camera arms and the run id is handed out at INIT_RUN: the wait for
+    a reinit must come before it (waxx Expt.finish_prepare_wax)."""
+    from waxx.base.expt import Expt
+    src = inspect.getsource(Expt.finish_prepare_wax)
+    assert src.index("self.pre_init_run()") < src.index("_client.init_run(")
 
 
 # --- SlmReinitService, fake link and clock ---------------------------------------------

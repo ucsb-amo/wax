@@ -170,6 +170,9 @@ class Expt(Scanner, Dealer, Scribe):
         except Exception:
             self._N_shots_total = 1
 
+        # overloaded per machine (kexp.Base: a due SLM reinit, between runs)
+        self.pre_init_run()
+
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
             payload = self._serialize_init_payload()
@@ -207,6 +210,14 @@ class Expt(Scanner, Dealer, Scribe):
             except Exception as e:
                 print(f"[Monitor] note: could not announce this run to the monitor "
                       f"server ({e!r}); composite ops are not fenced for it.")
+
+    def pre_init_run(self):
+        """Host, in finish_prepare_wax just before INIT_RUN: the last moment
+        before the run starts -- liveOD arms the camera and hands out the run
+        id at INIT_RUN, so a wait here costs neither the first frame's timeout
+        nor a run id. Raising here stops the run before it has one. Overload
+        per machine (kexp.Base)."""
+        pass
 
     @kernel
     def cleanup_scan_kernel_wax(self):

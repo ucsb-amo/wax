@@ -1,4 +1,5 @@
 import socket
+import time
 from artiq.coredevice.core import Core
 from artiq.language.core import now_mu, delay, kernel
 from waxx.config.expt_params import ExptParams
@@ -16,6 +17,17 @@ SLM_RPC_DELAY = 0.25
 SLM_APPLIED_TIMEOUT_S = 30.
 # A server that has not said "queued" by then is one from before replies.
 SLM_FIRST_REPLY_S = 3.
+# A run about to start waits this long for a due reinit (reinit_if_due). The
+# supervisor on the SLM PC calls one SLM task hung after 2 min.
+SLM_RUN_START_REINIT_TIMEOUT_S = 90.
+# How often it asks the server whether the reinit is done.
+SLM_REINIT_POLL_S = 0.5
+# A status query's connect timeout (the server answers status at once).
+SLM_STATUS_CONNECT_S = 2.
+# The status fields a run keeps from before and after its reinit.
+_STATUS_KEYS = ("instance", "start_count", "pattern_epoch", "reinit_due", "due_for_s",
+                "next_due_in_s", "reinit_in_progress", "slm_ready", "last_reinit_error",
+                "queue_len", "pattern")
 
 
 class SLMWriteError(RuntimeError):
@@ -137,6 +149,154 @@ class SLM:
         # Printed too: an exception raised through a kernel loses its message.
         print(f"[slm] ERROR: {text} -- the mask on the SLM is not the one asked for.")
         return SLMWriteError(text)
+
+    # --- the reinit, at a run boundary --------------------------------------------
+
+    def reinit_if_due(self, by="a run starting", required=False, timeout_s=None,
+                      poll_s=None) -> dict:
+        """Have a due SLM reinit done now, before a run starts, and wait for it.
+
+        The SLM server re-initialises only when asked: once an hour it marks a
+        reinit due, and the monitor server asks for it while the machine is
+        idle -- which back-to-back runs, or a run loop, may never leave it. So
+        a run about to start asks the server:
+
+        * a reinit due: ask for it, wait until it is done;
+        * one in progress (the monitor server's, say): wait until it is done;
+        * none: return at once (one status query).
+
+        Done means a new ``pattern_epoch`` (the server puts the last pattern
+        back after a reinit) or a new server process (``instance``: its
+        start-up initialisation is one). Waits at most `timeout_s`.
+
+        `required` (a run that uses the SLM): raise :class:`SLMWriteError`
+        when the reinit failed or did not finish, so the run does not start on
+        an SLM in an unknown state. A server that is unreachable, or too old
+        to take control commands, never stops a run here: its mask writes
+        report that themselves.
+
+        Returns what happened, for the run's file: ``{"result", "by", "t_s",
+        "before", "after", "error"}``, ``result`` one of ``"not_due"``,
+        ``"reinit_done"``, ``"waited"`` (one already in progress finished),
+        ``"restarted"``, ``"failed"``, ``"timeout"``, ``"no_control"`` (a
+        server from before 2026-09-28, which re-initialises by itself, blank),
+        ``"unreachable"``.
+        """
+        timeout_s = SLM_RUN_START_REINIT_TIMEOUT_S if timeout_s is None else timeout_s
+        poll_s = SLM_REINIT_POLL_S if poll_s is None else poll_s
+        t0 = time.monotonic()
+        record = {"result": "", "by": by, "t_s": 0.0, "before": None, "after": None,
+                  "error": ""}
+
+        def finish(result, error="", after=None):
+            record.update(result=result, error=error, t_s=round(time.monotonic() - t0, 2))
+            if after is not None:
+                record["after"] = {k: after.get(k) for k in _STATUS_KEYS}
+            return record
+
+        where = f"{self.server_ip}:{self.server_port}"
+        try:
+            st = self._status()
+        except slm_link.NoReply:
+            print(f"[slm] WARNING: the SLM server at {where} takes no control commands (a "
+                  f"server from before 2026-09-28): it re-initialises by itself once an "
+                  f"hour and then shows a BLANK mask, whether a run is going or not.")
+            return finish("no_control")
+        except (slm_link.ReplyTimeout, OSError) as e:
+            print(f"[slm] WARNING: could not ask the SLM server at {where} whether a reinit "
+                  f"is due ({e}); starting without.")
+            return finish("unreachable", str(e))
+        if st.get("status") != "ok":
+            print(f"[slm] WARNING: the SLM server at {where} refused a status query "
+                  f"({st.get('error')}); starting without checking for a reinit.")
+            return finish("unreachable", f"status refused: {st.get('error')}")
+        record["before"] = {k: st.get(k) for k in _STATUS_KEYS}
+        if not (st.get("reinit_due") or st.get("reinit_in_progress")):
+            return finish("not_due")
+
+        epoch0, instance0 = st.get("pattern_epoch"), st.get("instance")
+        if st.get("reinit_in_progress"):
+            done_result = "waited"
+            console.info("[slm] the SLM is re-initialising: this run waits for it.")
+        else:
+            done_result = "reinit_done"
+            due = st.get("due_for_s")
+            console.info("[slm] an SLM reinit is due"
+                         + (f" (for {due / 60:.0f} min)" if isinstance(due, (int, float)) else "")
+                         + ": re-initialising it before this run starts.")
+            try:
+                reply = slm_link.exchange(self.server_ip, self.server_port,
+                                          {"cmd": "reinit", "by": by}, control=True,
+                                          until=("queued", "error"),
+                                          connect_s=SLM_STATUS_CONNECT_S,
+                                          first_reply_s=SLM_FIRST_REPLY_S,
+                                          total_s=SLM_FIRST_REPLY_S)
+            except (slm_link.NoReply, slm_link.ReplyTimeout, OSError) as e:
+                return self._run_start_reinit_failed(
+                    finish("failed", f"the reinit request failed: {e}"), required)
+            if reply.get("status") != "queued":
+                return self._run_start_reinit_failed(
+                    finish("failed", f"the SLM server refused the reinit: {reply.get('error')}"),
+                    required)
+
+        # The request went out and closed ("queued"): the server serves one
+        # connection at a time, so it is followed by status queries, which
+        # also leave the monitor server's polls through.
+        last, idle_polls = st, 0
+        while time.monotonic() - t0 < timeout_s:
+            time.sleep(poll_s)
+            try:
+                s2 = self._status()
+            except (slm_link.NoReply, slm_link.ReplyTimeout, OSError):
+                continue            # busy with another client, or restarting
+            if s2.get("status") != "ok":
+                continue
+            last = s2
+            if s2.get("reinit_in_progress"):
+                idle_polls = 0
+                continue
+            if s2.get("instance") != instance0 or s2.get("pattern_epoch") != epoch0:
+                if s2.get("slm_ready") is False:
+                    return self._run_start_reinit_failed(
+                        finish("failed", f"the SLM is not ready: {s2.get('slm_not_ready')}",
+                               after=s2), required)
+                result = "restarted" if s2.get("instance") != instance0 else done_result
+                finish(result, after=s2)
+                pat = s2.get("pattern") or {}
+                console.info(f"[slm] re-initialised in {record['t_s']:.1f} s"
+                             + (" (a new SLM server process)" if result == "restarted" else "")
+                             + f"; pattern put back ({pat.get('mask')} "
+                             f"{pat.get('dimension')} um @ ({pat.get('center_x')}, "
+                             f"{pat.get('center_y')})). The run starts now.")
+                return record
+            # Nothing running and no new epoch: finished without success once
+            # nothing is queued either -- asked twice, for the moment between
+            # the worker taking the reinit off the queue and starting it.
+            idle_polls = 0 if s2.get("queue_len") else idle_polls + 1
+            if idle_polls >= 2:
+                return self._run_start_reinit_failed(
+                    finish("failed", s2.get("last_reinit_error")
+                           or "the reinit ended without re-initialising the SLM", after=s2),
+                    required)
+        return self._run_start_reinit_failed(
+            finish("timeout", f"not re-initialised within {timeout_s:g} s", after=last),
+            required)
+
+    def _status(self) -> dict:
+        return slm_link.exchange(self.server_ip, self.server_port, {"cmd": "status"},
+                                 control=True, until=("ok", "error"),
+                                 connect_s=SLM_STATUS_CONNECT_S,
+                                 first_reply_s=SLM_FIRST_REPLY_S, total_s=SLM_FIRST_REPLY_S)
+
+    @staticmethod
+    def _run_start_reinit_failed(record, required) -> dict:
+        text = f"the SLM reinit before this run did not complete ({record['result']}): " \
+               f"{record['error']}"
+        if required:
+            print(f"[slm] ERROR: {text}. This run uses the SLM, so it does not start.")
+            raise SLMWriteError(text)
+        print(f"[slm] WARNING: {text}. This run does not use the SLM, so it starts anyway.")
+        return record
 
     @kernel
     def write_phase_mask_kernel(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot',initialize=False,
