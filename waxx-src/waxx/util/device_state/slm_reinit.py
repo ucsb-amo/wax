@@ -28,12 +28,21 @@ An operator can ask for one now (``request_now``, the Device Control GUI's SLM
 pill): the same check, no settle time. The SLM server restarts its hour after
 every reinit, however it was asked for.
 
+An operator can also restart the SLM server process (``request_restart``, the
+pill's "Restart SLM server"): the same check, then the ``restart`` control
+command. The server exits and its supervisor (``supervisor.py`` on the SLM PC)
+starts a new one, which puts the saved pattern back; the service follows it
+until a server with a new ``instance`` answers. Refused unless the server says
+it is supervised -- a server nobody restarts would just be gone.
+
 What the service reports (``snapshot()``, served in ``status_json`` as
 ``slm_reinit`` and broadcast as ``{"type": "slm_reinit"}``)::
 
     {"label", "state", "detail", "since", "reinit_due", "due_for_s",
      "next_due_at", "interval_s", "pattern_epoch", "pattern", "last_reinit",
-     "last_poll", "blocked_by", "manual_pending", "last_manual"}
+     "last_poll", "blocked_by", "manual_pending", "last_manual",
+     "supervised", "can_restart", "server_instance", "start_count", "last_exit",
+     "slm_ready", "restart_pending", "last_restart"}
 
 ``next_due_at`` is the wall time the SLM server next marks a reinit due (as of
 the last poll); the reinit itself follows once the machine is idle.
@@ -55,7 +64,10 @@ REINITIALISING = "reinitialising"
 FAILED = "failed"              # the last reinit failed; retried after a pause
 UNREACHABLE = "unreachable"
 NO_CONTROL = "no_control"      # a server from before control commands
-STATES = (UNKNOWN, IDLE, DUE, REINITIALISING, FAILED, UNREACHABLE, NO_CONTROL)
+RESTARTING = "restarting"      # the server process is being restarted by its supervisor
+STATES = (UNKNOWN, IDLE, DUE, REINITIALISING, FAILED, UNREACHABLE, NO_CONTROL, RESTARTING)
+#: states in which the service is following a request (poll failures are expected)
+_FOLLOWING = (REINITIALISING, RESTARTING)
 
 #: The longest a run's announcement waits for a reinit request being sent.
 #: The announcement's reply also waits for the connections' release
@@ -136,6 +148,11 @@ class SlmReinitService:
         self._next_due_at: float | None = None      # wall time the server marks it due
         self._manual: str | None = None             # who asked for a reinit now
         self._last_manual: dict | None = None       # {"by", "at", "result"}
+        self._restart_req: str | None = None        # who asked for a server restart
+        self._restart_t0: float | None = None       # clock time the restart was sent
+        self._restart_instance0: str | None = None  # the server instance it replaces
+        self._restart_by: str = ""
+        self._last_restart: dict | None = None      # {"at", "t_s", "by", "instance", ...}
 
     # --- lifecycle ---------------------------------------------------------------
 
@@ -191,6 +208,43 @@ class SlmReinitService:
         self._notify()
         return ""
 
+    # --- an operator's server restart ------------------------------------------------
+
+    def restart_refusal(self) -> str:
+        """Why a restart cannot be asked for now ("" when it can); the machine
+        check (``blocker``) aside."""
+        if self._state in _FOLLOWING:
+            return f"the SLM server is {self._state.replace('_', ' ')} already"
+        if self._state == NO_CONTROL:
+            return ("the SLM server takes no control commands (a server from before "
+                    "2026-09-28)")
+        if self._state == UNKNOWN:
+            return "the SLM server has not answered yet"
+        if self._state == UNREACHABLE:
+            return "the SLM server is not answering (restart it at the SLM PC)"
+        st = self._status
+        if "restart" not in (st.get("capabilities") or ()):
+            return "this SLM server has no restart command (a server from before its supervisor)"
+        if not st.get("supervised"):
+            return ("the SLM server is not running under its supervisor (supervisor.py): "
+                    "nothing would start it again")
+        return ""
+
+    def request_restart(self, who: str = "") -> str:
+        """Restart the SLM server process: the same check as a reinit, sent on
+        the next tick. Returns "" when it will be sent, else why not."""
+        with self._cond:
+            why = self._blocker() or self.restart_refusal()
+            if why:
+                return why
+            if self._restart_req is not None:
+                return f"a restart asked for by {self._restart_req} is about to be sent"
+            if self._manual is not None:
+                return f"a reinit asked for by {self._manual} is about to be sent"
+            self._restart_req = who or "an operator"
+        self._notify()
+        return ""
+
     # --- one pass ----------------------------------------------------------------
 
     def tick(self) -> None:
@@ -206,8 +260,20 @@ class SlmReinitService:
         if self._state == REINITIALISING:
             self._follow_reinit(now)
             return
+        if self._state == RESTARTING:
+            self._follow_restart(now)
+            return
         if now >= self._next_poll:
             self._poll(now)
+        with self._cond:
+            restart, self._restart_req = self._restart_req, None
+        if restart is not None:
+            why = self.restart_refusal()
+            if why:
+                self._refused_restart(restart, why)
+            else:
+                self._request_restart(now, by=restart)
+            return
         with self._cond:
             manual, self._manual = self._manual, None
         if manual is not None:
@@ -228,7 +294,7 @@ class SlmReinitService:
         behind the reinit holds it."""
         self._next_poll = now + self.config.poll_s
         no_reply, reply_timeout = _link_errors()
-        following = self._state == REINITIALISING
+        following = self._state in _FOLLOWING
         try:
             status = self._link(self.config.host, self.config.port, {"cmd": "status"},
                                 control=True, until=("ok", "error"), connect_s=2.0,
@@ -331,6 +397,93 @@ class SlmReinitService:
         self._last_manual = {"by": who, "at": time.time(), "result": f"not sent: {why}"}
         self._notify()
 
+    # --- a server restart --------------------------------------------------------------
+
+    def _request_restart(self, now: float, by: str) -> None:
+        """Send ``restart``; the run fence as for a reinit (a run announcing
+        itself waits until the request is on its way; its own mask write then
+        fails loudly if it lands while the server is down, never silently)."""
+        with self._cond:
+            why = self._blocker()
+            if why:
+                self._idle_since = None
+                self._blocked_by = why
+                self._refused_restart(by, why)
+                return
+            self._sending = True
+        no_reply, reply_timeout = _link_errors()
+
+        def sent():
+            with self._cond:
+                self._sending = False
+                self._cond.notify_all()
+
+        instance0 = self._status.get("instance")
+        asked = f"{by} (through the monitor server)"
+        try:
+            reply = self._link(self.config.host, self.config.port,
+                               {"cmd": "restart", "by": asked}, control=True,
+                               until=("queued", "error"), connect_s=SEND_WAIT_S,
+                               first_reply_s=3.0, total_s=3.0, on_sent=sent)
+        except (no_reply, reply_timeout, OSError) as e:
+            self._refused_restart(by, f"the restart request failed: {e or type(e).__name__}")
+            return
+        finally:
+            sent()
+        if reply.get("status") != "queued":
+            self._refused_restart(by, f"the SLM server refused it: {reply.get('error')}")
+            return
+        self._restart_t0, self._restart_instance0, self._restart_by = now, instance0, by
+        self._log(f"{self.config.label}: restarting the SLM server (asked for by {by}; the "
+                  f"machine was idle).")
+        self._record("slm_restart_requested", by=by, instance=instance0)
+        self._set(RESTARTING, f"asked for by {by}")
+        self._next_poll = now + 1.0
+
+    def _refused_restart(self, who: str, why: str) -> None:
+        self._log(f"{self.config.label}: the SLM server restart {who} asked for was not "
+                  f"sent: {why}.")
+        self._record("slm_restart_refused", by=who, msg=why)
+        self._last_restart = {"by": who, "at": time.time(), "result": f"not sent: {why}"}
+        self._notify()
+
+    def _follow_restart(self, now: float) -> None:
+        """While restarting: poll every second until a server with a new
+        ``instance`` answers (the old one is gone for a few seconds)."""
+        if now < self._next_poll:
+            return
+        status = self._poll(now)
+        self._next_poll = now + 1.0
+        t = now - (self._restart_t0 if self._restart_t0 is not None else now)
+        if status is not None and status.get("instance") and \
+                status.get("instance") != self._restart_instance0:
+            self._last_restart = {"by": self._restart_by, "at": time.time(), "t_s": round(t, 1),
+                                  "result": "done", "instance": status.get("instance"),
+                                  "start_count": status.get("start_count"),
+                                  "pattern_source": status.get("pattern_source"),
+                                  "pattern": status.get("pattern"),
+                                  "slm_ready": status.get("slm_ready")}
+            ready = "" if status.get("slm_ready") else (
+                f" -- but the SLM is not ready: {status.get('slm_not_ready')}")
+            self._log(f"{self.config.label}: SLM server restarted in {t:.1f} s (instance "
+                      f"{status.get('instance')}, {status.get('pattern_source')}){ready}.")
+            self._record("slm_restart_done", t_s=round(t, 1), instance=status.get("instance"),
+                         pattern_source=status.get("pattern_source"),
+                         slm_ready=status.get("slm_ready"))
+            self._restart_t0 = None
+            self._next_poll = now + self.config.poll_s
+            self._set(DUE if status.get("reinit_due") else IDLE, "")
+            return
+        if t > self.config.done_timeout_s:
+            text = (f"no new SLM server answered within {self.config.done_timeout_s:.0f} s of "
+                    f"the restart (check the supervisor window on the SLM PC)")
+            self._restart_t0 = None
+            self._last_restart = {"by": self._restart_by, "at": time.time(), "result": text}
+            self._log(f"{self.config.label}: {text}.")
+            self._record("slm_restart_failed", text=text)
+            self._next_poll = now + self.config.poll_s
+            self._set(UNREACHABLE, text)
+
     def _follow_reinit(self, now: float) -> None:
         """While re-initialising: poll every second until the epoch moves."""
         if self._reinit_t0 is None:
@@ -383,7 +536,12 @@ class SlmReinitService:
                 "interval_s": st.get("interval_s"), "pattern_epoch": st.get("pattern_epoch"),
                 "pattern": st.get("pattern"), "last_reinit": self._last_reinit,
                 "last_poll": self._last_poll, "blocked_by": self._blocked_by,
-                "manual_pending": self._manual, "last_manual": self._last_manual}
+                "manual_pending": self._manual, "last_manual": self._last_manual,
+                "supervised": bool(st.get("supervised")),
+                "can_restart": not self.restart_refusal(),
+                "server_instance": st.get("instance"), "start_count": st.get("start_count"),
+                "last_exit": st.get("last_exit"), "slm_ready": st.get("slm_ready"),
+                "restart_pending": self._restart_req, "last_restart": self._last_restart}
 
     def _set(self, state: str, detail: str) -> None:
         if state == self._state and detail == self._detail:

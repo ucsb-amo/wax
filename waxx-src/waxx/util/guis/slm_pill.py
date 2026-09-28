@@ -9,6 +9,9 @@ has:
 * **Re-initialise SLM now** -- the monitor server sends it only while the
   machine is idle (monitor running, no run starting, no reset or run loop),
   so the item is off, with the reason, while it is not;
+* **Restart SLM server** -- the server process exits and its supervisor on the
+  SLM PC starts a new one, which puts the saved pattern back; the same idle
+  check, and only for a server that says it is supervised;
 * **Launch spot finder** -- when the host GUI was given a launcher (the lab's
   SLM spot finder, started on this PC).
 
@@ -34,6 +37,7 @@ LOOK = {
     "unreachable": ("#c62828", "SLM server not answering"),
     "no_control": ("#9e9e9e", "SLM server from before 2026-09-28 (reinits by itself)"),
     "unknown": ("#9e9e9e", "not asked yet"),
+    "restarting": ("#ba68c8", "restarting the SLM server"),
 }
 _NOT_REPORTED = ("#9e9e9e", "not reported by the monitor server")
 
@@ -41,7 +45,7 @@ _NOT_REPORTED = ("#9e9e9e", "not reported by the monitor server")
 REINIT_STATES = ("idle", "due", "failed", "unreachable")
 
 _SUFFIX = {"due": " · due", "reinitialising": " · reinit…", "failed": " · failed",
-           "unreachable": " · ?"}
+           "unreachable": " · ?", "restarting": " · restart…"}
 
 
 def _css(color: str) -> str:
@@ -97,10 +101,30 @@ def describe_last(snap: dict | None) -> str:
     return text + ", pattern put back"
 
 
+def describe_restart(snap: dict | None) -> str:
+    """The server's supervision and its last restart, for people."""
+    snap = snap or {}
+    if not snap.get("supervised"):
+        return ""
+    text = "SLM server supervised"
+    if isinstance(snap.get("start_count"), int):
+        text += f" (start {snap['start_count']}"
+        if snap.get("last_exit"):
+            text += f", last exit {snap['last_exit']}"
+        text += ")"
+    last = snap.get("last_restart")
+    if isinstance(last, dict):
+        text += f"; restart asked for by {last.get('by')} at {_hhmm(last.get('at'))}: "
+        text += (f"done in {last['t_s']:.1f} s" if last.get("result") == "done"
+                 and isinstance(last.get("t_s"), (int, float)) else str(last.get("result")))
+    return text
+
+
 class SlmPill(QPushButton):
     """See the module docstring."""
 
     reinit_requested = pyqtSignal()
+    restart_requested = pyqtSignal()
     spot_finder_requested = pyqtSignal()
 
     def __init__(self, can_launch: bool = False, parent=None):
@@ -154,6 +178,29 @@ class SlmPill(QPushButton):
             return False, f"the machine is not idle: {snap['blocked_by']}"
         return True, ""
 
+    def restart_allowed(self) -> tuple[bool, str]:
+        """Whether "Restart SLM server" may be sent (the server checks again)."""
+        if not self.reachable:
+            return False, "the monitor server is unreachable"
+        if not self.reported:
+            return False, ("the monitor server does not report the SLM (older code, or no SLM "
+                           "configured)")
+        snap = self.snapshot or {}
+        if "can_restart" not in snap:
+            return False, "the monitor server predates SLM server restarts"
+        if snap.get("restart_pending"):
+            return False, f"a restart asked for by {snap['restart_pending']} is being sent"
+        if snap.get("blocked_by"):
+            return False, f"the machine is not idle: {snap['blocked_by']}"
+        if not snap.get("can_restart"):
+            if self.state in ("restarting", "reinitialising"):
+                return False, LOOK[self.state][1]
+            if not snap.get("supervised"):
+                return False, ("the SLM server is not running under its supervisor "
+                               "(supervisor.py on the SLM PC)")
+            return False, LOOK.get(self.state, _NOT_REPORTED)[1]
+        return True, ""
+
     def refresh(self) -> None:
         if not self.reachable:
             color, word = LOOK["unknown"][0], "monitor server unreachable"
@@ -180,15 +227,16 @@ class SlmPill(QPushButton):
         detail = str(snap.get("detail") or "") if self.reported else ""
         lines = [f"SLM hourly reinit: {word}." + (f" {detail}" if detail else "")]
         for text in (describe_next(snap) if self.reported else "",
-                     describe_last(snap) if self.reported else ""):
+                     describe_last(snap) if self.reported else "",
+                     describe_restart(snap) if self.reported else ""):
             if text:
                 lines.append(text)
         manual = snap.get("last_manual") if self.reported else None
         if isinstance(manual, dict):
             lines.append(f"Asked for by {manual.get('by')} at {_hhmm(manual.get('at'))}: "
                          f"{manual.get('result')}")
-        lines.append("Right-click: reinit now" + (", launch the spot finder"
-                                                   if self.can_launch else "") + ".")
+        lines.append("Right-click: reinit now, restart the SLM server"
+                     + (", launch the spot finder" if self.can_launch else "") + ".")
         return lines
 
     # -- the menu -------------------------------------------------------------------
@@ -213,6 +261,13 @@ class SlmPill(QPushButton):
         reinit.triggered.connect(self.reinit_requested.emit)
         if not allowed:
             menu.addAction(f"    not now: {why}").setEnabled(False)
+        r_allowed, r_why = self.restart_allowed()
+        restart = menu.addAction("Restart SLM server…")
+        restart.setObjectName("slm_restart_server")
+        restart.setEnabled(r_allowed)
+        restart.triggered.connect(self.restart_requested.emit)
+        if not r_allowed:
+            menu.addAction(f"    not now: {r_why}").setEnabled(False)
         if self.can_launch:
             menu.addSeparator()
             launch = menu.addAction("Launch spot finder")

@@ -170,6 +170,19 @@ def describe_entry(e: dict) -> str:
         text = f"SLM re-initialised in {e.get('t_s')} s, pattern put back: {e.get('pattern')}"
     elif kind == "slm_reinit_failed":
         text = f"SLM reinit FAILED: {e.get('text')}"
+    elif kind == "slm_restart_manual":
+        text = f"SLM server restart asked for by {e.get('by')}"
+    elif kind == "slm_restart_requested":
+        text = f"SLM server restart sent (machine idle), asked for by {e.get('by')}"
+    elif kind == "slm_restart_refused":
+        text = f"SLM server restart asked for by {e.get('by')} REFUSED: {e.get('msg')}"
+    elif kind == "slm_restart_done":
+        text = (f"SLM server restarted in {e.get('t_s')} s (instance {e.get('instance')}, "
+                f"{e.get('pattern_source')})")
+        if e.get("slm_ready") is False:
+            text += " -- SLM NOT READY"
+    elif kind == "slm_restart_failed":
+        text = f"SLM server restart FAILED: {e.get('text')}"
     elif kind == "slm_reinit_state":
         text = f"SLM reinit {e.get('state')}"
         if e.get("detail"):

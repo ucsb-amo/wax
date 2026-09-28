@@ -2030,6 +2030,7 @@ class DeviceStateGUI(QMainWindow):
         from waxx.util.guis.slm_pill import SlmPill  # noqa: PLC0415
         self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
         self.slm_pill.reinit_requested.connect(self._request_slm_reinit)
+        self.slm_pill.restart_requested.connect(self._request_slm_restart)
         self.slm_pill.spot_finder_requested.connect(self._launch_spot_finder)
         row.addWidget(self.slm_pill)
 
@@ -2642,6 +2643,45 @@ class DeviceStateGUI(QMainWindow):
         else:
             self._record_line(f"[slm] reinit refused: {reply.get('msg')}")
             QMessageBox.warning(self, "Re-initialise SLM",
+                                f"The monitor server did not send it: {reply.get('msg')}")
+
+    def _request_slm_restart(self) -> None:
+        """The SLM pill's "Restart SLM server": the server process exits and its
+        supervisor on the SLM PC starts a new one; only while the machine is idle."""
+        pill = self.slm_pill
+        if pill is None:
+            return
+        allowed, why = pill.restart_allowed()
+        if not allowed:
+            QMessageBox.warning(self, "Restart SLM server", f"Not sent: {why}.")
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Restart SLM server")
+        box.setText("The SLM server process exits and its supervisor on the SLM PC starts a "
+                    "new one (a few seconds): it re-initialises the SLM and puts the saved "
+                    "pattern back. The monitor server sends it only while no run is starting "
+                    "or running; a run started in those seconds fails its mask write with an "
+                    "error rather than running without its mask.")
+        yes = box.addButton("Restart", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        self._send_request({"type": "slm_reinit", "action": "restart", "client": host},
+                           self._on_slm_restart_reply)
+
+    def _on_slm_restart_reply(self, reply: dict) -> None:
+        if reply.get("status") == "ok":
+            self._record_line("[slm] server restart asked for; the monitor server sends it now")
+        else:
+            self._record_line(f"[slm] server restart refused: {reply.get('msg')}")
+            QMessageBox.warning(self, "Restart SLM server",
                                 f"The monitor server did not send it: {reply.get('msg')}")
 
     def _launch_spot_finder(self) -> None:

@@ -748,18 +748,28 @@ class MonitorUDPServer(UdpServer):
 
     def _reply_slm_reinit(self, obj: dict) -> dict:
         """``action`` "reinit": an operator's reinit now (the Device Control
-        GUI's SLM pill) -- refused unless the machine is idle; "status": the
-        service's snapshot."""
+        GUI's SLM pill) -- refused unless the machine is idle; "restart": an
+        operator's restart of the SLM server process (its supervisor starts it
+        again) -- the same check; "status": the service's snapshot."""
         if self.slm_reinit is None:
             return {"status": "error", "msg": "this monitor server has no SLM reinit configured"}
         action = obj.get("action")
         if action == "status":
             return {"status": "ok", "slm_reinit": self.slm_reinit.snapshot()}
-        if action != "reinit":
+        if action not in ("reinit", "restart"):
             return {"status": "error", "msg": f"unknown slm_reinit action {action!r}"}
         operator = str(obj.get("operator") or "")
         client = str(obj.get("client") or "")
         who = " on ".join(p for p in (operator, client) if p) or "a client"
+        if action == "restart":
+            refusal = self.slm_reinit.request_restart(who)
+            if refusal:
+                log.warning("SLM server restart requested by %s refused: %s", who, refusal)
+                self.journal.record("slm_restart_refused", by=who, msg=refusal)
+                return {"status": "error", "msg": refusal}
+            log.info("SLM server restart requested by %s: sent when the service next ticks.", who)
+            self.journal.record("slm_restart_manual", by=who)
+            return {"status": "ok"}
         refusal = self.slm_reinit.request_now(who)
         if refusal:
             log.warning("SLM reinit requested by %s refused: %s", who, refusal)
