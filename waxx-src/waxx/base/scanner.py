@@ -318,7 +318,8 @@ class Scanner():
         run_info.save_on_underflow the run instead ends normally and saves the
         shots taken (no traceback).  Any other exception out of scan_kernel
         runs cleanup_abort_kernel (the machine's safe state, no data write)
-        and is re-raised.
+        and is re-raised.  So does any exception out of pre_scan (the
+        warm-up shots).
 
         raise_underflow: ignored since 2026-09-27 (it used to re-raise without
         cleanup to get the traceback, which the default now gives).
@@ -390,7 +391,18 @@ class Scanner():
         if raise_underflow:
             self._note_raise_underflow_ignored()
 
-        self.pre_scan()
+        # pre_scan runs the warm-up shots (kexp.Base), full sequences that
+        # can fail like any shot. A failure there gets the same exit as the
+        # "anything else" case below: the machine's safe state, then the
+        # original exception with its traceback. No data write or shot
+        # notification exists for a warm-up shot, so there is nothing else
+        # to clean up.
+        try:
+            self.pre_scan()
+        except:
+            self.core.break_realtime()
+            self.cleanup_abort_kernel()
+            raise
 
         scanning = True
         aborted_bool = False
