@@ -74,14 +74,19 @@ INIT_HANG_S = 180.0
 def heartbeat_health(path, max_age_s=HEARTBEAT_MAX_AGE_S, task_hang_s=TASK_HANG_S,
                      init_hang_s=INIT_HANG_S, now=time.time):
     """``health(pid) -> (ok, why)`` from the server's heartbeat file; ok None:
-    no heartbeat from this process yet."""
+    no heartbeat from this process yet.
+
+    ``pid`` is the process the supervisor started. Under a venv that is the
+    venv's ``python.exe`` launcher, and the server is the launcher's child, so
+    the heartbeat's ``ppid`` matches instead of its ``pid`` (checking ``pid``
+    alone had every server killed as hung 65 s after it started, 2026-09-28)."""
     def check(pid):
         try:
             with open(path, encoding="utf-8") as fh:
                 beat = json.load(fh)
         except (OSError, ValueError):
             return None, "no heartbeat yet"
-        if beat.get("pid") != pid:
+        if pid not in (beat.get("pid"), beat.get("ppid")):
             return None, "no heartbeat from this process yet"
         age = now() - float(beat.get("t", 0))
         if age > max_age_s:

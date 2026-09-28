@@ -297,6 +297,7 @@ def test_the_heartbeat_file(make_server):
     host.rs._write_heartbeat()
     beat = json.load(open(host.rs._heartbeat_path, encoding="utf-8"))
     assert beat["pid"] == os.getpid() and beat["worker_alive"] is True
+    assert beat["ppid"] == os.getppid()
     assert beat["task"] is None and beat["queue_len"] == 0 and beat["slm_ready"] is True
     assert abs(beat["t"] - time.time()) < 5
 
@@ -346,7 +347,13 @@ def test_the_heartbeat_hang_check(supervisor_mod, tmp_path):
     assert check(42)[0] is None                           # no file yet
     beat(pid=41)
     assert check(42)[0] is None                           # an earlier process's
+    beat(pid=41, ppid=40)
+    assert check(42)[0] is None
     beat()
+    assert check(42) == (True, "")
+    # Under a venv the supervisor starts a launcher, which starts the server:
+    # the pid it holds is the server's parent.
+    beat(pid=43, ppid=42)
     assert check(42) == (True, "")
     now[0] = 1030.0
     assert check(42)[0] is False                          # stale
@@ -410,7 +417,7 @@ def _e2e_status(port):
         return None
 
 
-def test_the_supervisor_end_to_end(tmp_path):
+def test_the_supervisor_end_to_end(tmp_path, supervisor_mod):
     srv = tmp_path / "srv"
     srv.mkdir()
     for name in ("run_server.py", "slm_protocol.py"):
@@ -428,6 +435,14 @@ def test_the_supervisor_end_to_end(tmp_path):
         assert _wait(lambda: _e2e_status(port) is not None, 30), "no server came up"
         st1 = _e2e_status(port)
         assert st1["supervised"] is True and st1["start_count"] == 1
+        # The hang check must take the server's heartbeat for its own child's.
+        # Under a venv, sys.executable is a launcher and the server is the
+        # launcher's child: on 2026-09-28 every server was killed as "hung"
+        # 65 s after it started, because the pids never matched.
+        check = supervisor_mod.heartbeat_health(str(state / "heartbeat.json"))
+        server_pid = json.loads((state / "supervisor.json").read_text(encoding="utf-8"))[
+            "server_pid"]
+        assert _wait(lambda: check(server_pid)[0] is True, 10), check(server_pid)
         applied = slm_link.exchange("127.0.0.1", port,
                                     {"mask": "spot", "center": [123, 456], "dimension": 7},
                                     until=("applied", "error"), total_s=5.0)

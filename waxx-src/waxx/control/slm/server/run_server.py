@@ -381,7 +381,9 @@ def _write_heartbeat():
     if _heartbeat_path is None:
         return
     task = _current_task
-    beat = {"pid": os.getpid(), "instance": INSTANCE, "t": time.time(),
+    # ppid too: under a venv the supervisor starts a launcher, whose child this
+    # process is, so the pid the supervisor holds is our parent's.
+    beat = {"pid": os.getpid(), "ppid": os.getppid(), "instance": INSTANCE, "t": time.time(),
             "worker_alive": _worker_alive,
             "task": None if task is None else task["type"],
             "task_age_s": None if task is None else round(time.monotonic() - task["since"], 1),
