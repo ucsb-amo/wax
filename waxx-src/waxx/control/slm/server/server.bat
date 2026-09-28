@@ -41,10 +41,17 @@ timeout /t 1 /nobreak >nul
 goto wait_display_loop
 
 :start
-echo Windows sees %SCREENS% displays. Starting the SLM server.
+echo Windows sees %SCREENS% displays. Starting the SLM server under its supervisor.
+echo (It starts the server again when it is asked to restart, crashes or hangs.
+echo  Ctrl+C or closing this window stops the server.)
 call %kpy%
 cd /d "%~dp0"
-python run_server.py
+python supervisor.py
+if "%ERRORLEVEL%"=="90" (
+    echo The supervisor could not load waxx.util.supervise: running the SLM server
+    echo WITHOUT supervision -- nothing restarts it if it stops.
+    python run_server.py
+)
 pause
 exit /b
 

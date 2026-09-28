@@ -1,14 +1,21 @@
 import socket
 import json
+import os
+import sys
 import time
 import threading
 import queue
+import uuid
 from slm_server import SLM_server
-from slm_protocol import split_commands, command_seq, control_command, Replier
+from slm_protocol import (split_commands, command_seq, control_command, Replier,
+                          DEFAULT_SERVER_IP, DEFAULT_SERVER_PORT, CAPABILITIES,
+                          EXIT_SHUTDOWN, EXIT_FATAL, EXIT_INIT_FAILED, EXIT_PORT_IN_USE,
+                          EXIT_RESTART, default_state_dir)
 
 
-SERVER_IP = '192.168.1.102'
-SERVER_PORT = 5000
+# SLM_SERVER_IP / SLM_SERVER_PORT: for tests (127.0.0.1); the lab uses the defaults.
+SERVER_IP = os.environ.get("SLM_SERVER_IP") or DEFAULT_SERVER_IP
+SERVER_PORT = int(os.environ.get("SLM_SERVER_PORT") or DEFAULT_SERVER_PORT)
 BUFFER_SIZE = 1024
 
 REINIT_INTERVAL_SEC = 3600          # reinitialize period
@@ -23,6 +30,8 @@ CMD_QUEUE_MAXSIZE = 256
 AUTO_REINIT = False
 # A due reinit nobody asked for is reported (printed) after this long, then hourly.
 REINIT_OVERDUE_WARN_SEC = 6 * 3600
+# How often the heartbeat file (for the supervisor's hang check) is written.
+HEARTBEAT_SEC = 2.0
 
 slmtest = SLM_server()
 cmd_q = queue.Queue(maxsize=CMD_QUEUE_MAXSIZE)
@@ -60,6 +69,27 @@ _reinit = {"due_since": None,           # monotonic time the timer marked it due
            "last_error": "",
            "pattern_epoch": 0}
 
+# This process: who it is, and whether the SLM can take a pattern. After a failed
+# initialisation the SDK has been deleted (Load_lut failure path), so a pattern
+# must not be written until a reinit succeeds.
+INSTANCE = uuid.uuid4().hex[:8]
+STARTED_AT = time.time()
+_slm_ready = False
+_slm_not_ready_why = "not initialised yet"
+_applies = 0
+_pattern_source = "default (nothing saved)"
+_bind_mode = ""
+# The task the worker is on, for the heartbeat: {"type", "since"} or None.
+_current_task = None
+_worker_alive = False
+# Set by main() (from SLM_STATE_DIR / SLM_HEARTBEAT_PATH); None: not written.
+_state_path = None
+_heartbeat_path = None
+# How the process ends itself. os._exit: the worker thread must be able to end
+# the whole process (a restart, a shutdown, a fatal error). Tests replace it.
+_exit = os._exit
+
+
 def _touch_activity():
     global _last_activity_monotonic
     with _last_activity_lock:
@@ -69,71 +99,152 @@ def _seconds_since_last_activity():
     with _last_activity_lock:
         return time.monotonic() - _last_activity_monotonic
 
-def slm_worker():
+
+def _supervised():
+    return os.environ.get("SLM_SUPERVISED") == "1"
+
+
+def _end_process(code, why):
+    """Leave now, with the exit code the supervisor acts on."""
+    print(f"Exiting (code {code}): {why}", flush=True)
     try:
-        print("Initializing SLM...")
-        slmtest.initialize_slm()
-        _apply_pattern(last_pattern, fast=True)
-        _touch_activity()
-    except Exception as e:
-        print(f"Error during initial init: {e}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    _exit(code)
 
+
+def _drop_queued(why):
+    """Answer everything still queued: it will not be applied by this process."""
     while True:
-        task = cmd_q.get() 
-        if task is None:
-            break  
-
-        ttype = task.get("type")
         try:
-            if ttype == "REINIT":
-                _do_reinit(task)
+            task = cmd_q.get_nowait()
+        except queue.Empty:
+            return
+        if task is not None:
+            _reply(task, status="dropped", error=why)
+        cmd_q.task_done()
 
-            elif ttype == "APPLY":
-                last_pattern.update({
-                    "dimension": task["dimension"],
-                    "phase": task["phase"],
-                    "center_x": task["center_x"],
-                    "center_y": task["center_y"],
-                    "grating_spacing": task["grating_spacing"],
-                    "angle_deg": task["angle_deg"],
-                    "mask": task["mask"]
-                })
-                t0 = time.monotonic()
-                _apply_pattern(last_pattern, fast=True)
-                _touch_activity()
-                # Write_image has returned. The SLM still needs its next video
-                # frame and the liquid-crystal response time before the light
-                # sees the new pattern; the client waits that out itself.
-                _reply(task, status="applied",
-                       center=[last_pattern["center_x"], last_pattern["center_y"]],
-                       mask=last_pattern["mask"],
-                       dimension=last_pattern["dimension"],
-                       t_apply_s=round(time.monotonic() - t0, 4))
 
-            else:
-                print(f"Unknown task type: {ttype}")
+def slm_worker():
+    global _slm_ready, _slm_not_ready_why, _worker_alive, _current_task
+    _worker_alive = True
+    try:
+        _current_task = {"type": "INIT", "since": time.monotonic()}
+        try:
+            print("Initializing SLM...")
+            slmtest.initialize_slm()
+            _slm_ready, _slm_not_ready_why = True, ""
+            _apply_pattern(last_pattern, fast=True)
+            _save_pattern()
+            _touch_activity()
         except Exception as e:
-            print(f"Error handling task {ttype}: {e}")
-            _reply(task, status="error", error=str(e))
-        finally:
-            cmd_q.task_done()
+            # Without an initialised SLM this server is useless; its supervisor
+            # starts it again (with a growing delay while it keeps failing).
+            print(f"Error during initial init: {e}")
+            _slm_ready, _slm_not_ready_why = False, f"start-up init failed: {e}"
+            _current_task = None
+            _worker_alive = False
+            _end_process(EXIT_INIT_FAILED, f"the SLM could not be initialised: {e}")
+            return
+        _current_task = None
+
+        while True:
+            task = cmd_q.get()
+            if task is None:
+                break
+
+            ttype = task.get("type")
+            _current_task = {"type": ttype, "since": time.monotonic()}
+            try:
+                if ttype == "REINIT":
+                    _do_reinit(task)
+
+                elif ttype == "APPLY":
+                    if not _slm_ready:
+                        _reply(task, status="error",
+                               error=f"the SLM is not initialised ({_slm_not_ready_why}); "
+                                     f"ask for a reinit")
+                        continue
+                    last_pattern.update({
+                        "dimension": task["dimension"],
+                        "phase": task["phase"],
+                        "center_x": task["center_x"],
+                        "center_y": task["center_y"],
+                        "grating_spacing": task["grating_spacing"],
+                        "angle_deg": task["angle_deg"],
+                        "mask": task["mask"]
+                    })
+                    t0 = time.monotonic()
+                    _apply_pattern(last_pattern, fast=True)
+                    _note_applied()
+                    _touch_activity()
+                    # Write_image has returned. The SLM still needs its next video
+                    # frame and the liquid-crystal response time before the light
+                    # sees the new pattern; the client waits that out itself.
+                    _reply(task, status="applied",
+                           center=[last_pattern["center_x"], last_pattern["center_y"]],
+                           mask=last_pattern["mask"],
+                           dimension=last_pattern["dimension"],
+                           t_apply_s=round(time.monotonic() - t0, 4))
+
+                elif ttype == "EXIT":
+                    code = task["code"]
+                    word = "restarting" if code == EXIT_RESTART else "shutting_down"
+                    print(f"{'Restart' if code == EXIT_RESTART else 'Shutdown'} asked for by "
+                          f"{task.get('by') or 'a client'}.")
+                    _save_pattern()
+                    try:
+                        slmtest.release()
+                    except Exception as e:
+                        print(f"Releasing the SLM SDK failed (the process exits anyway): {e}")
+                    _reply(task, status=word)
+                    _drop_queued(f"the SLM server is {word.replace('_', ' ')}")
+                    _end_process(code, word.replace("_", " "))
+                    return
+
+                else:
+                    print(f"Unknown task type: {ttype}")
+            except Exception as e:
+                print(f"Error handling task {ttype}: {e}")
+                _reply(task, status="error", error=str(e))
+            finally:
+                _current_task = None
+                cmd_q.task_done()
+    except BaseException as e:           # the worker must never die quietly
+        _worker_alive = False
+        _end_process(EXIT_FATAL, f"the SLM worker died: {type(e).__name__}: {e}")
+        return
+    _worker_alive = False
+
+
+def _note_applied():
+    global _applies
+    _applies += 1
+    _save_pattern()
+
 
 def _do_reinit(task):
     """Re-initialise the SLM and put back the pattern it showed (last_pattern).
 
     It used to put back default_pattern (a blank mask): a run whose mask was
     written at its start then ran on blank (runs 83224-83344, 2026-09-27/28)."""
+    global _slm_ready, _slm_not_ready_why
     with _reinit_lock:
         _reinit["in_progress"] = True
     t0 = time.monotonic()
     try:
         print("Reinitializing SLM...")
         slmtest.initialize_slm()
+        _slm_ready, _slm_not_ready_why = True, ""
         print("Restoring the last pattern after reinitializing...\n")
         _apply_pattern(last_pattern, fast=True)
     except Exception as e:
-        # Still due: the next request tries again.
+        # Still due: the next request tries again. Until one succeeds the SDK may
+        # be gone (Load_lut failure deletes it), so patterns are refused.
         print(f"Error during reinit: {e}")
+        _slm_ready, _slm_not_ready_why = False, f"the last reinit failed: {e}"
         with _reinit_lock:
             _reinit["in_progress"] = False
             _reinit["last_error"] = str(e)
@@ -155,6 +266,10 @@ def _status():
     now = time.monotonic()
     with _reinit_lock:
         r = dict(_reinit)
+    try:
+        start_count = int(os.environ.get("SUPERVISOR_START_COUNT", ""))
+    except ValueError:
+        start_count = None
     return {
         "status": "ok",
         "reinit_due": r["due_since"] is not None,
@@ -170,6 +285,18 @@ def _status():
         "idle_s": round(_seconds_since_last_activity(), 1),
         "queue_len": cmd_q.qsize(),
         "auto_reinit": AUTO_REINIT,
+        "pid": os.getpid(),
+        "instance": INSTANCE,
+        "started_at": STARTED_AT,
+        "supervised": _supervised(),
+        "start_count": start_count,
+        "last_exit": os.environ.get("SUPERVISOR_LAST_EXIT") or None,
+        "slm_ready": _slm_ready,
+        "slm_not_ready": "" if _slm_ready else _slm_not_ready_why,
+        "applies": _applies,
+        "pattern_source": _pattern_source,
+        "bind": _bind_mode,
+        "capabilities": list(CAPABILITIES),
     }
 
 
@@ -202,6 +329,77 @@ def _apply_pattern(pat, fast=True): # Generate and upload a pattern
         f'spacing={pat["grating_spacing"]}, angle={pat["angle_deg"]}'
     )
     print('Waiting for next task...\n')
+
+
+# --- the pattern survives a restart --------------------------------------------------
+
+_PATTERN_KEYS = {"dimension": int, "phase": float, "center_x": int, "center_y": int,
+                 "grating_spacing": int, "angle_deg": int, "mask": int}
+
+
+def _save_pattern():
+    """Write last_pattern to the state file (atomically), so the next process --
+    after a restart or a crash -- puts the same pattern back."""
+    if _state_path is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(_state_path), exist_ok=True)
+        tmp = _state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"pattern": dict(last_pattern), "saved_at": time.time(),
+                       "instance": INSTANCE}, fh)
+        os.replace(tmp, _state_path)
+    except OSError as e:
+        print(f"Could not save the pattern to {_state_path}: {e}")
+
+
+def _load_pattern():
+    """last_pattern from the state file, if there is a valid one; says where from."""
+    global _pattern_source
+    if _state_path is None or not os.path.exists(_state_path):
+        _pattern_source = "default (nothing saved)"
+        return False
+    try:
+        with open(_state_path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        pat = {k: cast(saved["pattern"][k]) for k, cast in _PATTERN_KEYS.items()}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        _pattern_source = f"default (saved pattern unreadable: {e})"
+        print(f"Saved pattern in {_state_path} not used: {e}")
+        return False
+    last_pattern.update(pat)
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(saved.get("saved_at", 0)))
+    _pattern_source = f"restored (saved {when})"
+    print(f"Restoring the pattern saved {when}: center=({pat['center_x']},{pat['center_y']}), "
+          f"mask={pat['mask']}, dimension={pat['dimension']}")
+    return True
+
+
+# --- heartbeat, for the supervisor's hang check ----------------------------------------
+
+def _write_heartbeat():
+    if _heartbeat_path is None:
+        return
+    task = _current_task
+    beat = {"pid": os.getpid(), "instance": INSTANCE, "t": time.time(),
+            "worker_alive": _worker_alive,
+            "task": None if task is None else task["type"],
+            "task_age_s": None if task is None else round(time.monotonic() - task["since"], 1),
+            "queue_len": cmd_q.qsize(), "applies": _applies, "slm_ready": _slm_ready}
+    try:
+        tmp = _heartbeat_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(beat, fh)
+        os.replace(tmp, _heartbeat_path)
+    except OSError:
+        pass
+
+
+def heartbeat_loop(stop=None):
+    while stop is None or not stop.is_set():
+        _write_heartbeat()
+        time.sleep(HEARTBEAT_SEC)
+
 
 def periodic_reinit_scheduler(stop=None):
     """
@@ -256,20 +454,80 @@ def periodic_reinit_scheduler(stop=None):
         except queue.Full:
             print("Skipped: queue full.")
 
-def start_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((SERVER_IP, SERVER_PORT))
-        server_socket.listen(1)
-        print(f'Server listening on {SERVER_IP}:{SERVER_PORT}...')
+
+# --- listening ------------------------------------------------------------------------
+
+class PortInUse(OSError):
+    """Another server is listening on the port."""
+
+
+def _port_has_listener(ip, port, timeout=0.5):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _open_listener(ip, port):
+    """The listening socket, never shared with another server.
+
+    SO_REUSEADDR alone lets a second server bind the same port on Windows while
+    the first one still listens -- two servers then take turns with the SLM.
+    So: refuse if something already answers on the port; bind exclusively
+    (SO_EXCLUSIVEADDRUSE) where the OS has it; fall back to SO_REUSEADDR only
+    when the exclusive bind is refused with nobody listening (connections of
+    the previous process lingering in TIME_WAIT after a restart)."""
+    global _bind_mode
+    if _port_has_listener(ip, port):
+        raise PortInUse(f"something already listens on {ip}:{port}")
+    excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if excl is not None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, excl, 1)
+            s.bind((ip, port))
+            s.listen(1)
+            _bind_mode = "exclusive"
+            return s
+        except OSError as e:
+            s.close()
+            if _port_has_listener(ip, port):
+                raise PortInUse(f"something already listens on {ip}:{port}") from e
+            first_error = e
+    else:
+        first_error = None
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, port))
+    s.listen(1)
+    _bind_mode = ("reuseaddr" if first_error is None else
+                  f"reuseaddr (exclusive bind refused: {first_error})")
+    return s
+
+
+def start_server(listener=None):
+    server_socket = listener or _open_listener(SERVER_IP, SERVER_PORT)
+    with server_socket:
+        print(f'Server listening on {SERVER_IP}:{SERVER_PORT} ({_bind_mode})...')
 
         while True:
             conn, addr = server_socket.accept()
             print(f'Connected by {addr}')
-            handle_client(conn)
+            handle_client(conn, addr)
 
-def handle_client(conn):
+def _is_local_peer(conn):
+    """Whether a connection comes from this PC (loopback, or its own address)."""
+    try:
+        peer = conn.getpeername()[0]
+        own = conn.getsockname()[0]
+    except OSError:
+        return False
+    return peer == own or peer.startswith("127.") or peer == "::1"
+
+def handle_client(conn, addr=None):
     replier = Replier(conn)
+    local = _is_local_peer(conn)
     pending = ""
     with conn:
         while True:
@@ -282,7 +540,7 @@ def handle_client(conn):
                 pending += data.decode('utf-8', errors='replace')
                 commands, pending = split_commands(pending, at_eof=at_eof)
                 for command in commands:
-                    _handle_command(command.strip(), replier)
+                    _handle_command(command.strip(), replier, local=local)
                 if at_eof:
                     print("Client disconnected.")
                     break
@@ -294,10 +552,23 @@ def handle_client(conn):
                 print(f"Error while handling client: {e}")
                 break
 
-def _handle_control(ctl, seq, replier):
+def _enqueue_exit(code, seq, replier, by):
+    """Queue a restart / shutdown behind any pattern already queued."""
+    task = {"type": "EXIT", "code": code, "by": by}
+    if seq is not None:
+        task["seq"] = seq
+        task["replier"] = replier
+        replier.send({"seq": seq, "status": "queued"})
+    try:
+        cmd_q.put_nowait(task)
+    except queue.Full:
+        _reply(task, status="error", error="command queue full")
+
+def _handle_control(ctl, seq, replier, local=False):
     """A control command ({"cmd": ...}): "status" answers at once; "reinit"
     queues a reinit behind any pattern already queued and answers "queued",
-    then "reinit_done" (or "error") when it is done."""
+    then "reinit_done" (or "error") when it is done; "restart" / "shutdown"
+    queue the process's exit (see slm_protocol)."""
     cmd = ctl.get("cmd")
     if cmd == "status":
         if seq is not None:
@@ -315,17 +586,36 @@ def _handle_control(ctl, seq, replier):
         except queue.Full:
             _reply(task, status="error", error="command queue full")
         return
+    if cmd == "restart":
+        if not _supervised():
+            why = ("not running under its supervisor (supervisor.py): nothing would start "
+                   "it again")
+            print(f"Restart asked for by {ctl.get('by') or 'a client'} REFUSED: {why}")
+            if seq is not None:
+                replier.send({"seq": seq, "status": "error", "error": why})
+            return
+        _enqueue_exit(EXIT_RESTART, seq, replier, ctl.get("by"))
+        return
+    if cmd == "shutdown":
+        if not local:
+            why = "shutdown is accepted only from the SLM PC itself"
+            print(f"Shutdown asked for by {ctl.get('by') or 'a client'} REFUSED: {why}")
+            if seq is not None:
+                replier.send({"seq": seq, "status": "error", "error": why})
+            return
+        _enqueue_exit(EXIT_SHUTDOWN, seq, replier, ctl.get("by"))
+        return
     if seq is not None:
         replier.send({"seq": seq, "status": "error", "error": f"unknown cmd {cmd!r}"})
 
 
-def _handle_command(command, replier):
+def _handle_command(command, replier, local=False):
     print(f"Received command: {command}")
     seq = command_seq(command)
 
     ctl = control_command(command)
     if ctl is not None:
-        _handle_control(ctl, seq, replier)
+        _handle_control(ctl, seq, replier, local=local)
         return
 
     dims = analyze_command(command)
@@ -428,9 +718,26 @@ def analyze_command(command):
             print("Wrong plaintext format length.")
             return None
 
-if __name__ == '__main__':
+
+def main():
+    global _state_path, _heartbeat_path
+    _state_path = os.path.join(default_state_dir(), "last_pattern.json")
+    _heartbeat_path = os.environ.get("SLM_HEARTBEAT_PATH") or None
+    print(f"SLM server {INSTANCE} (pid {os.getpid()})"
+          + (f", supervised, start {os.environ.get('SUPERVISOR_START_COUNT')}"
+             if _supervised() else ", not supervised"))
+    _load_pattern()
+    # The port first: a second server must stop here, before it touches the SLM.
+    try:
+        listener = _open_listener(SERVER_IP, SERVER_PORT)
+    except PortInUse as e:
+        _end_process(EXIT_PORT_IN_USE, f"{e}: another SLM server is running")
+        return
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=slm_worker, daemon=True).start()
-
     threading.Thread(target=periodic_reinit_scheduler, daemon=True).start()
+    start_server(listener)
 
-    start_server()
+
+if __name__ == '__main__':
+    main()

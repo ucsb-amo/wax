@@ -43,6 +43,25 @@ The server marks a reinit due an hour after the last one (or after it started)
 and no longer does it by itself: the monitor server asks for it when no run is
 starting or running. After a reinit the server puts back the pattern it
 showed, and ``pattern_epoch`` goes up.
+
+Supervision (2026-09-28): on the SLM PC the server runs under ``supervisor.py``
+(:mod:`waxx.util.supervise`), which starts it again when it exits. Two more
+control commands, both queued behind any pattern already queued:
+
+    SLMCTL {"cmd": "restart", "seq": n, "by": "..."}
+        -> {"seq": n, "status": "queued"}, then {"seq": n, "status": "restarting"};
+           the process exits with EXIT_RESTART and its supervisor starts a new
+           one, which puts the saved pattern back. Refused ("error") when the
+           server is not supervised -- nothing would start it again.
+    SLMCTL {"cmd": "shutdown", "seq": n, "by": "..."}
+        -> {"seq": n, "status": "queued"}, then {"seq": n, "status": "shutting_down"};
+           exits with EXIT_SHUTDOWN and the supervisor stops too. Accepted only
+           from the SLM PC itself (the supervisor's graceful stop).
+
+Commands still queued when the process exits are answered ``"dropped"``.
+``status`` also reports ``pid``, ``instance`` (new for every process),
+``started_at``, ``supervised``, ``start_count``, ``last_exit``, ``slm_ready``,
+``applies``, ``pattern_source``, ``bind`` and ``capabilities``.
 """
 
 import json
@@ -54,6 +73,35 @@ MAX_PENDING_CHARS = 65536
 
 #: First word of a control command line.
 CONTROL_PREFIX = "SLMCTL"
+
+#: Where the SLM server listens (the SLM PC).
+DEFAULT_SERVER_IP = "192.168.1.102"
+DEFAULT_SERVER_PORT = 5000
+
+#: Exit codes: the server's protocol with its supervisor (waxx.util.supervise).
+EXIT_SHUTDOWN = 0          # asked to stop: the supervisor stops too
+EXIT_FATAL = 70            # the SLM worker died unexpectedly
+EXIT_INIT_FAILED = 71      # the SLM could not be initialised at start-up
+EXIT_PORT_IN_USE = 72      # another SLM server is already listening on the port
+EXIT_RESTART = 75          # asked to restart: the supervisor starts it again at once
+
+EXIT_MEANING = {EXIT_SHUTDOWN: "shut down on request", EXIT_FATAL: "SLM worker died",
+                EXIT_INIT_FAILED: "SLM initialisation failed at start-up",
+                EXIT_PORT_IN_USE: "another SLM server holds the port",
+                EXIT_RESTART: "restart requested"}
+
+#: What this server understands, reported by ``status``.
+CAPABILITIES = ("seq", "status", "reinit", "restart", "shutdown")
+
+
+def default_state_dir() -> str:
+    """Where the saved pattern, the heartbeat and the supervisor's logs live on
+    this PC: ``SLM_STATE_DIR``, else ``%LOCALAPPDATA%\\slm_server``."""
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    return (os.environ.get("SLM_STATE_DIR")
+            or os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+                            "slm_server"))
 
 _decoder = json.JSONDecoder()
 

@@ -210,7 +210,12 @@ class SLM_server():
         else:
             print("Error: Failed to load LUT!")
             slm_lib.Delete_SDK()
-            exit()
+            # Raise, not exit(): initialize_slm runs in the server's worker
+            # thread, where exit() ended only that thread and left the server
+            # accepting patterns it would never apply. run_server.py exits the
+            # whole process on this, and its supervisor starts it again.
+            raise RuntimeError(f"failed to load the LUT {LUT_PATH} (Load_lut returned "
+                               f"{load_success}); is the SLM showing as a display?")
 
         #  Clear the SLM Before Uploading Image
         clear_pattern = np.zeros((height * width), dtype=np.uint8)
@@ -269,6 +274,15 @@ class SLM_server():
             img_data = np.array(img, dtype=np.uint8).ravel()
 
             slm_lib.Write_image(img_data.ctypes.data_as(POINTER(c_ubyte)), is_eight_bit_image)
+
+    def release(self):
+        """Hand the SDK back before the process exits on purpose (a restart or a
+        shutdown), so the next server's Create_SDK starts from a clean slate.
+        initialize_slm calls Delete_SDK first anyway; this is the tidy path."""
+        global slm_lib
+        if slm_lib is not None and self.slm_initialized:
+            slm_lib.Delete_SDK()
+            self.slm_initialized = False
 
 
 
