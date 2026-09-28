@@ -24,11 +24,19 @@ servers from before this change drop without applying anything: against such
 a server this service only says so (state ``no_control``, checked again every
 ``retry_after_failure_s``) -- that server still re-initialises by itself.
 
+An operator can ask for one now (``request_now``, the Device Control GUI's SLM
+pill): the same check, no settle time. The SLM server restarts its hour after
+every reinit, however it was asked for.
+
 What the service reports (``snapshot()``, served in ``status_json`` as
 ``slm_reinit`` and broadcast as ``{"type": "slm_reinit"}``)::
 
-    {"state", "detail", "since", "reinit_due", "due_for_s", "pattern_epoch",
-     "pattern", "last_reinit", "last_poll", "blocked_by"}
+    {"label", "state", "detail", "since", "reinit_due", "due_for_s",
+     "next_due_at", "interval_s", "pattern_epoch", "pattern", "last_reinit",
+     "last_poll", "blocked_by", "manual_pending", "last_manual"}
+
+``next_due_at`` is the wall time the SLM server next marks a reinit due (as of
+the last poll); the reinit itself follows once the machine is idle.
 
 ``state`` is one of :data:`STATES`.
 """
@@ -125,6 +133,9 @@ class SlmReinitService:
         self._retry_at = 0.0                        # clock time
         self._last_reinit: dict | None = None
         self._ever_answered = False
+        self._next_due_at: float | None = None      # wall time the server marks it due
+        self._manual: str | None = None             # who asked for a reinit now
+        self._last_manual: dict | None = None       # {"by", "at", "result"}
 
     # --- lifecycle ---------------------------------------------------------------
 
@@ -155,6 +166,31 @@ class SlmReinitService:
         with self._cond:
             self._cond.wait_for(lambda: not self._sending, timeout)
 
+    # --- an operator's reinit ------------------------------------------------------
+
+    def request_now(self, who: str = "") -> str:
+        """Re-initialise now rather than when due -- still only while nothing
+        could be using the SLM: the same check as a due reinit here, and again
+        under the lock when it is sent (the next tick, within ``TICK_S``); no
+        settle time and no pause after a failure.  Returns "" when it will be
+        sent, else why not."""
+        with self._cond:
+            why = self._blocker()
+            if why:
+                return why
+            if self._state == REINITIALISING:
+                return "the SLM is re-initialising already"
+            if self._state == NO_CONTROL:
+                return ("the SLM server takes no control commands (a server from before "
+                        "2026-09-28, which re-initialises by itself)")
+            if self._state == UNKNOWN:
+                return "the SLM server has not answered yet"
+            if self._manual is not None:
+                return f"a reinit asked for by {self._manual} is about to be sent"
+            self._manual = who or "an operator"
+        self._notify()
+        return ""
+
     # --- one pass ----------------------------------------------------------------
 
     def tick(self) -> None:
@@ -172,6 +208,14 @@ class SlmReinitService:
             return
         if now >= self._next_poll:
             self._poll(now)
+        with self._cond:
+            manual, self._manual = self._manual, None
+        if manual is not None:
+            if self._state in (REINITIALISING, NO_CONTROL):
+                self._refused_manual(manual, f"the SLM server is {self._state.replace('_', ' ')}")
+            else:
+                self._request_reinit(now, by=manual)
+            return
         if (self._state == DUE and self._idle_since is not None
                 and now - self._idle_since >= self.config.settle_s
                 and now >= self._retry_at):
@@ -212,6 +256,9 @@ class SlmReinitService:
                 self._set(UNREACHABLE, f"status refused: {status.get('error')}")
             return None
         self._status = status
+        next_in = status.get("next_due_in_s")
+        self._next_due_at = (self._last_poll + next_in
+                             if isinstance(next_in, (int, float)) else None)
         if not following:
             if status.get("reinit_in_progress"):
                 self._set(REINITIALISING, "the SLM server is re-initialising")
@@ -223,12 +270,15 @@ class SlmReinitService:
                 self._set(IDLE, "")
         return status
 
-    def _request_reinit(self, now: float) -> None:
+    def _request_reinit(self, now: float, by: str | None = None) -> None:
+        """Send the reinit: the due one (``by`` None) or an operator's."""
         with self._cond:
             why = self._blocker()
             if why:
                 self._idle_since = None
                 self._blocked_by = why
+                if by is not None:
+                    self._refused_manual(by, why)
                 return
             self._sending = True
         no_reply, reply_timeout = _link_errors()
@@ -239,9 +289,10 @@ class SlmReinitService:
                 self._cond.notify_all()
 
         epoch0 = self._status.get("pattern_epoch")
+        asked = "the monitor server" if by is None else f"{by} (through the monitor server)"
         try:
             reply = self._link(self.config.host, self.config.port,
-                               {"cmd": "reinit", "by": "the monitor server"}, control=True,
+                               {"cmd": "reinit", "by": asked}, control=True,
                                until=("queued", "error"), connect_s=SEND_WAIT_S,
                                first_reply_s=3.0, total_s=3.0, on_sent=sent)
         except no_reply:
@@ -264,12 +315,21 @@ class SlmReinitService:
             return
         self._reinit_t0 = now
         self._reinit_epoch0 = epoch0
-        self._log(f"{self.config.label}: re-initialising (asked for by the monitor server; "
+        self._retry_at = 0.0
+        if by is not None:
+            self._last_manual = {"by": by, "at": time.time(), "result": "sent"}
+        self._log(f"{self.config.label}: re-initialising (asked for by {asked}; "
                   f"the machine was idle).")
-        self._record("slm_reinit_requested", epoch=epoch0,
+        self._record("slm_reinit_requested", epoch=epoch0, by=by or "",
                      due_for_s=self._status.get("due_for_s"))
-        self._set(REINITIALISING, "asked for by the monitor server")
+        self._set(REINITIALISING, f"asked for by {by}" if by else "asked for by the monitor server")
         self._next_poll = now + 1.0
+
+    def _refused_manual(self, who: str, why: str) -> None:
+        self._log(f"{self.config.label}: the reinit {who} asked for was not sent: {why}.")
+        self._record("slm_reinit_refused", by=who, msg=why)
+        self._last_manual = {"by": who, "at": time.time(), "result": f"not sent: {why}"}
+        self._notify()
 
     def _follow_reinit(self, now: float) -> None:
         """While re-initialising: poll every second until the epoch moves."""
@@ -319,9 +379,11 @@ class SlmReinitService:
         st = self._status
         return {"label": self.config.label, "state": self._state, "detail": self._detail,
                 "since": self._since, "reinit_due": bool(st.get("reinit_due")),
-                "due_for_s": st.get("due_for_s"), "pattern_epoch": st.get("pattern_epoch"),
+                "due_for_s": st.get("due_for_s"), "next_due_at": self._next_due_at,
+                "interval_s": st.get("interval_s"), "pattern_epoch": st.get("pattern_epoch"),
                 "pattern": st.get("pattern"), "last_reinit": self._last_reinit,
-                "last_poll": self._last_poll, "blocked_by": self._blocked_by}
+                "last_poll": self._last_poll, "blocked_by": self._blocked_by,
+                "manual_pending": self._manual, "last_manual": self._last_manual}
 
     def _set(self, state: str, detail: str) -> None:
         if state == self._state and detail == self._detail:
@@ -332,6 +394,9 @@ class SlmReinitService:
                 self._log(f"{self.config.label}: {state} -- {detail}")
             self._record("slm_reinit_state", state=state, detail=detail)
         self._state, self._detail = state, detail
+        self._notify()
+
+    def _notify(self) -> None:
         if self._on_change is not None:
             try:
                 self._on_change(self.snapshot())

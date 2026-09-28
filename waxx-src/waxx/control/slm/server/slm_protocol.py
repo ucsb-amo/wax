@@ -31,16 +31,18 @@ server has no control commands.
 
     SLMCTL {"cmd": "status", "seq": n}
         -> {"seq": n, "status": "ok", "reinit_due": bool, "due_for_s",
-            "reinit_in_progress", "last_reinit_age_s", "last_reinit_error",
-            "pattern_epoch", "pattern", "idle_s", "queue_len", "auto_reinit"}
+            "next_due_in_s", "interval_s", "reinit_in_progress",
+            "last_reinit_age_s", "last_reinit_error", "pattern_epoch", "pattern",
+            "idle_s", "queue_len", "auto_reinit"}
     SLMCTL {"cmd": "reinit", "seq": n, "by": "..."}
         -> {"seq": n, "status": "queued"}, then
            {"seq": n, "status": "reinit_done", "pattern": {...},
             "pattern_epoch": m, "t_reinit_s": ...}   (or "error")
 
-The server marks a reinit due every hour and no longer does it by itself: the
-monitor server asks for it when no run is starting or running. After a reinit
-the server puts back the pattern it showed, and ``pattern_epoch`` goes up.
+The server marks a reinit due an hour after the last one (or after it started)
+and no longer does it by itself: the monitor server asks for it when no run is
+starting or running. After a reinit the server puts back the pattern it
+showed, and ``pattern_epoch`` goes up.
 """
 
 import json

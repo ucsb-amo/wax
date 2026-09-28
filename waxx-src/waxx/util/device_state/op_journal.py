@@ -151,9 +151,15 @@ def describe_entry(e: dict) -> str:
         if e.get("text"):
             text += f": {e['text']}"
     elif kind == "slm_reinit_requested":
-        text = "SLM reinit asked for (machine idle)"
-        if isinstance(e.get("due_for_s"), (int, float)):
+        text = "SLM reinit sent (machine idle)"
+        if e.get("by"):
+            text += f", asked for by {e['by']}"
+        elif isinstance(e.get("due_for_s"), (int, float)):
             text += f", due for {e['due_for_s'] / 60:.0f} min"
+    elif kind == "slm_reinit_manual":
+        text = f"SLM reinit asked for by {e.get('by')}"
+    elif kind == "slm_reinit_refused":
+        text = f"SLM reinit asked for by {e.get('by')} REFUSED: {e.get('msg')}"
     elif kind == "slm_reinit_done":
         text = f"SLM re-initialised in {e.get('t_s')} s, pattern put back: {e.get('pattern')}"
     elif kind == "slm_reinit_failed":

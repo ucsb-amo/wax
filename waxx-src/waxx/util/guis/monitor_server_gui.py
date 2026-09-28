@@ -209,6 +209,10 @@ class MonitorUDPServer(UdpServer):
     request being sent.  Served in ``status_json`` as ``slm_reinit`` and
     broadcast as ``{"type": "slm_reinit"}``.
 
+    * ``slm_reinit`` (``action`` ``reinit``, ``operator``, ``client``) — an
+      operator's reinit now, refused unless the machine is idle; (``action``
+      ``status``) — the snapshot.
+
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
     ``end()`` sends its end state (or, aborted inside its scan, sends
@@ -401,6 +405,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_reset_state(obj))
         if mtype == "run_loop":
             return json.dumps(self._reply_run_loop(obj))
+        if mtype == "slm_reinit":
+            return json.dumps(self._reply_slm_reinit(obj))
         if mtype == "output":
             return json.dumps(self._reply_output(obj))
         if mtype == "get_journal":
@@ -723,6 +729,29 @@ class MonitorUDPServer(UdpServer):
 
     def _on_slm_reinit_change(self, snapshot: dict) -> None:
         self._broadcaster.send({"type": "slm_reinit", "slm_reinit": snapshot})
+
+    def _reply_slm_reinit(self, obj: dict) -> dict:
+        """``action`` "reinit": an operator's reinit now (the Device Control
+        GUI's SLM pill) -- refused unless the machine is idle; "status": the
+        service's snapshot."""
+        if self.slm_reinit is None:
+            return {"status": "error", "msg": "this monitor server has no SLM reinit configured"}
+        action = obj.get("action")
+        if action == "status":
+            return {"status": "ok", "slm_reinit": self.slm_reinit.snapshot()}
+        if action != "reinit":
+            return {"status": "error", "msg": f"unknown slm_reinit action {action!r}"}
+        operator = str(obj.get("operator") or "")
+        client = str(obj.get("client") or "")
+        who = " on ".join(p for p in (operator, client) if p) or "a client"
+        refusal = self.slm_reinit.request_now(who)
+        if refusal:
+            log.warning("SLM reinit requested by %s refused: %s", who, refusal)
+            self.journal.record("slm_reinit_refused", by=who, msg=refusal)
+            return {"status": "error", "msg": refusal}
+        log.info("SLM reinit requested by %s: sent when the service next ticks.", who)
+        self.journal.record("slm_reinit_manual", by=who)
+        return {"status": "ok"}
 
     # --- host-side connections ------------------------------------------------------
 

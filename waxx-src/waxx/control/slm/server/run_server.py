@@ -54,6 +54,7 @@ _last_activity_monotonic = time.monotonic()
 # was re-initialised (and the last pattern put back) since it last looked.
 _reinit_lock = threading.Lock()
 _reinit = {"due_since": None,           # monotonic time the timer marked it due
+           "next_due": None,            # monotonic time it marks it due next
            "in_progress": False,
            "last_done": None,           # monotonic time of the last reinit
            "last_error": "",
@@ -139,7 +140,10 @@ def _do_reinit(task):
         _reply(task, status="error", error=f"reinit failed: {e}")
         return
     with _reinit_lock:
-        _reinit.update(in_progress=False, due_since=None, last_done=time.monotonic(),
+        done = time.monotonic()
+        # the next one is due an interval after this one, however it was asked for
+        _reinit.update(in_progress=False, due_since=None, last_done=done,
+                       next_due=done + REINIT_INTERVAL_SEC,
                        last_error="", pattern_epoch=_reinit["pattern_epoch"] + 1)
         epoch = _reinit["pattern_epoch"]
     _reply(task, status="reinit_done", pattern=dict(last_pattern), pattern_epoch=epoch,
@@ -155,6 +159,9 @@ def _status():
         "status": "ok",
         "reinit_due": r["due_since"] is not None,
         "due_for_s": None if r["due_since"] is None else round(now - r["due_since"], 1),
+        # when the timer next marks one due (None before the timer runs)
+        "next_due_in_s": None if r["next_due"] is None else round(r["next_due"] - now, 1),
+        "interval_s": REINIT_INTERVAL_SEC,
         "reinit_in_progress": r["in_progress"],
         "last_reinit_age_s": None if r["last_done"] is None else round(now - r["last_done"], 1),
         "last_reinit_error": r["last_error"],
@@ -202,24 +209,30 @@ def periodic_reinit_scheduler(stop=None):
     reinit due -- the monitor server asks for it ("reinit") when no run is
     starting or running, and "status" reports it until then. With AUTO_REINIT
     True, the old behaviour: enqueue REINIT if the server is idle long enough
-    and the queue is empty. `stop` (a threading.Event) ends it, for tests.
+    and the queue is empty. The interval restarts after every reinit (the
+    reinit sets the next due time). `stop` (a threading.Event) ends it, for tests.
     """
-    next_tick = time.monotonic() + REINIT_INTERVAL_SEC
+    with _reinit_lock:
+        if _reinit["next_due"] is None:
+            _reinit["next_due"] = time.monotonic() + REINIT_INTERVAL_SEC
     next_overdue_warn = None
     while stop is None or not stop.is_set():
         time.sleep(0.5)
         now = time.monotonic()
         with _reinit_lock:
             due_since = _reinit["due_since"]
+            next_due = _reinit["next_due"]
+            if now >= next_due:
+                # whole intervals: a loop that stalled past several fires it once
+                _reinit["next_due"] = next_due + REINIT_INTERVAL_SEC * (
+                    int((now - next_due) // REINIT_INTERVAL_SEC) + 1)
         if due_since is not None and now - due_since >= REINIT_OVERDUE_WARN_SEC:
             if next_overdue_warn is None or now >= next_overdue_warn:
                 print(f"WARNING: a reinit has been due for {(now - due_since) / 3600:.1f} h "
                       f"and nobody asked for it (is the monitor server running?).")
                 next_overdue_warn = now + 3600
-        if now < next_tick:
+        if now < next_due:
             continue
-
-        next_tick += REINIT_INTERVAL_SEC
 
         if not AUTO_REINIT:
             with _reinit_lock:

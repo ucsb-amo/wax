@@ -1611,6 +1611,11 @@ class DeviceStateGUI(QMainWindow):
     ``composite_connections``
     (:class:`waxx.util.device_state.connections.Connection`) are the
     monitor server's host-side connections, shown as pills in the status row.
+    The SLM pill beside them (:mod:`waxx.util.guis.slm_pill`) shows the
+    monitor server's SLM reinit and asks for one now; ``spot_finder_launcher``
+    (a callable that starts the lab's SLM spot finder on this PC and returns
+    a short description of what it started) adds "Launch spot finder" to its
+    menu.
 
     The Sequences tab (:mod:`waxx.util.guis.sequences_panel`) is always
     there: the experiments the monitor server runs itself (its run loops and
@@ -1630,10 +1635,13 @@ class DeviceStateGUI(QMainWindow):
                   composite_frames=None,
                   composite_scenes=None,
                   composite_telemetry=None,
-                  composite_connections=None):
+                  composite_connections=None,
+                  spot_finder_launcher=None):
         super().__init__()
         self.config_data = {}
         self.device_widgets = {}
+        self._spot_finder_launcher = spot_finder_launcher
+        self.slm_pill = None
 
         self.dds_frame_obj = dds_frame
         self.dac_frame_obj = dac_frame
@@ -2013,6 +2021,12 @@ class DeviceStateGUI(QMainWindow):
         self._connections_slot = QHBoxLayout()
         self._connections_slot.setContentsMargins(0, 0, 0, 0)
         row.addLayout(self._connections_slot)
+        # The SLM's reinit (and the spot finder launcher), beside them.
+        from waxx.util.guis.slm_pill import SlmPill  # noqa: PLC0415
+        self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
+        self.slm_pill.reinit_requested.connect(self._request_slm_reinit)
+        self.slm_pill.spot_finder_requested.connect(self._launch_spot_finder)
+        row.addWidget(self.slm_pill)
 
         # The changes log lives in its own pop-out window (see
         # ChangesLogWindow) instead of a strip under the grids.
@@ -2108,6 +2122,9 @@ class DeviceStateGUI(QMainWindow):
             self.sequences_panel.set_loops(detail["run_loops"])
         if "run_pending" in detail:
             self._run_pending = detail.get("run_pending")
+        if self.slm_pill is not None:
+            self.slm_pill.set_snapshot(detail.get("slm_reinit"),
+                                       reported="slm_reinit" in detail)
         busy = (detail.get("composite_ops") or {}).get("busy_s")
         if isinstance(busy, (int, float)) and busy > 0:
             self._busy_until = max(self._busy_until, time.monotonic() + busy)
@@ -2149,6 +2166,8 @@ class DeviceStateGUI(QMainWindow):
             self.composite_panel.set_monitor_state(None, reachable=False)
         if self.sequences_panel is not None:
             self.sequences_panel.set_reachable(False)
+        if self.slm_pill is not None:
+            self.slm_pill.set_reachable(False)
         self._refresh_summary()
 
     def on_status_pill_clicked(self):
@@ -2483,6 +2502,59 @@ class DeviceStateGUI(QMainWindow):
         except Exception:
             host = ""
         self._send_request({"type": "reset_state", "client": host}, self._on_reset_reply)
+
+    def _request_slm_reinit(self) -> None:
+        """The SLM pill's "Re-initialise SLM now": the monitor server sends it
+        only while the machine is idle, and says so if it is not."""
+        pill = self.slm_pill
+        if pill is None:
+            return
+        allowed, why = pill.reinit_allowed()
+        if not allowed:
+            QMessageBox.warning(self, "Re-initialise SLM", f"Not sent: {why}.")
+            return
+        from waxx.util.guis.slm_pill import describe_next  # noqa: PLC0415
+        nxt = describe_next(pill.snapshot)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Re-initialise SLM")
+        box.setText("The SLM server re-initialises the SLM now (a few seconds) and puts the "
+                    "pattern it shows back. The monitor server sends it only while no run is "
+                    "starting or running."
+                    + (f"\n\n{nxt}; the hour restarts after this one." if nxt else ""))
+        yes = box.addButton("Re-initialise", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        try:
+            host = socket.gethostname()
+        except Exception:
+            host = ""
+        self._send_request({"type": "slm_reinit", "action": "reinit", "client": host},
+                           self._on_slm_reinit_reply)
+
+    def _on_slm_reinit_reply(self, reply: dict) -> None:
+        if reply.get("status") == "ok":
+            self._record_line("[slm] reinit asked for; the monitor server sends it now")
+        else:
+            self._record_line(f"[slm] reinit refused: {reply.get('msg')}")
+            QMessageBox.warning(self, "Re-initialise SLM",
+                                f"The monitor server did not send it: {reply.get('msg')}")
+
+    def _launch_spot_finder(self) -> None:
+        """The SLM pill's "Launch spot finder": the lab's launcher, on this PC."""
+        if self._spot_finder_launcher is None:
+            return
+        try:
+            what = self._spot_finder_launcher()
+        except Exception as e:
+            self._record_line(f"[slm] spot finder did not start: {e}")
+            QMessageBox.warning(self, "Launch spot finder",
+                                f"The spot finder did not start:\n{e}")
+            return
+        self._record_line(f"[slm] spot finder started{f' ({what})' if what else ''}")
 
     def _on_reset_reply(self, reply: dict) -> None:
         if reply.get("status") == "ok":
@@ -2898,6 +2970,10 @@ class DeviceStateGUI(QMainWindow):
         if mtype == "connections":
             if panel is not None:
                 panel.set_connections(payload.get("connections"))
+            return
+        if mtype == "slm_reinit":
+            if self.slm_pill is not None and isinstance(payload.get("slm_reinit"), dict):
+                self.slm_pill.set_snapshot(payload["slm_reinit"])
             return
         if mtype != "state_update":
             return

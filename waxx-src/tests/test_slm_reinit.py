@@ -416,6 +416,8 @@ class FakeSlm:
         self.hold_send = None          # threading.Event the reinit send waits on
         self.polls_to_finish = 2
         self._left = 0
+        self.next_due_in_s = 1800.0
+        self.by = []                   # the "by" of each reinit request
 
     def __call__(self, host, port, payload, *, control, until, on_sent=None, **kw):
         cmd = payload["cmd"]
@@ -437,9 +439,11 @@ class FakeSlm:
                     self.in_progress, self.due = False, False
                     self.epoch += 1
             return {"status": "ok", "reinit_due": self.due, "due_for_s": 60.0 if self.due else None,
+                    "next_due_in_s": self.next_due_in_s, "interval_s": 3600,
                     "reinit_in_progress": self.in_progress, "pattern_epoch": self.epoch,
                     "pattern": {"center_x": 321}, "last_reinit_error": self.error}
         if cmd == "reinit":
+            self.by.append(payload.get("by"))
             self.in_progress, self._left = True, self.polls_to_finish
             return {"status": "queued"}
         raise AssertionError(cmd)
@@ -705,7 +709,318 @@ def test_run_pending_waits_for_the_slm_before_replying_and_status_json_reports_i
 def test_journal_lines_for_the_reinit():
     from waxx.util.device_state.op_journal import describe_entry
     base = {"t": "2026-09-28T12:00:00"}
-    assert "asked for" in describe_entry({**base, "kind": "slm_reinit_requested", "due_for_s": 600})
+    assert "due for 10 min" in describe_entry({**base, "kind": "slm_reinit_requested",
+                                               "due_for_s": 600})
+    assert "asked for by jp on kong" in describe_entry({**base, "kind": "slm_reinit_requested",
+                                                        "by": "jp on kong", "due_for_s": None})
     assert "pattern put back" in describe_entry({**base, "kind": "slm_reinit_done", "t_s": 2.1,
                                                  "pattern": {"center_x": 1}})
     assert "FAILED" in describe_entry({**base, "kind": "slm_reinit_failed", "text": "x"})
+    assert "asked for by kong" in describe_entry({**base, "kind": "slm_reinit_manual",
+                                                  "by": "kong"})
+    assert "REFUSED: busy" in describe_entry({**base, "kind": "slm_reinit_refused", "by": "kong",
+                                              "msg": "busy"})
+
+
+# --- the next due time and an operator's reinit (2026-09-28, the SLM pill) --------------
+
+def test_server_reports_the_next_due_time_and_a_reinit_restarts_the_hour(slm_host, monkeypatch):
+    rs = slm_host.rs
+    monkeypatch.setattr(rs, "REINIT_INTERVAL_SEC", 100.0)
+    assert _status(slm_host)["next_due_in_s"] is None           # timer not running yet
+    stop = threading.Event()
+    t = threading.Thread(target=rs.periodic_reinit_scheduler, args=(stop,), daemon=True)
+    t.start()
+    try:
+        assert _wait(lambda: _status(slm_host)["next_due_in_s"] is not None)
+        st = _status(slm_host)
+        assert 95.0 <= st["next_due_in_s"] <= 100.0 and st["interval_s"] == 100.0
+        rs._reinit["next_due"] = time.monotonic() + 3.0         # as if 97 s had passed
+        assert _status(slm_host)["next_due_in_s"] <= 3.0
+        _ask(slm_host, {"cmd": "reinit"}, ("reinit_done", "error"), control=True)
+        st = _status(slm_host)
+        assert 95.0 <= st["next_due_in_s"] <= 100.0              # the hour restarted
+        assert st["reinit_due"] is False
+    finally:
+        stop.set()
+        t.join(2.0)
+
+
+def test_timer_catches_up_by_whole_intervals(slm_host, monkeypatch):
+    rs = slm_host.rs
+    monkeypatch.setattr(rs, "REINIT_INTERVAL_SEC", 10.0)
+    rs._reinit["next_due"] = time.monotonic() - 35.0             # a stalled loop
+    stop = threading.Event()
+    t = threading.Thread(target=rs.periodic_reinit_scheduler, args=(stop,), daemon=True)
+    t.start()
+    try:
+        assert _wait(lambda: _status(slm_host)["reinit_due"])
+        st = _status(slm_host)
+        assert 0.0 < st["next_due_in_s"] <= 10.0                 # one step, not four
+        assert slm_host.inits == 1
+    finally:
+        stop.set()
+        t.join(2.0)
+
+
+def test_snapshot_has_the_next_due_wall_time():
+    slm = FakeSlm()
+    slm.next_due_in_s = 1200.0
+    svc, clock, _ = _service(slm, lambda: "")
+    t0 = time.time()
+    svc.tick()
+    snap = svc.snapshot()
+    assert t0 + 1199.0 <= snap["next_due_at"] <= time.time() + 1200.0
+    assert snap["interval_s"] == 3600
+
+
+def test_request_now_is_sent_at_once_even_when_not_due_and_names_who_asked():
+    slm = FakeSlm()                                  # not due
+    svc, clock, journal = _service(slm, lambda: "")
+    svc.tick()
+    assert svc.snapshot()["state"] == sr.IDLE
+    assert svc.request_now("jp on kong") == ""
+    assert svc.snapshot()["manual_pending"] == "jp on kong"
+    assert svc.request_now("someone else").startswith("a reinit asked for by jp on kong")
+    svc.tick()                                       # same instant: no settle time
+    assert slm.requests.count("reinit") == 1
+    assert slm.by == ["jp on kong (through the monitor server)"]
+    snap = svc.snapshot()
+    assert snap["state"] == sr.REINITIALISING and snap["manual_pending"] is None
+    assert snap["last_manual"]["result"] == "sent"
+    assert ("slm_reinit_requested", "jp on kong") in [(k, f.get("by")) for k, f in journal.records]
+
+
+def test_request_now_ignores_the_pause_after_a_failure():
+    slm = FakeSlm()
+    slm.due = True
+    slm.polls_to_finish = 10 ** 9
+    svc, clock, _ = _service(slm, lambda: "")
+    _run(svc, clock, 70.0)
+    assert svc.snapshot()["state"] == sr.FAILED
+    slm.in_progress = False
+    assert svc.request_now("kong") == ""
+    svc.tick()
+    assert slm.requests.count("reinit") == 2
+
+
+@pytest.mark.parametrize("setup, text", [
+    (lambda slm, why: why.__setitem__(0, "run 9 (x) is starting"), "run 9 (x) is starting"),
+    (lambda slm, why: setattr(slm, "silent", True), "no control commands"),
+])
+def test_request_now_refused(setup, text):
+    slm = FakeSlm()
+    why = [""]
+    svc, clock, _ = _service(slm, lambda: why[0])
+    assert "not answered yet" in svc.request_now("kong")      # never polled
+    setup(slm, why)
+    svc.tick()
+    assert text in svc.request_now("kong")
+    svc.tick()
+    assert "reinit" not in slm.requests
+
+
+def test_request_now_refused_when_a_run_announces_itself_before_it_is_sent():
+    slm = FakeSlm()
+    why = [""]
+    changes = []
+    svc, clock, journal = _service(slm, lambda: why[0])
+    svc._on_change = changes.append
+    svc.tick()
+    assert svc.request_now("kong") == ""
+    why[0] = "run 11 (x) is starting"                 # between the request and the tick
+    svc.tick()
+    assert "reinit" not in slm.requests
+    snap = svc.snapshot()
+    assert snap["manual_pending"] is None
+    assert snap["last_manual"]["result"] == "not sent: run 11 (x) is starting"
+    assert ("slm_reinit_refused", "kong") in [(k, f.get("by")) for k, f in journal.records]
+    assert changes and changes[-1]["last_manual"]["result"].startswith("not sent")
+
+
+def test_monitor_server_slm_reinit_request(server):
+    from waxx.util.comms_server.comm_server import STATES
+    ask = lambda obj: json.loads(server.generate_reply(json.dumps(obj)))  # noqa: E731
+    server.slm_reinit._state = sr.IDLE               # as after a poll
+    reply = ask({"type": "slm_reinit", "action": "reinit", "client": "kong"})
+    assert reply["status"] == "error" and "monitor is not ready" in reply["msg"]
+    server.status.set_state(STATES.READY, "running")
+    reply = ask({"type": "slm_reinit", "action": "reinit", "client": "kong", "operator": "jp"})
+    assert reply == {"status": "ok"}
+    assert server.slm_reinit.snapshot()["manual_pending"] == "jp on kong"
+    assert ask({"type": "slm_reinit", "action": "status"})["slm_reinit"]["manual_pending"] \
+        == "jp on kong"
+    assert ask({"type": "slm_reinit", "action": "explode"})["status"] == "error"
+    server.slm_reinit = None
+    assert "no SLM reinit" in ask({"type": "slm_reinit", "action": "reinit"})["msg"]
+
+
+# --- the SLM pill -----------------------------------------------------------------------
+
+def _pill(qapp, can_launch=True):
+    from waxx.util.guis.slm_pill import SlmPill
+    return SlmPill(can_launch=can_launch)
+
+
+def _menu_texts(pill):
+    menu = pill.build_menu()
+    return [(a.text(), a.isEnabled()) for a in menu.actions() if not a.isSeparator()], menu
+
+
+def _action(menu, name):
+    return next(a for a in menu.actions() if a.objectName() == name)
+
+
+def test_pill_shows_the_state_and_the_next_reinit_time(qapp):
+    from waxx.util.guis import slm_pill
+    pill = _pill(qapp)
+    now = time.time()
+    pill.set_snapshot({"state": "idle", "next_due_at": now + 38 * 60, "blocked_by": "",
+                       "last_reinit": {"at": now - 1200, "t_s": 2.1}})
+    assert pill.text() == "SLM" and slm_pill.LOOK["idle"][0] in pill.styleSheet()
+    at = time.strftime("%H:%M", time.localtime(now + 38 * 60))
+    texts, menu = _menu_texts(pill)
+    assert (f"Next reinit due {at} (in 38 min)", False) in texts
+    assert any(t.startswith("Last reinit") and "2.1 s" in t for t, _ in texts)
+    assert ("Re-initialise SLM now…", True) in texts
+    assert ("Launch spot finder", True) in texts
+    assert f"Next reinit due {at}" in pill.toolTip()
+
+
+def test_pill_menu_actions_emit_and_disabled_reasons_show(qapp):
+    pill = _pill(qapp)
+    got = []
+    pill.reinit_requested.connect(lambda: got.append("reinit"))
+    pill.spot_finder_requested.connect(lambda: got.append("launch"))
+    pill.set_snapshot({"state": "due", "reinit_due": True, "due_for_s": 120.0,
+                       "blocked_by": "run 83344 (feedback) is starting"})
+    assert pill.text() == "SLM · due"
+    texts, menu = _menu_texts(pill)
+    assert _action(menu, "slm_reinit_now").isEnabled() is False
+    assert any("not now: the machine is not idle: run 83344" in t for t, _ in texts)
+    assert any(t.startswith("Reinit due since") and "run 83344" in t for t, _ in texts)
+    _action(menu, "slm_launch_spot_finder").trigger()
+    pill.set_snapshot({"state": "due", "reinit_due": True, "blocked_by": ""})
+    _, menu = _menu_texts(pill)
+    _action(menu, "slm_reinit_now").trigger()
+    assert got == ["launch", "reinit"]
+
+
+def test_pill_before_the_monitor_server_reports_it(qapp):
+    from PyQt6.QtWidgets import QWidget
+    host = QWidget()                              # never shown: a pill in a status row
+    pill = _pill(qapp, can_launch=True)
+    pill.setParent(host)
+    pill.set_snapshot(None, reported=False)
+    assert not pill.isHidden()                    # shown with the row: it can launch
+    texts, menu = _menu_texts(pill)
+    assert ("SLM reinit: not reported by the monitor server", False) in texts
+    assert _action(menu, "slm_reinit_now").isEnabled() is False
+    assert _action(menu, "slm_launch_spot_finder").isEnabled() is True
+    pill.set_reachable(False)
+    assert "monitor server unreachable" in pill.toolTip()
+    assert pill.reinit_allowed()[1] == "the monitor server is unreachable"
+    hidden = _pill(qapp, can_launch=False)
+    hidden.setParent(host)
+    hidden.set_snapshot(None, reported=False)
+    assert hidden.isHidden()                      # nothing to offer
+    hidden.set_snapshot({"state": "idle"})
+    assert not hidden.isHidden()
+    lone = _pill(qapp)                            # parentless: never shows itself
+    lone.set_snapshot({"state": "idle"})
+    assert not lone.isVisible()
+
+
+@pytest.mark.parametrize("state, allowed", [("idle", True), ("due", True), ("failed", True),
+                                             ("unreachable", True), ("reinitialising", False),
+                                             ("no_control", False), ("unknown", False)])
+def test_pill_reinit_allowed_by_state(qapp, state, allowed):
+    pill = _pill(qapp)
+    pill.set_snapshot({"state": state, "blocked_by": ""})
+    assert pill.reinit_allowed()[0] is allowed
+
+
+# --- the Device Control GUI -------------------------------------------------------------
+
+@pytest.fixture
+def dcgui(qapp, monkeypatch):
+    from waxx.util.guis import device_control_gui as dc
+    from waxx.util.guis import sequences_panel
+    from test_composite_panel import FakeSender
+    from test_device_control_gui import FakeSettings
+    monkeypatch.setattr(dc, "QSettings", FakeSettings)
+    monkeypatch.setattr(sequences_panel, "_OpSender", FakeSender)
+    for name in ("_setup_update_sender", "_setup_state_listener", "_setup_state_worker",
+                 "setup_status_checker", "setup_timer", "request_state"):
+        monkeypatch.setattr(dc.DeviceStateGUI, name, lambda self, *a, **k: None)
+    launched = []
+
+    def launcher():
+        launched.append(1)
+        return "console pid 1 on test-pc"
+
+    g = dc.DeviceStateGUI(spot_finder_launcher=launcher)
+    g._test_launched = launched
+    g._test_sent = []
+    monkeypatch.setattr(g, "_send_request", lambda obj, cb: (g._test_sent.append(obj),
+                                                             cb({"status": "ok"})))
+    yield g
+    g.close()
+
+
+def test_gui_feeds_the_pill_from_status_and_broadcasts(dcgui):
+    pill = dcgui.slm_pill
+    assert pill is not None and pill.can_launch
+    dcgui._on_status_detail({"state": 0, "slm_reinit": {"state": "due", "reinit_due": True}})
+    assert pill.reported and pill.text() == "SLM · due"
+    dcgui._on_state_broadcast({"type": "slm_reinit", "slm_reinit": {"state": "reinitialising"}})
+    assert pill.text() == "SLM · reinit…"
+    dcgui._on_status_detail({"state": 0})                    # an older server
+    assert pill.reported is False
+    dcgui.on_connection_failed()
+    assert pill.reachable is False
+
+
+def test_gui_reinit_asks_then_sends(dcgui, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    dcgui._on_status_detail({"state": 0, "slm_reinit": {"state": "idle", "blocked_by": ""}})
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton",
+                        lambda self: next(b for b in self.buttons() if b.text() == "Cancel"))
+    dcgui._request_slm_reinit()
+    assert dcgui._test_sent == []                            # cancelled
+    monkeypatch.setattr(QMessageBox, "clickedButton",
+                        lambda self: next(b for b in self.buttons()
+                                          if b.text() == "Re-initialise"))
+    dcgui._request_slm_reinit()
+    assert dcgui._test_sent[-1]["type"] == "slm_reinit"
+    assert dcgui._test_sent[-1]["action"] == "reinit"
+    assert any("[slm] reinit asked for" in line for line in dcgui._changes)
+
+
+def test_gui_reinit_not_sent_when_not_allowed(dcgui, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    dcgui._on_status_detail({"state": 0, "slm_reinit": {"state": "idle",
+                                                        "blocked_by": "a state reset is running"}})
+    dcgui._request_slm_reinit()
+    assert dcgui._test_sent == [] and "a state reset is running" in warned[0]
+
+
+def test_gui_launches_the_spot_finder_and_reports_failures(dcgui, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    dcgui._launch_spot_finder()
+    assert dcgui._test_launched == [1]
+    assert any("spot finder started (console pid 1 on test-pc)" in line
+               for line in dcgui._changes)
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+
+    def broken():
+        raise FileNotFoundError("no spot finder at X")
+
+    dcgui._spot_finder_launcher = broken
+    dcgui._launch_spot_finder()
+    assert "no spot finder at X" in warned[0]
+    assert any("spot finder did not start" in line for line in dcgui._changes)
