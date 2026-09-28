@@ -24,6 +24,7 @@ from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
+from waxx.util.device_state.slm_reinit import SlmReinitService
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +202,13 @@ class MonitorUDPServer(UdpServer):
       ``cmd``, ``kwargs``): the monitor's "Apply traps" writes the AWG tones
       this way, then pulses the AWG trigger from its kernel.
 
+    The SLM's hourly reinit (``slm_reinit``, a
+    :class:`~waxx.util.device_state.slm_reinit.SlmReinitConfig`): the SLM
+    server marks it due; this server asks for it only while the monitor is
+    running and no run is starting, and ``run_pending`` waits (≤ 1 s) for a
+    request being sent.  Served in ``status_json`` as ``slm_reinit`` and
+    broadcast as ``{"type": "slm_reinit"}``.
+
     Trust: when an experiment takes the core (the monitor is interrupted by a
     run) the state file stops describing the hardware until that run's
     ``end()`` sends its end state (or, aborted inside its scan, sends
@@ -227,7 +235,7 @@ class MonitorUDPServer(UdpServer):
     RUN_PENDING_TTL_S = 120.0
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
-                 run_loops=(), connections=()):
+                 run_loops=(), connections=(), slm_reinit=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
 
         self.status = MonitorStatus()
@@ -281,6 +289,15 @@ class MonitorUDPServer(UdpServer):
             log.error("Connection definitions rejected (%s); running without them.", e)
             self.connections = ConnectionService((), log=lambda text: log.info("%s", text))
 
+        # The SLM's hourly reinit, asked for only while the machine is idle
+        # (a SlmReinitConfig, or None for a machine without an SLM server).
+        self.slm_reinit = None
+        if slm_reinit is not None:
+            self.slm_reinit = SlmReinitService(slm_reinit, blocker=self._slm_reinit_blocker,
+                                               on_change=self._on_slm_reinit_change,
+                                               journal=self.journal,
+                                               log=lambda text: log.info("%s", text))
+
     def on_message_received(self,message):
         m = message.strip()
         if m.startswith("{"):
@@ -329,6 +346,8 @@ class MonitorUDPServer(UdpServer):
                 "run_pending": dict(self._run_pending) if self._run_pending else None,
                 "runner": runner, "reset": self.reset.info(),
                 "connections": self.connections.snapshot(),
+                "slm_reinit": (self.slm_reinit.snapshot() if self.slm_reinit is not None
+                               else None),
                 "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
 
     def _handle_structured(self, raw):
@@ -495,6 +514,8 @@ class MonitorUDPServer(UdpServer):
                                                name="monitor-op-runner")
         self._runner_thread.start()
         self.connections.start()
+        if self.slm_reinit is not None:
+            self.slm_reinit.start()
         super().run()
 
     # --- run fence and trust ------------------------------------------------------
@@ -508,6 +529,10 @@ class MonitorUDPServer(UdpServer):
         self.journal.record("run_pending", run_id=obj.get("run_id"), expt=obj.get("expt"),
                             client=obj.get("client"))
         self._broadcaster.send({"type": "run_pending", "run_pending": self._public_pending()})
+        # No SLM reinit starts from now on; one being asked for is on its way
+        # to the SLM server before the run's first mask (slm_reinit.SEND_WAIT_S).
+        if self.slm_reinit is not None:
+            self.slm_reinit.run_starting()
         # Before replying: the run opens the AWG right after it takes the
         # core, and the reply is what lets its finish_prepare return.
         # Bounded (connections.RELEASE_TIMEOUT_S), inside the client's timeout.
@@ -677,6 +702,27 @@ class MonitorUDPServer(UdpServer):
         info = self.ops.info()
         if info["registered"] or info["queued"] or info["running"]:
             self._broadcast_results(self.ops.unregister(reason))
+
+    # --- the SLM's reinit ------------------------------------------------------------
+
+    def _slm_reinit_blocker(self) -> str:
+        """Why the SLM may be in use ("" when it is not): only a running
+        monitor proves no run holds the core. Called under the service's
+        lock -- reads attributes only."""
+        if self.status.state != STATES.READY:
+            return f"the monitor is {self.status.state_name.lower().replace('_', ' ')}"
+        p = self._run_pending
+        if p is not None:
+            return f"{_run_name(p.get('run_id'), p.get('expt'))} is starting"
+        if self.reset.running:
+            return "a state reset is running"
+        loop = active_loop(self.loops.values())
+        if loop is not None:
+            return f"{loop.spec.title} is running"
+        return ""
+
+    def _on_slm_reinit_change(self, snapshot: dict) -> None:
+        self._broadcaster.send({"type": "slm_reinit", "slm_reinit": snapshot})
 
     # --- host-side connections ------------------------------------------------------
 
@@ -974,6 +1020,8 @@ class MonitorUDPServer(UdpServer):
 
     def stop(self):
         self._runner_stop.set()
+        if self.slm_reinit is not None:
+            self.slm_reinit.stop()
         # Close the connections (bounded) while this process is still here;
         # their agents would close them anyway once it is gone.
         self.connections.stop()
@@ -993,7 +1041,8 @@ class MonitorServerGUI(QWidget):
                 journal_dir=None,
                 reset_expt_path=None,
                 run_loops=(),
-                connections=()):
+                connections=(),
+                slm_reinit=None):
         super().__init__()
 
         self.config_file_path = config_file_path
@@ -1001,6 +1050,7 @@ class MonitorServerGUI(QWidget):
         self.reset_expt_path = reset_expt_path
         self.run_loops = tuple(run_loops or ())
         self.connection_defs = tuple(connections or ())
+        self.slm_reinit_config = slm_reinit
 
         # Refuse to start a second monitor server for the same hardware.
         server_id = monitor_server_id()
@@ -1099,7 +1149,8 @@ class MonitorServerGUI(QWidget):
                                            journal_dir=self.journal_dir,
                                            reset_expt_path=self.reset_expt_path,
                                            run_loops=self.run_loops,
-                                           connections=self.connection_defs)
+                                           connections=self.connection_defs,
+                                           slm_reinit=self.slm_reinit_config)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)

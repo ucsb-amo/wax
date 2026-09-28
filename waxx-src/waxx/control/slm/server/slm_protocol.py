@@ -21,6 +21,26 @@ per line on the same connection:
     {"seq": n, "status": "dropped"}                     pushed out of a full queue
 
 A command without ``"seq"`` gets no reply, so existing clients see no change.
+
+Control commands (2026-09-28) are one line, ``SLMCTL <json>\\n`` (see
+:func:`control_line`), never a bare JSON object: every earlier server takes any
+JSON object for a pattern and fills in defaults -- a ``{"cmd": "status"}``
+would put up a blank mask. Earlier servers drop an ``SLMCTL`` line as
+malformed plaintext and do not answer, so a client that gets no reply knows the
+server has no control commands.
+
+    SLMCTL {"cmd": "status", "seq": n}
+        -> {"seq": n, "status": "ok", "reinit_due": bool, "due_for_s",
+            "reinit_in_progress", "last_reinit_age_s", "last_reinit_error",
+            "pattern_epoch", "pattern", "idle_s", "queue_len", "auto_reinit"}
+    SLMCTL {"cmd": "reinit", "seq": n, "by": "..."}
+        -> {"seq": n, "status": "queued"}, then
+           {"seq": n, "status": "reinit_done", "pattern": {...},
+            "pattern_epoch": m, "t_reinit_s": ...}   (or "error")
+
+The server marks a reinit due every hour and no longer does it by itself: the
+monitor server asks for it when no run is starting or running. After a reinit
+the server puts back the pattern it showed, and ``pattern_epoch`` goes up.
 """
 
 import json
@@ -30,7 +50,15 @@ import threading
 # is passed on as malformed rather than held forever.
 MAX_PENDING_CHARS = 65536
 
+#: First word of a control command line.
+CONTROL_PREFIX = "SLMCTL"
+
 _decoder = json.JSONDecoder()
+
+
+def _maybe_control(rest: str) -> bool:
+    """Whether unterminated text could be (the start of) a control line."""
+    return CONTROL_PREFIX.startswith(rest[:len(CONTROL_PREFIX)])
 
 
 def split_commands(buf: str, at_eof: bool = False):
@@ -42,7 +70,9 @@ def split_commands(buf: str, at_eof: bool = False):
     complete, or the stream has ended, in which case it is passed on as it is
     and the caller reports it as malformed. Anything that does not start with
     ``{`` is a legacy plaintext command: one line, or the rest of the chunk
-    when there is no newline, which is what the server always did.
+    when there is no newline, which is what the server always did. A control
+    line (``SLMCTL ...``) is always newline-terminated, so one without its
+    newline yet is kept until the rest arrives.
     """
     commands = []
     i, n = 0, len(buf)
@@ -69,23 +99,54 @@ def split_commands(buf: str, at_eof: bool = False):
         else:
             j = buf.find("\n", i)
             if j < 0:
+                if _maybe_control(buf[i:]) and not at_eof and n - i <= MAX_PENDING_CHARS:
+                    return commands, buf[i:]
                 commands.append(buf[i:])
                 return commands, ""
             commands.append(buf[i:j])
             i = j + 1
 
 
+def _seq_of(d: dict):
+    seq = d.get("seq")
+    # bool is an int subclass; a stray true/false is not a sequence number
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+
+
 def command_seq(command: str):
     """The client's sequence number if it asked for replies, else None."""
+    ctl = control_command(command)
+    if ctl is not None:
+        return _seq_of(ctl)
     try:
         d = json.loads(command)
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(d, dict):
         return None
-    seq = d.get("seq")
-    # bool is an int subclass; a stray true/false is not a sequence number
-    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+    return _seq_of(d)
+
+
+def control_line(obj: dict) -> str:
+    """The wire form of a control command: ``SLMCTL <json>`` and a newline."""
+    return f"{CONTROL_PREFIX} {json.dumps(obj, separators=(',', ':'))}\n"
+
+
+def control_command(command: str):
+    """The control command as a dict (with a string ``"cmd"``) if `command`
+    is a control line, else None (a pattern, or malformed)."""
+    if not isinstance(command, str):
+        return None
+    head, _, body = command.strip().partition(" ")
+    if head != CONTROL_PREFIX:
+        return None
+    try:
+        d = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(d, dict) and isinstance(d.get("cmd"), str):
+        return d
+    return None
 
 
 class Replier:

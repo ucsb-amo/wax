@@ -150,6 +150,18 @@ def describe_entry(e: dict) -> str:
         text = f"{e.get('device')} {kind[9:]}"
         if e.get("text"):
             text += f": {e['text']}"
+    elif kind == "slm_reinit_requested":
+        text = "SLM reinit asked for (machine idle)"
+        if isinstance(e.get("due_for_s"), (int, float)):
+            text += f", due for {e['due_for_s'] / 60:.0f} min"
+    elif kind == "slm_reinit_done":
+        text = f"SLM re-initialised in {e.get('t_s')} s, pattern put back: {e.get('pattern')}"
+    elif kind == "slm_reinit_failed":
+        text = f"SLM reinit FAILED: {e.get('text')}"
+    elif kind == "slm_reinit_state":
+        text = f"SLM reinit {e.get('state')}"
+        if e.get("detail"):
+            text += f": {e['detail']}"
     elif kind.startswith("state_reset_"):
         text = f"{e.get('expt') or 'reset'} {kind[12:]}{_who(e)}"
         if e.get("text") or e.get("msg"):

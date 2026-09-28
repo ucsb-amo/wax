@@ -4,7 +4,7 @@ import time
 import threading
 import queue
 from slm_server import SLM_server
-from slm_protocol import split_commands, command_seq, Replier
+from slm_protocol import split_commands, command_seq, control_command, Replier
 
 
 SERVER_IP = '192.168.1.102'
@@ -14,6 +14,15 @@ BUFFER_SIZE = 1024
 REINIT_INTERVAL_SEC = 3600          # reinitialize period
 MIN_IDLE_BEFORE_REINIT_SEC = 20     # idle time
 CMD_QUEUE_MAXSIZE = 256
+# False (default since 2026-09-28): the hourly timer only marks a reinit due
+# (``status`` says so); the lab's monitor server asks for it (``reinit``) when no
+# run is starting or running. The server-timed reinit used to land in the middle
+# of runs that write the mask only at init and blank their mask (run 83344).
+# True: the old behaviour -- reinit by itself when idle -- for a setup without a
+# monitor server.
+AUTO_REINIT = False
+# A due reinit nobody asked for is reported (printed) after this long, then hourly.
+REINIT_OVERDUE_WARN_SEC = 6 * 3600
 
 slmtest = SLM_server()
 cmd_q = queue.Queue(maxsize=CMD_QUEUE_MAXSIZE)
@@ -38,7 +47,17 @@ last_pattern = {
 }
 
 _last_activity_lock = threading.Lock()
-_last_activity_monotonic = time.monotonic()  
+_last_activity_monotonic = time.monotonic()
+
+# Reinit bookkeeping, reported by the "status" command. pattern_epoch counts the
+# reinits since this server started: a client that sees it change knows the SLM
+# was re-initialised (and the last pattern put back) since it last looked.
+_reinit_lock = threading.Lock()
+_reinit = {"due_since": None,           # monotonic time the timer marked it due
+           "in_progress": False,
+           "last_done": None,           # monotonic time of the last reinit
+           "last_error": "",
+           "pattern_epoch": 0}
 
 def _touch_activity():
     global _last_activity_monotonic
@@ -66,10 +85,7 @@ def slm_worker():
         ttype = task.get("type")
         try:
             if ttype == "REINIT":
-                print("Reinitializing SLM...")
-                slmtest.initialize_slm()
-                print("Restoring default pattern after reinitializing...\n")
-                _apply_pattern(default_pattern, fast=True)
+                _do_reinit(task)
 
             elif ttype == "APPLY":
                 last_pattern.update({
@@ -101,6 +117,55 @@ def slm_worker():
         finally:
             cmd_q.task_done()
 
+def _do_reinit(task):
+    """Re-initialise the SLM and put back the pattern it showed (last_pattern).
+
+    It used to put back default_pattern (a blank mask): a run whose mask was
+    written at its start then ran on blank (runs 83224-83344, 2026-09-27/28)."""
+    with _reinit_lock:
+        _reinit["in_progress"] = True
+    t0 = time.monotonic()
+    try:
+        print("Reinitializing SLM...")
+        slmtest.initialize_slm()
+        print("Restoring the last pattern after reinitializing...\n")
+        _apply_pattern(last_pattern, fast=True)
+    except Exception as e:
+        # Still due: the next request tries again.
+        print(f"Error during reinit: {e}")
+        with _reinit_lock:
+            _reinit["in_progress"] = False
+            _reinit["last_error"] = str(e)
+        _reply(task, status="error", error=f"reinit failed: {e}")
+        return
+    with _reinit_lock:
+        _reinit.update(in_progress=False, due_since=None, last_done=time.monotonic(),
+                       last_error="", pattern_epoch=_reinit["pattern_epoch"] + 1)
+        epoch = _reinit["pattern_epoch"]
+    _reply(task, status="reinit_done", pattern=dict(last_pattern), pattern_epoch=epoch,
+           t_reinit_s=round(time.monotonic() - t0, 3))
+
+
+def _status():
+    """What the "status" command answers."""
+    now = time.monotonic()
+    with _reinit_lock:
+        r = dict(_reinit)
+    return {
+        "status": "ok",
+        "reinit_due": r["due_since"] is not None,
+        "due_for_s": None if r["due_since"] is None else round(now - r["due_since"], 1),
+        "reinit_in_progress": r["in_progress"],
+        "last_reinit_age_s": None if r["last_done"] is None else round(now - r["last_done"], 1),
+        "last_reinit_error": r["last_error"],
+        "pattern_epoch": r["pattern_epoch"],
+        "pattern": dict(last_pattern),
+        "idle_s": round(_seconds_since_last_activity(), 1),
+        "queue_len": cmd_q.qsize(),
+        "auto_reinit": AUTO_REINIT,
+    }
+
+
 def _reply(task, **msg):
     """Answer the client that sent `task`, if it asked to be answered."""
     replier = task.get("replier")
@@ -131,19 +196,37 @@ def _apply_pattern(pat, fast=True): # Generate and upload a pattern
     )
     print('Waiting for next task...\n')
 
-def periodic_reinit_scheduler():
+def periodic_reinit_scheduler(stop=None):
     """
-    Reinitialize every REINIT_INTERVAL_SEC, but only enqueues REINIT
-    if server is idle long enough and the queue is empty.
+    Every REINIT_INTERVAL_SEC: with AUTO_REINIT False (the default) mark a
+    reinit due -- the monitor server asks for it ("reinit") when no run is
+    starting or running, and "status" reports it until then. With AUTO_REINIT
+    True, the old behaviour: enqueue REINIT if the server is idle long enough
+    and the queue is empty. `stop` (a threading.Event) ends it, for tests.
     """
     next_tick = time.monotonic() + REINIT_INTERVAL_SEC
-    while True:
+    next_overdue_warn = None
+    while stop is None or not stop.is_set():
         time.sleep(0.5)
         now = time.monotonic()
+        with _reinit_lock:
+            due_since = _reinit["due_since"]
+        if due_since is not None and now - due_since >= REINIT_OVERDUE_WARN_SEC:
+            if next_overdue_warn is None or now >= next_overdue_warn:
+                print(f"WARNING: a reinit has been due for {(now - due_since) / 3600:.1f} h "
+                      f"and nobody asked for it (is the monitor server running?).")
+                next_overdue_warn = now + 3600
         if now < next_tick:
             continue
 
         next_tick += REINIT_INTERVAL_SEC
+
+        if not AUTO_REINIT:
+            with _reinit_lock:
+                if _reinit["due_since"] is None:
+                    _reinit["due_since"] = now
+                    print("Reinit due: waiting for the monitor server to ask for it.")
+            continue
 
         idle_secs = _seconds_since_last_activity()
         if idle_secs < MIN_IDLE_BEFORE_REINIT_SEC:
@@ -198,9 +281,39 @@ def handle_client(conn):
                 print(f"Error while handling client: {e}")
                 break
 
+def _handle_control(ctl, seq, replier):
+    """A control command ({"cmd": ...}): "status" answers at once; "reinit"
+    queues a reinit behind any pattern already queued and answers "queued",
+    then "reinit_done" (or "error") when it is done."""
+    cmd = ctl.get("cmd")
+    if cmd == "status":
+        if seq is not None:
+            replier.send({"seq": seq, **_status()})
+        return
+    if cmd == "reinit":
+        task = {"type": "REINIT"}
+        if seq is not None:
+            task["seq"] = seq
+            task["replier"] = replier
+            replier.send({"seq": seq, "status": "queued"})
+        try:
+            cmd_q.put_nowait(task)
+            print(f"Enqueued REINIT (asked for by {ctl.get('by') or 'a client'}).")
+        except queue.Full:
+            _reply(task, status="error", error="command queue full")
+        return
+    if seq is not None:
+        replier.send({"seq": seq, "status": "error", "error": f"unknown cmd {cmd!r}"})
+
+
 def _handle_command(command, replier):
     print(f"Received command: {command}")
     seq = command_seq(command)
+
+    ctl = control_command(command)
+    if ctl is not None:
+        _handle_control(ctl, seq, replier)
+        return
 
     dims = analyze_command(command)
     if dims is None:
