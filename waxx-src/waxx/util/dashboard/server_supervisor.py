@@ -55,93 +55,14 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
 
 
-def _kill_pid_trees(pids: Iterable[int], timeout_s: float = 5.0) -> bool:
-    """Forcibly terminate several processes *and their child trees* (Windows).
-
-    One ``taskkill`` call with repeated ``/PID`` flags, so closing a
-    dashboard with nine servers spawns one helper process instead of nine.
-    Scoped strictly to the given pids and their descendants; it can never
-    reach sibling servers or the dashboard.  Returns True if the command was
-    issued.  No-op (returns False) off Windows or with no pids.
-    """
-    pids = [int(p) for p in pids if p and int(p) > 0]
-    if not _IS_WINDOWS or not pids:
-        return False
-    try:
-        import subprocess  # noqa: PLC0415
-        args = ["taskkill"]
-        for pid in pids:
-            args += ["/PID", str(pid)]
-        args += ["/T", "/F"]
-        subprocess.run(
-            args,
-            creationflags=_CREATE_NO_WINDOW,
-            capture_output=True,
-            timeout=timeout_s,
-        )
-        return True
-    except Exception as exc:  # pragma: no cover
-        _LOG.debug("_kill_pid_trees(%s) raised: %r", pids, exc)
-        return False
-
-
-def _kill_pid_tree(pid: int) -> bool:
-    """Single-pid convenience wrapper around :func:`_kill_pid_trees`."""
-    return _kill_pid_trees([pid])
-
-
-# Keep strong module-level references to the installed console-control
-# handler and its ctypes prototype.  A handler that gets garbage-collected
-# while still registered crashes the process when the OS next invokes it.
-_CONSOLE_GUARD_INSTALLED = False
-_CONSOLE_GUARD_CB = None  # type: ignore[var-annotated]
-
-
-def install_console_signal_guard() -> bool:
-    """Make the dashboard process immune to CTRL_C / CTRL_BREAK.
-
-    The dashboard may run as a console app (``python.exe``) sharing its
-    console with child processes.  A console signal aimed at a child can
-    leak back to the dashboard's own process group and kill the whole GUI.
-    Installing a console-control handler that reports CTRL_C / CTRL_BREAK
-    as *handled* suppresses the default terminating behaviour.
-
-    Other control events (CLOSE / LOGOFF / SHUTDOWN) are left unhandled so
-    normal window-close shutdown still works.
-
-    Returns True if the guard is installed (or was already installed).
-    No-op (returns False) off Windows.
-    """
-    global _CONSOLE_GUARD_INSTALLED, _CONSOLE_GUARD_CB
-    if not _IS_WINDOWS:
-        return False
-    if _CONSOLE_GUARD_INSTALLED:
-        return True
-    try:
-        import ctypes  # noqa: PLC0415
-        from ctypes import wintypes  # noqa: PLC0415
-
-        CTRL_C_EVENT = 0
-        CTRL_BREAK_EVENT = 1
-
-        handler_proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
-
-        def _handler(ctrl_type):  # noqa: ANN001 - ctypes callback
-            return ctrl_type in (CTRL_C_EVENT, CTRL_BREAK_EVENT)
-
-        cb = handler_proto(_handler)
-        kernel32 = ctypes.windll.kernel32
-        ok = bool(kernel32.SetConsoleCtrlHandler(cb, True))
-        if not ok:
-            _LOG.debug("SetConsoleCtrlHandler failed err=%s", ctypes.get_last_error())
-            return False
-        _CONSOLE_GUARD_CB = cb
-        _CONSOLE_GUARD_INSTALLED = True
-        _LOG.info("console signal guard installed (CTRL_C/CTRL_BREAK ignored)")
-        return True
-    except Exception as exc:  # pragma: no cover
-        _LOG.debug("install_console_signal_guard raised: %r", exc)
-        return False
+# The process-table helpers are shared with the Qt-free supervisor
+# (waxx.util.supervise), which runs servers on PCs without a dashboard; these
+# names stay importable from here.
+from waxx.util.supervise import (  # noqa: E402
+    install_console_signal_guard,
+    kill_pid_tree as _kill_pid_tree,
+    kill_pid_trees as _kill_pid_trees,
+)
 
 
 class SupervisorState(enum.Enum):
