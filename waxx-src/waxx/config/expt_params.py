@@ -15,11 +15,12 @@ class ExptParams(ExptParamsWaxa):
         self.t_apd_slack = 12.e-6                   # slack re-armed after each blocking sampler read
 
         ### integrator readout window (waxx.control.integrator.Integrator)
-        # Defaults reproduce the original fixed timing: gate opens at the light
-        # command, closes at the pulse end, samples 1 us later.
-        self.t_integrator_gate_delay = 0.           # gate open (and close) delayed this long after the light command
-        self.t_integrator_gate_extra = 0.           # gate held open this long past the delayed pulse end
-        self.t_integrator_settle = 1.e-6            # gate close -> Sampler CNV
+        # Defaults from the K machine timing tests 83665-83675 (2026-09-29): light
+        # reaches the integrator ~1 us after its command, the output rings ~3-4 us
+        # after the gate closes. The original fixed timing was 0 / 0 / 1 us.
+        self.t_integrator_gate_delay = 0.7e-6       # gate open (and close) delayed this long after the light command
+        self.t_integrator_gate_extra = 1.0e-6       # gate held open this long past the delayed pulse end
+        self.t_integrator_settle = 4.0e-6           # gate close -> Sampler CNV
         self.N_max_iter_imaging_pid = np.int32(50)  # iteration cap (np.int32 pins TInt32)
         self.frac_err_threshold_imaging_pid = 0.005 # convergence threshold on |v_signal/v_target - 1|
         self.gain_p_imaging_pid = -0.019            # proportional gain (tuned)

@@ -27,8 +27,8 @@ class Integrator():
       p.t_integrator_gate_extra  stop_and_settle closes the gate at
                                  cursor + gate_delay + gate_extra (cursor = pulse end)
       p.t_integrator_settle      gate close -> end of stop_and_settle (the sample)
-    The waxx defaults (0, 0, 1 us) are the original fixed timing. 2026-09-29
-    tests (runs 83665-83674): the light reaches the integrator ~1 us after its
+    The waxx defaults are 0.7, 1.0, 4.0 us (the original fixed timing was 0, 0,
+    1 us). 2026-09-29 tests (runs 83665-83675): the light reaches the integrator ~1 us after its
     command, and the output rings for ~3-4 us after the gate closes.
     """
     def __init__(self,
