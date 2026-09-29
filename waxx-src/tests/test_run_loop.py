@@ -245,6 +245,77 @@ def test_start_twice_and_stop_when_idle_are_refused(expt):
     assert loop.info()["state"] == "stopped"
 
 
+# --- a run whose process dies without telling liveOD --------------------------------
+
+class DyingLive(FakeLive):
+    """liveOD with run ``run_id`` of ``expt`` still in progress after its process died;
+    RUN_EXITED sent on its behalf lands in ``notices`` and closes it."""
+
+    def __init__(self, run_id, run_state="running", expt="auto_tof.py", age=1.0):
+        super().__init__()
+        self.run_in_progress, self.run_id = True, run_id
+        self.run_state, self.expt, self.age = run_state, expt, age
+        self.notices = []
+
+    def __call__(self):
+        reply = super().__call__()
+        reply.update(run_state=self.run_state, expt_name=self.expt, init_run_age_s=self.age)
+        return reply
+
+    def run_exited(self, run_id, reason):
+        self.notices.append((run_id, reason))
+        self.run_in_progress, self.run_state = False, "exited"
+        return {"ok": True}
+
+
+def _dies(live, run_id, when_ready=None):
+    """The process: liveOD is idle until it starts (the gate), then it dies hard."""
+    live.run_in_progress = False
+
+    def start():
+        live.run_in_progress = True
+    return FakeProc(live, run_id, ["Segmentation fault"], code=3221225477, outcome=None,
+                    before=start)
+
+
+def test_a_run_killed_hard_is_reported_to_live_od_by_the_loop(expt):
+    live = DyingLive(101)
+    loop = _loop(expt, live, [_dies(live, 101)])
+    loop.start()
+    loop.join(5)
+    assert [n[0] for n in live.notices] == [101]
+    assert "exit code 3221225477" in live.notices[0][1] and "Segmentation fault" in live.notices[0][1]
+    assert loop.info()["state"] == "latched" and "exit code 3221225477" in loop.info()["text"]
+    assert "run_loop_told_live_od_exited" in loop.journal.kinds
+    assert any("without telling liveOD" in line for line in loop.output.since()["lines"])
+
+
+@pytest.mark.parametrize("live_kw, run_id", [
+    ({"run_state": "exited"}, 101),        # its own notice got through
+    ({}, 102),                             # liveOD has another run
+])
+def test_no_notice_when_live_od_knows_or_has_another_run(expt, live_kw, run_id):
+    live = DyingLive(101, **live_kw)
+    loop = _loop(expt, live, [_dies(live, run_id)])
+    loop.start()
+    loop.join(5)
+    assert live.notices == []
+
+
+@pytest.mark.parametrize("expt_name, age, told", [
+    ("auto_tof.py", 0.0, True),            # ours: our experiment, started after the launch
+    ("rabi.py", 0.0, False),               # someone else's experiment
+    ("auto_tof.py", 1e6, False),           # older than this launch
+])
+def test_a_run_killed_before_its_run_id_line_is_matched_by_name_and_age(expt, expt_name,
+                                                                        age, told):
+    live = DyingLive(101, expt=expt_name, age=age)
+    loop = _loop(expt, live, [_dies(live, None)])
+    loop.start()
+    loop.join(5)
+    assert [n[0] for n in live.notices] == ([101] if told else [])
+
+
 # --- in the monitor server ---------------------------------------------------------
 
 class Broadcasts:
@@ -368,3 +439,152 @@ def test_server_serves_the_output_of_its_own_loops_only(server):
     reply = server.ask({"type": "output", "kind": "reset"})
     assert reply["status"] == "error" and "no reset experiment" in reply["msg"]
     assert server.ask({"type": "output", "kind": "shell"})["status"] == "error"
+
+
+# --- pick loops (the file chosen at Start) ------------------------------------------
+
+@pytest.fixture
+def pick_root(tmp_path):
+    root = tmp_path / "experiments"
+    (root / "tools").mkdir(parents=True)
+    (root / "tools" / "monitor.py").write_text("class monitor: pass\n")
+    (root / "JP").mkdir()
+    (root / "JP" / "rabi.py").write_text('"""Rabi flop, 17 points."""\nclass rabi: pass\n')
+    (root / "JP" / "notes.txt").write_text("not an experiment\n")
+    (tmp_path / "outside.py").write_text("class outside: pass\n")
+    return root
+
+
+def _pick_loop(root, live, procs):
+    queue = list(procs)
+    spawned = []
+
+    def spawn(command):
+        spawned.append(command)
+        return queue.pop(0)
+
+    spec = loop_specs({"expt_loop": {"title": "Experiment loop", "root": str(root),
+                                     "exclude": (str(root / "tools" / "monitor.py"),)}})[0]
+    loop = RunLoop(spec, poll=live, spawn=spawn, start_monitor=lambda why: None,
+                   gap_s=0., poll_s=0.01)
+    loop.spawned = spawned
+    return loop
+
+
+def test_loop_specs_reads_a_pick_entry_and_skips_one_without_a_root(pick_root):
+    specs = loop_specs({"a": ("A", "x.py"), "p": {"title": "P", "root": str(pick_root)},
+                        "none": {"title": "N", "root": None}})
+    assert [s.key for s in specs] == ["a", "p"]
+    assert specs[1].pick and not specs[0].pick and specs[1].expt_path == ""
+
+
+def test_pick_loop_refuses_files_it_must_not_run(pick_root):
+    loop = _pick_loop(pick_root, FakeLive(), [])
+    info = loop.info()
+    assert info["pick"] and info["expt"] == "" and info["path"] == ""
+    for path, why in [(None, "no experiment file"), ("JP/notes.txt", "not a Python file"),
+                      ("JP/missing.py", "no such file"), ("../outside.py", "only experiments inside"),
+                      (str(pick_root.parent / "outside.py"), "only experiments inside"),
+                      ("tools/monitor.py", "cannot be looped"), ("JP/a&b.py", "not allowed")]:
+        reply = loop.start(path=path)
+        assert reply["status"] == "error" and why in reply["msg"], (path, reply)
+        assert loop.describe(path)["status"] == "error"
+    assert loop.spawned == [] and loop.info()["state"] == "idle"
+
+
+def test_pick_loop_describes_and_runs_the_chosen_file(pick_root):
+    live = FakeLive()
+    loop = _pick_loop(pick_root, live, [FakeProc(live, 201, code=1)])
+    d = loop.describe("JP/rabi.py")
+    assert d["status"] == "ok" and d["expt"] == "rabi" and d["rel"] == "JP/rabi.py"
+    assert "Rabi flop" in d["about"]
+    assert loop.start(operator="jp", client="kong", path=r"JP\rabi.py")["status"] == "ok"
+    loop.join(5)
+    info = loop.info()
+    assert info["expt"] == "rabi" and info["rel"] == "JP/rabi.py" and "Rabi flop" in info["about"]
+    assert loop.spawned[0].endswith(str((pick_root / "JP" / "rabi.py").resolve()))
+    assert info["state"] == "latched"         # its one run failed (exit code 1)
+
+
+def test_pick_loop_quotes_a_path_with_spaces(pick_root):
+    (pick_root / "M testing").mkdir()
+    (pick_root / "M testing" / "x.py").write_text("class x: pass\n")
+    live = FakeLive()
+    loop = _pick_loop(pick_root, live, [FakeProc(live, 301, code=1)])
+    assert loop.start(path="M testing/x.py")["status"] == "ok"
+    loop.join(5)
+    assert loop.spawned[0].endswith('x.py"') and ' "' in loop.spawned[0]
+
+
+# --- scan settings (the card's ⚙) --------------------------------------------------
+
+TOF_SCAN = {"xvar": "t_tof", "unit": "ms", "scale": 1e-3, "minimum": 0.0, "maximum": 25e-3,
+            "start": 1e-3, "stop": 4e-3, "n": 9, "repeats": 5}
+
+
+def test_scan_settings_reach_each_run_and_a_change_applies_from_the_next(expt):
+    import json
+    from waxx.util.device_state.loop_scan import ENV_VAR
+    live, envs, loop = FakeLive(), [], None
+    (spec,) = loop_specs({"auto_tof": ("BEC TOF loop", str(expt), TOF_SCAN)})
+    assert spec.scan.xvar == "t_tof"
+
+    def first():
+        # set during run 1: run 1 keeps what it was launched with
+        assert loop.configure({"start": 2e-3, "stop": None, "n": 9, "repeats": 20},
+                              operator="jp")["status"] == "ok"
+        return FakeProc(live, 101)
+
+    procs = [first, lambda: (loop.stop(), FakeProc(live, 102))[1]]
+
+    def spawn(command, extra_env=None):
+        envs.append(json.loads(extra_env[ENV_VAR]))
+        return procs.pop(0)()
+
+    loop = RunLoop(spec, poll=live, spawn=spawn, gap_s=0., poll_s=0.01, journal=Journal())
+    info = loop.info()
+    assert info["scan"]["settings"] == {"start": 1e-3, "stop": 4e-3, "n": 9, "repeats": 5}
+    assert info["scan"]["text"] == "t_tof 1–4 ms, 9 points × 5 repeats (45 shots)"
+    loop.start()
+    loop.join(5)
+    assert envs == [{"start": 1e-3, "stop": 4e-3, "n": 9, "repeats": 5},
+                    {"start": 2e-3, "stop": None, "n": 1, "repeats": 20}]
+    lines = loop.output.since(0)["lines"]
+    assert any("scan set by jp: t_tof 2 ms × 20 repeats" in l and "next run" in l
+               for l in lines)
+    assert any("2nd run of the loop: auto_tof (t_tof 2 ms × 20 repeats" in l for l in lines)
+    assert "run_loop_configure" in loop._journal.kinds
+
+
+def test_bad_scan_settings_are_refused_and_a_loop_without_a_scan_has_none(expt):
+    (spec,) = loop_specs({"auto_tof": ("BEC TOF loop", str(expt), TOF_SCAN)})
+    loop = RunLoop(spec, poll=FakeLive())
+    reply = loop.configure({"start": 1e-3, "stop": 30e-3, "n": 5, "repeats": 1})
+    assert reply["status"] == "error" and "above the maximum 25 ms" in reply["msg"]
+    assert loop.info()["scan"]["settings"]["stop"] == 4e-3            # unchanged
+    plain = RunLoop(LoopSpec("auto_tof", "BEC TOF loop", str(expt)), poll=FakeLive())
+    assert "scan" not in plain.info()
+    assert "has no scan settings" in plain.configure({"start": 1e-3, "repeats": 1})["msg"]
+
+
+def test_server_configures_a_loops_scan(qapp, monkeypatch, tmp_path, expt):
+    import json
+    from waxx.util.guis import monitor_server_gui as msg
+    monkeypatch.setattr(msg, "StateBroadcaster", Broadcasts)
+    monkeypatch.setattr(msg, "monitor_server_id", lambda: "monitor-under-test")
+    s = msg.MonitorUDPServer(config_file_path=str(tmp_path / "state.json"),
+                             run_loops=loop_specs({"auto_tof": ("BEC TOF loop", str(expt),
+                                                                TOF_SCAN)}))
+    try:
+        ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
+        reply = ask({"type": "run_loop", "action": "configure", "loop": "auto_tof",
+                     "scan": {"start": 3e-3, "stop": 5e-3, "n": 3, "repeats": 2}})
+        assert reply["status"] == "ok" and reply["loop"]["scan"]["settings"]["n"] == 3
+        status = json.loads(s.generate_reply("status_json"))
+        assert status["run_loops"]["auto_tof"]["scan"]["text"].startswith("t_tof 3–5 ms")
+        assert any(p.get("type") == "run_loop" for p in s._broadcaster.sent)
+        reply = ask({"type": "run_loop", "action": "configure", "loop": "auto_tof",
+                     "scan": {"start": -1, "repeats": 1}})
+        assert reply["status"] == "error" and "below the minimum" in reply["msg"]
+    finally:
+        s.sock.close()

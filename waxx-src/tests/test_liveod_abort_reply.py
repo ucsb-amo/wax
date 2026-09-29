@@ -141,6 +141,104 @@ def test_an_exit_while_frames_are_still_due_leaves_the_camera_run_alone(server):
     assert os.path.exists(reply["filepath"])
 
 
+def _exited_with_frames_due(srv, ready=True, frames=1):
+    """A camera run whose experiment exited with frames still due (run 83706)."""
+    reply = srv._handle_init_run(_init_msg(capture_images=True, camera_key="cam_a"))
+    if ready:
+        srv._cam_ready_event.set()
+    for _ in range(frames):
+        srv.on_image_received(None)
+    srv._handle_run_exited({"run_token": reply["run_token"], "reason": "uncaught AssertionError: "})
+    return reply
+
+
+def _closed_exited(srv, saver, states, done, reply):
+    assert srv._run_in_progress is False and done == [True]
+    assert states[-1][0] == "exited" and "run closed" in states[-1][1]
+    assert srv._last_outcome["outcome"] == "exited"
+    assert os.path.exists(reply["filepath"]) and saver.saved == []     # kept, not saved
+    assert srv._handle_poll({})["run_in_progress"] is False
+
+
+def test_an_exited_run_whose_camera_was_never_ready_closes_at_once(server):
+    srv, saver, states, done = server
+    stops = []
+    srv.exited_run_signal.connect(stops.append)
+    reply = _exited_with_frames_due(srv, ready=False, frames=0)
+    assert srv.exited_run_pending() and done == []
+    srv._check_exited_run()
+    _closed_exited(srv, saver, states, done, reply)
+    assert stops and "never ready" in stops[0]
+    # a Reset pressed afterwards cannot delete it: the file is forgotten
+    srv._run_file.discard(wait_for_writer=False)
+    assert os.path.exists(reply["filepath"])
+
+
+def test_an_exited_run_waits_for_late_frames_then_closes(server):
+    from waxx.util.live_od import live_od_server as mod
+    srv, saver, states, done = server
+    reply = _exited_with_frames_due(srv)
+    t0 = srv._exited_pending["t"]
+    srv._check_exited_run(now=t0 + mod.EXITED_FRAME_GRACE_S - 1.0)
+    assert srv._run_in_progress is True and done == []
+    srv.on_image_received(None)                  # a frame from an already queued trigger
+    last = srv._frame_times[-1]
+    srv._check_exited_run(now=last + mod.EXITED_FRAME_GRACE_S - 1.0)
+    assert srv._run_in_progress is True
+    srv._check_exited_run(now=last + mod.EXITED_FRAME_GRACE_S + 1.0)
+    _closed_exited(srv, saver, states, done, reply)
+    assert "2/3" in states[-1][1]
+
+
+def test_an_exited_run_closes_when_its_camera_thread_finishes(server):
+    srv, saver, states, done = server
+    reply = _exited_with_frames_due(srv)
+    srv.on_data_handler_done(run_token=reply["run_token"])
+    srv._check_exited_run()
+    _closed_exited(srv, saver, states, done, reply)
+
+
+def test_reset_closes_an_exited_run_now_and_keeps_its_file(server):
+    srv, saver, states, done = server
+    resets = []
+    srv.reset_signal.connect(lambda: resets.append(True))
+    reply = _exited_with_frames_due(srv)
+    answer = srv._handle_reset({})               # a remote viewer's Reset
+    assert answer["closing_exited_run"] and srv._reset_requested is False
+    assert resets == []                          # the window's reset would delete the file
+    srv._check_exited_run()
+    _closed_exited(srv, saver, states, done, reply)
+    assert "Reset" in states[-1][1]
+
+
+def test_run_exited_for_another_run_id_changes_nothing(server):
+    srv, _, states, done = server
+    srv._handle_init_run(_init_msg())
+    run_id = srv._current_run_id
+    reply = srv._handle_run_exited({"run_id": run_id + 1, "reason": "x"})
+    assert reply["stale_run"] and srv._run_in_progress is True and done == []
+    assert srv._handle_run_exited({"run_id": run_id, "reason": "x"})["ok"]
+    assert srv._run_in_progress is False and states[-1][0] == "exited"
+
+
+def test_reset_again_closes_an_unanswered_abort(server):
+    from waxx.util.live_od import live_od_server as mod
+    srv, _, states, done = server
+    reply = srv._handle_init_run(_init_msg())
+    srv._handle_reset({})
+    srv.note_reset_requested()                   # the window's reset, same press
+    assert srv.abort_again() is False            # an echo of that press, not a second one
+    srv._abort_requested_at -= mod.ABORT_AGAIN_MIN_S + 1.0
+    answer = srv._handle_reset({})
+    assert answer["closing_aborted_run"]
+    srv._check_abort_again()
+    assert states[-1][0] == "aborted" and srv._run_in_progress is False and done == [True]
+    assert not os.path.exists(reply["filepath"])        # aborted: discarded, as ever
+    assert srv._last_outcome["outcome"] == "discarded" and srv._reset_requested is False
+    # a late message from a hung (not dead) experiment cannot act on anything
+    assert srv._handle_end_run({"run_token": reply["run_token"]})["stale_run"]
+
+
 def test_a_superseded_runs_exit_changes_nothing(server):
     srv, _, states, _ = server
     old = srv._handle_init_run(_init_msg())
@@ -314,3 +412,46 @@ def test_an_experiment_that_dies_mid_abort_ends_the_abort(server, no_atexit):
     srv._handle_reset({})
     c.notify_exit()
     assert states[-1][0] == "aborted" and not os.path.exists(path)
+
+
+# ----------------------------------------------------------------------
+# the window's Reset button
+# ----------------------------------------------------------------------
+
+class _Srv:
+    def __init__(self, exited=False, again=False):
+        self.exited, self.again, self.calls = exited, again, []
+
+    def exited_run_pending(self):
+        return self.exited
+
+    def close_exited_run_now(self, reason="Reset pressed"):
+        self.calls.append(("close_exited", reason))
+
+    def abort_again(self):
+        self.calls.append(("abort_again",))
+        return self.again
+
+
+class _Win:
+    """Just what LiveODWindow.reset reads before the camera threads."""
+
+    def __init__(self, srv):
+        self.live_od_server, self.messages = srv, []
+        self.the_baby = object()                 # must not be touched
+
+    def msg(self, text, level=None):
+        self.messages.append(text)
+
+
+@pytest.mark.parametrize("exited, again, expected", [
+    (True, False, [("close_exited", "Reset pressed")]),
+    (False, True, [("abort_again",)]),
+])
+def test_the_window_reset_leaves_a_gone_experiments_run_to_the_server(app, exited, again,
+                                                                       expected):
+    from waxx.util.live_od.gui.main_window import LiveODWindow
+    win = _Win(_Srv(exited=exited, again=again))
+    LiveODWindow.reset(win)
+    assert win.live_od_server.calls == expected and win.messages
+    assert win.the_baby is not None              # no interrupt: that path deletes the file

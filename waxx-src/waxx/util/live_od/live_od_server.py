@@ -42,6 +42,14 @@ logger = get_logger("server")
 # recent periods, never less than the minimum.
 ABORT_REPLY_MIN_S = 30.0
 ABORT_REPLY_SHOT_FACTOR = 3.0
+# A run whose experiment exited with camera frames still due (RUN_EXITED) is closed
+# once no frame has come for this long: triggers the core device had already queued
+# can still bring frames after the process is gone, nothing later can.
+EXITED_FRAME_GRACE_S = 5.0
+# A Reset pressed this long after an Abort the experiment has not answered closes
+# the aborted run at once, as the next run start would (a second press, not the
+# window's own echo of the first).
+ABORT_AGAIN_MIN_S = 3.0
 
 
 def _safe_repr(value) -> str:
@@ -90,6 +98,7 @@ class LiveODServer(QThread, NetServer):
     shot_adjust_values_signal = pyqtSignal(dict)              # current adjust values dict, emitted per shot
     run_state_signal = pyqtSignal(str, str)                   # state, detail (see class docstring)
     markers_changed_signal = pyqtSignal(str, list)            # camera_key, markers (a remote viewer edited them)
+    exited_run_signal = pyqtSignal(str)                       # how an exited run was closed: stop its camera thread, file untouched
 
     def __init__(self, server_talk, data_saver, port: int = 0, marker_path=None):
         super().__init__()  # QThread.__init__
@@ -112,6 +121,14 @@ class LiveODServer(QThread, NetServer):
         # when the current run's Abort was requested (time.time()); None when no
         # abort is waiting for the experiment's answer (_check_abort_reply)
         self._abort_requested_at = None
+        # A Reset pressed again on that unanswered abort: the server thread closes
+        # the run (_check_abort_again)
+        self._abort_again = False
+        # The run's experiment exited (RUN_EXITED) with frames still due: {"why",
+        # "t" (time.monotonic())} until _check_exited_run closes it; None otherwise
+        self._exited_pending = None
+        # why a Reset asked for that run to be closed now ("" when none did)
+        self._exited_close_now = ""
         self._run_in_progress = False   # True between INIT_RUN and END_RUN/ABORT
         self._shot_timestamps: list = []  # Unix timestamps (s) recorded server-side on each SHOT_COMPLETE
         self._scalar_subscriber_count: dict = {}  # tier -> subscriber count
@@ -774,6 +791,11 @@ class LiveODServer(QThread, NetServer):
                 except Exception:
                     logger.exception("abort reply check failed")
                 try:
+                    self._check_abort_again()
+                    self._check_exited_run()
+                except Exception:
+                    logger.exception("closing a run whose experiment is gone failed")
+                try:
                     raw = socket.recv()
                 except zmq.Again:
                     continue          # poll timeout — loop to check _running
@@ -964,6 +986,9 @@ class LiveODServer(QThread, NetServer):
         self._current_run_id = run_id
         self._reset_requested = False
         self._abort_requested_at = None
+        self._abort_again = False
+        self._exited_pending = None
+        self._exited_close_now = ""
         self._run_in_progress = True
         self._shot_timestamps = []       # reset per-run timestamp list
         self._init_run_time = time.time()
@@ -1343,6 +1368,12 @@ class LiveODServer(QThread, NetServer):
         A superseded run's notice changes nothing; one after the run ended is ignored."""
         if not self._run_msg_ok(msg):
             return self._stale_run_reply("RUN_EXITED", msg)
+        # A notice sent on the process's behalf (the monitor server's run loop,
+        # which has no token) names the run instead; another run's changes nothing.
+        if msg.get("run_id") is not None and msg.get("run_id") != self._current_run_id:
+            return {"ok": False, "stale_run": True,
+                    "error": f"RUN_EXITED for run {msg.get('run_id')}, but the current run is "
+                             f"{self._current_run_id}; ignored"}
         if not self._run_in_progress:
             return {"ok": True, "ignored": True}
         why = str(msg.get("reason") or "") or "no exception reported"
@@ -1354,9 +1385,12 @@ class LiveODServer(QThread, NetServer):
         received, expected = self._images_received_now(), self._images_expected
         if self._current_capture_images and received < expected:
             detail = (f"The experiment's process exited without END_RUN ({why}) with "
-                      f"{received}/{expected} frames in. The camera thread still owns the "
-                      f"run's file, so the run stays open until the next run start or a reset.")
+                      f"{received}/{expected} frames in. The run is closed once no frame has "
+                      f"come for {EXITED_FRAME_GRACE_S:.0f} s (at once on Reset); its file is "
+                      f"left as it was: not saved, not deleted.")
             logger.warning(f"RUN_EXITED: run {run_id}: {detail}")
+            if self._exited_pending is None:
+                self._exited_pending = {"why": why, "t": time.monotonic()}
             self._set_run_state("exited", detail)
             return {"ok": True}
         detail = (f"The experiment's process exited without END_RUN ({why}). Its file is "
@@ -1372,7 +1406,115 @@ class LiveODServer(QThread, NetServer):
         self.run_done_signal.emit()
         return {"ok": True}
 
+    # A run whose experiment is gone
+    # ------------------------------------------------------------------
+
+    def exited_run_pending(self) -> bool:
+        """The current run's experiment exited with frames still due and the run is
+        not closed yet (_check_exited_run)."""
+        return self._exited_pending is not None and self._run_in_progress
+
+    def close_exited_run_now(self, reason: str = "Reset pressed"):
+        """Close that run on the next pass of the server loop instead of waiting for
+        frames. Its file is kept as it is, as for any exited run. Any thread."""
+        self._exited_close_now = str(reason) or "Reset pressed"
+
+    def abort_unanswered_for(self):
+        """Seconds since the current run's Abort, while the experiment has not
+        answered it; None when no abort is waiting."""
+        t0 = self._abort_requested_at
+        if t0 is None or not self._run_in_progress or not self._reset_requested:
+            return None
+        return time.time() - t0
+
+    def abort_again(self) -> bool:
+        """Reset pressed again on an Abort nobody answered (at least
+        ABORT_AGAIN_MIN_S after it): the experiment is taken to be gone and the run
+        is closed on the next pass of the server loop, as the next run start would
+        (its file discarded, as for any abort). False when that does not apply.
+        Any thread."""
+        waited = self.abort_unanswered_for()
+        if waited is None or waited < ABORT_AGAIN_MIN_S:
+            return False
+        self._abort_again = True
+        return True
+
+    def _check_abort_again(self):
+        """Server thread: carry out abort_again()."""
+        if not self._abort_again:
+            return
+        self._abort_again = False
+        waited = self.abort_unanswered_for()
+        if waited is None:
+            return                      # answered, or a new run, in the meantime
+        run_id = self._current_run_id
+        logger.warning(f"Reset pressed again: run {run_id}'s abort has had no answer for "
+                       f"{waited:.0f} s. The run is closed now, as the next run start would "
+                       f"close it: its file is discarded (it was aborted). A late message from "
+                       f"its experiment is ignored.")
+        self._host_end_run("ABORT_RUN", record=False)
+        self._finalize_reset_run(notify_gui=False)
+        # the aborted run's token is retired: a late message from its experiment
+        # (a hung process, not a dead one) gets "superseded" instead of acting here
+        self._adopt_run_token(uuid.uuid4().hex)
+
+    def _check_exited_run(self, now=None):
+        """Server thread: close the run whose experiment exited with frames still
+        due (RUN_EXITED) once no more can come -- its camera thread has finished,
+        the camera was never ready (so nothing triggered it), or no frame for
+        EXITED_FRAME_GRACE_S -- or at once when a Reset asked for it. Until
+        2026-09-29 such a run stayed "in progress" until the next run start (83706)."""
+        pending = self._exited_pending
+        if pending is None:
+            return
+        if not self._run_in_progress:
+            self._exited_pending = None
+            return
+        now = time.monotonic() if now is None else float(now)
+        if self._exited_close_now:
+            how = self._exited_close_now
+        elif self._run_file.writer_done.is_set():
+            how = "its camera thread has finished"
+        elif not self._cam_ready_event.is_set():
+            how = "the camera was never ready, so nothing triggered it"
+        else:
+            with self._images_lock:
+                last = self._frame_times[-1] if self._frame_times else None
+            quiet = now - max(pending["t"], last if last is not None else pending["t"])
+            if quiet < EXITED_FRAME_GRACE_S:
+                return
+            how = f"no frame for {quiet:.0f} s after the experiment exited"
+        self._close_exited_run(pending["why"], how)
+
+    def _close_exited_run(self, why: str, how: str):
+        self._exited_pending = None
+        self._exited_close_now = ""
+        run_id = self._current_run_id
+        received, expected = self._images_received_now(), self._images_expected
+        detail = (f"The experiment's process exited without END_RUN ({why}) with "
+                  f"{received}/{expected} frames in; run closed ({how}). Its file is left "
+                  f"as it was: not saved, not deleted.")
+        logger.warning(f"Run {run_id}: {detail}")
+        # the window stops the run's camera thread quietly (the file stays)
+        self.exited_run_signal.emit(how)
+        self._host_end_run("RUN_EXITED", record=False)
+        # forgotten: a reset pressed later must not delete an exited run's file
+        self._run_file.filepath = ""
+        self._run_in_progress = False
+        self._abort_requested_at = None
+        self._record_outcome("exited", why)
+        self._set_run_state("exited", detail)
+        self.run_done_signal.emit()
+
     def _handle_reset(self, msg: dict) -> dict:
+        if self.exited_run_pending():
+            logger.warning("RESET requested by remote viewer: the run's experiment has "
+                           "exited; closing the run now (its file is kept).")
+            self.close_exited_run_now("Reset pressed in a remote viewer")
+            return {"ok": True, "closing_exited_run": True}
+        if self.abort_again():
+            logger.warning("RESET requested again by remote viewer on an unanswered abort.")
+            return {"ok": True, "closing_aborted_run": True}
         logger.warning("RESET requested by remote viewer.")
         self._reset_requested = True
         self.note_reset_requested()

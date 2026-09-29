@@ -80,6 +80,7 @@ from beacon.camera.schema import (ANDOR_EMCCD, ANDOR_LIVE_EM_GAIN_CAP, BASLER_US
 from beacon.camera.worker import LockedError
 
 from waxx.util.live_od.camera_host.sinks import RunSink
+from waxx.util.live_od.log import VERBOSE
 
 logger = logging.getLogger("waxx.live_od.camera_host")
 
@@ -525,7 +526,7 @@ class CameraHost:
         for cat, cons in self._constraints.items():
             for c in cons:
                 conds = " and ".join(f"{k} {op} {v!r}" for k, op, v in c.when)
-                logger.info(f"camera host: lab constraint on {cat} ({c.applies_to}): {conds} -> "
+                logger.debug(f"camera host: lab constraint on {cat} ({c.applies_to}): {conds} -> "
                              f"{c.level}: {c.reason}")
         if self._serve:
             core.start_in_thread()
@@ -1078,9 +1079,11 @@ class CameraHost:
             self._run_settings_rev[spec.key] = w.settings_rev
             rb = plain_readback(res.readback)
             shown = ", ".join(f"{k}={rb[k]!r}" for k in sorted(rb))
-            logger.info(_ascii(f"camera host: run {run.run_id} on {spec.key} armed for {n} "
-                               f"frame(s) (acq_gen {res.acq_gen}, stray frames discarded "
-                               f"{res.stale_discarded}); read back: {shown}"))
+            logger.debug(f"camera host: run {run.run_id} on {spec.key} armed for {n} "
+                         f"frame(s) (acq_gen {res.acq_gen}, stray frames discarded "
+                         f"{res.stale_discarded})")
+            logger.log(VERBOSE, _ascii(f"camera host: run {run.run_id} on {spec.key} "
+                                       f"read back: {shown}"))
             fut.set_result(res)
             self._bump()
         wf.add_done_callback(done)
@@ -1166,7 +1169,7 @@ class CameraHost:
             persist_since=run.persist_since, errors=tuple(errors))
         if run.locked:
             level = logging.WARNING if (summary.problems or errors or summary.surplus
-                                        or summary.stale) else logging.INFO
+                                        or summary.stale) else logging.DEBUG
             logger.log(level, f"camera host: run {run.run_id} on {run.key} released ({reason}): "
                               f"{summary.delivered}/{run.n_img} frame(s) delivered, lost "
                               f"{list(summary.lost_idx)}, surplus {summary.surplus}, stale "

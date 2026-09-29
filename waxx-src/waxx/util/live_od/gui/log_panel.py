@@ -19,10 +19,19 @@ from PyQt6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QPlainTextE
                              QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 from waxx.util.live_od.gui import theme
 
-MAX_RECORDS = 5000
+# DEBUG lines (a few a shot) are kept too, so this holds a few runs' worth
+MAX_RECORDS = 20000
 
-_FILTERS = (("All", logging.DEBUG), ("Info", logging.INFO),
-            ("Warnings", logging.WARNING), ("Errors", logging.ERROR))
+# (label, lowest level shown, warnings shown). Errors show at every level.
+_FILTERS = (("Info only", logging.INFO, False),
+            ("Info", logging.INFO, True),
+            ("Debug", logging.DEBUG, True),
+            ("All", 0, True))
+_DEFAULT_FILTER = 1
+_FILTER_TIPS = ("Info and errors; no warnings",
+                "Info, warnings and errors",
+                "Adds the debug lines (per-shot progress, camera arm/release)",
+                "Everything, including full dumps (camera read-backs)")
 
 
 def _level_style(levelno: int) -> str:
@@ -104,7 +113,7 @@ class LogPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._records = deque(maxlen=MAX_RECORDS)   # (levelno, text, created)
-        self._min_level = logging.DEBUG
+        self._min_level, self._show_warnings = _FILTERS[_DEFAULT_FILTER][1:]
         self._collapsed = False
 
         self._toggle = QToolButton()
@@ -118,9 +127,11 @@ class LogPanel(QWidget):
         self._last_line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         self._filter = QComboBox()
-        for label, _ in _FILTERS:
+        for i, (label, _, _) in enumerate(_FILTERS):
             self._filter.addItem(label)
-        self._filter.setToolTip("Lowest level shown")
+            self._filter.setItemData(i, _FILTER_TIPS[i], Qt.ItemDataRole.ToolTipRole)
+        self._filter.setCurrentIndex(_DEFAULT_FILTER)
+        self._filter.setToolTip("What the log shows; errors always show")
         self._filter.currentIndexChanged.connect(self._on_filter_changed)
 
         header = QHBoxLayout()
@@ -207,11 +218,11 @@ class LogPanel(QWidget):
         if created is None:
             created = time.time()
         self._records.append((levelno, text, created))
-        if levelno >= self._min_level:
+        if self._shown(levelno):
             self._text.appendHtml(self._to_html(levelno, text, created))
-        first_line = text.split("\n", 1)[0]
-        self._last_line.setText(
-            f'<span style="{_level_style(levelno)}">{html.escape(first_line)}</span>')
+            first_line = text.split("\n", 1)[0]
+            self._last_line.setText(
+                f'<span style="{_level_style(levelno)}">{html.escape(first_line)}</span>')
         if levelno >= logging.ERROR:
             self.banner.show_error(text, created)
             self.error_logged.emit(text)
@@ -264,11 +275,18 @@ class LogPanel(QWidget):
         self._text.clear()
         self._last_line.clear()
 
+    def _shown(self, levelno: int) -> bool:
+        if levelno >= logging.ERROR:
+            return True
+        if levelno >= logging.WARNING:
+            return self._show_warnings
+        return levelno >= self._min_level
+
     def _on_filter_changed(self, index: int):
-        self._min_level = _FILTERS[index][1]
+        self._min_level, self._show_warnings = _FILTERS[index][1:]
         self._text.clear()
         for levelno, text, created in self._records:
-            if levelno >= self._min_level:
+            if self._shown(levelno):
                 self._text.appendHtml(self._to_html(levelno, text, created))
 
     @staticmethod

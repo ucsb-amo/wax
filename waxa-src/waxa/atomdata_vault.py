@@ -442,6 +442,13 @@ class AtomdataVault(atomdata_base):
         ])
         self._build_shot_param_values(chunks)
 
+        # Per-shot end-of-shot wall-clock times (data/timestamp_shot_end);
+        # NaN for shots whose run did not record them. Top-level and
+        # scan-shaped, so every reorder/reshape below carries it along.
+        self.timestamp_shot_end = np.concatenate(
+            self._shot_end_times_per_chunk(chunks), axis=0
+        )
+
         # Concatenate images / timestamps if present.
         # Keep a reference to the first chunk's raw images so the ROI GUI
         # shows a representative frame from the first run only (not all runs).
@@ -1019,6 +1026,34 @@ class AtomdataVault(atomdata_base):
             out[(i, *np.ix_(*maps))] = a
         return out
 
+    @staticmethod
+    def _shot_end_times_per_chunk(chunks):
+        """Each chunk's ``timestamp_shot_end`` shaped ``(*c.xvardims,)``.
+
+        A run without a usable one (not recorded, or a stamp count that does
+        not match its shots) contributes NaN for every shot and is named in
+        one warning, so a missing shot clock is never silent.
+        """
+        parts, missing = [], []
+        for c in chunks:
+            dims = tuple(int(n) for n in np.atleast_1d(c.xvardims))
+            ts = getattr(c, 'timestamp_shot_end', None)
+            ts = np.asarray(ts if ts is not None else [], dtype=np.float64)
+            if ts.shape == dims:
+                parts.append(ts)
+                continue
+            parts.append(np.full(dims, np.nan))
+            reason = ('not recorded' if ts.size == 0
+                      else f'shape {ts.shape} != scan {dims}')
+            missing.append(f'{int(c.run_info.run_id)} ({reason})')
+        if missing:
+            warnings.warn(
+                f"AtomdataVault: timestamp_shot_end is NaN for the shots of "
+                f"{len(missing)} of {len(chunks)} runs: " + ", ".join(missing),
+                stacklevel=4,
+            )
+        return parts
+
     def _assemble_stacked(self, chunks, promote_xvar, structure, sort, roi_id):
         """Build an (Nvars + 1)-axis vault from multi-axis runs.
 
@@ -1085,7 +1120,7 @@ class AtomdataVault(atomdata_base):
                 return None
 
         skip = {'images', 'image_timestamps', 'xvars', 'xvardims', 'sort_idx',
-                'sort_N', 'avg', 'std', 'sem', 'od_raw'}
+                'sort_N', 'avg', 'std', 'sem', 'od_raw', 'timestamp_shot_end'}
         if self._drop_raw_images or not self._has_images:
             skip |= {'img_atoms', 'img_light', 'img_dark'}
         skipped = []
@@ -1124,6 +1159,8 @@ class AtomdataVault(atomdata_base):
             np.asarray(self.source_run_ids, dtype=np.int64).reshape(-1, *([1] * nv)),
             -1,
         )
+        self.timestamp_shot_end = self._stack_scan_arrays(
+            self._shot_end_times_per_chunk(chunks), inner_dims, index_maps)
         self._shot_param_values = {}
 
         self.images = np.array([])

@@ -138,6 +138,7 @@ class LiveODWindow(QWidget):
         self.live_od_server.shot_conditions_signal.connect(self.analyzer.set_shot_conditions)
         self.live_od_server.shot_timing_signal.connect(self.on_shot_timing)
         self.live_od_server.run_done_signal.connect(self.on_run_done)
+        self.live_od_server.exited_run_signal.connect(self.on_run_exited)
         self.live_od_server.reset_signal.connect(self.reset)
         self.live_od_server.camera_control_signal.connect(self.on_remote_camera_control)
         self.live_od_server.run_state_signal.connect(self.on_run_state)
@@ -1245,6 +1246,17 @@ class LiveODWindow(QWidget):
         self.msg(f"Data file unusable ({reason}) — aborting run.", logging.ERROR)
         self.reset()
 
+    def on_run_exited(self, how: str):
+        """The server closed a run whose experiment exited with frames still due
+        (``how``: why now). Its camera thread is asked to stop quietly: the frames
+        that came stay in the file, which is neither saved nor deleted. The
+        interrupt path (reset) would delete it. run_done_signal follows."""
+        baby = self.the_baby
+        if baby is not None and baby.isRunning():
+            self.msg(f"The experiment exited; stopping camera thread {baby.name} ({how}). "
+                     f"The run's file is kept as it is.", logging.WARNING)
+            _stop_camera_thread(baby, f"its experiment exited ({how})")
+
     def on_run_done(self):
         """Called when the LiveODServer processes an END_RUN message."""
         self._run_active = False
@@ -1331,6 +1343,22 @@ class LiveODWindow(QWidget):
         self.viewer_window.update_image_count(count, total)
 
     def reset(self):
+        # A run whose experiment is gone: its experiment exited with frames still
+        # due (the server closes the run and keeps its file -- interrupting the
+        # camera thread here would delete it), or an Abort nobody has answered
+        # (pressed again: the server closes the aborted run now). The server
+        # thread does the closing; the next pass of its loop, within 0.5 s.
+        srv = getattr(self, 'live_od_server', None)
+        if srv is not None:
+            if srv.exited_run_pending():
+                srv.close_exited_run_now("Reset pressed")
+                self.msg("Reset: the run's experiment has exited; closing the run "
+                         "(its file is kept).", logging.WARNING)
+                return
+            if srv.abort_again():
+                self.msg("Reset pressed again: the Abort has no answer from the experiment; "
+                         "closing the aborted run now.", logging.WARNING)
+                return
         # Guard against duplicate calls (e.g. local button + remote reset_signal
         # arriving close together).  If _reset_requested is already set and
         # there is no active run or camera baby, the reset was already handled.

@@ -25,7 +25,18 @@ One run at a time:
   start unless it is already running: an aborted run has usually restarted it
   already (its abort path sends ``run complete``).
 
-The loop only ever sends liveOD read-only POLLs, and never kills a run.
+A loop is either fixed to one file (``LoopSpec.expt_path``) or a *pick* loop
+(``LoopSpec.root``): its file is chosen at every Start -- the Sequences tab's
+file dialog -- and must be a ``.py`` file inside ``root`` on the server's
+machine, not one of ``LoopSpec.exclude`` (the monitor experiment).  The file is
+read at every launch, so an edit takes effect at the loop's next run.
+
+The loop never kills a run.  It sends liveOD read-only POLLs, and one message
+more: when a run's process has exited and liveOD still has that run in progress
+without having heard of the exit -- the process's own exit notice (an atexit
+handler) never ran because it was killed or crashed hard, or it did not get
+through -- the loop sends the RUN_EXITED notice for it, naming the run id, so
+liveOD closes the run instead of showing it in progress until the next run.
 
 Every run's terminal output is kept (``RunLoop.output``, an
 :class:`~waxx.util.device_state.output_log.OutputLog`) for the GUIs' log view,
@@ -35,6 +46,7 @@ with a line of the loop's own before each run and at the end.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import threading
@@ -47,6 +59,8 @@ from typing import Callable, Iterable, Mapping
 
 from waxx.util.device_state.monitor_manager import (
     _INTERRUPTED_SIGNATURES, _diagnose, _matches, ar_command, environment_report)
+from waxx.util.device_state import loop_scan
+from waxx.util.device_state.loop_scan import ScanSettingsError, ScanSpec
 from waxx.util.device_state.output_log import OutputLog
 from waxx.util.device_state.state_reset import describe_expt
 
@@ -69,53 +83,134 @@ _TAIL_SHOWN = 8
 ACTIVE = ("running", "stopping")
 
 
+#: Characters refused in a picked file's path: the run is launched through the
+#: shell (``%kpy% & ar <file>``).
+_SHELL_CHARS = set('&|<>^%"!')
+
+
 @dataclass(frozen=True)
 class LoopSpec:
     """A loop the server offers: ``key`` (what GUIs ask for), a title, and the
-    experiment file.  Only files given to the server this way can be run."""
+    experiment file.  Only files given to the server this way can be run --
+    or, for a pick loop (``root`` set, ``expt_path`` empty), a ``.py`` file
+    inside ``root`` chosen at Start, other than those in ``exclude``."""
 
     key: str
     title: str
-    expt_path: str
+    expt_path: str = ""
+    root: str = ""
+    exclude: tuple = ()
+    #: Scan settings the GUI may set (:mod:`~waxx.util.device_state.loop_scan`).
+    scan: ScanSpec | None = None
+
+    @property
+    def pick(self) -> bool:
+        return bool(self.root)
 
 
 def loop_specs(mapping: Mapping | None) -> list[LoopSpec]:
-    """``{key: (title, path)}`` -> specs, skipping entries without a path (an
-    unset env var leaves the lab's paths None)."""
-    return [LoopSpec(str(k), str(title), str(path))
-            for k, (title, path) in (mapping or {}).items() if path]
+    """``{key: (title, path)}`` or ``{key: (title, path, scan)}`` -> specs,
+    skipping entries without a path (an unset env var leaves the lab's paths
+    None); ``scan`` is a :class:`~waxx.util.device_state.loop_scan.ScanSpec`
+    or its fields as a mapping.  A pick loop's entry is ``{key: {"title": ...,
+    "root": folder, "exclude": (paths,)}}`` (skipped without a root; a
+    ``"scan"`` there too)."""
+    specs = []
+    for k, entry in (mapping or {}).items():
+        if isinstance(entry, Mapping):
+            if entry.get("root"):
+                specs.append(LoopSpec(str(k), str(entry.get("title") or k),
+                                      root=str(entry["root"]),
+                                      exclude=tuple(str(p) for p in entry.get("exclude") or ()
+                                                    if p),
+                                      scan=_scan_spec(entry.get("scan"))))
+            continue
+        title, path, *rest = entry
+        if path:
+            specs.append(LoopSpec(str(k), str(title), str(path),
+                                  scan=_scan_spec(rest[0] if rest else None)))
+    return specs
 
 
-def _spawn(command: str):
+def _scan_spec(scan) -> ScanSpec | None:
+    if scan is None or isinstance(scan, ScanSpec):
+        return scan
+    return ScanSpec.from_mapping(scan)
+
+
+def resolve_pick(spec: LoopSpec, path) -> tuple[Path | None, str]:
+    """A pick loop's file from what a GUI sent (absolute, or relative to the
+    root): ``(path, "")``, or ``(None, why it is refused)``."""
+    if not spec.pick:
+        return None, f"{spec.title} runs a fixed file"
+    text = str(path or "").strip()
+    if not text:
+        return None, "no experiment file was chosen"
+    bad = sorted(_SHELL_CHARS & set(text))
+    if bad:
+        return None, f"the file's path contains {' '.join(bad)} (not allowed): {text}"
+    root = Path(spec.root).resolve()
+    candidate = Path(text.replace("\\", "/"))
+    full = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if full != root and root not in full.parents:
+        return None, f"only experiments inside {root} can be looped, not {full}"
+    if full.suffix.lower() != ".py":
+        return None, f"not a Python file: {full}"
+    if not full.is_file():
+        return None, f"no such file on the monitor server's machine: {full}"
+    for ex in spec.exclude:
+        try:
+            if full == Path(ex).resolve():
+                return None, f"{full.name} cannot be looped (it is the monitor's own experiment)"
+        except OSError:
+            continue
+    return full, ""
+
+
+def _spawn(command: str, extra_env: Mapping | None = None):
+    # unbuffered: the run's "Run ID:" line arrives when printed, and is not lost
+    # in a buffer when the process is killed
+    env = dict(os.environ, PYTHONUNBUFFERED="1", **(extra_env or {}))
     return Popen(command, stdout=PIPE, stderr=STDOUT, universal_newlines=True,
-                 bufsize=1, errors="replace", shell=True)
+                 bufsize=1, errors="replace", shell=True, env=env)
 
 
 class _LiveOD:
-    """POLL only, through one lazily made client; a failed call drops it so the
-    next one rediscovers the server."""
+    """POLL (and the exit notice, ``run_exited``) through one lazily made client;
+    a failed call drops it so the next one rediscovers the server."""
 
     def __init__(self):
         self._client = None
 
-    def __call__(self) -> dict:
+    def _call(self, fn):
         from waxx.util.live_od.live_od_client import LiveODClient  # noqa: PLC0415
         if self._client is None:
             self._client = LiveODClient(timeout_ms=3000, discovery_timeout=3.0)
         try:
-            reply = self._client.poll()
+            return fn(self._client)
         except Exception:
             self._client = None
             raise
+
+    def __call__(self) -> dict:
+        reply = self._call(lambda c: c.poll())
         if not reply.get("ok", False):
             raise RuntimeError(f"liveOD POLL failed: {reply}")
         return reply
+
+    def run_exited(self, run_id: int, reason: str) -> dict:
+        """RUN_EXITED for run ``run_id`` on behalf of its exited process (no run
+        token: liveOD matches the run id instead)."""
+        return self._call(lambda c: c._send_recv(
+            {"tag": "RUN_EXITED", "run_id": int(run_id), "reason": reason}))
 
 
 class RunLoop:
     """One loop.  ``info()`` is what GUIs are told (see the keys it sets).
 
     ``poll()`` returns liveOD's POLL reply (raises when unreachable);
+    ``run_exited(run_id, reason)`` sends liveOD RUN_EXITED for a run whose
+    process is gone (default: the default poll's own; none with a custom poll);
     ``fence()`` the run announced to the server, or None; ``busy()`` why
     something else of the server's holds the core, or ""; ``start_monitor(why)``
     starts the monitor unless it is running.  ``on_change(info)`` is called on
@@ -123,6 +218,7 @@ class RunLoop:
     """
 
     def __init__(self, spec: LoopSpec, *, poll: Callable[[], dict] | None = None,
+                 run_exited: Callable[[int, str], dict] | None = None,
                  fence: Callable[[], dict | None] | None = None,
                  busy: Callable[[], str] | None = None,
                  start_monitor: Callable[[str], None] | None = None,
@@ -130,8 +226,11 @@ class RunLoop:
                  spawn=None, clock: Callable[[], float] = time.time,
                  gap_s: float = GAP_S, poll_s: float = POLL_S):
         self.spec = spec
-        self.expt = Path(spec.expt_path).stem
+        #: The file run: the spec's, or a pick loop's last chosen one ("" until then).
+        self.path = spec.expt_path
+        self.expt = Path(self.path).stem if self.path else ""
         self._poll = poll or _LiveOD()
+        self._run_exited = run_exited or getattr(self._poll, "run_exited", None)
         self._fence = fence
         self._busy = busy
         self._start_monitor = start_monitor
@@ -147,9 +246,12 @@ class RunLoop:
         self._own_run_ids: deque = deque(maxlen=20)
         self._stop_by = ""
         self._external = ""
-        self._about, self._about_mtime = "", None
+        self._about, self._about_key = "", None
         self._s: dict = {"state": "idle", "text": "not started", "runs": 0,
                          "run_id": None, "last": None}
+        #: The scan settings the next run gets (None: the loop has none).  Kept
+        #: in memory: a server restart goes back to the spec's defaults.
+        self._scan = spec.scan.defaults() if spec.scan is not None else None
         #: The runs' terminal output, for the GUIs (the server log has it too).
         self.output = OutputLog()
 
@@ -163,18 +265,45 @@ class RunLoop:
     def info(self) -> dict:
         with self._lock:
             out = dict(self._s)
+            scan = dict(self._scan) if self._scan is not None else None
         out.update(key=self.spec.key, title=self.spec.title, expt=self.expt,
-                   path=self.spec.expt_path, about=self._read_about())
+                   path=self.path, about=self._read_about())
+        if scan is not None:
+            out["scan"] = dict(self.spec.scan.info(), settings=scan,
+                               text=loop_scan.describe(self.spec.scan, scan))
+        if self.spec.pick:
+            out.update(pick=True, root=str(Path(self.spec.root).resolve()),
+                       rel=self._rel(self.path))
         return out
 
-    def _read_about(self) -> str:
+    def _rel(self, path) -> str:
+        if not path:
+            return ""
         try:
-            mtime = Path(self.spec.expt_path).stat().st_mtime_ns
+            return Path(path).resolve().relative_to(Path(self.spec.root).resolve()).as_posix()
+        except (OSError, ValueError):
+            return str(path)
+
+    def _read_about(self) -> str:
+        path = self.path
+        if not path:
+            return ""
+        try:
+            key = (path, Path(path).stat().st_mtime_ns)
         except OSError:
             return ""
-        if mtime != self._about_mtime:
-            self._about, self._about_mtime = describe_expt(self.spec.expt_path), mtime
+        if key != self._about_key:
+            self._about, self._about_key = describe_expt(path), key
         return self._about
+
+    def describe(self, path) -> dict:
+        """What a pick loop would run for ``path`` (checked as at Start): the
+        server's full path and the file's docstring, for the GUI's confirm."""
+        full, why = resolve_pick(self.spec, path)
+        if full is None:
+            return {"status": "error", "msg": why}
+        return {"status": "ok", "path": str(full), "rel": self._rel(full), "expt": full.stem,
+                "about": describe_expt(full)}
 
     def _set(self, **fields) -> None:
         with self._lock:
@@ -183,11 +312,17 @@ class RunLoop:
 
     # -- requests ---------------------------------------------------------------
 
-    def start(self, operator: str = "", client: str = "") -> dict:
+    def start(self, operator: str = "", client: str = "", path=None) -> dict:
+        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`)."""
         who = _who(operator, client)
-        path = Path(self.spec.expt_path)
-        if not path.is_file():
-            return self._refused(f"the loop's experiment file does not exist: {path}", who)
+        if self.spec.pick:
+            full, why = resolve_pick(self.spec, path)
+            if full is None:
+                return self._refused(why, who)
+        else:
+            full = Path(self.path)
+            if not full.is_file():
+                return self._refused(f"the loop's experiment file does not exist: {full}", who)
         with self._lock:
             if self._s["state"] in ACTIVE:
                 return self._refused(f"{self.spec.title} is already running", who)
@@ -195,12 +330,16 @@ class RunLoop:
         if blocked is not None:
             return self._refused(blocked[0], who)
         with self._lock:
+            if self._s["state"] in ACTIVE:
+                return self._refused(f"{self.spec.title} is already running", who)
+            if self.spec.pick:
+                self.path, self.expt = str(full), full.stem
             self._stop_by, self._external = "", ""
             self._wake.clear()
             self._s = {"state": "running", "text": f"started by {who}", "runs": 0,
                        "run_id": None, "last": None, "started": self._clock(),
                        "ended": None, "operator": operator, "client": client}
-        log.info("%s: started by %s (%s).", self.spec.title, who, self.spec.expt_path)
+        log.info("%s: started by %s (%s).", self.spec.title, who, self.path)
         self._record("run_loop_start", operator=operator, client=client)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"run-loop-{self.spec.key}")
@@ -221,6 +360,29 @@ class RunLoop:
         log.info("%s: stop requested by %s.", self.spec.title, who)
         self._record("run_loop_stop", operator=operator, client=client)
         self._wake.set()
+        self._notify()
+        return {"status": "ok", "loop": self.info()}
+
+    def configure(self, settings, operator: str = "", client: str = "") -> dict:
+        """Set the scan settings (loop_scan's dict, SI); while the loop runs
+        they apply from its next run."""
+        who = _who(operator, client)
+        if self.spec.scan is None:
+            return {"status": "error", "msg": f"{self.spec.title} has no scan settings"}
+        try:
+            new = loop_scan.normalize(self.spec.scan, settings)
+        except ScanSettingsError as exc:
+            return {"status": "error", "msg": str(exc)}
+        with self._lock:
+            old, self._scan = self._scan, new
+            active = self._s["state"] in ACTIVE
+        text = loop_scan.describe(self.spec.scan, new)
+        log.info("%s: scan set by %s: %s (was %s).", self.spec.title, who, text,
+                 loop_scan.describe(self.spec.scan, old))
+        self._record("run_loop_configure", operator=operator, client=client, scan=new,
+                     previous=old)
+        if active:
+            self.output.mark(f"scan set by {who}: {text} -- from the next run", self._clock)
         self._notify()
         return {"status": "ok", "loop": self.info()}
 
@@ -309,16 +471,25 @@ class RunLoop:
 
     def _one_run(self) -> tuple[str, str, bool] | None:
         """Launch the experiment once and follow it; None when it saved."""
-        command = ar_command(self.spec.expt_path)
+        path = self.path
+        command = ar_command(f'"{path}"' if " " in path else path)
         n = self.info()["runs"] + 1
+        with self._lock:
+            scan = dict(self._scan) if self._scan is not None else None
         try:
-            proc = self._spawn(command)
+            if scan is None:
+                proc = self._spawn(command)
+            else:
+                proc = self._spawn(command, {loop_scan.ENV_VAR: loop_scan.to_env(scan)})
         except OSError as exc:
             log.error("%s: could not spawn %r: %r", self.spec.title, command, exc)
             for line in environment_report():
                 log.error("  %s", line)
             return "latched", f"could not start {self.expt}: {exc!r}", True
-        self.output.mark(f"{_nth(n)} run of the loop: {self.expt}", self._clock)
+        mark = f"{_nth(n)} run of the loop: {self.expt}"
+        if scan is not None:
+            mark += f" ({loop_scan.describe(self.spec.scan, scan)})"
+        self.output.mark(mark, self._clock)
         self._set(run_id=None, run_started=self._clock(), tail=None,
                   text=f"run {n} of the loop starting ({self.expt})")
         lines: queue.Queue = queue.Queue()
@@ -353,7 +524,57 @@ class RunLoop:
                 self._set(run_id=run_id, text=f"run {run_id} in progress ({_nth(n)} of the loop)")
                 self._record("run_loop_run", run_id=run_id, n=n)
         code = proc.wait()
+        self._tell_live_od_it_exited(run_id, code, list(tail), n)
         return self._judge(code, list(tail), run_id, abort_seen)
+
+    def _tell_live_od_it_exited(self, run_id, code, tail: list[str], n: int) -> None:
+        """The run's process has exited. If liveOD still has the run in progress
+        and has not heard that its process exited (``run_state`` "exited"), send
+        RUN_EXITED for it: the process's own notice (an atexit handler) never ran
+        -- it was killed or crashed hard -- or did not get through. Without it
+        the run stays "in progress" in liveOD until the next run starts."""
+        if self._run_exited is None:
+            return
+        try:
+            poll = self._poll()
+        except Exception as exc:
+            log.warning("%s: could not ask liveOD whether it knows the run ended: %s",
+                        self.spec.title, exc)
+            return
+        if not poll.get("run_in_progress") or poll.get("run_state") == "exited":
+            return
+        live_id = poll.get("run_id")
+        if run_id is None:
+            # killed before its "Run ID:" line came through: liveOD's run is this
+            # one only if it is our experiment and started after this launch
+            age = poll.get("init_run_age_s")
+            started = self.info().get("run_started")
+            if (Path(str(poll.get("expt_name") or "")).stem != self.expt or age is None
+                    or started is None or age > self._clock() - started):
+                return
+        elif live_id != run_id:
+            return
+        reason = f"its process ended with exit code {code} and sent no exit notice"
+        if tail:
+            reason += f"; last line: {tail[-1]}"
+        reason += " (sent by the monitor server's run loop)"
+        try:
+            reply = self._run_exited(live_id, reason)
+        except Exception as exc:
+            log.error("%s: run %s is still in progress in liveOD after its process exited, "
+                      "and telling liveOD failed: %s", self.spec.title, live_id, exc)
+            self.output.mark(f"run {live_id}: liveOD still shows it in progress, and could "
+                             f"not be told its process exited ({exc})", self._clock)
+            return
+        ok = bool(reply.get("ok"))
+        log.warning("%s: run %s was still in progress in liveOD after its process exited "
+                    "(exit code %s); told liveOD: %s", self.spec.title, live_id, code,
+                    "done" if ok else reply)
+        self.output.mark(f"run {live_id}: its process exited without telling liveOD; "
+                         + ("the loop told it" if ok else f"liveOD refused the notice: {reply}"),
+                         self._clock)
+        self._record("run_loop_told_live_od_exited", run_id=live_id, n=n, exit_code=code,
+                     ok=ok)
 
     def _judge(self, code, tail: list[str], run_id, abort_seen: bool):
         name = f"run {run_id}" if run_id is not None else "the run (it never got a run id)"

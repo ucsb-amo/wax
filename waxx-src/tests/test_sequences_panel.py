@@ -367,3 +367,119 @@ def test_the_pill_menu_offers_what_the_state_allows(gui):
     assert gui._monitor_commands_allowed() == (False, True)
     gui.on_connection_failed()
     assert gui._monitor_commands_allowed() == (False, False)
+
+
+# --- pick loop (file chosen at Start) -------------------------------------------------------
+
+PICK = {"key": "expt_loop", "title": "Experiment loop", "expt": "", "path": "", "about": "",
+        "pick": True, "root": "C:/code/k-exp/kexp/experiments", "rel": "",
+        "state": "idle", "text": "not started", "runs": 0, "run_id": None, "last": None}
+
+
+def test_server_path_maps_a_local_file_onto_the_servers_root(tmp_path):
+    root = tmp_path / "kexp" / "experiments"
+    (root / "JP").mkdir(parents=True)
+    f = root / "JP" / "rabi.py"
+    f.write_text("")
+    assert sp.server_path(str(f), str(root)) == "JP/rabi.py"
+    # another PC: a different checkout, same layout under kexp/experiments
+    other = r"D:\lab\k-exp\KEXP\Experiments\JP\sub\rabi.py"
+    assert sp.server_path(other, r"C:\code\k-exp\kexp\experiments") == "JP/sub/rabi.py"
+    assert sp.server_path(r"D:\elsewhere\rabi.py", r"C:\code\k-exp\kexp\experiments") is None
+
+
+def test_pick_card_chooses_a_file_describes_it_then_starts_it(panel, monkeypatch):
+    panel.set_loops({"expt_loop": PICK})
+    card = panel.loop_cards["expt_loop"]
+    assert card.start_button.text() == "Start…" and "no file chosen" in card.title.text()
+    panel.choose_file = lambda caption, start: r"Z:\x\kexp\experiments\JP\rabi.py"
+    card.start_button.click()
+    req = _reply(panel, {"status": "ok", "path": "C:/code/k-exp/kexp/experiments/JP/rabi.py",
+                         "rel": "JP/rabi.py", "expt": "rabi", "about": "Rabi flop."})
+    assert (req["action"], req["loop"], req["path"]) == ("describe", "expt_loop", "JP/rabi.py")
+    title, text, verb = panel.confirm_answers[-1]
+    assert title == "Experiment loop: rabi" and "Rabi flop." in text
+    assert "on the monitor server" in text and "read again at every run" in text
+    req = _reply(panel, {"status": "ok", "loop": dict(PICK, state="running", expt="rabi",
+                                                      path="C:/.../rabi.py")})
+    assert (req["action"], req["path"]) == ("start", "JP/rabi.py")
+    assert card.title.text() == "Experiment loop: rabi" and card.pill.text() == "RUNNING"
+
+
+def test_pick_card_shows_why_the_server_refused_the_file(panel):
+    panel.set_loops({"expt_loop": PICK})
+    card = panel.loop_cards["expt_loop"]
+    n = len(panel.confirm_answers)
+    panel.choose_file = lambda caption, start: r"Z:\x\kexp\experiments\tools\monitor.py"
+    card.start_button.click()
+    _reply(panel, {"status": "error", "msg": "monitor.py cannot be looped"})
+    assert len(panel.confirm_answers) == n and "cannot be looped" in card.status.text()
+    # cancelling the dialog sends nothing
+    sent = len(panel._sender.requests)
+    panel.choose_file = lambda caption, start: ""
+    card.start_button.click()
+    assert len(panel._sender.requests) == sent
+
+
+# --- scan settings (⚙) ------------------------------------------------------------------
+
+SCAN = {"xvar": "t_tof", "unit": "ms", "scale": 1e-3, "minimum": 0.0, "maximum": 25e-3,
+        "max_points": 200, "max_repeats": 100,
+        "settings": {"start": 1e-3, "stop": 4e-3, "n": 9, "repeats": 5},
+        "text": "t_tof 1–4 ms, 9 points × 5 repeats (45 shots)"}
+
+
+def test_the_gear_shows_only_for_a_loop_with_a_scan_and_sends_it(panel):
+    panel.set_loops({"auto_tof": LOOP})
+    card = panel.loop_cards["auto_tof"]
+    assert card.settings_button.isHidden()
+    panel.set_loops({"auto_tof": dict(LOOP, scan=SCAN)})
+    assert not card.settings_button.isHidden() and card.settings_button.isEnabled()
+    assert "scan: t_tof 1–4 ms, 9 points" in card.status.text()
+    row = card.layout().itemAt(0).layout()
+    assert row.indexOf(card.settings_button) == row.indexOf(card.toggle) - 1
+    asked = []
+    new = {"start": 2e-3, "stop": None, "n": 1, "repeats": 20}
+    panel.ask_scan = lambda title, scan, running=False: asked.append((title, running)) or new
+    card.settings_button.click()
+    assert asked == [("BEC TOF loop", False)]
+    req = _reply(panel, {"status": "ok", "loop": dict(LOOP, scan=dict(
+        SCAN, settings=new, text="t_tof 2 ms × 20 repeats (20 shots)"))})
+    assert (req["type"], req["action"], req["loop"], req["scan"]) == \
+        ("run_loop", "configure", "auto_tof", new)
+    assert "scan: t_tof 2 ms × 20 repeats" in card.status.text()
+    card.settings_button.click()
+    _reply(panel, {"status": "error", "msg": "the start value -1 ms is below the minimum 0 ms"})
+    assert "✕ scan not set: the start value -1 ms" in card.status.text()
+    panel.ask_scan = lambda *a, **k: None                   # Cancel: nothing sent
+    n = len(panel._sender.requests)
+    card.settings_button.click()
+    assert len(panel._sender.requests) == n
+    panel.set_reachable(False)
+    assert not card.settings_button.isEnabled()
+
+
+def test_the_dialog_grays_points_without_a_stop_value_and_checks_like_the_server(qapp):
+    d = sp.ScanSettingsDialog("BEC TOF loop", SCAN, running=True)
+    ok = d.buttons.button(sp.QDialogButtonBox.StandardButton.Ok)
+    assert (d.start.text(), d.stop.text(), d.points.value(), d.repeats.value()) == \
+        ("1", "4", 9, 5)
+    assert d.points.isEnabled() and ok.isEnabled()
+    assert d.settings() == {"start": 1e-3, "stop": 4e-3, "n": 9, "repeats": 5}
+    assert "45 shots" in d.summary.text()
+    d.stop.setText("")
+    assert not d.points.isEnabled()
+    d.repeats.setValue(20)
+    assert d.settings() == {"start": 1e-3, "stop": None, "n": 1, "repeats": 20}
+    assert d.summary.text() == "t_tof 1 ms × 20 repeats (20 shots)"
+    d.start.setText("30")
+    assert not ok.isEnabled() and "above the maximum 25 ms" in d.summary.text()
+    assert d.settings() is None
+    d.start.setText("abc")
+    assert not ok.isEnabled() and "not a number" in d.summary.text()
+    d.start.setText("0.5")
+    d.stop.setText("2.5")
+    d.points.setValue(5)
+    assert ok.isEnabled() and d.settings() == pytest.approx(
+        {"start": 0.5e-3, "stop": 2.5e-3, "n": 5, "repeats": 20})
+    d.close()

@@ -176,7 +176,11 @@ class MonitorUDPServer(UdpServer):
       broadcast as ``reset_run``.
     * ``run_loop`` (``action`` ``start`` / ``stop``, ``loop``) — run one of
       the server's ``run_loops`` back to back (see
-      :mod:`waxx.util.device_state.run_loop`); one loop at a time.  Changes
+      :mod:`waxx.util.device_state.run_loop`); one loop at a time.  A pick
+      loop's ``start`` takes ``path`` (relative to its root, or absolute);
+      ``describe`` with ``path`` checks it and returns its docstring.
+      ``configure`` with ``scan`` sets a loop's scan settings (see
+      :mod:`waxx.util.device_state.loop_scan`; from its next run).  Changes
       are broadcast as ``run_loop``; ``status_json`` has ``run_loops``.  A
       ``reset`` (monitor restart) request ends a running loop; the loop's
       end asks for the monitor through ``start_monitor_signal``.
@@ -647,13 +651,17 @@ class MonitorUDPServer(UdpServer):
         action = obj.get("action")
         if action == "stop":
             return loop.stop(operator=operator, client=client)
+        if action == "describe":
+            return loop.describe(obj.get("path"))
+        if action == "configure":
+            return loop.configure(obj.get("scan"), operator=operator, client=client)
         if action != "start":
             return {"status": "error", "msg": f"unknown run loop action {action!r}"}
         other = active_loop(self.loops.values())
         if other is not None and other is not loop:
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
-        return loop.start(operator=operator, client=client)
+        return loop.start(operator=operator, client=client, path=obj.get("path"))
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line

@@ -82,7 +82,7 @@ def shot_times(ad, return_source: bool = False):
     ``"img_timestamp_atoms"``, ``"timestamp_shot_end"``, ``"run_start"``.
     Missing / padded shots are NaN.  Raises if no clock is available.
     """
-    for attr in ("img_timestamp_atoms", "timestamp_shot_end"):
+    for attr in ("timestamp_shot_end", "img_timestamp_atoms"):
         t = _usable_times(getattr(ad, attr, None))
         if t is not None:
             return (t, attr) if return_source else t

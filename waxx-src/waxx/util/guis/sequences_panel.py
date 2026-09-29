@@ -10,6 +10,15 @@ the terminal output of its runs.  The server keeps the last lines
 the new ones every second while this tab is visible, and nothing is polled
 otherwise.
 
+A pick loop's card (kexp: "Experiment loop") opens a file dialog at Start; the
+file goes to the server relative to its experiments folder (:func:`server_path`),
+which checks it and describes it from its own copy before the confirm.
+
+A loop with scan settings (:mod:`waxx.util.device_state.loop_scan`; kexp: the
+BEC TOF loop's t_tof) has ⚙ left of ▾: start, stop (blank: repeat the start
+value), points and repeats, sent to the server, which uses them from the next
+run.  The card's status line shows the current scan.
+
 Everything shown is the server's: every GUI sees the same loop and reset.
 The reset's Run emits ``reset_requested``; the host GUI confirms and sends it
 (the same dialog as the untrusted banner's button).
@@ -17,16 +26,19 @@ The reset's Run emits ``reset_requested``; the host GUI confirms and sends it
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QToolButton,
-    QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from waxx.util.dashboard import theme
+from waxx.util.device_state import loop_scan
 from waxx.util.guis.composite_panel import (
     CARD_GAP, ERR_TEXT, OK_TEXT, WARN_TEXT, _OpSender, _card_css, _clock, _label_pill_css,
     _pill_button_css, _small,
@@ -49,6 +61,120 @@ _RESET_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
 
 _NO_OUTPUT = ("This monitor server keeps no output (older code): restart the monitor "
               "server to get the log.")
+
+
+def server_path(local: str, root: str) -> str | None:
+    """A file chosen in this GUI's dialog as the monitor server's pick loop
+    wants it: relative to ``root`` (the server's folder).  On the server's own
+    machine the file is inside ``root``; on another lab PC the same repo
+    layout is assumed -- the part after the root's last two folders (e.g.
+    ``kexp/experiments``).  None when neither fits."""
+    picked = Path(local)
+    try:
+        return picked.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (OSError, ValueError):
+        pass
+    tail = [p.lower() for p in Path(root).parts[-2:]]
+    parts = list(picked.parts)
+    lowered = [p.lower() for p in parts]
+    n = len(tail)
+    for i in range(len(parts) - n, -1, -1):
+        if n and lowered[i:i + n] == tail and len(parts) > i + n:
+            return Path(*parts[i + n:]).as_posix()
+    return None
+
+
+def _local_start(path, root: str) -> str:
+    """Where the dialog opens: the loop's last file or its root, when this
+    machine has them."""
+    for candidate in (path, root):
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return ""
+
+
+class ScanSettingsDialog(QDialog):
+    """A loop's scan: start, stop (blank: the start value alone), points
+    between them (grayed out without a stop value), repeats.  Values are shown
+    in the spec's unit; :meth:`settings` returns SI.  OK is enabled only for
+    settings the server would accept (the same check, loop_scan.normalize)."""
+
+    def __init__(self, title: str, scan: dict, running: bool = False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{title}: scan settings")
+        self.spec = loop_scan.ScanSpec(
+            xvar=str(scan.get("xvar") or "value"), unit=str(scan.get("unit") or ""),
+            scale=float(scan.get("scale") or 1.0), minimum=scan.get("minimum"),
+            maximum=scan.get("maximum"))
+        current = scan.get("settings") or {}
+        unit = f" ({self.spec.unit})" if self.spec.unit else ""
+        box = QVBoxLayout(self)
+        form = QFormLayout()
+        self.start = QLineEdit(self._shown(current.get("start")))
+        self.stop = QLineEdit(self._shown(current.get("stop")))
+        self.stop.setPlaceholderText("blank: repeat the start value")
+        self.points = QSpinBox()
+        self.points.setRange(2, int(scan.get("max_points") or loop_scan.MAX_POINTS))
+        self.points.setValue(max(2, int(current.get("n") or 2)))
+        self.repeats = QSpinBox()
+        self.repeats.setRange(1, int(scan.get("max_repeats") or loop_scan.MAX_REPEATS))
+        self.repeats.setValue(int(current.get("repeats") or 1))
+        form.addRow(f"{self.spec.xvar} start{unit}", self.start)
+        form.addRow(f"{self.spec.xvar} stop{unit}", self.stop)
+        form.addRow("points", self.points)
+        form.addRow("repeats", self.repeats)
+        box.addLayout(form)
+        self.summary = _small("")
+        self.summary.setWordWrap(True)
+        box.addWidget(self.summary)
+        if running:
+            box.addWidget(_small("The loop is running: new settings apply from its next run."))
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                        | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        box.addWidget(self.buttons)
+        for w in (self.start, self.stop):
+            w.textChanged.connect(self._update)
+        for w in (self.points, self.repeats):
+            w.valueChanged.connect(self._update)
+        self._update()
+
+    def _shown(self, v) -> str:
+        return "" if v is None else f"{float(v) / self.spec.scale:g}"
+
+    def _si(self, text: str):
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            return float(text) * self.spec.scale
+        except ValueError:
+            return text             # normalize says it is not a number
+
+    def settings(self) -> dict | None:
+        """The checked settings (SI), or None when they are refused."""
+        try:
+            return loop_scan.normalize(self.spec, self._raw())
+        except loop_scan.ScanSettingsError:
+            return None
+
+    def _raw(self) -> dict:
+        start = self._si(self.start.text())
+        return {"start": "" if start is None else start, "stop": self._si(self.stop.text()),
+                "n": self.points.value(), "repeats": self.repeats.value()}
+
+    def _update(self) -> None:
+        self.points.setEnabled(bool(self.stop.text().strip()))
+        try:
+            s = loop_scan.normalize(self.spec, self._raw())
+        except loop_scan.ScanSettingsError as exc:
+            s, text, color = None, f"✕ {exc}", ERR_TEXT
+        else:
+            text, color = loop_scan.describe(self.spec, s), theme.FG_MUTED
+        self.summary.setText(text)
+        self.summary.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(s is not None)
 
 
 class SequenceCard(QFrame):
@@ -103,6 +229,20 @@ class SequenceCard(QFrame):
         self.status = _small("")
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.status, 1)
+        #: ⚙: the loop's scan settings (shown when the server offers them).
+        self.settings_button = QToolButton()
+        self.settings_button.setText("⚙")
+        self.settings_button.setAutoRaise(True)
+        self.settings_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setStyleSheet(
+            f"QToolButton {{ color: {theme.FG_MUTED}; border: 0; border-radius: 4px;"
+            f" font-size: 14px; padding: 0px 6px; }}"
+            f"QToolButton:hover {{ color: {theme.FG_STRONG}; background: {theme.BG_BUTTON_HOVER}; }}"
+            f"QToolButton:disabled {{ color: {theme.BORDER}; }}")
+        self.settings_button.clicked.connect(lambda _=False: panel.configure_loop(key))
+        self.settings_button.hide()
+        row.addWidget(self.settings_button)
         self.toggle = QToolButton()
         self.toggle.setText("▾")
         self.toggle.setCheckable(True)
@@ -157,7 +297,10 @@ class SequenceCard(QFrame):
     def _show(self) -> None:
         info = self.info
         if self.kind == "run_loop":
-            self.title.setText(info.get("title") or self.key)
+            title = info.get("title") or self.key
+            if info.get("pick"):
+                title += f": {info['expt']}" if info.get("expt") else " (no file chosen yet)"
+            self.title.setText(title)
             about = info.get("about") or ""
             self.title.setToolTip("\n\n".join(p for p in (about, info.get("path") or "") if p))
             state = info.get("state") or "idle"
@@ -171,6 +314,9 @@ class SequenceCard(QFrame):
             last = info.get("last") or {}
             if last.get("outcome") == "saved" and state not in ("running", "stopping"):
                 parts.append(f"last saved: run {last.get('run_id')}")
+            scan = info.get("scan") or {}
+            if scan.get("text"):
+                parts.append(f"scan: {scan['text']}")
             color = WARN_TEXT if state == "latched" else (OK_TEXT if state == "running"
                                                           else theme.FG_MUTED)
         else:
@@ -202,10 +348,21 @@ class SequenceCard(QFrame):
         state = self.info.get("state") or "idle"
         unreachable = "" if reachable else "the monitor server is unreachable"
         if self.kind == "run_loop":
+            pick = bool(self.info.get("pick"))
+            self.start_button.setText("Start…" if pick else "Start")
             self.start_button.setEnabled(reachable and state not in ("running", "stopping"))
-            self.start_button.setToolTip(unreachable)
+            self.start_button.setToolTip(
+                unreachable or ("Choose an experiment file in "
+                                f"{self.info.get('root') or 'the experiments folder'}, "
+                                "then run it back to back" if pick else ""))
             self.stop_button.setEnabled(reachable and state == "running")
             self.stop_button.setText("Stopping…" if state == "stopping" else "Stop")
+            scan = self.info.get("scan")
+            self.settings_button.setVisible(bool(scan))
+            self.settings_button.setEnabled(reachable)
+            self.settings_button.setToolTip(
+                unreachable or "Scan settings: "
+                + str((scan or {}).get("text") or "") + "\n(a change applies from the next run)")
         else:
             running = state == "running"
             self.start_button.setText("Running…" if running else "Run")
@@ -293,6 +450,8 @@ class SequencesPanel(QWidget):
         self._req = 0
         self._requests: dict[int, Callable[[dict], None]] = {}
         self.loop_cards: dict[str, SequenceCard] = {}
+        #: The last file chosen for a pick loop (the dialog opens there).
+        self._last_pick = ""
         box = QVBoxLayout(self)
         box.setContentsMargins(CARD_GAP, 10, CARD_GAP, CARD_GAP)
         box.setSpacing(8)
@@ -380,15 +539,62 @@ class SequencesPanel(QWidget):
     def start_loop(self, key: str) -> bool:
         card = self.loop_cards.get(key)
         info = card.info if card is not None else {}
+        if info.get("pick"):
+            return self._pick_and_start(key, card, info)
+        return self._confirm_and_start(key, card, info)
+
+    def _pick_and_start(self, key: str, card, info: dict) -> bool:
+        """A pick loop: choose the file here, have the server check it (and
+        describe it from its own copy), confirm, start."""
+        root = str(info.get("root") or "")
+        start_at = self._last_pick or _local_start(info.get("path"), root)
+        chosen = self.choose_file(f"{info.get('title') or key}: choose an experiment", start_at)
+        if not chosen:
+            return False
+        self._last_pick = chosen
+        rel = server_path(chosen, root)
+        if rel is None:
+            if card is not None:
+                card.set_message(f"✕ not started: {chosen} is not inside the experiments "
+                                 f"folder ({root})")
+            return False
+
+        def described(reply):
+            if reply.get("status") != "ok":
+                if card is not None:
+                    card.set_message(f"✕ not started: {reply.get('msg')}")
+                return
+            self._confirm_and_start(key, card, dict(info, about=reply.get("about") or "",
+                                                    path=reply.get("path") or rel,
+                                                    expt=reply.get("expt") or ""),
+                                    path=rel)
+        self.send_request({"type": "run_loop", "action": "describe", "loop": key,
+                           "path": rel}, described)
+        return True
+
+    def choose_file(self, caption: str, start_at: str) -> str:
+        """The file dialog (tests replace it)."""
+        chosen, _ = QFileDialog.getOpenFileName(self, caption, start_at,
+                                                "Python experiments (*.py)")
+        return chosen
+
+    def _confirm_and_start(self, key: str, card, info: dict, path: str | None = None) -> bool:
         title = info.get("title") or key
+        if path is not None and info.get("expt"):
+            title = f"{title}: {info['expt']}"
         lines = [info["about"]] if info.get("about") else []
+        if path is not None:
+            lines.append("The file is read again at every run: an edit takes effect at the "
+                         "loop's next run. Its runs must save through liveOD (save_data=True), "
+                         "or the loop stops after the first.")
         lines.append("It runs back to back on the monitor server, whether or not this window "
                      "stays open, until Stop. It stops by itself (latched off) on an Abort in "
                      "liveOD, a run that fails or saves incomplete, someone else's run, or the "
                      "monitor being started. Stop lets the run in progress finish and save, "
                      "then starts the monitor.")
         if info.get("path"):
-            lines.append(f"File: {info['path']}")
+            lines.append(f"File{' (on the monitor server)' if path is not None else ''}: "
+                         f"{info['path']}")
         if not self.confirm(title, "\n\n".join(lines), verb=f"Start {title}"):
             return False
 
@@ -397,8 +603,39 @@ class SequencesPanel(QWidget):
                 self.on_run_loop(reply.get("loop"))
             elif card is not None:
                 card.set_message(f"✕ not started: {reply.get('msg')}")
-        self.send_request({"type": "run_loop", "action": "start", "loop": key}, done)
+        request = {"type": "run_loop", "action": "start", "loop": key}
+        if path is not None:
+            request["path"] = path
+        self.send_request(request, done)
         return True
+
+    def configure_loop(self, key: str) -> bool:
+        """⚙: edit the loop's scan settings and send them to the server."""
+        card = self.loop_cards.get(key)
+        info = card.info if card is not None else {}
+        scan = info.get("scan")
+        if not scan:
+            return False
+        settings = self.ask_scan(info.get("title") or key, scan,
+                                 running=info.get("state") in ("running", "stopping"))
+        if settings is None:
+            return False
+
+        def done(reply):
+            if reply.get("status") == "ok":
+                self.on_run_loop(reply.get("loop"))
+            elif card is not None:
+                card.set_message(f"✕ scan not set: {reply.get('msg')}")
+        self.send_request({"type": "run_loop", "action": "configure", "loop": key,
+                           "scan": settings}, done)
+        return True
+
+    def ask_scan(self, title: str, scan: dict, running: bool = False) -> dict | None:
+        """The settings dialog (tests replace it): new settings (SI), or None."""
+        dialog = ScanSettingsDialog(title, scan, running=running, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.settings()
 
     def stop_loop(self, key: str) -> None:
         card = self.loop_cards.get(key)

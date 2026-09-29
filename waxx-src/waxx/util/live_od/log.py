@@ -30,6 +30,11 @@ from logging.handlers import RotatingFileHandler
 from PyQt6.QtCore import QObject, pyqtSignal
 
 LOGGER_NAME = "waxx.live_od"
+
+# Below DEBUG: full dumps (a camera's whole read-back, ...). The file and the GUI's
+# "All" level show them; the terminal stops at DEBUG.
+VERBOSE = 5
+logging.addLevelName(VERBOSE, "VERBOSE")
 DEFAULT_LOG_DIR = os.path.join(os.path.expanduser("~"), ".waxx", "logs")
 
 # The buffer's size. At the per-shot DEBUG rate (a few lines a shot) this is
@@ -222,15 +227,16 @@ def get_log_buffer() -> LogBuffer:
         _buffer = LogBuffer()
         logger.addHandler(_buffer)
         if logger.level == logging.NOTSET:
-            logger.setLevel(logging.DEBUG)
+            logger.setLevel(VERBOSE)
     return _buffer
 
 
-def setup_logging(log_dir=DEFAULT_LOG_DIR, level=logging.INFO) -> QtLogHandler:
+def setup_logging(log_dir=DEFAULT_LOG_DIR, level=VERBOSE) -> QtLogHandler:
     """Attach the terminal, file, Qt and buffer handlers (once) and return the Qt handler.
 
-    ``level`` is the GUI's: the terminal, the file and the buffer take everything,
-    DEBUG included (per-shot lines are DEBUG except for about one in twenty).
+    ``level`` is the GUI's; by default it takes everything and the log panel's level
+    menu filters. The terminal takes DEBUG and above (per-shot lines are DEBUG except
+    for about one in twenty); the file and the buffer take everything, VERBOSE included.
     ``log_dir=None`` skips the file. A log directory that cannot be written is
     reported and otherwise ignored: liveOD must start without it.
     """
@@ -239,10 +245,11 @@ def setup_logging(log_dir=DEFAULT_LOG_DIR, level=logging.INFO) -> QtLogHandler:
     if _qt_handler is not None:
         return _qt_handler
 
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(VERBOSE)
     logger.propagate = False    # the root logger may have handlers of its own
 
     stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.DEBUG)
     stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S"))
     logger.addHandler(stream)
 

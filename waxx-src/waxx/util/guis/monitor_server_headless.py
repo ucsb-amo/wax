@@ -111,7 +111,9 @@ class HeadlessMonitorServer(QObject):
                                            state_generator=self.state_generator)
         log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
         for spec in self.run_loops:
-            log.info("run loop '%s': %s", spec.title, spec.expt_path)
+            log.info("run loop '%s': %s", spec.title,
+                     f"any .py file in {spec.root} (chosen at Start)" if spec.pick
+                     else spec.expt_path)
         for c in self.udp_server.connections.connections:
             log.info("connection '%s': %s (opens when the monitor is running)", c.label,
                      c.driver)

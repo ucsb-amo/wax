@@ -1582,6 +1582,10 @@ class atomdata_base():
             if arr is not None:
                 setattr(ad, k, slice_ndarray(arr))
 
+        # Per-shot end times (empty on runs that did not record them).
+        if self._is_scan_shaped_numeric_array(getattr(self, 'timestamp_shot_end', None)):
+            ad.timestamp_shot_end = slice_ndarray(ad.timestamp_shot_end)
+
         # Slice DataVault — read from ad so reassign_repeats rearrangements are respected.
         for k in ad.data.keys:
             setattr(ad.data, k, slice_ndarray(getattr(ad.data, k)))
@@ -2285,6 +2289,11 @@ class atomdata_base():
                     old_xvardims
                 )
 
+        if self._is_scan_shaped_numeric_array(getattr(self, 'timestamp_shot_end', None)):
+            self.timestamp_shot_end = self._reassign_repeat_ndarray(
+                self.timestamp_shot_end, source_xvar_idx, xvar_idx, n_repeats,
+                old_xvardims)
+
         for key in self.data.keys:
             value = vars(self.data)[key]
             if self._is_scan_shaped_numeric_array(value):
@@ -2436,6 +2445,10 @@ class atomdata_base():
                     new_attr = np.array(new_attr)
                 vars(struct)[key] = new_attr
 
+        # checked before xvardims is reordered below
+        transpose_ts_end = self._is_scan_shaped_numeric_array(
+            getattr(self, 'timestamp_shot_end', None))
+
         listlike_keys = ['xvars','xvarnames','xvardims']
         reorder_listlike(self,listlike_keys)
 
@@ -2471,6 +2484,8 @@ class atomdata_base():
             ndarraylike_keys = ['img_atoms','img_light','img_dark']
             reorder_ndarraylike(self,ndarraylike_keys)
         reorder_ndarraylike(self.data,self.data.keys)
+        if transpose_ts_end:
+            reorder_ndarraylike(self,['timestamp_shot_end'])
         transpose_scopedata()
 
         self._dealer = self._init_dealer()

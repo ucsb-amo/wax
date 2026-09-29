@@ -471,11 +471,24 @@ def test_log_panel_levels_filter_and_banner(app):
     assert "how_to_finish_it" in panel.banner._label.text()      # the hint stays in view
 
     assert panel._text.toPlainText().count("\n") >= 3
-    panel._filter.setCurrentIndex(3)                     # errors only
-    shown = panel._text.toPlainText()
-    assert "save failed" in shown and "camera ready" not in shown
-    panel._filter.setCurrentIndex(0)
-    assert "camera ready" in panel._text.toPlainText()
+    panel.append_record(logging.DEBUG, "shot 3/120")
+    panel.append_record(5, "read back: gain=300")          # VERBOSE
+
+    def shown():
+        return panel._text.toPlainText()
+
+    # default "Info": info, warnings, errors
+    assert panel._filter.currentText() == "Info"
+    assert all(t in shown() for t in ("camera ready", "data drive slow", "save failed"))
+    assert "shot 3/120" not in shown() and "read back" not in shown()
+    panel._filter.setCurrentIndex(0)                     # "Info only": no warnings, errors stay
+    assert "camera ready" in shown() and "save failed" in shown()
+    assert "data drive slow" not in shown()
+    panel._filter.setCurrentIndex(2)                     # "Debug"
+    assert "shot 3/120" in shown() and "data drive slow" in shown()
+    assert "read back" not in shown()
+    panel._filter.setCurrentIndex(3)                     # "All"
+    assert "read back" in shown()
 
     panel.banner.dismiss()
     assert panel.banner.isHidden()
@@ -571,7 +584,7 @@ def test_setup_logging_writes_the_file_and_is_idempotent(app, tmp_path, monkeypa
     try:
         handler = log.setup_logging(log_dir=str(tmp_path))
         assert log.setup_logging(log_dir=str(tmp_path)) is handler
-        log.get_logger("server").debug("shot 3/120")     # DEBUG: file yes, GUI no
+        log.get_logger("server").debug("shot 3/120")     # DEBUG: reaches the file
         for h in logger.handlers:
             h.flush()
         assert "shot 3/120" in (tmp_path / "live_od.log").read_text(encoding="utf-8")
