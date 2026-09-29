@@ -13,6 +13,13 @@ class ExptParams(ExptParamsWaxa):
         self.t_apd_imaging_check = 50.e-6          # default integration window per APD power check
         self.t_apd_pid_settle = 1.e-3               # settling allowed after each setpoint write
         self.t_apd_slack = 12.e-6                   # slack re-armed after each blocking sampler read
+
+        ### integrator readout window (waxx.control.integrator.Integrator)
+        # Defaults reproduce the original fixed timing: gate opens at the light
+        # command, closes at the pulse end, samples 1 us later.
+        self.t_integrator_gate_delay = 0.           # gate open (and close) delayed this long after the light command
+        self.t_integrator_gate_extra = 0.           # gate held open this long past the delayed pulse end
+        self.t_integrator_settle = 1.e-6            # gate close -> Sampler CNV
         self.N_max_iter_imaging_pid = np.int32(50)  # iteration cap (np.int32 pins TInt32)
         self.frac_err_threshold_imaging_pid = 0.005 # convergence threshold on |v_signal/v_target - 1|
         self.gain_p_imaging_pid = -0.019            # proportional gain (tuned)

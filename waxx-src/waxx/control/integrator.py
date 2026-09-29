@@ -19,15 +19,32 @@ T_ADC_CNVH_PULSE_MU = 30
 T_ADC_CONV_MU = 450
 
 class Integrator():
+    """Gated integrator read by a Sampler channel.
+
+    Readout window (all ExptParams, so every run file records them):
+      p.t_integrator_gate_delay  gate opens this long after begin_integrate's
+                                 cursor (the light command); the cursor stays there
+      p.t_integrator_gate_extra  stop_and_settle closes the gate at
+                                 cursor + gate_delay + gate_extra (cursor = pulse end)
+      p.t_integrator_settle      gate close -> end of stop_and_settle (the sample)
+    The waxx defaults (0, 0, 1 us) are the original fixed timing. 2026-09-29
+    tests (runs 83665-83674): the light reaches the integrator ~1 us after its
+    command, and the output rings for ~3-4 us after the gate closes.
+    """
     def __init__(self,
                  ttl_integrate=TTL_OUT,
                  ttl_reset=TTL_OUT,
-                 sampler_ch=Sampler_Last_CH):
+                 sampler_ch=Sampler_Last_CH,
+                 expt_params=ExptParams()):
         self.ttl_integrate = ttl_integrate # logic inverted -- on=not integrating, off=integrating
-        self.ttl_reset = ttl_reset # on=clearing integrator, off=not clearing integrator
+        # off = clearing (clear(), init(), and "held in clear" after a read);
+        # on = released (begin_integrate)
+        self.ttl_reset = ttl_reset
         if not isinstance(sampler_ch, Sampler_Last_CH):
             raise ValueError('For fast readout, use channel 6 or 7 of the sampler and assign as Sampler_Last_CH in sampler_id.py')
         self.sampler_ch = sampler_ch
+        self.params = expt_params
+        self.p = self.params
 
     @kernel
     def init(self):
@@ -37,10 +54,12 @@ class Integrator():
 
     @kernel
     def begin_integrate(self, reset=True):
-        """Sample aperture opens at current position of timeline cursor.
+        """Sample aperture opens p.t_integrator_gate_delay after the current
+        cursor (the light command); the cursor is left where it was.
         Pretriggers reset and gate open delay times.
-        """        
-        t_gate_open = now_mu()
+        """
+        t_light = now_mu()
+        t_gate_open = t_light + np.int64(self.p.t_integrator_gate_delay * 1.e9)
         if reset:
             at_mu(t_gate_open - T_INTEGRATOR_BEGIN_MU - T_RESET_RESPONSE_MU - T_RESET_MU)
             self.ttl_reset.off()
@@ -51,16 +70,22 @@ class Integrator():
         at_mu(t_gate_open - T_INTEGRATOR_BEGIN_MU)
         self.ttl_integrate.off()
 
-        at_mu(t_gate_open)
+        at_mu(t_light)
 
     @kernel
     def stop_and_settle(self):
+        """Call at the pulse end. Closes the gate p.t_integrator_gate_delay +
+        p.t_integrator_gate_extra later and leaves the cursor
+        p.t_integrator_settle after the close (where the sample goes)."""
+        at_mu(now_mu() + np.int64((self.p.t_integrator_gate_delay
+                                   + self.p.t_integrator_gate_extra) * 1.e9))
         self.ttl_integrate.on()
-        delay_mu(T_SETTLE_MU)
+        delay_mu(np.int64(self.p.t_integrator_settle * 1.e9))
 
     @kernel
     def stop_and_sample(self) -> TFloat:
-        """Advances timeline cursor by 2200 ns.
+        """Advances the timeline cursor by gate_delay + gate_extra + settle,
+        plus the Sampler conversion and readout.
 
         Returns:
             TFloat: The sampled value.
