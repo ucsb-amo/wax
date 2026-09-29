@@ -48,6 +48,18 @@ What the service reports (``snapshot()``, served in ``status_json`` as
 the last poll); the reinit itself follows once the machine is idle.
 
 ``state`` is one of :data:`STATES`.
+
+The SLM server's log (``log_since``, the Device Control GUI's "View SLM server
+log"): the supervisor on the SLM PC writes every line of the server, and its
+own events, to a daily file; the ``log`` control command reads it back from a
+cursor. While a GUI asks for the log (every second while its window is open)
+this service fetches the new lines every ``LOG_POLL_S`` into :attr:`log`, an
+:class:`~waxx.util.device_state.output_log.OutputLog` served through the
+monitor server's ``output`` request (``kind`` ``"slm"``). Nobody looking:
+nothing is fetched, and the next look carries on from the cursor (a long gap
+is jumped, and the view says how much). The fetch runs on this service's
+thread, after the reinit's work, so it never holds up a reinit request; the
+SLM server answers it at once, never queued behind the SLM.
 """
 
 from __future__ import annotations
@@ -56,6 +68,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
+
+from waxx.util.device_state.output_log import OutputLog
 
 UNKNOWN = "unknown"            # not polled yet
 IDLE = "idle"                  # reachable, no reinit due
@@ -73,6 +87,21 @@ _FOLLOWING = (REINITIALISING, RESTARTING)
 #: The announcement's reply also waits for the connections' release
 #: (connections.RELEASE_TIMEOUT_S), and clients give up after 5 s.
 SEND_WAIT_S = 1.0
+
+#: How often the SLM server's log is fetched while a GUI shows it.
+LOG_POLL_S = 2.0
+#: One GUI request for the log keeps it being fetched this long.
+LOG_WANTED_S = 10.0
+#: The pause after a fetch of the log failed.
+LOG_RETRY_S = 10.0
+#: The pause after the SLM server refused to send its log.
+LOG_REFUSED_RETRY_S = 60.0
+#: How often a reason not to ask (an old or unsupervised server) is looked at again.
+LOG_RECHECK_S = 2.0
+#: Lines of the SLM server's log kept here for GUIs.
+LOG_KEEP_LINES = 3000
+#: Lines the first fetch starts with.
+LOG_TAIL_LINES = 300
 
 
 @dataclass(frozen=True)
@@ -102,6 +131,14 @@ def _default_link(host, port, payload, **kw):
 def _link_errors():
     from waxx.control.slm.slm_link import NoReply, ReplyTimeout  # noqa: PLC0415
     return NoReply, ReplyTimeout
+
+
+def _amount(n_bytes: int) -> str:
+    if n_bytes < 10_000:
+        return f"{n_bytes} bytes"
+    if n_bytes < 10_000_000:
+        return f"{n_bytes / 1000:.0f} kB"
+    return f"{n_bytes / 1e6:.0f} MB"
 
 
 class SlmReinitService:
@@ -153,6 +190,14 @@ class SlmReinitService:
         self._restart_instance0: str | None = None  # the server instance it replaces
         self._restart_by: str = ""
         self._last_restart: dict | None = None      # {"at", "t_s", "by", "instance", ...}
+
+        #: The SLM server's log, as fetched while a GUI shows it (log_since).
+        self.log = OutputLog(LOG_KEEP_LINES)
+        self._log_cursor: dict | None = None        # the SLM server's cursor in its files
+        self._log_wanted_until: float | None = None  # clock time
+        self._log_next = 0.0                        # clock time
+        self._log_problem = ""                      # the problem last said in the log
+        self._log_follow = {"state": "idle", "detail": "", "path": "", "last_fetch": None}
 
     # --- lifecycle ---------------------------------------------------------------
 
@@ -248,7 +293,14 @@ class SlmReinitService:
     # --- one pass ----------------------------------------------------------------
 
     def tick(self) -> None:
-        now = self._clock()
+        self._tick_reinit(self._clock())
+        try:
+            self._tick_log(self._clock())
+        except Exception as e:  # the reinit's work must go on whatever the log does
+            self._log_trouble(self._clock(), "bug", f"fetching the log failed here: {e!r}",
+                              LOG_RETRY_S)
+
+    def _tick_reinit(self, now: float) -> None:
         with self._cond:
             why = self._blocker()
         if why:
@@ -525,6 +577,94 @@ class SlmReinitService:
                   f"{self.config.retry_after_failure_s / 60:.0f} min.")
         self._record("slm_reinit_failed", text=text)
         self._set(FAILED, text)
+
+    # --- the SLM server's log ---------------------------------------------------------
+
+    def log_since(self, after=0) -> dict:
+        """The log lines numbered above `after` (``OutputLog.since``) and
+        ``follow`` (how the fetching goes: ``state`` idle / waiting / following
+        / trouble, ``detail``, ``path`` of the files on the SLM PC,
+        ``last_fetch``); the log is fetched for the next ``LOG_WANTED_S``."""
+        self._log_wanted_until = self._clock() + LOG_WANTED_S
+        return dict(self.log.since(after), follow=dict(self._log_follow))
+
+    def _tick_log(self, now: float) -> None:
+        until = self._log_wanted_until
+        if until is None or now > until:
+            if self._log_follow["state"] != "idle":
+                self._set_log_follow("idle", "nobody is looking")
+            return
+        if now < self._log_next:
+            return
+        st = self._status
+        if self._state == RESTARTING:
+            # the supervisor's lines about it are fetched once the new server answers
+            self._set_log_follow("waiting", "the SLM server is restarting")
+            self._log_next = now + LOG_RECHECK_S
+            return
+        if not st:
+            self._set_log_follow("waiting", "the SLM server has not answered the monitor "
+                                            "server yet")
+            self._log_next = now + LOG_RECHECK_S
+            return
+        if self._state == NO_CONTROL or "log" not in (st.get("capabilities") or ()):
+            self._log_trouble(now, "old", "this SLM server has no log command (it is from "
+                                          "before 2026-09-28): pull wax on the SLM PC, then "
+                                          "restart the SLM server", LOG_RECHECK_S)
+            return
+        if not st.get("supervised"):
+            self._log_trouble(now, "unsupervised", "the SLM server is not running under its "
+                                                   "supervisor (supervisor.py), which writes its "
+                                                   "log: its output is only in its window on "
+                                                   "the SLM PC", LOG_RECHECK_S)
+            return
+        self._fetch_log(now)
+
+    def _fetch_log(self, now: float) -> None:
+        no_reply, reply_timeout = _link_errors()
+        try:
+            reply = self._link(self.config.host, self.config.port,
+                               {"cmd": "log", "cursor": self._log_cursor, "tail": LOG_TAIL_LINES},
+                               control=True, until=("ok", "error"), connect_s=1.0,
+                               first_reply_s=2.0, total_s=4.0)
+        except (no_reply, reply_timeout, OSError) as e:
+            self._log_trouble(now, "no_answer", f"the SLM server did not send its log "
+                                                f"({e or type(e).__name__}); trying again",
+                              LOG_RETRY_S)
+            return
+        if reply.get("status") != "ok":
+            self._log_trouble(now, "refused", f"the SLM server did not send its log: "
+                                              f"{reply.get('error')}", LOG_REFUSED_RETRY_S)
+            return
+        if self._log_problem:
+            self.log.mark("the SLM server's log comes through again")
+            self._log_problem = ""
+        if reply.get("restarted"):
+            self.log.mark("the SLM server's log files changed (one was removed or cut short): "
+                          "its last lines again")
+        skipped = reply.get("skipped_bytes")
+        if isinstance(skipped, int) and not isinstance(skipped, bool) and skipped > 0:
+            self.log.mark(f"{_amount(skipped)} of the SLM server's log not fetched (nobody was "
+                          f"looking); all of it is in {reply.get('path')} on the SLM PC")
+        for line in reply.get("lines") or ():
+            self.log.append(str(line))
+        cursor = reply.get("cursor")
+        self._log_cursor = cursor if isinstance(cursor, dict) else None
+        self._log_next = now if reply.get("more") else now + LOG_POLL_S
+        self._set_log_follow("following", "", path=str(reply.get("path") or ""),
+                             last_fetch=time.time())
+
+    def _log_trouble(self, now: float, key: str, text: str, retry_s: float) -> None:
+        """A reason the log is not coming: said in the log once (until it
+        changes or the log comes through again), and in ``follow``."""
+        self._log_next = now + retry_s
+        if key != self._log_problem:
+            self._log_problem = key
+            self.log.mark(text)
+        self._set_log_follow("trouble", text)
+
+    def _set_log_follow(self, state: str, detail: str, **kw) -> None:
+        self._log_follow = dict(self._log_follow, state=state, detail=detail, **kw)
 
     # --- reporting ---------------------------------------------------------------
 

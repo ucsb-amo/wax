@@ -10,7 +10,8 @@ from slm_server import SLM_server
 from slm_protocol import (split_commands, command_seq, control_command, Replier,
                           DEFAULT_SERVER_IP, DEFAULT_SERVER_PORT, CAPABILITIES,
                           EXIT_SHUTDOWN, EXIT_FATAL, EXIT_INIT_FAILED, EXIT_PORT_IN_USE,
-                          EXIT_RESTART, default_state_dir)
+                          EXIT_RESTART, default_state_dir, log_dir, read_log,
+                          LOG_TAIL_LINES, LOG_REPLY_LINES)
 
 
 # SLM_SERVER_IP / SLM_SERVER_PORT: for tests (127.0.0.1); the lab uses the defaults.
@@ -32,6 +33,11 @@ AUTO_REINIT = False
 REINIT_OVERDUE_WARN_SEC = 6 * 3600
 # How often the heartbeat file (for the supervisor's hang check) is written.
 HEARTBEAT_SEC = 2.0
+# Control commands that leave no lines in the log: the monitor server reads the
+# log with "log" every few seconds while someone watches it, and every request
+# would otherwise add its own lines ("Connected by", "Received command") to the
+# log it is reading.
+QUIET_COMMANDS = ("log",)
 
 slmtest = SLM_server()
 cmd_q = queue.Queue(maxsize=CMD_QUEUE_MAXSIZE)
@@ -515,7 +521,6 @@ def start_server(listener=None):
 
         while True:
             conn, addr = server_socket.accept()
-            print(f'Connected by {addr}')
             handle_client(conn, addr)
 
 def _is_local_peer(conn):
@@ -531,6 +536,15 @@ def handle_client(conn, addr=None):
     replier = Replier(conn)
     local = _is_local_peer(conn)
     pending = ""
+    # "Connected by" waits for the first command that is printed, so a
+    # connection with only quiet commands (QUIET_COMMANDS) prints nothing.
+    announced = []
+
+    def announce():
+        if not announced:
+            announced.append(True)
+            print(f'Connected by {addr}')
+
     with conn:
         while True:
             try:
@@ -542,9 +556,10 @@ def handle_client(conn, addr=None):
                 pending += data.decode('utf-8', errors='replace')
                 commands, pending = split_commands(pending, at_eof=at_eof)
                 for command in commands:
-                    _handle_command(command.strip(), replier, local=local)
+                    _handle_command(command.strip(), replier, local=local, announce=announce)
                 if at_eof:
-                    print("Client disconnected.")
+                    if announced:
+                        print("Client disconnected.")
                     break
 
             except ConnectionResetError:
@@ -566,15 +581,41 @@ def _enqueue_exit(code, seq, replier, by):
     except queue.Full:
         _reply(task, status="error", error="command queue full")
 
+def _log_lines(ctl):
+    """What the "log" command answers: this PC's log files (written by the
+    supervisor) from the client's cursor on; see slm_protocol.read_log."""
+    if not _supervised():
+        return {"status": "error",
+                "error": "the SLM server is not running under its supervisor "
+                         "(supervisor.py), which writes the log: its output is only in its "
+                         "window on the SLM PC"}
+
+    def count(key, default):
+        value = ctl.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return default
+        return min(max(value, 0), LOG_REPLY_LINES)
+
+    try:
+        return read_log(log_dir(), ctl.get("cursor"), tail=count("tail", LOG_TAIL_LINES),
+                        max_lines=max(count("max_lines", LOG_REPLY_LINES), 1))
+    except Exception as e:
+        return {"status": "error", "error": f"reading the log failed: {type(e).__name__}: {e}"}
+
+
 def _handle_control(ctl, seq, replier, local=False):
-    """A control command ({"cmd": ...}): "status" answers at once; "reinit"
-    queues a reinit behind any pattern already queued and answers "queued",
-    then "reinit_done" (or "error") when it is done; "restart" / "shutdown"
-    queue the process's exit (see slm_protocol)."""
+    """A control command ({"cmd": ...}): "status" and "log" answer at once;
+    "reinit" queues a reinit behind any pattern already queued and answers
+    "queued", then "reinit_done" (or "error") when it is done; "restart" /
+    "shutdown" queue the process's exit (see slm_protocol)."""
     cmd = ctl.get("cmd")
     if cmd == "status":
         if seq is not None:
             replier.send({"seq": seq, **_status()})
+        return
+    if cmd == "log":
+        if seq is not None:
+            replier.send({"seq": seq, **_log_lines(ctl)})
         return
     if cmd == "reinit":
         task = {"type": "REINIT"}
@@ -611,11 +652,16 @@ def _handle_control(ctl, seq, replier, local=False):
         replier.send({"seq": seq, "status": "error", "error": f"unknown cmd {cmd!r}"})
 
 
-def _handle_command(command, replier, local=False):
-    print(f"Received command: {command}")
+def _handle_command(command, replier, local=False, announce=None):
     seq = command_seq(command)
-
     ctl = control_command(command)
+    if ctl is not None and ctl.get("cmd") in QUIET_COMMANDS:
+        _handle_control(ctl, seq, replier, local=local)
+        return
+    if announce is not None:
+        announce()
+    print(f"Received command: {command}")
+
     if ctl is not None:
         _handle_control(ctl, seq, replier, local=local)
         return

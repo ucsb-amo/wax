@@ -74,6 +74,36 @@ def test_several_hidden_persisted_cameras_are_all_named(app):
         delete_widgets(app, [control])
 
 
+def test_legacy_words_show_persist_like_the_host(app):
+    """The remote viewer's control: Persist from CAMERA_STATE's additive persist,
+    on legacy words, looks as the host's; a new word keeps it; a host camera's own
+    persist is not overridden."""
+    from waxx.util.live_od.gui.camera_control import CameraControl, PERSIST_FILL
+    control = CameraControl(glyphs=False)
+    try:
+        control.set_persist({"cam_b": True})                 # before the camera is known
+        control.set_states({"cam_a": "open", "cam_b": "closed", "cam_c": "closed"})
+        control.set_current("cam_a")
+        assert control.persisted("cam_b") and not control.persisted("cam_a")
+        assert control.hidden_persisted() == ["cam_b"] and control.arrow_button.is_red()
+        rows = {k: row for k, (_a, row) in control._rows.items()}
+        assert rows["cam_b"].button.look().hatch
+        assert rows["cam_b"].button.look().fill == PERSIST_FILL
+        assert "PERSIST ON" in rows["cam_b"].button.toolTip()
+        control.set_states({"cam_b": "open"})                # a new word keeps Persist
+        assert control.persisted("cam_b")
+        control.set_current("cam_b")
+        assert control.main_button.look().hatch and not control.arrow_button.is_red()
+        control.set_persist({"cam_b": False})
+        assert not control.main_button.look().hatch and control.hidden_persisted() == []
+
+        control.set_snapshot({"cameras": {"cam_c": _entry("cam_c")}})
+        control.set_persist({"cam_c": True})                 # the host's snapshot decides
+        assert not control.persisted("cam_c")
+    finally:
+        delete_widgets(app, [control])
+
+
 def test_legacy_menu_button_arrow_and_rows(app):
     """The remote viewer's CameraMenuButton, from CAMERA_STATE's additive persist."""
     from waxx.util.live_od.gui.camera_menu import CameraMenuButton, PERSIST_COLOR

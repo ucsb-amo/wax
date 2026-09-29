@@ -21,7 +21,12 @@ What it models:
   * a ring buffer of ``buffer_size`` frames: older ones are overwritten and
     GetImages16 refuses them with DRV_P1INVALID;
   * a call log (``log``: list of (name, args)) and one-shot fault injection
-    (``fail_next(name, code)``).
+    (``fail_next(name, code)``);
+  * internal and external shutters (``hw["shutter"]``, ``hw["shutter_ext"]``):
+    with AC_FEATURES_SHUTTEREX (``has_shutter_ex``, default on) SetShutterEx
+    sets each and plain SetShutter reaches only the external output, so code
+    that drives the internal shutter with SetShutter (which the SDK manual
+    forbids on such a camera) is caught; without it SetShutter sets both.
 
 Install with ``install(monkeypatch, fake)`` (patches pylablib's wlib, the
 AndorSDK2 module's lib and libctl, and waxx's andor.lib).
@@ -81,7 +86,7 @@ class FakeSDK2Lib(AndorSDK2Lib):
                  vs_amplitudes=("Normal", "+1", "+2", "+3", "+4"),
                  min_exposure=1.0e-6, exposure_quantum=None, exposure_scale=1.0,
                  readout_time=18.1e-3, keepclean_time=3.9e-3,
-                 has_shutter=True, has_baseline_clamp=True,
+                 has_shutter=True, has_shutter_ex=True, has_baseline_clamp=True,
                  temperature_during_acquisition=False,
                  trigger_modes_available=(0, 1, 6, 7, 10),
                  min_image_length=1, em_gain_floor=0, unreadable_after_abort=False):
@@ -118,6 +123,9 @@ class FakeSDK2Lib(AndorSDK2Lib):
         features = 0xFFFFFFFF
         if not has_shutter:
             features &= ~int(AC_FEATURES.AC_FEATURES_SHUTTER)
+        if not (has_shutter and has_shutter_ex):
+            features &= ~int(AC_FEATURES.AC_FEATURES_SHUTTEREX)
+        self.has_shutter_ex = bool(features & int(AC_FEATURES.AC_FEATURES_SHUTTEREX))
         if temperature_during_acquisition:
             features |= int(AC_FEATURES.AC_FEATURES_TEMPERATUREDURINGACQUISITION)
         else:
@@ -145,7 +153,7 @@ class FakeSDK2Lib(AndorSDK2Lib):
             adc=0, oamp=0, hs=0, preamp=0, vs=0, vs_amp=0,
             em_gain_mode=0, em_advanced=0, em_gain=0,
             exposure=0.0, kinetic_cycle=0.0, accum_cycle=0.0, n_kinetics=1, n_accum=1,
-            baseline_clamp=0, shutter=None, cooler=0, cooler_mode=0, fan=0,
+            baseline_clamp=0, shutter=None, shutter_ext=None, cooler=0, cooler_mode=0, fan=0,
             temperature_setpoint=20, camlink=0, crop=None,
         )
         self.temperature = -60.0
@@ -478,7 +486,17 @@ class FakeSDK2Lib(AndorSDK2Lib):
 
     @_sdk
     def SetShutter(self, typ, mode, closing, opening):
+        # hw["shutter"] is the internal shutter: (typ, mode, closing, opening)
+        self.hw["shutter_ext"] = int(mode)
+        if not self.has_shutter_ex:
+            self.hw["shutter"] = (int(typ), int(mode), closing, opening)
+
+    @_sdk
+    def SetShutterEx(self, typ, mode, closing, opening, extmode):
+        if not self.has_shutter_ex:
+            raise AndorSDK2LibError("SetShutterEx", int(D.DRV_NOT_SUPPORTED))
         self.hw["shutter"] = (int(typ), int(mode), closing, opening)
+        self.hw["shutter_ext"] = int(extmode)
 
     @_sdk
     def SetTriggerMode(self, mode):

@@ -38,6 +38,11 @@ _ACQ_MODE_SETUP = {
     5: ("setup_cont_mode", "acq_params/cont", False),
 }
 
+# SetShutterEx extmode for the external shutter output: permanently open, the
+# SDK manual's setting for no external shutter (SetShutterEx, p.310).  The
+# shutter this class controls is the internal one.
+_EXTERNAL_SHUTTER_MODE = 1
+
 # Grab loops on the camera are serialized by a lock per physical device (as in
 # basler_usb): a CameraBaby left over from an aborted or superseded run can
 # still be in its grab loop -- or in its death handler -- when the next run's
@@ -231,10 +236,14 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         return mode
 
     def start_grab(self, N_img, output_queue:Queue=None,
-                   check_interrupt_method=None, on_armed=None):
+                   check_interrupt_method=None, on_armed=None,
+                   first_frame_extra_s=0.):
         '''
         Acquire N_img externally triggered frames, putting (img, t, idx) on
         output_queue as each arrives.  Returns the frames in index order.
+
+        Each frame is waited for TIMEOUT; the first one TIMEOUT +
+        first_frame_extra_s (the run's warm-up shots, see CameraBaby).
 
         idx is the frame's index within this acquisition as the SDK counts it
         (see read_frames_from), so a frame the ring buffer lost can never move a
@@ -251,14 +260,17 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         stop_grab() cannot stop this one.
         '''
         with self.grab_lock():
-            return self._grab_loop(N_img, output_queue, check_interrupt_method, on_armed)
+            return self._grab_loop(N_img, output_queue, check_interrupt_method, on_armed,
+                                   first_frame_extra_s)
 
     def grab_lock(self):
         """The lock serializing grab loops on this physical camera."""
         return _grab_lock_for(DEVICE_LOCK_KEY)
 
-    def _grab_loop(self, N_img, output_queue, check_interrupt_method, on_armed):
+    def _grab_loop(self, N_img, output_queue, check_interrupt_method, on_armed,
+                   first_frame_extra_s=0.):
         N_img = int(N_img)
+        extra_s = max(0., float(first_frame_extra_s or 0.))
         if output_queue is None:
             output_queue = self._internal_output_queue
         check = check_interrupt_method or nothing
@@ -279,13 +291,17 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
                 if check():
                     print('Interrupt submitted, waiting for grab loop termination...')
                     break
+                first_wait = not frames and next_idx == 0
+                timeout = TIMEOUT + extra_s if first_wait else TIMEOUT
                 try:
-                    running = self.wait_for_frame(timeout=TIMEOUT,check_interrupt_method=check)
+                    running = self.wait_for_frame(timeout=timeout,check_interrupt_method=check)
                 except self.TimeoutError:
                     # pylablib's AndorTimeoutError carries no message; re-raise as
                     # the builtin TimeoutError that liveOD reports without a traceback.
+                    parts = (f" ({TIMEOUT:.0f} s + {extra_s:.0f} s for warm-up shots)"
+                             if first_wait and extra_s else "")
                     raise TimeoutError(
-                        f"No Andor image within {TIMEOUT:.0f} s "
+                        f"No Andor image within {timeout:.0f} s{parts} "
                         f"(got {len(frames)}/{N_img}). Camera not triggered?") from None
                 new_frames, lost, first = self.read_frames_from(next_idx)
                 if not new_frames and not lost:
@@ -424,6 +440,33 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         self.enable_frame_transfer_mode(False)
         return Readback(int(bool(self.is_frame_transfer_enabled())), "driver_cache")
 
+    @_camfunc(setpar="shutter",option=("feat",AC_FEATURES.AC_FEATURES_SHUTTER))
+    @interface.use_parameters(mode="shutter_mode",_returns=("shutter_mode",None,None,None))
+    def setup_shutter(self, mode, ttl_mode=0, open_time=None, close_time=None):
+        """Set the INTERNAL shutter: ``"auto"``, ``"open"`` or ``"closed"``.
+
+        pylablib's version sends SetShutter, but a camera that controls its
+        internal and external shutters independently (AC_FEATURES_SHUTTEREX)
+        must be sent SetShutterEx (SDK manual, SetShutter note 2, p.309).  On
+        such a camera this sends SetShutterEx with `mode` for the internal
+        shutter and the external output held permanently open.  Without
+        SHUTTEREX it sends SetShutter, which drives the internal shutter; the
+        external output then follows it (SetShutterEx note 3, p.311).
+
+        `ttl_mode` is the external output's level for open (0 low, 1 high).
+        `open_time` / `close_time` are in ms, by default the camera's minimum.
+        Returns ``(mode, ttl_mode, open_time, close_time)`` like pylablib, so
+        get_shutter() reads the internal shutter's mode.
+        """
+        min_close, min_open = self.get_min_shutter_times()   # SDK order: closing, opening
+        open_time = min_open if open_time is None else open_time
+        close_time = min_close if close_time is None else close_time
+        if self._has_option("feat", AC_FEATURES.AC_FEATURES_SHUTTEREX):
+            lib.SetShutterEx(ttl_mode, mode, close_time, open_time, _EXTERNAL_SHUTTER_MODE)
+        else:
+            lib.SetShutter(ttl_mode, mode, close_time, open_time)
+        return (mode, ttl_mode, open_time, close_time)
+
     def setup_shutter_if_supported(self, mode):
         """setup_shutter(mode) if the camera has shutter control; returns
         whether anything was sent."""
@@ -433,8 +476,8 @@ class AndorEMCCD(Andor.AndorSDK2Camera):
         return True
 
     def shutter_readback(self):
-        """The shutter mode last sent (the SDK has no getter), or unsupported
-        when the camera has no shutter control."""
+        """The internal shutter mode last sent (the SDK has no getter), or
+        unsupported when the camera has no shutter control."""
         if not self._has_option("feat", AC_FEATURES.AC_FEATURES_SHUTTER):
             return Readback(None, "unsupported")
         return Readback(self.get_shutter(), "commanded")

@@ -244,9 +244,13 @@ class BaslerUSB(pylon.InstantCamera):
         return _grab_lock_for(self._serial())
 
     def start_grab(self,N_img,output_queue:Queue=None,
-                   check_interrupt_method=None,on_armed=None):
+                   check_interrupt_method=None,on_armed=None,
+                   first_frame_extra_s=0.):
         '''
         Grab N_img triggered frames, putting (img, t, idx) on output_queue.
+
+        The first frame is waited for TIMEOUT_INIT + first_frame_extra_s (the
+        run's warm-up shots, see CameraBaby), each later one TIMEOUT_RUN.
 
         on_armed() is called exactly once, after grabbing is confirmed started
         and before the first frame is waited for.  Frames are retrieved one by
@@ -269,10 +273,13 @@ class BaslerUSB(pylon.InstantCamera):
         # the finally below) tears down the new run's grab -- which then times
         # out and kills the run after it, cascading until liveOD is restarted.
         with self.grab_lock():
-            self._grab_loop(int(N_img), output_queue, check, on_armed)
+            self._grab_loop(int(N_img), output_queue, check, on_armed,
+                            first_frame_extra_s)
 
-    def _grab_loop(self, Nimg, output_queue:Queue, check_interrupt_method, on_armed=None):
-        frame_timeout = TIMEOUT_INIT # initial timeout
+    def _grab_loop(self, Nimg, output_queue:Queue, check_interrupt_method, on_armed=None,
+                   first_frame_extra_s=0.):
+        extra_s = max(0., float(first_frame_extra_s or 0.))
+        frame_timeout = TIMEOUT_INIT + extra_s # initial timeout
         # OneByOne (was LatestImages): every frame is retrieved in the order it
         # was grabbed; LatestImages may drop older frames when the host falls
         # behind, which would shift every later frame into the wrong slot.
@@ -297,8 +304,10 @@ class BaslerUSB(pylon.InstantCamera):
                 try:
                     if grab is None or not grab.IsValid():
                         if time.monotonic() > deadline:
+                            parts = (f" ({TIMEOUT_INIT:.0f} s + {extra_s:.0f} s for warm-up shots)"
+                                     if count == 0 and extra_s else "")
                             raise TimeoutError(
-                                f"No Basler image within {frame_timeout:.0f} s "
+                                f"No Basler image within {frame_timeout:.0f} s{parts} "
                                 f"(got {count}/{Nimg}). Camera not triggered?")
                         continue
                     if not grab.GrabSucceeded():

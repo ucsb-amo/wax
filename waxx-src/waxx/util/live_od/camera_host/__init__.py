@@ -8,7 +8,8 @@ cameras through CameraNanny as before.
     sinks.py         RunSink: one run's frames, off the worker's taps
     legacy.py        HostNanny / HostCameraHandle: the camera thread's nanny and
                      camera in host mode (camera_mother unchanged)
-    claims.py        ReservationKeeper: borrow a Basler from the beacon server
+    claims.py        ReservationKeeper: borrow a camera from the server that has it
+                     (a Basler from the beacon server, the Andor from the spot finder)
     bar.py           HostCameraBar / HostCameraButton: the old camera bar's surface
     qt_bridge.py     HostQtBridge: snapshots as a Qt signal
     local_stream.py  LocalHostStream: a camera as an in-process viewer source

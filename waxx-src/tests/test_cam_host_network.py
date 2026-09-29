@@ -6,13 +6,14 @@
   INIT_RUN, the claim renewed (and re-made when that server restarts),
   RETURN when liveOD lets the camera go, a clear refusal naming whoever
   holds it;
-* who may write (T3): programs on this PC only, never a persisted field,
-  never an owner-only one;
+* who may write (T3): live settings and live-stream requests from any PC,
+  snaps, names and relinquish only from this PC; never a persisted field, an
+  owner-only one or the EM-gain unlock; nothing while a run holds the camera;
 * a remote SNAP after a run gets the live profile back first;
-* live requests: liveOD's (start_stream / stop_stream) and a program's on this
-  PC (START_LIVE / STOP_LIVE) are kept apart, and the stream stops when the
-  last one is given back; START_LIVE never opens a camera, is refused during a
-  run and to other PCs, and gets the live profile back first after a run;
+* live requests: liveOD's (start_stream / stop_stream) and a program's
+  (START_LIVE / STOP_LIVE) are kept apart, and the stream stops when the last
+  one is given back; START_LIVE never opens a camera, is refused during a run,
+  and gets the live profile back first after a run;
 * LocalHostStream (the in-process viewer source) and HostQtBridge.
 """
 import os
@@ -150,21 +151,35 @@ def test_the_claim_is_renewed_and_made_again_when_beacon_restarts(env):
 # who may write (T3)
 # ----------------------------------------------------------------------
 
-def test_remote_writes_view_only_persist_and_owner_rules(env):
+def test_remote_writes_settings_and_live_only_persist_and_owner_rules(env):
     host = host_for(env, lambda cid: [], cams=(BASLER, ANDOR))
     wp = host._write_policy
-    ok, why = wp("10.255.255.1", CID, ["gain"])
-    assert not ok and "view only" in why and "10.255.255.1" in why
+    far, ANDOR_ID = "10.255.255.1", "andor_emccd:cam_a"
+    # another PC: live settings and the live stream, nothing else
+    assert wp(far, CID, ["gain", "exposure_time"]) == (True, "")
+    assert wp(far, CID, ["__live__"]) == (True, "")
+    for key in ("snap", "name", "relinquish", "return"):
+        ok, why = wp(far, CID, [key])
+        assert not ok and "is not this PC" in why and far in why and key in why, key
+    ok, why = wp(far, CID, ["gain", "snap"])                   # one bad key refuses the write
+    assert not ok and "['snap']" in why
     assert not wp("", CID, ["snap"])[0]
+    assert not wp(far, "basler_usb:unknown", ["gain"])[0]       # not a camera of ours
     assert wp("127.0.0.1", CID, ["gain"]) == (True, "")
-    ok, why = wp("127.0.0.1", "andor_emccd:cam_a", ["cooler"])
-    assert not ok and "owner-only" in why
-    assert not wp("10.255.255.1", CID, ["relinquish"])[0]
+    assert wp("127.0.0.1", CID, ["snap"]) == (True, "")
+    # owner-only fields and the EM-gain unlock: liveOD's own settings only, for everyone
+    for addr in ("127.0.0.1", far):
+        ok, why = wp(addr, ANDOR_ID, ["cooler"])
+        assert not ok and "owner-only" in why
+        ok, why = wp(addr, ANDOR_ID, ["gain", "em_gain_unlocked"])
+        assert not ok and "em_gain_unlocked" in why and "never over the network" in why
+    # persist: a persisted field is refused to everyone
     host.request("cam_b", "open").result(5)
     host.set_persist("cam_b", True)
-    ok, why = wp("127.0.0.1", CID, ["gain", "exposure_time"])
-    assert not ok and "persist is on for cam_b" in why and "['gain']" in why
-    assert wp("127.0.0.1", CID, ["exposure_time"]) == (True, "")
+    for addr in ("127.0.0.1", far):
+        ok, why = wp(addr, CID, ["gain", "exposure_time"])
+        assert not ok and "persist is on for cam_b" in why and "['gain']" in why
+        assert wp(addr, CID, ["exposure_time"]) == (True, "")
 
 
 def test_a_persisted_field_is_refused_over_the_wire(env):
@@ -246,7 +261,7 @@ def test_a_program_streams_an_idle_camera_until_it_gives_its_request_back(env):
     wait_for(lambda: w.state == "idle", what="the stream stopped")
 
 
-def test_start_live_never_opens_and_is_refused_to_other_pcs_and_during_a_run(env):
+def test_start_live_never_opens_and_is_refused_during_a_run(env):
     host = host_for(env, lambda cid: [], serve=True)
     w = host.worker("cam_b")
     r = live(host, "START_LIVE")
@@ -254,25 +269,41 @@ def test_start_live_never_opens_and_is_refused_to_other_pcs_and_during_a_run(env
     time.sleep(0.2)
     assert not w.is_open and cam(host)["live_requesters"] == []
     host.request("cam_b", "open").result(5)
-    # another PC: view only, over the wire as in the policy
-    ok, why = host._write_policy("10.255.255.1", CID, ["__live__"])
-    assert not ok and "view only" in why and "live-stream requests" in why
-    assert host._write_policy("127.0.0.1", CID, ["__live__"]) == (True, "")
+    # a viewer on another PC, over the wire: live settings and the live stream
+    # yes, a snap no
     host._is_local = lambda addr: False
     try:
-        r = live(host, "START_LIVE")
-        assert r["ok"] is False and r["code"] == "refused" and "view only" in r["reason"]
-        time.sleep(0.2)
-        assert w.state == "idle"                               # nothing started
+        r = v2(host.core.port, {"cmd": "SET_SETTINGS", "camera_id": CID,
+                                "values": {"exposure_time": 2e-3}})
+        assert r["ok"] is True and r["readback"]["exposure_time"]["value"] == pytest.approx(2e-3)
+        r = v2(host.core.port, {"cmd": "SNAP", "camera_id": CID, "timeout_s": 1.0})
+        assert r["ok"] is False and r["code"] == "refused" and "is not this PC" in r["reason"]
+        r = live(host, "START_LIVE", client_id="viewer-far")
+        assert r["ok"] and w.state == "streaming"
+        assert cam(host)["live_requesters"] == ["v2:viewer-far"]
+        r = live(host, "STOP_LIVE", client_id="viewer-far")
+        assert r["ok"] and r["stopped"] is True
+        wait_for(lambda: w.state == "idle", what="the stream stopped")
     finally:
         del host._is_local
-    # a run: its lock clears every request, START_LIVE is refused, no stream resumes
+    # a run: its lock clears every request, START_LIVE and live settings are
+    # refused, from here and from another PC; no stream resumes
     host.start_stream("cam_b").result(5)
     assert live(host, "START_LIVE")["ok"]
     host.begin_run("tok", "cam_b", True, camera_params=basler_params())
     assert cam(host)["live_requesters"] == []
     r = live(host, "START_LIVE")
     assert r["ok"] is False and r["code"] == "run_locked"
+    host._is_local = lambda addr: False
+    try:
+        r = live(host, "START_LIVE", client_id="viewer-far")
+        assert r["ok"] is False and r["code"] == "run_locked"
+        r = v2(host.core.port, {"cmd": "SET_SETTINGS", "camera_id": CID,
+                                "values": {"exposure_time": 3e-3}})
+        assert r["ok"] is False and r["code"] == "run_locked"
+    finally:
+        del host._is_local
+    assert w.settings["exposure_time"] != pytest.approx(3e-3)
     from beacon.camera.worker import LockedError
     with pytest.raises(LockedError, match="camera is locked"):
         host.start_stream("cam_b").result(5)

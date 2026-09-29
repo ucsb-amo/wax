@@ -72,7 +72,8 @@ def run_registers(fake, p):
         "preamp": hw["preamp"], "vs": hw["vs"], "vs_amp": hw["vs_amp"],
         "em_gain_mode": hw["em_gain_mode"], "em_advanced": hw["em_advanced"],
         "em_gain": hw["em_gain"], "exposure": hw["exposure"], "clamp": hw["baseline_clamp"],
-        "shutter": SHUTTER_MODE[hw["shutter"][1]], "camlink": hw["camlink"],
+        "shutter": SHUTTER_MODE[hw["shutter"][1]], "shutter_ext": SHUTTER_MODE[hw["shutter_ext"]],
+        "camlink": hw["camlink"],
         "cooler_mode": hw["cooler_mode"],
     }
 
@@ -85,7 +86,7 @@ def expected_registers(p):
         "invert": 0, "term": 1, "adc": 0, "oamp": 0, "hs": p["hs_speed"], "preamp": p["preamp"],
         "vs": p["vs_speed"], "vs_amp": p["vs_amp"], "em_gain_mode": 3, "em_advanced": 0,
         "em_gain": p["gain"], "exposure": p["exposure_time"], "clamp": p["baseline_clamp"],
-        "shutter": p["shutter"], "camlink": 1, "cooler_mode": 1,
+        "shutter": p["shutter"], "shutter_ext": "open", "camlink": 1, "cooler_mode": 1,
     }
 
 
@@ -151,7 +152,7 @@ def test_read_settings_before_any_apply(backend):
 def test_a_camera_without_shutter_control(make_backend):
     be, fake = make_backend(sdk_kwargs=dict(has_shutter=False))
     assert be.apply(RUN, "run")["shutter"] == Readback(None, "unsupported")
-    assert fake.calls("SetShutter") == []
+    assert fake.calls("SetShutter") == [] and fake.calls("SetShutterEx") == []
 
 
 # -- apply: a full state, in order --------------------------------------------------
@@ -212,7 +213,7 @@ def test_apply_order(backend):
         assert getter in names[:start_i], getter
         assert getter not in names[start_i:], getter
     assert all(args[0] == 0 for n, args in fake.log if n == "SetEMAdvanced")
-    assert "auto" not in [SHUTTER_MODE[a[1]] for n, a in fake.log if n == "SetShutter"]
+    assert "auto" not in [SHUTTER_MODE[a[1]] for n, a in fake.log if n in ("SetShutter", "SetShutterEx")]
 
 
 # -- apply: refusals send nothing ---------------------------------------------------------
@@ -423,7 +424,7 @@ def test_close_never_raises_and_reports(make_backend):
     be, fake = make_backend()
     be.apply(LIVE, "live")
     be.start_acquisition("live")
-    fake.fail_next("SetShutter")
+    fake.fail_next("SetShutterEx")
     fake.fail_next("ShutDown")
     report = be.close()
     assert isinstance(report, CloseReport)
@@ -441,6 +442,6 @@ def test_clean_close_stops_closes_the_shutter_and_frees_the_sdk(make_backend):
     report = be.close()
     assert report == CloseReport(attached_after=False, accessible_after=True, errors=())
     names = [n for n, _ in fake.log[start:]]
-    assert names.index("AbortAcquisition") < names.index("SetShutter") < names.index("ShutDown")
+    assert names.index("AbortAcquisition") < names.index("SetShutterEx") < names.index("ShutDown")
     assert fake.hw["cooler_mode"] == 1
     DeviceLock(andor_mod.DEVICE_LOCK_KEY).acquire().release()

@@ -4,6 +4,7 @@ frames, and the device lock."""
 import importlib.util
 import logging
 import sys
+import threading
 import types
 from pathlib import Path
 from queue import Queue
@@ -277,6 +278,61 @@ def test_a_counter_that_does_not_count_is_turned_off_and_said(cam, usb, monkeypa
 def test_no_trigger_times_out(cam):
     with pytest.raises(TimeoutError, match="got 0/2"):
         cam.start_grab(2, Queue(), on_armed=lambda: None)
+
+
+@pytest.fixture
+def later():
+    """later(cam, delay_s, frames) -> an on_armed that queues ``frames`` delay_s
+    after arming: triggers that come late, as after a run's warm-up shots.
+    Timers still pending at the end of the test are cancelled."""
+    timers = []
+
+    def make(cam, delay_s, frames):
+        results = cam._fake["results"]
+
+        def on_armed():
+            t = threading.Timer(delay_s, lambda: results.extend(frames))
+            timers.append(t)
+            t.start()
+        return on_armed
+    yield make
+    for t in timers:
+        t.cancel()
+
+
+def test_first_frame_extra_is_an_explicit_keyword(usb):
+    import inspect
+    assert "first_frame_extra_s" in inspect.signature(usb.BaslerUSB.start_grab).parameters
+
+
+def test_a_late_first_frame_times_out_without_extra(cam, later):
+    # TIMEOUT_INIT is 0.5 s here; the first frame comes 0.8 s after arming
+    with pytest.raises(TimeoutError, match="got 0/1") as err:
+        cam.start_grab(1, Queue(), on_armed=later(cam, 0.8, _frames(1)))
+    assert "warm-up" not in str(err.value)
+
+
+def test_first_frame_extra_waits_longer_for_the_first_frame(cam, later):
+    q = Queue()
+    cam.start_grab(1, q, on_armed=later(cam, 0.8, _frames(1)), first_frame_extra_s=1.0)
+    assert _indices(q) == [0]
+
+
+def test_first_frame_extra_does_not_lengthen_later_waits(cam, later):
+    # frame 0 at once, frame 1 0.8 s later: TIMEOUT_RUN (0.5 s) still applies
+    frames = _frames(2)
+    cam._fake["results"].append(frames[0])
+    q = Queue()
+    with pytest.raises(TimeoutError, match="got 1/2") as err:
+        cam.start_grab(2, q, on_armed=later(cam, 0.8, frames[1:]), first_frame_extra_s=5.0)
+    assert "warm-up" not in str(err.value)
+    assert _indices(q) == [0]
+
+
+def test_a_first_frame_timeout_with_extra_says_so(cam):
+    with pytest.raises(TimeoutError, match="got 0/1") as err:
+        cam.start_grab(1, Queue(), on_armed=lambda: None, first_frame_extra_s=0.2)
+    assert "s for warm-up shots)" in str(err.value)
 
 
 def test_not_grabbing_after_start_is_an_error_and_never_arms(cam, monkeypatch):

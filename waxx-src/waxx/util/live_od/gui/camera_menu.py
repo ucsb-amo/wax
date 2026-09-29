@@ -2,6 +2,12 @@
 
     [Running] 80545 · hf_tweezer_bec  [ andor |▾]  [====> 37/120]  Δt 8.2s ...
 
+No liveOD window uses ``CameraMenuButton`` any more: the acquisition window (with
+or without the camera host) and the remote viewer all show
+``camera_control.CameraControl``, so the camera button looks the same everywhere.
+It stays for old imports; ``STATES`` and ``CONNECTED_STATES`` here are the shared
+state colours.
+
 The button shows one camera -- the run's, or before there has been a run the first
 one connected -- coloured by its state, and connects / disconnects it when clicked.
 The arrow drops down the same button for each of the other cameras. This replaces
@@ -16,8 +22,7 @@ or config imports, so the remote viewer can use it without ARTIQ.
 a camera whose settings are persisted into runs as the camera host's
 ``CameraControl`` does: bright red with a white diagonal hatch and an LED in the
 state colour; the arrow turns red when a camera not shown has it on, and that
-camera's drop-down button is hatched. When liveOD's camera host owns the cameras,
-the acquisition window uses ``camera_control.CameraControl`` instead.
+camera's drop-down button is hatched.
 """
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal

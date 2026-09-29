@@ -62,9 +62,30 @@ Commands still queued when the process exits are answered ``"dropped"``.
 ``status`` also reports ``pid``, ``instance`` (new for every process),
 ``started_at``, ``supervised``, ``start_count``, ``last_exit``, ``slm_ready``,
 ``applies``, ``pattern_source``, ``bind`` and ``capabilities``.
+
+The log (2026-09-28): the supervisor writes every line of the server and every
+event of its own to ``<state dir>\\logs\\slm_server_<date>.log`` on the SLM PC.
+The server reads those files back for a client far from the SLM PC -- the
+Device Control GUI, through the monitor server -- answered at once, never
+queued behind the SLM:
+
+    SLMCTL {"cmd": "log", "seq": n, "cursor": c, "tail": k}
+        -> {"seq": n, "status": "ok", "lines": [...], "cursor": c', "more": bool,
+            "restarted": bool, "skipped_bytes": b, "path": "<the log folder>"}
+
+``cursor`` is the ``cursor`` of the previous reply (null for the first
+request, which gets the last ``tail`` lines). ``more``: lines past this reply
+are waiting -- ask again at once. ``restarted``: the cursor no longer fits the
+files (one was removed or cut short), so this reply starts again from the last
+lines. ``skipped_bytes``: this much unread text was jumped over (more than
+:data:`LOG_SKIP_BYTES`: nobody followed it); the files keep it. Only a
+supervised server has a log file; an unsupervised one answers ``error``. A
+``log`` request leaves no lines in the log it reads (see ``QUIET_COMMANDS`` in
+``run_server.py``).
 """
 
 import json
+import os
 import threading
 
 # An unterminated JSON object that still does not parse after this much text
@@ -91,17 +112,173 @@ EXIT_MEANING = {EXIT_SHUTDOWN: "shut down on request", EXIT_FATAL: "SLM worker d
                 EXIT_RESTART: "restart requested"}
 
 #: What this server understands, reported by ``status``.
-CAPABILITIES = ("seq", "status", "reinit", "restart", "shutdown")
+CAPABILITIES = ("seq", "status", "reinit", "restart", "shutdown", "log")
 
 
 def default_state_dir() -> str:
     """Where the saved pattern, the heartbeat and the supervisor's logs live on
     this PC: ``SLM_STATE_DIR``, else ``%LOCALAPPDATA%\\slm_server``."""
-    import os  # noqa: PLC0415
     import tempfile  # noqa: PLC0415
     return (os.environ.get("SLM_STATE_DIR")
             or os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
                             "slm_server"))
+
+
+# --- the log files (written by supervisor.Journal, read back by "log") -------------------
+
+LOG_DIRNAME = "logs"
+LOG_PREFIX = "slm_server_"
+LOG_SUFFIX = ".log"
+#: Lines a first ``log`` reply (no cursor) starts with.
+LOG_TAIL_LINES = 300
+#: Most lines one ``log`` reply carries; the client asks again for the rest.
+LOG_REPLY_LINES = 500
+#: Longest line passed on; the rest is cut off, and the line says so.
+LOG_LINE_CHARS = 2000
+#: Unread text past this (about 3000 lines) is jumped over rather than sent
+#: (see the module doc).
+LOG_SKIP_BYTES = 300_000
+#: Where the reading starts after a jump: this far before the end.
+LOG_RESUME_BYTES = 64_000
+#: Most bytes read from a file at once.
+LOG_READ_BYTES = 256_000
+#: Files a first reply's last lines may come from (a day that has just begun).
+LOG_TAIL_FILES = 2
+
+
+def log_dir(state_dir=None) -> str:
+    """The folder of the supervisor's daily log files."""
+    return os.path.join(state_dir or default_state_dir(), LOG_DIRNAME)
+
+
+def _log_files(folder) -> list:
+    """The daily log files, oldest first (their names sort by date)."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    return sorted(n for n in names if n.startswith(LOG_PREFIX) and n.endswith(LOG_SUFFIX))
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _read(path, start, n) -> bytes:
+    if n <= 0:
+        return b""
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        return fh.read(n)
+
+
+def _text(raw: bytes) -> str:
+    line = raw.decode("utf-8", errors="replace").rstrip("\r")
+    if len(line) > LOG_LINE_CHARS:
+        line = f"{line[:LOG_LINE_CHARS]} … ({len(line) - LOG_LINE_CHARS} more characters)"
+    return line
+
+
+def _cut_lines(data: bytes, final: bool) -> list:
+    """The lines in `data` as ``(bytes, bytes consumed)``: only lines ended by
+    a newline, unless `final` (the file gets no more text, so its last line is
+    whole without one)."""
+    out, pos = [], 0
+    while True:
+        j = data.find(b"\n", pos)
+        if j < 0:
+            if final and pos < len(data):
+                out.append((data[pos:], len(data) - pos))
+            return out
+        out.append((data[pos:j], j + 1 - pos))
+        pos = j + 1
+
+
+def _tail(folder, files, n):
+    """The last `n` whole lines, oldest first, and the cursor after them."""
+    lines, cursor = [], None
+    for k, name in enumerate(reversed(files[-LOG_TAIL_FILES:])):
+        path = os.path.join(folder, name)
+        size = _size(path)
+        if size is None:
+            continue
+        start = max(0, size - LOG_READ_BYTES)
+        data = _read(path, start, size - start)
+        newest = k == 0
+        if newest:
+            # the newest file may end in a line still being written
+            end = data.rfind(b"\n") + 1
+            data = data[:end]
+            cursor = {"file": name, "offset": start + end}
+        parts = _cut_lines(data, final=not newest)
+        if start > 0 and parts:
+            parts = parts[1:]           # began mid-line
+        lines = [_text(raw) for raw, _ in parts] + lines
+        if len(lines) >= n or start > 0:
+            break                        # enough, or an older file would leave a gap
+    return lines[-n:] if n > 0 else [], cursor
+
+
+def read_log(folder, cursor=None, tail=LOG_TAIL_LINES, max_lines=LOG_REPLY_LINES) -> dict:
+    """What the ``log`` command answers (see the module doc), from the log
+    files in `folder`."""
+    files = _log_files(folder)
+    reply = {"status": "ok", "lines": [], "cursor": None, "more": False, "restarted": False,
+             "skipped_bytes": 0, "path": str(folder)}
+    if not files:
+        return reply
+    name = cursor.get("file") if isinstance(cursor, dict) else None
+    offset = cursor.get("offset") if isinstance(cursor, dict) else None
+    size = _size(os.path.join(folder, name)) if name in files else None
+    if not isinstance(offset, int) or isinstance(offset, bool) or size is None \
+            or not 0 <= offset <= size:
+        reply["lines"], reply["cursor"] = _tail(folder, files, tail)
+        reply["restarted"] = cursor is not None
+        return reply
+
+    i = files.index(name)
+    later = [_size(os.path.join(folder, f)) or 0 for f in files[i + 1:]]
+    unread = size - offset + sum(later)
+    if unread > LOG_SKIP_BYTES:
+        # Jump to near the end of the newest file, at a line start.
+        last = os.path.join(folder, files[-1])
+        last_size = _size(last) or 0
+        start = max(0, last_size - LOG_RESUME_BYTES)
+        if start > 0:
+            nl = _read(last, start, LOG_RESUME_BYTES).find(b"\n")
+            start = last_size if nl < 0 else start + nl + 1
+        skipped = (size - offset) + sum(later[:-1]) + start if later else start - offset
+        i, offset = len(files) - 1, start
+        reply["skipped_bytes"] = int(skipped)
+
+    lines = []
+    while len(lines) < max_lines:
+        path = os.path.join(folder, files[i])
+        size = _size(path) or 0
+        final = i < len(files) - 1      # an earlier day's file gets no more lines
+        data = _read(path, offset, min(max(size - offset, 0), LOG_READ_BYTES))
+        whole = offset + len(data) >= size
+        parts = _cut_lines(data, final=final and whole)
+        if not parts and not whole and data:
+            parts = [(data, len(data))]  # one line longer than a read: pass it on cut
+        for raw, n in parts[:max_lines - len(lines)]:
+            lines.append(_text(raw))
+            offset += n
+        if len(lines) >= max_lines:
+            break
+        if offset >= size and final:
+            i, offset = i + 1, 0         # on to the next day's file
+            continue
+        if not parts or whole:
+            break
+    remaining = (_size(os.path.join(folder, files[i])) or 0) - offset + sum(
+        _size(os.path.join(folder, f)) or 0 for f in files[i + 1:])
+    reply.update(lines=lines, cursor={"file": files[i], "offset": offset},
+                 more=len(lines) >= max_lines and remaining > 0)
+    return reply
 
 _decoder = json.JSONDecoder()
 

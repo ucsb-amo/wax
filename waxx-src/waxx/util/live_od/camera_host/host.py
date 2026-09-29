@@ -14,8 +14,9 @@ the cameras in ``LiveODConfig.camera_host_claim_on_start``.
 **Runs** (in-process only, never on the wire; the liveOD server calls them):
 
     begin_run(token, key, capture_images, camera_params)  INIT_RUN, before the
-        run file is reserved: validate the run profile, borrow a Basler from the
-        beacon server that has it (bounded), lock the camera with the token
+        run file is reserved: validate the run profile, borrow the camera from
+        the server that has it (a Basler from the beacon server, the Andor from
+        the SLM spot finder; bounded), lock the camera with the token
     note_run_id(token, run_id)                            once the id is known
     arm_run(token, camera_params, n_img) -> Future[ArmResult]
         the first WAIT_CAM_READY: apply the full run profile, start the
@@ -50,10 +51,14 @@ camera_params until it is turned off.  Each run it changes is logged at
 INIT_RUN and recorded as ``camera_overrides`` (origin "persist").  While it is
 on, a remote write of a persisted field is refused.
 
-**Remote clients** (T3): only programs on this PC may change live settings,
-snap, ask for the live stream (START_LIVE, of a camera liveOD has open: it
-never opens one), rename or relinquish; every other address is view-only and
-starts nothing (policy "persistent": attaching never touches the device).
+**Remote clients** (T3, widened 2026-09-28): a program on any PC (the Camera
+Viewer) may change live settings and ask for the live stream (START_LIVE, of
+a camera liveOD has open: it never opens one) -- never while a run holds the
+camera: the worker's run lock refuses both from INIT_RUN until the run ends.
+Only programs on this PC may snap, rename or relinquish.  Owner-only fields
+and persisted ones are refused to everyone, and so is ``em_gain_unlocked``:
+the live EM-gain cap is lifted only in liveOD's own settings.  Attaching
+starts nothing (policy "persistent": it never touches the device).
 """
 from __future__ import annotations
 
@@ -84,12 +89,18 @@ SERVER_ID_SUFFIX = ":liveod"
 CONTROL_KEYS = ("em_gain_unlocked",)
 #: begin_run: the camera must take the run lock within this
 LOCK_TIMEOUT_S = 3.0
-#: begin_run: a Basler borrowed from the beacon server within this (per server)
+#: begin_run / open: a camera borrowed from another server within this (per server)
 CLAIM_TIMEOUT_S = 3.0
+#: ... the Andor within this: its verified close (stop, shutter closed, SDK
+#: ShutDown) is slower than a Basler's, and the SLM spot finder's server waits
+#: up to 15 s for it before answering (served_source.RELINQUISH_CLOSE_S)
+ANDOR_CLAIM_TIMEOUT_S = 20.0
 #: end_run: disarm and unlock within this, each
 END_RUN_OP_S = 5.0
 #: start_stream / stop_stream: liveOD's own live request (the core's request_live key)
 LIVEOD_REQUESTER = "liveod"
+#: the write_policy key of START_LIVE / STOP_LIVE (beacon.camera.core)
+LIVE_KEY = "__live__"
 
 #: host_state -> the legacy word POLL / CAMERA_STATE have always used (T14)
 LEGACY_STATE = {
@@ -519,7 +530,8 @@ class CameraHost:
         if self._serve:
             core.start_in_thread()
             logger.info(f"camera host: serving {self.server_id} on port {core.port} "
-                        f"(protocol v2; other PCs view only)")
+                        f"(protocol v2; other PCs: live settings and the live stream, "
+                        f"never during a run)")
         for key in self._claim_on_start:
             spec = self._by_key.get(key)
             if spec is None or not spec.has_camera:
@@ -531,7 +543,7 @@ class CameraHost:
 
     def shutdown(self, timeout_s: float = 3.0) -> dict:
         """Close every camera (Andor: acquisition stopped, shutter closed, SDK
-        closed) and give borrowed Baslers back.  Idempotent; bounded:
+        closed) and give borrowed cameras back.  Idempotent; bounded:
         ``timeout_s`` for the cameras, then 1 s per borrowed camera."""
         with self._lock:
             if self._shut:
@@ -799,15 +811,26 @@ class CameraHost:
         return a in (self._local or set()) or a.startswith("127.")
 
     def _write_policy(self, client_addr: str, camera_id: str, keys) -> tuple:
+        """The core's ``write_policy`` (module docstring, "Remote clients").
+        A run's hold is not checked here: the worker's run lock refuses live
+        settings and START_LIVE / STOP_LIVE for as long as a run holds the camera."""
         keys = [str(k) for k in keys]
-        if not self._is_local(client_addr):
-            return False, (f"view only: {client_addr or 'an unknown address'} is not this PC; "
-                           f"liveOD's cameras take settings, snaps, live-stream requests and "
-                           f"names only from programs on this PC (T3)")
+        control = sorted(set(keys) & set(CONTROL_KEYS))
+        if control:
+            return False, (f"{control} can be set only in liveOD's own settings, never over "
+                           f"the network")
         spec = self._by_cid.get(camera_id)
-        if spec is None or spec.category is None:
+        cat = spec.category if spec is not None else None
+        if not self._is_local(client_addr):
+            other = sorted(k for k in keys
+                           if k != LIVE_KEY and not (cat is not None and cat.has(k)))
+            if other:
+                return False, (f"{client_addr or 'an unknown address'} is not this PC: "
+                               f"programs on other PCs may change the live settings of "
+                               f"liveOD's cameras and ask for the live stream, but not "
+                               f"{other} (T3)")
+        if cat is None:
             return True, ""
-        cat = spec.category
         owner = sorted(k for k in keys if cat.has(k) and cat.setting(k).owner_only)
         if owner:
             return False, (f"{owner} can be changed only in liveOD's own {spec.key} settings "
@@ -879,8 +902,8 @@ class CameraHost:
         A run without a camera (``capture_images`` False), or on an entry with
         no camera behind it (the APD), takes no lock.  Otherwise: the run
         profile is built and checked (camera_params, with Persist on top, the
-        lab's constraints), a Basler is borrowed from the beacon server that
-        has it, and the camera is locked with ``token``.  Raises ``HostRefused``
+        lab's constraints), the camera is borrowed from another server that
+        has it, and it is locked with ``token``.  Raises ``HostRefused``
         naming the rule and the value; nothing is locked then."""
         token = str(token)
         with self._lock:
@@ -947,24 +970,27 @@ class CameraHost:
                         labels=self._labels(camera_key))
 
     def _claim_if_needed(self, spec: CameraSpec, w) -> None:
-        """A Basler that liveOD does not hold yet: borrow it from the beacon
-        server that lists it (bounded).  ``HostRefused`` naming the holder."""
+        """A camera that liveOD does not hold yet: borrow it from every other
+        v2 camera server that lists it (bounded) -- a Basler from the beacon
+        server of its PC, the Andor from the SLM spot finder while the spot
+        finder has it open.  Nothing to borrow when no other server lists it.
+        ``HostRefused`` naming the holder."""
         keeper = self._keeper
-        if spec.camera_type != "basler" or keeper is None or w.is_open \
-                or keeper.holds(spec.camera_id):
+        if keeper is None or w.is_open or keeper.holds(spec.camera_id):
             return
         from waxx.util.live_od.camera_host.claims import ClaimRefused
+        timeout_s = ANDOR_CLAIM_TIMEOUT_S if spec.camera_type == "andor" else CLAIM_TIMEOUT_S
         self._busy[spec.key] = "claiming"
         self._bump()
         try:
-            keeper.claim(spec.camera_id, timeout_s=CLAIM_TIMEOUT_S)
+            keeper.claim(spec.camera_id, timeout_s=timeout_s)
             self._held_elsewhere.pop(spec.key, None)
         except ClaimRefused as exc:
             self._held_elsewhere[spec.key] = dict(exc.holder) or {"label": exc.server_id}
             raise HostRefused(f"{spec.key} ({spec.camera_id}) is held elsewhere: {exc}") from None
         except Exception as exc:
             raise HostRefused(f"{spec.key} ({spec.camera_id}): could not borrow it from the "
-                              f"beacon camera server: {type(exc).__name__}: {exc}") from None
+                              f"camera server that has it: {type(exc).__name__}: {exc}") from None
         finally:
             self._busy.pop(spec.key, None)
             self._bump()
@@ -1222,7 +1248,7 @@ class CameraHost:
 
     def operator_release(self, key: str) -> concurrent.futures.Future:
         """The operator ends whatever holds ``key``: a run's lock (named in a
-        WARNING), then closes it and gives a borrowed Basler back."""
+        WARNING), then closes it and gives a borrowed camera back."""
         spec = self.spec(key)
 
         def task():

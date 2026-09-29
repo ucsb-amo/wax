@@ -212,6 +212,9 @@ class MonitorUDPServer(UdpServer):
     * ``slm_reinit`` (``action`` ``reinit``, ``operator``, ``client``) — an
       operator's reinit now, refused unless the machine is idle; (``action``
       ``status``) — the snapshot.
+    * ``output`` (``kind`` ``"slm"``, ``after``) — the SLM server's log lines
+      after ``after``, fetched from the SLM PC while GUIs keep asking (the
+      Device Control GUI's "View SLM server log").
 
     * ``regenerate_state`` (``operator``, ``client``) — rebuild the state file
       from the lab's device definitions, every channel at its default
@@ -654,8 +657,13 @@ class MonitorUDPServer(UdpServer):
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line
-        ``after`` (OutputLog.since)."""
+        ``after`` (OutputLog.since); ``kind`` "slm": the SLM server's log
+        (SlmReinitService.log_since, which keeps it coming while asked for)."""
         kind = obj.get("kind")
+        if kind == "slm":
+            if self.slm_reinit is None:
+                return {"status": "error", "msg": "this monitor server has no SLM configured"}
+            return dict(self.slm_reinit.log_since(obj.get("after", 0)), status="ok")
         if kind == "reset":
             if not self.reset.configured:
                 return {"status": "error", "msg": "no reset experiment on this monitor server"}

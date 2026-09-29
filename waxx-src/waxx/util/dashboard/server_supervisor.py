@@ -88,18 +88,31 @@ def _is_port_in_use(host: str, port: int, timeout_s: float = 0.2) -> bool:
         return False
 
 
-def _beacon_seen(server_id: str) -> bool:
-    """True if the discovery registry currently holds a beacon for *server_id*.
+#: A beacon older than this is a server that has stopped (they beacon every
+#: 0.5 s).  The registry keeps an entry forever once heard, so without an age
+#: limit a server this dashboard stopped itself read as EXTERNAL from then on.
+_BEACON_FRESH_S = 1.5
+#: Beacons heard this soon after our own child exited may still be its last
+#: datagram in flight, so they do not count as another instance.
+_OWN_EXIT_MARGIN_S = 0.25
 
-    Cache-only lookup (zero timeout): never blocks the GUI thread.  Callers
-    that want a fresh answer give the registry time to collect beacons first
-    (they arrive every 0.5 s) - the dashboard delays autostart for that.
+
+def _beacon_seen(server_id: str, heard_after: Optional[float] = None) -> bool:
+    """True if a beacon for *server_id* was heard within ``_BEACON_FRESH_S``
+    (and after the ``time.monotonic()`` stamp *heard_after*, when given).
+
+    Cache-only lookup: never blocks the GUI thread.  Callers that want a fresh
+    answer give the registry time to collect beacons first (they arrive every
+    0.5 s) - the dashboard delays autostart for that.
     """
     try:
-        from beacon.discovery.client import discover  # noqa: PLC0415
-        return discover(server_id, timeout=0.0) is not None
+        from beacon.discovery.client import discover_entries  # noqa: PLC0415
+        entry = discover_entries(server_id, max_age=_BEACON_FRESH_S).get(server_id)
     except Exception:
         return False
+    if entry is None:
+        return False
+    return heard_after is None or entry.last_seen > heard_after
 
 
 class _PrecheckTask(QRunnable):
@@ -144,6 +157,9 @@ class ServerSupervisor(QObject):
     RESTART_WINDOW_S = 60.0
     INITIAL_RESTART_DELAY_S = 0.5
     MAX_RESTART_DELAY_S = 30.0
+    # While EXTERNAL, look for the other instance this often; once it stops
+    # beaconing the supervisor goes back to IDLE so the panel stays truthful.
+    EXTERNAL_RECHECK_MS = 2000
 
     def __init__(
         self,
@@ -189,6 +205,12 @@ class ServerSupervisor(QObject):
         self._last_data_dir_fail: Optional[str] = None
         self._restart_suppressed = False
         self._graceful_sent_at: Optional[float] = None
+        # time.monotonic() when our own child last exited: its beacons, still
+        # in the discovery cache, must not read as another instance.
+        self._child_exited_at: Optional[float] = None
+        self._external_timer = QTimer(self)
+        self._external_timer.setInterval(self.EXTERNAL_RECHECK_MS)
+        self._external_timer.timeout.connect(self._recheck_external)
         self._precheck_finished.connect(self._on_precheck_finished)
 
     # ------------------------------------------------------------------
@@ -215,28 +237,40 @@ class ServerSupervisor(QObject):
     def check_external(self) -> bool:
         """Probe for an instance we did not start.
 
-        Checks the discovery beacon registry for ``beacon_id`` (cache only,
-        non-blocking) and, as a legacy fallback, the snapshot port.  If
-        another instance is found the supervisor enters EXTERNAL and returns
-        True.
+        Checks the discovery beacon registry for a *fresh* ``beacon_id``
+        beacon (cache only, non-blocking) and, as a legacy fallback, the
+        snapshot port.  If another instance is found the supervisor enters
+        EXTERNAL and returns True.
         """
         if self.is_alive():
             return False
-        if self.beacon_id and _beacon_seen(self.beacon_id):
-            _LOG.info(
-                "%s: beacon '%s' already on the subnet, marking EXTERNAL",
-                self.server_id, self.beacon_id,
-            )
-            self._set_state(SupervisorState.EXTERNAL)
-            return True
-        if self.snapshot_port and _is_port_in_use(self.snapshot_host or "127.0.0.1", self.snapshot_port):
-            _LOG.info(
-                "%s: port %s:%s already bound, marking EXTERNAL",
-                self.server_id, self.snapshot_host, self.snapshot_port,
-            )
+        why = self._external_evidence()
+        if why:
+            _LOG.info("%s: %s, marking EXTERNAL", self.server_id, why)
             self._set_state(SupervisorState.EXTERNAL)
             return True
         return False
+
+    def _external_evidence(self) -> str:
+        """Why another instance looks alive ("" if it does not).  No state change."""
+        if self.beacon_id:
+            heard_after = None
+            if self._child_exited_at is not None:
+                heard_after = self._child_exited_at + _OWN_EXIT_MARGIN_S
+            if _beacon_seen(self.beacon_id, heard_after=heard_after):
+                return f"beacon '{self.beacon_id}' already on the subnet"
+        if self.snapshot_port and _is_port_in_use(self.snapshot_host or "127.0.0.1", self.snapshot_port):
+            return f"port {self.snapshot_host}:{self.snapshot_port} already bound"
+        return ""
+
+    def _recheck_external(self) -> None:
+        if self._state != SupervisorState.EXTERNAL:
+            self._external_timer.stop()
+            return
+        if not self._external_evidence():
+            _LOG.info("%s: the external instance is gone (no beacon for %.1f s), back to IDLE",
+                      self.server_id, _BEACON_FRESH_S)
+            self._set_state(SupervisorState.IDLE)
 
     # Backwards-compatible name.
     check_port_external = check_external
@@ -501,8 +535,9 @@ class ServerSupervisor(QObject):
         self._drain_stdout()
         self._drain_stderr()
         self._graceful_sent_at = None
+        self._child_exited_at = time.monotonic()
 
-        crashed = exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
+        crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
         if crashed and not self._stop_requested:
             self._set_state(SupervisorState.CRASHED)
             self.crashed.emit(exit_code)
@@ -562,6 +597,10 @@ class ServerSupervisor(QObject):
             return
         _LOG.debug("%s: state %s -> %s", self.server_id, self._state.name, new.name)
         self._state = new
+        if new == SupervisorState.EXTERNAL:
+            self._external_timer.start()
+        else:
+            self._external_timer.stop()
         self.state_changed.emit(new)
 
 

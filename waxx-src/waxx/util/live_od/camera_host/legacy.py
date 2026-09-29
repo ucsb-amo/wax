@@ -107,8 +107,11 @@ class HostCameraHandle:
         self._over = str(why) or "the run ended"
 
     def start_grab(self, N_img, output_queue: Queue = None, check_interrupt_method=None,
-                   on_armed=None):
+                   on_armed=None, first_frame_extra_s=0.):
+        """The first frame is waited for ``first_timeout_s + first_frame_extra_s``
+        (the run's warm-up shots, see CameraBaby), each later one ``next_timeout_s``."""
         n = int(N_img)
+        extra_s = max(0., float(first_frame_extra_s or 0.))
         run = self._run
         key = run.key
         if run.n_img and n != run.n_img:
@@ -131,7 +134,7 @@ class HostCameraHandle:
                 declared = None
         next_idx, got = 0, 0
         shape = dtype = None
-        timeout = self.first_timeout_s
+        timeout = self.first_timeout_s + extra_s
         deadline = time.monotonic() + timeout
         while next_idx < n:
             if check() or self._detached.is_set():
@@ -185,7 +188,9 @@ class HostCameraHandle:
                     f"{key}: the acquisition ended with frame(s) {missing} of {n} missing "
                     f"(reported lost by the camera; got {got})", lost=missing)
             if time.monotonic() > deadline:
-                raise TimeoutError(f"No {key} image within {timeout:.0f} s (got {got}/{n}). "
+                parts = (f" ({self.first_timeout_s:.0f} s + {extra_s:.0f} s for warm-up shots)"
+                         if got == 0 and extra_s else "")
+                raise TimeoutError(f"No {key} image within {timeout:.0f} s{parts} (got {got}/{n}). "
                                    f"Camera not triggered?")
         return None
 

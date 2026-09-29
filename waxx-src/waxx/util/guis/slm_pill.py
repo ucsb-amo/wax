@@ -12,11 +12,15 @@ has:
 * **Restart SLM server** -- the server process exits and its supervisor on the
   SLM PC starts a new one, which puts the saved pattern back; the same idle
   check, and only for a server that says it is supervised;
+* **View SLM server log** -- a window following the SLM server's log (what
+  the server and its supervisor on the SLM PC write), streamed through the
+  monitor server while the window is open;
 * **Launch spot finder** -- when the host GUI was given a launcher (the lab's
   SLM spot finder, started on this PC).
 
 The pill never talks to the network: it emits ``reinit_requested`` /
-``spot_finder_requested`` and the host GUI does the rest.
+``restart_requested`` / ``log_requested`` / ``spot_finder_requested`` and the
+host GUI does the rest.
 """
 
 from __future__ import annotations
@@ -125,6 +129,7 @@ class SlmPill(QPushButton):
 
     reinit_requested = pyqtSignal()
     restart_requested = pyqtSignal()
+    log_requested = pyqtSignal()
     spot_finder_requested = pyqtSignal()
 
     def __init__(self, can_launch: bool = False, parent=None):
@@ -235,7 +240,7 @@ class SlmPill(QPushButton):
         if isinstance(manual, dict):
             lines.append(f"Asked for by {manual.get('by')} at {_hhmm(manual.get('at'))}: "
                          f"{manual.get('result')}")
-        lines.append("Right-click: reinit now, restart the SLM server"
+        lines.append("Click: reinit now, restart the SLM server, view its log"
                      + (", launch the spot finder" if self.can_launch else "") + ".")
         return lines
 
@@ -268,6 +273,11 @@ class SlmPill(QPushButton):
         restart.triggered.connect(self.restart_requested.emit)
         if not r_allowed:
             menu.addAction(f"    not now: {r_why}").setEnabled(False)
+        menu.addSeparator()
+        # Always offered: the window says why when there is no log to show.
+        view_log = menu.addAction("View SLM server log…")
+        view_log.setObjectName("slm_view_log")
+        view_log.triggered.connect(self.log_requested.emit)
         if self.can_launch:
             menu.addSeparator()
             launch = menu.addAction("Launch spot finder")

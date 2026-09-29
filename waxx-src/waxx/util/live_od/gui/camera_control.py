@@ -1,13 +1,16 @@
-"""The camera in the liveOD status row when liveOD's camera host owns the cameras:
+"""The camera in the liveOD status row:
 
     [Running] 80545 · hf_tweezer_bec  [(o) andor  3 |▾][⚙][🎥]  [====> 37/120] ...
 
-``CameraControl`` is the host-mode successor of ``CameraMenuButton`` (which stays,
-for the legacy path and the remote viewer).  One camera is on the main button --
-the run's, or before any run the first connected one -- coloured by its state; the
-arrow drops down a row (button, ⚙, 🎥) for each of the others.  The ⚙ opens the
-camera's settings dialog, the 🎥 its live view.  Both glyphs are painted (the
-characters would render as colour emoji).
+``CameraControl`` replaced ``CameraMenuButton`` (kept only for old imports) in
+every liveOD window, so a camera button looks the same with and without the
+camera host.  Without it (and in the remote viewer) it is made with
+``glyphs=False``: no ⚙ and no 🎥, since the settings dialog and the live view
+need the host.  One camera is on the main button -- the run's, or before any run
+the first connected one -- coloured by its state; the arrow drops down a row
+(button, ⚙, 🎥) for each of the others.  The ⚙ opens the camera's settings
+dialog, the 🎥 its live view.  Both glyphs are painted (the characters would
+render as colour emoji).
 
 What the main button does depends on the camera (``decide``):
 
@@ -31,7 +34,9 @@ give_back / take / retry; ``HOST_REQUEST`` maps them onto ``CameraHost.request``
 ``settings_requested(key)``, ``live_view_requested(key, on)``, and -- for a
 camera known only by its legacy state word (``set_state``/``set_states``) --
 ``toggle_requested(key)``, as ``CameraMenuButton`` did.  The states come in
-through ``set_snapshot`` (a ``CameraHost.snapshot()``, or ``{key: entry}``).
+through ``set_snapshot`` (a ``CameraHost.snapshot()``, or ``{key: entry}``), or
+as legacy words through ``set_state``/``set_states``, with Persist for those
+through ``set_persist`` (CAMERA_STATE's additive ``persist``).
 No host, camera or config imports.
 
 The total width is fixed, computed from the camera names only, so nothing a run
@@ -266,9 +271,12 @@ def look_for(key: str, entry: Optional[Mapping], *, unknown: bool = False) -> Lo
     entry = dict(entry or {})
     badge = badge_text(entry.get("n_subs"))
     if "host_state" not in entry:
-        color = STATES.get(legacy_word(entry), STATES["closed"])[0]
-        return Look(key, color, led=color, badge=badge,
-                    led_mark="!" if legacy_word(entry) == "failed" else "")
+        word = legacy_word(entry)
+        color = STATES.get(word, STATES["closed"])[0]
+        mark = "!" if word == "failed" else ""
+        if entry.get("persist"):
+            return Look(key, PERSIST_FILL, hatch=True, led=color, led_mark=mark, badge=badge)
+        return Look(key, color, led=color, led_mark=mark, badge=badge)
     if unknown:
         return Look(key, UNKNOWN_FILL, led=UNKNOWN_FILL, led_mark="?", border=UNKNOWN_BORDER)
     color, _words, kind = HOST_STATES.get(str(entry.get("host_state")), HOST_STATES["error"])
@@ -301,8 +309,9 @@ def main_width(keys, font: QFont) -> int:
     return PAD + LED + GAP + longest + GAP + badge_width(font) + PAD
 
 
-def total_width(keys, font: QFont) -> int:
-    return main_width(keys, font) + ARROW_WIDTH + 2 * GLYPH_WIDTH + 3 * SPACING
+def total_width(keys, font: QFont, glyphs: bool = True) -> int:
+    width = main_width(keys, font) + ARROW_WIDTH
+    return width + 2 * GLYPH_WIDTH + 3 * SPACING if glyphs else width
 
 
 def _rounded(rect: QRectF, radius: float, left: bool = True, right: bool = True) -> QPainterPath:
@@ -585,20 +594,25 @@ class _GlyphButton(QAbstractButton):
 
 
 class _CameraRow(QWidget):
-    """One camera in the drop-down: its button, ⚙ and 🎥."""
+    """One camera in the drop-down: its button, ⚙ and 🎥 (the button only
+    without ``glyphs``)."""
 
-    def __init__(self, key: str, width: int, parent=None):
+    def __init__(self, key: str, width: int, parent=None, glyphs: bool = True):
         super().__init__(parent)
         self.key = key
         self.button = _CameraButton(width, round_right=True)
-        self.cog = _GlyphButton("cog")
-        self.live = _GlyphButton("movie")
+        self.cog = _GlyphButton("cog", self)
+        self.live = _GlyphButton("movie", self)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 2, 6, 2)
         layout.setSpacing(SPACING + 1)
         layout.addWidget(self.button)
-        layout.addWidget(self.cog)
-        layout.addWidget(self.live)
+        if glyphs:
+            layout.addWidget(self.cog)
+            layout.addWidget(self.live)
+        else:
+            self.cog.hide()
+            self.live.hide()
 
 
 # ---------------------------------------------------------------------------
@@ -616,11 +630,12 @@ class CameraControl(QWidget):
     """See the module docstring.
 
     ``CameraControl(camera_keys=(), parent=None, *, confirm=None, expect_snapshots=False,
-    stale_after_s=5.0, clock=time.monotonic)``.  ``confirm(title, text) -> bool``
+    stale_after_s=5.0, clock=time.monotonic, glyphs=True)``.  ``confirm(title, text) -> bool``
     asks before "Close SDK…" and "Take from beacon…" (default: a Yes/Cancel box
     defaulting to Cancel).  ``expect_snapshots``: the owner will feed
     ``set_snapshot``; the unknown marking then starts ``stale_after_s`` after
-    construction even if no snapshot ever comes.
+    construction even if no snapshot ever comes.  ``glyphs=False``: no ⚙ and no
+    🎥, on the main button or in the drop-down (no camera host to serve them).
     """
 
     action_requested = pyqtSignal(str, str)         # camera_key, action (ACTIONS)
@@ -629,25 +644,28 @@ class CameraControl(QWidget):
     toggle_requested = pyqtSignal(str)              # camera_key (legacy cameras only)
 
     def __init__(self, camera_keys=(), parent=None, *, confirm=None, expect_snapshots=False,
-                 stale_after_s: float = STALE_AFTER_S, clock=time.monotonic):
+                 stale_after_s: float = STALE_AFTER_S, clock=time.monotonic,
+                 glyphs: bool = True):
         super().__init__(parent)
         self._entries: dict = {}            # camera_key -> snapshot entry, in the lab's order
         self._current = None                # the run's camera, once there has been one
         self._disabled = set()              # legacy: waiting for an answer
+        self._persist_words = {}            # legacy: camera_key -> Persist on (set_persist)
         self._live_open = set()             # cameras whose live view is open
         self._rows: dict = {}               # camera_key -> (QWidgetAction, _CameraRow)
         self._confirm = confirm or (lambda title, text: _ask(self, title, text))
         self._clock = clock
         self._stale_after_s = float(stale_after_s)
         self._host_mode = bool(expect_snapshots)
+        self._glyphs = bool(glyphs)
         self._last_snapshot_t = clock()
         self._unknown = False
         self._width_keys = None
 
         self.main_button = _CameraButton(10)
         self.arrow_button = _ArrowButton()
-        self.cog_button = _GlyphButton("cog")
-        self.live_button = _GlyphButton("movie")
+        self.cog_button = _GlyphButton("cog", self)
+        self.live_button = _GlyphButton("movie", self)
         self.cog_button.setToolTip("Camera settings")
         self.live_button.setToolTip("Live view")
         layout = QHBoxLayout(self)
@@ -655,10 +673,14 @@ class CameraControl(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self.main_button)
         layout.addWidget(self.arrow_button)
-        layout.addSpacing(SPACING + 1)
-        layout.addWidget(self.cog_button)
-        layout.addSpacing(SPACING + 1)
-        layout.addWidget(self.live_button)
+        if self._glyphs:
+            layout.addSpacing(SPACING + 1)
+            layout.addWidget(self.cog_button)
+            layout.addSpacing(SPACING + 1)
+            layout.addWidget(self.live_button)
+        else:
+            self.cog_button.hide()
+            self.live_button.hide()
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         self._menu = QMenu(self)
@@ -710,9 +732,22 @@ class CameraControl(QWidget):
                 added = True
             elif "host_state" in self._entries[key]:
                 continue
-            self._entries[key] = {"key": key, "state": state if state in STATES else "closed"}
+            self._entries[key] = {"key": key, "state": state if state in STATES else "closed",
+                                  "persist": self._persist_words.get(key, False)}
         if added:
             self._fit_width()
+        self._render()
+
+    def set_persist(self, persist: Mapping) -> None:
+        """Which legacy cameras have Persist on (CAMERA_STATE's additive
+        ``persist``); cameras not named keep what they had.  Ignored for a camera
+        the host's snapshots describe: their own ``persist`` is the authority."""
+        for key, on in dict(persist or {}).items():
+            key = str(key)
+            self._persist_words[key] = bool(on)
+            entry = self._entries.get(key)
+            if entry is not None and "host_state" not in entry:
+                entry["persist"] = bool(on)
         self._render()
 
     def set_current(self, camera_key: str) -> None:
@@ -758,6 +793,9 @@ class CameraControl(QWidget):
 
     def is_unknown(self) -> bool:
         return self._unknown
+
+    def persisted(self, camera_key: str) -> bool:
+        return bool(self._entries.get(camera_key, {}).get("persist"))
 
     def decision(self, camera_key: str) -> Decision:
         return decide(camera_key, self._entries.get(camera_key),
@@ -824,8 +862,9 @@ class CameraControl(QWidget):
     # ------------------------------------------------------------------
 
     def _add_camera(self, key: str) -> None:
-        self._entries[key] = {"key": key, "state": "closed"}
-        row = _CameraRow(key, 10)
+        self._entries[key] = {"key": key, "state": "closed",
+                              "persist": self._persist_words.get(key, False)}
+        row = _CameraRow(key, 10, glyphs=self._glyphs)
         row.button.clicked.connect(lambda _=False, k=key: self._on_main(k))
         row.cog.clicked.connect(lambda _=False, k=key: self._on_cog(k))
         row.live.clicked.connect(lambda _=False, k=key: self._on_live(k))
@@ -844,7 +883,7 @@ class CameraControl(QWidget):
         self.main_button.setFixedSize(width, HEIGHT)
         for _action, row in self._rows.values():
             row.button.setFixedSize(width + ARROW_WIDTH, HEIGHT)
-        self.setFixedSize(total_width(keys, self.font()), HEIGHT)
+        self.setFixedSize(total_width(keys, self.font(), self._glyphs), HEIGHT)
 
     def _tick(self) -> None:
         if not self._host_mode:
@@ -858,7 +897,11 @@ class CameraControl(QWidget):
         entry = self._entries.get(key, {})
         if d.kind == "legacy":
             word = legacy_word(entry)
-            return f"{key}: {STATES.get(word, STATES['closed'])[1]}. {d.main_tip}"
+            tip = f"{key}: {STATES.get(word, STATES['closed'])[1]}. {d.main_tip}"
+            if entry.get("persist"):
+                tip += (f"\nPERSIST ON: liveOD applies {key}'s persisted settings on top of "
+                        f"every run's camera_params (recorded in the run file).")
+            return tip
         if d.kind == "unknown":
             age = self._clock() - self._last_snapshot_t
             return f"{key}: state unknown — no snapshot from liveOD's camera host for {age:.0f} s."

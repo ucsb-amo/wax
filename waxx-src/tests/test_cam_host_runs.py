@@ -141,6 +141,30 @@ def test_armed_with_no_triggers_and_ready_is_on_armed(make):
     host.end_run("tok")
 
 
+def test_warmup_extra_lengthens_only_the_first_frame_wait(make):
+    host, fakes = make()
+    arm(host, fakes, n=2)
+    fb = fakes["cam_b"]
+    handle = host.attach_run("tok")
+    handle.first_timeout_s = handle.next_timeout_s = 0.3
+    q, out = Queue(), {"exc": None}
+
+    def run():
+        try:
+            handle.start_grab(2, q, None, first_frame_extra_s=0.6)
+        except BaseException as exc:
+            out["exc"] = exc
+    t = threading.Thread(target=run, name="test-grab")
+    t.start()
+    time.sleep(0.5)                                           # past first_timeout_s alone
+    fb.trigger(1)
+    wait_for(lambda: q.qsize() == 1, what="the late first frame")
+    t.join(5)                                                 # no second trigger: 0.3 s, not extended
+    assert isinstance(out["exc"], TimeoutError) and "got 1/2" in str(out["exc"])
+    assert "warm-up" not in str(out["exc"])
+    host.end_run("tok")
+
+
 def test_a_free_running_camera_is_refused_at_the_arm(make):
     from beacon.camera.worker import ArmError
     from waxx.util.live_od.camera_host import HostNanny

@@ -248,3 +248,33 @@ def test_subscriber_badge(app):
         assert "3 subscriber(s)" in control.main_button.toolTip()
     finally:
         delete_widgets(app, [control])
+
+
+def test_without_glyphs_the_button_is_the_same_minus_cog_and_movie(app):
+    """The no-host window and the remote viewer: the same main button and arrow,
+    no ⚙ or 🎥 on the row or in the drop-down, and a width without them."""
+    from waxx.util.live_od.gui.camera_control import (ARROW_WIDTH, CameraControl, main_width,
+                                                      total_width)
+    keys = ["cam_a", "a_long_camera_name"]
+    bare = CameraControl(keys, glyphs=False)
+    full = CameraControl(keys)
+    got = []
+    bare.toggle_requested.connect(got.append)
+    try:
+        for control in (bare, full):
+            control.show()
+        app.processEvents()
+        assert not bare.cog_button.isVisible() and not bare.live_button.isVisible()
+        assert full.cog_button.isVisible() and full.live_button.isVisible()
+        for _action, row in bare._rows.values():
+            assert not row.cog.isVisibleTo(row) and not row.live.isVisibleTo(row)
+        assert bare.width() == total_width(keys, bare.font(), glyphs=False)
+        assert bare.width() == main_width(keys, bare.font()) + ARROW_WIDTH
+        assert bare.main_button.width() == full.main_button.width()
+        bare.set_state("cam_a", "open")
+        full.set_state("cam_a", "open")
+        assert bare.main_button.look() == full.main_button.look()
+        bare.main_button.click()
+        assert got == ["cam_a"]
+    finally:
+        delete_widgets(app, [bare, full])

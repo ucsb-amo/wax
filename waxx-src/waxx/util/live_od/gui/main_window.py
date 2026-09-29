@@ -15,7 +15,7 @@ from waxa import ROI
 from waxx.util.live_od.config import get_config, set_config
 from waxx.util.live_od.camera_mother import CameraMother, CameraBaby, DataHandler, CameraNanny
 from waxx.util.live_od.camera_connection_widget import CamConnBar
-from waxx.util.live_od.gui.camera_menu import CameraMenuButton
+from waxx.util.live_od.gui.camera_control import CameraControl
 from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.analyzer import Analyzer
 from waxx.util.live_od.gui.plotter import LiveODPlotter
@@ -267,17 +267,17 @@ class LiveODWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _make_camera_control(self):
-        """CameraControl fed by the camera host's snapshots, or (no host) the old
-        CameraMenuButton over the CamConnBar's buttons."""
+        """CameraControl fed by the camera host's snapshots, or (no host) by the
+        CamConnBar's buttons' state words, without ⚙ and 🎥 (they need the host):
+        the same button in both modes."""
         keys = [b.camera_name for b in self.camera_conn_bar.buttons]
         if self.camera_host is None:
-            menu = CameraMenuButton(keys)
-            menu.set_states(self.camera_conn_bar.get_states())   # those opened on start
+            control = CameraControl(keys, glyphs=False)
+            control.set_states(self.camera_conn_bar.get_states())   # those opened on start
             for btn in self.camera_conn_bar.buttons:
-                btn.state_changed.connect(menu.set_state)
-            menu.toggle_requested.connect(self._on_camera_toggle_requested)
-            return menu
-        from waxx.util.live_od.gui.camera_control import CameraControl
+                btn.state_changed.connect(control.set_state)
+            control.toggle_requested.connect(self._on_camera_toggle_requested)
+            return control
         control = CameraControl(keys, expect_snapshots=True)
         control.action_requested.connect(self._on_camera_action_requested)
         control.settings_requested.connect(self._open_camera_settings)
@@ -532,8 +532,8 @@ class LiveODWindow(QWidget):
         self.camera_conn_bar = self._make_camera_bar()
         self.camera_conn_bar.setParent(self)
         self.camera_conn_bar.hide()
-        # the status row's camera button: CameraControl (settings, live view, Persist)
-        # when the camera host owns the cameras, else CameraMenuButton as before
+        # the status row's camera button: CameraControl in both modes (settings, live
+        # view and Persist only when the camera host owns the cameras)
         self.camera_menu = self._make_camera_control()
         self.status_strip.add_camera_widget(self.camera_menu)
         self.live_view_window = None

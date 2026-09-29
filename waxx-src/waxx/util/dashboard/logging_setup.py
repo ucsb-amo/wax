@@ -5,6 +5,9 @@ calls once at startup.  Goals:
 
 * Uniform log file locations: ``<log_root>/_logs/{server,client}/<id>__<host>.log``
 * Rotating files (5 MB x 5 backups) so the network share never fills.
+* The log file is written from a background thread, so a hung share never
+  blocks the thread that logs; if the share fails mid-run the file moves to
+  the local-appdata mirror and the share is retried every 5 minutes.
 * ``faulthandler`` installed before any third-party import so native crashes
   (pylonsdk SEGVs, pyserial driver faults, pyzmq aborts) write Python tracebacks
   to the same log file.
@@ -33,12 +36,15 @@ Public API:
 
 from __future__ import annotations
 
+import atexit
 import faulthandler
 import logging
 import logging.handlers
 import os
+import queue
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +52,7 @@ from typing import Optional
 _BOOT_WARNINGS: list[str] = []
 _ACTIVE_LOG_DIR: Optional[Path] = None
 _FAULTHANDLER_FILE = None  # kept alive so faulthandler can write to it
+_FILE_WRITERS: dict[str, logging.handlers.QueueListener] = {}  # resolved log path -> writer thread
 _FORMATTER = logging.Formatter(
     fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -134,7 +141,8 @@ def _resolve_log_dir(kind: str) -> Path:
 
 
 class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
-    """``RotatingFileHandler`` that survives Windows file-locking races.
+    """``RotatingFileHandler`` that survives Windows file-locking races and a
+    failing log share.
 
     On Windows, if any other process or another open handle (e.g. a stale
     faulthandler file) still holds the active log file when rollover
@@ -143,9 +151,105 @@ class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
     here, write one warning to stderr, and continue logging into the
     current file — losing rotation for this cycle is far better than
     crashing the dashboard.
+
+    When opening, writing or flushing the file raises ``OSError`` — an SMB
+    reconnect leaves the open handle dead (``Errno 22`` on every ``tell``),
+    and the NAS can then refuse new opens of that one file (``Errno 13``
+    after ~70 s) — the handler switches to *fallback*, says so on stderr and
+    in the fallback file, and tries the primary again every
+    ``RETRY_PRIMARY_S``.  Without this every record re-tried the dead file
+    and printed a "--- Logging error ---" traceback.
     """
 
+    RETRY_PRIMARY_S = 300.0
     _rollover_warned: bool = False
+
+    def __init__(self, filename, *, fallback=None, **kwargs):
+        super().__init__(filename, **kwargs)
+        self._primary = self.baseFilename
+        self._fallback = os.path.abspath(fallback) if fallback else None
+        self._primary_failed_at: Optional[float] = None  # monotonic; None while on the primary
+
+    def emit(self, record):
+        self._maybe_return_to_primary()
+        try:
+            self._write(record)
+        except RecursionError:
+            raise
+        except OSError as exc:
+            if not self._switch_to_fallback(exc):
+                self.handleError(record)
+                return
+            try:
+                self._write(record)
+            except Exception:
+                self.handleError(record)
+        except Exception:
+            self.handleError(record)
+
+    def _write(self, record) -> None:
+        """Rotate if due and write *record*.  Unlike the stdlib ``emit`` this
+        lets ``OSError`` through, so :meth:`emit` can fall back."""
+        if self.shouldRollover(record):
+            self.doRollover()
+        if self.stream is None:
+            self.stream = self._open()
+        self.stream.write(self.format(record) + self.terminator)
+        self.stream.flush()
+
+    def _switch_to_fallback(self, exc: BaseException) -> bool:
+        if self._fallback is None or self.baseFilename == self._fallback:
+            return False
+        self._drop_stream()
+        self.baseFilename = self._fallback
+        self._primary_failed_at = time.monotonic()
+        try:
+            os.makedirs(os.path.dirname(self._fallback), exist_ok=True)
+        except OSError:
+            pass
+        self._note(f"cannot write {self._primary} ({exc!r}); logging to {self._fallback} "
+                   f"and retrying {self._primary} every {self.RETRY_PRIMARY_S:.0f} s.")
+        return True
+
+    def _maybe_return_to_primary(self) -> None:
+        if self._primary_failed_at is None:
+            return
+        if time.monotonic() - self._primary_failed_at < self.RETRY_PRIMARY_S:
+            return
+        self._primary_failed_at = time.monotonic()
+        self.baseFilename = self._primary
+        try:
+            stream = self._open()
+        except OSError:
+            self.baseFilename = self._fallback
+            return
+        self._drop_stream()
+        self.stream = stream
+        self._primary_failed_at = None
+        self._note(f"{self._primary} is writable again; logging there "
+                   f"(the gap is in {self._fallback}).")
+
+    def _drop_stream(self) -> None:
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _note(self, msg: str) -> None:
+        """Say *msg* on stderr and, best effort, in the file now in use."""
+        line = f"logging_setup: {msg}"
+        if sys.stderr is not None:
+            try:
+                sys.stderr.write(line + "\n")
+            except Exception:
+                pass
+        try:
+            self._write(logging.LogRecord(
+                "logging_setup", logging.WARNING, __file__, 0, line, None, None))
+        except Exception:
+            pass
 
     def doRollover(self):  # noqa: N802 - stdlib API
         try:
@@ -169,28 +273,25 @@ class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
                 self.stream = None
 
 
-def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
-    """Attach a rotating file handler + console handler to the root logger.
+def _install_handlers(log_path: Path, fallback: Path, level: int = logging.INFO) -> None:
+    """Attach a rotating file handler (behind a queue) + console handler to
+    the root logger.
 
-    Idempotent for the same path: if a handler already exists pointing at this
-    file we leave it alone.
+    Idempotent for the same path: if a handler already writes this file we
+    leave it alone.
     """
     global _FAULTHANDLER_FILE
 
     root = logging.getLogger()
     root.setLevel(level)
 
-    abs_target = str(log_path.resolve())
-    for h in root.handlers:
-        if isinstance(h, logging.handlers.RotatingFileHandler):
-            try:
-                if Path(h.baseFilename).resolve() == log_path.resolve():
-                    return  # already configured
-            except Exception:
-                continue
+    target = str(log_path.resolve())
+    if target in _FILE_WRITERS:
+        return  # already configured
 
     file_handler = _SafeRotatingFileHandler(
         filename=str(log_path),
+        fallback=fallback,
         maxBytes=5 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -198,7 +299,17 @@ def _install_handlers(log_path: Path, level: int = logging.INFO) -> None:
     )
     file_handler.setFormatter(_FORMATTER)
     file_handler.setLevel(level)
-    root.addHandler(file_handler)
+    # The file usually lives on a network share, where one open can block for
+    # ~70 s: write it from a background thread so the thread that logs (a
+    # server's request loop) never waits on the share.
+    records: queue.SimpleQueue = queue.SimpleQueue()
+    queue_handler = logging.handlers.QueueHandler(records)
+    queue_handler.setLevel(level)
+    root.addHandler(queue_handler)
+    writer = logging.handlers.QueueListener(records, file_handler, respect_handler_level=True)
+    writer.start()
+    atexit.register(writer.stop)  # drains the queue before logging.shutdown
+    _FILE_WRITERS[target] = writer
 
     # Console handler - only add one if there isn't a StreamHandler already,
     # and only when there is a console at all (under pythonw.exe sys.stderr
@@ -257,7 +368,7 @@ def configure_server_logging(server_id: str, level: int = logging.INFO) -> Path:
     log_dir = _resolve_log_dir("server")
     _ACTIVE_LOG_DIR = log_dir
     log_path = log_dir / f"{server_id}__{_hostname()}.log"
-    _install_handlers(log_path, level=level)
+    _install_handlers(log_path, _local_fallback_root() / "server" / log_path.name, level=level)
     logging.getLogger().info(
         "configure_server_logging: id=%s host=%s pid=%d log=%s",
         server_id, _hostname(), os.getpid(), log_path,
@@ -276,7 +387,7 @@ def configure_client_logging(level: int = logging.INFO) -> Path:
     log_dir = _resolve_log_dir("client")
     _ACTIVE_LOG_DIR = log_dir
     log_path = log_dir / f"dashboard__{_hostname()}.log"
-    _install_handlers(log_path, level=level)
+    _install_handlers(log_path, _local_fallback_root() / "client" / log_path.name, level=level)
     logging.getLogger().info(
         "configure_client_logging: host=%s pid=%d log=%s",
         _hostname(), os.getpid(), log_path,

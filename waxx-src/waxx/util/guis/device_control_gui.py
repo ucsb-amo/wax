@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QLineEdit, QMessageBox, QSizePolicy, QMenu, QListWidget, QComboBox,
-    QScrollArea, QGraphicsOpacityEffect
+    QScrollArea, QGraphicsOpacityEffect, QPlainTextEdit, QFileDialog
 )
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread, QSignalBlocker, QSettings, QByteArray
 from PyQt6.QtGui import QFont, QIcon, QPainter, QPixmap, QColor, QKeySequence, QShortcut
@@ -65,6 +65,8 @@ RECONCILE_MS = 10000                 # periodic full-snapshot safety reconcile
 STALE_WIDGET_RETRY_MS = 500          # re-sync a widget skipped while it was busy
 TELEMETRY_PULL_MS = 1000             # measured values into the cards and the strip
 JOURNAL_LOAD_N = 1000                # server journal records the changes window loads
+SLM_LOG_POLL_MS = 1000               # an open SLM log window asks for new lines this often
+SLM_LOG_MAX_LINES = 5000             # lines an SLM log window keeps
 
 _SETTINGS_ORG = "waxx"
 _SETTINGS_APP = "device_control_gui"
@@ -1602,6 +1604,161 @@ class ChangesLogWindow(QWidget):
         super().closeEvent(event)
 
 
+class SlmLogWindow(QWidget):
+    """Pop-out window following the SLM server's log (the SLM pill's "View
+    SLM server log…"): every line the server and its supervisor write on the
+    SLM PC.
+
+    The monitor server fetches the log from the SLM PC while this window asks
+    for it (the host GUI, every ``SLM_LOG_POLL_MS``) and keeps its last lines,
+    numbered (``OutputLog``), so the window asks only for lines after
+    :attr:`after`. Parentless (own taskbar entry) like
+    :class:`ChangesLogWindow`; deleted on close -- opened again, it loads
+    what the monitor server kept.
+    """
+
+    closed = pyqtSignal()
+
+    _GEOMETRY_KEY = "ui/slm_log_geometry"
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Window)
+        self.setWindowTitle("SLM server log")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setStyleSheet(f"background: {theme.BG};")
+        #: Number of the last line shown (the monitor server's numbering).
+        self.after = 0
+        #: A request is on its way (the host sends one at a time).
+        self.fetching = False
+        #: The monitor server cannot send the log (older code): stop asking.
+        self.unsupported = False
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(6, 6, 6, 6)
+        box.setSpacing(4)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        self.status_label = QLabel("Asking the monitor server for the SLM server's log…")
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._set_status(self.status_label.text(), theme.FG_MUTED)
+        head.addWidget(self.status_label, 1)
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.setToolTip("Copy every line shown to the clipboard.")
+        self.copy_button.clicked.connect(self._copy_all)
+        head.addWidget(self.copy_button)
+        self.save_button = QPushButton("Save…")
+        self.save_button.setToolTip("Save the lines shown to a text file.")
+        self.save_button.clicked.connect(self._save)
+        head.addWidget(self.save_button)
+        box.addLayout(head)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMaximumBlockCount(SLM_LOG_MAX_LINES)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(9)
+        self.text.setFont(mono)
+        self.text.setStyleSheet(
+            f"QPlainTextEdit {{ color: {theme.FG}; background: {theme.BG_SUNKEN}; "
+            f"border: 1px solid {theme.BORDER}; border-radius: 4px; }}")
+        self.text.setPlaceholderText("No lines yet.")
+        box.addWidget(self.text, 1)
+
+        self.resize(900, 420)
+        geom = _setting(self._GEOMETRY_KEY, None)
+        if isinstance(geom, QByteArray) and not geom.isEmpty():
+            try:
+                self.restoreGeometry(geom)
+            except Exception:
+                pass
+
+    def request(self) -> dict:
+        return {"type": "output", "kind": "slm", "after": self.after}
+
+    def add_output(self, reply: dict) -> bool:
+        """Show one ``output`` reply; True when the monitor server has more
+        lines waiting."""
+        if reply.get("status") != "ok":
+            msg = str(reply.get("msg") or "no reply")
+            if "unknown output kind" in msg or "unknown type" in msg:
+                self.unsupported = True
+                self._set_status("This monitor server cannot send the SLM server's log (it "
+                                 "is from before 2026-09-28): restart the monitor server, then "
+                                 "open this window again.", theme.WARN)
+            else:
+                self._set_status(f"No answer from the monitor server: {msg}", theme.WARN)
+            return False
+        try:
+            first, nxt = int(reply.get("first", 0)), int(reply.get("next", 0))
+        except (TypeError, ValueError):
+            return False
+        if nxt <= self.after:
+            # The monitor server restarted (its numbering started again).
+            self.text.clear()
+            self.after = 0
+            return True
+        lines = [str(x) for x in (reply.get("lines") or [])]
+        if lines and first > self.after + 1:
+            lines.insert(0, "(earlier lines: in the log files on the SLM PC)" if self.after == 0
+                         else f"({first - self.after - 1} lines were not kept here)")
+        if lines:
+            bar = self.text.verticalScrollBar()
+            at_end = bar.value() >= bar.maximum() - 2
+            self.text.appendPlainText("\n".join(lines))
+            if at_end:
+                bar.setValue(bar.maximum())
+        self.after = max(self.after, nxt - 1)
+        self._show_follow(reply.get("follow") or {})
+        return bool(reply.get("more"))
+
+    def _show_follow(self, follow: dict) -> None:
+        state = follow.get("state")
+        detail = str(follow.get("detail") or "")
+        if state == "following":
+            text = "Following the SLM server's log"
+            if follow.get("path"):
+                text += f" · {follow['path']} on the SLM PC"
+            if isinstance(follow.get("last_fetch"), (int, float)):
+                text += (" · fetched "
+                         + time.strftime("%H:%M:%S", time.localtime(follow["last_fetch"])))
+            self._set_status(text, theme.FG_MUTED)
+        elif state == "trouble":
+            self._set_status(f"⚠ {detail}", theme.WARN)
+        elif state == "waiting":
+            self._set_status(f"Waiting: {detail}", theme.FG_MUTED)
+        else:
+            self._set_status("Asking the SLM server for its log…", theme.FG_MUTED)
+
+    def _set_status(self, text: str, color: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color};")
+
+    def _copy_all(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.clipboard().setText(self.text.toPlainText())
+
+    def _save(self) -> None:
+        default = f"slm_server_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Save the SLM server log", default,
+                                              "Text (*.txt)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.text.toPlainText() + "\n")
+        except OSError as e:
+            QMessageBox.warning(self, "Save the SLM server log", f"Not saved:\n{e}")
+
+    def closeEvent(self, event):
+        _save_setting(self._GEOMETRY_KEY, self.saveGeometry())
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management.
 
@@ -1701,6 +1858,9 @@ class DeviceStateGUI(QMainWindow):
         # changes window; kept here so it survives the window being closed.
         self._changes: deque = deque(maxlen=CHANGES_LOG_MAX_ROWS)
         self._changes_window: ChangesLogWindow | None = None
+        # The SLM pill's log window, and its poll (running only while it is open).
+        self._slm_log_window: SlmLogWindow | None = None
+        self._slm_log_timer: QTimer | None = None
 
         self.setup_ui()
         self._setup_update_sender()
@@ -2003,7 +2163,9 @@ class DeviceStateGUI(QMainWindow):
         self.status_pill.clicked.connect(self.on_status_pill_clicked)
         self.status_pill.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.status_pill.customContextMenuRequested.connect(self._status_pill_menu)
-        self.status_pill.setToolTip("Right-click: start, restart or stop the monitor "
+        self.status_pill.setToolTip("Click: start the monitor experiment when it is not "
+                                    "running (retry when the server is unreachable).\n"
+                                    "Right-click: start, restart or stop the monitor "
                                     "experiment.")
         self._style_pill(theme.OFF)
         row.addWidget(self.status_pill)
@@ -2031,6 +2193,7 @@ class DeviceStateGUI(QMainWindow):
         self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
         self.slm_pill.reinit_requested.connect(self._request_slm_reinit)
         self.slm_pill.restart_requested.connect(self._request_slm_restart)
+        self.slm_pill.log_requested.connect(self._open_slm_log)
         self.slm_pill.spot_finder_requested.connect(self._launch_spot_finder)
         row.addWidget(self.slm_pill)
 
@@ -2273,9 +2436,14 @@ class DeviceStateGUI(QMainWindow):
         self._refresh_summary()
 
     def on_status_pill_clicked(self):
-        """Clicking the pill does nothing unless the server is unreachable,
-        in which case it retries at once."""
+        """Clicking the pill retries at once when the server is unreachable,
+        and starts the monitor experiment when it is not running -- the same
+        Start as the right-click menu, which asks first when a run probably
+        holds the core.  A running or starting monitor ignores the click:
+        Restart and Stop are on the right-click menu, behind a question."""
         if not self.connection_failed:
+            if self._monitor_commands_allowed()[0]:
+                self.on_start_clicked()
             return
         self.status_pill.setText("Connecting…")
         self._style_pill(theme.OFF)
@@ -2683,6 +2851,47 @@ class DeviceStateGUI(QMainWindow):
             self._record_line(f"[slm] server restart refused: {reply.get('msg')}")
             QMessageBox.warning(self, "Restart SLM server",
                                 f"The monitor server did not send it: {reply.get('msg')}")
+
+    def _open_slm_log(self) -> None:
+        """The SLM pill's "View SLM server log": the log window, following the
+        log (through the monitor server) while it is open."""
+        if self._slm_log_window is None:
+            win = SlmLogWindow()
+            win.setWindowIcon(self.windowIcon())
+            win.closed.connect(self._on_slm_log_window_closed)
+            self._slm_log_window = win
+            if self._slm_log_timer is None:
+                self._slm_log_timer = QTimer(self)
+                self._slm_log_timer.timeout.connect(self._poll_slm_log)
+            self._slm_log_timer.start(SLM_LOG_POLL_MS)
+            self._poll_slm_log()
+        self._slm_log_window.show()
+        self._slm_log_window.raise_()
+        self._slm_log_window.activateWindow()
+
+    def _poll_slm_log(self) -> None:
+        win = self._slm_log_window
+        if win is None:
+            if self._slm_log_timer is not None:
+                self._slm_log_timer.stop()
+            return
+        if win.fetching or win.unsupported:
+            return
+        win.fetching = True
+        self._send_request(win.request(), lambda reply, w=win: self._on_slm_log_reply(w, reply),
+                           timeout=2.0, attempts=1)
+
+    def _on_slm_log_reply(self, win: SlmLogWindow, reply: dict) -> None:
+        if win is not self._slm_log_window:
+            return                  # closed (or replaced) meanwhile
+        win.fetching = False
+        if win.add_output(reply):
+            self._poll_slm_log()    # more lines waiting: ask again now
+
+    def _on_slm_log_window_closed(self) -> None:
+        self._slm_log_window = None
+        if self._slm_log_timer is not None:
+            self._slm_log_timer.stop()
 
     def _launch_spot_finder(self) -> None:
         """The SLM pill's "Launch spot finder": the lab's launcher, on this PC."""
@@ -3307,6 +3516,12 @@ class DeviceStateGUI(QMainWindow):
         if win is not None:
             self._changes_window = None
             win.close()
+        slm_log = self._slm_log_window
+        if slm_log is not None:
+            self._slm_log_window = None
+            slm_log.close()
+        if self._slm_log_timer is not None:
+            self._slm_log_timer.stop()
         if self.composite_panel is not None:
             self.composite_panel.shutdown()
         if self.sequences_panel is not None:

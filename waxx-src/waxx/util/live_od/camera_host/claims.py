@@ -1,8 +1,10 @@
-"""Borrowing a camera from the beacon camera server that has it, and keeping it.
+"""Borrowing a camera from the camera server that has it, and keeping it.
 
 A Basler camera is listed by the beacon camera server of the PC it is plugged
-into, which opens it whenever a viewer looks at it.  Before liveOD's camera
-host opens one for a run, it asks that server to let go of it:
+into, which opens it whenever a viewer looks at it; the Andor is listed by the
+SLM spot finder's own server while the spot finder has it open (it serves the
+camera for exactly this).  Before liveOD's camera host opens one (at its
+start, for a live stream, for a run), it asks that server to let go of it:
 
     RELINQUISH_CAMERA{camera_ids, holder, ttl_s}   the server closes the device
                                                    (verified) and keeps it

@@ -150,6 +150,68 @@ def test_clamps_leave_the_camera_thread_once(app):
 
 
 # ----------------------------------------------------------------------
+# warm-up shots: more time for the first frame
+# ----------------------------------------------------------------------
+
+class ExtraCamera(ArmingCamera):
+    """start_grab as the drivers have it since 2026-09-28: first_frame_extra_s."""
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.extra = []
+
+    def start_grab(self, N_img, output_queue=None, check_interrupt_method=None, on_armed=None,
+                   first_frame_extra_s=0.):
+        self.extra.append(first_frame_extra_s)
+        super().start_grab(N_img, output_queue, check_interrupt_method, on_armed)
+
+
+def _warnings_during(fn):
+    import logging
+    warned = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            warned.append(record.getMessage())
+    h = H(logging.WARNING)
+    logging.getLogger("waxx.live_od").addHandler(h)
+    try:
+        fn()
+    finally:
+        logging.getLogger("waxx.live_od").removeHandler(h)
+    return warned
+
+
+def test_warmup_shots_give_the_first_frame_more_time(app):
+    from waxx.config.timeouts import CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT as PER
+    camera = ExtraCamera([])
+    baby, handler, _ = make_baby(camera)
+    handler.params.N_warmup_shots = 3
+    baby.run()
+    assert camera.extra == [3 * PER]
+    assert "status 2" in camera.events and "frame 2" in camera.events
+
+
+@pytest.mark.parametrize("n_warmup", [None, 0, -1])
+def test_no_warmup_shots_leave_the_first_frame_timeout_alone(app, n_warmup):
+    camera = ExtraCamera([])
+    baby, handler, _ = make_baby(camera)
+    if n_warmup is not None:
+        handler.params.N_warmup_shots = n_warmup
+    baby.run()
+    assert camera.extra == [0.]                               # the driver's default: nothing passed
+
+
+def test_an_old_driver_with_warmup_shots_still_grabs_and_it_is_said(app):
+    events = []
+    baby, handler, _ = make_baby(ArmingCamera(events))
+    handler.params.N_warmup_shots = 2
+    warned = _warnings_during(baby.run)
+    assert "frame 2" in events
+    assert any("no first_frame_extra_s" in w for w in warned)
+
+
+# ----------------------------------------------------------------------
 # B5: each baby has its own stop
 # ----------------------------------------------------------------------
 

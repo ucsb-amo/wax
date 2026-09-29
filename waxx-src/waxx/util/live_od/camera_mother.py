@@ -7,7 +7,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from waxx.control.cameras import DummyCamera
 
-from waxx.config.timeouts import DATA_SAVER_TIMEOUT
+from waxx.config.timeouts import DATA_SAVER_TIMEOUT, CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT
 from waxx.util.live_od.camera_nanny import CameraNanny
 from waxx.util.live_od.config import get_config
 # Everything that touches the run's data file lives in live_od/data. SaveWorker
@@ -46,6 +46,16 @@ def _takes_on_armed(start_grab) -> bool:
         return False
     return any(p.name == "on_armed" or p.kind is inspect.Parameter.VAR_KEYWORD
                for p in params)
+
+
+def _takes_first_frame_extra(start_grab) -> bool:
+    """Does this driver's ``start_grab`` name ``first_frame_extra_s=`` (more time
+    for the run's first frame)? Drivers from before 2026-09-28 do not; a bare
+    ``**kwargs`` does not count, since it would drop the value unused."""
+    try:
+        return "first_frame_extra_s" in inspect.signature(start_grab).parameters
+    except (TypeError, ValueError):
+        return False
 
 class CameraMother(QThread):
     """Legacy stub kept for import compatibility.
@@ -559,11 +569,12 @@ class CameraBaby(QThread):
         N_shots = int(self.data_handler.params.N_shots)
         N_pwa_per_shot = int(self.data_handler.params.N_pwa_per_shot)
         self.camera_grab_start.emit(N_img,N_shots,N_pwa_per_shot)
+        extra = self._first_frame_extra_kwargs()
         if _takes_on_armed(self.camera.start_grab):
             # ready is reported by the driver, once acquisition is running
             self.camera.start_grab(N_img,output_queue=self.queue,
                         check_interrupt_method=self.break_check,
-                        on_armed=self._report_ready)
+                        on_armed=self._report_ready, **extra)
         else:
             logger.warning(f"{self.name}: this camera driver's start_grab() has no on_armed "
                            f"callback, so the run is told the camera is ready before its "
@@ -571,9 +582,32 @@ class CameraBaby(QThread):
                            f"shifts every later frame (update the driver).")
             self._report_ready()
             self.camera.start_grab(N_img,output_queue=self.queue,
-                        check_interrupt_method=self.break_check)
+                        check_interrupt_method=self.break_check, **extra)
         if not self.interrupted and not self._stop.is_set():
             self.death = self.honorable_death
+
+    def _first_frame_extra_kwargs(self) -> dict:
+        """``{"first_frame_extra_s": s}`` for a run with warm-up shots, else {}.
+
+        The camera arms at INIT_RUN, but a run's N warm-up shots
+        (params.N_warmup_shots) come before its first imaged shot, so the
+        driver's first-frame timeout alone ends such runs before their first
+        frame. Each warm-up adds CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT."""
+        try:
+            n_warmup = int(getattr(self.data_handler.params, "N_warmup_shots", 0) or 0)
+        except (TypeError, ValueError):
+            n_warmup = 0
+        if n_warmup <= 0:
+            return {}
+        extra_s = n_warmup * CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT
+        if not _takes_first_frame_extra(self.camera.start_grab):
+            logger.warning(f"{self.name}: {n_warmup} warm-up shot(s), but this camera driver's "
+                           f"start_grab() has no first_frame_extra_s, so the first frame gets "
+                           f"only the driver's usual timeout (update the driver).")
+            return {}
+        logger.info(f"{self.name}: {n_warmup} warm-up shot(s): the first frame may take "
+                    f"{extra_s:.0f} s longer than usual.")
+        return {"first_frame_extra_s": extra_s}
 
     def break_check(self):
         return self.interrupted or self._stop.is_set()

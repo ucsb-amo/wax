@@ -98,5 +98,5 @@ def test_shutdown_stops_closes_the_shutter_then_shuts_down(host):
     report = host.shutdown(10.0)
     assert report["cameras_closed"] is True
     names = [n for n, _ in fake.log[start:]]
-    assert names.index("AbortAcquisition") < names.index("SetShutter") < names.index("ShutDown")
+    assert names.index("AbortAcquisition") < names.index("SetShutterEx") < names.index("ShutDown")
     assert SHUTTER_MODE[fake.hw["shutter"][1]] == "closed"

@@ -7,7 +7,8 @@
   identity and supervision in ``status``; the heartbeat; one server per port;
 * supervisor.py: the heartbeat hang check, the graceful stop, and an end-to-end
   run (a copy of run_server.py with a stub SDK, supervised on 127.0.0.1):
-  started, restarted with the pattern put back, shut down;
+  started, its log read back (``log``), restarted with the pattern put back,
+  shut down;
 * the monitor server's service asks for a restart only while idle and only of a
   supervised server, and follows it to the new instance;
 * the Device Control GUI's SLM pill offers it.
@@ -443,6 +444,15 @@ def test_the_supervisor_end_to_end(tmp_path, supervisor_mod):
         server_pid = json.loads((state / "supervisor.json").read_text(encoding="utf-8"))[
             "server_pid"]
         assert _wait(lambda: check(server_pid)[0] is True, 10), check(server_pid)
+        # The log: the supervisor's file, read back by the server; a log
+        # request leaves no lines of its own in it.
+        first = slm_link.exchange("127.0.0.1", port, {"cmd": "log", "cursor": None},
+                                  until=("ok", "error"), control=True, total_s=5.0)
+        assert first["status"] == "ok" and first["path"] == str(state / "logs")
+        assert any("[supervisor] SLM server started" in line for line in first["lines"])
+        again = slm_link.exchange("127.0.0.1", port, {"cmd": "log", "cursor": first["cursor"]},
+                                  until=("ok", "error"), control=True, total_s=5.0)
+        assert not any('"cmd":"log"' in line for line in first["lines"] + again["lines"])
         applied = slm_link.exchange("127.0.0.1", port,
                                     {"mask": "spot", "center": [123, 456], "dimension": 7},
                                     until=("applied", "error"), total_s=5.0)

@@ -36,7 +36,7 @@ from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.gui.live_scalar_plot_window import LiveScalarPlotWindow
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
-from waxx.util.live_od.gui.camera_menu import CameraMenuButton
+from waxx.util.live_od.gui.camera_control import CameraControl
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +410,8 @@ class RemoteViewerWindow(QWidget):
         # The server's cameras: the one on the button is the server's current camera,
         # the arrow drops down the others. Filled in from the first CAMERA_STATE
         # broadcast, so the remote viewer needs no camera config (or ARTIQ / kexp).
-        self.camera_menu = CameraMenuButton()
+        # The acquisition window's control, without ⚙ and 🎥 (they need the host).
+        self.camera_menu = CameraControl(glyphs=False)
         self.camera_menu.toggle_requested.connect(self._on_camera_button_clicked)
         self.camera_menu.hide()
         status_bar.addWidget(self.camera_menu)

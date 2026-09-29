@@ -469,7 +469,11 @@ def test_someone_else_still_watching_keeps_the_stream(stubbed, app):
     assert host.stopped == []
 
 
-def test_the_legacy_window_keeps_its_camera_menu(window):
-    from waxx.util.live_od.gui.camera_menu import CameraMenuButton
-    assert type(window.camera_menu) is CameraMenuButton
+def test_the_legacy_window_shows_the_same_camera_control(window):
+    """Without the host the status row has the host's CameraControl too, minus ⚙
+    and 🎥 (the settings dialog and the live view need the host)."""
+    from waxx.util.live_od.gui.camera_control import CameraControl
+    menu = window.camera_menu
+    assert type(menu) is CameraControl
+    assert not menu.cog_button.isVisibleTo(menu) and not menu.live_button.isVisibleTo(menu)
     assert window._live_view_button is None and window.live_view_window is None

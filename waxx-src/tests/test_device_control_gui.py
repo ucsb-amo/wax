@@ -409,3 +409,50 @@ def test_main_window_close_closes_popout(loaded, qapp):
     qapp.processEvents()          # the pop-out is delete-on-close: gone now
     assert loaded._changes_window is None
     assert closed == [True]
+
+
+# --- status pill -------------------------------------------------------------
+
+@pytest.fixture
+def pill_gui(gui, monkeypatch):
+    """The monitor commands are recorded, not sent."""
+    gui.sent_commands = []
+    monkeypatch.setattr(gui, "_send_monitor_command", gui.sent_commands.append)
+    monkeypatch.setattr(gui, "_live_od_status", lambda: {})
+    return gui
+
+
+def test_pill_click_starts_a_stopped_monitor(pill_gui):
+    pill_gui._on_status_detail({"state": int(dc.STATES.NOT_READY), "sub_state": "never_started"})
+    pill_gui.status_pill.clicked.emit()
+    assert pill_gui.sent_commands == ["reset"]
+
+
+def test_pill_click_is_ignored_while_the_monitor_runs_or_starts(pill_gui):
+    for state, sub in ((dc.STATES.READY, "running"), (dc.STATES.LOADING, "starting")):
+        pill_gui._on_status_detail({"state": int(state), "sub_state": sub})
+        pill_gui.status_pill.clicked.emit()
+    assert pill_gui.sent_commands == []
+
+
+def test_pill_click_asks_before_taking_the_core_from_a_run(pill_gui, monkeypatch):
+    asked = []
+
+    def answer_no(*args, **kwargs):
+        asked.append(args[2])
+        return dc.QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(dc.QMessageBox, "question", answer_no)
+    pill_gui._on_status_detail({"state": int(dc.STATES.NOT_READY),
+                                "sub_state": "interrupted_by_run"})
+    pill_gui.status_pill.clicked.emit()
+    assert len(asked) == 1 and "holds the core" in asked[0]
+    assert pill_gui.sent_commands == []
+
+
+def test_pill_click_retries_when_the_server_is_unreachable(pill_gui):
+    pill_gui.on_connection_failed()
+    pill_gui.status_pill.clicked.emit()
+    assert pill_gui.sent_commands == []
+    assert not pill_gui.connection_failed
+    assert pill_gui.status_pill.text() == "Connecting…"

@@ -15,6 +15,8 @@ DATA_SAVER_TIMEOUT = 120.
 # camera-not-ready handshake failure instead of blocking the run forever).
 CAMERA_OPEN_TIMEOUT = 30.
 
+CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT = 10.
+
 CAMERA_GRAB_TIMEOUT_BASLER_INIT = 20.
 CAMERA_GRAB_TIMEOUT_BASLER_RUN = 8.
 

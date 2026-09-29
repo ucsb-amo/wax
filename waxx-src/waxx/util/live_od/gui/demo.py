@@ -2,7 +2,7 @@
 for looking at the layout without cameras, ARTIQ or a lab config:
 
     python -m waxx.util.live_od.gui.demo            the camera host's CameraControl
-    python -m waxx.util.live_od.gui.demo --legacy   the old CameraMenuButton
+    python -m waxx.util.live_od.gui.demo --legacy   the same control without the host
 
 The camera control is fed by ``DemoHost``, a made-up camera host in this process
 (snapshots once a second, as ``HostQtBridge`` delivers them): its ⚙ opens the real
@@ -23,7 +23,8 @@ import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
-from waxx.util.live_od.gui.camera_menu import CameraMenuButton, CONNECTED_STATES
+from waxx.util.live_od.gui.camera_control import CameraControl
+from waxx.util.live_od.gui.camera_menu import CONNECTED_STATES
 from waxx.util.live_od.gui.status_strip import StatusStrip
 from waxx.util.live_od.gui.viewer import LiveODViewer
 from waxx.util.live_od.log import get_logger, setup_logging
@@ -258,12 +259,12 @@ class DemoWindow(QWidget):
         extra = []
         if legacy:
             # made-up cameras that connect / disconnect at a click, nothing behind them
-            self.camera_menu = CameraMenuButton(["andor", "xy_basler", "z_basler", "basler_2dmot"])
+            self.camera_menu = CameraControl(["andor", "xy_basler", "z_basler", "basler_2dmot"],
+                                             glyphs=False)
             self.camera_menu.toggle_requested.connect(lambda key: self.camera_menu.set_state(
                 key, "closed" if self.camera_menu.state(key) in CONNECTED_STATES else "open"))
             self.camera_menu.set_state("andor", "open")
         else:
-            from waxx.util.live_od.gui.camera_control import CameraControl
             self.host = DemoHost()
             self.bridge = DemoBridge(self.host, self)
             self.camera_menu = CameraControl([k for k, _c, _t in DemoHost.CAMERAS],

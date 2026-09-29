@@ -58,7 +58,9 @@ def cam(sdk):
 
 
 def shutter_modes(fake):
-    return [SHUTTER_MODE[args[1]] for name, args in fake.calls("SetShutter")]
+    """Internal shutter modes sent, in order."""
+    return [SHUTTER_MODE[args[1]] for name, args in fake.log
+            if name in ("SetShutter", "SetShutterEx")]
 
 
 # -- init ------------------------------------------------------------------------
@@ -75,6 +77,7 @@ def test_init_leaves_the_camera_in_the_run_state(sdk):
     assert (hw["em_gain_mode"], hw["em_advanced"], hw["em_gain"]) == (3, 0, 30)
     assert hw["baseline_clamp"] == 1 and hw["cooler_mode"] == 1 and hw["camlink"] == 1
     assert SHUTTER_MODE[hw["shutter"][1]] == "open"
+    assert SHUTTER_MODE[hw["shutter_ext"]] == "open"
     # one amplifier-mode write for hs_speed (B10): no bare SetHSSpeed outside set_amp_mode
     hs_calls = [i for i, (n, _) in enumerate(sdk.log) if n == "SetHSSpeed"]
     for i in hs_calls:
@@ -176,7 +179,7 @@ def test_close_stops_before_closing_the_shutter(cam, sdk):
     start = len(sdk.log)
     assert cam.Close() == []
     names = [n for n, _ in sdk.log[start:]]
-    shutter_i = start + names.index("SetShutter")
+    shutter_i = start + names.index("SetShutterEx")
     assert SHUTTER_MODE[sdk.log[shutter_i][1][1]] == "closed"
     assert sdk.index("AbortAcquisition", start) < shutter_i
     assert shutter_i < sdk.index("SetCoolerMode", start) < sdk.index("ShutDown", start)
@@ -186,7 +189,7 @@ def test_close_stops_before_closing_the_shutter(cam, sdk):
 
 
 def test_shutdown_still_runs_when_the_shutter_command_fails(cam, sdk):
-    sdk.fail_next("SetShutter")
+    sdk.fail_next("SetShutterEx")
     errors = cam.Close()
     assert len(errors) == 1 and "setup_shutter('closed')" in errors[0]
     assert sdk.shutdown_count == 1 and not cam.is_opened()
@@ -194,7 +197,7 @@ def test_shutdown_still_runs_when_the_shutter_command_fails(cam, sdk):
 
 
 def test_close_safely_never_raises_and_reports_every_failure(cam, sdk):
-    sdk.fail_next("SetShutter")
+    sdk.fail_next("SetShutterEx")
     sdk.fail_next("ShutDown")
     errors = cam.close_safely()
     assert len(errors) == 2
@@ -310,6 +313,41 @@ def test_no_trigger_times_out_with_the_builtin_timeout(cam, sdk, monkeypatch):
     with pytest.raises(TimeoutError, match="got 0/2"):
         cam.start_grab(2, output_queue=Queue(), on_armed=lambda: armed.append(1))
     assert armed == [1] and not sdk.acquiring
+
+
+def test_first_frame_extra_lengthens_only_the_first_wait(cam, sdk, monkeypatch):
+    waits = []
+    real = cam.wait_for_frame
+
+    def wait(*args, timeout=None, **kwargs):
+        waits.append(timeout)
+        if len(waits) == 2:
+            sdk.trigger(1)                   # the second shot's trigger
+        return real(*args, timeout=timeout, **kwargs)
+    monkeypatch.setattr(cam, "wait_for_frame", wait)
+    q = Queue()
+    cam.start_grab(2, output_queue=q, on_armed=lambda: sdk.trigger(1), first_frame_extra_s=90.)
+    assert waits == [andor_mod.TIMEOUT + 90., andor_mod.TIMEOUT]
+    assert [idx for _, _, idx in (q.get_nowait() for _ in range(q.qsize()))] == [0, 1]
+
+
+def test_without_extra_every_wait_is_the_usual_timeout(cam, sdk, monkeypatch):
+    waits = []
+    real = cam.wait_for_frame
+
+    def wait(*args, timeout=None, **kwargs):
+        waits.append(timeout)
+        return real(*args, timeout=timeout, **kwargs)
+    monkeypatch.setattr(cam, "wait_for_frame", wait)
+    cam.start_grab(1, output_queue=Queue(), on_armed=lambda: sdk.trigger(1))
+    assert waits == [andor_mod.TIMEOUT]
+
+
+def test_a_first_frame_timeout_with_extra_says_so(cam, sdk, monkeypatch):
+    monkeypatch.setattr(andor_mod, "TIMEOUT", 0.2)
+    with pytest.raises(TimeoutError, match="got 0/2") as err:
+        cam.start_grab(2, output_queue=Queue(), on_armed=lambda: None, first_frame_extra_s=0.2)
+    assert "s for warm-up shots)" in str(err.value) and not sdk.acquiring
 
 
 def test_surplus_frames_are_not_queued(cam, sdk, caplog):
@@ -448,5 +486,36 @@ def test_a_camera_without_shutter_control_reports_it(make_sdk):
     sdk = make_sdk(has_shutter=False)
     cam = andor_mod.AndorEMCCD()
     assert cam.apply_run_fields()["shutter"] == Readback(None, "unsupported")
-    assert sdk.calls("SetShutter") == []
+    assert sdk.calls("SetShutter") == [] and sdk.calls("SetShutterEx") == []
     assert cam.Close() == []
+
+
+# -- shutter: the internal one is the one controlled -------------------------------------------
+def test_the_internal_shutter_is_controlled_the_external_held_open(cam, sdk):
+    # SHUTTEREX camera: SetShutterEx only (the manual forbids SetShutter there),
+    # the mode on the internal shutter, extmode permanently open, min times
+    # in the SDK's (closing, opening) order
+    assert sdk.calls("SetShutter") == []
+    typ, mode, closing, opening = sdk.hw["shutter"]
+    assert (typ, SHUTTER_MODE[mode], closing, opening) == (0, "open", 27, 27)
+    assert SHUTTER_MODE[sdk.hw["shutter_ext"]] == "open"
+    cam.setup_shutter("closed")
+    assert SHUTTER_MODE[sdk.hw["shutter"][1]] == "closed"
+    assert SHUTTER_MODE[sdk.hw["shutter_ext"]] == "open"
+    assert cam.shutter_readback() == Readback("closed", "commanded")
+    assert sdk.calls("SetShutterEx")[-1][1] == (0, 2, 27, 27, 1)
+    cam.Close()
+    assert SHUTTER_MODE[sdk.hw["shutter"][1]] == "closed"
+    assert SHUTTER_MODE[sdk.hw["shutter_ext"]] == "open"
+    assert sdk.calls("SetShutter") == []
+
+
+def test_without_independent_control_setshutter_drives_the_internal_shutter(make_sdk):
+    sdk = make_sdk(has_shutter_ex=False)
+    cam = andor_mod.AndorEMCCD()
+    assert sdk.calls("SetShutterEx") == []
+    assert SHUTTER_MODE[sdk.hw["shutter"][1]] == "open"
+    assert cam.apply_run_fields()["shutter"] == Readback("open", "commanded")
+    assert cam.Close() == []
+    assert SHUTTER_MODE[sdk.hw["shutter"][1]] == "closed"
+    assert sdk.calls("SetShutterEx") == []
