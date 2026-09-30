@@ -177,23 +177,37 @@ def _spawn(command: str, extra_env: Mapping | None = None):
 
 class _LiveOD:
     """POLL (and the exit notice, ``run_exited``) through one lazily made client;
-    a failed call drops it so the next one rediscovers the server."""
+    a failed call drops it so the next one rediscovers the server.
+
+    A POLL that fails is tried once more on a fresh client: after a liveOD
+    restart the kept client still points at the old port, and without the
+    retry the first Start after the restart was refused ("liveOD is not
+    reachable") although liveOD was up.  POLL is read-only, so repeating it is
+    safe; the exit notice is not repeated."""
 
     def __init__(self):
         self._client = None
 
-    def _call(self, fn):
+    def _call(self, fn, retry: bool = False):
         from waxx.util.live_od.live_od_client import LiveODClient  # noqa: PLC0415
-        if self._client is None:
-            self._client = LiveODClient(timeout_ms=3000, discovery_timeout=3.0)
-        try:
-            return fn(self._client)
-        except Exception:
-            self._client = None
-            raise
+        for attempt in range(2 if retry else 1):
+            if self._client is None:
+                self._client = LiveODClient(timeout_ms=3000, discovery_timeout=3.0)
+            try:
+                return fn(self._client)
+            except Exception:
+                client, self._client = self._client, None
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                if attempt == (1 if retry else 0):
+                    raise
+                log.info("liveOD POLL failed on the kept client; retrying on a fresh one "
+                         "(liveOD may have restarted)")
 
     def __call__(self) -> dict:
-        reply = self._call(lambda c: c.poll())
+        reply = self._call(lambda c: c.poll(), retry=True)
         if not reply.get("ok", False):
             raise RuntimeError(f"liveOD POLL failed: {reply}")
         return reply

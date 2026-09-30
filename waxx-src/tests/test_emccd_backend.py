@@ -367,6 +367,32 @@ def test_the_last_run_frame_is_read_before_the_run_is_stopped(make_backend):
     assert not be.acquisition_state()["acquiring"]     # and the run is stopped
 
 
+def test_a_last_frame_landing_between_the_read_and_the_stop_is_not_lost(make_backend):
+    """kong 2026-09-29/30, runs 83639 83755 83875 83902 84031 84075 (1 in ~80 runs):
+    the last frame landed after the read but before the stop check, which went by
+    the SDK's frames_done, so the run was stopped with that frame unread -- and
+    after AbortAcquisition it cannot be read: N-1/N with nothing marked lost."""
+    be, fake = make_backend(sdk_kwargs=dict(unreadable_after_abort=True))
+    be.apply(RUN, "run")
+    be.start_acquisition("run", n_frames=3)
+    fake.trigger(2)
+    read_new = be._read_new
+    landed = []
+
+    def read_then_last_frame_lands(cam):
+        out = read_new(cam)
+        if not landed:
+            landed.append(True)
+            fake.trigger(1)                   # the run's last frame, just after the read
+        return out
+
+    be._read_new = read_then_last_frame_lands
+    got = [f.hw_idx for f in be.retrieve(0.5)]
+    got += [f.hw_idx for f in be.retrieve(0.5)]
+    assert got == [0, 1, 2]
+    assert not be.acquisition_state()["acquiring"]     # stopped once all 3 were read
+
+
 def test_run_lost_frames_keep_their_index(make_backend):
     be, fake = make_backend(sdk_kwargs=dict(buffer_size=4))
     be.apply(RUN, "run")

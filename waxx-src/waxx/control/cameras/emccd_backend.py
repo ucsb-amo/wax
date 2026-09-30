@@ -523,9 +523,12 @@ class EMCCDBackend:
         return state
 
     def _stop_run_if_complete(self, cam) -> bool:
-        # A run stops by itself after n_frames: nothing beyond them is acquired.
-        if self._mode == "run" and cam.acquisition_in_progress():
-            if cam.get_acquisition_progress().frames_done >= self._n_frames:
+        # A run stops by itself once all n_frames have been READ (lost ones
+        # count: they have an index). Not on the SDK's frames_done: a last frame
+        # that lands after the read but before that check would be stopped
+        # unread, and lost (see _read_then_stop).
+        if self._mode == "run" and self._next_idx >= self._n_frames:
+            if cam.acquisition_in_progress():
                 cam.stop_acquisition()
                 return True
         return False
@@ -533,14 +536,12 @@ class EMCCDBackend:
     def _read_then_stop(self, cam) -> list:
         # Read BEFORE stopping a complete run: after AbortAcquisition pylablib
         # serves none of the frames already acquired (the SDK's progress count no
-        # longer covers them), so a frame read only after the stop was lost, and
-        # silently -- kong 2026-09-27, run 83174: 14/15, the last frame missing.
+        # longer covers them), so a frame read only after the stop is lost, and
+        # silently -- kong 2026-09-27, run 83174: 14/15, the last frame missing;
+        # 2026-09-29/30, 83639 83755 83875 83902 84031 84075: the same frame,
+        # stopped on frames_done between the read and the check.
         new = self._read_new(cam)
-        if self._stop_run_if_complete(cam):
-            try:
-                new += self._read_new(cam)      # one that landed between the read and the stop
-            except Exception:
-                pass
+        self._stop_run_if_complete(cam)
         return new
 
     def _read_new(self, cam) -> list:
