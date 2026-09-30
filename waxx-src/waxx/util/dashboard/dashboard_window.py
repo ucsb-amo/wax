@@ -825,17 +825,54 @@ class DashboardMainWindow(QMainWindow):
         if self._layout_ready:
             self._layout_save_timer.start()
 
+    def _layout_group(self) -> str:
+        return f"dashboard/{self._kind}/{self._host_ip}"
+
+    def _discard_saved_layout(self, reason: str) -> None:
+        """Drop the whole saved layout for this host so startup uses the default placement."""
+        _LOG.warning("Discarding saved layout (%s); starting with the default layout", reason)
+        self._settings.remove(self._layout_group())
+        self._settings.sync()
+        self._last_loaded_layout = None
+        self.statusBar().showMessage(f"Saved layout was bad ({reason}) - using the default layout", 10000)
+
+    def _guarded_restore(self, geo, state) -> bool:
+        """restoreGeometry/restoreState behind a crash sentinel.
+
+        A corrupt or incompatible saved state can make Qt abort the whole
+        process inside restoreState(), which no try/except can catch.  The
+        sentinel is written (and flushed) before the call and cleared after,
+        so if it is still set on the next launch the saved layout is dropped.
+        """
+        pending = self._layout_key("restore_pending")
+        self._settings.setValue(pending, True)
+        self._settings.sync()
+        try:
+            if geo is not None and not self.restoreGeometry(geo):
+                _LOG.warning("restoreGeometry rejected the saved geometry")
+            if state is not None and not self.restoreState(state):
+                _LOG.warning("restoreState rejected the saved dock state")
+                return False
+            return True
+        finally:
+            self._settings.remove(pending)
+            self._settings.sync()
+
     def _restore_layout(self) -> None:
+        if self._settings.value(self._layout_key("restore_pending")) is not None:
+            self._discard_saved_layout("previous launch crashed while restoring it")
+            return
         geo = self._settings.value(self._layout_key("geometry"))
         state = self._settings.value(self._layout_key("state"))
+        ok = False
         try:
-            if geo is not None:
-                self.restoreGeometry(geo)
-            if state is not None:
-                self.restoreState(state)
+            ok = self._guarded_restore(geo, state)
         except Exception as exc:
             _LOG.warning("Failed to restore layout, falling back to defaults: %r", exc)
         self._clamp_to_screen()
+        if not ok and state is not None:
+            self._discard_saved_layout("Qt rejected the saved dock state")
+            return
         if geo is not None or state is not None:
             self._last_loaded_layout = {"geometry": geo, "state": state}
 
@@ -875,14 +912,9 @@ class DashboardMainWindow(QMainWindow):
         if not snap:
             return False
         try:
-            geo = snap.get("geometry")
-            state = snap.get("state")
-            if geo is not None:
-                self.restoreGeometry(geo)
-            if state is not None:
-                self.restoreState(state)
+            ok = self._guarded_restore(snap.get("geometry"), snap.get("state"))
             self._clamp_to_screen()
-            return True
+            return ok
         except Exception as exc:
             _LOG.warning("Failed to apply layout snapshot: %r", exc)
             return False
