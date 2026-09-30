@@ -585,12 +585,14 @@ class atomdata_base():
             stored in run_info.run_id), and that data is found and loaded. If zero
             or a negative number are given, data is loaded relative to the most
             recent dataset (idx=0).
-        roi_id: None, int, or string
+        roi_id: None, int, string, or pixel pair
             Specifies which crop to use. If roi_id=None, defaults to the ROI saved in
             the data if it exists, otherwise prompts the user to select an ROI using
             the GUI. If an int, interpreted as an run ID, which will be checked for
             a saved ROI and that ROI will be used. If a string, interprets as a key
-            in the roi.xlsx document in the PotassiumData folder.
+            in the roi.xlsx document in the PotassiumData folder. If a pair of pixel
+            ranges ([x0, x1], [y0, y1]) (tuple, list or array), that box is used
+            directly (full-frame pixels, end-exclusive). Ignored when lite=True.
         path: str
             The full path to the file to be loaded. If not specified, loads the file
             as dictated by `idx`.
@@ -751,12 +753,14 @@ class atomdata_base():
         using the new ROI, then reloads and re-analyzes.
 
         Args:
-            roi_id (None, int, or str): Specifies which crop to use. If None,
-            defaults to the ROI saved in the data if it exists, otherwise
-            prompts the user to select an ROI using the GUI. If an int,
-            interpreted as an run ID, which will be checked for a saved ROI and
-            that ROI will be used. If a string, interprets as a key in the
-            roi.xlsx document in the PotassiumData folder.
+            roi_id (None, int, str, or pixel pair): Specifies which crop to
+            use. If None, defaults to the ROI saved in the data if it exists,
+            otherwise prompts the user to select an ROI using the GUI. If an
+            int, interpreted as an run ID, which will be checked for a saved ROI
+            and that ROI will be used. If a string, interprets as a key in the
+            roi.xlsx document in the PotassiumData folder. If a pair of pixel
+            ranges ([x0, x1], [y0, y1]), that box is used directly (full-frame
+            pixels, end-exclusive).
 
             use_saved (bool): If False, ignores saved ROI and forces creation of
             a new one. Default is False.
@@ -785,12 +789,14 @@ class atomdata_base():
         freshly-written lite data.
 
         Args:
-            roi_id (None, int, or str): Specifies which crop to use. If None,
-            defaults to the ROI saved in the data if it exists, otherwise
-            prompts the user to select an ROI using the GUI. If an int,
-            interpreted as an run ID, which will be checked for a saved ROI
-            and that ROI will be used. If a string, interprets as a key in
-            the roi.xlsx document in the PotassiumData folder.
+            roi_id (None, int, str, or pixel pair): Specifies which crop to
+            use. If None, defaults to the ROI saved in the data if it exists,
+            otherwise prompts the user to select an ROI using the GUI. If an
+            int, interpreted as an run ID, which will be checked for a saved
+            ROI and that ROI will be used. If a string, interprets as a key in
+            the roi.xlsx document in the PotassiumData folder. If a pair of
+            pixel ranges ([x0, x1], [y0, y1]), that box is used directly
+            (full-frame pixels, end-exclusive).
 
             use_saved (bool): If False, ignores saved ROI and forces creation
             of a new one. Default is False.
@@ -844,9 +850,9 @@ class atomdata_base():
 
         Parameters
         ----------
-        roi_id : None, int, or str
+        roi_id : None, int, str, or pixel pair ([x0, x1], [y0, y1])
             If None (default), uses the ROI currently loaded in this atomdata
-            instance. If an int/str, a temporary ROI is loaded for cropping
+            instance. Otherwise a temporary ROI is loaded for cropping
             (``self.roi`` is not mutated) and used for the fast in-memory path.
         use_saved_roi : bool
             Passed through to ROI lookup when ``roi_id`` is given, and to the
@@ -2810,7 +2816,8 @@ class atomdata_base():
             # it -- a run that already carries an ROI never pays for this.
             # roi_id given as an int or a string may still prompt; those paths
             # start the job themselves when they open the dialog.
-            _will_prompt_for_roi = (roi_id == 'auto'
+            # (isinstance first: roi_id may be an array, see roi.explicit_roi.)
+            _will_prompt_for_roi = ((isinstance(roi_id, str) and roi_id == 'auto')
                                     or (roi_id is None
                                         and (skip_saved_roi
                                              or not self._saved_roi_from_file)))

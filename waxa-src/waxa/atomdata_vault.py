@@ -146,7 +146,7 @@ class AtomdataVault(atomdata_base):
         Each entry is either an already-loaded ``atomdata`` object or a
         ``run_id`` (positive int). Run-ids are loaded internally using
         ``lite`` and ``roi_id``. Nested lists/tuples/ndarrays are flattened.
-    roi_id : None, int, or str
+    roi_id : None, int, str, or pixel pair ([x0, x1], [y0, y1])
         Forwarded to ``atomdata(...)`` when loading run-ids, and used for the
         vault's ROI. If ``None``, the ROI of the first input is used.
     lite : bool
@@ -729,7 +729,7 @@ class AtomdataVault(atomdata_base):
         """Load the first run and establish the anchor ROI.
 
         Returns ``(atomdata, anchor_roi_id)`` where ``anchor_roi_id`` is an int
-        run-id, a str ROI key, or ``None`` (images ignored).
+        run-id, a str ROI key, a pixel pair, or ``None`` (images ignored).
         """
         if ignore_images:
             return atomdata(rid, roi_id=roi_id, lite=lite,

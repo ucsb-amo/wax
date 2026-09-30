@@ -12,12 +12,14 @@ def load_atomdata(idx=0, roi_id=None, path = "",
         or a negative number are given, data is loaded relative to the most
         recent dataset (idx=0).
 
-    roi_id: None, int, or string
+    roi_id: None, int, string, or pixel pair
         Specifies which crop to use. If roi_id=None, defaults to the ROI saved in
         the data if it exists, otherwise prompts the user to select an ROI using
         the GUI. If an int, interpreted as an run ID, which will be checked for
         a saved ROI and that ROI will be used. If a string, interprets as a key
-        in the roi.xlsx document in the PotassiumData folder.
+        in the roi.xlsx document in the PotassiumData folder. If a pair of pixel
+        ranges ([x0, x1], [y0, y1]) (tuple, list or array), that box is used
+        directly (full-frame pixels, end-exclusive).
 
     path: str
         The full path to the file to be loaded. If not specified, loads the file

@@ -240,6 +240,40 @@ def read_saved_roi(file_path):
     return roix, roiy
 
 
+def explicit_roi(roi_id):
+    """Returns ([x0, x1], [y0, y1]) if `roi_id` gives the ROI in pixels, else None.
+
+    An explicit ROI is a pair of pixel ranges, ([x0, x1], [y0, y1]), as a
+    tuple, list or array of shape (2, 2) holding integer values. Ranges are
+    end-exclusive, like ``roix``/``roiy`` everywhere else. None, ints (run ids)
+    and strings (roi.xlsx keys, 'auto') return None.
+
+    Raises:
+        ValueError: `roi_id` is a sequence or array but not a valid pixel ROI.
+    """
+    if roi_id is None or isinstance(roi_id, (str, bytes, int, np.integer)):
+        return None
+    if not isinstance(roi_id, (list, tuple, np.ndarray)):
+        return None
+    try:
+        arr = np.asarray(roi_id, dtype=float)
+    except (TypeError, ValueError):
+        arr = None
+    if arr is None or arr.shape != (2, 2):
+        raise ValueError(
+            f"An explicit roi_id must be ([x0, x1], [y0, y1]) in pixels; "
+            f"got {roi_id!r}.")
+    if not np.all(np.isfinite(arr)) or not np.all(arr == np.round(arr)):
+        raise ValueError(
+            f"Explicit roi_id pixel bounds must be integers; got {roi_id!r}.")
+    (x0, x1), (y0, y1) = arr.astype(int).tolist()
+    if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+        raise ValueError(
+            f"Explicit roi_id needs 0 <= x0 < x1 and 0 <= y0 < y1; "
+            f"got roix={[x0, x1]}, roiy={[y0, y1]}.")
+    return [x0, x1], [y0, y1]
+
+
 def _on_qt_main_thread():
     """True if Qt widgets may be created from the calling thread."""
     app = QApplication.instance()
@@ -421,12 +455,14 @@ class ROI():
         """Loads an ROI according to the provided roi_id.
 
         Args:
-            roi_id (None, int, or str): Specifies which crop to use. If None,
-            defaults to the ROI saved in the data if it exists, otherwise
-            prompts the user to select an ROI using the GUI. If an int,
-            interpreted as an run ID, which will be checked for a saved ROI and
-            that ROI will be used. If a string, interprets as a key in the
-            roi.xlsx document in the PotassiumData folder.
+            roi_id (None, int, str, or pixel pair): Specifies which crop to
+            use. If None, defaults to the ROI saved in the data if it exists,
+            otherwise prompts the user to select an ROI using the GUI. If an
+            int, interpreted as an run ID, which will be checked for a saved ROI
+            and that ROI will be used. If a string, interprets as a key in the
+            roi.xlsx document in the PotassiumData folder. If a pair of pixel
+            ranges ([x0, x1], [y0, y1]) (tuple, list or array), that box is
+            used directly, in full-frame pixels, end-exclusive.
             printouts (bool): If True, prints out information about the
             ROI loading process.
 
@@ -437,7 +473,18 @@ class ROI():
             the GUI shows these ODs directly without re-reading from disk or
             recomputing from raw camera images.
         """
-        
+
+        # An ROI given directly in pixels: used as is, never prompts, and is
+        # not written anywhere (save_roi_h5 / save_roi_excel do that on request).
+        pixel_roi = explicit_roi(roi_id)
+        if pixel_roi is not None:
+            roix, roiy = pixel_roi
+            self._check_explicit_roi_in_frame(roix, roiy, lite=lite,
+                                              printouts=printouts)
+            self.roix, self.roiy = roix, roiy
+            if printouts: print(f"Using ROI given directly: roix={roix}, roiy={roiy}.")
+            return
+
         # Headless auto-detection: never opens the GUI. Used by unattended
         # callers that cannot answer a dialog. 'auto' is therefore a reserved
         # roi.xlsx key.
@@ -499,6 +546,31 @@ class ROI():
             px, py = self.get_image_size()
             self.roix = [0,px]
             self.roiy = [0,py]
+
+    def _check_explicit_roi_in_frame(self, roix, roiy, lite=False, printouts=True):
+        """Raises ValueError if a pixel ROI reaches past the camera frame.
+
+        Array slicing would silently clip such a box, so the crop would not be
+        the one that was asked for. The pixel ROI is in full-frame
+        coordinates; for lite data, whose images are already cropped, the
+        frame size comes from the regular (non-lite) file.
+        """
+        try:
+            if lite:
+                fpath, _ = self.server_talk.get_data_file(self.run_id, lite=False)
+                with h5py.File(fpath, 'r') as f:
+                    py, px = f['data']['images'].shape[-2:]
+            else:
+                px, py = self.get_image_size()
+        except Exception as e:
+            if printouts:
+                print(f"Could not read the frame size to check the ROI "
+                      f"({type(e).__name__}: {e}); using it unchecked.")
+            return
+        if roix[1] > px or roiy[1] > py:
+            raise ValueError(
+                f"ROI roix={roix}, roiy={roiy} reaches past the {px} x {py} "
+                f"(x by y) camera frame of run {self.run_id}.")
 
     def save_roi_h5(self, lite=False, printouts=False):
         if self._current_file_path is not None:
