@@ -588,3 +588,68 @@ def test_server_configures_a_loops_scan(qapp, monkeypatch, tmp_path, expt):
         assert reply["status"] == "error" and "below the minimum" in reply["msg"]
     finally:
         s.sock.close()
+
+
+# -- the real POLL client wrapper (_LiveOD) against a fake LiveODClient ---------------------
+
+class _StaleThenFreshClient:
+    """LiveODClient stand-in: the first client made points at a liveOD that has
+    restarted (its POLL times out); every later one reaches the new liveOD."""
+    made = []
+
+    def __init__(self, timeout_ms=None, discovery_timeout=None):
+        self.stale = not _StaleThenFreshClient.made
+        self.closed = False
+        self.sent = []
+        _StaleThenFreshClient.made.append(self)
+
+    def poll(self):
+        if self.stale:
+            raise ConnectionError("No response from liveOD server (old port)")
+        return {"ok": True, "run_in_progress": False, "reset_requested": False}
+
+    def _send_recv(self, payload):
+        self.sent.append(payload)
+        if self.stale:
+            raise ConnectionError("No response from liveOD server (old port)")
+        return {"ok": True}
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_client(monkeypatch):
+    import waxx.util.live_od.live_od_client as client_mod
+    _StaleThenFreshClient.made = []
+    monkeypatch.setattr(client_mod, "LiveODClient", _StaleThenFreshClient)
+    return _StaleThenFreshClient
+
+
+def test_poll_after_a_live_od_restart_retries_on_a_fresh_client(fake_client):
+    """The first Start after a liveOD restart was refused ("liveOD is not
+    reachable") while liveOD was up: the kept client still had the old port."""
+    from waxx.util.device_state.run_loop import _LiveOD
+    live = _LiveOD()
+    assert live()["ok"] is True
+    assert len(fake_client.made) == 2
+    assert fake_client.made[0].closed and not fake_client.made[1].closed
+    assert live()["ok"] is True                 # the fresh client is kept
+    assert len(fake_client.made) == 2
+
+
+def test_poll_still_fails_when_live_od_is_really_gone(fake_client, monkeypatch):
+    from waxx.util.device_state.run_loop import _LiveOD
+    monkeypatch.setattr(fake_client, "poll", lambda self: (_ for _ in ()).throw(
+        ConnectionError("no liveOD")))
+    with pytest.raises(ConnectionError):
+        _LiveOD()()
+    assert len(fake_client.made) == 2           # one retry, not more
+
+
+def test_the_exit_notice_is_sent_once(fake_client):
+    """RUN_EXITED is not repeated: a notice must never be delivered twice."""
+    from waxx.util.device_state.run_loop import _LiveOD
+    with pytest.raises(ConnectionError):
+        _LiveOD().run_exited(84100, "test")
+    assert len(fake_client.made) == 1 and len(fake_client.made[0].sent) == 1
