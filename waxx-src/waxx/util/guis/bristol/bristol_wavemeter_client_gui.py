@@ -1,10 +1,12 @@
 """Client-side Qt6 GUI for the Bristol wavemeter server.
 
-Compact dark-mode detuning readout.  The \u0394-vs-t history plot lives in its
-own pop-out window (:class:`BristolPlotWindow`) opened from the panel's
-"Plot" button, so the panel itself stays a few lines tall inside the
-dashboard.  Imports ``DARK_STYLESHEET`` and ``apply_dark_palette`` from the
-server GUI module to avoid duplicating the shared f\u2080 / \u0394 styling.
+Compact dark-mode detuning readout.  The \u0394-vs-t history plot sits below
+the readout in a collapsible section: the \u25b8/\u25be arrow shows it inline
+(collapsed by default, so the panel stays a few lines tall inside the
+dashboard), and the \u29c9 button moves it into its own window
+(:class:`BristolPlotWindow`).  Closing that window, or \u29c9 again, puts it back.
+Imports ``DARK_STYLESHEET`` and ``apply_dark_palette`` from the server GUI
+module to avoid duplicating the shared f\u2080 / \u0394 styling.
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,6 +27,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +43,7 @@ from waxx.util.guis.bristol.bristol_wavemeter_server_gui import (
 _POLL_MS = 100
 _MAX_HISTORY_S = 120
 _PLOT_WINDOW_APP_ID = "weldlab.kexp.gui.bristol_wavemeter_plot"
+_POPOUT_TIP = "Pop the Δ-vs-t plot out into its own window (own taskbar entry)"
 
 
 class BristolPlotWindow(QMainWindow):
@@ -51,25 +55,46 @@ class BristolPlotWindow(QMainWindow):
     no taskbar button, easy to lose behind it).  This window gets its own
     taskbar entry and Alt-Tab slot and can sit on another monitor.
 
-    Closing the window only **hides** it - the owning
-    :class:`BristolDetuningWidget` keeps the history and re-shows the same
-    window (same geometry) on the next click.  :meth:`shutdown` closes it
-    for real when the owner is torn down.
+    The window does not own the plot: :meth:`take` / :meth:`give_back` move
+    the owner's plot body in and out, so the same plot (and its history) is
+    either embedded in the panel or shown here.  Closing the window only
+    **hides** it and emits :attr:`closed_by_user`; the owning
+    :class:`BristolDetuningWidget` then docks the plot back and re-shows the
+    same window (same geometry) on the next pop-out.  :meth:`shutdown`
+    closes it for real when the owner is torn down.
     """
 
-    def __init__(self, body: QWidget, title: str):
+    closed_by_user = pyqtSignal()
+
+    def __init__(self, title: str):
         super().__init__(None)  # parentless: own taskbar entry
         self._shutting_down = False
         self.setWindowTitle(title)
         self.setWindowIcon(_make_sine_icon())
         self.setStyleSheet(DARK_STYLESHEET)
-        self.setCentralWidget(body)
+        # A fixed container as the central widget: setCentralWidget() would
+        # delete a previous central widget, and the body has to survive
+        # moving back to the panel.
+        container = QWidget()
+        self._layout = QVBoxLayout(container)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self.setCentralWidget(container)
         self.resize(640, 360)
         try:
             from waxx.util.dashboard.panel_window import set_window_app_id  # noqa: PLC0415
             set_window_app_id(self, _PLOT_WINDOW_APP_ID)  # best effort, Windows only
         except Exception:  # noqa: BLE001 - purely cosmetic
             pass
+
+    def take(self, body: QWidget) -> None:
+        """Host ``body`` (reparents it into this window)."""
+        self._layout.addWidget(body)
+        body.show()
+
+    def give_back(self, body: QWidget) -> None:
+        """Release ``body`` so the owner can re-embed it."""
+        self._layout.removeWidget(body)
+        body.setParent(None)
 
     def shutdown(self) -> None:
         """Close for real (owner is going away)."""
@@ -81,9 +106,11 @@ class BristolPlotWindow(QMainWindow):
         if self._shutting_down:
             super().closeEvent(event)
             return
-        # User closed it: keep the widget (and its history) around, just hide.
+        # User closed it: keep the window (and the plot history) around,
+        # just hide, and let the owner dock the plot back into the panel.
         self.hide()
         event.ignore()
+        self.closed_by_user.emit()
 
 
 class BristolDetuningWidget(QWidget):
@@ -174,6 +201,12 @@ class BristolDetuningWidget(QWidget):
         self._stop_event.set()
         win = self._plot_win
         if win is not None:
+            if self._popped_out:
+                # Take the plot back first so deleting the window does not
+                # delete it out from under _update().
+                win.give_back(self._plot_body)
+                self._embed_layout.addWidget(self._plot_body)
+                self._popped_out = False
             self._plot_win = None
             win.shutdown()
 
@@ -217,14 +250,6 @@ class BristolDetuningWidget(QWidget):
         self._f0_spin.setFixedWidth(150)
         top.addWidget(self._f0_spin)
 
-        self._plot_btn = QPushButton("Plot ⧉")
-        self._plot_btn.setFixedHeight(22)
-        self._plot_btn.setToolTip(
-            "Open the Δ-vs-t history plot in its own window (own taskbar entry)"
-        )
-        self._plot_btn.clicked.connect(self.show_plot_window)
-        top.addWidget(self._plot_btn)
-
         root.addLayout(top)
 
         # ── Row 2: detuning readout on its own line (large) ──────────
@@ -233,13 +258,48 @@ class BristolDetuningWidget(QWidget):
         self._det_lbl.setStyleSheet("color: #ff6464;")
         self._det_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._det_lbl)
-        root.addStretch(1)
 
-        # ── Pop-out plot window: averaging controls + plot ───────────
+        # ── Row 3: plot header - ▸/▾ embeds inline, ⧉ pops out ───────
+        plot_hdr = QHBoxLayout()
+        plot_hdr.setSpacing(4)
+        self._plot_toggle = QToolButton()
+        self._plot_toggle.setText("Plot")
+        self._plot_toggle.setCheckable(True)
+        self._plot_toggle.setChecked(False)
+        self._plot_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._plot_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._plot_toggle.setStyleSheet(
+            "QToolButton { border: none; font-weight: 600; padding: 2px 4px; }"
+        )
+        self._plot_toggle.setToolTip("Show / hide the Δ-vs-t history plot in this panel")
+        self._plot_toggle.clicked.connect(self._on_plot_toggle)
+        plot_hdr.addWidget(self._plot_toggle)
+        plot_hdr.addStretch(1)
+        self._popout_btn = QToolButton()
+        self._popout_btn.setText("⧉")
+        self._popout_btn.setAutoRaise(True)
+        self._popout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._popout_btn.setFixedSize(22, 22)
+        self._popout_btn.setToolTip(_POPOUT_TIP)
+        self._popout_btn.clicked.connect(self._on_popout_clicked)
+        plot_hdr.addWidget(self._popout_btn)
+        root.addLayout(plot_hdr)
+
+        # Inline host for the plot body.  Stretch 1 so an expanded plot
+        # takes the spare height; while it is hidden the trailing stretch
+        # (factor 0) keeps the rows packed at the top.
+        self._embed_host = QWidget()
+        self._embed_layout = QVBoxLayout(self._embed_host)
+        self._embed_layout.setContentsMargins(0, 0, 0, 0)
+        self._embed_host.setVisible(False)
+        root.addWidget(self._embed_host, 1)
+        root.addStretch(0)
+
+        # ── Plot body: averaging controls + plot ─────────────────────
         # Built once, up front, so the N spinbox exists for the readout
-        # even before the window has ever been shown.  History is collected
-        # regardless of whether the window is open; the curve is only
-        # redrawn while it is visible.
+        # even before the plot has ever been shown.  It lives either in
+        # _embed_host or in the pop-out window, never both.  History is
+        # collected regardless; the curve is only redrawn while visible.
         plot_body = QWidget()
         plot_layout = QVBoxLayout(plot_body)
         plot_layout.setContentsMargins(8, 6, 8, 6)
@@ -277,24 +337,82 @@ class BristolDetuningWidget(QWidget):
 
         plot_layout.addWidget(ctl_wrap)
         plot_layout.addWidget(self._plot, 1)
+        self._plot_body = plot_body
+        self._embed_layout.addWidget(plot_body)
+        self._popped_out = False
 
         self._plot_win: BristolPlotWindow | None = BristolPlotWindow(
-            plot_body, "Bristol Wavemeter — Δ history"
+            "Bristol Wavemeter — Δ history"
         )
+        self._plot_win.closed_by_user.connect(self.dock_plot)
 
         # Hidden average label kept for back-compat with old _clear() code path.
         self._avg_lbl = QLabel("")
         self._avg_lbl.setVisible(False)
 
+    # ------------------------------------------------------------------
+    # Plot placement: embedded (▸/▾) or popped out (⧉)
+    # ------------------------------------------------------------------
+
+    def set_plot_expanded(self, expanded: bool) -> None:
+        """Show / hide the plot inline.  No-op while it is popped out."""
+        if self._popped_out:
+            return
+        expanded = bool(expanded)
+        self._plot_toggle.setChecked(expanded)
+        self._plot_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._embed_host.setVisible(expanded)
+        if expanded:
+            self._redraw_curve()
+
+    def _on_plot_toggle(self) -> None:
+        self.set_plot_expanded(self._plot_toggle.isChecked())
+
+    def _on_popout_clicked(self) -> None:
+        if self._popped_out:
+            self.dock_plot()
+        else:
+            self.show_plot_window()
+
     def show_plot_window(self) -> None:
-        """Show (or bring to front) the pop-out plot window."""
+        """Move the plot into the pop-out window and show / raise it."""
         win = self._plot_win
         if win is None:  # after stop()
             return
+        if not self._popped_out:
+            self._embed_layout.removeWidget(self._plot_body)
+            win.take(self._plot_body)
+            self._popped_out = True
+            self._embed_host.setVisible(False)
+            self._plot_toggle.setEnabled(False)
+            self._plot_toggle.setArrowType(Qt.ArrowType.RightArrow)
+            self._plot_toggle.setText("Plot (popped out)")
+            self._popout_btn.setToolTip("Return the plot to this panel")
         self._redraw_curve()
         win.show()
         win.raise_()
         win.activateWindow()
+
+    def dock_plot(self) -> None:
+        """Move the plot back into the panel, shown inline.
+
+        Called by ⧉ while popped out and when the user closes the pop-out
+        window; the window itself is kept (hidden) for the next pop-out.
+        """
+        win = self._plot_win
+        if not self._popped_out or win is None:
+            return
+        win.hide()
+        win.give_back(self._plot_body)
+        self._embed_layout.addWidget(self._plot_body)
+        self._plot_body.show()
+        self._popped_out = False
+        self._plot_toggle.setEnabled(True)
+        self._plot_toggle.setText("Plot")
+        self._popout_btn.setToolTip(_POPOUT_TIP)
+        self.set_plot_expanded(True)
 
     def _redraw_curve(self) -> None:
         self._curve.setData(list(self._times), list(self._detunings_ghz))
@@ -332,8 +450,9 @@ class BristolDetuningWidget(QWidget):
         self._times.append(t)
         self._detunings_ghz.append(det)
 
-        # History is always recorded; only redraw while someone can see it.
-        if self._plot_win is not None and self._plot_win.isVisible():
+        # History is always recorded; only redraw while someone can see it
+        # (inline and expanded, or in the shown pop-out window).
+        if self._plot_body.isVisible():
             self._redraw_curve()
 
         N = self._n_spin.value()
