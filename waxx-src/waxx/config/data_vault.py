@@ -282,8 +282,38 @@ class DataContainer2D_i64(DataContainer):
         self._put_shot_data_to_run_data()
 
 
+class HostDataContainer(DataContainer):
+    """A container the HOST fills (no kernel involvement at all).
+
+    For per-shot data a host thread produces during the shot -- e.g. an
+    auxiliary camera frame snapped over the network (CameraStreamClient).
+    Differences from the kernel containers:
+
+    * any numpy dtype and 1D/2D/3D per-shot shape (uint8 frames included);
+    * never routed to the per-type kernel lists, so ``put_shot_data`` never
+      ships it through an RPC and the kernel never embeds its array;
+    * ``_data_gotten`` is True from birth: END_RUN always saves ``_run_data``,
+      so the fill value (e.g. -1 for "no frame") reaches the file instead of
+      HDF5 zeros masquerading as data;
+    * filled with ``put_shot_data_host(idx, value)`` from host code.  The
+      caller is responsible for locking against END_RUN serialization.
+    """
+
+    def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt,
+                 fill_value=0):
+        super().__init__(per_shot_data_shape, dtype, external_data_bool, expt)
+        self._run_data = np.full(self._per_shot_data_shape, fill_value,
+                                 dtype=dtype)
+        self._data_gotten = True
+
+    def put_shot_data_host(self, idx, value):
+        """Write one shot's value at xvar-counter index ``idx`` (tuple).
+        Raises on a shape/dtype mismatch -- the caller records the failure."""
+        self._run_data[tuple(idx)] = np.asarray(value).reshape(self._cell_shape)
+
+
 class DataVault():
-    
+
     def __init__(self, expt=None):
         self.keys = []
         self._container_list = []
@@ -374,6 +404,21 @@ class DataVault():
                    external_data_bool,
                    self._expt)
     
+    def add_host_data_container(self,
+                                per_shot_data_shape=(1,),
+                                dtype=np.float64,
+                                fill_value=0,
+                                external_data_bool=False) -> HostDataContainer:
+        """A container host code fills during the run (``put_shot_data_host``);
+        the kernel never sees it, so any numpy dtype and per-shot shape go
+        (e.g. a uint8 camera frame). ``fill_value`` is what a shot that never
+        got data reads back as (pick something data cannot be, e.g. -1 / NaN).
+        Assign the result to an attribute of ``self.data`` before
+        ``finish_prepare`` like any other container."""
+        return HostDataContainer(per_shot_data_shape, dtype,
+                                 external_data_bool, self._expt,
+                                 fill_value=fill_value)
+
     def init(self):
         self.write_keys()
         self.set_container_sizes()
@@ -390,6 +435,8 @@ class DataVault():
 
     def _route_to_type_list(self, dc):
         """Append a real container to its concrete (ndim, dtype) kernel list."""
+        if isinstance(dc, HostDataContainer):
+            return   # host-filled: never shipped by put_shot_data / the kernel
         entry = self._registry.get((dc._NDIM, np.dtype(dc._DTYPE).type))
         if entry is None:
             raise ValueError(

@@ -260,27 +260,14 @@ class MagnetometerServer(NetServer):
                 target=self._field_log_loop, name="hmr-field-log", daemon=True
             ).start()
 
+        # The read loop opens the port itself (and keeps retrying).  Opening it
+        # here as well raced that loop at every start: one thread closed the
+        # other's port and the second open got "Access is denied".
+        logger.info("Opening %s at %d baud (device ID: %r); polling every %.3f s",
+                    self.serial_port, self.baud, self.device_id, self.poll_interval)
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
 
-        logger.info("Opening %s at %d baud (device ID: %r)", self.serial_port, self.baud, self.device_id)
-        self.reader = HMR2300Reader(
-            port=self.serial_port,
-            baud=self.baud,
-            device_id=self.device_id,
-        )
-        try:
-            self.reader.open()
-            self.reader.setup()
-            logger.info("Sensor ready. Polling every %.3f s.", self.poll_interval)
-        except Exception as exc:
-            self.reader = None
-            logger.error(
-                "COM port connection failed (%s: %s) — "
-                "TCP server starting without serial. "
-                "Use SERIAL_RECONNECT or RESTART_SERIAL to retry.",
-                type(exc).__name__, exc,
-            )
         try:
             self._server_loop(_srv)
         finally:
@@ -391,6 +378,7 @@ class MagnetometerServer(NetServer):
     def _read_loop(self):
         last_values = None
         same_count = 0
+        stuck_values = None
 
         while not self.stop_event.is_set():
             if not self.serial_should_be_connected:
@@ -457,9 +445,19 @@ class MagnetometerServer(NetServer):
                     last_values = values
 
                 if same_count == MAX_STUCK_SAME_VALUES:
+                    # The counts go in the message so the reading taken after
+                    # the reconnect (logged below) shows whether the sensor
+                    # had frozen or the field was just that quiet.
+                    stuck_values = values
                     raise RuntimeError(
-                        f"Sensor readings stuck for {same_count} consecutive polls"
+                        f"Sensor readings stuck for {same_count} consecutive polls "
+                        f"at counts {values}"
                     )
+
+                if stuck_values is not None:
+                    logger.info("First reading after a stuck reset: counts %s (stuck at %s)",
+                                values, stuck_values)
+                    stuck_values = None
 
                 x_G = x_counts / SENSOR_COUNTS_PER_GAUSS
                 y_G = y_counts / SENSOR_COUNTS_PER_GAUSS

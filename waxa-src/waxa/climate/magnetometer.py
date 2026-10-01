@@ -51,7 +51,7 @@ DEFAULT_KEYS = {
 TIME_COLUMN = "timestamp_s"
 # Must match FIELD_LOG_FILENAME in waxx's hmr_magnetometer_server (waxa cannot import waxx).
 FIELD_LOG_FILENAME = "hmr2300_{date}.csv"
-MAX_PENDING = 20_000   # readings kept for retry while the server is unreachable (~2.3 days at 10 s)
+MAX_PENDING = 100_000   # readings kept for retry while the server is unreachable (~28 h at 1 s)
 
 
 def default_log_dir() -> Path:

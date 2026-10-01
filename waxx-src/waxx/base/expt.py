@@ -97,6 +97,10 @@ class Expt(Scanner, Dealer, Scribe):
         self.run_info = RunInfo(self, save_data, server_talk=server_talk,
                                 defer_run_id=True)
         self.scope_data = ScopeData()
+        # Per-shot auxiliary camera clients (waxx.control.cameras
+        # .camera_stream_client); each registers itself here and is drained /
+        # closed in end_wax. Host-only: never touched by kernel code.
+        self.camera_streams = []
         self._ridstr = "Run ID: " + str(self.run_info.run_id)
         self._counter = counter()
 
@@ -402,6 +406,18 @@ class Expt(Scanner, Dealer, Scribe):
             self.scope_data.close()
         except Exception as _e:
             print(f"[end_wax] WARNING: scope_data.close() raised: {_e} — continuing.")
+
+        # Drain the per-shot auxiliary camera clients BEFORE the END_RUN
+        # payload is serialized: finish() waits for in-flight snaps, writes
+        # provenance into _extra_file_texts, restores camera settings and
+        # closes the stream. finish() never raises by contract; the guard is
+        # belt and braces so a broken client cannot cost the run's data.
+        for _cs in list(getattr(self, 'camera_streams', ())):
+            try:
+                _cs.finish()
+            except Exception as _e:
+                print(f"[end_wax] WARNING: camera stream "
+                      f"'{getattr(_cs, 'key', '?')}' finish() raised: {_e} — continuing.")
 
         self.cleanup_scanned()
 
