@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import socket
 import threading
@@ -48,6 +49,14 @@ DEFAULT_SERVER_PORT = 0
 MAX_HISTORY = 10000
 SENSOR_COUNTS_PER_GAUSS = 15000.0
 MAX_STUCK_SAME_VALUES = 20
+
+# Field log: one reading per wall-clock second, one CSV per local day
+# (so a file holds at most 86400 rows).  Values are in gauss, as served.
+FIELD_LOG_FIELDS = ["datetime_iso", "timestamp_s", "Bx", "By", "Bz", "Btot"]
+FIELD_LOG_FILENAME = "hmr2300_{date}.csv"
+# Readings waiting for the writer thread (1 h at 1 Hz); beyond this they are
+# dropped, with a warning, rather than growing without bound.
+FIELD_LOG_QUEUE_MAX = 3600
 
 # Grace period between answering SHUTDOWN and starting to tear down, so the
 # reply is on the wire before the listening socket closes.
@@ -174,6 +183,7 @@ class MagnetometerServer(NetServer):
         server_host=DEFAULT_SERVER_HOST,
         server_port=DEFAULT_SERVER_PORT,
         reference_csv_path=None,
+        field_log_dir=None,
     ):
         NetServer.__init__(self, "magnetometer", server_port)
         self.serial_port = serial_port
@@ -183,6 +193,14 @@ class MagnetometerServer(NetServer):
         self.server_host = server_host
         self.server_port = server_port  # may be 0 until run() binds
         self.reference_csv_path = reference_csv_path
+        # Folder for the daily field-log CSVs; None = no field log.
+        self.field_log_dir = field_log_dir
+        self._field_log_queue: queue.Queue = queue.Queue(maxsize=FIELD_LOG_QUEUE_MAX)
+        # Wall-clock second of the last reading handed to the field log.
+        self._field_log_last_sec: int | None = None
+        self._field_log_dropped = 0
+        # Last write error (type name, str), to log a repeating failure once.
+        self._field_log_failure_sig: tuple[str, str] | None = None
 
         self.reader = None
         self.stop_event = threading.Event()
@@ -235,6 +253,12 @@ class MagnetometerServer(NetServer):
         self._srv = _srv
         self._start_beacon()
         logger.info("Starting TCP server on %s:%d", self.server_host, self.server_port)
+
+        if self.field_log_dir:
+            logger.info("Field log: one reading per second to %s", self.field_log_dir)
+            threading.Thread(
+                target=self._field_log_loop, name="hmr-field-log", daemon=True
+            ).start()
 
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
@@ -446,6 +470,7 @@ class MagnetometerServer(NetServer):
                 with self.history_lock:
                     self.history.append(reading)
                 self._last_rx_monotonic = time.monotonic()
+                self._queue_field_log(reading)
 
             except Exception as exc:
                 if self.stop_event.is_set():
@@ -467,6 +492,73 @@ class MagnetometerServer(NetServer):
 
             if self.stop_event.wait(self.poll_interval):
                 break
+
+    # ------------------------------------------------------------------
+    # Field log (daily CSV, one reading per second)
+    # ------------------------------------------------------------------
+
+    def _queue_field_log(self, reading):
+        """Hand the first reading of each wall-clock second to the writer thread.
+
+        The reading is logged as measured (no averaging).  Never blocks and
+        never raises: the read loop must not depend on the data drive.
+        """
+        if not self.field_log_dir:
+            return
+        sec = int(reading["t"])
+        if sec == self._field_log_last_sec:
+            return
+        self._field_log_last_sec = sec
+        try:
+            self._field_log_queue.put_nowait(reading)
+        except queue.Full:
+            self._field_log_dropped += 1
+            if self._field_log_dropped == 1 or self._field_log_dropped % 600 == 0:
+                logger.warning(
+                    "Field log queue full — %d reading(s) not logged so far.",
+                    self._field_log_dropped,
+                )
+
+    def _field_log_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                reading = self._field_log_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._write_field_log_row(reading)
+                if self._field_log_failure_sig is not None:
+                    logger.info("Field log writing again.")
+                    self._field_log_failure_sig = None
+            except Exception as exc:
+                sig = (type(exc).__name__, str(exc))
+                if sig != self._field_log_failure_sig:
+                    logger.warning(
+                        "Field log write failed (%s: %s) — this reading is not logged; "
+                        "will keep trying with later ones.", sig[0], sig[1],
+                    )
+                    self._field_log_failure_sig = sig
+
+    def _write_field_log_row(self, reading):
+        t = float(reading["t"])
+        stamp = datetime.fromtimestamp(t)
+        path = os.path.join(
+            self.field_log_dir,
+            FIELD_LOG_FILENAME.format(date=stamp.strftime("%Y-%m-%d")),
+        )
+        os.makedirs(self.field_log_dir, exist_ok=True)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELD_LOG_FIELDS)
+            if f.tell() == 0:
+                writer.writeheader()
+            writer.writerow({
+                "datetime_iso": stamp.isoformat(timespec="milliseconds"),
+                "timestamp_s": t,
+                "Bx": reading["Bx"],
+                "By": reading["By"],
+                "Bz": reading["Bz"],
+                "Btot": reading["Btot"],
+            })
 
     def _reconnect(self, quiet: bool = False):
         """(Re)open the serial port.

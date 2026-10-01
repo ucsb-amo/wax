@@ -8,9 +8,13 @@
 
 Command line: ``python -m waxa.climate --help``.
 
-Read-only.  Requires the Broida VPN.  See ``client.py`` for units.
+Reading is read-only (guest login).  ``ZabbixSender`` pushes values to
+trapper items; ``waxa.climate.coil`` uses it to publish the K coil
+temperature (``python -m waxa.climate.coil --help``).  Requires the Broida
+VPN.  See ``client.py`` for units.
 """
 from waxa.climate.zabbix import DEFAULT_URL, ZabbixAPI, ZabbixError
+from waxa.climate.sender import SenderResult, TrapperValue, ZabbixSender
 from waxa.climate.client import (
     DEFAULT_HOST,
     ClimateClient,
@@ -31,6 +35,7 @@ from waxa.climate.attach import (
 
 __all__ = [
     "DEFAULT_HOST", "DEFAULT_URL", "ZabbixAPI", "ZabbixError",
+    "SenderResult", "TrapperValue", "ZabbixSender",
     "ClimateClient", "ClimateItem", "ClimateSeries",
     "f_to_c", "to_datetime64", "to_local", "to_unix",
     "climate_for_run", "run_start_time", "run_window", "series_for_run", "shot_times",
