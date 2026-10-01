@@ -67,7 +67,7 @@ from waxx.util.device_state.state_reset import describe_expt
 log = logging.getLogger(__name__)
 
 #: Pause between one run's end and the next launch.
-GAP_S = 2.0
+GAP_S = 0.5
 #: How often liveOD is polled for an Abort while a run is starting.
 POLL_S = 0.5
 
