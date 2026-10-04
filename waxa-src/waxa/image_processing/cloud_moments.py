@@ -74,17 +74,17 @@ def mot_diagnostics(ad, key: str = "img_mot",
     """:func:`image_moments` of a per-shot image container on an atomdata.
 
     *key* names a DataVault container (``img_mot``, ``img_2dmot``,
-    ``img_mot_beams``). Shots whose frame was missed (``<key>_seq == -1``,
-    when that container exists) are NaN, never dropped. Leading axes are
+    ``img_mot_beams_xy``). Shots whose frame was missed (the stream's
+    ``<key>_meta`` record, or the older ``<key>_seq == -1``; see
+    ``waxa.data.camera_frames``) are NaN, never dropped. Leading axes are
     flattened to one shot axis; arrays come back shaped ``(n_shots,)``.
     """
+    from waxa.data.camera_frames import frames_present
     if key not in ad.data.keys:
         raise KeyError(f"{key!r} is not a data container on this run "
                        f"(have: {list(ad.data.keys)})")
     stack = np.asarray(getattr(ad.data, key), float)
     stack = stack.reshape(-1, *stack.shape[-2:])
-    seq_key = key + "_seq"
-    if seq_key in ad.data.keys:
-        missed = np.asarray(getattr(ad.data, seq_key)).ravel() == -1
-        stack[missed] = np.nan
+    missed = ~np.asarray(frames_present(ad, key)).ravel()
+    stack[missed] = np.nan
     return image_moments(stack, downsample=downsample)

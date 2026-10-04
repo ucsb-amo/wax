@@ -11,6 +11,7 @@ from waxa.image_processing.compute_ODs import compute_OD
 from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum_dist
 from waxa.roi import ROI, prefetch_auto_roi
 from waxa.data.data_saver import DataSaver
+from waxa.data.h5_image import create_image_dataset
 from waxa.base import Dealer, xvar
 from waxa.data.server_talk import server_talk as st
 from waxa.helper.datasmith import *
@@ -446,6 +447,15 @@ def unpack_group(file,group_key,obj):
     keys = list(g.keys())
     for k in keys:
         vars(obj)[k] = g[k][()]
+
+#: Root attributes that are not run records (source texts and fields with an
+#: attribute of their own); everything else that is a string lands in
+#: ``atomdata.run_records``.
+_NON_RECORD_ATTRS = frozenset({
+    'expt_file', 'params_file', 'cooling_file', 'imaging_file', 'control_file',
+    'camera_overrides', 'roix', 'roiy', 'xvarnames',
+})
+
 
 def read_camera_overrides(attrs) -> dict:
     """liveOD's record of the camera settings a run got that differ from what
@@ -953,7 +963,7 @@ class atomdata_base():
             # data group
             data_grp = f_lite.create_group('data')
             if has_images:
-                data_grp.create_dataset('images', data=cropped_images)
+                create_image_dataset(data_grp, 'images', data=cropped_images)
                 data_grp.create_dataset('image_timestamps', data=ts_ush)
 
             # DataVault keys — already in memory, unshuffle on the fly.
@@ -967,7 +977,7 @@ class atomdata_base():
                     val = self._dealer._unshuffle_ndarray(
                         val, exclude_dims=ndims_per_shot, reshuffle=False,
                     )
-                data_grp.create_dataset(key, data=val)
+                create_image_dataset(data_grp, key, data=val)
 
             # sort metadata (kept in shuffled-order form in the file)
             if isinstance(self.sort_idx, np.ndarray) and self.sort_idx.size > 0:
@@ -2904,6 +2914,26 @@ class atomdata_base():
                                                 imaging_text,
                                                 control_text,
                                                 base_files=base_files)
+            # Every other text record the run stored at the file root -- the
+            # experiment's _extra_file_texts: camera_stream_<key>,
+            # slm_at_start, device_state_at_start, dds_init, ... -- as
+            # strings (the JSON ones parse with json.loads). Source texts are
+            # in experiment_code, camera_overrides has its own attribute.
+            self.run_records = {}
+            try:
+                for attr_key in f.attrs.keys():
+                    if (attr_key in _NON_RECORD_ATTRS
+                            or attr_key.startswith('base_class_')):
+                        continue
+                    val = f.attrs[attr_key]
+                    if isinstance(val, np.ndarray) and val.shape == ():
+                        val = val.item()
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8", errors="replace")
+                    if isinstance(val, str):
+                        self.run_records[attr_key] = val
+            except Exception:
+                pass
             timing['h5_read_experiment_text_s'] = time.perf_counter() - t_stage
 
             t_stage = time.perf_counter()
