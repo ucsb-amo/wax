@@ -5,6 +5,7 @@ import time
 import h5py
 
 from waxa.data.server_talk import server_talk as st
+from waxa.data.h5_image import create_image_dataset
 
 # __DEFAULT_KEY = "no_one_will_ever_use_this_key000111"
 
@@ -188,11 +189,11 @@ class DataSaver():
         f.attrs['camera_ready_ack'] = 0
         
         f.attrs['xvarnames'] = expt.xvarnames
-        data.create_dataset('images',data=expt.images)
+        create_image_dataset(data, 'images', data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
             this_data = vars(expt.data)[key]._run_data
-            data.create_dataset(key, data=this_data)
+            create_image_dataset(data, key, data=this_data)
 
         if expt.sort_idx:
             # pad with [-1]s to allow saving in hdf5 (avoid staggered array)
@@ -522,13 +523,18 @@ class DataSaver():
             f.attrs["images_shape"] = list(images_shape)
             f.attrs["images_dtype"] = images_dtype
 
-        # DataVault pre-allocation
+        # DataVault pre-allocation (image stacks chunked + compressed)
         for key, info in payload.get("datavault_shapes", {}).items():
             shape = tuple(info["shape"])
             dtype = np.dtype(info["dtype"])
             if shape:
+                # the container's fill value, so a slot nothing ever wrote
+                # reads back as "no data" (NaN, -1) rather than HDF5's zero
+                kw = {}
+                if info.get("fill") is not None:
+                    kw["fillvalue"] = info["fill"]
                 try:
-                    data_grp.create_dataset(key, shape=shape, dtype=dtype)
+                    create_image_dataset(data_grp, key, shape=shape, dtype=dtype, **kw)
                 except Exception as exc:
                     print(f"[DataSaver] Could not pre-allocate DataVault '{key}': {exc}")
 
@@ -670,8 +676,11 @@ class DataSaver():
                     image_timestamps = f["data"]["image_timestamps"][()]
 
                 for key, dc_info in payload.get("datavault", {}).items():
-                    # Data written directly to HDF5 by DataHandler.
-                    if bool(dc_info.get("external")) and key in f["data"]:
+                    # Data written into the file during the run (pushed
+                    # through liveOD). Written at its final index already
+                    # (final_order): nothing to read back or reorder.
+                    if (bool(dc_info.get("external")) and key in f["data"]
+                            and not dc_info.get("final_order")):
                         external[key] = f["data"][key][()]
 
         if torn:
@@ -1073,6 +1082,8 @@ class DataSaver():
         traces = []
         for scope_info in payload.get("scope_data", []):
             label = str(scope_info["label"])
+            if scope_info.get("pushed") or scope_info.get("data") is None:
+                continue        # written during the run, in final order
             data = np.asarray(scope_info["data"])
             if data.ndim < 3 or data.size == 0:
                 print(f"[DataSaver] WARNING: skipping scope '{label}' — data has unexpected shape {data.shape}")
@@ -1096,10 +1107,10 @@ class DataSaver():
         """
         if not scope_traces:
             return
-        if "scope_data" in f["data"]:
-            del f["data"]["scope_data"]
-        scope_data_grp = f["data"].create_group("scope_data")
+        scope_data_grp = f["data"].require_group("scope_data")
         for label, t, v in scope_traces:
+            if label in scope_data_grp:
+                del scope_data_grp[label]
             this_scope = scope_data_grp.create_group(label)
             write_scope_time_axes(this_scope, t)
             this_scope.create_dataset("v", data=v, compression='gzip', compression_opts=4)
@@ -1124,6 +1135,42 @@ def pending_save_dir() -> str:
     return path
 
 
+# A stashed payload keeps the run's final params and small containers; an
+# array bigger than this (an auxiliary camera stack, scope traces) is left
+# out, with a note, so the stash stays a small local write.
+STASH_MAX_ARRAY_BYTES = 8 * 1024 * 1024
+
+
+def _payload_without_bulk(payload: dict) -> dict:
+    """A shallow copy of an END_RUN payload with every array above
+    STASH_MAX_ARRAY_BYTES replaced by None (``stash_dropped`` says so)."""
+    out = dict(payload)
+    dv = {}
+    dropped = []
+    for key, info in (payload.get("datavault") or {}).items():
+        info = dict(info)
+        data = info.get("data")
+        if isinstance(data, np.ndarray) and data.nbytes > STASH_MAX_ARRAY_BYTES:
+            info["data"] = None
+            info["stash_dropped"] = True
+            dropped.append(key)
+        dv[key] = info
+    out["datavault"] = dv
+    scopes = []
+    for info in (payload.get("scope_data") or []):
+        info = dict(info)
+        data = info.get("data")
+        if isinstance(data, np.ndarray) and data.nbytes > STASH_MAX_ARRAY_BYTES:
+            info["data"] = None
+            info["stash_dropped"] = True
+            dropped.append(f"scope {info.get('label', '?')}")
+        scopes.append(info)
+    out["scope_data"] = scopes
+    if dropped:
+        out["stash_dropped"] = dropped
+    return out
+
+
 def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=None,
                           incomplete=None) -> str:
     """Pickle an END_RUN payload to local disk before the save is attempted.
@@ -1140,7 +1187,7 @@ def stash_end_run_payload(payload: dict, filepath: str, run_id, shot_timestamps=
                 {
                     "run_id": int(run_id),
                     "filepath": str(filepath),
-                    "payload": payload,
+                    "payload": _payload_without_bulk(payload),
                     "shot_timestamps": list(shot_timestamps or []),
                     "incomplete": dict(incomplete) if incomplete else None,
                 },

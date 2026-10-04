@@ -305,6 +305,10 @@ class HostDataContainer(DataContainer):
         self._run_data = np.full(self._per_shot_data_shape, fill_value,
                                  dtype=dtype)
         self._data_gotten = True
+        self._fill_value = fill_value
+        # True once a shot of it went into the run's file during the run
+        # (Expt.push_shot_data): END_RUN then sends no copy of the array
+        self._pushed = False
 
     def put_shot_data_host(self, idx, value):
         """Write one shot's value at xvar-counter index ``idx`` (tuple).

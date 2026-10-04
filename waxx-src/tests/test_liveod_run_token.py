@@ -57,7 +57,8 @@ def dispatch(srv):
     """The server's message loop, minus the socket."""
     handlers = {"INIT_RUN": srv._handle_init_run, "WAIT_CAM_READY": srv._handle_wait_cam_ready,
                 "SHOT_COMPLETE": srv._handle_shot_complete, "END_RUN": srv._handle_end_run,
-                "ABORT_RUN": srv._handle_abort_run, "POLL": srv._handle_poll}
+                "ABORT_RUN": srv._handle_abort_run, "POLL": srv._handle_poll,
+                "SAVE_STATUS": srv._handle_save_status}
 
     def transport(payload, rcvtimeo_ms=None):
         return handlers[payload["tag"]](dict(payload))

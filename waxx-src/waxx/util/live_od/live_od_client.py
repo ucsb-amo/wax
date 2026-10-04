@@ -28,8 +28,10 @@ import atexit
 import logging
 import pickle
 import sys
+import threading
 import time
 
+import numpy as np
 import zmq
 
 from beacon.discovery.client import NetClient
@@ -38,6 +40,99 @@ from waxx.util.comms_server.hardware_id import resolve_scoped_server_id
 
 # wait_cam_ready asks in slices this long, so a reset is noticed within one slice.
 CAM_READY_SLICE_S = 0.5
+# PUT_DATA: one array of a few MB on the lab network; the reply is immediate
+PUT_DATA_TIMEOUT_MS = 10_000
+# a request this big is said out loud (see _send_recv)
+LARGE_MESSAGE_BYTES = 1 << 30
+# The asynchronous END_RUN save: polled this often; given up when its phase
+# has not changed for SAVE_STALL_S, or after SAVE_MAX_S in all.
+SAVE_POLL_S = 0.5
+SAVE_STALL_S = 600.0
+SAVE_MAX_S = 3600.0
+
+
+class LiveODDataSender:
+    """PUT_DATA from the host threads that have a shot's data during the run
+    (camera stream workers, the scope reader): a REQ socket of its own, one
+    request at a time under a lock, each array sent as a raw frame (never
+    pickled, never copied). The client's own socket stays the run's
+    sequential channel."""
+
+    def __init__(self, client):
+        self._client = client
+        self._lock = threading.Lock()
+        self._ctx = None
+        self._sock = None
+
+    def _socket(self):
+        if self._sock is None:
+            if self._ctx is None:
+                self._ctx = zmq.Context()
+            sock = self._ctx.socket(zmq.REQ)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.SNDTIMEO, PUT_DATA_TIMEOUT_MS)
+            sock.setsockopt(zmq.RCVTIMEO, PUT_DATA_TIMEOUT_MS)
+            sock.connect(f"tcp://{self._client._ip}:{self._client._port}")
+            self._sock = sock
+        return self._sock
+
+    def _drop_socket(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    @staticmethod
+    def _frames(specs):
+        """``[header, array, array, ...]``: the header names each array's key,
+        slot (``index``), or slice start (``offset``), shape and dtype, and
+        what to make the dataset from if the file has none (``full_shape``,
+        ``fill``)."""
+        header = {"tag": "PUT_DATA", "items": []}
+        frames = []
+        for spec in specs:
+            arr = np.ascontiguousarray(spec["array"])
+            index = spec.get("index")
+            full = spec.get("full_shape")
+            header["items"].append({
+                "key": str(spec["key"]),
+                "index": None if index is None else [int(i) for i in index],
+                "offset": None if spec.get("offset") is None else int(spec["offset"]),
+                "shape": [int(s) for s in arr.shape],
+                "dtype": arr.dtype.str,
+                "full_shape": None if full is None else [int(s) for s in full],
+                "fill": spec.get("fill"),
+            })
+            frames.append(arr)
+        return header, frames
+
+    def put(self, specs) -> dict:
+        """Send the arrays; the server's reply (``ok``, ``queued``)."""
+        header, frames = self._frames(specs)
+        head = pickle.dumps(self._client._for_this_run(header))
+        with self._lock:
+            sock = self._socket()
+            try:
+                sock.send_multipart([head] + frames, copy=False)
+                return pickle.loads(sock.recv())
+            except zmq.Again:
+                self._drop_socket()
+                raise ConnectionError(
+                    f"[LiveODClient] No reply to PUT_DATA from liveOD at "
+                    f"tcp://{self._client._ip}:{self._client._port} within "
+                    f"{PUT_DATA_TIMEOUT_MS / 1000:.0f} s")
+
+    def close(self):
+        with self._lock:
+            self._drop_socket()
+            if self._ctx is not None:
+                try:
+                    self._ctx.term()
+                except Exception:
+                    pass
+                self._ctx = None
 # The exit notice's one request may take this long; the process is exiting.
 EXIT_NOTICE_TIMEOUT_MS = 2000
 
@@ -76,6 +171,21 @@ class LiveODClient(NetClient):
         self._run_open: bool = False
         self._exit_notified: bool = False
         self._exit_hook_registered: bool = False
+        # What the server said it can do (INIT_RUN reply ``features``): an
+        # older server says nothing, and gets the original protocol.
+        self.server_features: dict = {}
+        self._sender = None
+
+    def supports(self, feature: str) -> bool:
+        """The server has ``feature`` (``put_data``, ``async_save``)."""
+        return bool(self.server_features.get(feature))
+
+    def put_data(self, specs) -> dict:
+        """PUT_DATA: arrays into the run's file now (see LiveODDataSender).
+        Thread-safe; raises ConnectionError on no reply."""
+        if self._sender is None:
+            self._sender = LiveODDataSender(self)
+        return self._sender.put(specs)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -117,7 +227,15 @@ class LiveODClient(NetClient):
         if rcvtimeo_ms is not None:
             self._socket.setsockopt(zmq.RCVTIMEO, rcvtimeo_ms)
         try:
-            self._socket.send(pickle.dumps(payload))
+            data = pickle.dumps(payload)
+            if len(data) > LARGE_MESSAGE_BYTES:
+                # runs 84979 / 84980 (2026-10-02): END_RUN messages of 4.3 GiB
+                # never reached liveOD; the per-shot PUT_DATA path exists so
+                # that no message need be this big
+                print(f"[LiveODClient] WARNING: the {payload.get('tag')} message is "
+                      f"{len(data) / 2 ** 30:.2f} GiB; messages this size have failed to "
+                      f"arrive. Is liveOD taking data during the run (PUT_DATA)?")
+            self._socket.send(data)
             return pickle.loads(self._socket.recv())
         except zmq.Again:
             # Re-discover in case liveOD restarted on a new port, then
@@ -265,6 +383,7 @@ class LiveODClient(NetClient):
                 f"[LiveODClient] INIT_RUN failed: {reply.get('error')}"
             )
         self._run_token = str(reply.get("run_token") or "")
+        self.server_features = dict(reply.get("features") or {})
         self._run_open = True
         self._exit_notified = False
         if not getattr(self, "_exit_hook_registered", False):
@@ -387,7 +506,16 @@ class LiveODClient(NetClient):
         retry budget), or the client gives up on a save that is still running.
         """
         payload["tag"] = "END_RUN"
-        reply = self._send_recv(self._for_this_run(payload), rcvtimeo_ms=600_000)
+        if self.supports("async_save"):
+            # The server acknowledges at once and saves on a thread of its
+            # own; this polls it, so a long save never looks like a dead
+            # server, and the server's loop stays free meanwhile.
+            payload["async_save"] = True
+            reply = self._send_recv(self._for_this_run(payload), rcvtimeo_ms=60_000)
+            if reply.get("ok") and reply.get("saving"):
+                reply = self._wait_for_save()
+        else:
+            reply = self._send_recv(self._for_this_run(payload), rcvtimeo_ms=600_000)
         self._run_open = False               # liveOD answered: the run is closed there
         if not reply.get("ok"):
             raise RuntimeError(
@@ -409,6 +537,42 @@ class LiveODClient(NetClient):
                 f"{'!' * 72}\n"
             )
         return True
+
+    def _wait_for_save(self) -> dict:
+        """Poll SAVE_STATUS until the asynchronous save is over; the END_RUN
+        reply as the synchronous path would have given it (``ok``,
+        ``incomplete``, ``error``), plus ``save_s``."""
+        t0 = time.monotonic()
+        last_phase, t_phase, failures = None, t0, 0
+        while True:
+            time.sleep(SAVE_POLL_S)
+            try:
+                st = self._send_recv(self._for_this_run({"tag": "SAVE_STATUS"}))
+                failures = 0
+            except ConnectionError:
+                failures += 1
+                if failures >= 3:
+                    raise
+                continue
+            state = st.get("state")
+            if state in ("saved", "saved_incomplete"):
+                return {"ok": True, "incomplete": st.get("incomplete"),
+                        "save_s": st.get("elapsed_s")}
+            if state == "failed":
+                return {"ok": False, "error": st.get("error"), "save_s": st.get("elapsed_s")}
+            if state != "saving":
+                raise RuntimeError(
+                    f"[LiveODClient] END_RUN: liveOD reports no save in progress "
+                    f"for this run ({'superseded' if st.get('stale_run') else state!r})")
+            phase = st.get("phase")
+            now = time.monotonic()
+            if phase != last_phase:
+                last_phase, t_phase = phase, now
+            if now - t_phase > SAVE_STALL_S or now - t0 > SAVE_MAX_S:
+                raise RuntimeError(
+                    f"[LiveODClient] END_RUN: liveOD's save has been in phase "
+                    f"{phase!r} for {now - t_phase:.0f} s ({now - t0:.0f} s in all); "
+                    f"giving up on it")
 
     def poll(self) -> dict:
         """The server's POLL reply: run state, run id, shot and frame counts,

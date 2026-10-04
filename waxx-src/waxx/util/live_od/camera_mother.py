@@ -12,7 +12,7 @@ from waxx.util.live_od.camera_nanny import CameraNanny
 from waxx.util.live_od.config import get_config
 # Everything that touches the run's data file lives in live_od/data. SaveWorker
 # is imported here only because it used to be defined here.
-from waxx.util.live_od.data.image_writer import ImageWriter, SaveWorker
+from waxx.util.live_od.data.image_writer import ImageWriter, SaveWorker, writer_for
 from waxx.util.live_od.log import get_logger
 from waxa.data.server_talk import server_talk as st
 
@@ -129,7 +129,9 @@ class DataHandler(QThread):
         self.data_filepath = data_filepath
         super().__init__()
         self.queue = queue
-        self.writer = ImageWriter(data_filepath)
+        # the server started the run's writer at INIT_RUN (the one handle on
+        # the file); an older path without one gets its own, as before
+        self.writer = writer_for(data_filepath) or ImageWriter(data_filepath)
 
         from waxa.dummy.camera_params import CameraParams
         from waxa.data import RunInfo
@@ -279,9 +281,12 @@ class DataHandler(QThread):
             logger.exception(f"DataHandler: write_image_to_dataset failed: {e}")
 
         if self.save_data and self.writer.started:
-            # Propagate interruption so the writer drains without writing.  It
-            # closes the file and emits done_writing_signal; don't emit it here.
-            self.writer.finish(self.interrupted)
+            # The camera's frames are all in. A writer of the server's stays
+            # open for the experiment's pushed arrays until END_RUN finishes
+            # it; one of our own closes now. Either way it emits
+            # done_writing_signal once the file is closed; don't emit it here.
+            # An interruption makes it drain without writing.
+            self.writer.images_done(self.interrupted)
         else:
             self.done_writing_signal.emit()
 

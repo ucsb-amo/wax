@@ -177,13 +177,17 @@ def test_server_finalizes_a_reset_whose_experiment_died_at_the_next_init(server)
 
 
 def test_server_camera_run_gates_the_save_on_the_writer(server):
+    """END_RUN finishes the run's writer itself and saves once it has closed
+    the file (2026-10-02: the writer is started at INIT_RUN for every saving
+    run and stays open until END_RUN for the experiment's pushed arrays)."""
     srv, saver, states = server
     srv._handle_init_run(_init_msg(capture_images=True, camera_key="cam_a"))
     assert not srv._data_handler_done_event.is_set()
-    threading.Timer(0.2, srv.on_data_handler_done).start()
-    t0 = time.time()
+    writer = srv._run_file.writer
+    assert writer is not None and writer.started and not writer.finished
     assert srv._handle_end_run({})["ok"]
-    assert time.time() - t0 >= 0.15 and len(saver.saved) == 1
+    assert writer.finished and srv._data_handler_done_event.is_set()
+    assert len(saver.saved) == 1
 
 
 # ----------------------------------------------------------------------

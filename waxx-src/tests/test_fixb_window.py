@@ -98,6 +98,9 @@ def window(app, tmp_path, monkeypatch):
             obj.request_stop()
         if hasattr(obj, "grab_finished"):
             obj.grab_finished()
+    # the run's writer is the server's and lives until END_RUN or shutdown:
+    # finished here as shutdown does, so the dispatchers' join below sees it end
+    win.live_od_server.wait_for_image_writer(0.0)
     for obj in spawned:
         problems.append(qt.join_or_keep(obj))
         writer = getattr(obj, "writer", None)

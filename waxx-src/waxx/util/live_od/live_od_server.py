@@ -29,6 +29,7 @@ from waxx.util.comms_server.hardware_id import scoped_server_id
 from waxx.util.live_od.config import get_config
 # Everything the server does to the run's data file (reserve, save, delete) is
 # in live_od/data/run_file.py; this module keeps the protocol and the run state.
+from waxx.util.live_od.data.image_writer import PutItem
 from waxx.util.live_od.data.run_file import RunFile, RunFileSaveError
 from waxx.util.live_od.log import get_logger, get_log_buffer
 from waxx.util.live_od.marker_store import MarkerStore
@@ -46,6 +47,9 @@ ABORT_REPLY_SHOT_FACTOR = 3.0
 # once no frame has come for this long: triggers the core device had already queued
 # can still bring frames after the process is gone, nothing later can.
 EXITED_FRAME_GRACE_S = 5.0
+# INIT_RUN waits this long for the previous run's asynchronous save before it
+# refuses (the client's INIT_RUN timeout is 60 s)
+SAVE_WAIT_BEFORE_INIT_S = 45.0
 # A Reset pressed this long after an Abort the experiment has not answered closes
 # the aborted run at once, as the next run start would (a second press, not the
 # window's own echo of the first).
@@ -93,6 +97,9 @@ class LiveODServer(QThread, NetServer):
     run_done_signal = pyqtSignal()
     run_started_signal = pyqtSignal(int, object)               # run_id, xvarnames (emitted after INIT_RUN, before new_run_signal)
     reset_signal = pyqtSignal()                               # triggered by remote RESET command
+    # an array the experiment pushed during the run (PUT_DATA): {run_id, key,
+    # index, array, t}; the window hands it to the broadcaster (AUX_DATA)
+    aux_data_signal = pyqtSignal(object)
     camera_control_signal = pyqtSignal(str, str)              # camera_key, action ('open'|'close'|'toggle')
     adjust_specs_signal = pyqtSignal(list)                    # list of spec dicts, emitted after every INIT_RUN (empty list when no adjust params)
     shot_adjust_values_signal = pyqtSignal(dict)              # current adjust values dict, emitted per shot
@@ -279,8 +286,13 @@ class LiveODServer(QThread, NetServer):
                 self._run_file.writer_finished()
 
     def wait_for_image_writer(self, timeout: float) -> bool:
-        """True once the current run's image writer has closed the run's file
-        (at once when there is none). For the window's shutdown."""
+        """True once the current run's writer has closed the run's file (at
+        once when there is none). For the window's shutdown: the writer is
+        told to finish first, with what it has (the run is over for liveOD)."""
+        try:
+            self._run_file.finish_writer()
+        except Exception:
+            logger.exception("shutdown: finishing the run's writer failed")
         return self._run_file.writer_done.wait(timeout)
 
     def on_image_received(self, *_, run_token=None):
@@ -796,58 +808,180 @@ class LiveODServer(QThread, NetServer):
                 except Exception:
                     logger.exception("closing a run whose experiment is gone failed")
                 try:
-                    raw = socket.recv()
+                    # a pickled dict, plus raw buffers for PUT_DATA (one frame
+                    # per array, never copied through pickle)
+                    frames = socket.recv_multipart()
                 except zmq.Again:
                     continue          # poll timeout — loop to check _running
 
-                tag = "<unknown>"
-                try:
-                    msg = pickle.loads(raw)
-                    tag = msg.get("tag", "")
-                    if tag == "INIT_RUN":
-                        reply = self._handle_init_run(msg)
-                    elif tag == "WAIT_CAM_READY":
-                        reply = self._handle_wait_cam_ready(msg)
-                    elif tag == "SHOT_COMPLETE":
-                        reply = self._handle_shot_complete(msg)
-                    elif tag == "END_RUN":
-                        reply = self._handle_end_run(msg)
-                    elif tag == "RESET":
-                        reply = self._handle_reset(msg)
-                    elif tag == "CAMERA_CONTROL":
-                        reply = self._handle_camera_control(msg)
-                    elif tag == "POLL":
-                        reply = self._handle_poll(msg)
-                    elif tag == "GET_LOG":
-                        reply = self._handle_get_log(msg)
-                    elif tag == "ABORT_RUN":
-                        reply = self._handle_abort_run(msg)
-                    elif tag == "RUN_EXITED":
-                        reply = self._handle_run_exited(msg)
-                    elif tag == "SUBSCRIBE_SCALARS":
-                        reply = self._handle_subscribe_scalars(msg)
-                    elif tag == "UNSUBSCRIBE_SCALARS":
-                        reply = self._handle_unsubscribe_scalars(msg)
-                    elif tag == "GET_ADJUST_VALUES":
-                        reply = self._handle_get_adjust_values(msg)
-                    elif tag == "SET_ADJUST_VALUE":
-                        reply = self._handle_set_adjust_value(msg)
-                    elif tag == "SET_ADJUST_SPEC":
-                        reply = self._handle_set_adjust_spec(msg)
-                    elif tag == "GET_MARKERS":
-                        reply = self._handle_get_markers(msg)
-                    elif tag == "SET_MARKERS":
-                        reply = self._handle_set_markers(msg)
-                    else:
-                        reply = {"ok": False, "error": f"Unknown tag: {tag}"}
-                except Exception as exc:
-                    reply = {"ok": False, "error": str(exc)}
-                    logger.exception(f"Error handling {tag!r}: {exc}")
-
+                reply = self._dispatch(frames)
                 socket.send(pickle.dumps(reply))
         finally:
+            # the run's writer must not outlive the server with the file open
+            try:
+                self._run_file.finish_writer()
+            except Exception:
+                logger.exception("closing the run's writer at shutdown failed")
             socket.close()
             context.term()
+
+    def _dispatch(self, frames) -> dict:
+        """One request to its handler: ``frames[0]`` is the pickled message,
+        the rest are PUT_DATA's raw buffers. The reply dict; never raises."""
+        tag = "<unknown>"
+        try:
+            msg = pickle.loads(frames[0])
+            tag = msg.get("tag", "")
+            if tag == "INIT_RUN":
+                reply = self._handle_init_run(msg)
+            elif tag == "WAIT_CAM_READY":
+                reply = self._handle_wait_cam_ready(msg)
+            elif tag == "SHOT_COMPLETE":
+                reply = self._handle_shot_complete(msg)
+            elif tag == "PUT_DATA":
+                reply = self._handle_put_data(msg, frames[1:])
+            elif tag == "END_RUN":
+                reply = self._handle_end_run(msg)
+            elif tag == "SAVE_STATUS":
+                reply = self._handle_save_status(msg)
+            elif tag == "GET_AUX_DATA":
+                reply = self._handle_get_aux_data(msg)
+            elif tag == "RESET":
+                reply = self._handle_reset(msg)
+            elif tag == "CAMERA_CONTROL":
+                reply = self._handle_camera_control(msg)
+            elif tag == "POLL":
+                reply = self._handle_poll(msg)
+            elif tag == "GET_LOG":
+                reply = self._handle_get_log(msg)
+            elif tag == "ABORT_RUN":
+                reply = self._handle_abort_run(msg)
+            elif tag == "RUN_EXITED":
+                reply = self._handle_run_exited(msg)
+            elif tag == "SUBSCRIBE_SCALARS":
+                reply = self._handle_subscribe_scalars(msg)
+            elif tag == "UNSUBSCRIBE_SCALARS":
+                reply = self._handle_unsubscribe_scalars(msg)
+            elif tag == "GET_ADJUST_VALUES":
+                reply = self._handle_get_adjust_values(msg)
+            elif tag == "SET_ADJUST_VALUE":
+                reply = self._handle_set_adjust_value(msg)
+            elif tag == "SET_ADJUST_SPEC":
+                reply = self._handle_set_adjust_spec(msg)
+            elif tag == "GET_MARKERS":
+                reply = self._handle_get_markers(msg)
+            elif tag == "SET_MARKERS":
+                reply = self._handle_set_markers(msg)
+            else:
+                reply = {"ok": False, "error": f"Unknown tag: {tag}"}
+        except Exception as exc:
+            reply = {"ok": False, "error": str(exc)}
+            logger.exception(f"Error handling {tag!r}: {exc}")
+        return reply
+
+    # ------------------------------------------------------------------
+    # Data pushed during the run, and the asynchronous save
+    # ------------------------------------------------------------------
+
+    def _handle_put_data(self, msg: dict, buffers) -> dict:
+        """Arrays the experiment pushes during the run (auxiliary camera frames,
+        scope traces): one raw buffer per item, each for its slot of a dataset
+        under ``data/`` (pre-allocated at INIT_RUN, or made on first use from
+        ``full_shape``). In a run that saves they are queued for the run's
+        writer, the only handle on the file; the reply says that much and no
+        more -- what the writer could not write is in END_RUN's completeness
+        report. In a run that saves nothing they are taken all the same
+        (``written`` False): the latest of each key is kept for GET_AUX_DATA
+        and every one goes out on the broadcast (AUX_DATA)."""
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("PUT_DATA", msg)
+        if not self._run_in_progress:
+            return {"ok": False, "error": "no run in progress"}
+        specs = list(msg.get("items", []))
+        if len(specs) != len(buffers):
+            return {"ok": False, "error": f"{len(specs)} items but {len(buffers)} buffers"}
+        items = []
+        for spec, buf in zip(specs, buffers):
+            dtype = np.dtype(str(spec["dtype"]))
+            arr = np.frombuffer(buf, dtype=dtype)
+            shape = tuple(int(s) for s in spec.get("shape", (arr.size,)))
+            arr = arr.reshape(shape)
+            items.append(PutItem(spec["key"], spec.get("index"), arr,
+                                 full_shape=spec.get("full_shape"), dtype=dtype,
+                                 fill=spec.get("fill"), offset=spec.get("offset")))
+        saving = self._run_file.pending
+        written = self._run_file.put(items) if saving else False
+        if saving and not written:
+            return {"ok": False, "error": "the run's file is not taking data "
+                                          "(its writer is closed)"}
+        # the latest of each key, for live viewers and derived quantities,
+        # whether the run saves or not
+        self._note_aux_items(items)
+        return {"ok": True, "queued": len(items) if written else 0, "written": written}
+
+    def _note_aux_items(self, items):
+        """Keep the latest array per key (GET_AUX_DATA) and hand each one to
+        the window for the broadcast (AUX_DATA). A slice of a whole array
+        pushed at the end is not a shot's data and is left out."""
+        latest = getattr(self, "_aux_latest", None)
+        if latest is None:
+            latest = self._aux_latest = {}
+        now = time.time()
+        for it in items:
+            if it.index is None and it.offset is not None:
+                continue
+            rec = {"run_id": self._current_run_id, "key": it.key,
+                   "index": None if it.index is None else list(it.index),
+                   "array": it.array, "t": now}
+            latest[it.key] = rec
+            try:
+                self.aux_data_signal.emit(rec)
+            except Exception:
+                logger.debug("aux data signal failed", exc_info=True)
+
+    def _handle_get_aux_data(self, msg: dict) -> dict:
+        """The latest pushed array of each key (or of ``keys``), with the run
+        it came from; for a viewer that wants a frame it missed."""
+        latest = dict(getattr(self, "_aux_latest", None) or {})
+        keys = msg.get("keys")
+        if keys:
+            latest = {k: v for k, v in latest.items() if k in set(keys)}
+        return {"ok": True, "run_id": self._current_run_id, "items": latest}
+
+    def _handle_save_status(self, msg: dict) -> dict:
+        """How far the asynchronous END_RUN save is (the client polls this
+        instead of waiting on one long reply)."""
+        if not self._run_msg_ok(msg):
+            return self._stale_run_reply("SAVE_STATUS", msg)
+        reply = self._run_file.status()
+        reply["ok"] = True
+        return reply
+
+    def _on_async_save_done(self, result: dict):
+        """The save thread is over (called on it): the run's outcome and state,
+        as the synchronous END_RUN records them."""
+        run_id = self._current_run_id
+        state = result.get("state")
+        if state == "failed":
+            logger.error(f"END_RUN: save of run {run_id} failed: {result.get('error')}")
+            self._record_outcome("save_failed", str(result.get("cause", "")))
+            self._set_run_state("error", f"Save failed: {result.get('cause', '')}")
+        elif state == "saved_incomplete":
+            inc = result.get("incomplete") or {}
+            logger.error(
+                f"END_RUN: run_id={run_id} saved INCOMPLETE ({inc.get('reason', '')}). "
+                f"The file is marked data_complete=False; its images are in arrival "
+                f"order and do not line up with the shots."
+            )
+            self._record_outcome("saved_incomplete", str(inc.get("reason", "")))
+            self._set_run_state("saved", f"INCOMPLETE: {inc.get('reason', '')}")
+        else:
+            logger.info(f"END_RUN: run_id={run_id} saved.")
+            self._record_outcome("saved")
+            self._set_run_state("saved")
+        self._run_in_progress = False
+        self._abort_requested_at = None
+        self.run_done_signal.emit()
 
     # ------------------------------------------------------------------
     # Message handlers
@@ -907,6 +1041,15 @@ class LiveODServer(QThread, NetServer):
         # that is refused leaves the run in progress as it was (its token, so
         # its messages still count; its camera; its state).
         token = uuid.uuid4().hex
+        # The previous run's save may still be running (an asynchronous
+        # END_RUN): this run's file is not made under it.
+        if self._run_file.saving:
+            logger.info("INIT_RUN: waiting for the previous run's save to finish")
+            if not self._run_file.wait_save(SAVE_WAIT_BEFORE_INIT_S):
+                return self._refuse_init_run(
+                    f"the previous run is still being saved after "
+                    f"{SAVE_WAIT_BEFORE_INIT_S:.0f} s; try again",
+                    "INIT_RUN refused: the previous run is still being saved")
         save_data = bool(msg.get("save_data", False))
         capture_images = bool(msg.get("capture_images", False))
         camera_key = str(msg.get("camera_key", ""))
@@ -991,10 +1134,14 @@ class LiveODServer(QThread, NetServer):
         self._exited_close_now = ""
         self._run_in_progress = True
         self._shot_timestamps = []       # reset per-run timestamp list
+        self._aux_latest = {}            # the latest pushed array per key, this run
         self._init_run_time = time.time()
         self._shot_durations = []  # reset rolling average for new run
 
         n_img = int(msg.get('params', {}).get('N_img', 1))
+        # the run's one handle on its file, open from here to END_RUN: the
+        # camera's frames and the experiment's pushed arrays go through it
+        self._run_file.start_writer(n_img)
         n_shots = int(msg.get('N_shots_with_repeats', 1))
         n_pwa = int(msg.get('N_pwa_per_shot', 1))
         self._current_n_shots = n_shots
@@ -1058,7 +1205,10 @@ class LiveODServer(QThread, NetServer):
             f"{n_shots} shots, save={save_data}, "
             f"camera={camera_key if capture_images else 'none'}"
         )
-        reply = {"ok": True, "run_id": run_id, "filepath": filepath, "run_token": self._run_token}
+        reply = {"ok": True, "run_id": run_id, "filepath": filepath, "run_token": self._run_token,
+                 # what this server can do beyond the original protocol: arrays
+                 # pushed during the run, and a save the client polls for
+                 "features": {"put_data": True, "async_save": True}}
         # camera settings this run will get that differ from its camera_params
         # (Persist, host mode); the client prints them as a banner
         overrides = self.camera_overrides_record()
@@ -1256,6 +1406,19 @@ class LiveODServer(QThread, NetServer):
             self.run_done_signal.emit()
             return {"ok": True}
         incomplete = None
+        if self._run_file.pending and msg.get("async_save"):
+            # The save runs on a thread of its own and the client polls
+            # SAVE_STATUS for it: a long save neither blocks every other
+            # client nor looks like a dead server to the experiment.
+            self._set_run_state("saving")
+            self._run_file.save_async(
+                msg, self._current_run_id, self._shot_timestamps,
+                on_done=self._on_async_save_done,
+                images_expected=self._images_expected,
+                images_received=self._images_received_now(),
+                grab_failure=self._grab_failure,
+            )
+            return {"ok": True, "saving": True}
         if self._run_file.pending:
             self._set_run_state("saving")
             try:
@@ -1397,8 +1560,9 @@ class LiveODServer(QThread, NetServer):
                   f"left as it was: not saved, not deleted.")
         logger.warning(f"RUN_EXITED: run {run_id}: {detail}")
         self._host_end_run("RUN_EXITED", record=False)
-        # forgotten: a reset pressed later must not delete an exited run's file
-        self._run_file.filepath = ""
+        # the writer closes the file with what it has; forgotten: a reset
+        # pressed later must not delete an exited run's file
+        self._run_file.leave()
         self._run_in_progress = False
         self._abort_requested_at = None
         self._record_outcome("exited", why)
@@ -1473,7 +1637,7 @@ class LiveODServer(QThread, NetServer):
         now = time.monotonic() if now is None else float(now)
         if self._exited_close_now:
             how = self._exited_close_now
-        elif self._run_file.writer_done.is_set():
+        elif self._run_file.images_done:
             how = "its camera thread has finished"
         elif not self._cam_ready_event.is_set():
             how = "the camera was never ready, so nothing triggered it"
@@ -1498,8 +1662,9 @@ class LiveODServer(QThread, NetServer):
         # the window stops the run's camera thread quietly (the file stays)
         self.exited_run_signal.emit(how)
         self._host_end_run("RUN_EXITED", record=False)
-        # forgotten: a reset pressed later must not delete an exited run's file
-        self._run_file.filepath = ""
+        # the writer closes the file with what it has; forgotten: a reset
+        # pressed later must not delete an exited run's file
+        self._run_file.leave()
         self._run_in_progress = False
         self._abort_requested_at = None
         self._record_outcome("exited", why)

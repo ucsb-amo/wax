@@ -190,6 +190,8 @@ _HOST_STEPS = [
     ("waxx.base.scanner", "Scanner", "generate_assignment_kernels",
      "generate_assignment_kernels"),
     ("waxx.base.expt", "Expt", "end_wax", "end_wax"),
+    ("waxx.base.expt", "Expt", "_finish_camera_streams", "camera streams finish"),
+    ("waxx.util.live_od.live_od_client", "LiveODClient", "_wait_for_save", "liveOD save (polled)"),
     ("waxx.base.monitor", "Monitor", "update_device_states", "monitor.update_device_states"),
 ]
 

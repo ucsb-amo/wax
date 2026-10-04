@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import os
+import threading
 import time
 
 from artiq.experiment import *
@@ -97,6 +98,11 @@ class Expt(Scanner, Dealer, Scribe):
         self.run_info = RunInfo(self, save_data, server_talk=server_talk,
                                 defer_run_id=True)
         self.scope_data = ScopeData()
+        self.scope_data.attach_expt(self)      # per-shot traces into the run's file
+        # data pushed into the run's file during the run (push_shot_data)
+        self._push_failed = set()               # keys END_RUN must carry after all
+        self._n_pushed = 0
+        self._n_push_failed = 0
         # Per-shot auxiliary camera clients (waxx.control.cameras
         # .camera_stream_client); each registers itself here and is drained /
         # closed in end_wax. Host-only: never touched by kernel code.
@@ -402,6 +408,7 @@ class Expt(Scanner, Dealer, Scribe):
                 notify=True,
                 restart_monitor=True):
 
+        _t0 = time.monotonic()
         try:
             self.scope_data.close()
         except Exception as _e:
@@ -412,20 +419,19 @@ class Expt(Scanner, Dealer, Scribe):
         # provenance into _extra_file_texts, restores camera settings and
         # closes the stream. finish() never raises by contract; the guard is
         # belt and braces so a broken client cannot cost the run's data.
-        for _cs in list(getattr(self, 'camera_streams', ())):
-            try:
-                _cs.finish()
-            except Exception as _e:
-                print(f"[end_wax] WARNING: camera stream "
-                      f"'{getattr(_cs, 'key', '?')}' finish() raised: {_e} — continuing.")
+        self._finish_camera_streams()
+        _t_streams = time.monotonic() - _t0
 
         self.cleanup_scanned()
 
+        _t_end_run = _t_save = 0.
         _client = getattr(self, 'live_od_client', None)
         if _client is not None:
             payload = self._serialize_end_payload(expt_filepath)
-            # print(payload)
+            _t1 = time.monotonic()
             _client.end_run(payload)
+            _t_end_run = time.monotonic() - _t1
+            _t_save = float(_client.last_end_run_reply.get("save_s") or 0.)
         else:
             # Legacy fallback
             if self.setup_camera:
@@ -441,6 +447,7 @@ class Expt(Scanner, Dealer, Scribe):
             from waxx.util.notifications import send_run_done_email_async
             send_run_done_email_async(self.run_info.run_id, expt_filepath)
 
+        _t2 = time.monotonic()
         if hasattr(self,'monitor'):
             # The end state goes through the monitor server (the only writer
             # of the state file); it marks the state trusted again.
@@ -448,8 +455,15 @@ class Expt(Scanner, Dealer, Scribe):
                                               expt=self._expt_name_from_filepath(expt_filepath))
             if restart_monitor:
                 self.monitor.signal_end()
+        _t_monitor = time.monotonic() - _t2
 
         self._run_done_printout(expt_filepath)
+        # where the end of the run went (the save is liveOD's own figure)
+        pushed = f", {self._n_pushed} arrays pushed during the run" if self._n_pushed else ""
+        failed = f" ({self._n_push_failed} pushes failed)" if self._n_push_failed else ""
+        console.info(f"[end] streams closed {_t_streams:.1f} s | liveOD end_run "
+                     f"{_t_end_run:.1f} s (save {_t_save:.1f} s) | monitor {_t_monitor:.1f} s"
+                     f"{pushed}{failed}")
 
         # Runs have hung after this point (2026-09-26, run 83102) with nothing
         # left to show why: if the process outlives this by a minute, its
@@ -521,6 +535,157 @@ class Expt(Scanner, Dealer, Scribe):
                 pass
         return ranges
 
+    # ---- data pushed into the run's file during the run -----------------
+    #
+    # liveOD pre-allocates every DataVault dataset at INIT_RUN and, with
+    # PUT_DATA, takes a shot's value as soon as the host has it, written at
+    # the slot it has once the run is unshuffled. END_RUN then carries no copy
+    # of that container. A container that was never pushed and is big goes in
+    # PUT_DATA slices just before END_RUN; what is left in END_RUN is small.
+
+    # a container bigger than this that was not pushed during the run is
+    # pushed in slices before END_RUN rather than carried inside it
+    BULK_PUSH_BYTES = 8 * 1024 * 1024
+    PUT_DATA_SLICE_BYTES = 48 * 1024 * 1024
+    # every auxiliary camera stream's finish() runs at once; this is the wait
+    T_STREAM_FINISH_S = 90.
+
+    def current_shot_index(self):
+        """The scan counters of the shot in progress, one per xvar."""
+        return tuple(int(x.counter) for x in self.scan_xvars)
+
+    def final_shot_index(self, idx):
+        """Where the shot at scan-counter index ``idx`` lands once the run is
+        unshuffled: the slot its data has in the file (the inverse of what
+        the saver's unshuffle does, axis by axis)."""
+        idx = tuple(int(i) for i in idx)
+        if not self.sort_idx:
+            return idx
+        sort_N = [int(n) for n in self.sort_N]
+        out = []
+        for i, N in zip(idx, self.xvardims):
+            N = int(N)
+            if N in sort_N:
+                out.append(int(np.asarray(self.sort_idx[sort_N.index(N)])[i]))
+            else:
+                out.append(i)
+        return tuple(out)
+
+    @property
+    def push_data_enabled(self) -> bool:
+        """liveOD takes arrays during this run: a run liveOD knows (a client
+        exists) against a server with PUT_DATA. A run that saves nothing
+        pushes too: liveOD keeps the latest of each and broadcasts them, and
+        writes nothing."""
+        client = getattr(self, "live_od_client", None)
+        return bool(client is not None and client.supports("put_data"))
+
+    def push_shot_data(self, items, idx=None):
+        """Push one shot's value of each container in ``items`` (``[(dc,
+        value), ...]``) into the run's file at the shot's final slot. ``idx``
+        is the shot's scan-counter index (the shot in progress when None).
+        True when liveOD took them. On a refusal or a failure the container
+        falls back to END_RUN, which has the value anyway. Never raises; any
+        host thread may call it."""
+        if not self.push_data_enabled:
+            return False
+        if idx is None:
+            idx = self.current_shot_index()
+        final = self.final_shot_index(idx)
+        specs = [{"key": dc.key, "index": final, "array": value,
+                  "full_shape": dc._run_data.shape,
+                  "fill": getattr(dc, "_fill_value", None)}
+                 for dc, value in items]
+        ok = self._push(specs)
+        for dc, _ in items:
+            if ok:
+                dc._pushed = True
+            else:
+                self._push_failed.add(dc.key)
+        return ok
+
+    def push_raw(self, specs) -> bool:
+        """Push arrays by key (``[{key, index | offset, array, full_shape,
+        fill}]``): data outside any container (scope traces). True when
+        liveOD took them. Never raises."""
+        if not self.push_data_enabled:
+            return False
+        return self._push(specs)
+
+    def _push(self, specs) -> bool:
+        try:
+            reply = self.live_od_client.put_data(specs)
+        except Exception as e:
+            self._note_push_failure(f"{type(e).__name__}: {e}")
+            return False
+        if not reply.get("ok"):
+            self._note_push_failure(str(reply.get("error", "refused")))
+            return False
+        self._n_pushed += len(specs)
+        return True
+
+    def _note_push_failure(self, why):
+        self._n_push_failed += 1
+        if self._n_push_failed <= 3:
+            print(f"[push] liveOD did not take pushed data ({why}); it goes with "
+                  f"END_RUN instead.")
+
+    def _push_whole_container(self, dc) -> bool:
+        """A big container END_RUN would otherwise carry: unshuffled here and
+        pushed in slices along its first axis. True when it all went."""
+        key = getattr(dc, "key", "")
+        arr = dc._run_data
+        if (not self.push_data_enabled or not getattr(self.run_info, "save_data", False)
+                or key in self._push_failed
+                or not isinstance(arr, np.ndarray) or arr.ndim == 0
+                or arr.nbytes <= self.BULK_PUSH_BYTES
+                or not getattr(dc, "_data_gotten", False)
+                or getattr(dc, "_external_data_bool", False)):
+            return False
+        if self.sort_idx:
+            n_per_shot = max(0, arr.ndim - len(self.xvardims))
+            arr = DataSaver._unshuffle_single_array(
+                arr, [np.array(s).tolist() for s in self.sort_idx],
+                [int(n) for n in self.sort_N], exclude_dims=n_per_shot)
+        rows = max(1, self.PUT_DATA_SLICE_BYTES // max(1, arr[0].nbytes))
+        fill = getattr(dc, "_fill_value", None)
+        for start in range(0, arr.shape[0], rows):
+            spec = {"key": key, "index": None, "offset": start,
+                    "array": arr[start:start + rows], "full_shape": arr.shape, "fill": fill}
+            if not self._push([spec]):
+                self._push_failed.add(key)
+                return False
+        dc._pushed = True
+        return True
+
+    def _finish_camera_streams(self):
+        """finish() every auxiliary camera stream, all at once (each has its
+        own connection and takes a few round trips). One still closing after
+        T_STREAM_FINISH_S is left to its own atexit cleanup."""
+        streams = list(getattr(self, 'camera_streams', ()))
+        if not streams:
+            return
+
+        def one(cs):
+            try:
+                cs.finish()
+            except Exception as e:
+                print(f"[end_wax] WARNING: camera stream "
+                      f"'{getattr(cs, 'key', '?')}' finish() raised: {e} — continuing.")
+
+        threads = [threading.Thread(target=one, args=(cs,), daemon=True,
+                                    name=f"finish:{getattr(cs, 'key', '?')}")
+                   for cs in streams]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + self.T_STREAM_FINISH_S
+        for t in threads:
+            t.join(max(0., deadline - time.monotonic()))
+        late = [t.name for t in threads if t.is_alive()]
+        if late:
+            print(f"[end_wax] WARNING: still closing after {self.T_STREAM_FINISH_S:.0f} s, "
+                  f"left to their exit cleanup: {late}")
+
     def _serialize_init_payload(self) -> dict:
         """Build the INIT_RUN payload from current experiment state."""
         cam_params_dict = {
@@ -535,6 +700,8 @@ class Expt(Scanner, Dealer, Scribe):
                 'shape': dc._run_data.shape,
                 'dtype': str(dc._run_data.dtype),
                 'external': bool(dc._external_data_bool),
+                # the slot nothing writes reads back as this, not as zero
+                'fill': getattr(dc, '_fill_value', None),
             }
 
         if self.setup_camera:
@@ -591,6 +758,11 @@ class Expt(Scanner, Dealer, Scribe):
         scope_data_list = []
         if self.scope_data._scope_trace_taken:
             for scope in self.scope_data.scopes:
+                if getattr(scope, "pushed_ok", False):
+                    # every shot's traces went into the file during the run
+                    scope_data_list.append({'label': str(scope.label), 'data': None,
+                                            'pushed': True})
+                    continue
                 try:
                     reshaped = scope.reshape_data()
                 except Exception as _e:
@@ -604,10 +776,19 @@ class Expt(Scanner, Dealer, Scribe):
                         'data': reshaped,
                     })
 
-        # DataVault
+        # DataVault. A container that went into the file during the run, or
+        # goes now in slices (big ones), is in there at its final slots
+        # already: END_RUN carries no copy of it.
         dv = {}
         for key in self.data.keys:
             dc = vars(self.data)[key]
+            pushed = bool(getattr(dc, '_pushed', False)) and key not in self._push_failed
+            if not pushed:
+                pushed = self._push_whole_container(dc)
+            if pushed:
+                dv[key] = {'data': None, 'data_gotten': True,
+                           'external': True, 'final_order': True}
+                continue
             dv[key] = {
                 'data': dc._run_data,
                 'data_gotten': bool(dc._data_gotten),
