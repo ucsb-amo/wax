@@ -54,6 +54,34 @@ def _as_roi(value):
     return tuple(_as_int("sensor_roi", v) for v in items)
 
 
+def _set_trigger_ttl(params, trigger_ttl):
+    """Record which TTL line triggers this camera.
+
+    ``trigger_ttl`` is a ttl_frame attribute name (str) or the TTL object
+    itself (anything with ``.ch``; its ``.key`` is the attribute name the
+    frame gave it). What is kept, and saved with every run as
+    ``camera_params/``: ``trigger_ttl`` (the name) and ``trigger_ttl_ch``
+    (the channel, -1 when only a name was given). The object goes under
+    ``_trigger_ttl`` -- the underscore keeps it out of the run file -- for
+    reference only: a camera table is module-level, so its TTL object is
+    never the experiment's bound device; the experiment resolves the name /
+    channel onto its own ttl frame (kexp.config.camera_id.camera_trigger_ttl).
+    """
+    if trigger_ttl is None or isinstance(trigger_ttl, str):
+        params.trigger_ttl = str(trigger_ttl or "")
+        params.trigger_ttl_ch = -1
+        params._trigger_ttl = None
+        return
+    name = getattr(trigger_ttl, "key", "") or getattr(trigger_ttl, "name", "")
+    ch = getattr(trigger_ttl, "ch", None)
+    if ch is None:
+        raise TypeError(f"trigger_ttl must be a ttl_frame attribute name or a "
+                        f"TTL object (with .ch), got {trigger_ttl!r}")
+    params.trigger_ttl = str(name)
+    params.trigger_ttl_ch = int(ch)
+    params._trigger_ttl = trigger_ttl
+
+
 def full_frame_roi(detector_shape):
     """The sensor_roi of the whole sensor at bin 1; detector_shape is (rows, cols)."""
     rows, cols = detector_shape
@@ -124,12 +152,16 @@ class BaslerParams(CameraParams):
                 t_light_only_image_delay=25.e-3, t_dark_image_delay=20.e-3,
                 resolution = (1200,1920,),
                 magnification = 0.75,
+                trigger_ttl = "",
                 key = ""):
         super().__init__()
         self.key = key
         self.camera_type = "basler"
         self.serial_no = serial_number
         self.trigger_source = trigger_source
+        # The TTL line wired to this camera's trigger input: a ttl_frame
+        # attribute name or the TTL object (see _set_trigger_ttl).
+        _set_trigger_ttl(self, trigger_ttl)
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
         self.resolution = resolution
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
@@ -189,10 +221,14 @@ class AndorParams(CameraParams):
                  trigger_mode="ext", frame_transfer=0, sensor_roi=(0, 512, 0, 512, 1, 1),
                  resolution = (512,512,),
                  magnification = 50./3,
+                 trigger_ttl = "",
                  key = ""):
         super().__init__()
         self.key = key
         self.camera_type = "andor"
+        # The TTL line wired to this camera's trigger input: a ttl_frame
+        # attribute name or the TTL object (see _set_trigger_ttl).
+        _set_trigger_ttl(self, trigger_ttl)
         self.pixel_size_m = 16.e-6
         self.magnification = magnification
         self.exposure_delay = 0. # needs to be updated from docs
