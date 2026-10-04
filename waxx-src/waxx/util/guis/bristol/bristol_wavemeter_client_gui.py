@@ -330,9 +330,10 @@ class BristolDetuningWidget(QWidget):
         self._plot.getAxis("left").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._plot.getAxis("bottom").setStyle(tickFont=pg.Qt.QtGui.QFont("Monospace", 9))
         self._curve = self._plot.plot(pen=pg.mkPen("#ffaa00", width=1.5))
-        # Add Δ = 0 reference line (horizontal, only visible if in y-range)
+        # Add Δ = 0 reference line (horizontal, only visible if in y-range).
+        # ignoreBounds keeps it out of autorange so it never pins the view to 0.
         zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color="#666666", style=pg.QtCore.Qt.PenStyle.DashLine, width=1))
-        self._plot.addItem(zero_line)
+        self._plot.addItem(zero_line, ignoreBounds=True)
         self._plot.setMinimumHeight(180)
 
         plot_layout.addWidget(ctl_wrap)
