@@ -166,6 +166,9 @@ class LiveODWindow(QWidget):
         self.live_od_server.adjust_specs_signal.connect(self._on_adjust_specs)
         self.live_od_server.shot_adjust_values_signal.connect(self.broadcaster.broadcast_adjust_values)
         self.live_od_server.shot_adjust_values_signal.connect(self._adjust_panel.update_values)
+        # arrays pushed during the run (diagnostic frames, scope traces) go
+        # out to remote viewers whether the run saves or not
+        self.live_od_server.aux_data_signal.connect(self.broadcaster.broadcast_aux_data)
         self.analyzer.broadcast_signal.connect(self.broadcaster.broadcast_od_image)
         self.analyzer.shot_scalars_signal.connect(self.live_scalar_plot_window.on_shot_scalars)
         self.analyzer.shot_scalars_signal.connect(self.broadcaster.broadcast_shot_scalars)

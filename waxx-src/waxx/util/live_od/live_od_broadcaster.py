@@ -177,6 +177,13 @@ class LiveODBroadcaster(QThread, NetServer):
         """
         self._enqueue({'tag': 'FK_TOF', **data})
 
+    def broadcast_aux_data(self, item: dict):
+        """An array the experiment pushed during the run (a diagnostic camera
+        frame, a scope trace): ``run_id``, ``key``, ``index`` (the shot's slot
+        in the run, or None for a whole dataset), ``array``, ``t``. Sent for
+        every run, saved or not (LiveODServer.aux_data_signal)."""
+        self._enqueue({'tag': 'AUX_DATA', **item})
+
     def broadcast_log_msg(self, text: str, level: int = 20):
         """``level``: a ``logging`` level number (20 = INFO). Viewers that predate
         it ignore the key."""

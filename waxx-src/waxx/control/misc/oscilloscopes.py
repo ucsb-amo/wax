@@ -1,16 +1,163 @@
+import queue
+import threading
+
 import numpy as np
 from .oscilloscopes_base import Scope_Base, SiglentSDS2000X_Base
 from artiq.language import TBool, now_mu
 from artiq.experiment import kernel, rpc
 from waxx.util.artiq.async_print import aprint
 
+# ScopeData.close() waits this long for the sender to push the last traces
+SCOPE_SENDER_FLUSH_S = 30.
+
+
+class ScopeTraces:
+    """A run's traces from one scope, shot by shot, without a time axis per
+    shot: every shot's voltages (``v``, one ``(channels, points)`` float32
+    array each), the first shot's time axes (``t_ref``), and the axes of only
+    those shots whose axes differed (``t_extra``). ``full()`` gives the old
+    ``(shots, channels, 2, points)`` array back when END_RUN has to carry it.
+    (Keeping t per shot doubled the memory: 8 MB/shot for a 1M-point trace.)"""
+
+    def __init__(self):
+        self.v = []
+        self.t_ref = None
+        self.t_extra = {}
+
+    @property
+    def n(self) -> int:
+        return len(self.v)
+
+    @property
+    def t_varies(self) -> bool:
+        """Some shot's time axes differ from the first shot's."""
+        return bool(self.t_extra)
+
+    def store(self, arr) -> int:
+        """One shot's ``(channels, 2, points)`` array (t, v); its shot number."""
+        arr = np.asarray(arr, dtype=np.float32)
+        t, v = arr[:, 0, :], arr[:, 1, :]
+        shot = len(self.v)
+        self.v.append(np.array(v))
+        if self.t_ref is None:
+            self.t_ref = np.array(t)
+        elif t.shape != self.t_ref.shape or not np.array_equal(t, self.t_ref):
+            self.t_extra[shot] = np.array(t)
+        return shot
+
+    def pad(self, n_shots: int):
+        """Zero shots up to ``n_shots`` (save_on_underflow partial saves)."""
+        if self.n == 0:
+            return
+        while self.n < n_shots:
+            self.t_extra[self.n] = np.zeros_like(self.t_ref)
+            self.v.append(np.zeros_like(self.v[0]))
+
+    def clear(self):
+        self.v, self.t_ref, self.t_extra = [], None, {}
+
+    def full(self):
+        """``(shots, channels, 2, points)`` float32, t and v for every shot."""
+        if not self.v:
+            return np.empty((0, 0, 2, 0), np.float32)
+        v = np.asarray(self.v, dtype=np.float32)
+        out = np.empty((v.shape[0], v.shape[1], 2, v.shape[2]), np.float32)
+        out[:, :, 1, :] = v
+        out[:, :, 0, :] = self.t_ref
+        for shot, t in self.t_extra.items():
+            out[shot, :, 0, :] = t
+        return out
+
+
+class _ScopeSender(threading.Thread):
+    """Pushes each shot's traces into the run's file as soon as read_sweep
+    has them, on this thread: the kernel's RPC returns as before. The first
+    shot also writes the time axis; a later shot with a different one marks
+    the scope ``t_varies`` and END_RUN sends everything the old way."""
+
+    def __init__(self, expt):
+        super().__init__(name="scope-sender", daemon=True)
+        self._expt = expt
+        self._q = queue.Queue()
+        self.start()
+
+    def enqueue(self, scope, arr, idx):
+        self._q.put((scope, arr, idx))
+
+    def flush(self, timeout):
+        self._q.put(None)
+        self.join(timeout)
+        return not self.is_alive()
+
+    def run(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            scope, arr, idx = item
+            try:
+                self._push_one(scope, arr, idx)
+            except Exception as e:
+                scope.push_failed = True
+                print(f"[{scope.label}] WARNING: pushing a shot's traces failed: {e!r}")
+
+    def _push_one(self, scope, arr, idx):
+        expt = self._expt
+        final = expt.final_shot_index(idx)
+        n_ch, _, npts = arr.shape
+        key = f"scope_data/{scope.label}"
+        specs = []
+        if not getattr(scope, "_t_pushed", False):
+            # the first shot's time axis (channel 0, as the file stores it);
+            # a later shot with another one is the scope's t_varies (store)
+            scope._t_pushed = True
+            t_ref = scope.traces.t_ref
+            t = np.asarray(t_ref[0] if t_ref is not None else arr[0, 0, :], dtype=np.float32)
+            specs.append({"key": key + "/t", "index": None, "array": t,
+                          "full_shape": (npts,), "fill": None})
+        specs.append({"key": key + "/v", "index": final, "array": arr[:, 1, :],
+                      "full_shape": tuple(expt.xvardims) + (n_ch, npts), "fill": np.nan})
+        if expt.push_raw(specs):
+            scope.pushed_any = True
+        else:
+            scope.push_failed = True
+
+
 class ScopeData:
     def __init__(self):
         self.scopes = []
         self.xvardims = []
         self._scope_trace_taken = False
+        self._expt = None
+        self._sender = None
+
+    def attach_expt(self, expt):
+        """The experiment whose shots the traces belong to (shot index, file)."""
+        self._expt = expt
+
+    def push(self, scope, arr):
+        """One shot's traces, just read: into the run's file on the sender
+        thread (nothing here waits). ``arr`` is ``(channels, 2, points)``."""
+        expt = self._expt
+        if expt is None or not getattr(expt, "push_data_enabled", False):
+            return
+        try:
+            idx = expt.current_shot_index()
+            if self._sender is None:
+                self._sender = _ScopeSender(expt)
+            self._sender.enqueue(scope, arr, idx)
+        except Exception as e:
+            scope.push_failed = True
+            print(f"[{scope.label}] WARNING: could not queue a shot's traces: {e!r}")
 
     def close(self):
+        if self._sender is not None:
+            if not self._sender.flush(SCOPE_SENDER_FLUSH_S):
+                for scope in self.scopes:
+                    scope.push_failed = True        # END_RUN carries the traces
+                print(f"[ScopeData] WARNING: the trace sender did not finish within "
+                      f"{SCOPE_SENDER_FLUSH_S:.0f} s; the traces go with END_RUN.")
+            self._sender = None
         for scope in self.scopes:
             try:
                 scope.close()
@@ -76,38 +223,65 @@ class GenericWaxxScope():
         self.label = label
         self.device_id = self.handle_devid_input(device_id)
         self.scope_trace_taken_this_shot = False
-        self._data = []
+        self.traces = ScopeTraces()     # this run's traces, one time axis
         self._channels = []
         self._reshaped = False
+        self._full = None
+        # traces pushed into the run's file shot by shot (ScopeData.push)
+        self._t_pushed = False
+        self.pushed_any = False
+        self.push_failed = False
         
         self._scopedata.scopes.append(self)
 
         if not hasattr(self,'scope'):
             self.scope = Scope_Base()
 
-    def clear_data(self):
-        self._data = []
+    @property
+    def t_varies(self) -> bool:
+        """A shot's time axes differed from the first shot's: END_RUN sends
+        every shot's traces, axes included."""
+        return self.traces.t_varies
+
+    @property
+    def pushed_ok(self) -> bool:
+        """Every shot's traces are in the run's file already (END_RUN need
+        not carry them)."""
+        return self.pushed_any and not self.push_failed and not self.t_varies
+
+    def _store_sweep(self, arr):
+        """One shot's ``(channels, 2, points)`` traces: kept (one time axis for
+        the run) and pushed into the run's file."""
+        self.traces.store(arr)
         self._reshaped = False
+        if arr.ndim == 3:
+            self._scopedata.push(self, arr)
+
+    def clear_data(self):
+        self.traces.clear()
+        self._reshaped = False
+        self._full = None
 
     def data(self):
         if self._scopedata.xvardims != []:
-            self.reshape_data()
-        return np.asarray(self._data)
+            return self.reshape_data()
+        return self.traces.full()
 
     def close(self):
         self.scope.close()
 
     def reshape_data(self):
-        if self._data == []:
+        """``(*xvardims, channels, 2, points)``: every shot's t and v."""
+        if self.traces.n == 0:
             n_xvar_dims = len(self._scopedata.xvardims)
             print(f"[{self.label}] WARNING: reshape_data() called with no data — returning empty array.")
             return np.empty((0,) * (n_xvar_dims + 3))
         if not self._reshaped:
-            self._data = np.asarray(self._data)
-            Npts = np.array(self._data).shape[-1]
-            self._data = self._data.reshape(*self._scopedata.xvardims,self._data.shape[-3],2,Npts)
+            full = self.traces.full()
+            n_ch, npts = full.shape[1], full.shape[-1]
+            self._full = full.reshape(*self._scopedata.xvardims, n_ch, 2, npts)
             self._reshaped = True
-        return self._data
+        return self._full
 
     def handle_devid_input(self,device_id):
         default = (device_id == "")
@@ -144,12 +318,8 @@ class GenericWaxxScope():
         If k captures exist where 0 < k < n_shots, appends zero-filled copies
         of _data[0] until len(_data) == n_shots.
         """
-        n_captured = len(self._data)
-        if n_captured == 0 or n_captured >= n_shots:
-            return
-        zero_entry = np.zeros_like(np.asarray(self._data[0]))
-        while len(self._data) < n_shots:
-            self._data.append(zero_entry.copy())
+        self.traces.pad(n_shots)
+        self._reshaped = False
 
 class SiglentScope_SDS2104X(GenericWaxxScope):
     def __init__(self,device_id="",label="",arm=True,
@@ -187,7 +357,7 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
         self._scopedata._scope_trace_taken = True
         if np.any([ch not in range(4) for ch in channels]):
             raise ValueError('Invalid channel.')
-        shot = len(self._data)
+        shot = self.traces.n
         data = []
         for ch in range(4):
             if ch not in channels:
@@ -214,7 +384,8 @@ class SiglentScope_SDS2104X(GenericWaxxScope):
                     print(f"[SiglentScope read_sweep] ERROR shot {shot} ch={ch}: "
                           f"{e} -- no length to size a NaN placeholder; this "
                           f"run's traces will be ragged")
-        self._data.append(np.array(data))
+        # float32 from the start: what the file holds, at half the memory
+        self._store_sweep(np.asarray(data, dtype=np.float32))
         return True
 
 class TektronixScope_TBS1104(GenericWaxxScope):
@@ -262,5 +433,5 @@ class TektronixScope_TBS1104(GenericWaxxScope):
                 d[1] = sweeps[j][:,1] # data[idx][1] = sweeps[j][:,1]
                 data.append(d)
                 j += 1
-        self._data.append(np.array(data))
+        self._store_sweep(np.asarray(data, dtype=np.float32))
         return True
