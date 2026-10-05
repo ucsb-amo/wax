@@ -297,22 +297,60 @@ class HostDataContainer(DataContainer):
       HDF5 zeros masquerading as data;
     * filled with ``put_shot_data_host(idx, value)`` from host code.  The
       caller is responsible for locking against END_RUN serialization.
+
+    ``keep_run_data=False`` makes it *stream-only*: the experiment process
+    keeps no copy of the run's values at all. Each shot goes into the run's
+    file during the run (Expt.queue_shot_data -> liveOD PUT_DATA), liveOD
+    pre-allocates the dataset with ``fill_value``, and END_RUN never carries
+    it. ``_run_data`` is then a read-only zero-memory view of the fill value
+    with the run's full shape and dtype (for INIT_RUN's shapes), never a
+    real array; ``put_shot_data_host`` refuses. Camera streams use this:
+    9 diagnostic frames a shot held for the whole run were ~2.5 GB per
+    1000 shots in the experiment process.
     """
 
     def __init__(self, per_shot_data_shape, dtype, external_data_bool, expt,
-                 fill_value=0):
+                 fill_value=0, keep_run_data=True):
         super().__init__(per_shot_data_shape, dtype, external_data_bool, expt)
-        self._run_data = np.full(self._per_shot_data_shape, fill_value,
-                                 dtype=dtype)
         self._data_gotten = True
         self._fill_value = fill_value
+        self._keep_run_data = bool(keep_run_data)
+        self._run_data = self._fill_array(self._per_shot_data_shape)
         # True once a shot of it went into the run's file during the run
         # (Expt.push_shot_data): END_RUN then sends no copy of the array
         self._pushed = False
 
+    @property
+    def stream_only(self) -> bool:
+        """True: no in-memory copy; the run's file is the only store."""
+        return not self._keep_run_data
+
+    def _fill_array(self, shape):
+        if self._keep_run_data:
+            return np.full(shape, self._fill_value, dtype=self._dtype)
+        # every element is the one 0-d fill value (strides 0): no memory
+        # however big the shape, and writing to it raises
+        return np.broadcast_to(np.array(self._fill_value, dtype=self._dtype), shape)
+
+    def set_container_size(self):
+        if self._keep_run_data:
+            return super().set_container_size()
+        # the shape set_container_size + squeeze_axes give, without building it
+        xvd = [int(n) for n in self._expt.xvardims]
+        shape = xvd + list(self._per_shot_data_shape)
+        while len(shape) > len(xvd) and shape[-1] == 1:
+            shape.pop()
+        self._run_data = self._fill_array(tuple(shape))
+        self._cell_shape = tuple(shape[len(xvd):])
+
     def put_shot_data_host(self, idx, value):
         """Write one shot's value at xvar-counter index ``idx`` (tuple).
         Raises on a shape/dtype mismatch -- the caller records the failure."""
+        if not self._keep_run_data:
+            raise RuntimeError(
+                f"data container '{self.key}' is stream-only (keep_run_data=False): "
+                f"it keeps no values in this process; send a shot with "
+                f"Expt.queue_shot_data instead")
         self._run_data[tuple(idx)] = np.asarray(value).reshape(self._cell_shape)
 
 
@@ -412,16 +450,19 @@ class DataVault():
                                 per_shot_data_shape=(1,),
                                 dtype=np.float64,
                                 fill_value=0,
-                                external_data_bool=False) -> HostDataContainer:
+                                external_data_bool=False,
+                                keep_run_data=True) -> HostDataContainer:
         """A container host code fills during the run (``put_shot_data_host``);
         the kernel never sees it, so any numpy dtype and per-shot shape go
         (e.g. a uint8 camera frame). ``fill_value`` is what a shot that never
         got data reads back as (pick something data cannot be, e.g. -1 / NaN).
-        Assign the result to an attribute of ``self.data`` before
-        ``finish_prepare`` like any other container."""
+        ``keep_run_data=False``: stream-only, no copy kept in this process
+        (see HostDataContainer). Assign the result to an attribute of
+        ``self.data`` before ``finish_prepare`` like any other container."""
         return HostDataContainer(per_shot_data_shape, dtype,
                                  external_data_bool, self._expt,
-                                 fill_value=fill_value)
+                                 fill_value=fill_value,
+                                 keep_run_data=keep_run_data)
 
     def init(self):
         self.write_keys()

@@ -1260,6 +1260,24 @@ class AtomdataVault(atomdata_base):
                 stacklevel=3,
             )
 
+        # per-shot auxiliary frames a run could not get into its file
+        aux_by_run = {int(c.run_info.run_id): dict(getattr(c, 'aux_frames_dropped', {}) or {})
+                      for c in chunks}
+        self.aux_frames_dropped_by_run = aux_by_run
+        self.aux_frames_dropped = getattr(first, 'aux_frames_dropped', {})
+        with_drops = sorted(
+            rid for rid, rec in aux_by_run.items()
+            if 'unreadable' in rec or any(
+                (t.get('dropped') or t.get('clears_failed'))
+                for t in (rec.get('keys') or {}).values() if isinstance(t, dict)))
+        if with_drops:
+            warnings.warn(
+                "AtomdataVault: in run(s) " + ", ".join(str(r) for r in with_drops)
+                + " some per-shot auxiliary frames never reached the file (those slots "
+                "hold the fill value). See vault.aux_frames_dropped_by_run.",
+                stacklevel=3,
+            )
+
     def _warn_param_mismatches(self, chunks):
         """Emit a single warning summarizing fixed-param disagreements
         across chunks (excluding the scanned xvar itself) and record the
@@ -2394,6 +2412,7 @@ class AtomdataVault(atomdata_base):
         ad_out.image_timestamps = self.image_timestamps
         ad_out.experiment_code = getattr(self, 'experiment_code', None)
         ad_out.camera_overrides = getattr(self, 'camera_overrides', {})
+        ad_out.aux_frames_dropped = getattr(self, 'aux_frames_dropped', {})
 
         ad_out.params = copy.deepcopy(self.params)
         ad_out.p = ad_out.params

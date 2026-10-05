@@ -192,7 +192,16 @@ class DataSaver():
         create_image_dataset(data, 'images', data=expt.images)
         data.create_dataset('image_timestamps',data=expt.image_timestamps)
         for key in expt.data.keys:
-            this_data = vars(expt.data)[key]._run_data
+            this_dc = vars(expt.data)[key]
+            this_data = this_dc._run_data
+            if getattr(this_dc, 'stream_only', False):
+                # a zero-memory view of the fill (no copy kept in the
+                # experiment process): the dataset is made from shape and
+                # fill, never by materializing the view
+                create_image_dataset(data, key, shape=this_data.shape,
+                                     dtype=this_data.dtype,
+                                     fillvalue=this_dc._fill_value)
+                continue
             create_image_dataset(data, key, data=this_data)
 
         if expt.sort_idx:
@@ -223,6 +232,10 @@ class DataSaver():
         f = h5File
         for key in expt.data.keys:
             this_dc = vars(expt.data)[key]
+            if getattr(this_dc, 'stream_only', False):
+                # nothing kept in memory to save: the file holds what it holds
+                # (its fill, made in create_data_file)
+                continue
             if this_dc._external_data_bool:
                 # overwrite with data from hdf5 in case populated by a process outside expt
                 this_data = f['data'][key][...]

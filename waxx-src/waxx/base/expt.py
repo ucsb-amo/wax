@@ -1,5 +1,6 @@
 import numpy as np
 from pathlib import Path
+import json
 import os
 import threading
 import time
@@ -18,6 +19,7 @@ from artiq.language.core import kernel_from_string, now_mu, TerminationRequested
 
 from waxx.config.data_vault import DataVault
 from waxx.base.scanner import Scanner, WRITE_FAILURES
+from waxx.base.shot_data_queue import ShotDataQueue, NO_PUT_DATA
 from waxx.control.misc.oscilloscopes import ScopeData
 from waxx.util.artiq.async_print import aprint
 from waxx.util import console
@@ -31,6 +33,9 @@ T_ABORT_EXIT_HANG_DUMP = 30.
 # The same after a normal end(). Exit may wait up to 20 s for the run-done
 # mail (waxx.util.notifications._EXIT_WAIT_S), so this is longer.
 T_END_EXIT_HANG_DUMP = 60.
+
+# makes Expt.shot_data_queue once when stream workers ask for it together
+_SHOT_QUEUE_LOCK = threading.Lock()
 
 
 def _arm_exit_hang_dump(seconds=T_ABORT_EXIT_HANG_DUMP, announce=True):
@@ -103,6 +108,9 @@ class Expt(Scanner, Dealer, Scribe):
         self._push_failed = set()               # keys END_RUN must carry after all
         self._n_pushed = 0
         self._n_push_failed = 0
+        # stream-only containers' shots on their way to liveOD (queue_shot_data);
+        # made on first use
+        self._shot_queue = None
         # Per-shot auxiliary camera clients (waxx.control.cameras
         # .camera_stream_client); each registers itself here and is drained /
         # closed in end_wax. Host-only: never touched by kernel code.
@@ -420,6 +428,9 @@ class Expt(Scanner, Dealer, Scribe):
         # closes the stream. finish() never raises by contract; the guard is
         # belt and braces so a broken client cannot cost the run's data.
         self._finish_camera_streams()
+        # what the streams queued and liveOD never took is counted here, and
+        # recorded (aux_frames_dropped) before END_RUN is built
+        self._close_shot_data_queue()
         _t_streams = time.monotonic() - _t0
 
         self.cleanup_scanned()
@@ -542,6 +553,13 @@ class Expt(Scanner, Dealer, Scribe):
     # the slot it has once the run is unshuffled. END_RUN then carries no copy
     # of that container. A container that was never pushed and is big goes in
     # PUT_DATA slices just before END_RUN; what is left in END_RUN is small.
+    #
+    # Stream-only containers (camera streams' frames; HostDataContainer with
+    # keep_run_data=False) have no copy in this process at all: each shot
+    # goes through one bounded queue (queue_shot_data, waxx.base
+    # .shot_data_queue) whose sender thread pushes it. What the queue could
+    # not deliver is counted, never resent at the end, and recorded in the
+    # file's aux_frames_dropped attribute; those slots keep liveOD's fill.
 
     # a container bigger than this that was not pushed during the run is
     # pushed in slices before END_RUN rather than carried inside it
@@ -549,6 +567,14 @@ class Expt(Scanner, Dealer, Scribe):
     PUT_DATA_SLICE_BYTES = 48 * 1024 * 1024
     # every auxiliary camera stream's finish() runs at once; this is the wait
     T_STREAM_FINISH_S = 90.
+    # the stream-only shot queue holds at most this much waiting for liveOD;
+    # an item that would go over it is dropped (and counted)
+    PUSH_QUEUE_MAX_BYTES = 50 * 1024 * 1024
+    # a queued item liveOD refuses is tried this many more times
+    PUSH_QUEUE_RETRIES = 2
+    # after the streams finished (each drained the queue), the queue gets
+    # this long more before what is left is recorded as not sent
+    T_PUSH_QUEUE_CLOSE_S = 5.
 
     def current_shot_index(self):
         """The scan counters of the shot in progress, one per xvar."""
@@ -630,13 +656,161 @@ class Expt(Scanner, Dealer, Scribe):
             print(f"[push] liveOD did not take pushed data ({why}); it goes with "
                   f"END_RUN instead.")
 
+    # ---- the stream-only shot queue ----------------------------------------
+
+    @property
+    def shot_data_queue(self) -> ShotDataQueue:
+        """The run's one queue for stream-only containers (made on first use)."""
+        q = getattr(self, "_shot_queue", None)
+        if q is None:
+            with _SHOT_QUEUE_LOCK:
+                q = getattr(self, "_shot_queue", None)
+                if q is None:
+                    q = ShotDataQueue(self._push_queued, self.PUSH_QUEUE_MAX_BYTES,
+                                      retries=self.PUSH_QUEUE_RETRIES)
+                    self._shot_queue = q
+        return q
+
+    def queue_shot_data(self, items, idx=None, on_done=None) -> bool:
+        """Queue one shot's value of each stream-only container in ``items``
+        (``[(dc, value), ...]``, one PUT_DATA message) for the run's file, at
+        the shot's final slot; ``idx`` is the shot's scan-counter index (the
+        shot in progress when None). Returns at once: True when queued.
+        ``on_done(ok, reason)`` gets the outcome (waxx.base.shot_data_queue)
+        -- ok only once liveOD has taken it. Never raises; any host thread."""
+        return self._queue_shot_specs(items, idx, on_done, clear=False)
+
+    def queue_shot_clear(self, containers, idx, on_done=None) -> bool:
+        """Queue a reset of the shot's slot in each container to its fill
+        value (a warm-up / duplicate shot starting the slot over: the frame
+        the earlier request sent must not stay there). Behind everything
+        queued before it; never dropped for room."""
+        try:
+            items = [(dc, np.full(dc._cell_shape, dc._fill_value, dtype=dc._run_data.dtype))
+                     for dc in containers]
+        except Exception as e:
+            print(f"[push] !! could not build a slot clear for "
+                  f"{[getattr(dc, 'key', '?') for dc in containers]} ({e!r})")
+            if on_done is not None:
+                on_done(False, "clear_error")
+            return False
+        return self._queue_shot_specs(items, idx, on_done, clear=True)
+
+    def _queue_shot_specs(self, items, idx, on_done, clear):
+        try:
+            if idx is None:
+                idx = self.current_shot_index()
+            final = self.final_shot_index(idx)
+            specs = [{"key": dc.key, "index": final, "array": value,
+                      "full_shape": dc._run_data.shape,
+                      "fill": getattr(dc, "_fill_value", None)}
+                     for dc, value in items]
+            q = self.shot_data_queue
+            if not self.push_data_enabled:
+                self._warn_no_put_data()
+                q.drop(specs, NO_PUT_DATA, on_done=on_done, clear=clear)
+                return False
+            return q.put(specs, on_done=on_done, clear=clear)
+        except Exception as e:
+            print(f"[push] !! could not queue shot data "
+                  f"{[getattr(dc, 'key', '?') for dc, _ in items]} ({e!r})")
+            if on_done is not None:
+                try:
+                    on_done(False, "queue_error")
+                except Exception:
+                    pass
+            return False
+
+    def _warn_no_put_data(self):
+        if getattr(self, "_no_put_data_warned", False):
+            return
+        self._no_put_data_warned = True
+        why = ("this run has no liveOD client" if getattr(self, "live_od_client", None) is None
+               else "this liveOD takes no PUT_DATA (an older liveOD: restart it from "
+                    "the current code)")
+        print(f"[push] !! {why}: stream-only per-shot data (auxiliary / diagnostic "
+              f"camera frames) is NOT saved this run; every such frame is counted as "
+              f"dropped ({NO_PUT_DATA}) in the stream's record and in aux_frames_dropped.")
+
+    def _push_queued(self, specs) -> bool:
+        """The shot queue's push: True, or raises saying why (the queue
+        retries, counts and reports; nothing falls back to END_RUN)."""
+        try:
+            reply = self.live_od_client.put_data(specs)
+        except Exception:
+            self._n_push_failed += 1
+            raise
+        if not reply.get("ok"):
+            self._n_push_failed += 1
+            raise RuntimeError(f"liveOD refused it: {reply.get('error', 'refused')}")
+        self._n_pushed += len(specs)
+        return True
+
+    def drain_shot_data(self, timeout) -> bool:
+        """Wait up to ``timeout`` s for every queued shot to have its outcome.
+        True when the queue is empty (or was never used)."""
+        q = getattr(self, "_shot_queue", None)
+        return True if q is None else q.drain(timeout)
+
+    def _stream_only_keys(self):
+        try:
+            return [k for k in self.data.keys
+                    if getattr(vars(self.data)[k], "stream_only", False)]
+        except Exception:
+            return []
+
+    def _close_shot_data_queue(self):
+        """After the streams finished: close the queue (what is still in it
+        is recorded as not sent), let the streams correct their records for
+        any outcome that came after they wrote them, and write
+        ``aux_frames_dropped`` -- whenever the run has stream-only data, with
+        zeros too, so its absence means "no queue", never "no drops"."""
+        keys = self._stream_only_keys()
+        if getattr(self, "_shot_queue", None) is None and not keys:
+            return
+        try:
+            q = self.shot_data_queue
+            q.ensure_keys(keys)
+            left = q.close(self.T_PUSH_QUEUE_CLOSE_S)
+            if any(left.values()):
+                print(f"[push] !! the shot-data queue still held data at the end: "
+                      f"{left} -- not sent; those slots keep their fill value")
+            for cs in list(getattr(self, "camera_streams", ())):
+                refresh = getattr(cs, "refresh_after_queue_close", None)
+                if refresh is not None:
+                    try:
+                        refresh()
+                    except Exception as e:
+                        print(f"[push] WARNING: could not update stream "
+                              f"'{getattr(cs, 'key', '?')}''s record ({e!r})")
+            report = q.report()
+            self._extra_file_texts["aux_frames_dropped"] = json.dumps(report)
+            lost = {k: t for k, t in report["keys"].items()
+                    if t["dropped"] or t["clears_failed"]}
+            if lost:
+                parts = []
+                for k, t in sorted(lost.items()):
+                    s = f"{k}: {t['dropped']} dropped {t['reasons']}"
+                    if t["clears_failed"]:
+                        s += (f", {t['clears_failed']} slot clears NOT sent (an earlier "
+                              f"frame may remain at {t['first_clear_failed_slots']})")
+                    parts.append(s)
+                print(f"[push] !! per-shot data that never reached the run's file "
+                      f"(slots keep their fill value; see the aux_frames_dropped "
+                      f"attribute): " + "; ".join(parts))
+        except Exception as e:
+            print(f"[push] !! WARNING: closing the shot-data queue failed ({e!r}); "
+                  f"aux_frames_dropped may be missing or incomplete")
+
     def _push_whole_container(self, dc) -> bool:
         """A big container END_RUN would otherwise carry: unshuffled here and
-        pushed in slices along its first axis. True when it all went."""
+        pushed in slices along its first axis. True when it all went. Its
+        in-memory copy is complete, so this also covers a container a per-shot
+        push failed for. Never for a stream-only container (no copy here)."""
         key = getattr(dc, "key", "")
         arr = dc._run_data
         if (not self.push_data_enabled or not getattr(self.run_info, "save_data", False)
-                or key in self._push_failed
+                or getattr(dc, "stream_only", False)
                 or not isinstance(arr, np.ndarray) or arr.ndim == 0
                 or arr.nbytes <= self.BULK_PUSH_BYTES
                 or not getattr(dc, "_data_gotten", False)
@@ -656,6 +830,8 @@ class Expt(Scanner, Dealer, Scribe):
                 self._push_failed.add(key)
                 return False
         dc._pushed = True
+        # every slot was just (re)written from the complete copy
+        self._push_failed.discard(key)
         return True
 
     def _finish_camera_streams(self):
@@ -782,6 +958,14 @@ class Expt(Scanner, Dealer, Scribe):
         dv = {}
         for key in self.data.keys:
             dc = vars(self.data)[key]
+            if getattr(dc, 'stream_only', False):
+                # Never carried: there is no copy here (its _run_data is a
+                # zero-memory view of the fill). Its shots went in during the
+                # run; a slot that did not get one keeps liveOD's pre-allocated
+                # fill, and aux_frames_dropped says which and why.
+                dv[key] = {'data': None, 'data_gotten': True,
+                           'external': True, 'final_order': True}
+                continue
             pushed = bool(getattr(dc, '_pushed', False)) and key not in self._push_failed
             if not pushed:
                 pushed = self._push_whole_container(dc)

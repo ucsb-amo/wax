@@ -1,7 +1,10 @@
 """Offline tests for waxx.control.cameras.camera_stream_client.
 
 No network, no UDP, no servers: the client is constructed with the _stream /
-_server_defaults test hooks, and the fake expt carries a real DataVault.
+_server_defaults test hooks, and the fake expt carries a real DataVault and
+Expt's real shot queue, whose PUT_DATA goes to an in-memory stand-in for the
+run's file (FakePutData). Stream containers are stream-only: the frames are
+read back from that stand-in (F / M), never from the containers.
 """
 import json
 import threading
@@ -79,7 +82,54 @@ class FakeCore:
         return float(mu) * 1e-9
 
 
+class FakePutData:
+    """liveOD's PUT_DATA as the run's file sees it: each key's dataset made
+    at its full_shape with its fill on first use, written at each index.
+    ``refuse(specs)`` -> True makes liveOD refuse that message."""
+
+    def __init__(self):
+        self.arrays = {}
+        self.calls = []
+        self.history = []           # (key, index, array) of every write taken
+        self.refuse = None
+        self.enabled = True
+        self._lock = threading.Lock()
+
+    def supports(self, feature):
+        return self.enabled and feature == "put_data"
+
+    def put_data(self, specs):
+        with self._lock:
+            self.calls.append([(s["key"], tuple(s["index"])) for s in specs])
+            if self.refuse is not None and self.refuse(specs):
+                return {"ok": False, "error": "refused (test)"}
+            for s in specs:
+                arr = np.asarray(s["array"])
+                self.history.append((s["key"], tuple(s["index"]), arr.copy()))
+                if s["key"] not in self.arrays:
+                    self.arrays[s["key"]] = np.full(s["full_shape"], s["fill"],
+                                                    dtype=arr.dtype)
+                self.arrays[s["key"]][tuple(s["index"])] = arr
+            return {"ok": True}
+
+
+def _expt_methods():
+    """Expt's real queue / push methods, to bind onto a fake expt."""
+    from waxx.base.expt import Expt
+    names = ("current_shot_index", "final_shot_index", "push_data_enabled",
+             "shot_data_queue", "queue_shot_data", "queue_shot_clear",
+             "_queue_shot_specs", "_warn_no_put_data", "_push_queued",
+             "drain_shot_data", "_stream_only_keys", "_close_shot_data_queue",
+             "push_shot_data", "push_raw", "_push", "_note_push_failure",
+             "_push_whole_container", "_serialize_end_payload",
+             "PUSH_QUEUE_MAX_BYTES", "PUSH_QUEUE_RETRIES", "T_PUSH_QUEUE_CLOSE_S",
+             "BULK_PUSH_BYTES", "PUT_DATA_SLICE_BYTES")
+    return {n: vars(Expt)[n] for n in names}
+
+
 class FakeExpt:
+    locals().update(_expt_methods())
+
     def __init__(self, xvardims=(4,)):
         self.core = FakeCore()
         self.data = DataVault(expt=self)
@@ -88,15 +138,29 @@ class FakeExpt:
         self.camera_streams = []
         self._extra_file_texts = {}
         self.setup_camera = False
+        self.sort_idx, self.sort_N = [], []
+        self.run_info = SimpleNamespace(save_data=True)
+        self.live_od_client = FakePutData()
+        self._shot_queue = None
+        self._push_failed = set()
+        self._n_pushed = self._n_push_failed = 0
 
 
 DEFAULTS = {"exposure_time": 19e-6, "gain": 0.0, "trigger_mode": "Off",
             "roi": [2, 3, 7, 9]}
 
 
+def F(fe, key):
+    """``key`` as the run's file holds it: what was pushed, else the fill
+    liveOD pre-allocated (the container's zero-memory view, read only)."""
+    fe.drain_shot_data(5.0)
+    got = fe.live_od_client.arrays.get(key)
+    return got if got is not None else np.array(fe.data.__dict__[key]._run_data)
+
+
 def M(fe, key, field):
     """The META_FIELDS column ``field`` of ``<key>_meta``, shaped (*xvardims,)."""
-    return fe.data.__dict__[key + "_meta"]._run_data[..., META_FIELDS.index(field)]
+    return F(fe, key + "_meta")[..., META_FIELDS.index(field)]
 
 
 def make_client(fe=None, stream=None, defaults=DEFAULTS, **kw):
@@ -113,6 +177,7 @@ def wait_drained(cs, timeout=5.0):
     while (not cs._queue.empty() or cs._busy) and time.monotonic() < deadline:
         time.sleep(0.01)
     time.sleep(0.05)
+    cs._expt.drain_shot_data(timeout)       # and the shot queue delivered it
 
 
 def test_construction_applies_defaults_and_crops():
@@ -165,8 +230,36 @@ def test_host_containers_stay_out_of_kernel_lists():
         assert fe.data.img_test._run_data.shape == (4, 6, 5)
         assert fe.data.img_test_meta._run_data.shape == (4, N_META)
         assert np.isnan(fe.data.img_test_meta._run_data).all()
-        # END_RUN saves host containers (data_gotten True from birth)
+        # stream-only: the shape is a view of one fill value, no frames kept
+        for key in ("img_test", "img_test_meta"):
+            dc = getattr(fe.data, key)
+            assert dc.stream_only and dc._run_data.strides == (0,) * dc._run_data.ndim
         assert fe.data.img_test._data_gotten
+    finally:
+        cs.finish()
+
+
+def test_duplicate_request_queues_a_clear_ahead_of_the_new_frame():
+    """A warm-up shot's frame already in the file is cleared before the
+    real shot's frame goes in, in that order; the real frame then wins."""
+    fe, stream, cs = make_client()
+    fe.data.init()
+    try:
+        cs.request_snap_mu(0, 0.0)
+        wait_drained(cs)
+        first_seq = M(fe, "img_test", "seq")[0]
+        cs.request_snap_mu(0, 0.0)
+        wait_drained(cs)
+        calls = [c for c in fe.live_od_client.calls]
+        # frame, then clear, then the new frame: all for slot 0
+        assert len(calls) == 3 and all(c[0] == ("img_test", (0,)) for c in calls)
+        seqs = [a[0] for k, i, a in fe.live_od_client.history if k == "img_test_meta"]
+        assert seqs[0] == first_seq and np.isnan(seqs[1]) and seqs[2] > first_seq
+        frames = [a for k, i, a in fe.live_od_client.history if k == "img_test"]
+        assert np.all(frames[1] == 0) and np.all(frames[2] == 7)
+        assert cs.counts["slot_clears_sent"] == 1 and cs.counts["duplicate"] == 1
+        assert M(fe, "img_test", "seq")[0] > first_seq
+        assert cs._n_missing() == 0
     finally:
         cs.finish()
 
@@ -183,7 +276,7 @@ def test_per_shot_capture_lands_at_counter_index():
         assert seq[0] > 0
         assert np.isnan(seq[1])
         assert seq[2] > seq[0]
-        assert np.all(fe.data.img_test._run_data[0] == 7)
+        assert np.all(F(fe, "img_test")[0] == 7)
         assert np.isfinite(M(fe, "img_test", "t")[0])
         assert np.isfinite(M(fe, "img_test", "t_target")[0])
         assert M(fe, "img_test", "exposure")[0] == 19e-6
@@ -231,8 +324,10 @@ def test_duplicate_request_clears_slot():
         wait_drained(cs)
         assert cs.counts["duplicate"] == 1
         assert np.isnan(M(fe, "img_test", "seq")[0])   # cleared, not stale
-        assert np.all(fe.data.img_test._run_data[0] == 0)
+        assert np.all(F(fe, "img_test")[0] == 0)
         assert cs.counts["failed"] == 1
+        # the slot is missing (the first frame was cleared, the second failed)
+        assert cs._n_missing() == 1
     finally:
         cs.finish()
 
@@ -463,7 +558,7 @@ def test_no_saved_roi_downsample_fallback():
         cs.request_snap_mu(0, 0.0)
         wait_drained(cs)
         assert fe.data.img_test._run_data.shape == (4, 5, 6)
-        assert np.all(fe.data.img_test._run_data[0] == 7)
+        assert np.all(F(fe, "img_test")[0] == 7)
     finally:
         cs.finish()
     rec = json.loads(fe._extra_file_texts["camera_stream_img_test"])
@@ -603,6 +698,7 @@ def wait_settled(cs, timeout=5.0):
     while cs._inflight() and time.monotonic() < deadline:
         time.sleep(0.01)
     time.sleep(0.1)
+    cs._expt.drain_shot_data(timeout)       # and the shot queue delivered it
 
 
 def test_triggered_construction_leaves_camera_waiting_for_trigger():
@@ -642,8 +738,8 @@ def test_triggered_frames_land_at_their_shot():
             wait_settled(cs)
         seq = M(fe, "img_test", "seq")
         assert seq[0] > 0 and np.isnan(seq[1]) and seq[2] > seq[0]
-        assert np.all(fe.data.img_test._run_data[0] == 9)
-        assert np.all(fe.data.img_test._run_data[1] == 0)
+        assert np.all(F(fe, "img_test")[0] == 9)
+        assert np.all(F(fe, "img_test")[1] == 0)
         hw = M(fe, "img_test", "hw_idx")
         assert hw[2] == hw[0] + 1
         assert M(fe, "img_test", "hw_ts")[0] > 0
@@ -761,8 +857,8 @@ def test_triggered_two_keys_two_frames_per_shot():
         cs.announce_trigger_mu(0, 1)
         stream.edge(value=2)
         wait_settled(cs)
-        assert np.all(fe.data.img_a._run_data[1] == 1)
-        assert np.all(fe.data.img_b._run_data[1] == 2)
+        assert np.all(F(fe, "img_a")[1] == 1)
+        assert np.all(F(fe, "img_b")[1] == 2)
         assert M(fe, "img_b", "seq")[1] == M(fe, "img_a", "seq")[1] + 1
         assert np.isnan(M(fe, "img_a", "seq")[0])
         assert cs._n_missing() == 0
@@ -771,8 +867,8 @@ def test_triggered_two_keys_two_frames_per_shot():
         stream.edge(value=3)
         wait_settled(cs)
         assert cs.counts["bad_frame_index"] == 1
-        assert np.all(fe.data.img_a._run_data[1] == 1)
-        assert np.all(fe.data.img_b._run_data[1] == 2)
+        assert np.all(F(fe, "img_a")[1] == 1)
+        assert np.all(F(fe, "img_b")[1] == 2)
         # a second announcement of the same frame slot (a warm-up shot)
         # clears only that slot
         cs.announce_trigger_mu(0, 0)
@@ -800,8 +896,8 @@ def test_triggered_pairing_follows_expected_time_not_announcement_order():
         time.sleep(0.3)
         stream.edge(value=6)
         wait_settled(cs)
-        assert np.all(fe.data.img_early._run_data[0] == 5)
-        assert np.all(fe.data.img_late._run_data[0] == 6)
+        assert np.all(F(fe, "img_early")[0] == 5)
+        assert np.all(F(fe, "img_late")[0] == 6)
         assert cs._n_missing() == 0
     finally:
         cs.finish()
@@ -829,10 +925,10 @@ def test_siblings_on_a_shared_line_discard_each_others_frames():
         sb.edge(value=2)
         wait_settled(a)
         wait_settled(b)
-        assert np.all(fe.data.img_a._run_data[0] == 1)
+        assert np.all(F(fe, "img_a")[0] == 1)
         assert np.isnan(M(fe, "img_a", "seq")[1])
         assert np.isnan(M(fe, "img_b", "seq")[0])
-        assert np.all(fe.data.img_b._run_data[1] == 2)
+        assert np.all(F(fe, "img_b")[1] == 2)
         assert a.counts["sibling_frames_discarded"] == 1
         assert b.counts["sibling_frames_discarded"] == 1
         assert a._n_missing() == 0 and b._n_missing() == 0
@@ -844,7 +940,7 @@ def test_siblings_on_a_shared_line_discard_each_others_frames():
         sa.edge(value=3)                 # B misses its (unwanted) frame
         wait_settled(a)
         wait_settled(b)
-        assert np.all(fe.data.img_a._run_data[2] == 3)
+        assert np.all(F(fe, "img_a")[2] == 3)
         assert b._n_missing() == 0 and b.counts["failed"] == 0
         assert b.counts.get("sibling_frame_no_frame") == 1
     finally:
@@ -942,7 +1038,7 @@ def test_per_frame_settings_applied_before_the_edge_and_recorded():
         assert cs._rev == stream.rev
         stream.edge(value=2)
         wait_settled(cs)
-        assert np.all(fe.data.img_bright._run_data[0] == 2)
+        assert np.all(F(fe, "img_bright")[0] == 2)
         assert M(fe, "img_bright", "exposure")[0] == 2e-3
         assert M(fe, "img_bright", "gain")[0] == 20.
         assert M(fe, "img_dim", "exposure")[0] == 19e-6
@@ -1035,7 +1131,7 @@ def test_per_frame_settings_too_late_frame_kept_and_flagged():
         stream.edge(value=4)
         wait_settled(cs)
         assert len(stream.set_calls) == n_sets     # nothing applied
-        assert np.all(fe.data.img_bright._run_data[0] == 4)
+        assert np.all(F(fe, "img_bright")[0] == 4)
         assert M(fe, "img_bright", "exposure")[0] == 19e-6   # the truth
         assert cs.counts["frame_settings_late"] == 1
     finally:

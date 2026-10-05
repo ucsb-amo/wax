@@ -19,6 +19,15 @@ Two kinds:
   frame the server publishes. Streams on a shared TTL are siblings: every
   edge is announced to all of them, and each keeps only its own frames.
 
+Frames are not kept in the experiment process: the containers are
+stream-only (``keep_run_data=False``), and each frame goes with its record
+into the run's file during the run through the experiment's bounded shot
+queue (``Expt.queue_shot_data``; waxx.base.shot_data_queue). A frame counts
+as ``ok`` only once liveOD has taken it; one the queue could not deliver
+(full, liveOD refusing, no PUT_DATA, left at the end) is counted as failed
+with its reason, and its slot keeps the fill (zeros, NaN record). Nothing is
+resent with END_RUN.
+
 Neither ever raises into the run: a frame that fails or goes missing is
 counted, kept in the provenance record (``camera_stream_<key>``) and printed
 at the end. Settings come from the camera's saved beacon-server defaults,
@@ -58,6 +67,9 @@ FRAME_SETTING_KEYS = ("exposure_time", "gain")
 TRIGGER_KEYS = ("trigger_mode", "trigger_source")
 # finish() waits this long for the worker thread before closing the stream
 WORKER_JOIN_S = 6.0
+# finish() waits this long for the shot queue to deliver what is in it
+# before writing the record (well inside Expt.T_STREAM_FINISH_S)
+T_QUEUE_DRAIN_S = 30.0
 # the provenance record keeps at most this many events, and per kind
 MAX_EVENTS = 100
 MAX_EVENTS_PER_KIND = 5
@@ -203,15 +215,21 @@ class CameraStreamClient:
         self._t_late_tolerance = float(t_late_tolerance)
         self._live_od_client = live_od_client
 
-        self._lock = threading.Lock()
+        # reentrant: a shot-queue outcome can come back on the thread that
+        # queued it (dropped at once), while that thread holds the lock
+        self._lock = threading.RLock()
         self._queue = queue.Queue()
         self._stop = threading.Event()
         self._finished = False
         self._busy = False
+        # ok = frames liveOD took (the slot's frame is in the run's file)
         self.counts = {"requested": 0, "ok": 0, "failed": 0, "late": 0,
                        "duplicate": 0, "rpc_errors": 0}
         self.events = []
-        self._req_count = {}        # scan point -> times requested
+        self._req_count = {}        # slot -> times requested (the slot's generation)
+        self._slot_ok = {}          # slot -> its current request's frame is in the file
+        self._provenance_written = False
+        self._late_outcomes = 0     # queue outcomes after the record was written
         self._rev = None            # the settings revision our frames need
         self._priors = {}           # settings to put back at the end
         self._applied = {}          # readback of what we set
@@ -285,11 +303,12 @@ class CameraStreamClient:
                 n = self._req_count.get(idx, 0) + 1
                 self._req_count[idx] = n
                 self.counts["requested"] += 1
+                self._slot_ok[idx] = False
                 if n > 1:        # a warm-up shot or a double grab: start over
                     self._clear_slot_locked(idx)
             if n > 1:
                 self._note("duplicate", idx=list(idx), count=n)
-            self._queue.put_nowait((idx, target))
+            self._queue.put_nowait((idx, target, n))
         except Exception as e:
             self._note("rpc_errors", error=repr(e))
 
@@ -326,10 +345,13 @@ class CameraStreamClient:
 
     def _register_containers(self):
         d = self._expt.data
+        # stream-only: no copy of the run's frames in this process
         self.dc = d.add_host_data_container(self._frame_shape,
-                                            dtype=self._frame_dtype, fill_value=0)
+                                            dtype=self._frame_dtype, fill_value=0,
+                                            keep_run_data=False)
         self.dc_meta = d.add_host_data_container((N_META,), np.float64,
-                                                 fill_value=np.nan)
+                                                 fill_value=np.nan,
+                                                 keep_run_data=False)
         setattr(d, self.key, self.dc)
         setattr(d, self.key + "_meta", self.dc_meta)
 
@@ -489,45 +511,75 @@ class CameraStreamClient:
             self.counts["failed"] += 1
         self._note(reason, idx=list(idx), **fields)
 
-    def _store(self, dc, dc_meta, idx, img, frame, t_target, **more):
-        """Write one frame and its record; True when stored."""
+    def _store(self, dc, dc_meta, idx, img, frame, t_target, slot=None, gen=None,
+               **more):
+        """Queue one frame and its record for the run's file (one message);
+        True when queued. ``slot`` / ``gen``: the request it answers -- a
+        frame whose slot was requested again since (a warm-up shot) is not
+        queued, so it cannot land after that slot's clear. Whether it reached
+        the file comes later, to _on_pushed."""
         settings = getattr(frame, "settings", None) or {}
         row = meta_row(seq=frame.seq, t=frame.t_mono, t_target=t_target,
                        hw_ts=getattr(frame, "hw_ts", None),
                        hw_idx=getattr(frame, "hw_idx", None),
                        exposure=settings.get("exposure_time"),
                        gain=settings.get("gain"))
+        slot = idx if slot is None else slot
         with self._lock:
             if self._finished:
                 error = "finished"
+            elif gen is not None and self._req_count.get(slot) != gen:
+                error = "superseded"
             else:
-                try:
-                    dc.put_shot_data_host(idx, img)
-                    dc_meta.put_shot_data_host(idx, row)
-                    self.counts["ok"] += 1
-                    error = None
-                except Exception as e:
-                    error = repr(e)
+                error = None
+                # under the lock, so a re-request's clear cannot slip ahead
+                # of it; returns at once (the network is the queue's thread)
+                done = (lambda ok, reason, _s=slot, _g=gen, _i=idx, _m=more:
+                        self._on_pushed(_s, _g, _i, ok, reason, _m))
+                self._expt.queue_shot_data([(dc, img), (dc_meta, row)], idx=idx,
+                                           on_done=done)
         if error == "finished":
             self._note("frame_after_finish", idx=list(idx), **more)
-        elif error is not None:
-            self._fail(idx, "store_failed", error=error, **more)
-        elif getattr(self._expt, "push_data_enabled", False):
-            # into the run's file now (this thread; the kernel never waits):
-            # the frame and its record go in one message
-            if self._expt.push_shot_data([(dc, img), (dc_meta, row)], idx=idx):
-                self._note("pushed")
-            else:
-                self._note("push_failed", idx=list(idx))
+        elif error == "superseded":
+            # its request was replaced by a later one for the same slot
+            self._note("superseded_frames", idx=list(idx), **more)
         return error is None
 
+    def _on_pushed(self, slot, gen, idx, ok, reason, more):
+        """The shot queue's outcome for one frame (any thread)."""
+        with self._lock:
+            if ok:
+                self.counts["ok"] += 1
+                if gen is None or self._req_count.get(slot) == gen:
+                    self._slot_ok[slot] = True
+            if self._provenance_written:
+                self._late_outcomes += 1
+        if not ok:
+            self._fail(idx, str(reason or "push_failed"), **more)
+
     def _clear_slot_locked(self, idx):
-        """Reset a scan point to "no frame" (caller holds the lock)."""
+        """Start a scan point over as "no frame" (caller holds the lock):
+        a clear goes to the run's file behind anything already queued for
+        it, so a frame the earlier request sent does not stay there."""
+        self._queue_clear(idx, [self.dc, self.dc_meta])
+
+    def _queue_clear(self, idx, containers, **more):
+        done = (lambda ok, reason, _i=idx, _m=more:
+                self._on_cleared(_i, ok, reason, _m))
         try:
-            self.dc._run_data[tuple(idx)] = 0
-            self.dc_meta._run_data[tuple(idx)] = np.nan
-        except Exception:
-            pass
+            self._expt.queue_shot_clear(containers, idx=idx, on_done=done)
+        except Exception as e:
+            self._on_cleared(idx, False, f"clear_error: {e!r}", more)
+
+    def _on_cleared(self, idx, ok, reason, more):
+        if ok:
+            self._note("slot_clears_sent")
+        elif reason == "no_put_data":
+            # nothing of this run reaches the file: no earlier frame there
+            self._note("slot_clears_not_needed")
+        else:
+            # the earlier request's frame may still be in this slot
+            self._note("slot_clears_failed", idx=list(idx), reason=reason, **more)
 
     def _check_shape(self, idx, img, **more):
         if tuple(img.shape) == self._frame_shape and img.dtype == self._frame_dtype:
@@ -563,7 +615,7 @@ class CameraStreamClient:
             except Exception:
                 pass
 
-    def _serve(self, idx, target):
+    def _serve(self, idx, target, gen=None):
         t_fire = target - self._t_snap_lead
         while not self._stop.is_set() and time.monotonic() < t_fire:
             time.sleep(min(t_fire - time.monotonic(), 0.2))
@@ -580,7 +632,8 @@ class CameraStreamClient:
             return
         img = self._reduce(frame.image)
         if self._check_shape(idx, img):
-            self._store(self.dc, self.dc_meta, idx, img, frame, target)
+            self._store(self.dc, self.dc_meta, idx, img, frame, target,
+                        slot=idx, gen=gen)
 
     def _snap_once(self):
         """One snap at our settings revision; if someone changed the settings
@@ -608,8 +661,9 @@ class CameraStreamClient:
     # ---- end of run ------------------------------------------------------
 
     def finish(self, timeout_s=None):
-        """Wait for frames still in flight, write the provenance, print the
-        tally, put the camera's settings back, close. Never raises."""
+        """Wait for frames still in flight, then for the shot queue to
+        deliver them, write the provenance, print the tally, put the
+        camera's settings back, close. Never raises."""
         if self._finished:
             return
         try:
@@ -623,6 +677,13 @@ class CameraStreamClient:
             if lost:
                 self._note("finish_timeout_inflight_lost", queued=self._queue.qsize())
             self._stop_worker()
+            # no frame can be queued once the worker is gone; then every
+            # queued frame's outcome before the record is written
+            self._join_worker()
+            self._drain_shot_queue()
+            with self._lock:
+                # set first: an outcome racing the write is caught as late
+                self._provenance_written = True
             self._write_provenance()
             self._report()
         except Exception as e:
@@ -637,6 +698,36 @@ class CameraStreamClient:
 
     def close(self):
         self.finish()
+
+    def _drain_shot_queue(self):
+        """Wait (bounded) for the experiment's shot queue to be empty. The
+        queue is shared by every stream, so this waits for theirs too; what
+        is still there after T_QUEUE_DRAIN_S is settled by Expt when it
+        closes the queue (refresh_after_queue_close)."""
+        drain = getattr(self._expt, "drain_shot_data", None)
+        if drain is None:
+            return
+        try:
+            if not drain(T_QUEUE_DRAIN_S):
+                self._note("queue_not_drained_at_finish", wait_s=T_QUEUE_DRAIN_S)
+        except Exception as e:
+            self._note("queue_not_drained_at_finish", error=repr(e))
+
+    def refresh_after_queue_close(self):
+        """Expt closed the shot queue: if any of our frames got its outcome
+        after the record was written (left in the queue, or still being
+        sent), write the record again and say so. Never raises."""
+        try:
+            with self._lock:
+                late, self._late_outcomes = self._late_outcomes, 0
+            if not late:
+                return
+            self._write_provenance()
+            print(f"[{self.label}] {late} frame outcome(s) came after the record "
+                  f"was first written (the shot queue closed); record updated:")
+            self._report()
+        except Exception as e:
+            print(f"[{self.label}] WARNING: could not update the record ({e!r})")
 
     def _atexit_cleanup(self):
         """The abort path (no end_wax)."""
@@ -668,8 +759,22 @@ class CameraStreamClient:
             print(f"[{self.label}] note: worker still busy after {WORKER_JOIN_S:g} s")
 
     def _n_missing(self):
+        """Requested slots whose frame is not in the run's file."""
+        with self._lock:
+            return sum(1 for ok in self._slot_ok.values() if not ok)
+
+    def _n_slots(self):
+        with self._lock:
+            return len(self._slot_ok)
+
+    # counts kinds that are a frame the shot queue did not deliver
+    QUEUE_REASONS = ("queue_full", "push_failed", "not_sent_at_end",
+                     "unconfirmed_at_end", "no_put_data", "queue_error")
+
+    def _queue_losses(self):
+        """{reason: n} of frames the shot queue did not deliver."""
         c = self.counts
-        return int(c["requested"] - c["ok"] - c["duplicate"])
+        return {r: c[r] for r in self.QUEUE_REASONS if c.get(r)}
 
     def _provenance_extra(self):
         return {"mode": "free_run", "t_snap_lead": self._t_snap_lead}
@@ -695,7 +800,12 @@ class CameraStreamClient:
             "sensor_frame_shape": list(getattr(self, "_sensor_shape", ())),
             "frame_shape": list(self._frame_shape),
             "frame_dtype": str(self._frame_dtype),
+            # frames went into the run's file during the run (shot queue ->
+            # PUT_DATA); shots.ok counts only those liveOD took, and a frame
+            # the queue did not deliver is in shots.failed under its reason
+            "storage": "stream_only",
             "shots": dict(self.counts),
+            "frames_not_delivered": self._queue_losses(),
             "n_shots_missing_frame": self._n_missing(),
             "events": list(self.events),
         }
@@ -712,15 +822,30 @@ class CameraStreamClient:
         if c.get("wrong_mode_calls"):
             print(f"[{self.label}] !! {c['wrong_mode_calls']} call(s) to the other "
                   f"mode's kernel method (grab vs trigger) were ignored")
+        self._report_clears()
         missing = self._n_missing()
         if missing or c["rpc_errors"]:
-            print(f"[{self.label}] !! {missing} of {c['requested']} requested shots "
-                  f"have NO frame in '{self.key}' (ok {c['ok']}, failed "
+            lost = self._queue_losses()
+            print(f"[{self.label}] !! {missing} of {self._n_slots()} requested shots "
+                  f"have NO frame in '{self.key}' (in the file {c['ok']}, failed "
                   f"{c['failed']}, late {c['late']}, duplicates {c['duplicate']}, "
-                  f"rpc errors {c['rpc_errors']}); their {self.key}_meta seq is NaN")
+                  f"rpc errors {c['rpc_errors']}"
+                  + (f"; not delivered to liveOD: {lost}" if lost else "")
+                  + f"); their {self.key}_meta seq is NaN")
         else:
             print(f"[{self.label}] {c['ok']}/{c['requested']} frames captured "
                   f"into '{self.key}'")
+
+    def _report_clears(self):
+        """A warm-up slot whose clear never reached the file may still hold
+        the warm-up's frame: said out loud."""
+        n = self.counts.get("slot_clears_failed", 0)
+        if n:
+            slots = [e.get("idx") for e in self.events
+                     if e.get("event") == "slot_clears_failed"]
+            print(f"[{self.label}] !! {n} slot clear(s) for a repeated request "
+                  f"(warm-up shot) did NOT reach liveOD: an earlier frame may remain "
+                  f"in those slots, e.g. {slots}")
 
     def _before_restore(self):
         pass
@@ -872,12 +997,16 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         """A sibling fired our line: the frame is expected, not kept."""
         try:
             self._note("sibling_edges")
-            self._queue.put_nowait((float(t_expected), tuple(idx), -1))
+            self._queue.put_nowait((float(t_expected), tuple(idx), -1, 0))
         except Exception:
             pass
 
     def _announce(self, idx, j, t_expected):
+        """Queue an announced edge as (t_expected, idx, j, generation): the
+        generation is the request count of slot (idx, j), so a frame that
+        answers an earlier request of a re-requested slot is not stored."""
         duplicate = False
+        n = 0
         with self._lock:
             if j >= 0:
                 if self._last_announced is not None:
@@ -886,25 +1015,28 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 n = self._req_count.get((idx, j), 0) + 1
                 self._req_count[(idx, j)] = n
                 self.counts["requested"] += 1
+                self._slot_ok[(idx, j)] = False
                 if n > 1:                   # a warm-up shot: start this frame over
                     self._clear_slot_locked(idx, j)
                     duplicate = True
-                self._slot_ok[(idx, j)] = False
         if duplicate:
             self._note("duplicate", idx=list(idx), frame=j, count=n)
-        self._queue.put_nowait((float(t_expected), tuple(idx), int(j)))
+        self._queue.put_nowait((float(t_expected), tuple(idx), int(j), n))
 
     # ---- setup -----------------------------------------------------------
 
     def _register_containers(self):
         d = self._expt.data
         for k in self.keys:
+            # stream-only: no copy of the run's frames in this process
             slot = SimpleNamespace(
                 key=k,
                 dc=d.add_host_data_container(self._frame_shape,
-                                             dtype=self._frame_dtype, fill_value=0),
+                                             dtype=self._frame_dtype, fill_value=0,
+                                             keep_run_data=False),
                 dc_meta=d.add_host_data_container((N_META,), np.float64,
-                                                  fill_value=np.nan))
+                                                  fill_value=np.nan,
+                                                  keep_run_data=False))
             setattr(d, k, slot.dc)
             setattr(d, k + "_meta", slot.dc_meta)
             self._slots.append(slot)
@@ -1029,7 +1161,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
 
     def _miss(self, entry, reason, **fields):
         """An announced edge got no usable frame."""
-        t_expected, idx, j = entry
+        t_expected, idx, j = entry[:3]
         if j < 0:                           # a sibling's edge: nothing of ours lost
             self._note("sibling_frame_" + reason, idx=list(idx), **fields)
         else:
@@ -1060,7 +1192,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 self._set_now(target, frame=j)
             return
         entry = self._pending[0]
-        t_expected, idx, j = entry
+        t_expected, idx, j = entry[:3]
         if j < 0 or entry in self._settings_done:
             return
         target = self._frame_settings.get(j, self._base_settings)
@@ -1143,7 +1275,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         if entry is None:
             self._note("stray_frames", seq=int(frame.seq))
             return
-        t_expected, idx, j = entry
+        t_expected, idx, j, gen = entry
         if j < 0:
             self._note("sibling_frames_discarded")
             return
@@ -1159,33 +1291,27 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         if not self._check_shape(idx, img, frame=j):
             return
         slot = self._slots[j]
-        if self._store(slot.dc, slot.dc_meta, idx, img, frame, t_expected, frame_index=j):
-            with self._lock:
-                self._slot_ok[(idx, j)] = True
+        # _slot_ok[(idx, j)] turns True when liveOD has the frame (_on_pushed)
+        self._store(slot.dc, slot.dc_meta, idx, img, frame, t_expected,
+                    slot=(idx, j), gen=gen, frame_index=j)
 
     def _clear_slot_locked(self, idx, j=None):
-        """Reset frame ``j`` (every frame when None) of a scan point to "no
-        frame" (caller holds the lock)."""
-        try:
-            idx = tuple(idx)
-            for jj in (range(len(self._slots)) if j is None else (j,)):
-                self._slots[jj].dc._run_data[idx] = 0
-                self._slots[jj].dc_meta._run_data[idx] = np.nan
-                self._slot_ok.pop((idx, jj), None)
-        except Exception:
-            pass
+        """Start frame ``j`` (every frame when None) of a scan point over as
+        "no frame" (caller holds the lock): a clear goes to the run's file
+        behind anything already queued for it."""
+        idx = tuple(idx)
+        for jj in (range(len(self._slots)) if j is None else (j,)):
+            self._queue_clear(idx, [self._slots[jj].dc, self._slots[jj].dc_meta],
+                              frame=jj)
 
     # ---- end of run ------------------------------------------------------
 
     def _inflight(self):
         return (not self._queue.empty()) or bool(self._pending)
 
-    def _n_missing(self):
-        return sum(1 for ok in self._slot_ok.values() if not ok)
-
     def _frame_counts(self):
-        """Per key: edges announced and frames stored (0 announced = that
-        stage did not run this time)."""
+        """Per key: slots announced and slots whose frame is in the run's
+        file (0 announced = that stage did not run this time)."""
         with self._lock:
             requested = {}
             for (idx, j) in self._req_count:
@@ -1228,13 +1354,16 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             print(f"[{self.label}] !! {c['wrong_mode_calls']} call(s) to the other "
                   f"mode's kernel method (grab vs trigger) were ignored")
         keys = ", ".join(f"'{k}'" for k in self.keys)
+        self._report_clears()
         missing = self._n_missing()
         if missing or c["rpc_errors"] or c.get("gaps"):
-            print(f"[{self.label}] !! {missing} of {c['requested']} requested frames "
-                  f"are MISSING in {keys} (ok {c['ok']}, failed {c['failed']}, "
+            lost = self._queue_losses()
+            print(f"[{self.label}] !! {missing} of {self._n_slots()} requested frames "
+                  f"are MISSING in {keys} (in the file {c['ok']}, failed {c['failed']}, "
                   f"counter gaps {c.get('gaps', 0)}, stray {c.get('stray_frames', 0)}, "
-                  f"duplicates {c['duplicate']}, rpc errors {c['rpc_errors']}); "
-                  f"their <key>_meta seq is NaN")
+                  f"duplicates {c['duplicate']}, rpc errors {c['rpc_errors']}"
+                  + (f"; not delivered to liveOD: {lost}" if lost else "")
+                  + "); their <key>_meta seq is NaN")
         else:
             discarded = c.get("sibling_frames_discarded", 0)
             print(f"[{self.label}] {c['ok']}/{c['requested']} frames captured into {keys}"

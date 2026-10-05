@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from waxa.data.camera_frames import N_META
+
 
 # ----------------------------------------------------------------------
 # LiveODClient: the sender and the polled END_RUN
@@ -236,34 +238,35 @@ def test_a_stored_frame_is_pushed_with_its_record():
     from test_camera_stream_client import make_triggered, wait_settled
     fe, stream, cs = make_triggered()
     fe.data.init()
-    pushed = []
-    fe.push_data_enabled = True
-    fe.push_shot_data = lambda items, idx=None: (pushed.append((items, idx)) or True)
     try:
         cs.announce_trigger_mu(0, 0)
         stream.edge(value=7)
         wait_settled(cs)
-        assert cs.counts.get("pushed") == 1
-        (items, idx), = pushed
-        assert [dc is cs.dc for dc, _ in items] == [True, False]
-        assert np.all(items[0][1] == 7) and items[1][0] is cs.dc_meta
-        assert idx == (0,)
+        assert cs.counts["ok"] == 1
+        # the frame and its record in one PUT_DATA message, at the shot's slot
+        (call,) = fe.live_od_client.calls
+        assert call == [("img_test", (0,)), ("img_test_meta", (0,))]
+        (_, _, frame), (_, _, row) = fe.live_od_client.history
+        assert np.all(frame == 7) and row.shape == (N_META,) and row[0] > 0
     finally:
         cs.finish()
 
 
-def test_a_failed_push_is_counted_and_the_frame_kept():
+def test_a_failed_push_is_counted_and_no_frame_kept_in_memory():
+    """Stream frames have no in-memory copy and no END_RUN fallback: a frame
+    liveOD did not take is failed (with its reason), not ok."""
     from test_camera_stream_client import make_triggered, wait_settled
     fe, stream, cs = make_triggered()
     fe.data.init()
-    fe.push_data_enabled = True
-    fe.push_shot_data = lambda items, idx=None: False
+    fe.live_od_client.refuse = lambda specs: True
+    fe.shot_data_queue.retry_backoff_s = 0.01
     try:
         cs.announce_trigger_mu(0, 0)
         stream.edge(value=5)
         wait_settled(cs)
-        assert cs.counts.get("push_failed") == 1 and cs.counts["ok"] == 1
-        assert np.all(fe.data.img_test._run_data[0] == 5)
+        assert cs.counts.get("push_failed") == 1 and cs.counts["ok"] == 0
+        assert cs._n_missing() == 1
+        assert fe.data.img_test._run_data.strides == (0, 0, 0)
     finally:
         cs.finish()
 

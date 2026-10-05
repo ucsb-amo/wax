@@ -453,7 +453,7 @@ def unpack_group(file,group_key,obj):
 #: ``atomdata.run_records``.
 _NON_RECORD_ATTRS = frozenset({
     'expt_file', 'params_file', 'cooling_file', 'imaging_file', 'control_file',
-    'camera_overrides', 'roix', 'roiy', 'xvarnames',
+    'camera_overrides', 'aux_frames_dropped', 'roix', 'roiy', 'xvarnames',
 })
 
 
@@ -521,6 +521,54 @@ def camera_overrides_banner(run_id, record) -> str:
              for key, f in fields.items()]
     return (f"!! run {run_id}: camera settings differ from ad.camera_params "
             f"(the request): " + ", ".join(parts))
+
+def read_aux_frames_dropped(attrs) -> dict:
+    """The experiment's record of per-shot auxiliary data (camera stream /
+    diagnostic frames, ``ad.data.<key>`` and ``<key>_meta``) that never
+    reached the run's file, from the root attribute ``aux_frames_dropped``
+    (JSON): ``{"queue_max_bytes", "peak_bytes", "retries", "keys": {key:
+    {"sent", "dropped", "reasons", "first_dropped_slots", "clears_sent",
+    "clears_failed", "clear_fail_reasons", "first_clear_failed_slots"}}}``.
+    A dropped slot holds the container's fill (frame zeros, NaN record).
+    ``{}`` when the file has none: the run had no stream-only data, or
+    predates the record -- not "nothing dropped". A record that cannot be
+    parsed comes back as ``{"unreadable": ...}`` rather than as nothing."""
+    import json
+    if 'aux_frames_dropped' not in attrs:
+        return {}
+    raw = attrs['aux_frames_dropped']
+    if isinstance(raw, bytes):
+        raw = raw.decode(errors='replace')
+    try:
+        record = json.loads(str(raw))
+        if not isinstance(record, dict):
+            raise ValueError(f"not a JSON object: {type(record).__name__}")
+        return record
+    except Exception as exc:
+        return {"unreadable": f"{type(exc).__name__}: {exc}", "raw": str(raw)}
+
+def aux_frames_dropped_banner(run_id, record) -> str:
+    """The one-line ``!!`` notice for a run whose per-shot auxiliary data
+    did not all reach the file, or ``""`` when nothing was dropped."""
+    if not record:
+        return ""
+    if 'unreadable' in record:
+        return (f"!! run {run_id}: the file's aux_frames_dropped record could not be "
+                f"read ({record['unreadable']}); auxiliary camera frames may be missing")
+    parts = []
+    for key, t in sorted((record.get('keys') or {}).items()):
+        if not isinstance(t, dict):
+            continue
+        dropped, clears = int(t.get('dropped') or 0), int(t.get('clears_failed') or 0)
+        if dropped:
+            parts.append(f"{key} {dropped} dropped {t.get('reasons') or {}}")
+        if clears:
+            parts.append(f"{key} {clears} warm-up slot clears not sent (an earlier frame "
+                         f"may remain at {t.get('first_clear_failed_slots')})")
+    if not parts:
+        return ""
+    return (f"!! run {run_id}: per-shot auxiliary data never reached the file (those "
+            f"slots hold the fill value; see ad.aux_frames_dropped): " + "; ".join(parts))
 
 class analysis_tags():
     """A simple container to hold analysis tags for analysis logic.
@@ -1411,6 +1459,20 @@ class atomdata_base():
     def camera_overrides(self, value):
         self._camera_overrides = dict(value or {})
 
+    @property
+    def aux_frames_dropped(self) -> dict:
+        """Per-shot auxiliary data (camera stream / diagnostic frames) that
+        never reached the run's file: the experiment's record, the file's
+        root attribute ``aux_frames_dropped`` (see read_aux_frames_dropped;
+        per key ``dropped``, ``reasons``, ``first_dropped_slots``). Those
+        slots hold the fill value. ``{}`` when the file has no record (no
+        stream-only data, or a file from before the record existed)."""
+        return vars(self).get('_aux_frames_dropped') or {}
+
+    @aux_frames_dropped.setter
+    def aux_frames_dropped(self, value):
+        self._aux_frames_dropped = dict(value or {})
+
     def slice_atomdata(self, which_shot_idx=0, which_xvar_idx=0, ignore_repeats=False,
                        xvar_value=None, xvar_tolerance=0.05):
         """Slices along a given xvar index at a particular value (which_shot_idx) of
@@ -1724,7 +1786,7 @@ class atomdata_base():
         ad._has_images = getattr(self, '_has_images', True)
 
         for attr in (
-            'experiment_code', '_camera_overrides',
+            'experiment_code', '_camera_overrides', '_aux_frames_dropped',
             'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
             'axis_camera_px_x', 'axis_camera_px_y',
         ):
@@ -1824,6 +1886,7 @@ class atomdata_base():
         ad_out.image_timestamps = self.image_timestamps
         ad_out.experiment_code = self.experiment_code
         ad_out.camera_overrides = self.camera_overrides
+        ad_out.aux_frames_dropped = self.aux_frames_dropped
 
         ad_out.params = deepcopy(self.params)
         ad_out.p = ad_out.params
@@ -2807,6 +2870,13 @@ class atomdata_base():
             # the request, and stays so.
             self.camera_overrides = read_camera_overrides(f.attrs)
             _banner = camera_overrides_banner(self.run_info.run_id, self.camera_overrides)
+            if _banner:
+                print(_banner)
+            # Per-shot auxiliary frames the experiment could not get into the
+            # file (its bounded send queue dropped them, or liveOD refused):
+            # recorded with counts and reasons; those slots hold the fill.
+            self.aux_frames_dropped = read_aux_frames_dropped(f.attrs)
+            _banner = aux_frames_dropped_banner(self.run_info.run_id, self.aux_frames_dropped)
             if _banner:
                 print(_banner)
             if self._has_images:

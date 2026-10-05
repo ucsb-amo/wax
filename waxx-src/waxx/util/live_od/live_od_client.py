@@ -123,6 +123,11 @@ class LiveODDataSender:
                     f"[LiveODClient] No reply to PUT_DATA from liveOD at "
                     f"tcp://{self._client._ip}:{self._client._port} within "
                     f"{PUT_DATA_TIMEOUT_MS / 1000:.0f} s")
+            except Exception:
+                # a REQ socket left between send and recv refuses every later
+                # send: the shot queue's retry needs a fresh one
+                self._drop_socket()
+                raise
 
     def close(self):
         with self._lock:
