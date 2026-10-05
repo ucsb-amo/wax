@@ -118,13 +118,17 @@ class TelemetryHub:
         try:
             got = slot.provider.poll() or {}
         except Exception as e:
+            error = f"{type(e).__name__}: {e}"
             with self._lock:
                 slot.t_try = t
-                if slot.error != repr(e):
+                # Log a failure once, not on every poll while it persists.
+                if slot.error != error:
                     _LOG.info("telemetry %s: %r", name, e)
-                slot.error = f"{type(e).__name__}: {e}"
+                slot.error = error
             return
         with self._lock:
+            if slot.error:
+                _LOG.info("telemetry %s: recovered", name)
             slot.t_try = slot.t_ok = t
             slot.error = ""
             for key, sample in got.items():

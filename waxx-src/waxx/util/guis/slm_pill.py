@@ -31,6 +31,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QMenu, QPushButton
 
 from waxx.util.dashboard import theme
+from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 
 #: service state -> (pill colour, word); colours as the connection bar's pills
 LOOK = {
@@ -215,7 +216,7 @@ class SlmPill(QPushButton):
             color, word = LOOK.get(self.state, LOOK["unknown"])
         suffix = _SUFFIX.get(self.state, "") if (self.reachable and self.reported) else ""
         self.setText("SLM" + suffix)
-        self.setStyleSheet(_css(color))
+        set_style_if_changed(self, _css(color))
         self.setToolTip("\n".join(self.tooltip_lines(word)))
         want = self.reported or self.can_launch
         # Never show() a parentless pill: it would flash up as its own window
@@ -286,4 +287,6 @@ class SlmPill(QPushButton):
         return menu
 
     def _show_menu(self, pos) -> None:
-        self.build_menu().exec(self.mapToGlobal(pos))
+        menu = self.build_menu()
+        menu.exec(self.mapToGlobal(pos))
+        delete_later(menu)                   # parented to the pill: one per click otherwise

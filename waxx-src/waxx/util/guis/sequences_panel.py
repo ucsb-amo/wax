@@ -44,6 +44,7 @@ from waxx.util.guis.composite_panel import (
     _pill_button_css, _small,
 )
 from waxx.util.guis.device_summary import reset_title
+from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 
 #: How often an open log asks the server for new lines.
 LOG_POLL_MS = 1000
@@ -335,12 +336,12 @@ class SequenceCard(QFrame):
             color = ERR_TEXT if state == "failed" else (OK_TEXT if state == "running"
                                                         else theme.FG_MUTED)
         self.pill.setText(text)
-        self.pill.setStyleSheet(_label_pill_css(level))
+        set_style_if_changed(self.pill, _label_pill_css(level))
         if self.message:
             parts.insert(0, self.message)
             self.message = ""
         self.status.setText(" · ".join(p for p in parts if p))
-        self.status.setStyleSheet(f"color: {color}; font-size: 11px;")
+        set_style_if_changed(self.status, f"color: {color}; font-size: 11px;")
         self.refresh_buttons()
 
     def refresh_buttons(self) -> None:
@@ -633,9 +634,12 @@ class SequencesPanel(QWidget):
     def ask_scan(self, title: str, scan: dict, running: bool = False) -> dict | None:
         """The settings dialog (tests replace it): new settings (SI), or None."""
         dialog = ScanSettingsDialog(title, scan, running=running, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return dialog.settings()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return dialog.settings()
+        finally:
+            delete_later(dialog)
 
     def stop_loop(self, key: str) -> None:
         card = self.loop_cards.get(key)
@@ -695,7 +699,9 @@ class SequencesPanel(QWidget):
         no = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(no)
         box.exec()
-        return box.clickedButton() is yes
+        clicked = box.clickedButton()
+        delete_later(box)
+        return clicked is yes
 
     def shutdown(self) -> None:
         self._timer.stop()

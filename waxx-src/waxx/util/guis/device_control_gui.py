@@ -23,6 +23,7 @@ from waxx.util.dashboard import theme
 from waxx.util.device_state.op_journal import describe_entry
 from waxx.util.guis.device_summary import (
     MakeSafeDialog, MonitorNotice, SummaryStrip, reset_title)
+from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 from waxa.helper.name_search import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -487,8 +488,10 @@ class DDSWidget(DeviceWidget):
             act.setChecked(unit == self._freq_unit)
             actions[act] = unit
         chosen = menu.exec(global_pos)
-        if chosen is not None:
-            self._choose_freq_unit(actions[chosen])
+        unit = actions.get(chosen)
+        delete_later(menu)
+        if unit is not None:
+            self._choose_freq_unit(unit)
 
     def _show_amp_unit_menu(self, global_pos) -> None:
         menu = QMenu(self)
@@ -500,8 +503,10 @@ class DDSWidget(DeviceWidget):
             act.setChecked(unit == self._amp_unit)
             actions[act] = unit
         chosen = menu.exec(global_pos)
-        if chosen is not None:
-            self._choose_amp_unit(actions[chosen])
+        unit = actions.get(chosen)
+        delete_later(menu)
+        if unit is not None:
+            self._choose_amp_unit(unit)
 
     # --- user unit choice (combo box or right-click menu) ----------------------
 
@@ -1051,6 +1056,7 @@ class TTLWidget(DeviceWidget):
         pulse_action.setCheckable(True)
         pulse_action.setChecked(self._pulse_mode)
         chosen = menu.exec(self.state_button.mapToGlobal(pos))
+        delete_later(menu)
         if chosen is pulse_action:
             self.set_pulse_mode(True)
         elif chosen is toggle_action:
@@ -2207,7 +2213,8 @@ class DeviceStateGUI(QMainWindow):
         return row
 
     def _style_pill(self, bg: str) -> None:
-        self.status_pill.setStyleSheet(
+        set_style_if_changed(
+            self.status_pill,
             f"QLabel {{ background: {bg}; color: white; border-radius: 6px; padding: 2px 10px; }}"
         )
 
@@ -2230,6 +2237,7 @@ class DeviceStateGUI(QMainWindow):
         menu, actions = self._build_status_menu()
         chosen = menu.exec(self.status_pill.mapToGlobal(pos))
         handler = actions.get(chosen)
+        delete_later(menu)
         if handler is not None:
             handler()
 
@@ -2307,7 +2315,9 @@ class DeviceStateGUI(QMainWindow):
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()
@@ -2691,13 +2701,16 @@ class DeviceStateGUI(QMainWindow):
         if not plans:
             return
         dialog = MakeSafeDialog(plans, self)
-        if dialog.exec() != MakeSafeDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == MakeSafeDialog.DialogCode.Accepted
+        selected = dialog.selected() if accepted else []
+        delete_later(dialog)
+        if not accepted:
             return
-        refused = panel.make_safe(dialog.selected())
+        refused = panel.make_safe(selected)
         if refused:
             self._record_line("[make safe] not sent for: " + ", ".join(refused) +
                               " (see their cards)")
-        self._show_composite_device(dialog.selected()[0] if dialog.selected() else "")
+        self._show_composite_device(selected[0] if selected else "")
 
     def _trust_state(self) -> None:
         reason = (self._trust or {}).get("reason", "")
@@ -2713,7 +2726,9 @@ class DeviceStateGUI(QMainWindow):
         yes = box.addButton("Trust the state file", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()
@@ -2765,7 +2780,9 @@ class DeviceStateGUI(QMainWindow):
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()
@@ -2796,7 +2813,9 @@ class DeviceStateGUI(QMainWindow):
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()
@@ -2835,7 +2854,9 @@ class DeviceStateGUI(QMainWindow):
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()
@@ -2956,7 +2977,9 @@ class DeviceStateGUI(QMainWindow):
         yes = box.addButton("Clear the fence", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.exec()
-        if box.clickedButton() is not yes:
+        clicked = box.clickedButton()
+        delete_later(box)
+        if clicked is not yes:
             return
         try:
             host = socket.gethostname()

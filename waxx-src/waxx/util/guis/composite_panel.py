@@ -76,6 +76,7 @@ from waxx.util.dashboard import theme
 from waxx.util.device_state import composite as cmp
 from waxx.util.device_state import connections as conns
 from waxx.util.guis.card_layout import FlowLayout, MasonryLayout
+from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 # liveOD's camera connect button colours (grey / purple / green / red), so a
 # connection reads the same here as a camera does there.
 from waxx.util.live_od.gui.camera_menu import STATES as _CAMERA_STATES
@@ -268,6 +269,10 @@ class _OpSender(QThread):
         super().__init__(parent)
         self._cond = threading.Condition()
         self._jobs: deque = deque()
+        # Status queries queued or being sent: the 1 s tick asks again for
+        # every op still waiting, and with a hung server those would pile up
+        # in _jobs without bound.  One query per seq at a time.
+        self._status_in_flight: set[int] = set()
         self._running = True
         self._client: MonitorClient | None = None
         try:
@@ -283,6 +288,9 @@ class _OpSender(QThread):
 
     def query(self, seq: int) -> None:
         with self._cond:
+            if seq in self._status_in_flight:
+                return
+            self._status_in_flight.add(seq)
             self._jobs.append(("status", seq))
             self._cond.notify()
 
@@ -320,7 +328,11 @@ class _OpSender(QThread):
                 self.replied.emit(req_id, reply)
             elif job[0] == "status":
                 _, seq = job
-                reply = client.op_status(seq) if client is not None else None
+                try:
+                    reply = client.op_status(seq) if client is not None else None
+                finally:
+                    with self._cond:
+                        self._status_in_flight.discard(seq)
                 if reply is None:
                     self._client = None
                     continue
@@ -1241,6 +1253,7 @@ class CompositeCard(QFrame):
         action = menu.addAction("Copy as experiment code")
         action.triggered.connect(lambda: self.copy_as_code(key))
         menu.exec(button.mapToGlobal(pos))
+        delete_later(menu)                   # parented to the button: one per click otherwise
 
     # -- state --------------------------------------------------------------------
 
@@ -1408,7 +1421,7 @@ class CompositeCard(QFrame):
                     color = WARN_TEXT
                     text += f" -- over {_fmt_s(self.device.max_on_s)}"
             self.watchdog_label.setText(text)
-            self.watchdog_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            set_style_if_changed(self.watchdog_label, f"color: {color}; font-size: 11px;")
             self.watchdog_arm.setVisible(True)
             self.watchdog_arm.setEnabled(hazardous and self.panel.ops_allowed()[0])
             self.watchdog_extend.setVisible(False)
@@ -1424,8 +1437,10 @@ class CompositeCard(QFrame):
             text = f"Watchdog armed · acts in {_fmt_s(fires or 0)}"
             color = OK_TEXT
         self.watchdog_label.setText(text)
-        self.watchdog_label.setStyleSheet(f"color: {color}; font-size: 11px;"
-                                          f" font-weight: {'600' if warned else 'normal'};")
+        # Runs every 1 s tick: restyle only on change.
+        set_style_if_changed(self.watchdog_label,
+                             f"color: {color}; font-size: 11px;"
+                             f" font-weight: {'600' if warned else 'normal'};")
         self.watchdog_arm.setVisible(False)
         self.watchdog_extend.setVisible(True)
         self.watchdog_disarm.setVisible(True)
@@ -1665,8 +1680,8 @@ class CompositeCard(QFrame):
     def set_footer(self, text: str, level: str) -> None:
         self.footer.setText(text)
         self.footer.setToolTip(text)
-        self.footer.setStyleSheet(f"color: {_LEVEL_COLOR.get(level, theme.FG_MUTED)};"
-                                  f" font-size: 11px;")
+        set_style_if_changed(self.footer, f"color: {_LEVEL_COLOR.get(level, theme.FG_MUTED)};"
+                                          f" font-size: 11px;")
         self.footer.setVisible(bool(text))
         self._footer_line.setVisible(bool(text))
 
@@ -1913,7 +1928,7 @@ class ScenesCard(QFrame):
             if info.get("cancel"):
                 text += " · cancelling"
             self.progress.setText(text)
-            self.progress.setStyleSheet(f"color: {WARN_TEXT}; font-size: 11px;")
+            set_style_if_changed(self.progress, f"color: {WARN_TEXT}; font-size: 11px;")
             self.cancel_button.show()
             self.summary.setText(f"▶ {info.get('title')} running")
         else:
@@ -1923,8 +1938,8 @@ class ScenesCard(QFrame):
                 ok = last.get("state") == "done"
                 self.progress.setText(f"{'✓' if ok else '✕'} {last.get('title')}: "
                                       f"{last.get('text')}")
-                self.progress.setStyleSheet(
-                    f"color: {OK_TEXT if ok else ERR_TEXT}; font-size: 11px;")
+                set_style_if_changed(
+                    self.progress, f"color: {OK_TEXT if ok else ERR_TEXT}; font-size: 11px;")
         allowed = self.panel.ops_allowed()[0]
         for b in self.run_buttons.values():
             b.setEnabled(allowed and not info)
@@ -2000,7 +2015,7 @@ class ConnectionBar(QFrame):
                 detail = str(entry.get("detail") or "")
             color, word = _CAMERA_STATES[_CONNECTION_LOOK.get(state, "failed")]
             pill.setText(self.label(key))
-            pill.setStyleSheet(_connection_pill_css(color))
+            set_style_if_changed(pill, _connection_pill_css(color))
             action = "disconnect" if state in (conns.CONNECTED, conns.CONNECTING) else "connect"
             allowed, why = self.panel.connections_allowed(action)
             pill.setEnabled(allowed)
@@ -2512,7 +2527,9 @@ class CompositePanel(QWidget):
             yes.setStyleSheet(f"color: {ERR_TEXT}; font-weight: 600;")
         box.setDefaultButton(no)
         box.exec()
-        return box.clickedButton() is yes
+        clicked = box.clickedButton()
+        delete_later(box)
+        return clicked is yes
 
     def refused(self, title: str, text: str) -> None:
         """Tell the operator a request they made was not carried out."""

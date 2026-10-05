@@ -163,6 +163,9 @@ class PDXCClientWidget(QWidget):
         self._last_connect_attempt = float("-inf")
         self._connect_in_flight = False
         self._move_in_flight = False
+        # One position read at a time: a slow server would otherwise collect
+        # one more pool task per 5 s poll.
+        self._position_in_flight = False
         self._position = POSITION_UNKNOWN
         self._settings: dict = {}
         self._build_ui()
@@ -263,7 +266,9 @@ class PDXCClientWidget(QWidget):
 
     def _set_status(self, text: str, color: str) -> None:
         self._status_lbl.setText(text)
-        self._status_lbl.setStyleSheet(f"color: {color};")
+        css = f"color: {color};"
+        if self._status_lbl.styleSheet() != css:
+            self._status_lbl.setStyleSheet(css)
 
     # ------------------------------------------------------------------
     # Connection
@@ -311,14 +316,21 @@ class PDXCClientWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _refresh_position(self) -> None:
-        if self._client is None or self._move_in_flight:
+        if self._client is None or self._move_in_flight or self._position_in_flight:
             return
         client = self._client
+        self._position_in_flight = True
         worker = _BgCall(client.get_position_state)
         worker.signals.done.connect(self._on_position)
+        worker.signals.failed.connect(self._on_position_failed)
         QThreadPool.globalInstance().start(worker)
 
+    def _on_position_failed(self, err: str) -> None:
+        # As before, a failed read changes nothing on screen; the next poll retries.
+        self._position_in_flight = False
+
     def _on_position(self, state) -> None:
+        self._position_in_flight = False
         state = str(state)
         if state not in _LABELS:
             state = POSITION_UNKNOWN
@@ -351,7 +363,9 @@ class PDXCClientWidget(QWidget):
     def _open_settings(self) -> None:
         if self._client is None:
             return
-        _SettingsDialog(self, self._settings, self._apply_setting).exec()
+        dialog = _SettingsDialog(self, self._settings, self._apply_setting)
+        dialog.exec()
+        dialog.deleteLater()                 # parented to the panel: one per open otherwise
 
     def _apply_setting(self, key: str, value: int) -> None:
         """Push one settings change to the server."""
