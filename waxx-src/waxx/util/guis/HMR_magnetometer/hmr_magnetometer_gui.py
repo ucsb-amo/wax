@@ -24,6 +24,7 @@ from datetime import datetime
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from waxx.util.dashboard.restyle import set_style
 from waxx.util.guis.HMR_magnetometer.hmr_magnetometer_client import HMRClient
 
 DEFAULT_SERVER_HOST = "localhost"
@@ -34,8 +35,41 @@ PLOT_BUFFER_MAXLEN = 2000
 STATS_WINDOW = 200
 DEFAULT_STATS_WINDOW_S = 10.0
 READOUT_PANEL_WIDTH = 300
+# The in-memory log behind "Save CSV" keeps this much history.  It used to
+# keep 24 h of Python floats (~5 MB/h of growth for the first day, in a
+# dashboard that runs for weeks); the server's own daily field-log CSVs (one
+# reading per second) are the long-term record.
+LOG_SPAN_S = 3600.0
+# Hard cap on the same log, in readings, in case the server ever sends far
+# more than the usual ~10 per second.
+LOG_MAXLEN = 72_000
+# Stats readouts refresh at least this often without new data, so numbers
+# from a stopped stream age out instead of standing still.
+STATS_REFRESH_S = 1.0
 
 logger = logging.getLogger(__name__)
+
+
+class _BgCall(QtCore.QRunnable):
+    """Run ``func()`` on the Qt thread pool and hand ``(result, exc)`` to
+    ``on_done`` -- on the pool thread, so ``on_done`` must only emit a signal."""
+
+    def __init__(self, func, on_done):
+        super().__init__()
+        self.setAutoDelete(True)
+        self._func = func
+        self._on_done = on_done
+
+    def run(self):  # noqa: D401 - QRunnable hook
+        try:
+            result, exc = self._func(), None
+        except BaseException as err:  # noqa: BLE001
+            result, exc = None, err
+        try:
+            self._on_done(result, exc)
+        except RuntimeError:
+            pass  # the GUI was deleted while the call ran
+
 
 class FixedPrecisionAxisItem(pg.AxisItem):
     def __init__(self, orientation, decimals=4, **kwargs):
@@ -47,6 +81,11 @@ class FixedPrecisionAxisItem(pg.AxisItem):
 
 
 class MagnetometerGUI(QtWidgets.QMainWindow):
+    # Pool thread -> GUI thread: (callback, result, exception).  Every network
+    # call except the read loop's runs on the pool (see _call_in_background);
+    # the dashboard embeds this window, so a blocking call here froze it all.
+    _bg_result = QtCore.pyqtSignal(object, object, object)
+
     def __init__(
         self,
         reference_csv_path=None,
@@ -61,14 +100,22 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.worker_thread = None
         self.stop_event = threading.Event()
         self.data_queue: queue.Queue = queue.Queue()
-        # Parallel deques for log data — ~24 h at 10 Hz, using flat floats
-        # instead of dicts to avoid Python object overhead (~18x smaller).
-        _LOG_MAXLEN = 864_000
-        self.log_t: deque = deque(maxlen=_LOG_MAXLEN)
-        self.log_x: deque = deque(maxlen=_LOG_MAXLEN)
-        self.log_y: deque = deque(maxlen=_LOG_MAXLEN)
-        self.log_z: deque = deque(maxlen=_LOG_MAXLEN)
-        self.log_btot: deque = deque(maxlen=_LOG_MAXLEN)
+        # Parallel deques for the "Save CSV" log — the last LOG_SPAN_S of
+        # readings, as flat floats instead of dicts (~18x smaller).
+        self.log_t: deque = deque(maxlen=LOG_MAXLEN)
+        self.log_x: deque = deque(maxlen=LOG_MAXLEN)
+        self.log_y: deque = deque(maxlen=LOG_MAXLEN)
+        self.log_z: deque = deque(maxlen=LOG_MAXLEN)
+        self.log_btot: deque = deque(maxlen=LOG_MAXLEN)
+        # Background status probe (_refresh_serial_status): one at a time.
+        self._probe_in_flight = False
+        # start_monitor() was called: report the outcome of the next probe.
+        self._start_requested = False
+        # Redraw / restat only when needed and only while the plots are seen.
+        self._plot_dirty = False
+        self._stats_dirty = False
+        self._last_stats_t = 0.0
+        self._bg_result.connect(self._on_bg_result)
         self.session_id = 0
         self.internal_ylim_update = False
         self.manual_ylim: dict = {}
@@ -83,10 +130,9 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         # Settings
         self.server_host = DEFAULT_SERVER_HOST
         self.server_port = DEFAULT_SERVER_PORT
-        try:
-            self.client: HMRClient | None = HMRClient()
-        except RuntimeError:
-            self.client = None
+        # Discovered by the first background probe (start_monitor below), not
+        # here: discovery waits up to seconds for a beacon.
+        self.client: HMRClient | None = None
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.window_s = DEFAULT_TIME_WINDOW
         self.stats_window_s = DEFAULT_STATS_WINDOW_S
@@ -224,9 +270,16 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         clear_action.triggered.connect(self.clear_data)
         run_menu.addAction(clear_action)
 
-        save_action = QtGui.QAction("Save CSV", self)
+        save_action = QtGui.QAction(f"Save CSV (last {LOG_SPAN_S / 3600:g} h)…", self)
+        save_action.setToolTip(
+            f"Save the readings this window received in the last {LOG_SPAN_S / 3600:g} h "
+            "(or since monitoring last (re)started or was cleared, if that is sooner). "
+            "The long-term record is the server's daily field-log CSVs (one reading "
+            "per second)."
+        )
         save_action.triggered.connect(self.save_log)
         run_menu.addAction(save_action)
+        run_menu.setToolTipsVisible(True)
 
         log_action = QtGui.QAction("Open Log…", self)
         log_action.triggered.connect(self._open_log_dialog)
@@ -729,22 +782,28 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 return
             means[key] = sum(values) / len(values)
 
-        try:
-            response = self.client._set_reference_values(
-                means["x"],
-                means["y"],
-                means["z"],
-                means["mag"],
-                timeout=2.0,
-            )
-            if not response.get("ok"):
-                raise RuntimeError(response.get("error", "Server returned error"))
-            ref = response["reference"]
-        except Exception as exc:
-            self._set_status(f"Failed to set reference: {exc}")
+        client = self.client
+        if client is None:
+            self._set_status("Failed to set reference: server not connected")
             return
 
-        self._apply_reference_to_plots(ref, status_prefix="Reference set")
+        def _done(response, exc):
+            try:
+                if exc is not None:
+                    raise exc
+                if not response.get("ok"):
+                    raise RuntimeError(response.get("error", "Server returned error"))
+                ref = response["reference"]
+            except Exception as err:
+                self._set_status(f"Failed to set reference: {err}")
+                return
+            self._apply_reference_to_plots(ref, status_prefix="Reference set")
+
+        self._call_in_background(
+            lambda: client._set_reference_values(
+                means["x"], means["y"], means["z"], means["mag"], timeout=2.0),
+            _done,
+        )
 
     def _clear_reference(self):
         """Remove reference lines from all plots."""
@@ -804,6 +863,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         title.setStyleSheet("font-weight: 700;")
         layout.addWidget(title, 0, 0, 1, 4)
 
+        # Start from the discovered address: _sync_settings writes these
+        # fields back into the client, and the defaults (localhost:50000) are
+        # not where a discovered server listens.
+        if self.client is not None:
+            self.server_host = str(self.client.host)
+            self.server_port = int(self.client.port)
         layout.addWidget(QtWidgets.QLabel("Host:"), 1, 0)
         self.server_host_edit = QtWidgets.QLineEdit(self.server_host)
         layout.addWidget(self.server_host_edit, 1, 1)
@@ -848,10 +913,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             txt = self.server_host_edit.text().strip()
             if txt:
                 self.server_host = txt
-                self.client.host = txt
+                if self.client is not None:
+                    self.client.host = txt
         if self.server_port_spin is not None:
             self.server_port = int(self.server_port_spin.value())
-            self.client.port = self.server_port
+            if self.client is not None:
+                self.client.port = self.server_port
         if self.poll_spin is not None:
             self.poll_interval = max(float(self.poll_spin.value()), 0.05)
 
@@ -866,31 +933,26 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             self.start_monitor()
 
     def start_monitor(self):
+        """Start polling the server.
+
+        The reachability check (discovery + a status round-trip) runs on the
+        thread pool; its result, in ``_on_probe_done``, starts the worker.
+        Failures must NOT pop up a dialog (the panel may be hidden in the
+        dashboard); they go to the status log and the next probe retries.
+        """
         if self.running or (self.worker_thread and self.worker_thread.is_alive()):
             return
+        self._start_requested = True
+        self._refresh_serial_status()
 
-        if self.client is None:
-            try:
-                self.client = HMRClient(discovery_timeout=0.1)
-            except RuntimeError:
-                self._set_status("Server not found — retrying...")
-                return
-
+    def _start_worker(self):
+        """GUI thread, after a successful probe: start the GET_SINCE worker."""
+        if self.running or (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        self._start_requested = False
         self._sync_settings()
         self.stop_event.clear()
         self._reset_display()
-
-        # Quick connectivity check before starting the worker thread.
-        # Failures must NOT pop up a dialog (the panel may be hidden in the
-        # dashboard); just log to status and bail so the user can retry.
-        try:
-            self.client._ping(timeout=2.0)
-        except Exception as exc:
-            host = getattr(self.client, "host", "?")
-            port = getattr(self.client, "port", "?")
-            self._set_status(f"Connection failed: cannot reach {host}:{port} ({exc})")
-            self.client = None
-            return
 
         self.running = True
         self.session_id += 1
@@ -907,8 +969,9 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
         self.running = False
         self.stop_event.set()
         self.session_id += 1
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=2.0)
+        # No join: the worker may sit in a 3 s GET_SINCE, and this runs on the
+        # GUI thread.  The session id bump makes it drop whatever it gets
+        # and return; a new worker gets a new session id.
         self.worker_thread = None
         self.toggle_button.setText("Start")
         self._set_status("Stopped")
@@ -923,9 +986,10 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
 
         while not self.stop_event.is_set() and session_id == self.session_id:
             try:
-                if self.client is None:
+                client = self.client
+                if client is None:
                     raise RuntimeError("client not connected")
-                result = self.client._get_since(last_t, timeout=3.0)
+                result = client._get_since(last_t, timeout=3.0)
                 if not result.get("ok"):
                     raise RuntimeError(result.get("error", "Server returned error"))
 
@@ -994,9 +1058,21 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 self.mag_buffer.append(btot)
                 updated = True
 
-            self._update_stats()
             if updated:
-                self._update_plot()
+                self._trim_log()
+                self._plot_dirty = True
+                self._stats_dirty = True
+            # Embedded in the dashboard this window is a hidden QMainWindow
+            # whose plots live in a dock: ask the plots, not the window,
+            # whether anyone can see them.  Hidden -> no redraw, no stats.
+            if self._plots_visible():
+                now = time.monotonic()
+                if self._stats_dirty or now - self._last_stats_t >= STATS_REFRESH_S:
+                    self._update_stats()
+                    self._stats_dirty = False
+                    self._last_stats_t = now
+                if self._plot_dirty:
+                    self._update_plot()
 
         except Exception as exc:
             logger.warning("_process_queue: unhandled exception: %s", exc)
@@ -1005,6 +1081,22 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Plot & stats updates
     # ------------------------------------------------------------------
+
+    def _plots_visible(self) -> bool:
+        plot = self.plot_items.get("mag")
+        if plot is None or not plot.isVisible():
+            return False
+        top = plot.window()
+        return not (top is not None and top.isMinimized())
+
+    def _trim_log(self):
+        """Drop "Save CSV" log entries older than LOG_SPAN_S (by reading time)."""
+        if not self.log_t:
+            return
+        cutoff = self.log_t[-1] - LOG_SPAN_S
+        while self.log_t and self.log_t[0] < cutoff:
+            for buf in (self.log_t, self.log_x, self.log_y, self.log_z, self.log_btot):
+                buf.popleft()
 
     def _update_stats(self):
         if len(self.time_buffer) < 2:
@@ -1043,8 +1135,12 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             self._set_readout(key, val, mean_v, std_ug, delta_mg)
 
     def _update_plot(self):
-        if not self.time_buffer or self.isMinimized():
+        if not self.time_buffer:
             return
+        if not self._plots_visible():
+            self._plot_dirty = True  # draw when the plots are shown again
+            return
+        self._plot_dirty = False
 
         self._sync_settings()
         window = max(float(self.window_s), 1e-9)
@@ -1149,6 +1245,8 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
             return
 
         fields = ["timestamp_s", "x_G", "y_G", "z_G", "btot_G"]
+        n = len(self.log_t)
+        span_min = (self.log_t[-1] - self.log_t[0]) / 60.0
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
@@ -1157,8 +1255,11 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                     self.log_t, self.log_x, self.log_y, self.log_z, self.log_btot
                 ):
                     writer.writerow({"timestamp_s": t, "x_G": x, "y_G": y, "z_G": z, "btot_G": b})
-            self._set_status(f"Saved: {path}")
-            QtWidgets.QMessageBox.information(self, "Saved", f"Log saved to:\n{path}")
+            self._set_status(f"Saved {n} readings spanning {span_min:.1f} min: {path}")
+            QtWidgets.QMessageBox.information(
+                self, "Saved",
+                f"Log saved to:\n{path}\n\n{n} readings spanning {span_min:.1f} min "
+                f"(this window keeps at most the last {LOG_SPAN_S / 60:.0f} min).")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
 
@@ -1234,96 +1335,172 @@ class MagnetometerGUI(QtWidgets.QMainWindow):
                 "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
             )
         self.server_conn_button.setText(text)
-        self.server_conn_button.setStyleSheet(style)
+        set_style(self.server_conn_button, style)
+
+    _SERIAL_STYLES = {
+        None: (
+            "Serial: ?",
+            "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
+            "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }",
+        ),
+        True: (
+            "Serial: Connected",
+            "QPushButton { background: #e9f7ef; border: 1px solid #95d3ab; color: #2f6a45; border-radius: 7px; padding: 2px 10px; }"
+            "QPushButton:hover { background: #dcf0e5; border-color: #77c594; }",
+        ),
+        False: (
+            "Serial: Disconnected",
+            "QPushButton { background: #fbeeee; border: 1px solid #e6abab; color: #8b4040; border-radius: 7px; padding: 2px 10px; }"
+            "QPushButton:hover { background: #f7dfdf; border-color: #d88f8f; }",
+        ),
+    }
+
+    def _set_serial_button(self, connected) -> None:
+        """connected: True / False / None (unknown)."""
+        self.serial_connected = connected
+        text, style = self._SERIAL_STYLES[connected]
+        self.serial_button.setText(text)
+        set_style(self.serial_button, style)
+
+    # ------------------------------------------------------------------
+    # Background calls (pool thread -> _bg_result -> GUI thread)
+    # ------------------------------------------------------------------
+
+    def _call_in_background(self, func, on_result) -> None:
+        """Run ``func()`` on the Qt thread pool; ``on_result(result, exc)`` is
+        then called on the GUI thread."""
+        emit = self._bg_result.emit
+        QtCore.QThreadPool.globalInstance().start(
+            _BgCall(func, lambda result, exc: emit(on_result, result, exc)))
+
+    def _on_bg_result(self, on_result, result, exc) -> None:
+        try:
+            on_result(result, exc)
+        except Exception as err:  # noqa: BLE001 - a slot must not raise
+            logger.warning("background call handler failed: %r", err)
+            self._set_status(f"GUI error: {err}")
 
     def _retry_server_connection(self) -> None:
         """Force immediate server rediscovery when the user clicks the connection button."""
-        self.client = None
-        self._update_server_conn_button("searching")
+        if not self.running:
+            # Never under a running worker: it reads self.client every poll.
+            self.client = None
+            self._update_server_conn_button("searching")
         self._refresh_serial_status()
 
-    def _refresh_serial_status(self):
-        if self.serial_button is None:
-            return
-        if self.client is None:
+    @staticmethod
+    def _probe(client):
+        """Pool thread: find the server and read its serial status.
+
+        Never touches widgets or ``self``.  A client that stops answering is
+        pointed at the server's current beacon (``_rediscover``) and asked
+        once more, instead of being thrown away: the worker thread keeps
+        using the same client object, so a server restarted on a new port is
+        followed without dropping the client from under it.
+        """
+        if client is None:
             try:
-                self.client = HMRClient(discovery_timeout=0.1)
-                self._update_server_conn_button("connected")
-                # Successfully connected — try to start monitor if not running.
-                if not self.running:
-                    self.start_monitor()
+                client = HMRClient(discovery_timeout=0.5)
             except RuntimeError:
-                self._update_server_conn_button("searching")
-                self.serial_connected = None
-                self.serial_button.setText("Serial: ?")
-                self.serial_button.setStyleSheet(
-                    "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
-                    "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
-                )
-                return
+                return {"state": "searching", "client": None}
         try:
-            result = self.client._get_serial_status(timeout=1.5)
-            connected = bool(result.get("connected", False))
-        except Exception:
-            logger.debug("_refresh_serial_status: serial status query failed", exc_info=True)
-            # Drop the client so the next tick re-discovers via beacon
-            # (handles server restart at a new port).
-            self.client = None
+            status = client._get_serial_status(timeout=1.5)
+        except Exception as first_exc:  # noqa: BLE001
+            moved = False
+            try:
+                before = (client.host, client.port)
+                moved = client._rediscover(timeout=0.5) and (client.host, client.port) != before
+            except Exception:  # noqa: BLE001
+                moved = False
+            if not moved:
+                return {"state": "lost", "client": client, "error": first_exc}
+            try:
+                status = client._get_serial_status(timeout=1.5)
+            except Exception as exc:  # noqa: BLE001
+                return {"state": "lost", "client": client, "error": exc}
+        return {"state": "connected", "client": client,
+                "serial_connected": bool(status.get("connected", False))}
+
+    def _refresh_serial_status(self):
+        """Probe the server off the GUI thread (every 2.5 s, and on demand).
+
+        One probe at a time; the result arrives in :meth:`_on_probe_done`.
+        """
+        if self.serial_button is None or self._probe_in_flight:
+            return
+        self._probe_in_flight = True
+        client = self.client
+        self._call_in_background(lambda: self._probe(client), self._on_probe_done)
+
+    def _on_probe_done(self, result, exc) -> None:
+        self._probe_in_flight = False
+        if exc is not None:
+            result = {"state": "lost", "client": self.client, "error": exc}
+        state = result.get("state")
+        client = result.get("client")
+        if client is not None and self.client is None:
+            self.client = client
+
+        if state == "searching":
+            self._update_server_conn_button("searching")
+            self._set_serial_button(None)
+            if self._start_requested:
+                self._start_requested = False
+                self._set_status("Server not found — retrying...")
+            return
+
+        if state == "lost":
+            logger.debug("serial status query failed: %r", result.get("error"))
             self._update_server_conn_button("lost")
-            self.serial_connected = None
-            self.serial_button.setText("Serial: ?")
-            self.serial_button.setStyleSheet(
-                "QPushButton { background: #f5f7fa; border: 1px solid #c7cfd9; color: #44576d; border-radius: 7px; padding: 2px 10px; }"
-                "QPushButton:hover { background: #eaf0f8; border-color: #9cb4d8; }"
-            )
+            self._set_serial_button(None)
+            if self._start_requested:
+                self._start_requested = False
+                host = getattr(client, "host", "?")
+                port = getattr(client, "port", "?")
+                self._set_status(
+                    f"Connection failed: cannot reach {host}:{port} ({result.get('error')})")
             return
 
         self._update_server_conn_button("connected")
-        # Server is reachable — restart the monitor if it stopped due to errors.
+        self._set_serial_button(bool(result.get("serial_connected")))
+        # Server is reachable — (re)start the monitor if it is not running
+        # (first start, or it stopped after too many poll errors).
         if not self.running:
-            self.start_monitor()
+            self._start_worker()
 
-        self.serial_connected = connected
-        if connected:
-            self.serial_button.setText("Serial: Connected")
-            self.serial_button.setStyleSheet(
-                "QPushButton { background: #e9f7ef; border: 1px solid #95d3ab; color: #2f6a45; border-radius: 7px; padding: 2px 10px; }"
-                "QPushButton:hover { background: #dcf0e5; border-color: #77c594; }"
-            )
-        else:
-            self.serial_button.setText("Serial: Disconnected")
-            self.serial_button.setStyleSheet(
-                "QPushButton { background: #fbeeee; border: 1px solid #e6abab; color: #8b4040; border-radius: 7px; padding: 2px 10px; }"
-                "QPushButton:hover { background: #f7dfdf; border-color: #d88f8f; }"
-            )
+    def _serial_action(self, label: str, call, timeout_note: str) -> None:
+        """Run a serial-control request on the pool; report it in the status log."""
+        client = self.client
+        if client is None:
+            self._set_status(f"Serial {label} error: server not connected")
+            return
+
+        def _done(result, exc):
+            try:
+                if exc is not None:
+                    raise exc
+                if not result.get("ok", False):
+                    raise RuntimeError(result.get("error", f"Serial {label} failed"))
+                self._set_status(result.get("message", timeout_note))
+            except Exception as err:
+                self._set_status(f"Serial {label} error: {err}")
+            finally:
+                self._refresh_serial_status()
+
+        self._call_in_background(lambda: call(client), _done)
 
     def _toggle_serial_connection(self):
-        try:
-            if self.serial_connected is False:
-                result = self.client._serial_reconnect(timeout=4.0)
-                action_name = "reconnect"
-            else:
-                result = self.client._serial_disconnect(timeout=2.5)
-                action_name = "disconnect"
-            if not result.get("ok", False):
-                raise RuntimeError(result.get("error", f"Serial {action_name} failed"))
-            self._set_status(result.get("message", f"Serial {action_name} command sent"))
-        except Exception as exc:
-            self._set_status(f"Serial control error: {exc}")
-        finally:
-            self._refresh_serial_status()
+        if self.serial_connected is False:
+            self._serial_action("reconnect", lambda c: c._serial_reconnect(timeout=4.0),
+                                "Serial reconnect command sent")
+        else:
+            self._serial_action("disconnect", lambda c: c._serial_disconnect(timeout=2.5),
+                                "Serial disconnect command sent")
 
     def _restart_serial(self):
         self._set_status("Restarting serial connection...")
-        try:
-            result = self.client._restart_serial(timeout=5.0)
-            if not result.get("ok", False):
-                raise RuntimeError(result.get("error", "Restart command failed"))
-            self._set_status(result.get("message", "Serial restarted"))
-        except Exception as exc:
-            self._set_status(f"Serial restart error: {exc}")
-        finally:
-            self._refresh_serial_status()
+        self._serial_action("restart", lambda c: c._restart_serial(timeout=5.0),
+                            "Serial restarted")
 
     def _set_status(self, text: str):
         stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"

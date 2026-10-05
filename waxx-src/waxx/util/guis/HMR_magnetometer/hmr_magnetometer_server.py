@@ -49,6 +49,15 @@ DEFAULT_SERVER_PORT = 0
 MAX_HISTORY = 10000
 SENSOR_COUNTS_PER_GAUSS = 15000.0
 MAX_STUCK_SAME_VALUES = 20
+# A stuck sensor is reset every ~MAX_STUCK_SAME_VALUES polls (~4.5 s), and each
+# reset used to put ~6 lines in the log -- most of the dashboard log while the
+# sensor stayed stuck for days.  Within one stuck episode the first reset and
+# the first reading after it are logged in full; later resets go to DEBUG
+# (this server's own log file) and a summary is logged this often.  Detection
+# and the reset itself are unchanged.
+STUCK_SUMMARY_INTERVAL_S = 600.0
+# an episode ends only after this long with readings and no stuck reset
+STUCK_RECOVERY_QUIET_S = 60.0
 
 # Field log: one reading per wall-clock second, one CSV per local day
 # (so a file holds at most 86400 rows).  Values are in gauss, as served.
@@ -80,7 +89,9 @@ def _configure_logging(log_path: str | None = None) -> None:
     fmt = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT)
 
     sh = logging.StreamHandler()
-    sh.setLevel(logging.DEBUG)
+    # stderr is what the dashboard's supervisor copies into the dashboard log:
+    # INFO and up there, the DEBUG detail only in the file below.
+    sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
@@ -99,6 +110,11 @@ def _configure_logging(log_path: str | None = None) -> None:
             logger.info("Logging to file: %s", log_path)
         except Exception as exc:
             logger.warning("Could not open log file %r: %s", log_path, exc)
+
+class SensorStuckError(RuntimeError):
+    """The sensor returned the same counts for MAX_STUCK_SAME_VALUES polls in
+    a row; the read loop resets the serial link, as for any read error."""
+
 
 class HMR2300Reader:
     def __init__(self, port, baud=DEFAULT_BAUD, device_id=DEFAULT_DEVICE_ID, timeout=1.0):
@@ -221,6 +237,9 @@ class MagnetometerServer(NetServer):
         # Monotonic time of the last parsed sensor reading (for the "com"
         # snapshot's last_rx_seconds_ago).
         self._last_rx_monotonic: float | None = None
+        # The current stuck-sensor episode, for the log only (see
+        # STUCK_SUMMARY_INTERVAL_S); None while the readings change.
+        self._stuck_episode: dict | None = None
         # Listening socket, kept so shutdown() can close it and unblock accept().
         self._srv: socket.socket | None = None
         self._shutdown_requested = False
@@ -379,6 +398,9 @@ class MagnetometerServer(NetServer):
         last_values = None
         same_count = 0
         stuck_values = None
+        # True after a repeat stuck reset: the reconnect that follows is
+        # routine and logged at DEBUG (see _note_stuck).
+        quiet_reconnect = False
 
         while not self.stop_event.is_set():
             if not self.serial_should_be_connected:
@@ -389,18 +411,20 @@ class MagnetometerServer(NetServer):
             # --- ensure serial is open (retry forever, never crash) ---
             if not self._is_serial_connected():
                 first_try = self._last_reconnect_failure_sig is None
+                loud = first_try and not quiet_reconnect
+                quiet_reconnect = False
                 # Only announce the attempt itself the first time (or after
                 # a streak break).  Subsequent silent retries every few
                 # seconds would otherwise spam the dashboard log.
-                if first_try:
+                if loud:
                     logger.info("Serial not connected, attempting reconnect on %s.", self.serial_port)
                 else:
                     logger.debug("Serial not connected, attempting reconnect on %s.", self.serial_port)
                 try:
-                    self._reconnect(quiet=not first_try)
+                    self._reconnect(quiet=not loud)
                     last_values = None
                     same_count = 0
-                    logger.info("Sensor reconnected.")
+                    (logger.info if loud else logger.debug)("Sensor reconnected.")
                     self._last_reconnect_failure_sig = None
                     self._reconnect_failure_streak = 0
                 except Exception as exc:
@@ -449,14 +473,17 @@ class MagnetometerServer(NetServer):
                     # the reconnect (logged below) shows whether the sensor
                     # had frozen or the field was just that quiet.
                     stuck_values = values
-                    raise RuntimeError(
+                    raise SensorStuckError(
                         f"Sensor readings stuck for {same_count} consecutive polls "
                         f"at counts {values}"
                     )
 
                 if stuck_values is not None:
-                    logger.info("First reading after a stuck reset: counts %s (stuck at %s)",
-                                values, stuck_values)
+                    episode = self._stuck_episode
+                    first_of_episode = episode is None or episode["resets"] <= 1
+                    (logger.info if first_of_episode else logger.debug)(
+                        "First reading after a stuck reset: counts %s (stuck at %s)",
+                        values, stuck_values)
                     stuck_values = None
 
                 x_G = x_counts / SENSOR_COUNTS_PER_GAUSS
@@ -469,13 +496,18 @@ class MagnetometerServer(NetServer):
                     self.history.append(reading)
                 self._last_rx_monotonic = time.monotonic()
                 self._queue_field_log(reading)
+                self._note_reading_ok()
 
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
                 if not self.serial_should_be_connected:
                     continue
-                logger.warning("Read error (%s: %s) — resetting serial for reconnect.", type(exc).__name__, exc)
+                if isinstance(exc, SensorStuckError):
+                    quiet_reconnect = self._note_stuck(exc, stuck_values)
+                else:
+                    logger.warning("Read error (%s: %s) — resetting serial for reconnect.",
+                                   type(exc).__name__, exc)
                 with self.serial_lock:
                     if self.reader is not None:
                         try:
@@ -490,6 +522,81 @@ class MagnetometerServer(NetServer):
 
             if self.stop_event.wait(self.poll_interval):
                 break
+
+    # ------------------------------------------------------------------
+    # Stuck-sensor log rate limiting (log only; detection is in _read_loop)
+    # ------------------------------------------------------------------
+
+    def _note_stuck(self, exc: Exception, counts) -> bool:
+        """Log a stuck detection; True when the reset that follows is a repeat
+        within the current episode (its reconnect chatter goes to DEBUG).
+
+        The first detection of an episode is logged in full, as before.  Later
+        ones go to DEBUG, with a WARNING summary every STUCK_SUMMARY_INTERVAL_S.
+        """
+        now = time.monotonic()
+        episode = self._stuck_episode
+        if episode is None:
+            self._stuck_episode = {
+                "since_wall": time.time(),
+                "since_mono": now,
+                "first_counts": counts,
+                "last_counts": counts,
+                "resets": 1,
+                "last_summary": now,
+                "last_reset_mono": now,
+                "readings_since_reset": 0,
+            }
+            logger.warning("Read error (%s: %s) — resetting serial for reconnect.",
+                           type(exc).__name__, exc)
+            return False
+        episode["resets"] += 1
+        episode["last_counts"] = counts
+        episode["last_reset_mono"] = now
+        episode["readings_since_reset"] = 0
+        logger.debug("Read error (%s: %s) — resetting serial for reconnect (stuck reset #%d).",
+                     type(exc).__name__, exc, episode["resets"])
+        if now - episode["last_summary"] >= STUCK_SUMMARY_INTERVAL_S:
+            episode["last_summary"] = now
+            logger.warning(
+                "Sensor still stuck: %d stuck resets in %.1f min since %s "
+                "(first stuck at counts %s, latest at counts %s). Each reset is "
+                "logged at DEBUG in this server's log file; next summary in %.0f min.",
+                episode["resets"], (now - episode["since_mono"]) / 60.0,
+                datetime.fromtimestamp(episode["since_wall"]).isoformat(timespec="seconds"),
+                episode["first_counts"], counts, STUCK_SUMMARY_INTERVAL_S / 60.0,
+            )
+        return True
+
+    def _note_reading_ok(self) -> None:
+        """Count good readings after a stuck reset; end the episode once the
+        readings have kept changing for STUCK_RECOVERY_QUIET_S.
+
+        A stuck sensor trips the detector on its (MAX_STUCK_SAME_VALUES + 1)th
+        identical reading, so more good readings than that since the last
+        reset mean the counts changed in between. A sensor that moves a count
+        or two after each reset and then sticks again (seen 2026-10-05) would
+        end and start an episode every few seconds, so the episode also needs
+        STUCK_RECOVERY_QUIET_S without a stuck reset.
+        """
+        episode = self._stuck_episode
+        if episode is None:
+            return
+        episode["readings_since_reset"] += 1
+        if episode["readings_since_reset"] <= MAX_STUCK_SAME_VALUES:
+            return
+        if time.monotonic() - episode["last_reset_mono"] < STUCK_RECOVERY_QUIET_S:
+            return
+        self._stuck_episode = None
+        logger.info(
+            "Sensor readings changing again: %d readings since the last reset with no "
+            "stuck detection. The episode had %d stuck reset(s) over %.1f min since %s "
+            "(first stuck at counts %s, last at counts %s).",
+            episode["readings_since_reset"], episode["resets"],
+            (time.monotonic() - episode["since_mono"]) / 60.0,
+            datetime.fromtimestamp(episode["since_wall"]).isoformat(timespec="seconds"),
+            episode["first_counts"], episode["last_counts"],
+        )
 
     # ------------------------------------------------------------------
     # Field log (daily CSV, one reading per second)
