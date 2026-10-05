@@ -29,7 +29,7 @@ from waxx.util.comms_server.hardware_id import scoped_server_id
 from waxx.util.live_od.config import get_config
 # Everything the server does to the run's data file (reserve, save, delete) is
 # in live_od/data/run_file.py; this module keeps the protocol and the run state.
-from waxx.util.live_od.data.image_writer import PutItem
+from waxx.util.live_od.data.image_writer import PutItem, writer_queue_stats
 from waxx.util.live_od.data.run_file import RunFile, RunFileSaveError
 from waxx.util.live_od.log import get_logger, get_log_buffer
 from waxx.util.live_od.marker_store import MarkerStore
@@ -97,9 +97,6 @@ class LiveODServer(QThread, NetServer):
     run_done_signal = pyqtSignal()
     run_started_signal = pyqtSignal(int, object)               # run_id, xvarnames (emitted after INIT_RUN, before new_run_signal)
     reset_signal = pyqtSignal()                               # triggered by remote RESET command
-    # an array the experiment pushed during the run (PUT_DATA): {run_id, key,
-    # index, array, t}; the window hands it to the broadcaster (AUX_DATA)
-    aux_data_signal = pyqtSignal(object)
     camera_control_signal = pyqtSignal(str, str)              # camera_key, action ('open'|'close'|'toggle')
     adjust_specs_signal = pyqtSignal(list)                    # list of spec dicts, emitted after every INIT_RUN (empty list when no adjust params)
     shot_adjust_values_signal = pyqtSignal(dict)              # current adjust values dict, emitted per shot
@@ -212,6 +209,21 @@ class LiveODServer(QThread, NetServer):
         self._host_pending = None
         # when Persist was turned on, for the overrides record of the current run
         self._camera_overrides_persist_since = None
+        # Arrays the experiment pushed during the run (PUT_DATA): the latest
+        # record per key, for GET_AUX_DATA; reset at INIT_RUN.
+        self._aux_latest = {}
+        # Called on this thread with a small notice per PUT_DATA (what arrived,
+        # no array); the window sets it to the broadcaster's thread-safe
+        # broadcast_aux_notice (set_aux_notice_sink). None: no notices.
+        self._aux_notice_sink = None
+
+    def set_aux_notice_sink(self, sink):
+        """``sink(notice)`` is called on the server thread for every PUT_DATA,
+        with ``{run_id, t, items: [{key, index, offset, shape, dtype, nbytes}]}``
+        -- no arrays: a viewer that wants them asks GET_AUX_DATA. It must be
+        quick and thread-safe (LiveODBroadcaster.broadcast_aux_notice only
+        queues the message)."""
+        self._aux_notice_sink = sink
 
     def set_markers(self, camera_key: str, markers) -> list:
         """Store one camera's markers (from the GUI; remote viewers use SET_MARKERS)."""
@@ -891,8 +903,9 @@ class LiveODServer(QThread, NetServer):
         writer, the only handle on the file; the reply says that much and no
         more -- what the writer could not write is in END_RUN's completeness
         report. In a run that saves nothing they are taken all the same
-        (``written`` False): the latest of each key is kept for GET_AUX_DATA
-        and every one goes out on the broadcast (AUX_DATA)."""
+        (``written`` False). Either way the latest of each key is kept for
+        GET_AUX_DATA, and a notice of what came (no arrays) goes out on the
+        broadcast (AUX_NOTICE)."""
         if not self._run_msg_ok(msg):
             return self._stale_run_reply("PUT_DATA", msg)
         if not self._run_in_progress:
@@ -920,29 +933,39 @@ class LiveODServer(QThread, NetServer):
         return {"ok": True, "queued": len(items) if written else 0, "written": written}
 
     def _note_aux_items(self, items):
-        """Keep the latest array per key (GET_AUX_DATA) and hand each one to
-        the window for the broadcast (AUX_DATA). A slice of a whole array
-        pushed at the end is not a shot's data and is left out."""
-        latest = getattr(self, "_aux_latest", None)
-        if latest is None:
-            latest = self._aux_latest = {}
+        """Keep the latest array per key (GET_AUX_DATA) and send one notice of
+        what came, without the arrays, to the broadcast (AUX_NOTICE). A slice
+        of a whole array pushed at the end is not a shot's data and is left
+        out of both.
+
+        The arrays themselves are not broadcast: ~2.5 MB of diagnostic frames
+        a shot, pickled whole into a PUB socket whose 8-message high-water mark
+        they shared with OD_IMAGE / RUN_DONE / RUN_STATE, crowded those out of
+        the viewers' pipes, and each one went through the GUI thread on its way
+        (2026-10-05). Nothing subscribed to them."""
         now = time.time()
+        notes = []
         for it in items:
             if it.index is None and it.offset is not None:
                 continue
-            rec = {"run_id": self._current_run_id, "key": it.key,
-                   "index": None if it.index is None else list(it.index),
-                   "array": it.array, "t": now}
-            latest[it.key] = rec
+            index = None if it.index is None else list(it.index)
+            self._aux_latest[it.key] = {"run_id": self._current_run_id, "key": it.key,
+                                        "index": index, "array": it.array, "t": now}
+            notes.append({"key": it.key, "index": index, "offset": it.offset,
+                          "shape": list(it.array.shape), "dtype": it.array.dtype.str,
+                          "nbytes": int(it.array.nbytes)})
+        sink = self._aux_notice_sink
+        if notes and sink is not None:
             try:
-                self.aux_data_signal.emit(rec)
+                sink({"run_id": self._current_run_id, "t": now, "items": notes})
             except Exception:
-                logger.debug("aux data signal failed", exc_info=True)
+                logger.debug("aux notice failed", exc_info=True)
 
     def _handle_get_aux_data(self, msg: dict) -> dict:
         """The latest pushed array of each key (or of ``keys``), with the run
-        it came from; for a viewer that wants a frame it missed."""
-        latest = dict(getattr(self, "_aux_latest", None) or {})
+        it came from; for a viewer that wants a frame it missed (the broadcast
+        only says that one came: AUX_NOTICE)."""
+        latest = dict(self._aux_latest)
         keys = msg.get("keys")
         if keys:
             latest = {k: v for k, v in latest.items() if k in set(keys)}
@@ -1791,6 +1814,9 @@ class LiveODServer(QThread, NetServer):
             # the current (or last) run's camera settings that differ from its
             # camera_params; {} when none do
             "camera_overrides": self.camera_overrides_record(),
+            # what the image writers hold that is not on disk yet:
+            # {items, bytes, peak_bytes, warn_bytes} (image_writer.QueueGauge)
+            "writer_queue": writer_queue_stats(),
         }
 
     def _handle_get_log(self, msg: dict) -> dict:

@@ -6,7 +6,7 @@ import threading
 from queue import Queue
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStyle,
                              QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSettings, QMetaObject
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSettings, QMetaObject
 import time
 import names
 
@@ -53,6 +53,57 @@ LIVE_VIEW_STOP_POLL_MS = 100
 def _ms_left(deadline: float) -> int:
     """Milliseconds to ``deadline`` (time.monotonic()), for QThread.wait; >= 0."""
     return max(0, int((deadline - time.monotonic()) * 1000))
+
+
+class BackgroundPoll(QObject):
+    """Runs ``fn`` off the GUI thread and delivers its result as ``result``
+    (queued to the receiver's thread). At most one call is in flight: ``poll``
+    while one is running does nothing and returns False, so a call stuck on a
+    stalled network drive never piles up threads behind it. An exception from
+    ``fn`` is delivered as None.
+
+    For the next-run-id label: server_talk.get_run_id reads a file on the data
+    drive, and an SMB stall there used to freeze the window (2026-10-05)."""
+
+    result = pyqtSignal(object)
+
+    def __init__(self, fn, name: str = "liveod-poll", parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self._name = name
+        self._lock = threading.Lock()
+        self._in_flight = False
+        self.skipped = 0            # polls skipped because the last was still running
+
+    @property
+    def in_flight(self) -> bool:
+        return self._in_flight
+
+    def poll(self) -> bool:
+        with self._lock:
+            if self._in_flight:
+                self.skipped += 1
+                return False
+            self._in_flight = True
+        try:
+            threading.Thread(target=self._work, name=self._name, daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._in_flight = False
+            raise
+        return True
+
+    def _work(self):
+        try:
+            value = self._fn()
+        except Exception:
+            value = None
+        with self._lock:
+            self._in_flight = False
+        try:
+            self.result.emit(value)
+        except RuntimeError:
+            pass                    # the window (and this object) is gone
 
 
 def _stop_camera_thread(thread, reason: str):
@@ -166,9 +217,10 @@ class LiveODWindow(QWidget):
         self.live_od_server.adjust_specs_signal.connect(self._on_adjust_specs)
         self.live_od_server.shot_adjust_values_signal.connect(self.broadcaster.broadcast_adjust_values)
         self.live_od_server.shot_adjust_values_signal.connect(self._adjust_panel.update_values)
-        # arrays pushed during the run (diagnostic frames, scope traces) go
-        # out to remote viewers whether the run saves or not
-        self.live_od_server.aux_data_signal.connect(self.broadcaster.broadcast_aux_data)
+        # a notice of each push during the run (diagnostic frames, scope
+        # traces; no arrays) goes out to remote viewers whether the run saves
+        # or not, straight from the server thread (no hop through this one)
+        self.live_od_server.set_aux_notice_sink(self.broadcaster.broadcast_aux_notice)
         self.analyzer.broadcast_signal.connect(self.broadcaster.broadcast_od_image)
         self.analyzer.shot_scalars_signal.connect(self.live_scalar_plot_window.on_shot_scalars)
         self.analyzer.shot_scalars_signal.connect(self.broadcaster.broadcast_shot_scalars)
@@ -516,10 +568,16 @@ class LiveODWindow(QWidget):
             self.msg(f"Camera {camera_key}: {e}", logging.ERROR)
 
     def update_run_id_label(self):
-        try:
-            rid = self.server_talk.get_run_id()
-        except Exception as e:
-            rid = None
+        """Ask for the next run id in the background (BackgroundPoll); the label
+        changes when the answer comes. Skipped while the last ask is still out."""
+        poller = getattr(self, '_run_id_poll', None)
+        if poller is None:
+            poller = self._run_id_poll = BackgroundPoll(self.server_talk.get_run_id,
+                                                        name="liveod-run-id", parent=self)
+            poller.result.connect(self._on_run_id_polled)
+        poller.poll()
+
+    def _on_run_id_polled(self, rid):
         self.status_strip.set_next_run_id(rid)
 
     def setup_widgets(self):

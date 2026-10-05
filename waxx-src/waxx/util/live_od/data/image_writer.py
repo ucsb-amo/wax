@@ -24,10 +24,16 @@ its slot of a pre-allocated dataset, or into a dataset it creates on first
 write. The DataHandler attaches to the registered writer (writer_for) instead
 of opening its own; it only says when the camera's frames are all in
 (images_done).
+
+2026-10-05: what the writers hold and have not written yet is counted
+(QueueGauge, POLL's ``writer_queue``; a WARNING past WRITER_QUEUE_WARN_BYTES).
+The queue stays unbounded. A frame handed over after the writer was finished,
+and anything still queued when the worker stops after an unexpected error, is
+reported as not written (it used to sit unseen in a queue nobody read).
 """
 import os
 import threading
-from queue import Queue
+from queue import Empty, Queue
 
 import numpy as np
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
@@ -194,6 +200,81 @@ def forget_writer(filepath):
         _WRITERS.pop(_report_key(filepath), None)
 
 
+# What the writers hold that is not on disk yet: frames and pushed arrays queued
+# for a SaveWorker. The queue itself stays unbounded on purpose -- refusing or
+# dropping a write would lose data -- so a slow drive shows up as memory. This
+# makes that backlog visible (POLL's ``writer_queue``) and loud: one WARNING when
+# it crosses WRITER_QUEUE_WARN_BYTES, one INFO when it is back below half of it.
+WRITER_QUEUE_WARN_BYTES = 200 * 2**20
+
+
+def _queued_nbytes(item) -> int:
+    """The array bytes one queue item holds (a PutItem, or a frame tuple)."""
+    try:
+        if isinstance(item, PutItem):
+            return int(item.array.nbytes)
+        return int(getattr(item[0], "nbytes", 0))
+    except Exception:
+        return 0
+
+
+class QueueGauge:
+    """Items and bytes waiting in the writers' queues, over every writer in the
+    process (a finished run's writer may still be draining when the next run's
+    starts). Thread-safe: added on the feeding threads, taken on the workers'."""
+
+    def __init__(self, warn_bytes: int = WRITER_QUEUE_WARN_BYTES):
+        self._lock = threading.Lock()
+        self.warn_bytes = int(warn_bytes)
+        self._items = 0
+        self._bytes = 0
+        self._peak_bytes = 0
+        self._warned = False
+
+    def added(self, item):
+        nbytes = _queued_nbytes(item)
+        with self._lock:
+            self._items += 1
+            self._bytes += nbytes
+            self._peak_bytes = max(self._peak_bytes, self._bytes)
+            crossed = not self._warned and self._bytes >= self.warn_bytes
+            if crossed:
+                self._warned = True
+            items, total = self._items, self._bytes
+        if crossed:
+            logger.warning(f"Image writer backlog: {items} item(s), {total / 2**20:.0f} MB queued "
+                           f"and not yet on disk (warning at {self.warn_bytes / 2**20:.0f} MB). "
+                           f"Is the data drive slow? Nothing is dropped; the backlog is held in "
+                           f"memory until written.")
+
+    def taken(self, item):
+        nbytes = _queued_nbytes(item)
+        with self._lock:
+            self._items = max(0, self._items - 1)
+            self._bytes = max(0, self._bytes - nbytes)
+            drained = self._warned and self._bytes < self.warn_bytes / 2
+            if drained:
+                self._warned = False
+            items, total = self._items, self._bytes
+        if drained:
+            logger.info(f"Image writer backlog down to {items} item(s), {total / 2**20:.0f} MB.")
+
+    def snapshot(self) -> dict:
+        """``{items, bytes, peak_bytes (since liveOD started), warn_bytes}``."""
+        with self._lock:
+            return {"items": self._items, "bytes": self._bytes,
+                    "peak_bytes": self._peak_bytes, "warn_bytes": self.warn_bytes}
+
+
+# the one every writer reports to (POLL reads it)
+WRITER_QUEUE = QueueGauge()
+
+
+def writer_queue_stats() -> dict:
+    """What the writers have queued and not yet written (QueueGauge.snapshot)."""
+    return WRITER_QUEUE.snapshot()
+
+
 def _float_storage(full_shape, dtype):
     """Storage options for a big float dataset made on first use (scope
     traces): one chunk per shot and gzip, as the end-of-run scope writer
@@ -266,9 +347,13 @@ class SaveWorker(QThread):
                  wait_timeout: float = 120.,
                  check_interrupt_method=None,
                  report: WriteReport = None,
-                 put_report: PutReport = None):
+                 put_report: PutReport = None,
+                 gauge: QueueGauge = None):
         super().__init__()
         self._save_queue = save_queue
+        # what the queue holds, counted by the feeder (ImageWriter) and taken
+        # off here as each item comes out
+        self._gauge = gauge if gauge is not None else WRITER_QUEUE
         self._wait_fn = wait_fn
         self._n_img = n_img
         self._wait_timeout = wait_timeout
@@ -309,6 +394,7 @@ class SaveWorker(QThread):
                 item = self._save_queue.get()
                 if item is None:            # sentinel — we're done
                     break
+                self._gauge.taken(item)
                 if self.interrupted or f is None:
                     if isinstance(item, PutItem) and f is None:
                         self.put_report.not_written(f"{item!r}: the file could not be opened")
@@ -384,7 +470,30 @@ class SaveWorker(QThread):
                     f.close()
                 except Exception:
                     pass
+            self._drain_unwritten()
             self.done_writing_signal.emit()
+
+    def _drain_unwritten(self):
+        """What is still queued once the loop is over (only after an unexpected
+        error: the end marker is always last) will never be written. Each item
+        is reported as not written, and taken off the backlog gauge."""
+        n = 0
+        while True:
+            try:
+                item = self._save_queue.get_nowait()
+            except Empty:
+                break
+            if item is None:
+                continue
+            self._gauge.taken(item)
+            n += 1
+            if isinstance(item, PutItem):
+                self.put_report.not_written(f"{item!r}: the writer stopped before writing it")
+            else:
+                self.report.not_written(f"frame {item[1]}: the writer stopped before writing it")
+        if n:
+            logger.error(f"SaveWorker: {n} queued item(s) were never written: the writer "
+                         f"stopped first. The run will be saved incomplete.")
 
     def _write_put(self, f, item: PutItem):
         """One pushed array into its slot; the dataset is made on first use."""
@@ -433,7 +542,8 @@ class ImageWriter(Scribe):
     Scribe supplies ``wait_for_data_available`` and ``remove_incomplete_data``.
     """
 
-    def __init__(self, data_filepath: str, server_owned: bool = False):
+    def __init__(self, data_filepath: str, server_owned: bool = False,
+                 gauge: QueueGauge = None):
         # Deliberately not Scribe.__init__: it builds a DataSaver and a run-id
         # source, which nothing here uses. (DataHandler used to build both on
         # every camera run, through PyQt's cooperative __init__.)
@@ -442,6 +552,12 @@ class ImageWriter(Scribe):
         self._save_queue = None
         self._worker = None
         self._finished = False
+        # the backlog gauge (POLL's writer_queue); a test may pass its own
+        self._gauge = gauge if gauge is not None else WRITER_QUEUE
+        # put / put_data / finish under one lock: nothing is queued behind the
+        # end marker, where the worker would never take it
+        self._put_lock = threading.Lock()
+        self._late_frames = 0
         self.report = None          # WriteReport, from the first start
         self.put_report = PutReport()
         self.images_finished = threading.Event()    # the camera's frames are all in
@@ -470,6 +586,7 @@ class ImageWriter(Scribe):
             check_interrupt_method=self._interrupt_check(check_interrupt_method),
             report=self.report,
             put_report=self.put_report,
+            gauge=self._gauge,
         )
         self._worker.start()
 
@@ -519,16 +636,38 @@ class ImageWriter(Scribe):
             failed_signal.emit(self._worker.open_error)
 
     def put(self, img, idx: int, img_t: float):
-        """Non-blocking hand-off of one image."""
-        self._save_queue.put((img, idx, img_t))
+        """Non-blocking hand-off of one image. A frame that comes once the
+        writer is finished cannot be written (the worker stops at the end
+        marker): it is reported as not written, not left in a queue nobody
+        reads."""
+        item = (img, idx, img_t)
+        with self._put_lock:
+            if self._save_queue is None:
+                raise RuntimeError("ImageWriter.put before the writer was started")
+            if not self._finished:
+                self._gauge.added(item)
+                self._save_queue.put(item)
+                return
+            self._late_frames += 1
+            n_late = self._late_frames
+        line = f"frame {idx}: came after the writer was finished; not written"
+        if self.report is not None:
+            self.report.not_written(line)
+        discarding = bool(self._worker is not None and self._worker.interrupted)
+        if n_late == 1 and not discarding:      # (an aborted run's file goes anyway)
+            logger.error(f"ImageWriter: {line}.")
+        else:
+            logger.debug(f"ImageWriter: {line}")
 
     def put_data(self, item: PutItem) -> bool:
         """Non-blocking hand-off of one pushed array; False once the writer is
         finished or was never started."""
-        if self._worker is None or self._finished:
-            return False
-        self._save_queue.put(item)
-        return True
+        with self._put_lock:
+            if self._worker is None or self._finished:
+                return False
+            self._gauge.added(item)
+            self._save_queue.put(item)
+            return True
 
     def images_done(self, interrupted: bool):
         """The camera's frames are all in (or the grab was interrupted). A
@@ -543,12 +682,13 @@ class ImageWriter(Scribe):
     def finish(self, interrupted: bool = False):
         """No more data. The worker closes the file and emits done; if
         ``interrupted`` it drains what is queued without writing it."""
-        if self._worker is None or self._finished:
-            return
-        self._finished = True
-        if interrupted:
-            self._worker.interrupted = True
-        self._save_queue.put(None)
+        with self._put_lock:
+            if self._worker is None or self._finished:
+                return
+            self._finished = True
+            if interrupted:
+                self._worker.interrupted = True
+            self._save_queue.put(None)
         forget_writer(self.data_filepath)
 
     def wait_done(self, timeout: float) -> bool:

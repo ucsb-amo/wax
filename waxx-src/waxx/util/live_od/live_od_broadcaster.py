@@ -16,6 +16,9 @@ Message format — every message is a pickled dict with a 'tag' key:
                              'sum_od_x': ndarray, 'sum_od_y': ndarray,
                              'shot_idx': int or None}
     {'tag': 'RUN_DONE'}
+    {'tag': 'AUX_NOTICE',   'run_id': int, 't': float,
+                             'items': [{'key', 'index', 'offset', 'shape',
+                                        'dtype', 'nbytes'}, ...]}
 """
 
 import pickle
@@ -177,12 +180,18 @@ class LiveODBroadcaster(QThread, NetServer):
         """
         self._enqueue({'tag': 'FK_TOF', **data})
 
-    def broadcast_aux_data(self, item: dict):
-        """An array the experiment pushed during the run (a diagnostic camera
-        frame, a scope trace): ``run_id``, ``key``, ``index`` (the shot's slot
-        in the run, or None for a whole dataset), ``array``, ``t``. Sent for
-        every run, saved or not (LiveODServer.aux_data_signal)."""
-        self._enqueue({'tag': 'AUX_DATA', **item})
+    def broadcast_aux_notice(self, notice: dict):
+        """What one PUT_DATA brought (diagnostic camera frames, scope traces),
+        without the arrays: ``run_id``, ``t``, ``items`` (one ``{key, index,
+        offset, shape, dtype, nbytes}`` each; ``index`` is the shot's slot, or
+        None for a whole dataset). Sent for every run, saved or not, straight
+        from the server thread (LiveODServer.set_aux_notice_sink). The latest
+        array of each key is GET_AUX_DATA's on the server's REP port.
+
+        Replaces AUX_DATA (2026-10-02..05), which carried every array: ~2.5 MB a
+        shot through the 8-message high-water mark that OD_IMAGE and the run
+        events need, for no subscriber."""
+        self._enqueue({'tag': 'AUX_NOTICE', **notice})
 
     def broadcast_log_msg(self, text: str, level: int = 20):
         """``level``: a ``logging`` level number (20 = INFO). Viewers that predate

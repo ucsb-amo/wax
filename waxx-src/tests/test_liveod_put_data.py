@@ -122,7 +122,7 @@ def test_put_data_is_refused_for_a_stale_run_no_run_or_no_file(server):
 def test_a_run_that_saves_nothing_takes_pushes_keeps_the_latest_and_broadcasts(server):
     srv, saver = server
     got = []
-    srv.aux_data_signal.connect(got.append)
+    srv.set_aux_notice_sink(lambda notice: got.extend(notice["items"]))
     init = srv._handle_init_run(_init_msg(save_data=False))
     token = init["run_token"]
     frame = np.arange(6, dtype=np.uint8).reshape(2, 3)
@@ -136,7 +136,9 @@ def test_a_run_that_saves_nothing_takes_pushes_keeps_the_latest_and_broadcasts(s
     rec = latest["items"]["img_a"]
     assert rec["index"] == [1] and np.array_equal(rec["array"], frame) and rec["run_id"] == init["run_id"]
     assert srv._handle_get_aux_data({"keys": ["img_a"]})["items"].keys() == {"img_a"}
+    # the broadcast says what came; the arrays are GET_AUX_DATA's
     assert [g["key"] for g in got] == ["img_a", "img_a_meta"]
+    assert all("array" not in g for g in got)
     # a second shot replaces the latest
     msg, bufs = _put_msg(token, [("img_a", [0], frame * 2, [2, 2, 3], 0)])
     assert srv._handle_put_data(msg, bufs)["ok"]
@@ -151,7 +153,7 @@ def test_a_run_that_saves_nothing_takes_pushes_keeps_the_latest_and_broadcasts(s
 def test_a_saving_run_also_broadcasts_what_it_writes_but_not_slices(server):
     srv, saver = server
     got = []
-    srv.aux_data_signal.connect(got.append)
+    srv.set_aux_notice_sink(lambda notice: got.extend(notice["items"]))
     init = srv._handle_init_run(_init_msg())
     token = init["run_token"]
     msg, bufs = _put_msg(token, [("img_a", [0], np.zeros((2, 3), np.uint8), [2, 2, 3], 0)])

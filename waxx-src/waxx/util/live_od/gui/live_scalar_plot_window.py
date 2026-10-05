@@ -9,11 +9,13 @@ Both the local liveOD window and the remote viewer window use this widget.
 """
 
 import collections
+import itertools
 import math
+import time
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -89,11 +91,18 @@ class LiveScalarPlotWindow(QWidget):
     subscription_changed_signal = pyqtSignal(object, object)  # old_tier, new_tier
 
     MAX_STORED_SHOTS = 10_000
+    # new shots redraw the plot at most this often (2 Hz)
+    REFRESH_MIN_INTERVAL_MS = 500
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Live Scalar Plot")
         self.resize(720, 460)
+
+        self._last_refresh_t = float("-inf")    # time.monotonic() of the last redraw
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_plot)
 
         self._data: collections.deque = collections.deque(maxlen=self.MAX_STORED_SHOTS)
         self._xvarnames: list = []
@@ -201,7 +210,20 @@ class LiveScalarPlotWindow(QWidget):
         """Receive a per-shot scalar dict from Analyzer or ZMQ subscriber."""
         self._data.append(scalars)
         if self.isVisible():        # a hidden window redraws once, on show
+            self._schedule_refresh()
+
+    def _schedule_refresh(self):
+        """Redraw for new shots at most every REFRESH_MIN_INTERVAL_MS: at once
+        when the last redraw is that old, else once when it is (however many
+        shots came in between). Redrawing up to MAX_STORED_SHOTS points on the
+        GUI thread for every shot is what this avoids."""
+        if self._refresh_timer.isActive():
+            return
+        since = (time.monotonic() - self._last_refresh_t) * 1000.0
+        if since >= self.REFRESH_MIN_INTERVAL_MS:
             self._refresh_plot()
+        else:
+            self._refresh_timer.start(max(1, int(self.REFRESH_MIN_INTERVAL_MS - since)))
 
     def on_new_run(self, run_id: int, xvarnames: list):
         """Called at the start of each run to reset data and update x-axis choices."""
@@ -334,7 +356,19 @@ class LiveScalarPlotWindow(QWidget):
             ys.append(y_val)
         return xs, ys
 
-    def _refresh_plot(self):
+    def _recent(self, n: int) -> list:
+        """The last ``n`` shots, oldest first, without copying the rest."""
+        if n >= len(self._data):
+            return list(self._data)
+        recent = list(itertools.islice(reversed(self._data), n))
+        recent.reverse()
+        return recent
+
+    def _refresh_plot(self, *_):
+        # any redraw (a control changed, a run started) covers the shots a
+        # scheduled one was waiting for
+        self._refresh_timer.stop()
+        self._last_refresh_t = time.monotonic()
         plot_item = self.plot_widget.getPlotItem()
         second = self._second_metric()
         plot_item.showAxis('right') if second is not None else plot_item.hideAxis('right')
@@ -348,8 +382,7 @@ class LiveScalarPlotWindow(QWidget):
         if self.show_all_check.isChecked():
             data = list(self._data)
         else:
-            n = self.n_shots_spin.value()
-            data = list(self._data)[-n:]
+            data = self._recent(self.n_shots_spin.value())
 
         xaxis_sel = self.xaxis_combo.currentText()
         _label, key, ymult, yunit = METRICS[self.metric_combo.currentIndex()]

@@ -31,6 +31,10 @@ def nothing():
 # A camera thread waiting for another thread's hold on its camera (the camera
 # lock, CameraNanny.camera_lock) checks its own stop this often (s).
 CAMERA_LOCK_POLL_S = 0.1
+# The image dispatcher (DataHandler) waits this long at most for the next frame
+# before it looks at its interrupt and the grab's end again (s). A frame is
+# taken the moment it is queued, whatever this is.
+DISPATCH_POLL_S = 0.1
 
 class CameraNotReadyError(ValueError):
     """The handshake got no open camera.  A ValueError because it used to be a
@@ -257,7 +261,12 @@ class DataHandler(QThread):
                 if self.interrupted:
                     break
                 try:
-                    img, _, idx = self.queue.get(block=False)
+                    # Blocks until a frame comes, or for DISPATCH_POLL_S at most,
+                    # so an interrupt or the grab's end is seen within that. (It
+                    # used to poll with a 1 ms sleep: ~1000 wake-ups a second
+                    # for the whole run, each taking the GIL from the threads
+                    # that do the work.)
+                    img, _, idx = self.queue.get(timeout=DISPATCH_POLL_S)
                     img_t = time.time()
                     self.images_received += 1
                     self.got_image_from_queue.emit(img)   # immediate display / OD plot
@@ -273,7 +282,6 @@ class DataHandler(QThread):
                         # timeout, and END_RUN's save then ran on top of it
                         # (run 80704, 2026-09-24).
                         break
-                    self.msleep(1)
                 except Exception as e:
                     logger.exception(f"DataHandler: unexpected error in image dispatch loop: {e}")
                     self.msleep(1)
