@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from waxx.util.dashboard import theme
+from waxx.util.dashboard.restyle import set_style, set_tooltip
 from waxx.util.dashboard.server_supervisor import SupervisorState
 from waxx.util.dashboard.widgets import ComStatusButton
 
@@ -48,7 +49,7 @@ class _LedDot(QLabel):
         self._refresh()
 
     def _refresh(self) -> None:
-        self.setStyleSheet(
+        set_style(self,
             f"QLabel {{ background-color: {self._color}; border-radius: 5px;"
             " border: 1px solid #1a1a1a; }"
         )
@@ -214,10 +215,11 @@ class PanelHeaderBar(QWidget):
     def set_conn(self, status: str, detail: str = "") -> None:
         status = str(status).lower()
         text = {"connected": "OK", "disconnected": "--", "connecting": "…"}.get(status, "ERR")
-        self._conn_badge.setVisible(True)
+        if self._conn_badge.isHidden():
+            self._conn_badge.setVisible(True)
         self._conn_badge.setText(text)
-        self._conn_badge.setStyleSheet(f"QLabel {{ {theme.pill_css(theme.conn_color(status))} }}")
-        self._conn_badge.setToolTip(detail or f"snapshot poll: {status}")
+        set_style(self._conn_badge, f"QLabel {{ {theme.pill_css(theme.conn_color(status))} }}")
+        set_tooltip(self._conn_badge, detail or f"snapshot poll: {status}")
 
     def set_com(self, com: Optional[dict]) -> None:
         """Drive the COM pill from a snapshot's ``"com"`` dict (``SerialSnapshot.as_dict()`` shape)."""

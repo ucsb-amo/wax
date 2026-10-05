@@ -11,6 +11,10 @@ calls once at startup.  Goals:
 * ``faulthandler`` installed before any third-party import so native crashes
   (pylonsdk SEGVs, pyserial driver faults, pyzmq aborts) write Python tracebacks
   to the same log file.
+* Unhandled exceptions (main thread, other threads, PyQt slots) are logged
+  with their traceback; in a process that has loaded Qt, Qt's own
+  warning / critical / fatal messages are logged too (a ``pythonw.exe``
+  dashboard has no stderr for them).
 * Fallback to ``%LOCALAPPDATA%/<app_name>/dashboard/_logs/`` if the primary
   log dir is unmapped or read-only.
 * Visible banner emitted via a "boot warning" list that the dashboard reads at
@@ -32,6 +36,8 @@ Public API:
 * :func:`attach_panel_logger`    - returns a child logger tagged with the panel id.
 * :func:`active_log_dir`         - returns the directory the helper is currently writing to.
 * :func:`pop_boot_warnings`      - returns and clears any startup warnings.
+* :func:`install_excepthooks` / :func:`install_qt_message_handler` - run by
+  the ``configure_*_logging`` calls; callable on their own.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ import os
 import queue
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -324,13 +331,12 @@ def _install_handlers(log_path: Path, fallback: Path, level: int = logging.INFO)
         console.setFormatter(_FORMATTER)
         console.setLevel(level)
         root.addHandler(console)
-    if sys.stderr is None:
-        # No console to print tracebacks to: route uncaught exceptions into
-        # the log file so a pythonw-launched dashboard never dies silently.
-        def _log_uncaught(exc_type, exc, tb):  # noqa: ANN001
-            logging.getLogger("uncaught").critical(
-                "uncaught exception", exc_info=(exc_type, exc, tb))
-        sys.excepthook = _log_uncaught
+    install_excepthooks()
+    # Qt's own warnings / fatals go to stderr, which a pythonw-launched
+    # dashboard does not have.  Only when Qt is already loaded: a server that
+    # never imports Qt must not start doing so here.
+    if "PyQt6.QtCore" in sys.modules:
+        install_qt_message_handler()
 
     # faulthandler: write native tracebacks to a sibling ``.fault`` file,
     # NOT the rotating log itself.  If we share the file handle with the
@@ -344,6 +350,175 @@ def _install_handlers(log_path: Path, fallback: Path, level: int = logging.INFO)
         faulthandler.enable(file=_FAULTHANDLER_FILE, all_threads=True)
     except Exception as exc:
         _BOOT_WARNINGS.append(f"logging_setup: faulthandler.enable failed ({exc!r})")
+
+
+def _is_ours(hook) -> bool:
+    return bool(getattr(hook, "_waxx_logging_hook", False))
+
+
+def install_excepthooks() -> None:
+    """Log every unhandled exception, on the main thread and on other threads.
+
+    Under PyQt6 an exception escaping a slot goes to ``sys.excepthook``; with
+    Python's default hook PyQt then aborts the whole process (under
+    ``python.exe``), and under ``pythonw.exe`` the traceback has nowhere to
+    go.  This hook writes the traceback to the log and returns, so the event
+    loop carries on.  ``KeyboardInterrupt`` keeps Python's default behaviour.
+    A hook installed earlier by someone else still runs after the log line.
+    Idempotent.
+    """
+    previous = sys.excepthook
+    if not _is_ours(previous):
+        chain = None if previous is sys.__excepthook__ else previous
+
+        def _log_uncaught(exc_type, exc, tb):  # noqa: ANN001
+            if issubclass(exc_type, KeyboardInterrupt):
+                sys.__excepthook__(exc_type, exc, tb)
+                return
+            logging.getLogger("uncaught").critical(
+                "uncaught exception", exc_info=(exc_type, exc, tb))
+            if chain is not None:
+                try:
+                    chain(exc_type, exc, tb)
+                except Exception:
+                    pass
+
+        _log_uncaught._waxx_logging_hook = True
+        sys.excepthook = _log_uncaught
+
+    previous_thread = threading.excepthook
+    if not _is_ours(previous_thread):
+        thread_chain = None if previous_thread is threading.__excepthook__ else previous_thread
+
+        def _log_thread_uncaught(args):  # noqa: ANN001
+            if args.exc_type is SystemExit:
+                return
+            name = args.thread.name if args.thread is not None else "?"
+            logging.getLogger("uncaught").critical(
+                "uncaught exception in thread %s", name,
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+            if thread_chain is not None:
+                try:
+                    thread_chain(args)
+                except Exception:
+                    pass
+
+        _log_thread_uncaught._waxx_logging_hook = True
+        threading.excepthook = _log_thread_uncaught
+
+
+#: Identical Qt messages (same type and text) are logged at most once per
+#: this many seconds; the next one that gets through says how many were held
+#: back.  Qt can repeat a warning on every paint or timer tick.
+QT_REPEAT_WINDOW_S = 60.0
+_QT_HANDLER_INSTALLED = False
+_QT_PREVIOUS_HANDLER = None  # what qInstallMessageHandler returned (for tests)
+
+
+def _flush_before_abort(line: str) -> None:
+    """Get *line* and everything already logged onto disk before Qt aborts.
+
+    The rotating file is written by a background thread, so the record just
+    logged is still in its queue: stop the writers (which drains them), and
+    also put the line in the ``.fault`` file directly, which is unbuffered.
+    """
+    try:
+        if _FAULTHANDLER_FILE is not None:
+            _FAULTHANDLER_FILE.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+            _FAULTHANDLER_FILE.flush()
+    except Exception:
+        pass
+    for writer in list(_FILE_WRITERS.values()):
+        try:
+            writer.stop()
+        except Exception:
+            pass
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+
+def install_qt_message_handler() -> bool:
+    """Route Qt's own messages (qWarning / qCritical / qFatal) into logging.
+
+    Qt prints them to stderr, which a ``pythonw.exe`` dashboard does not have:
+    the warnings that come before a freeze, and the fatal message that
+    explains a crash, were simply lost.  Debug -> DEBUG, info -> INFO,
+    warning -> WARNING, critical -> ERROR, fatal -> CRITICAL (logged, then
+    flushed to disk, before Qt aborts the process).  Logger name ``qt``.
+    Returns False when PyQt6 is not importable.  Idempotent.
+    """
+    global _QT_HANDLER_INSTALLED, _QT_PREVIOUS_HANDLER
+    if _QT_HANDLER_INSTALLED:
+        return True
+    try:
+        from PyQt6.QtCore import QtMsgType, qInstallMessageHandler  # noqa: PLC0415
+    except Exception:
+        return False
+
+    log = logging.getLogger("qt")
+    levels = {
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
+    }
+    lock = threading.Lock()
+    # (type, text) -> [monotonic time last logged, repeats held back since]
+    recent: dict[tuple, list] = {}
+    # A log handler that itself makes Qt warn (e.g. a widget-backed handler
+    # used from the wrong thread) must not recurse back in here.
+    busy = threading.local()
+
+    def _handler(mode, context, message):  # noqa: ANN001 - Qt callback
+        if getattr(busy, "active", False):
+            return
+        busy.active = True
+        try:
+            _handle(mode, context, message)
+        finally:
+            busy.active = False
+
+    def _handle(mode, context, message):  # noqa: ANN001
+        try:
+            where = ""
+            source = getattr(context, "file", None)
+            if source:
+                where = (f" ({source}:{getattr(context, 'line', '?')}"
+                         f" {getattr(context, 'function', '') or ''})")
+            if mode == QtMsgType.QtFatalMsg:
+                log.critical("Qt fatal: %s%s", message, where)
+                _flush_before_abort(f"Qt fatal: {message}{where}")
+                return
+            level = levels.get(mode, logging.WARNING)
+            if not log.isEnabledFor(level):
+                return
+            now = time.monotonic()
+            key = (int(getattr(mode, "value", 0)), message)
+            with lock:
+                entry = recent.get(key)
+                if entry is not None and now - entry[0] < QT_REPEAT_WINDOW_S:
+                    entry[1] += 1
+                    return
+                held_back = entry[1] if entry is not None else 0
+                if len(recent) > 512:
+                    recent.clear()
+                recent[key] = [now, 0]
+            note = ""
+            if held_back:
+                note = (f" [repeated {held_back} more time(s) in the "
+                        f"{QT_REPEAT_WINDOW_S:.0f} s before]")
+            log.log(level, "Qt: %s%s%s", message, where, note)
+        except Exception:
+            pass  # never raise into Qt
+
+    _QT_PREVIOUS_HANDLER = qInstallMessageHandler(_handler)
+    _QT_HANDLER_INSTALLED = True
+    return True
 
 
 def configure_server_logging(server_id: str, level: int = logging.INFO) -> Path:
@@ -440,4 +615,6 @@ __all__ = [
     "server_child_logger",
     "active_log_dir",
     "pop_boot_warnings",
+    "install_excepthooks",
+    "install_qt_message_handler",
 ]

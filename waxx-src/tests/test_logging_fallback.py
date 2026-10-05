@@ -128,6 +128,9 @@ def test_logging_call_does_not_wait_for_a_hung_share(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_SafeRotatingFileHandler, "_open", hung_open)
     monkeypatch.setattr(logging_setup.faulthandler, "enable", lambda **kw: None)
+    # Process-wide hooks: not this test's subject, and they would outlive it.
+    monkeypatch.setattr(logging_setup, "install_excepthooks", lambda: None)
+    monkeypatch.setattr(logging_setup, "install_qt_message_handler", lambda: False)
     for name in ("_APP_NAME", "_LOG_ROOT", "_LOGGER_NS", "_ACTIVE_LOG_DIR", "_FAULTHANDLER_FILE"):
         monkeypatch.setattr(logging_setup, name, getattr(logging_setup, name))
     monkeypatch.setattr(logging_setup, "_FILE_WRITERS", {})

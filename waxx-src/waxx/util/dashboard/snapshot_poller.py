@@ -18,7 +18,7 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
-from PyQt6.QtCore import QObject, QTimer, QThreadPool, QRunnable, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, QThreadPool, QRunnable, pyqtSignal
 
 
 _LOG = logging.getLogger("waxx.dashboard.snapshot")
@@ -37,9 +37,35 @@ class _PollTask(QRunnable):
         try:
             snap = self._client.get_snapshot()
         except BaseException as exc:  # noqa: BLE001 - we re-raise the type to caller
-            self._on_done(None, exc)
+            self._refresh_address()
+            self._report(None, exc)
             return
-        self._on_done(snap if isinstance(snap, dict) else {"raw": snap}, None)
+        self._report(snap if isinstance(snap, dict) else {"raw": snap}, None)
+
+    def _refresh_address(self) -> None:
+        """After a failed poll, let a discovery client pick up a new address.
+
+        A server restarted by the dashboard binds a new ephemeral port; the
+        client built for the old one would otherwise fail every poll for the
+        rest of the session.  ``NetClient._rediscover`` reads the beacon
+        cache (fresh every 0.5 s) and only waits when the server is gone, so
+        this stays cheap; it runs on the pool thread, never the GUI thread.
+        """
+        rediscover = getattr(self._client, "_rediscover", None)
+        if not callable(rediscover):
+            return
+        try:
+            rediscover(timeout=0.5)
+        except Exception:  # noqa: BLE001 - best effort; the failure is already reported
+            pass
+
+    def _report(self, snap: Optional[dict], exc: Optional[BaseException]) -> None:
+        try:
+            self._on_done(snap, exc)
+        except RuntimeError:
+            # The poller was deleted (panel closed) while this poll ran: the
+            # signal's C++ object is gone and nobody is waiting for the result.
+            pass
 
 
 class SnapshotPoller(QObject):
@@ -58,6 +84,8 @@ class SnapshotPoller(QObject):
 
     snapshot_received = pyqtSignal(dict)
     conn_changed = pyqtSignal(str, str)
+    # Internal: pool thread -> GUI thread.  (snapshot | None, exception | None)
+    _poll_finished = pyqtSignal(object, object)
 
     NORMAL_INTERVAL_MS = 1000
     THROTTLED_INTERVAL_MS = 5000
@@ -89,6 +117,11 @@ class SnapshotPoller(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(self.NORMAL_INTERVAL_MS)
         self._timer.timeout.connect(self._tick)
+        # Queued: the pool thread only emits; all bookkeeping and the timer
+        # (which belongs to this thread) are touched in _on_poll_done.  A
+        # QTimer restarted from another thread is refused by Qt, which used
+        # to stop polling for good after the 5th consecutive failure.
+        self._poll_finished.connect(self._on_poll_done, Qt.ConnectionType.QueuedConnection)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -116,13 +149,12 @@ class SnapshotPoller(QObject):
         if self._in_flight:
             return  # Skip overlapping polls; the previous one is still working.
         self._in_flight = True
-        task = _PollTask(self._client, self._on_poll_done)
+        task = _PollTask(self._client, self._poll_finished.emit)
         QThreadPool.globalInstance().start(task)
 
     def _on_poll_done(self, snap: Optional[dict], exc: Optional[BaseException]) -> None:
-        # NOTE: this runs on a worker thread.  Emit signals so the slots run
-        # on the main thread (Qt::AutoConnection -> Qt::QueuedConnection across
-        # threads).
+        # Runs on the poller's (GUI) thread: delivered through the queued
+        # _poll_finished signal from the pool thread.
         self._in_flight = False
         if exc is not None:
             self._record_failure(exc)

@@ -20,6 +20,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
 
 from waxx.util.dashboard import theme
+from waxx.util.dashboard.restyle import set_style, set_tooltip
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -123,9 +124,11 @@ class ComStatusButton(QToolButton):
     # ------------------------------------------------------------------
 
     def _apply_style(self) -> None:
+        # Called on every snapshot (1 Hz per panel): only touch what changed,
+        # since setStyleSheet re-polishes the widget even for the same text.
         bg, fg, glyph = _COM_PALETTE[self._status]
         self.setText(f"{self._label} {glyph}")
-        self.setStyleSheet(
+        set_style(self,
             "QToolButton {"
             f" background-color: {bg};"
             f" color: {fg};"
@@ -141,9 +144,11 @@ class ComStatusButton(QToolButton):
         tip = f"{self._label} - {self._status}"
         if self._tooltip_detail:
             tip = f"{tip}\n{self._tooltip_detail}"
-        self.setToolTip(tip)
+        set_tooltip(self, tip)
         # Connecting state ignores clicks.
-        self.setEnabled(self._status != _COM_STATUS_CONNECTING and not self._debounce_active)
+        enabled = self._status != _COM_STATUS_CONNECTING and not self._debounce_active
+        if self.isEnabled() != enabled:
+            self.setEnabled(enabled)
 
     def _on_clicked(self) -> None:
         if self._debounce_active:

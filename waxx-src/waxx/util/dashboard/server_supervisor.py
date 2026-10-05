@@ -157,6 +157,9 @@ class ServerSupervisor(QObject):
     RESTART_WINDOW_S = 60.0
     INITIAL_RESTART_DELAY_S = 0.5
     MAX_RESTART_DELAY_S = 30.0
+    # Longest stdout/stderr text held while waiting for its newline; beyond
+    # this it is passed on as a line of its own.
+    MAX_LINE_CHARS = 64 * 1024
     # While EXTERNAL, look for the other instance this often; once it stops
     # beaconing the supervisor goes back to IDLE so the panel stays truthful.
     EXTERNAL_RECHECK_MS = 2000
@@ -480,6 +483,8 @@ class ServerSupervisor(QObject):
     # ------------------------------------------------------------------
 
     def _spawn(self) -> None:
+        self._release_old_proc()
+        self._flush_partial_lines()
         proc = QProcess(self)
         if self.cwd:
             proc.setWorkingDirectory(self.cwd)
@@ -505,7 +510,12 @@ class ServerSupervisor(QObject):
 
         self._proc = proc
         self._graceful_sent_at = None
-        self._restart_history.append(time.monotonic())
+        now = time.monotonic()
+        # Only starts inside the restart window matter (see _maybe_auto_restart);
+        # trimming here keeps a days-long session of manual restarts bounded.
+        self._restart_history = [t for t in self._restart_history
+                                 if t >= now - self.RESTART_WINDOW_S]
+        self._restart_history.append(now)
 
         program = self.cmd[0]
         args = self.cmd[1:]
@@ -513,6 +523,34 @@ class ServerSupervisor(QObject):
                   self.server_id, program, args, self.cwd or "<inherited>")
         self._set_state(SupervisorState.STARTING)
         proc.start(program, args)
+
+    def _release_old_proc(self) -> None:
+        """Disconnect and schedule deletion of the previous, finished QProcess.
+
+        Each start makes a new QProcess parented to the supervisor; without
+        this every restart left the old one (and its pipe buffers) alive
+        until the dashboard closed.
+        """
+        old = self._proc
+        if old is None:
+            return
+        if old.state() != QProcess.ProcessState.NotRunning:
+            # Not expected (start() refuses while alive).  Leave a live
+            # child's QProcess alone; it stays parented to the supervisor.
+            return
+        for signal, slot in (
+            (old.readyReadStandardOutput, self._drain_stdout),
+            (old.readyReadStandardError, self._drain_stderr),
+            (old.errorOccurred, self._on_error),
+            (old.finished, self._on_finished),
+            (old.started, self._on_started),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._proc = None
+        old.deleteLater()
 
     def _force_kill_if_alive(self) -> None:
         if self._proc is not None and self.is_alive():
@@ -534,6 +572,7 @@ class ServerSupervisor(QObject):
                   self.server_id, exit_code, exit_status.name)
         self._drain_stdout()
         self._drain_stderr()
+        self._flush_partial_lines()
         self._graceful_sent_at = None
         self._child_exited_at = time.monotonic()
 
@@ -587,10 +626,25 @@ class ServerSupervisor(QObject):
             return
         text = self._line_buffer[stream] + data.decode("utf-8", errors="replace")
         *lines, tail = text.split("\n")
-        self._line_buffer[stream] = tail
         tag = "ERR" if stream == "stderr" else "OUT"
         for line in lines:
             self.log_line.emit(f"[{tag}] {line.rstrip(chr(13))}")
+        # A child that writes without newlines (a progress bar, a binary
+        # dump) must not grow the buffer for the rest of the session: pass
+        # the text on in MAX_LINE_CHARS pieces, marked as split.
+        while len(tail) > self.MAX_LINE_CHARS:
+            piece, tail = tail[:self.MAX_LINE_CHARS], tail[self.MAX_LINE_CHARS:]
+            self.log_line.emit(f"[{tag}] {piece} [line split: no newline after "
+                               f"{self.MAX_LINE_CHARS} characters]")
+        self._line_buffer[stream] = tail
+
+    def _flush_partial_lines(self) -> None:
+        """Emit what is left of an unterminated last line (child exited / respawn)."""
+        for stream, tail in self._line_buffer.items():
+            if tail:
+                tag = "ERR" if stream == "stderr" else "OUT"
+                self.log_line.emit(f"[{tag}] {tail.rstrip(chr(13))}")
+            self._line_buffer[stream] = ""
 
     def _set_state(self, new: SupervisorState) -> None:
         if new == self._state:
