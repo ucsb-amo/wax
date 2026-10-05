@@ -10,12 +10,15 @@ moves smooth even when the server is missing or slow.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
+from itertools import islice
 from typing import Callable, Optional
 
 import math
 import time
 
+import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
@@ -32,6 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from waxx.util.dashboard import theme
+from waxx.util.dashboard.restyle import set_style
 from waxx.util.guis.keysight.keysight_client import KeysightClient
 
 T_UPDATE_MS = 250
@@ -189,10 +193,12 @@ class _SupplyRow(QWidget):
 
     def _set_value(self, text: str, bg: str) -> None:
         self.value_btn.setText(text)
-        self.value_btn.setStyleSheet(
+        # Every 250 ms per supply: restyle only when the colour changes.
+        set_style(
+            self.value_btn,
             f"font-weight: bold; font-size: {FONTSIZE_PT}pt; "
             f"text-align: right; padding: 2px 8px 2px 4px; "
-            + (f"background-color: {bg};" if bg else "")
+            + (f"background-color: {bg};" if bg else ""),
         )
 
     def _on_click(self) -> None:
@@ -267,6 +273,10 @@ class _CurrentPlot(QWidget):
         self._plot.addLegend(offset=(5, 5))
         self._plot.setMouseEnabled(x=False, y=False)
         self._plot.getPlotItem().setContentsMargins(0, 0, 4, 0)
+        # A 3600 s range is ~14,400 samples a supply on a few hundred pixels:
+        # draw only what is in view, peak-preserving downsampled.
+        self._plot.setClipToView(True)
+        self._plot.setDownsampling(auto=True, mode="peak")
 
         # This widget *is* the plot; the toggle + range are handed to the
         # window's header row via ``header_widgets()``.
@@ -310,31 +320,52 @@ class _CurrentPlot(QWidget):
         while self._t[ip] and self._t[ip][0] < cutoff:
             self._t[ip].popleft()
             self._y[ip].popleft()
+        # No redraw here: the window calls redraw() once per snapshot, after
+        # every supply's sample is in (it used to redraw once per supply).
         self._dirty = True
+
+    def redraw(self) -> None:
+        """Redraw if new samples arrived and the plot can be seen."""
         if self._plot.isVisible():
             self._redraw()
+
+    def _visible_slice(self, ip: str, t_first: float) -> tuple[list, list]:
+        """(t, y) of supply *ip* from one sample before *t_first* to the end.
+
+        The buffer holds PLOT_RANGE_MAX_S (up to ~14,400 samples a supply);
+        only the plot-range window is handed to pyqtgraph.
+        """
+        ts, ys = self._t[ip], self._y[ip]
+        i0 = max(0, bisect_left(ts, t_first) - 1)
+        if i0 == 0:
+            return list(ts), list(ys)
+        return list(islice(ts, i0, None)), list(islice(ys, i0, None))
 
     def _redraw(self) -> None:
         if not self._dirty:
             return
         t_last = None
-        for ip, curve in self._curves.items():
-            curve.setData(list(self._t[ip]), list(self._y[ip]))
+        for ip in self._curves:
             if self._t[ip]:
                 t_last = self._t[ip][-1] if t_last is None else max(t_last, self._t[ip][-1])
-        if t_last is not None:
-            t_first = t_last - self.range_s
-            self._plot.setXRange(t_first, t_last, padding=0.0)
+        if t_last is None:
+            self._dirty = False
+            return
+        t_first = t_last - self.range_s
+        y_lo, y_hi = 0.0, PLOT_Y_MAX_FLOOR_A / 1.05
+        for ip, curve in self._curves.items():
+            t_vis, y_vis = self._visible_slice(ip, t_first)
+            curve.setData(t_vis, y_vis)
             # Fit y to the visible window, but never tighter than
             # [0, PLOT_Y_MAX_FLOOR_A] so idle supplies don't blow up noise.
-            visible = [
-                y for ip in self._curves
-                for t, y in zip(self._t[ip], self._y[ip])
-                if t >= t_first and math.isfinite(y)
-            ]
-            y_lo = min([0.0, *visible])
-            y_hi = max([PLOT_Y_MAX_FLOOR_A / 1.05, *visible]) * 1.05
-            self._plot.setYRange(y_lo, y_hi, padding=0.0)
+            t_arr = np.asarray(t_vis, dtype=float)
+            y_arr = np.asarray(y_vis, dtype=float)
+            y_arr = y_arr[(t_arr >= t_first) & np.isfinite(y_arr)]
+            if y_arr.size:
+                y_lo = min(y_lo, float(y_arr.min()))
+                y_hi = max(y_hi, float(y_arr.max()))
+        self._plot.setXRange(t_first, t_last, padding=0.0)
+        self._plot.setYRange(y_lo, y_hi * 1.05, padding=0.0)
         self._dirty = False
 
     def _on_range_changed(self, _value: int) -> None:
@@ -522,6 +553,7 @@ class KeysightClientWindow(QWidget):
                 self._alert_since.setdefault(ip, time.monotonic())
             else:
                 self._alert_since.pop(ip, None)
+        self._plot.redraw()   # once per snapshot, after every supply's sample
         self._update_flash()
 
     # ----- over-current flash ------------------------------------------- #

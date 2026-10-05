@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThread, QThreadPoo
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtCore import QSize
 
+from waxx.util.dashboard.restyle import set_style, set_tooltip
 from waxx.util.guis.als.als_gui_client import ALSGuiClient
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
 
@@ -136,10 +137,12 @@ class StatusDot(QPushButton):
 
         self.setText(f"{self.label_text} {state_text}")
         hint = f" \u2014 {self.tooltip_text}" if self.tooltip_text else ""
-        self.setToolTip(f"{self.label_text}: {state_text}{hint}")
-        self.setStyleSheet(
+        set_tooltip(self, f"{self.label_text}: {state_text}{hint}")
+        # Called on every 500 ms snapshot: restyle only on a state change.
+        set_style(
+            self,
             f"background-color: {color.name()}; color: #ffffff; border-radius: 9px; "
-            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;"
+            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;",
         )
 
 
@@ -212,7 +215,7 @@ class StepIndicator(QWidget):
         else:
             color = QColor(200, 200, 200)
         
-        self.indicator.setStyleSheet(f"background-color: {color.name()}; border-radius: 10px;")
+        set_style(self.indicator, f"background-color: {color.name()}; border-radius: 10px;")
 
 
 class SequenceProgressWindow(QWidget):
@@ -591,6 +594,8 @@ class ALSControlGUI(QMainWindow):
     # Cross-thread plumbing for the background snapshot/log fetcher.
     _remote_state_ready = pyqtSignal(object, object)   # (snapshot, logs_payload|None)
     _remote_state_failed = pyqtSignal(str)
+    # A user-requested remote call finished: (what, success message, exception|None).
+    _remote_call_done = pyqtSignal(str, str, object)
     """Main GUI window for laser control"""
 
     request_serial_connect = pyqtSignal()
@@ -703,7 +708,8 @@ class ALSControlGUI(QMainWindow):
         # Cross-thread completion signals from the background remote-state fetcher.
         self._remote_state_ready.connect(self._on_remote_state_ready)
         self._remote_state_failed.connect(self._on_remote_state_failed)
-        
+        self._remote_call_done.connect(self._on_remote_call_done)
+
         # Timer for auto-scrolling log back to bottom after user scrolls up
         self.auto_scroll_timer = QTimer()
         self.auto_scroll_timer.setSingleShot(True)
@@ -1173,27 +1179,53 @@ class ALSControlGUI(QMainWindow):
         return group
     
     def _init_workers(self):
-        """Initialize remote ALS server client and fetch initial state."""
-        try:
-            self.remote_client = ALSGuiClient(timeout_s=0.75)
-            self._set_server_conn_button_state("connected")
-        except RuntimeError:
-            self.remote_client = None
-            self._set_server_conn_button_state("searching")
-            return
+        """Find the remote ALS server and fetch the initial state.
+
+        Discovery runs on the thread pool in ``_sync_remote_state`` (it can
+        wait seconds for a beacon); building the client here blocked the
+        dashboard while it started.
+        """
+        self.remote_client = None
+        self._set_server_conn_button_state("searching")
         QTimer.singleShot(0, self._sync_remote_state)
-    
+
+    def _remote_call(self, what: str, func, ok_message: str = "") -> None:
+        """Run ``func(client)`` on the thread pool -- it is a network round
+        trip -- and report a failure in the status bar; the state is re-read
+        either way.  Used for every user-triggered request."""
+        client = self.remote_client
+        if client is None:
+            self.statusBar().showMessage(f"{what} failed: ALS server not connected")
+            return
+        emit = self._remote_call_done.emit
+
+        def _done(_result, exc):
+            # Pool thread: only hand the outcome to the GUI thread.
+            try:
+                emit(what, ok_message, exc)
+            except RuntimeError:
+                pass  # window deleted meanwhile
+
+        QThreadPool.globalInstance().start(_BgCall(lambda: func(client), _done))
+
+    def _on_remote_call_done(self, what: str, ok_message: str, exc) -> None:
+        if exc is not None:
+            LOGGER.warning("%s: remote call failed: %r", what, exc)
+            self.statusBar().showMessage(f"{what} failed: {exc}")
+        elif ok_message:
+            self.statusBar().showMessage(ok_message)
+        self._sync_remote_state()
+
     def _toggle_connection(self):
         """Toggle connection to the remote ALS hardware server."""
         if self.remote_client is None:
             return
         if self.status.connection_state == ConnectionState.CONNECTED:
-            self.remote_client.disconnect_serial()
             self.statusBar().showMessage("Disconnect requested")
+            self._remote_call("Serial disconnect", lambda c: c.disconnect_serial())
         else:
-            self.remote_client.connect_serial()
             self.statusBar().showMessage("Connect requested")
-        self._sync_remote_state()
+            self._remote_call("Serial connect", lambda c: c.connect_serial())
 
     def _toggle_power_status(self):
         if self.remote_client is None:
@@ -1202,10 +1234,9 @@ class ALSControlGUI(QMainWindow):
             self.statusBar().showMessage("Laser not connected")
             return
         if self.status.power_enabled:
-            self.remote_client.set_power_supply_off()
+            self._remote_call("Power supply off", lambda c: c.set_power_supply_off())
         else:
-            self.remote_client.set_power_supply_on()
-        self._sync_remote_state()
+            self._remote_call("Power supply on", lambda c: c.set_power_supply_on())
 
     def _toggle_interlock_status(self):
         if self.remote_client is None:
@@ -1214,10 +1245,9 @@ class ALSControlGUI(QMainWindow):
             self.statusBar().showMessage("Laser not connected")
             return
         if self.status.interlock_enabled:
-            self.remote_client.set_interlock_off()
+            self._remote_call("Interlock off", lambda c: c.set_interlock_off())
         else:
-            self.remote_client.set_interlock_on()
-        self._sync_remote_state()
+            self._remote_call("Interlock on", lambda c: c.set_interlock_on())
 
     def _toggle_second_stage_status(self):
         if self.remote_client is None:
@@ -1226,10 +1256,9 @@ class ALSControlGUI(QMainWindow):
             self.statusBar().showMessage("Laser not connected")
             return
         if self.status.second_stage_enabled:
-            self.remote_client.set_second_stage_off()
+            self._remote_call("Second stage off", lambda c: c.set_second_stage_off())
         else:
-            self.remote_client.set_second_stage_on()
-        self._sync_remote_state()
+            self._remote_call("Second stage on", lambda c: c.set_second_stage_on())
 
     def _sequence_thread_is_running(self) -> bool:
         return self._remote_sequence_state == SequenceState.RUNNING
@@ -1249,12 +1278,9 @@ class ALSControlGUI(QMainWindow):
             self.statusBar().showMessage("A sequence is already running")
             return
         self.statusBar().showMessage("Startup sequence requested")
-        client = self.remote_client
-        def _done(result, exc):
-            if exc is not None:
-                LOGGER.warning("run_startup_sequence remote call failed: %r", exc)
-            self._sync_remote_state()
-        QThreadPool.globalInstance().start(_BgCall(client.run_startup_sequence, _done))
+        # The completion used to call _sync_remote_state on the pool thread,
+        # touching widgets from there; it now goes through _remote_call_done.
+        self._remote_call("Startup sequence", lambda c: c.run_startup_sequence())
     
     def _start_shutdown(self):
         """Request remote shutdown sequence."""
@@ -1267,24 +1293,14 @@ class ALSControlGUI(QMainWindow):
             self.statusBar().showMessage("A sequence is already running")
             return
         self.statusBar().showMessage("Shutdown sequence requested")
-        client = self.remote_client
-        def _done(result, exc):
-            if exc is not None:
-                LOGGER.warning("run_shutdown_sequence remote call failed: %r", exc)
-            self._sync_remote_state()
-        QThreadPool.globalInstance().start(_BgCall(client.run_shutdown_sequence, _done))
+        self._remote_call("Shutdown sequence", lambda c: c.run_shutdown_sequence())
     
     def _interrupt_sequence(self):
         """Interrupt current remote sequence."""
         if self.remote_client is None:
             return
         self.statusBar().showMessage("Sequence interrupt requested")
-        client = self.remote_client
-        def _done(result, exc):
-            if exc is not None:
-                LOGGER.warning("interrupt_sequence remote call failed: %r", exc)
-            self._sync_remote_state()
-        QThreadPool.globalInstance().start(_BgCall(client.interrupt_sequence, _done))
+        self._remote_call("Sequence interrupt", lambda c: c.interrupt_sequence())
 
     def _sync_remote_state(self):
         """Poll the ALS server for state and logs without blocking the GUI.
@@ -1490,7 +1506,7 @@ class ALSControlGUI(QMainWindow):
             text = "Server: searching\u2026"
             style = "background-color: #8c959e; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
         self.server_conn_button.setText(text)
-        self.server_conn_button.setStyleSheet(style)
+        set_style(self.server_conn_button, style)
 
     def _retry_server_connection(self) -> None:
         """Force immediate server rediscovery when the user clicks the connection button."""
@@ -1586,8 +1602,9 @@ class ALSControlGUI(QMainWindow):
         if state == ConnectionState.CONNECTED:
             self.status.connected = True
             self.connect_button.setText(f"{self._remote_serial_port} Connected")
-            self.connect_button.setStyleSheet(
-                "background-color: #2ba363; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+            set_style(
+                self.connect_button,
+                "background-color: #2ba363; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;",
             )
             self.connect_button.setEnabled(not is_sequence_running)
             self.startup_button.setEnabled(not is_sequence_running)
@@ -1599,8 +1616,9 @@ class ALSControlGUI(QMainWindow):
         elif state == ConnectionState.ERROR:
             self.status.connected = False
             self.connect_button.setText(f"{self._remote_serial_port} Disconnected")
-            self.connect_button.setStyleSheet(
-                "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+            set_style(
+                self.connect_button,
+                "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;",
             )
             self.connect_button.setEnabled(True)
             self.startup_button.setEnabled(False)
@@ -1611,8 +1629,9 @@ class ALSControlGUI(QMainWindow):
         else:
             self.status.connected = False
             self.connect_button.setText(f"{self._remote_serial_port} Disconnected")
-            self.connect_button.setStyleSheet(
-                "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;"
+            set_style(
+                self.connect_button,
+                "background-color: #d03f37; color: #ffffff; border-radius: 10px; padding: 10px 14px; font-weight: 700;",
             )
             self.connect_button.setEnabled(True)
             self.startup_button.setEnabled(False)
@@ -1682,12 +1701,14 @@ class ALSControlGUI(QMainWindow):
             # Clamp to valid range
             power_percent = max(0.0, min(100.0, power_percent))
             
-            # Send command to laser
+            # Send command to laser (network round trip: on the thread pool)
             if self.status.connection_state == ConnectionState.CONNECTED:
-                if self.remote_client is not None:
-                    self.remote_client.set_power_percent(power_percent)
-                self.statusBar().showMessage(f"Power set to {power_percent:.1f}%")
-                self._sync_remote_state()
+                self.statusBar().showMessage(f"Setting power to {power_percent:.1f}%…")
+                self._remote_call(
+                    f"Set power to {power_percent:.1f}%",
+                    lambda c, p=power_percent: c.set_power_percent(p),
+                    ok_message=f"Power set to {power_percent:.1f}%",
+                )
             else:
                 self.statusBar().showMessage("Laser not connected")
             

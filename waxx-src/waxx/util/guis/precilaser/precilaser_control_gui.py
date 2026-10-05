@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from waxx.util.dashboard.restyle import set_style, set_tooltip
 from waxx.util.guis.precilaser.precilaser_gui_client import PrecilaserGuiClient
 
 
@@ -140,10 +141,12 @@ class StatusDot(QPushButton):
             state_text = self.off_text
         self.setText(f"{self.label_text} {state_text}")
         hint = f" \u2014 {self.tooltip_text}" if self.tooltip_text else ""
-        self.setToolTip(f"{self.label_text}: {state_text}{hint}")
-        self.setStyleSheet(
+        set_tooltip(self, f"{self.label_text}: {state_text}{hint}")
+        # Called on every 500 ms snapshot: restyle only on a state change.
+        set_style(
+            self,
             f"background-color: {color.name()}; color: #ffffff; border-radius: 9px; "
-            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;"
+            f"padding: 1px 6px; font-weight: 700; font-size: 10px; text-align: center;",
         )
 
 
@@ -629,6 +632,9 @@ class PrecilaserControlGUI(QMainWindow):
         layout.addWidget(self.sequence_state_value)
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
+        # Keep the last 1000 lines (as the ALS panel does); unbounded, the
+        # document grew for as long as the dashboard ran.
+        self.log_text.setMaximumBlockCount(1000)
         layout.addWidget(self.log_text)
         return box
 
@@ -656,13 +662,15 @@ class PrecilaserControlGUI(QMainWindow):
         is_connected = connection_state.upper() == "CONNECTED"
         if is_connected:
             self.serial_connect_button.setText("Disconnect Serial")
-            self.serial_connect_button.setStyleSheet(
-                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
+            set_style(
+                self.serial_connect_button,
+                "background-color: #b54747; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;",
             )
         else:
             self.serial_connect_button.setText("Connect Serial")
-            self.serial_connect_button.setStyleSheet(
-                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
+            set_style(
+                self.serial_connect_button,
+                "background-color: #2f7d50; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;",
             )
 
     def _update_laser_button(self) -> None:
@@ -794,7 +802,7 @@ class PrecilaserControlGUI(QMainWindow):
             text = "Server: searching\u2026"
             style = "background-color: #8c959e; color: #ffffff; border-radius: 8px; padding: 4px 10px; font-weight: 700;"
         self.server_conn_button.setText(text)
-        self.server_conn_button.setStyleSheet(style)
+        set_style(self.server_conn_button, style)
 
     def _retry_server_connection(self) -> None:
         """Force immediate server rediscovery when the user clicks the connection button."""

@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from waxx.util.dashboard.restyle import set_style
 from waxx.util.guis.bristol.bristol_wavemeter_server import BristolWavemeterServer
 
 _POLL_MS = 200
@@ -267,10 +268,10 @@ class BristolServerGUI(QMainWindow):
 
         if connected:
             self._status_lbl.setText("● CONNECTED")
-            self._status_lbl.setStyleSheet("color: #2ecc71; font-weight: bold;")
+            set_style(self._status_lbl, "color: #2ecc71; font-weight: bold;")
         else:
             self._status_lbl.setText("● DISCONNECTED")
-            self._status_lbl.setStyleSheet("color: #e74c3c; font-weight: bold;")
+            set_style(self._status_lbl, "color: #e74c3c; font-weight: bold;")
 
         self._port_lbl.setText(f"port: {self._server._waxx_port}")
 

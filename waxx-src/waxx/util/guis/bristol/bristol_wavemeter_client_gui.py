@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from waxx.util.dashboard.restyle import set_style
 from waxx.util.guis.bristol.bristol_wavemeter_client import BristolWavemeterGuiClient
 from waxx.util.guis.bristol.bristol_wavemeter_server_gui import (
     DARK_STYLESHEET,
@@ -428,20 +429,21 @@ class BristolDetuningWidget(QWidget):
 
         t = time.time() - self._start_time
 
+        # 10 Hz, hidden or not: restyle the status dot only when it changes.
         if freq_thz is not None:
             self._wm_lbl.setText(f"f = {freq_thz:.6f} THz")
             self._status_lbl.setText("\u25cf")
-            self._status_lbl.setStyleSheet("color: #2ecc71; font-size: 10px;")
+            set_style(self._status_lbl, "color: #2ecc71; font-size: 10px;")
         elif reachable:
             # Server reachable but the wavemeter itself has no reading.
             self._wm_lbl.setText("f = \u2014 THz")
             self._status_lbl.setText("\u25cf")
-            self._status_lbl.setStyleSheet("color: #e67e22; font-size: 10px;")
+            set_style(self._status_lbl, "color: #e67e22; font-size: 10px;")
         else:
             # Server unreachable / stopped.
             self._wm_lbl.setText("f = \u2014 THz")
             self._status_lbl.setText("\u25cf")
-            self._status_lbl.setStyleSheet("color: #e74c3c; font-size: 10px;")
+            set_style(self._status_lbl, "color: #e74c3c; font-size: 10px;")
 
         # NOTE: detuning label is updated below from the running-average
         # block as "Δ = mean ± σ".
