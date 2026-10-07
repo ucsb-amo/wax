@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.signal import savgol_filter
-import matplotlib.pyplot as plt
 import copy
 from waxa.helper import crop_array_by_index, remove_infnan
 
@@ -65,6 +64,7 @@ class Fit():
         return xplt, yplt
 
     def plot_fit(self,N_interp=10000,legend=True):
+        import matplotlib.pyplot as plt
         # plt.figure()
         plt.plot(self.xdata,self.ydata,'.',markersize=4)
         

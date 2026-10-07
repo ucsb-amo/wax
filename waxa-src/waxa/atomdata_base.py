@@ -12,6 +12,7 @@ from waxa.image_processing.compute_gaussian_cloud_params import fit_gaussian_sum
 from waxa.roi import ROI, prefetch_auto_roi
 from waxa.data.data_saver import DataSaver
 from waxa.data.h5_image import create_image_dataset
+from waxa.data.camera_frames import stream_frame_keys
 from waxa.base import Dealer, xvar
 from waxa.data.server_talk import server_talk as st
 from waxa.helper.datasmith import *
@@ -46,6 +47,88 @@ REPEAT_STAT_LAZY_BYTES = 32 * 1024 ** 2
 # Bookkeeping keys the lazy siblings carry; never treated as data.
 _LAZY_STAT_KEYS = ('_lazy_stat_attrs', '_lazy_stat_resolver')
 
+# How a run file is opened for reading -- see open_run_file. The file is
+# written one gzip chunk per frame, with every stream's chunks interleaved in
+# arrival order (the run camera's frames and the diagnostic stacks share one
+# writer), so no dataset can be read without passing over the whole file.
+# Read chunk by chunk, as the default driver does, the lab share serves
+# ~15 MB/s and a 500 MB run takes 40 s; read in one sequential pass it serves
+# 50-70 MB/s (2026-10-06, run 85125: 39 s -> ~10 s). The bytes read are the
+# same either way. When the file fits:
+#   'core'   -- HDF5's core driver: one sequential read of the whole file into
+#               memory, every dataset then read from there;
+#   'warm'   -- one sequential pass through the file so the OS cache holds it,
+#               then the ordinary open (bounded memory; as fast while the cache
+#               keeps the file);
+#   'direct' -- the ordinary chunk-by-chunk open (any size).
+# 'auto' picks by file size against the caps below and the memory available
+# now; WAXA_H5_READ_MODE forces one mode for the process.
+H5_READ_MODES = ('auto', 'core', 'warm', 'direct')
+H5_READ_MODE = os.environ.get('WAXA_H5_READ_MODE', 'auto')
+H5_CORE_MAX_BYTES = 4 * 1024 ** 3     # 'core' up to this size ...
+H5_CORE_MAX_FRACTION = 0.25           # ... and this fraction of available memory
+H5_WARM_MAX_FRACTION = 0.5            # 'warm' up to this fraction of available memory
+H5_WARM_BLOCK_BYTES = 32 * 1024 ** 2
+
+
+def _available_memory_bytes():
+    """Memory available to this process now, or None when unknown."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def choose_h5_read_mode(path, mode=None, size=None, available=None):
+    """The read mode for the run file at ``path``: ``mode`` (default
+    H5_READ_MODE) when it names one, else 'auto' picks by the file size
+    against H5_CORE_MAX_BYTES / H5_CORE_MAX_FRACTION / H5_WARM_MAX_FRACTION.
+    ``size`` and ``available`` stand in for the file size and the available
+    memory (for tests)."""
+    mode = mode or H5_READ_MODE
+    if mode not in H5_READ_MODES:
+        raise ValueError(f"unknown h5 read mode {mode!r}; one of {H5_READ_MODES}")
+    if mode != 'auto':
+        return mode
+    if size is None:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return 'direct'
+    if available is None:
+        available = _available_memory_bytes()
+    if size <= H5_CORE_MAX_BYTES and (available is None
+                                      or size <= H5_CORE_MAX_FRACTION * available):
+        return 'core'
+    if available is not None and size <= H5_WARM_MAX_FRACTION * available:
+        return 'warm'
+    return 'direct'
+
+
+def _warm_file_cache(path, block_bytes=H5_WARM_BLOCK_BYTES):
+    """One sequential pass through the file; the OS cache keeps it."""
+    with open(path, 'rb', buffering=0) as fh:
+        while fh.read(block_bytes):
+            pass
+
+
+def open_run_file(path, mode=None):
+    """``(h5py.File open for reading, mode used)`` for the run file at
+    ``path``, read the way ``choose_h5_read_mode`` picks. A 'core' open that
+    fails (no memory for the file) falls back to 'direct' with a warning."""
+    mode = choose_h5_read_mode(path, mode)
+    if mode == 'core':
+        try:
+            return h5py.File(path, 'r', driver='core', backing_store=False), mode
+        except (MemoryError, OSError) as e:
+            warnings.warn(f"whole-file read of {path} failed ({e!r}); "
+                          "reading it chunk by chunk instead")
+            mode = 'direct'
+    elif mode == 'warm':
+        _warm_file_cache(path)
+    return h5py.File(path, 'r'), mode
+
 class ScopeTraceArray():
     def __init__(self, scope_key, ch, t, v):
         self.scope_key = scope_key
@@ -56,23 +139,29 @@ class ScopeTraceArray():
 class _RepeatDataVault():
     """DataVault stand-in for the avg/std repeat-statistic siblings.
 
-    Keys that existed when the sibling was built are stored eagerly. Keys added
-    to the parent's DataVault *afterwards* -- e.g. a quantity computed in a
-    notebook and assigned back with ``ad.data.sz = ...`` -- are reduced on
-    demand by ``__getattr__``, so ``ad.avg.data.sz`` works without rebuilding
-    the siblings. Lazily-resolved keys are recomputed on every access rather
-    than cached, so they track later edits to the parent array.
+    Keys that existed when the sibling was built are stored eagerly, except
+    those at or above REPEAT_STAT_LAZY_BYTES (``_lazy_keys``, e.g. the
+    diagnostic frame stacks): those are reduced on first access, once for the
+    avg/std pair (``_shared_cache``), and then kept like the eager ones. Keys
+    added to the parent's DataVault *afterwards* -- e.g. a quantity computed
+    in a notebook and assigned back with ``ad.data.sz = ...`` -- are reduced
+    on demand by ``__getattr__`` too, so ``ad.avg.data.sz`` works without
+    rebuilding the siblings; those are recomputed on every access rather than
+    cached, so they track later edits to the parent array.
 
     Constructed without a source it is a plain container (a ``keys`` list plus
     array attributes), which is how the non-sibling call sites use it.
     """
 
-    def __init__(self, source=None, reducer=None, xvar_idx=None, n_repeats=1):
+    def __init__(self, source=None, reducer=None, xvar_idx=None, n_repeats=1,
+                 lazy_keys=(), shared_cache=None):
         self._keys = []
         self._source = source
         self._reducer = reducer
         self._xvar_idx = xvar_idx
         self._n_repeats = n_repeats
+        self._lazy_keys = set(lazy_keys)
+        self._shared_cache = shared_cache
 
     @property
     def keys(self):
@@ -98,8 +187,19 @@ class _RepeatDataVault():
         value = getattr(source.data, key)
         if not source._is_scan_shaped_numeric_array(value):
             return value
+        d = self.__dict__
+        cache = d.get('_shared_cache')
+        if key in d.get('_lazy_keys', ()) and cache is not None:
+            # Present when the siblings were built, too large to reduce then:
+            # reduced once for the pair, then kept like the eager keys.
+            if key not in cache:
+                cache[key] = source._reduce_repeat_ndarray_mean_std(
+                    value, d['_xvar_idx'], d['_n_repeats'])
+            result = cache[key][0 if reducer == 'mean' else 1]
+            d[key] = result
+            return result
         mean_val, std_val = source._reduce_repeat_ndarray_mean_std(
-            value, self.__dict__['_xvar_idx'], self.__dict__['_n_repeats'],
+            value, d['_xvar_idx'], d['_n_repeats'],
         )
         return mean_val if reducer == 'mean' else std_val
 
@@ -894,7 +994,8 @@ class atomdata_base():
             return
         self.roi.save_roi_h5(lite=self._lite,printouts=printouts)
 
-    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
+    def save_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None,
+                       include_streams=False):
         """Creates a lite (ROI-cropped) copy of this run's data file.
 
         Fast path: builds the lite HDF5 file directly from the arrays already
@@ -922,6 +1023,14 @@ class atomdata_base():
         ignore_images : bool or None
             If True, write a lite file without camera images or ROI metadata.
             If None, follows this atomdata object's ``_ignore_images`` state.
+        include_streams : bool
+            The camera-stream frame stacks (the per-shot diagnostic images,
+            ``ad.data.img_<name>`` with a ``<name>_meta`` record beside them)
+            are left out of the lite copy by default: they are most of a run
+            file and not what a lite copy is for. Their per-shot records stay,
+            so ``frames_present`` / ``frame_meta`` still answer. True keeps the
+            frames. The keys left out are listed in the lite file's root
+            attribute ``lite_dropped_keys`` (JSON; ``ad.run_records``).
         """
         if ignore_images is None:
             ignore_images = bool(getattr(self, '_ignore_images', False))
@@ -935,6 +1044,7 @@ class atomdata_base():
                 self.run_info.run_id,
                 roi_id=roi_id,
                 use_saved_roi=use_saved_roi,
+                include_streams=include_streams,
             )
             return
 
@@ -1014,9 +1124,13 @@ class atomdata_base():
                 create_image_dataset(data_grp, 'images', data=cropped_images)
                 data_grp.create_dataset('image_timestamps', data=ts_ush)
 
-            # DataVault keys — already in memory, unshuffle on the fly.
+            # DataVault keys — already in memory, unshuffle on the fly. The
+            # camera-stream frame stacks stay behind unless asked for.
+            dropped = [] if include_streams else stream_frame_keys(self.data.keys)
             n_xvars = len(self.xvarnames)
             for key in self.data.keys:
+                if key in dropped:
+                    continue
                 val = vars(self.data)[key]
                 if not isinstance(val, np.ndarray):
                     val = np.asarray(val)
@@ -1079,17 +1193,23 @@ class atomdata_base():
                         del f_lite.attrs[attr]
             f_lite.attrs['has_images'] = has_images
             f_lite.attrs['run_complete'] = True
+            if dropped:
+                import json as _json
+                f_lite.attrs['lite_dropped_keys'] = _json.dumps(dropped)
 
-        print(f'Lite version of run {self.run_info.run_id} saved at {lite_path}.')
+        note = f' ({len(dropped)} camera-stream frame stacks left out)' if dropped else ''
+        print(f'Lite version of run {self.run_info.run_id} saved at {lite_path}.{note}')
 
     # Alias: create_lite_copy and save_lite_copy do the same thing.
-    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None):
+    def create_lite_copy(self, roi_id=None, use_saved_roi=True, force_reread=False, ignore_images=None,
+                         include_streams=False):
         """Alias for :meth:`save_lite_copy`."""
         return self.save_lite_copy(
             roi_id=roi_id,
             use_saved_roi=use_saved_roi,
             force_reread=force_reread,
             ignore_images=ignore_images,
+            include_streams=include_streams,
         )
 
     ### Analysis
@@ -2070,15 +2190,25 @@ class atomdata_base():
         if getattr(self, '_has_images', True) and 'od_raw' not in vars(ad_avg):
             lazy_attrs.add('od_raw')
 
+        # DataVault keys: small ones now, large ones (the diagnostic frame
+        # stacks) on first access, once for the pair -- see _RepeatDataVault.
+        lazy_data_keys = set()
+        shared_data = {}
         for key in self.data.keys:
             value = vars(self.data)[key]
             if self._is_scan_shaped_numeric_array(value):
+                if value.nbytes >= REPEAT_STAT_LAZY_BYTES:
+                    lazy_data_keys.add(key)
+                    continue
                 mean_val, std_val = self._reduce_repeat_ndarray_mean_std(value, xvar_idx, n_repeats)
                 vars(ad_avg.data)[key] = mean_val
                 vars(ad_std.data)[key] = std_val
             else:
                 vars(ad_avg.data)[key] = value
                 vars(ad_std.data)[key] = value
+        for sib in (ad_avg, ad_std):
+            sib.data._lazy_keys = lazy_data_keys
+            sib.data._shared_cache = shared_data
 
         if hasattr(self, 'scope_data'):
             if self.scope_data:
@@ -2812,7 +2942,9 @@ class atomdata_base():
         self.scope_data = {}
 
         t_stage = time.perf_counter()
-        with h5py.File(file,'r') as f:
+        # One sequential read of the whole file when it fits (see open_run_file).
+        f, self._h5_read_mode = open_run_file(file)
+        with f:
             timing['h5_open_s'] = time.perf_counter() - t_stage
 
             t_stage = time.perf_counter()
@@ -3038,11 +3170,12 @@ class atomdata_base():
             print(
                 (
                     "[atomdata timing] load total={:.3f}s | get_data_file(initial)={:.3f}s | "
-                    "h5_open={:.3f}s | headers={:.3f}s | core_arrays={:.3f}s | "
+                    "h5_open[{}]={:.3f}s | headers={:.3f}s | core_arrays={:.3f}s | "
                     "datavault={:.3f}s | scope_data={:.3f}s"
                 ).format(
                     timing.get('load_total_s', 0.0),
                     timing.get('get_data_file_initial_s', 0.0),
+                    getattr(self, '_h5_read_mode', '?'),
                     timing.get('h5_open_s', 0.0),
                     timing.get('h5_unpack_headers_s', 0.0),
                     timing.get('h5_read_core_arrays_s', 0.0),

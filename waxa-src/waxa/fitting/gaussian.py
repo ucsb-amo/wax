@@ -1,9 +1,10 @@
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
-import matplotlib.pyplot as plt
-import kamo.constants as c
 from waxa.fitting.fit import Fit
+# matplotlib.pyplot and kamo.constants are imported where used: at module
+# level they cost ~0.9 s of every `import waxa` (kamo.constants pulls in arc
+# and sympy) for two debug plots and the temperature fit.
 
 class GaussianFit(Fit):
     def __init__(self,xdata,ydata,debug_plotting=False,
@@ -189,6 +190,7 @@ class GaussianFit(Fit):
 
         ## Debug plotting
         if self._debug_plotting:
+            import matplotlib.pyplot as plt
             fig, ax = plt.subplots(1,2,layout='constrained')
             ax[0].plot(x,ynorm_base_at_zero)
             ax[0].plot(x,miny)
@@ -426,6 +428,7 @@ class MultiGaussianFit(GaussianFit,Fit):
 
         ## Debug plotting
         if self._debug_plotting:
+            import matplotlib.pyplot as plt
             fig, ax = plt.subplots(1,2,layout='constrained')
             ax[0].plot(x,ynorm_base_at_zero)
             ax[0].plot(x,miny)
@@ -506,6 +509,7 @@ class BECFit(Fit):
         return -tf_trap_coeff * (x - tf_center)**2 + tf_offset
 
     def _fit(self, x, y):
+        import kamo.constants as c
 
         delta_x = x[-1]-x[0]
 
@@ -548,6 +552,7 @@ class GaussianTemperatureFit(Fit):
         self.y_fitdata = np.sqrt( self._fit_func(self._xdata_sq,T,sigma0_squared) ) / self._mult
 
     def _fit_func(self, t_squared, T, sigma0_squared):
+        import kamo.constants as c
         return c.kB * T / c.m_K * t_squared + sigma0_squared
 
     def _fit(self, x, y):

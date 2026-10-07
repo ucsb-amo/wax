@@ -102,15 +102,19 @@ class _VaultDataVault():
     plus arbitrary array attributes).
 
     When constructed with a source vault and a stat kind it also backs the
-    avg/std/sem siblings: keys added to the parent's DataVault after the
-    siblings were built are grouped on demand by ``__getattr__``. See
-    ``waxa.atomdata_base._RepeatDataVault``.
+    avg/std/sem siblings: keys present when the siblings were built but at or
+    above REPEAT_STAT_LAZY_BYTES (``_lazy_keys``) are grouped on first access,
+    once for the three siblings (``_shared_cache``), and then kept; keys added
+    to the parent's DataVault after the siblings were built are grouped on
+    every access by ``__getattr__``. See ``waxa.atomdata_base._RepeatDataVault``.
     """
 
     def __init__(self, source=None, kind=None):
         self._keys = []
         self._source = source
         self._kind = kind
+        self._lazy_keys = set()
+        self._shared_cache = None
 
     @property
     def keys(self):
@@ -132,9 +136,18 @@ class _VaultDataVault():
         value = getattr(source.data, key)
         if not source._is_scan_shaped_numeric_array(value):
             return value
-        return source._grouped_array_stats(value)[
-            {'mean': 0, 'std': 1, 'sem': 2}[kind]
-        ]
+        idx = {'mean': 0, 'std': 1, 'sem': 2}[kind]
+        d = self.__dict__
+        cache = d.get('_shared_cache')
+        if key in d.get('_lazy_keys', ()) and cache is not None:
+            # Present when the siblings were built, too large to group then:
+            # grouped once for the three siblings, then kept like the eager keys.
+            if key not in cache:
+                cache[key] = source._grouped_array_stats(value)
+            result = cache[key][idx]
+            d[key] = result
+            return result
+        return source._grouped_array_stats(value)[idx]
 
 
 class AtomdataVault(atomdata_base):
@@ -2502,10 +2515,17 @@ class AtomdataVault(atomdata_base):
         if getattr(self, '_has_images', True) and 'od_raw' not in vars(ad_avg):
             lazy_attrs.add('od_raw')
 
-        # DataVault container.
+        # DataVault container: small keys now, large ones (the diagnostic
+        # frame stacks) on first access, once for the three siblings -- see
+        # _VaultDataVault.
+        lazy_data_keys = set()
+        shared_data = {}
         for key in self.data.keys:
             value = vars(self.data)[key]
             if self._is_scan_shaped_numeric_array(value):
+                if value.nbytes >= REPEAT_STAT_LAZY_BYTES:
+                    lazy_data_keys.add(key)
+                    continue
                 mean, std, sem = _reduce(value)
                 vars(ad_avg.data)[key] = mean
                 vars(ad_std.data)[key] = std
@@ -2513,6 +2533,9 @@ class AtomdataVault(atomdata_base):
             else:
                 for sib in (ad_avg, ad_std, ad_sem):
                     vars(sib.data)[key] = value
+        for sib in (ad_avg, ad_std, ad_sem):
+            sib.data._lazy_keys = lazy_data_keys
+            sib.data._shared_cache = shared_data
 
         # Scope data: large, so reduced on first access.
         if hasattr(self, 'scope_data'):

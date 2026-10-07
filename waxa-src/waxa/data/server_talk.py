@@ -498,9 +498,11 @@ class server_talk():
                 f.write(f"{int(value)}")
 
     def create_lite_copy(self,run_idx,roi_id=None,use_saved_roi=True,
-                         roix=None,roiy=None,path="",should_cancel=None):
+                         roix=None,roiy=None,path="",should_cancel=None,
+                         include_streams=False):
         """Writes a lite copy of a run: non-image data copied, scope traces
-        downcast to float32, images cropped to an ROI.
+        downcast to float32, images cropped to an ROI, the camera-stream frame
+        stacks left out unless ``include_streams``.
 
         Pass ``roix``/``roiy`` to crop headlessly: nothing here then touches
         Qt, so it is safe on a worker thread (the data browser does this). The
@@ -518,6 +520,10 @@ class server_talk():
             path (str): the raw file, if already known (skips the run lookup).
             should_cancel (callable): polled between frames; returning True
                 aborts, removes the temporary file and returns None.
+            include_streams (bool): keep the camera-stream frame stacks (the
+                per-shot diagnostic images; see atomdata.save_lite_copy). Left
+                out by default, their records kept, and the keys left out
+                listed in the root attribute ``lite_dropped_keys`` (JSON).
 
         Returns:
             str or None: the lite file path, or None if cancelled.
@@ -550,7 +556,8 @@ class server_talk():
         cancelled = False
         try:
             cancelled = self._write_lite_file(
-                original_data_filepath, tmp_path, x0, x1, y0, y1, should_cancel)
+                original_data_filepath, tmp_path, x0, x1, y0, y1, should_cancel,
+                include_streams=include_streams)
             if not cancelled:
                 os.replace(tmp_path, lite_data_path)
         finally:
@@ -565,9 +572,12 @@ class server_talk():
         print(f'Lite version of run {rid} saved at {lite_data_path}.')
         return lite_data_path
 
-    def _write_lite_file(self, src_path, out_path, x0, x1, y0, y1, should_cancel=None):
+    def _write_lite_file(self, src_path, out_path, x0, x1, y0, y1, should_cancel=None,
+                         include_streams=False):
         """Body of create_lite_copy. Returns True if cancelled."""
         import h5py
+        import json
+        from waxa.data.camera_frames import stream_frame_keys
 
         with h5py.File(out_path,'w') as f_lite:
             with h5py.File(src_path,'r') as f_src:
@@ -577,11 +587,13 @@ class server_talk():
                     if key != 'data':
                         f_src.copy(f_src[key],f_lite,key)
 
-                # copy over non-image data
-                dkeys = f_src['data'].keys()
+                # copy over non-image data; the camera-stream frame stacks
+                # stay behind unless asked for
+                dkeys = list(f_src['data'].keys())
+                dropped = [] if include_streams else stream_frame_keys(dkeys)
                 f_lite.create_group('data')
                 for key in dkeys:
-                    if key == 'images':
+                    if key == 'images' or key in dropped:
                         continue
                     if key == 'scope_data':
                         # Downcast float64 → float32 and apply compression.
@@ -602,6 +614,8 @@ class server_talk():
                 akeys = f_src.attrs.keys()
                 for key in akeys:
                     f_lite.attrs[key] = f_src.attrs[key]
+                if dropped:
+                    f_lite.attrs['lite_dropped_keys'] = json.dumps(dropped)
 
                 if 'images' not in f_src['data']:
                     f_lite.attrs['has_images'] = False

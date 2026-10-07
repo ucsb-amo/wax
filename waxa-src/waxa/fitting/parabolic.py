@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.optimize import curve_fit
-import kamo.constants as c
 from waxa.fitting.fit import Fit
 
 class KinematicFit(Fit):

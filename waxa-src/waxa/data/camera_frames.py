@@ -83,4 +83,13 @@ def frames_present(ad, key):
     return np.isfinite(seq)
 
 
-__all__ = ["META_FIELDS", "N_META", "meta_row", "frame_meta", "frames_present"]
+def stream_frame_keys(keys):
+    """The data-container keys that hold camera-stream frames: a key with a
+    ``<key>_meta`` record (or a legacy ``<key>_seq``) beside it. The records
+    themselves are not included."""
+    keys = list(keys)
+    return [k for k in keys if (k + "_meta") in keys or (k + "_seq") in keys]
+
+
+__all__ = ["META_FIELDS", "N_META", "meta_row", "frame_meta", "frames_present",
+           "stream_frame_keys"]
