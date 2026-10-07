@@ -122,7 +122,6 @@ def test_host_mode_has_the_camera_control_and_one_settings_dialog_per_camera(liv
     from waxx.util.live_od.gui.camera_control import CameraControl
     win, host = live
     assert isinstance(win.camera_menu, CameraControl)
-    assert win._live_view_button is not None
     win.camera_menu.settings_requested.emit("cam_b")          # the cog
     dialog = win._camera_dialogs["cam_b"]
     win.camera_menu.settings_requested.emit("cam_b")

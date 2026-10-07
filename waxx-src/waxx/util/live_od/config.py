@@ -38,6 +38,16 @@ def _basler_needs_grab_drain(camera_key: str) -> bool:
 
 
 @dataclass
+class ToolWindow:
+    """A lab tool the liveOD windows offer a toolbar button for. ``command`` is
+    the argv of the program, run as a process of its own (so its work never
+    lands on liveOD's GUI thread); e.g. ``[sys.executable, "-m", "pkg.tool"]``."""
+    label: str
+    command: List[str]
+    tooltip: str = ""
+
+
+@dataclass
 class LiveODConfig:
     # ---- data plumbing (the acquisition window needs both) ------------------
     # waxa DataSaver: reserves the run id and file at INIT_RUN, saves at END_RUN.
@@ -88,6 +98,11 @@ class LiveODConfig:
     # number. kexp passes the analysis's own rule, which switches on the recorded
     # outer-coil current. None: no atom number, the scalar stays integrated OD.
     cross_section_for_shot: Optional[Callable[[Optional[dict]], Any]] = None
+
+    # ---- tool windows --------------------------------------------------------
+    # ToolWindow entries: one toolbar button each, in the acquisition window and
+    # the remote viewer (its launcher sets a config with only these).
+    tool_windows: List[ToolWindow] = field(default_factory=list)
 
     # ---- identity of the acquisition window ------------------------------------
     # Windows taskbar identity. A new value un-groups existing pinned buttons.

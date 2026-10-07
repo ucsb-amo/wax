@@ -37,6 +37,7 @@ from waxx.util.live_od.gui.live_scalar_plot_window import LiveScalarPlotWindow
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
 from waxx.util.live_od.gui.camera_control import CameraControl
+from waxx.util.live_od.gui.tool_windows import ToolLauncher
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ class LiveODSubscriber(QThread):
     shot_scalars_signal = pyqtSignal(object)        # per-shot scalar dict
     fk_tof_signal = pyqtSignal(object)              # per-shot FK TOF width dict
     adjust_values_signal = pyqtSignal(object)       # dict[key -> current_val]
+    aux_notice_signal = pyqtSignal(object)          # AUX_NOTICE dict: run_id, t, items (no arrays)
 
     # Reconnection configuration (seconds)
     RECONNECT_RETRY_INTERVAL = 2.0  # How often to retry server discovery
@@ -168,6 +170,9 @@ class LiveODSubscriber(QThread):
                             self.fk_tof_signal.emit(dict(msg))
                         elif tag == "ADJUST_VALUES":
                             self.adjust_values_signal.emit(dict(msg.get('values', {})))
+                        elif tag == "AUX_NOTICE":
+                            # what a PUT_DATA brought; the arrays are GET_AUX_DATA's
+                            self.aux_notice_signal.emit(dict(msg))
                         elif tag == "HELLO":
                             pass  # heartbeat — already triggered connected status above
                     except Exception as exc:
@@ -432,6 +437,13 @@ class RemoteViewerWindow(QWidget):
         self.live_plot_button = self.viewer_window.live_plot_button
         self._adjust_button.setMinimumHeight(0)
         self.viewer_window.add_window_button(self._adjust_button)
+        # the lab's tool windows (LiveODConfig.tool_windows), each its own process
+        from waxx.util.live_od.config import get_config
+        self._tool_launcher = ToolLauncher(
+            get_config().tool_windows,
+            lambda text, level=20: self.viewer_window.output_window.appendPlainText(text))
+        for button in self._tool_launcher.buttons():
+            self.viewer_window.add_window_button(button)
 
         self.reconnect_button = QPushButton("Reconnect")
         self.reconnect_button.clicked.connect(self._on_reconnect_clicked)

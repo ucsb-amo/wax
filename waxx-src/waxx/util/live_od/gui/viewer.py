@@ -307,11 +307,7 @@ class LiveODViewer(QWidget):
         theme.notifier().changed.connect(self._restyle)
 
     def _build_toolbar(self):
-        # --- view ---
-        self.reset_zoom_button = QPushButton('Fit')
-        self.reset_zoom_button.setToolTip("Reset the zoom: show the whole image (R)")
-        self.reset_zoom_button.clicked.connect(self.reset_zoom)
-
+        # --- view --- (no Fit button: R resets the zoom)
         self.lock_views_checkbox = QCheckBox("Lock views")
         self.lock_views_checkbox.setToolTip("Pan and zoom the raw frames and the OD image together")
         self.lock_views_checkbox.setChecked(True)
@@ -460,7 +456,7 @@ class LiveODViewer(QWidget):
 
         # Qt gives a push button a 75 px minimum whatever it says; a toolbar of short
         # words is a third narrower with each sized to its text.
-        for button in (self.reset_zoom_button, self.roi_button, self.od_auto_button,
+        for button in (self.roi_button, self.od_auto_button,
                        self.live_plot_button, self.markers_button, self.auto_roi_button):
             _fit_to_text(button)
         self.auto_roi_spinner.setFixedWidth(self.auto_roi_spinner.sizeHint().width())
@@ -475,7 +471,7 @@ class LiveODViewer(QWidget):
         self.history_label.setFixedWidth(50)
         self.image_count_label.setFixedWidth(104)
         # (no "OD" caption: the two boxes' tooltips and the colour bar say what they are)
-        for widget in (self.reset_zoom_button, self.view_button, self.roi_button,
+        for widget in (self.view_button, self.roi_button,
                        self.um_checkbox, self.markers_button, _vline(),
                        self.od_min_spinner, self.od_max_spinner,
                        self.od_auto_button, _vline(),

@@ -22,6 +22,7 @@ from waxx.util.live_od.gui.plotter import LiveODPlotter
 from waxx.util.live_od.live_od_server import LiveODServer
 from waxx.util.live_od.live_od_broadcaster import LiveODBroadcaster
 from waxx.util.live_od.gui.live_scalar_plot_window import LiveScalarPlotWindow
+from waxx.util.live_od.gui.tool_windows import ToolLauncher
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
 from waxx.util.live_od.gui.status_strip import StatusStrip
@@ -402,12 +403,6 @@ class LiveODWindow(QWidget):
         else:
             window.close_camera(camera_key)
 
-    def _open_live_view(self):
-        """The toolbar's Live view button."""
-        window = self._live_view()
-        window.show()
-        window.raise_()
-
     def _on_live_view_closed(self, camera_key: str):
         """A camera's view in the live window closed. Once nothing else subscribes
         to the camera and no run holds it, its live stream is stopped
@@ -600,16 +595,10 @@ class LiveODWindow(QWidget):
         self.status_strip.add_camera_widget(self.camera_menu)
         self.live_view_window = None
         self._camera_dialogs = {}
-        self._live_view_button = None
         # cameras whose last live view closed: camera_key -> until when (monotonic)
         # to wait for its other subscribers to go (_check_live_streams)
         self._live_stop_pending = {}
         self._live_stop_timer = None
-        if self.camera_host is not None:
-            self._live_view_button = QPushButton("Live view")
-            self._live_view_button.setToolTip("liveOD's live view (a camera's movie-camera "
-                                              "button opens its view there)")
-            self._live_view_button.clicked.connect(self._open_live_view)
 
         self.plotting_queue = Queue()
         self.analyzer = Analyzer(self.plotting_queue, self.viewer_window)
@@ -690,9 +679,10 @@ class LiveODWindow(QWidget):
         self._adjust_button.setMinimumHeight(0)     # sized like its toolbar neighbours
         self._adjust_button.setFixedWidth(72)       # "Adjust (12)" fits: no growth at run start
         self.viewer_window.add_window_button(self._adjust_button)
-        if self._live_view_button is not None:
-            self._live_view_button.setFixedWidth(72)    # fixed: the toolbar never moves
-            self.viewer_window.add_window_button(self._live_view_button)
+        # the lab's tool windows (LiveODConfig.tool_windows), each its own process
+        self._tool_launcher = ToolLauncher(get_config().tool_windows, self.msg)
+        for button in self._tool_launcher.buttons():
+            self.viewer_window.add_window_button(button)
         layout.addWidget(self.viewer_window, 1)
         self.setLayout(layout)
         if self._settings is not None:
@@ -1003,9 +993,13 @@ class LiveODWindow(QWidget):
         self.fk_tof_window.raise_()
 
     def _open_adjust_panel(self):
-        """Show the adjust panel."""
-        self._adjust_panel.show()
-        self._adjust_panel.raise_()
+        """Show the adjust panel, or bring it to the front and focus it if already open."""
+        panel = self._adjust_panel
+        if panel.isMinimized():
+            panel.setWindowState(panel.windowState() & ~Qt.WindowState.WindowMinimized)
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
 
     def _on_adjust_specs(self, specs: list):
         """Called after INIT_RUN — repopulate with the new run's adjust params (may be empty)."""

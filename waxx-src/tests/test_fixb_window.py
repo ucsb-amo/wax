@@ -479,4 +479,4 @@ def test_the_legacy_window_shows_the_same_camera_control(window):
     menu = window.camera_menu
     assert type(menu) is CameraControl
     assert not menu.cog_button.isVisibleTo(menu) and not menu.live_button.isVisibleTo(menu)
-    assert window._live_view_button is None and window.live_view_window is None
+    assert window.live_view_window is None
