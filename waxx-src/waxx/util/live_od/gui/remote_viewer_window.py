@@ -781,6 +781,8 @@ if __name__ == "__main__":
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
         "weldlab.kexp.gui.live_od_viewer"
     )
+    from waxa.taskbar import group_console
+    group_console()  # console joins the shared terminals taskbar button
 
     ip = sys.argv[1] if len(sys.argv) > 1 else None
     port = int(sys.argv[2]) if len(sys.argv) > 2 else None

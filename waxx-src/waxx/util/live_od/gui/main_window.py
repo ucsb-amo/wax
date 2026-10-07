@@ -1502,6 +1502,8 @@ def main(config):
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(config.app_user_model_id)
     except Exception:
         pass        # not Windows: no taskbar identity to set
+    from waxa.taskbar import group_console
+    group_console()  # console joins the shared terminals taskbar button
     app = QApplication(sys.argv)
     # layout, toggles and per-camera OD levels are remembered between sessions
     win = LiveODWindow(settings=QSettings("waxx", "live_od"))

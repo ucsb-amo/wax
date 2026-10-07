@@ -505,6 +505,8 @@ def main() -> None:
         )
     except Exception:
         pass
+    from waxa.taskbar import group_console
+    group_console()  # console joins the shared terminals taskbar button
 
     app = QApplication.instance() or QApplication(sys.argv)
     apply_dark_palette(app)
