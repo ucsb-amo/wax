@@ -313,7 +313,7 @@ class BristolDetuningWidget(QWidget):
         ctl_row.addWidget(n_lbl)
         self._n_spin = QSpinBox()
         self._n_spin.setRange(1, 1000)
-        self._n_spin.setValue(1)
+        self._n_spin.setValue(100)
         self._n_spin.setFixedWidth(70)
         self._n_spin.setFont(QFont("Monospace", 10))
         ctl_row.addWidget(self._n_spin)
