@@ -103,7 +103,7 @@ class PanelWindow(QMainWindow):
         self.setStyleSheet(f"QMainWindow {{ background: {theme.BG}; }}")
 
         header, body = panel.detach_for_popout()
-        header.set_window_glyphs_visible(popout=True, float_=False, close=False)
+        header.set_window_glyphs_visible(popout=True, close=False)
         header._popout_btn.setToolTip("Return this panel to the dashboard")
 
         container = QWidget(self)
@@ -133,7 +133,7 @@ class PanelWindow(QMainWindow):
 
     def give_back(self) -> None:
         """Detach header + body so the dock can :meth:`reattach` them."""
-        self._header.set_window_glyphs_visible(popout=True, float_=True, close=True)
+        self._header.set_window_glyphs_visible(popout=True, close=True)
         self._header._popout_btn.setToolTip("Pop out into its own window (own taskbar entry)")
         self._header.setParent(None)
         self._body.setParent(None)

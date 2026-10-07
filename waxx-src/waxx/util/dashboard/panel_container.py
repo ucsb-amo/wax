@@ -2,7 +2,7 @@
 
 Each panel is a :class:`QDockWidget` whose **title bar widget** is a
 :class:`PanelHeaderBar` (LED + title + start/stop/restart + conn/COM badges +
-pop-out / float / close glyphs).
+pop-out / close glyphs).
 
 Bodies are lazy: the dock starts with a :class:`PlaceholderBody` and the
 real widget is built by :meth:`realize_body`, which the dashboard calls when
@@ -72,10 +72,11 @@ class _PanelDockBase(QDockWidget):
         self._active = False
         # Allow shrinking; embedded GUIs sometimes carry oversized minimums.
         self.setMinimumSize(0, 0)
-        # The header carries its own float/close glyphs.
+        # The header carries its own close glyph.  Not floatable: a panel is
+        # docked or popped out into a real window (PanelWindow), never a Qt
+        # floating dock.
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
 
@@ -100,7 +101,6 @@ class _PanelDockBase(QDockWidget):
             label, is_server=is_server, com_label=com_label, icon=icon,
         )
         self.setTitleBarWidget(self._header)
-        self._header.float_clicked.connect(lambda: self.setFloating(not self.isFloating()))
         self._header.close_clicked.connect(self.close)
         self._body_widget: Optional[QWidget] = None
         self._popped_out = False

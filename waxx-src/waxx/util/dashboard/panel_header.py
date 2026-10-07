@@ -10,9 +10,10 @@ Lays out (left-to-right) on a single row:
 * Optional :class:`ComStatusButton` driven by the snapshot's ``"com"`` key
 * Pop-out button (moves the panel into an independent top-level window)
 
-Qt's built-in QDockWidget float / close buttons are *not* drawn when a
-custom title bar widget is installed, so the header carries its own
-float-toggle and close buttons as well.
+Qt's built-in QDockWidget close button is *not* drawn when a custom
+title bar widget is installed, so the header carries its own close button
+as well.  There is no in-dashboard float toggle: panels are either docked
+or popped out into a real top-level window.
 """
 
 from __future__ import annotations
@@ -75,14 +76,13 @@ class PanelHeaderBar(QWidget):
 
     Server panels show LED + title + Start/Stop/Restart + conn + COM.
     Client panels show just title + conn + COM (no supervisor controls,
-    no LED).  Every panel gets pop-out / float / close glyphs on the right.
+    no LED).  Every panel gets pop-out / close glyphs on the right.
     """
 
     start_clicked = pyqtSignal()
     stop_clicked = pyqtSignal()
     restart_clicked = pyqtSignal()
     popout_clicked = pyqtSignal()
-    float_clicked = pyqtSignal()
     close_clicked = pyqtSignal()
 
     def __init__(
@@ -157,14 +157,11 @@ class PanelHeaderBar(QWidget):
             self._com_btn.setToolTip(f"{com_label} — waiting for the server's first snapshot")
             layout.addWidget(self._com_btn)
 
-        # Window-ish glyphs: pop out, float/dock, close.
+        # Window-ish glyphs: pop out, close.
         layout.addSpacing(2)
         self._popout_btn = _glyph_button("⧉", "Pop out into its own window (own taskbar entry)", self)
         self._popout_btn.clicked.connect(self.popout_clicked)
         layout.addWidget(self._popout_btn)
-        self._float_btn = _glyph_button("❐", "Float / re-dock inside the dashboard", self)
-        self._float_btn.clicked.connect(self.float_clicked)
-        layout.addWidget(self._float_btn)
         self._close_btn = _glyph_button("✕", "Hide panel (re-open from the Panels menu)", self)
         self._close_btn.clicked.connect(self.close_clicked)
         layout.addWidget(self._close_btn)
@@ -193,9 +190,8 @@ class PanelHeaderBar(QWidget):
             if w is not None:
                 w.setVisible(bool(visible))
 
-    def set_window_glyphs_visible(self, popout: bool = True, float_: bool = True, close: bool = True) -> None:
+    def set_window_glyphs_visible(self, popout: bool = True, close: bool = True) -> None:
         self._popout_btn.setVisible(popout)
-        self._float_btn.setVisible(float_)
         self._close_btn.setVisible(close)
 
     def set_state(self, state: SupervisorState) -> None:

@@ -853,6 +853,11 @@ class DashboardMainWindow(QMainWindow):
             if state is not None and not self.restoreState(state):
                 _LOG.warning("restoreState rejected the saved dock state")
                 return False
+            # Panels are no longer floatable; a layout saved with a floating
+            # panel would otherwise leave it with no way back into the dock.
+            for panel in self._panels:
+                if panel.isFloating():
+                    panel.setFloating(False)
             return True
         finally:
             self._settings.remove(pending)
