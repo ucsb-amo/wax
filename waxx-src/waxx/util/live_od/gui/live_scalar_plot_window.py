@@ -44,7 +44,34 @@ METRICS = [
     ("fit σ y",                "fit_sd_y",               1e6,  "µm"),
     ("fit amp x",              "fit_amp_x",              1.0,  "sum OD"),
     ("fit amp y",              "fit_amp_y",              1.0,  "sum OD"),
+    ("fit centre x",           "fit_center_frame_x",     1e6,  "µm"),
+    ("fit centre y",           "fit_center_frame_y",     1e6,  "µm"),
 ]
+
+
+def _center_in_frame(axis):
+    """The fit centre on the camera frame (m at the atoms), from the analyzer's
+    crop-relative one: (crop origin px + centre / px size) * px size. Fixed to
+    the frame, so moving the ROI or the view does not move it. NaN without a
+    pixel calibration (the centre would be in pixels on a µm axis)."""
+    i = 0 if axis == "x" else 1
+
+    def get(d):
+        try:
+            if not d.get("px_calibrated"):
+                return float("nan")
+            px = float(d["px_size_m"])
+            return (float(d["crop_origin_px"][i]) * px + float(d[f"fit_center_{axis}"]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+    return get
+
+
+# Metrics worked out here from the scalars dict rather than sent as they are
+_DERIVED = {
+    "fit_center_frame_x": _center_in_frame("x"),
+    "fit_center_frame_y": _center_in_frame("y"),
+}
 
 NO_SECOND_METRIC = "(none)"
 COLOR_1 = (100, 180, 255)       # left axis and its points
@@ -58,6 +85,8 @@ _FIT_KEYS = {
     "fit_sd_y",
     "fit_amp_x",
     "fit_amp_y",
+    "fit_center_frame_x",
+    "fit_center_frame_y",
 }
 
 
@@ -336,7 +365,7 @@ class LiveScalarPlotWindow(QWidget):
         missing or not finite."""
         xs, ys = [], []
         for d in data:
-            y_raw = d.get(key)
+            y_raw = _DERIVED[key](d) if key in _DERIVED else d.get(key)
             if y_raw is None:
                 continue
             y_val = float(y_raw) * ymult
