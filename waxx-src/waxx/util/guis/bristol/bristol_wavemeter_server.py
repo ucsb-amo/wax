@@ -3,25 +3,38 @@
 Commands (line-terminated, case-insensitive):
   GET_READING  →  JSON: {"wavelength_nm", "frequency_thz", "timestamp", "connected"}
   STATUS       →  JSON: {"connected", "host", "error"}
+  GET_AVERAGE <n> <max_age_s>
+               →  JSON: {"ok", "n_requested", "n_used", "mean_hz", "std_hz",
+                         "t_first", "t_last", "age_s", "max_age_s", "connected"}
+                  Mean and sample std (ddof=1; 0. for a single reading) of the
+                  last <n> readings taken within <max_age_s> seconds of the
+                  request, on this server's clock. Fewer than <n> fresh
+                  readings are averaged as they are and counted in n_used;
+                  none gives ok=False, n_used=0.
 """
 from __future__ import annotations
 
 import atexit
+import collections
 import json
 import logging
 import signal
 import socket
+import statistics
 import threading
 import time
 from typing import Optional
 
-from waxx.control.misc.bristol_wavemeter import BristolWavemeter
+from waxx.control.misc.bristol_wavemeter import BristolWavemeter, _C_LIGHT
 from beacon.discovery.server import NetServer
 
 LOGGER = logging.getLogger("bristol_wavemeter_server")
 LOGGER.setLevel(logging.INFO)
 
 SERVER_ID = "bristol_wavemeter"
+
+# Readings kept for GET_AVERAGE (one per poll, ~0.1-0.2 s apart).
+HISTORY_LEN = 1000
 
 
 class BristolWavemeterServer(NetServer):
@@ -48,6 +61,9 @@ class BristolWavemeterServer(NetServer):
         }
         self._error: Optional[str] = None
         self._lock = threading.Lock()
+        # (timestamp, frequency_hz) of successful readings, oldest first.
+        # Cleared on every disconnect, so an average never spans an outage.
+        self._history: collections.deque = collections.deque(maxlen=HISTORY_LEN)
 
         self.running = False
         self._server_socket: Optional[socket.socket] = None
@@ -75,6 +91,46 @@ class BristolWavemeterServer(NetServer):
                 "host": self.wavemeter_host,
                 "error": self._error,
             }
+
+    def get_average(self, n: int, max_age_s: float) -> dict:
+        """Mean and sample std of the last ``n`` readings no older than
+        ``max_age_s`` (server clock). See the module docstring."""
+        n = int(n)
+        max_age_s = float(max_age_s)
+        if n < 1 or not max_age_s > 0.:
+            return {"ok": False, "n_used": 0,
+                    "error": f"bad GET_AVERAGE arguments n={n} max_age_s={max_age_s}"}
+        now = time.time()
+        with self._lock:
+            fresh = [(t, f) for (t, f) in self._history if now - t <= max_age_s]
+            connected = self._reading["connected"]
+        used = fresh[-n:]
+        out = {
+            "ok": bool(used),
+            "n_requested": n,
+            "n_used": len(used),
+            "mean_hz": None,
+            "std_hz": None,
+            "t_first": None,
+            "t_last": None,
+            "age_s": None,
+            "max_age_s": max_age_s,
+            "connected": connected,
+        }
+        if not used:
+            out["error"] = f"no readings within {max_age_s:g} s"
+            return out
+        freqs = [f for (_, f) in used]
+        # Statistics of the offsets from the first reading: the absolute
+        # values are ~4e14 Hz, the spread MHz, so this keeps full precision.
+        f_ref = freqs[0]
+        offsets = [f - f_ref for f in freqs]
+        out["mean_hz"] = f_ref + statistics.fmean(offsets)
+        out["std_hz"] = statistics.stdev(offsets) if len(offsets) > 1 else 0.
+        out["t_first"] = used[0][0]
+        out["t_last"] = used[-1][0]
+        out["age_s"] = now - used[-1][0]
+        return out
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -146,6 +202,7 @@ class BristolWavemeterServer(NetServer):
             wm = self._wavemeter
             self._wavemeter = None
             self._reading["connected"] = False
+            self._history.clear()
         if wm is not None:
             try:
                 wm._dev.close()
@@ -163,14 +220,22 @@ class BristolWavemeterServer(NetServer):
                 wm = self._wavemeter
             if wm is not None:
                 try:
+                    # One measurement per poll: the frequency comes from this
+                    # wavelength (get_frequency() would take a second one).
                     wl_m = wm.get_wavelength()
-                    freq_thz = wm.get_frequency() / 1e12
+                    if not wl_m > 0.:
+                        # no valid peak (0. was a ZeroDivisionError before);
+                        # same handling as a comms error, never averaged
+                        raise ValueError(f"no valid wavelength reading ({wl_m!r})")
+                    freq_hz = _C_LIGHT / wl_m
+                    t_now = time.time()
                     with self._lock:
                         self._reading["wavelength_nm"] = wl_m * 1e9
-                        self._reading["frequency_thz"] = freq_thz
-                        self._reading["timestamp"] = time.time()
+                        self._reading["frequency_thz"] = freq_hz / 1e12
+                        self._reading["timestamp"] = t_now
                         self._reading["connected"] = True
                         self._error = None
+                        self._history.append((t_now, freq_hz))
                     self._consecutive_poll_failures = 0
                 except Exception as exc:
                     self._consecutive_poll_failures += 1
@@ -223,8 +288,18 @@ class BristolWavemeterServer(NetServer):
             conn.settimeout(5.0)
             with conn.makefile("rb") as f:
                 line = f.readline().decode("utf-8", errors="replace").strip().upper()
+            parts = line.split()
             if line == "GET_READING":
                 response = json.dumps(self.get_reading())
+            elif parts and parts[0] == "GET_AVERAGE":
+                try:
+                    n, max_age_s = int(parts[1]), float(parts[2])
+                except (IndexError, ValueError):
+                    response = json.dumps({
+                        "ok": False, "n_used": 0,
+                        "error": f"usage: GET_AVERAGE <n> <max_age_s>, got {line!r}"})
+                else:
+                    response = json.dumps(self.get_average(n, max_age_s))
             elif line == "STATUS":
                 response = json.dumps(self.get_status())
             else:
