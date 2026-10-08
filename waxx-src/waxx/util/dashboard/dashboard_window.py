@@ -8,9 +8,15 @@ Features
 * Default layout honours each panel's ``placement`` / ``tab_group``: "tab"
   panels sharing a group in one area are stacked, everything else gets its
   own dock split from its neighbours.  ``Reset to default layout`` re-applies
-  that live; ``Revert to saved layout`` goes back to what was loaded.
-* QSettings layout persistence (per-host key), saved one second after any
-  dock move as well as at close, with a screen-bounds clamp on restore.
+  that live.
+* QSettings layout persistence (per-host key): the working layout is saved
+  one second after any change (dock move, splitter drag, dock or window
+  resize / move, show / hide, pop-out) as well as at close, and the next
+  launch opens to it, with a screen-bounds clamp on restore.
+* Named layouts (:mod:`layout_store`) chosen from the toolbar dropdown
+  (:mod:`layout_picker`): + / - add and delete, and each saved entry has
+  rename / save-over / delete buttons.  Applying one makes it the working
+  layout; later changes are remembered and flagged with a dot.
 * Lazy body realization: a panel's body is built when the panel first
   becomes visible (eager for in-process servers), with a progress line in
   the status bar; heavy imports can be warmed on a background thread.
@@ -18,7 +24,7 @@ Features
   its own taskbar button (:mod:`panel_window`); popped-out panels are
   remembered and restored on the next launch.
 * Panels menu (Ctrl+1..9 raises), Layout menu, live Servers menu, Tools
-  menu + toolbar (Logs, Errors, Revert/Reset layout), Log dock, persistent
+  menu + toolbar (Logs, Errors, layout dropdown), Log dock, persistent
   status-bar summary (running / crashed / idle counts, data dir, host, log).
 * Close: graceful shutdown requests fan out to every server, COM servers
   are watched in a modal until their ports are released, survivors are
@@ -35,12 +41,13 @@ import importlib
 import json
 import logging
 import platform
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from PyQt6.QtCore import QByteArray, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QEvent, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
@@ -56,6 +63,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -67,6 +75,8 @@ from PyQt6.QtWidgets import (
 )
 
 from waxx.util.dashboard import theme
+from waxx.util.dashboard.layout_picker import LayoutPicker
+from waxx.util.dashboard.layout_store import DEFAULT_NAME, LayoutSnapshot, LayoutStore
 from waxx.util.dashboard.logging_setup import active_log_dir, pop_boot_warnings
 from waxx.util.dashboard.panel_container import ClientPanel, ServerPanel, _PanelDockBase
 from waxx.util.dashboard.panel_window import PanelWindow
@@ -347,6 +357,12 @@ class DashboardMainWindow(QMainWindow):
         self._layout_save_timer.setSingleShot(True)
         self._layout_save_timer.setInterval(1000)
         self._layout_save_timer.timeout.connect(self._save_layout)
+        self._layouts = LayoutStore(self._settings, self._layout_group())
+        # Moves / resizes before this monotonic time come from applying a
+        # layout, not from the user, so they do not mark it modified.
+        self._applying_until = 0.0
+        self._reapply_state: Optional[QByteArray] = None
+        self._press_state: Optional[bytes] = None
 
         # Realization bookkeeping.
         self._realize_queue: deque[_PanelDockBase] = deque()
@@ -362,6 +378,7 @@ class DashboardMainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._restore_layout()
+        self._refresh_layout_picker()
 
         warnings = pop_boot_warnings()
         if warnings:
@@ -481,6 +498,7 @@ class DashboardMainWindow(QMainWindow):
 
     def _reset_to_default_layout(self) -> None:
         """Live re-application of the placement spec (no restart needed)."""
+        self._applying_until = time.monotonic() + 1.0
         for pid in list(self._popped):
             self.return_panel(self._by_id[pid])
         for panel in self._panels:
@@ -493,9 +511,10 @@ class DashboardMainWindow(QMainWindow):
         for panel in self._panels:
             if not panel.isHidden():
                 self._ensure_realized(panel)
-        self._settings.remove(self._layout_key("geometry"))
-        self._settings.remove(self._layout_key("state"))
         self._last_loaded_layout = None
+        self._layouts.active = DEFAULT_NAME
+        self._layouts.modified = False
+        self._refresh_layout_picker()
         self._mark_layout_dirty()
         self.statusBar().showMessage("Layout reset to defaults", 3000)
 
@@ -507,15 +526,23 @@ class DashboardMainWindow(QMainWindow):
         hdr = panel.header()
         hdr.popout_clicked.connect(lambda _c=False, p=panel: self.toggle_popout(p))
         panel.visibilityChanged.connect(lambda vis, p=panel: self._on_panel_visibility(p, vis))
-        panel.dockLocationChanged.connect(lambda _a: self._mark_layout_dirty())
+        panel.dockLocationChanged.connect(lambda _a: self._note_user_layout_change())
         panel.topLevelChanged.connect(lambda _f: self._mark_layout_dirty())
+        # Dock sizes change without any signal (splitter drags, a neighbour
+        # shown or hidden): watch the resize events so they are saved too.
+        panel.installEventFilter(self)
 
     def _on_panel_visibility(self, panel: _PanelDockBase, visible: bool) -> None:
         if visible and not panel.is_popped_out():
             self._ensure_realized(panel)
         act = self._panel_actions.get(panel.panel_id)
         if act is not None:
-            act.setChecked(not panel.isHidden())
+            shown = not panel.isHidden() or panel.is_popped_out()
+            # A tab switch fires visibilityChanged too; only a panel shown or
+            # closed (its menu tick flips) changes the arrangement.
+            if act.isChecked() != shown:
+                act.setChecked(shown)
+                self._note_user_layout_change()
         self._mark_layout_dirty()
 
     def _on_focus_changed(self, _old: Optional[QWidget], new: Optional[QWidget]) -> None:
@@ -558,22 +585,12 @@ class DashboardMainWindow(QMainWindow):
         panels_menu.addAction(show_all)
 
         # --- Layout -----------------------------------------------------
-        layout_menu = mb.addMenu("&Layout")
+        self._layout_menu = mb.addMenu("&Layout")
+        self._layout_menu.aboutToShow.connect(self._rebuild_layout_menu)
         self._revert_act = QAction("Revert to saved layout", self)
-        self._revert_act.setToolTip("Go back to the layout that was loaded at startup (or last loaded from a file)")
+        self._revert_act.setToolTip("Re-apply the selected layout, dropping changes made since")
         self._revert_act.triggered.connect(self._revert_layout)
-        layout_menu.addAction(self._revert_act)
-        reset = QAction("Reset to default layout", self)
-        reset.setToolTip("Re-apply the default dock placement live and forget the saved layout")
-        reset.triggered.connect(self._reset_to_default_layout)
-        layout_menu.addAction(reset)
-        layout_menu.addSeparator()
-        save_act = QAction("Save layout to file…", self)
-        save_act.triggered.connect(self._save_layout_to_file)
-        layout_menu.addAction(save_act)
-        load_act = QAction("Load layout from file…", self)
-        load_act.triggered.connect(self._load_layout_from_file)
-        layout_menu.addAction(load_act)
+        self._rebuild_layout_menu()
 
         # --- Servers (rebuilt on open so it reflects live state) ---------
         self._servers_menu = mb.addMenu("&Servers")
@@ -599,7 +616,16 @@ class DashboardMainWindow(QMainWindow):
         tb.addAction(self._logs_act)
         tb.addAction(self._errors_act)
         tb.addSeparator()
-        tb.addAction(self._revert_act)
+        picker = LayoutPicker(tb)
+        picker.apply_requested.connect(self._select_layout)
+        picker.add_requested.connect(self._add_layout)
+        picker.rename_requested.connect(self._rename_layout)
+        picker.overwrite_requested.connect(self._overwrite_layout)
+        picker.delete_requested.connect(self._delete_layout)
+        picker.import_requested.connect(self._load_layout_from_file)
+        picker.export_requested.connect(self._save_layout_to_file)
+        tb.addWidget(picker)
+        self._layout_picker = picker
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
         self._toolbar = tb
 
@@ -623,11 +649,13 @@ class DashboardMainWindow(QMainWindow):
                 body.setFocus()
         else:
             panel.hide()
+        self._note_user_layout_change()
 
     def _show_all_panels(self) -> None:
         for panel in self._panels:
             if not panel.is_popped_out():
                 panel.show()
+        self._note_user_layout_change()
 
     def _rebuild_popped_menu(self) -> None:
         menu = self._popped_menu
@@ -817,6 +845,10 @@ class DashboardMainWindow(QMainWindow):
     # Layout persistence
     # ------------------------------------------------------------------
 
+    #: The working layout's keys.  Named layouts live beside them in the
+    #: same group and survive a discard.
+    _WORKING_KEYS = ("geometry", "state", "popped", "popped_geometry")
+
     def _layout_key(self, which: str) -> str:
         # Per-host so different lab PCs can keep their own arrangement.
         return f"dashboard/{self._kind}/{self._host_ip}/{which}"
@@ -825,15 +857,29 @@ class DashboardMainWindow(QMainWindow):
         if self._layout_ready:
             self._layout_save_timer.start()
 
+    def _note_user_layout_change(self) -> None:
+        """The arrangement changed: save it, and flag the selected layout as changed."""
+        if not self._layout_ready:
+            return
+        self._mark_layout_dirty()
+        if time.monotonic() < self._applying_until:
+            return
+        if self._layouts.active and not self._layouts.modified:
+            self._layouts.modified = True
+            self._refresh_layout_picker()
+
     def _layout_group(self) -> str:
         return f"dashboard/{self._kind}/{self._host_ip}"
 
     def _discard_saved_layout(self, reason: str) -> None:
-        """Drop the whole saved layout for this host so startup uses the default placement."""
+        """Drop this host's working layout so startup uses the default placement."""
         _LOG.warning("Discarding saved layout (%s); starting with the default layout", reason)
-        self._settings.remove(self._layout_group())
+        for which in self._WORKING_KEYS:
+            self._settings.remove(self._layout_key(which))
         self._settings.sync()
         self._last_loaded_layout = None
+        self._layouts.active = DEFAULT_NAME
+        self._layouts.modified = False
         self.statusBar().showMessage(f"Saved layout was bad ({reason}) - using the default layout", 10000)
 
     def _guarded_restore(self, geo, state) -> bool:
@@ -869,6 +915,8 @@ class DashboardMainWindow(QMainWindow):
             return
         geo = self._settings.value(self._layout_key("geometry"))
         state = self._settings.value(self._layout_key("state"))
+        if geo is None and state is None and not self._layouts.active:
+            self._layouts.active = DEFAULT_NAME   # first launch: the default placement is on screen
         ok = False
         try:
             ok = self._guarded_restore(geo, state)
@@ -903,6 +951,7 @@ class DashboardMainWindow(QMainWindow):
             pass
 
     def _save_layout(self) -> None:
+        """Write the working layout (what the next launch opens to)."""
         try:
             self._settings.setValue(self._layout_key("geometry"), self.saveGeometry())
             self._settings.setValue(self._layout_key("state"), self.saveState())
@@ -924,63 +973,238 @@ class DashboardMainWindow(QMainWindow):
             _LOG.warning("Failed to apply layout snapshot: %r", exc)
             return False
 
+    # --- named layouts ---------------------------------------------------
+
+    def _capture_snapshot(self) -> LayoutSnapshot:
+        return LayoutSnapshot(
+            geometry=bytes(self.saveGeometry()),
+            state=bytes(self.saveState()),
+            popped=sorted(self._popped),
+            popped_geometry={pid: bytes(win.saved_geometry()) for pid, win in self._popped.items()},
+        )
+
+    def _apply_named_snapshot(self, snap: LayoutSnapshot) -> bool:
+        """Put a saved arrangement on screen, pop-outs included."""
+        self._applying_until = time.monotonic() + 1.0
+        geo = QByteArray(snap.geometry) if snap.geometry else None
+        state = QByteArray(snap.state) if snap.state else None
+        if state is None:
+            return False
+        for pid in list(self._popped):
+            self.return_panel(self._by_id[pid])
+        if not self._apply_layout_snapshot({"geometry": geo, "state": state}):
+            return False
+        for pid in snap.popped:
+            panel = self._by_id.get(pid)
+            if panel is not None:
+                g = snap.popped_geometry.get(pid)
+                self.pop_out(panel, geometry=QByteArray(g) if g else None)
+        self._last_loaded_layout = {"geometry": geo, "state": state}
+        # Bodies built from here on resize their docks; once they exist,
+        # put the saved sizes back (as startup does).
+        if self._realize_queue:
+            self._reapply_state = state
+        self._applying_until = time.monotonic() + 1.0
+        self._mark_layout_dirty()
+        return True
+
+    def _select_layout(self, name: str) -> None:
+        if name == DEFAULT_NAME:
+            self._reset_to_default_layout()
+            return
+        snap = self._layouts.get(name)
+        if snap is None:
+            QMessageBox.warning(self, "Layout missing", f"There is no saved layout called '{name}'.")
+            self._refresh_layout_picker()
+            return
+        if not self._apply_named_snapshot(snap):
+            QMessageBox.warning(
+                self, "Layout not applied",
+                f"Qt rejected the saved dock state of '{name}' (it may have been saved with a "
+                "different set of panels).",
+            )
+            return
+        self._layouts.active = name
+        self._layouts.modified = False
+        self._refresh_layout_picker()
+        self.statusBar().showMessage(f"Layout '{name}' applied", 3000)
+
+    def _ask_layout_name(self, title: str, initial: str, *, renaming: Optional[str] = None) -> Optional[str]:
+        text = initial
+        while True:
+            text, ok = QInputDialog.getText(self, title, "Layout name:", text=text)
+            if not ok:
+                return None
+            problem = self._layouts.validate_name(text, renaming=renaming)
+            if problem is None:
+                return text.strip()
+            QMessageBox.warning(self, title, problem)
+
+    def _add_layout(self) -> None:
+        suggestion = self._layouts.unique_name(f"Layout {len(self._layouts.names()) + 1}")
+        name = self._ask_layout_name("Save layout", suggestion)
+        if name is None:
+            return
+        self._layouts.put(name, self._capture_snapshot())
+        self._layouts.active = name
+        self._layouts.modified = False
+        self._refresh_layout_picker()
+        self.statusBar().showMessage(f"Saved the current arrangement as '{name}'", 4000)
+
+    def _rename_layout(self, name: str) -> None:
+        new = self._ask_layout_name("Rename layout", name, renaming=name)
+        if new is None or new == name:
+            return
+        try:
+            self._layouts.rename(name, new)
+        except KeyError:
+            QMessageBox.warning(self, "Layout missing", f"There is no saved layout called '{name}'.")
+        self._refresh_layout_picker()
+
+    def _overwrite_layout(self, name: str) -> None:
+        reply = QMessageBox.question(
+            self, "Save over layout?",
+            f"Save the current arrangement over '{name}'?  What '{name}' held before is lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._layouts.put(name, self._capture_snapshot())
+        self._layouts.active = name
+        self._layouts.modified = False
+        self._refresh_layout_picker()
+        self.statusBar().showMessage(f"Saved the current arrangement over '{name}'", 4000)
+
+    def _delete_layout(self, name: str) -> None:
+        if not name or name == DEFAULT_NAME:
+            return
+        reply = QMessageBox.question(
+            self, "Delete layout?",
+            f"Delete the saved layout '{name}'?  The arrangement on screen stays as it is.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._layouts.delete(name)
+        self._refresh_layout_picker()
+        self.statusBar().showMessage(f"Deleted layout '{name}'", 4000)
+
+    def _refresh_layout_picker(self) -> None:
+        names = self._layouts.names()
+        active = self._layouts.active
+        if active and active != DEFAULT_NAME and active not in names:
+            active = ""   # deleted by another dashboard on this host
+        picker = getattr(self, "_layout_picker", None)
+        if picker is not None:
+            picker.set_entries(names, active, self._layouts.modified,
+                               {n: self._layouts.saved_at(n) for n in names})
+        revert = getattr(self, "_revert_act", None)
+        if revert is not None:
+            revert.setText(f"Revert to '{active}'" if active else "Revert to the layout loaded at startup")
+
+    def _rebuild_layout_menu(self) -> None:
+        menu = self._layout_menu
+        menu.clear()
+        active = self._layouts.active
+        names = self._layouts.names()
+        for name in [DEFAULT_NAME] + names:
+            act = QAction(name, menu)
+            act.setCheckable(True)
+            act.setChecked(name == active)
+            act.triggered.connect(lambda _c=False, n=name: self._select_layout(n))
+            menu.addAction(act)
+        menu.addSeparator()
+        self._refresh_layout_picker()
+        self._revert_act.setEnabled(bool(active) or self._last_loaded_layout is not None)
+        menu.addAction(self._revert_act)
+        add = QAction("Save current as new layout…", menu)
+        add.triggered.connect(self._add_layout)
+        menu.addAction(add)
+        if active in names:
+            over = QAction(f"Save current over '{active}'", menu)
+            over.triggered.connect(lambda _c=False, n=active: self._overwrite_layout(n))
+            menu.addAction(over)
+            ren = QAction(f"Rename '{active}'…", menu)
+            ren.triggered.connect(lambda _c=False, n=active: self._rename_layout(n))
+            menu.addAction(ren)
+            dele = QAction(f"Delete '{active}'…", menu)
+            dele.triggered.connect(lambda _c=False, n=active: self._delete_layout(n))
+            menu.addAction(dele)
+        menu.addSeparator()
+        imp = QAction("Import layout from file…", menu)
+        imp.triggered.connect(self._load_layout_from_file)
+        menu.addAction(imp)
+        exp = QAction("Export current layout to file…", menu)
+        exp.triggered.connect(self._save_layout_to_file)
+        menu.addAction(exp)
+
     def _revert_layout(self) -> None:
+        active = self._layouts.active
+        if active:
+            self._select_layout(active)
+            return
+        self._applying_until = time.monotonic() + 1.0
         if self._apply_layout_snapshot(self._last_loaded_layout):
-            self.statusBar().showMessage("Reverted to the saved layout", 3000)
+            self.statusBar().showMessage("Reverted to the layout loaded at startup", 3000)
             self._mark_layout_dirty()
         else:
-            self.statusBar().showMessage("No saved layout to revert to — use Reset to default layout", 4000)
+            self.statusBar().showMessage("No saved layout to revert to — choose Default", 4000)
 
     # Backwards-compatible names.
     _snap_default_layout = _revert_layout
     _reset_layout = _reset_to_default_layout
 
     def _save_layout_to_file(self) -> None:
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Save layout", f"dashboard_layout_{self._kind}.json", "Layout JSON (*.json)",
-        )
+        """Export the arrangement on screen to a JSON file."""
+        active = self._layouts.active if self._layouts.active != DEFAULT_NAME else ""
+        base = active or f"dashboard_layout_{self._kind}"
+        path_str, _ = QFileDialog.getSaveFileName(self, "Export layout", f"{base}.json", "Layout JSON (*.json)")
         if not path_str:
             return
         path = Path(path_str)
         try:
-            geom_ba = self.saveGeometry()
-            state_ba = self.saveState()
-            payload = {
-                "kind": self._kind,
-                "host_ip": self._host_ip,
-                "geometry_hex": bytes(geom_ba).hex(),
-                "state_hex": bytes(state_ba).hex(),
-                "popped": sorted(self._popped),
-            }
+            payload = {"kind": self._kind, "host_ip": self._host_ip, "name": active,
+                       **self._capture_snapshot().to_json()}
             path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            self._last_loaded_layout = {"geometry": geom_ba, "state": state_ba}
-            self._save_layout()
-            self.statusBar().showMessage(f"Layout saved to {path}", 5000)
+            self.statusBar().showMessage(f"Layout exported to {path}", 5000)
         except Exception as exc:
-            _LOG.exception("Save layout failed")
-            QMessageBox.warning(self, "Save failed", f"Could not write {path}:\n{exc!r}")
+            _LOG.exception("Export layout failed")
+            QMessageBox.warning(self, "Export failed", f"Could not write {path}:\n{exc!r}")
 
     def _load_layout_from_file(self) -> None:
-        path_str, _ = QFileDialog.getOpenFileName(self, "Load layout", "", "Layout JSON (*.json)")
+        """Import a JSON layout file: apply it and add it to the saved layouts."""
+        path_str, _ = QFileDialog.getOpenFileName(self, "Import layout", "", "Layout JSON (*.json)")
         if not path_str:
             return
         path = Path(path_str)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            geom = QByteArray(bytes.fromhex(payload["geometry_hex"]))
-            state = QByteArray(bytes.fromhex(payload["state_hex"]))
-            for pid in list(self._popped):
-                self.return_panel(self._by_id[pid])
-            self._apply_layout_snapshot({"geometry": geom, "state": state})
-            for pid in payload.get("popped", []):
-                if pid in self._by_id:
-                    self.pop_out(self._by_id[pid])
-            self._last_loaded_layout = {"geometry": geom, "state": state}
-            self._save_layout()
-            self.statusBar().showMessage(f"Layout loaded from {path}", 5000)
+            snap = LayoutSnapshot.from_json(payload)
         except Exception as exc:
-            _LOG.exception("Load layout failed")
-            QMessageBox.warning(self, "Load failed", f"Could not load {path}:\n{exc!r}")
+            _LOG.exception("Import layout failed")
+            QMessageBox.warning(self, "Import failed", f"Could not read {path}:\n{exc!r}")
+            return
+        kind = payload.get("kind")
+        if kind and kind != self._kind:
+            reply = QMessageBox.question(
+                self, "Different dashboard",
+                f"{path.name} was saved from the {kind} dashboard, not this one ({self._kind}).  Apply it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        if not self._apply_named_snapshot(snap):
+            QMessageBox.warning(self, "Import failed", f"Qt rejected the dock state in {path.name}.")
+            return
+        name = self._layouts.unique_name(payload.get("name") or path.stem)
+        self._layouts.put(name, snap)
+        self._layouts.active = name
+        self._layouts.modified = False
+        self._refresh_layout_picker()
+        self.statusBar().showMessage(f"Imported {path.name} as layout '{name}'", 5000)
 
     # ------------------------------------------------------------------
     # Tools
@@ -1058,6 +1282,11 @@ class DashboardMainWindow(QMainWindow):
         if not self._realize_queue:
             if self._startup_realization:
                 self._finish_startup_realization()
+            elif self._reapply_state is not None:
+                # A layout applied while these bodies were placeholders.
+                state, self._reapply_state = self._reapply_state, None
+                self._applying_until = time.monotonic() + 1.0
+                self._guarded_restore(None, state)
             return
         panel = self._realize_queue.popleft()
         self._realize_done += 1
@@ -1084,6 +1313,7 @@ class DashboardMainWindow(QMainWindow):
         # The initial restoreState() ran before bodies existed; realizing
         # them resizes docks.  Re-apply the snapshot once so the saved
         # layout actually sticks, then restore popped-out panels.
+        self._applying_until = time.monotonic() + 1.0
         if self._last_loaded_layout:
             self._apply_layout_snapshot(self._last_loaded_layout)
         self._restore_popped_panels()
@@ -1102,8 +1332,12 @@ class DashboardMainWindow(QMainWindow):
         else:
             self.pop_out(panel)
 
-    def pop_out(self, panel: _PanelDockBase) -> None:
-        """Move *panel* into its own top-level window (own taskbar button)."""
+    def pop_out(self, panel: _PanelDockBase, geometry: Optional[QByteArray] = None) -> None:
+        """Move *panel* into its own top-level window (own taskbar button).
+
+        *geometry* places the window (a named layout's); by default it goes
+        where this panel's window was last.
+        """
         if panel.is_popped_out():
             return
         self._ensure_realized(panel)
@@ -1118,13 +1352,14 @@ class DashboardMainWindow(QMainWindow):
         panel.setFloating(False)
         win = PanelWindow(panel, app_id=f"{self._app_id}.{panel.panel_id}",
                           title_prefix=f"{self.windowTitle().split(' - ')[0]} — ")
-        geo = self._settings.value(self._layout_key(f"popped_geometry/{panel.panel_id}"))
+        geo = geometry if geometry is not None else             self._settings.value(self._layout_key(f"popped_geometry/{panel.panel_id}"))
         if geo is not None:
             try:
                 win.restoreGeometry(geo)
             except Exception:
                 pass
         win.return_requested.connect(self.return_panel)
+        win.installEventFilter(self)   # its moves / resizes are part of the layout
         self._popped[panel.panel_id] = win
         panel.hide()
         win.show()
@@ -1134,7 +1369,7 @@ class DashboardMainWindow(QMainWindow):
         if act is not None:
             act.setChecked(True)
             act.setText(f"{panel.icon + '  ' if panel.icon else ''}{panel.label}  (popped out)")
-        self._mark_layout_dirty()
+        self._note_user_layout_change()
 
     def return_panel(self, panel: _PanelDockBase) -> None:
         win = self._popped.pop(panel.panel_id, None)
@@ -1153,7 +1388,7 @@ class DashboardMainWindow(QMainWindow):
         if act is not None:
             act.setText(f"{panel.icon + '  ' if panel.icon else ''}{panel.label}")
             act.setChecked(True)
-        self._mark_layout_dirty()
+        self._note_user_layout_change()
 
     def _restore_popped_panels(self) -> None:
         raw = self._settings.value(self._layout_key("popped"))
@@ -1170,6 +1405,43 @@ class DashboardMainWindow(QMainWindow):
                     self.pop_out(panel)
                 except Exception:
                     _LOG.exception("could not restore popped-out panel %s", pid)
+
+    # ------------------------------------------------------------------
+    # Arrangement changes Qt has no signal for
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, ev):  # noqa: N802 - Qt API
+        super().resizeEvent(ev)
+        if not self.isMinimized():
+            self._note_user_layout_change()
+
+    def moveEvent(self, ev):  # noqa: N802 - Qt API
+        super().moveEvent(ev)
+        if not self.isMinimized():
+            self._note_user_layout_change()
+
+    def event(self, ev):  # noqa: D401 - Qt API
+        # Dragging a splitter between docks is handled by QMainWindow itself
+        # and emits nothing; compare the dock state across the press/release.
+        etype = ev.type()
+        if etype == QEvent.Type.MouseButtonPress and self._layout_ready:
+            self._press_state = bytes(self.saveState())
+        result = super().event(ev)
+        if etype == QEvent.Type.MouseButtonRelease and self._press_state is not None:
+            before, self._press_state = self._press_state, None
+            if bytes(self.saveState()) != before:
+                self._note_user_layout_change()
+        return result
+
+    def eventFilter(self, obj, ev):  # noqa: N802 - Qt API
+        etype = ev.type()
+        if etype in (QEvent.Type.Resize, QEvent.Type.Move):
+            if isinstance(obj, PanelWindow):
+                if not obj.isMinimized():
+                    self._note_user_layout_change()
+            elif etype == QEvent.Type.Resize and isinstance(obj, _PanelDockBase):
+                self._mark_layout_dirty()
+        return super().eventFilter(obj, ev)
 
     # ------------------------------------------------------------------
     # Close event
