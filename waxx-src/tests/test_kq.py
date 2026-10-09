@@ -235,9 +235,34 @@ def _interrupt_on(server, action):
 
 
 def test_ctrl_c_during_the_submit_says_the_job_may_be_queued(server, q, expts):
+    # a KeyboardInterrupt raised inside the request itself (no guard possible)
     _interrupt_on(server, "submit")
     r = kq(server, "run", str(expts / "rabi.py"))
     assert r.code == 130 and "the job may be queued -- check kq list" in r.err
+
+
+@pytest.mark.parametrize("cmd", ["run", "submit"])
+def test_a_ctrl_c_during_the_submit_round_trip_is_held_and_the_job_cancelled(server, q,
+                                                                            expts, cmd):
+    import signal
+    before = signal.getsignal(signal.SIGINT)
+
+    def on_request(obj):
+        if obj.get("action") == "submit":
+            signal.raise_signal(signal.SIGINT)    # Ctrl-C while the request is out
+    server.on_request = on_request
+    r = kq(server, cmd, str(expts / "rabi.py"), "--repeat", "2")
+    assert r.code == 130 and "cancelled jobs 1, 2 (not started)" in r.out
+    assert [q.describe({"id": i})["job"]["state"] for i in (1, 2)] == ["cancelled"] * 2
+    assert all(c.get("queued_only") for c in sent(server, "cancel"))
+    assert signal.getsignal(signal.SIGINT) is before          # the handler is put back
+
+
+def test_the_sigint_guard_is_put_back_after_a_refused_submit(server, expts):
+    import signal
+    before = signal.getsignal(signal.SIGINT)
+    assert kq(server, "run", str(expts / "nothing.py")).code == 6
+    assert signal.getsignal(signal.SIGINT) is before
 
 
 def test_ctrl_c_right_after_the_submit_cancels_the_job_and_names_it(server, q, expts):

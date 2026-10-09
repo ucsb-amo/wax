@@ -39,7 +39,9 @@ and one ending in a backslash: such a run goes through artiq_run directly.
 the job's output exactly as the experiment writes it ("Run ID: N" included),
 and exits with the experiment's result (see the exit codes).  Ctrl-C while
 the job is queued cancels it (and any later jobs of the same submission still
-queued).  Ctrl-C while it runs asks once on a terminal "abort the run? it
+queued); a Ctrl-C during the submit request itself is held until its reply
+(at most the request's timeout) and then does the same, so it never leaves a
+job queued that this terminal did not name.  Ctrl-C while it runs asks once on a terminal "abort the run? it
 discards its data file [y/N]": yes asks the queue to cancel it -- the queue
 then sends liveOD's Abort (the run stops at its next shot and liveOD discards
 its file) -- and kq prints "abort requested; waiting for the run to end" and
@@ -103,6 +105,7 @@ import argparse
 import datetime
 import json
 import re
+import signal
 import sys
 import time
 
@@ -517,6 +520,10 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             ctx.warn(f"kq: {exc}")
             return EXIT_USAGE
     owner = _owner(args)
+    # Ctrl-C is held back from the submit request until its reply has been
+    # read (bounded by the request's timeout): a job the server queued is then
+    # known by id and is cancelled below, never left queued unseen
+    guard = _SigintGuard().start()
     try:
         reply = ctx.client.submit(
             args.file, argv=list(args.args) + expt_argv, cwd=args.cwd, label=args.label,
@@ -528,30 +535,42 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             at_index=(None if getattr(args, "at_index", None) is None
                       else args.at_index - 1),
             before_id=getattr(args, "before", None), after_id=getattr(args, "after_id", None))
+        jobs = reply.get("jobs") or []
+        ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
+        tokens = {int(j["id"]): j.get("token") for j in jobs}
     except KeyboardInterrupt:
+        # raised inside the request without the guard (it could not be set:
+        # not the main thread)
+        guard.stop()
         safe_write(ctx.out, "\n")
         ctx.warn("[kq] interrupted while submitting: the job may be queued -- check kq list")
         return EXIT_INTERRUPTED
-    jobs = reply.get("jobs") or []
-    ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
-    tokens = {int(j["id"]): j.get("token") for j in jobs}
+    except BaseException:
+        if guard.stop():
+            ctx.warn("[kq] interrupted while submitting")
+        raise
     if not ids:
+        if guard.stop():
+            safe_write(ctx.out, "\n")
         ctx.warn("kq: the queue accepted the request but returned no job")
         return EXIT_REFUSED
     first = jobs[0] if jobs else {"id": ids[0]}
     many = (f"jobs {ids[0]}-{ids[-1]} (chain {first.get('chain')})" if len(ids) > 1
             else f"job {ids[0]}")
     due_text = f", due {_when(due)}" if due else ""
-    if args.cmd == "submit" or getattr(args, "detach", False):
-        placed = _position(ctx, ids[0], tokens.get(ids[0]))
-        ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
-                f"({placed})")
-        ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
-        return EXIT_OK
-    # from here on a Ctrl-C anywhere goes to _interrupted: the job ids are
-    # known, a queued job is cancelled (queued_only) and its id printed
+    # from here on a Ctrl-C anywhere -- one held back during the submit
+    # included -- goes to _interrupted: the job ids are known, a queued job is
+    # cancelled (queued_only) and its id printed
     n, cursor = 0, {"offset": 0}
     try:
+        if guard.stop():
+            raise KeyboardInterrupt
+        if args.cmd == "submit" or getattr(args, "detach", False):
+            placed = _position(ctx, ids[0], tokens.get(ids[0]))
+            ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
+                    f"({placed})")
+            ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
+            return EXIT_OK
         ctx.say(f"[kq] {many} queued ({_position(ctx, ids[0], tokens.get(ids[0]))})"
                 f"{due_text}")
         final = EXIT_OK
@@ -578,6 +597,34 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
         return final
     except KeyboardInterrupt:
         return _interrupted(ctx, ids[n:], tokens, owner, cursor)
+
+
+class _SigintGuard:
+    """Holds Ctrl-C back while it is on: SIGINT only sets ``fired``.
+    :meth:`stop` puts the previous handler back and returns ``fired``.  Off
+    the main thread (where Python cannot set a handler) it does nothing."""
+
+    def __init__(self):
+        self.fired = False
+        self._old = None
+        self._on = False
+
+    def _handler(self, signum, frame):
+        self.fired = True
+
+    def start(self) -> "_SigintGuard":
+        try:
+            self._old = signal.signal(signal.SIGINT, self._handler)
+            self._on = True
+        except (ValueError, OSError):
+            self._on = False
+        return self
+
+    def stop(self) -> bool:
+        if self._on:
+            self._on = False
+            signal.signal(signal.SIGINT, self._old)
+        return self.fired
 
 
 def _position(ctx: _Ctx, jid: int, token) -> str:
