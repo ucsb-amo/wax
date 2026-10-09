@@ -182,3 +182,39 @@ def test_ledger_concurrent_appends_do_not_interleave(tmp_path):
     rows = [json.loads(l) for l in led.jsonl.read_text().splitlines()]
     assert len(rows) == 100 and len({r["run_id"] for r in rows}) == 100
     assert not (tmp_path / "calibrations.jsonl.lock").exists()
+
+
+def test_ledger_key_must_match_exactly(tmp_path):
+    led = Ledger(tmp_path)
+    for bad in ("t_pi\n", "t pi", "tp\u03c0", "1x", "", "a.b"):
+        with pytest.raises(ValueError):
+            led.record_path(bad, 1)
+    assert led.record_path("t_pi_2", 1).name == "1.json"
+
+
+def test_ledger_history_line_goes_first(tmp_path, monkeypatch):
+    import waxx.calibration.ledger as ledger_mod
+    led = Ledger(tmp_path)
+
+    def fail(*a, **k):
+        raise PermissionError("per-run JSON not writable")
+    monkeypatch.setattr(ledger_mod, "replace_bytes", fail)
+    with pytest.raises(PermissionError):
+        led.write_record(res(run_id=7))
+    assert [e["run_id"] for e in led.events()] == [7]          # the history has it
+
+
+def test_a_stale_lock_fails_at_once(tmp_path):
+    import os
+    import time
+    from waxx.calibration._lock import LockTimeout
+    led = Ledger(tmp_path)
+    lock = tmp_path / "calibrations.jsonl.lock"
+    lock.write_text("pid 4242 since long ago")
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    t0 = time.monotonic()
+    with pytest.raises(LockTimeout, match="STALE LOCK .*pid 4242"):
+        led.append_event({"event": "emit", "key": "k", "run_id": 1})
+    assert time.monotonic() - t0 < 1.0
+    assert lock.exists() and not led.jsonl.exists()             # left for a person; nothing written

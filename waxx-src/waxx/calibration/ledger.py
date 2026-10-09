@@ -25,11 +25,11 @@ from typing import Iterator, Optional
 from waxx.calibration._lock import file_lock, replace_bytes
 from waxx.calibration.record import CalResult, _jsonable
 
-_KEY = re.compile(r"^[A-Za-z_]\w*$")
+_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _check_key(key):
-    if not isinstance(key, str) or not _KEY.match(key):
+    if not isinstance(key, str) or not _KEY.fullmatch(key):
         raise ValueError(f"calibration key {key!r} is not a params attribute name")
     return key
 
@@ -61,12 +61,12 @@ class Ledger:
                 f.write(line + "\n")
 
     def write_record(self, result: CalResult):
-        """The emit: per-run JSON (replaced if this run was emitted before) and
-        an ``emit`` line in the jsonl."""
+        """The emit: an ``emit`` line in the jsonl first (the history), then the
+        per-run JSON (replaced if this run was emitted before)."""
         path = self.record_path(result.key, result.run_id)
+        self.append_event({"event": "emit", **result.to_dict()})
         path.parent.mkdir(parents=True, exist_ok=True)
         replace_bytes(path, (result.to_json(indent=1) + "\n").encode("utf-8"))
-        self.append_event({"event": "emit", **result.to_dict()})
 
     def note_writeback(self, report, run_id: Optional[int] = None, by: str = ""):
         """An ``apply`` / ``revert`` line; a successful apply also updates the

@@ -14,12 +14,25 @@ import time
 from pathlib import Path
 
 
+STALE_S = 60.0         # a lock file older than this is reported at once, never waited on
+
+
 class LockTimeout(RuntimeError):
     pass
 
 
+def _holder(lock):
+    try:
+        return lock.read_text(errors="replace").strip() or "no holder recorded"
+    except OSError:
+        return "?"
+
+
 @contextlib.contextmanager
-def file_lock(target, timeout: float = 10.0, poll: float = 0.05):
+def file_lock(target, timeout: float = 10.0, poll: float = 0.05, stale_s: float = STALE_S):
+    """Hold ``<target>.lock``. Waits up to ``timeout`` s for a holder; a lock
+    file older than ``stale_s`` s is not waited on at all: it is reported at
+    once (a kcal / emit write takes well under a second) and left in place."""
     lock = Path(str(target) + ".lock")
     t0 = time.monotonic()
     while True:
@@ -27,13 +40,17 @@ def file_lock(target, timeout: float = 10.0, poll: float = 0.05):
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
         except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                age = 0.                                   # just released: try again
+            if age > stale_s:
+                raise LockTimeout(f"STALE LOCK {lock} ({_holder(lock)}, {age:.0f} s old): nothing "
+                                  f"was written. If no kcal / emit is running, a person may "
+                                  f"delete it")
             if time.monotonic() - t0 > timeout:
-                try:
-                    holder = lock.read_text(errors="replace").strip()
-                except OSError:
-                    holder = "?"
-                raise LockTimeout(f"{lock} is held ({holder or 'no holder recorded'}) for more "
-                                  f"than {timeout:g} s; if no kcal / emit is running, a person "
+                raise LockTimeout(f"{lock} is held ({_holder(lock)}) for more than {timeout:g} s; "
+                                  f"nothing was written. If no kcal / emit is running, a person "
                                   f"may delete it")
             time.sleep(poll)
     try:
