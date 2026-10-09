@@ -43,13 +43,25 @@ def env(tmp_path, monkeypatch):
     (reg / "broken_import.py").write_text("import a_module_that_does_not_exist_xyz\n"
                                           "def calibrate(ad, key, **o):\n    pass\n")
     (reg / "helper.py").write_text("X = 1\n")
+    (reg / "fake_emit.py").write_text(
+        "from waxx.calibration.record import CalResult\n"
+        "def calibrate(ad, key, **opts):\n"
+        "    return CalResult(key=key, value=6.612e-06, unc=2.1e-08, unit='s', n_used=63,\n"
+        "                     fit={'ok': True, 'saw': ad.tag, 'opts': opts.get('x')})\n")
     ledger = tmp_path / "ledger"
     (tmp_path / f"{names['cfg']}.py").write_text(
+        "from types import SimpleNamespace\n"
         "from waxx.calibration.config import CalibrationConfig\n"
+        "def _load(rid, needs_images=False):\n"
+        "    return SimpleNamespace(tag=rid, params=SimpleNamespace(t_pi=6.6403e-06))\n"
+        "def _bad(rid, needs_images=False):\n"
+        "    raise OSError('the data drive is not mapped')\n"
         f"CFG = CalibrationConfig(ledger_dir={str(ledger)!r},\n"
         "    policy={'t_pi': {'max_frac_change': 0.05}},\n"
         f"    registry_modules=[{names['reg']!r}],\n"
-        f"    params_class='{names['params']}:Params')\n")
+        f"    params_class='{names['params']}:Params', loader=_load)\n"
+        "BAD = CalibrationConfig(ledger_dir=CFG.ledger_dir, registry_modules=CFG.registry_modules,\n"
+        "    params_class=CFG.params_class, loader=_bad)\n")
     importlib.invalidate_caches()
     yield type("Env", (), dict(tmp=tmp_path, ledger=ledger, spec=f"{names['cfg']}:CFG",
                                params_file=tmp_path / f"{names['params']}.py", **names))
@@ -210,3 +222,83 @@ def test_kcal_analyses_and_missing_config(env, monkeypatch):
     monkeypatch.delenv(ENV_VAR, raising=False)
     code, out = kcal("show", "t_pi")
     assert code == 2 and ENV_VAR in out
+
+
+# ---- S6: stored flags count; stale records refused; refusals journaled --------------------
+
+def test_kcal_apply_keeps_the_flags_it_was_emitted_with(env, monkeypatch):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    r = record()
+    r.flags = [{"code": "file_changed", "text": "the params file was edited during the run"}]
+    Ledger(env.ledger).write_record(r)
+    raw = env.params_file.read_bytes()
+    code, out = kcal("apply", "t_pi", "--run", "85600")
+    assert code == 2 and "edited during the run" in out
+    assert env.params_file.read_bytes() == raw
+    code, out = kcal("check", "t_pi", "--run", "85600")
+    assert code == 1 and "file_changed:" in out
+    ev = [e for e in Ledger(env.ledger).events() if e["event"] == "apply_refused"]
+    assert len(ev) == 1 and ev[0]["flags"] == ["file_changed"] and "@" in ev[0]["by"]
+
+
+def test_kcal_apply_refuses_a_stale_record_unless_forced(env, monkeypatch):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    led = Ledger(env.ledger)
+    led.write_record(record(run_id=85600))
+    led.write_record(record(run_id=85601, value=6.62e-06))
+    code, out = kcal("apply", "t_pi", "--run", "85600")
+    assert code == 2 and "newer entries for t_pi: emit #85601" in out
+    code, out = kcal("apply", "t_pi", "--run", "85600", "--force")
+    assert code == 0 and "--force" in out, out
+    events = [e["event"] for e in led.events()]
+    assert events == ["emit", "emit", "apply_refused", "force", "apply"]
+    # an apply after this record's emit makes it stale too
+    code, out = kcal("apply", "t_pi", "--run", "85601")
+    assert code == 2 and "newer entries" in out and "apply #85600" in out
+
+
+def test_kcal_refused_apply_is_journaled(env, monkeypatch):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    led = Ledger(env.ledger)
+    led.write_record(record(key="amp", value=0.4321, unc=0.0011))
+    env.params_file.write_text(env.params_file.read_text().replace("self.amp = 0.41",
+                                                                   "self.amp = 2 * 0.2"))
+    sys.modules.pop(env.params, None)
+    code, out = kcal("apply", "amp", "--run", "85600")
+    assert code == 2 and "not a plain numeric literal" in out
+    ev = [e for e in led.events() if e["event"] == "apply"]
+    assert len(ev) == 1 and ev[0]["ok"] is False and "not a plain" in ev[0]["reason"]
+
+
+# ---- S9: kcal emit ---------------------------------------------------------------------------
+
+def test_kcal_emit_records_but_never_applies(env, monkeypatch):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    raw = env.params_file.read_bytes()
+    code, out = kcal("emit", "t_pi", "--run", "85600", "--analysis", "fake_emit",
+                     "--opts", '{"x": 3}')
+    assert code == 0, out
+    assert out.startswith("[cal] t_pi = 6.612e-06 +/- 2.1e-08 s (#85600")
+    assert "not applied: write_back is off" in out
+    assert env.params_file.read_bytes() == raw
+    rec = Ledger(env.ledger).load("t_pi", 85600)
+    assert rec.fit["saw"] == 85600 and rec.fit["opts"] == 3 and "kcal emit" in rec.fit["emitted_by"]
+    assert rec.old_value == 6.6403e-06 and rec.flags == []
+    code, out = kcal("apply", "t_pi", "--run", "85600")
+    assert code == 0, out
+
+
+def test_kcal_emit_bad_opts_and_unknown_analysis(env):
+    code, out = kcal("--config", env.spec, "emit", "t_pi", "--run", "1", "--analysis", "fake_emit",
+                     "--opts", "[1, 2]")
+    assert code == 2 and "JSON object" in out
+    code, out = kcal("--config", env.spec, "emit", "t_pi", "--run", "1", "--analysis", "nope")
+    assert code == 2 and "no analysis 'nope'" in out
+
+
+# ---- N8: an OSError is one line, exit 2 -------------------------------------------------------
+
+def test_kcal_oserror_is_one_line(env):
+    spec = env.spec.replace(":CFG", ":BAD")
+    code, out = kcal("--config", spec, "emit", "t_pi", "--run", "1", "--analysis", "fake_emit")
+    assert code == 2 and out == "kcal emit: OSError: the data drive is not mapped"
