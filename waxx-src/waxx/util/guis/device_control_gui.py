@@ -2397,6 +2397,11 @@ class DeviceStateGUI(QMainWindow):
             self.sequences_panel.set_loops(detail["run_loops"])
         if isinstance(detail.get("person_hold"), dict) and self.sequences_panel is not None:
             self.sequences_panel.set_hold(detail["person_hold"])
+        if self.sequences_panel is not None:
+            # one line on the Sequences tab; the queue's own panel is the
+            # monitor server's (Server Dashboard)
+            rq = detail.get("run_queue")
+            self.sequences_panel.set_queue(rq if isinstance(rq, dict) else None)
         if "run_pending" in detail:
             self._run_pending = detail.get("run_pending")
         if self.slm_pill is not None:
@@ -3248,6 +3253,8 @@ class DeviceStateGUI(QMainWindow):
             self.sequences_panel.set_loops(state["run_loops"])
         if isinstance(state.get("person_hold"), dict) and self.sequences_panel is not None:
             self.sequences_panel.set_hold(state["person_hold"])
+        if isinstance(state.get("run_queue"), dict) and self.sequences_panel is not None:
+            self.sequences_panel.set_queue(state["run_queue"])
         if "run_pending" in state:
             self._run_pending = state.get("run_pending")
             if panel is not None:
@@ -3309,6 +3316,10 @@ class DeviceStateGUI(QMainWindow):
         if mtype == "person_hold":
             if self.sequences_panel is not None:
                 self.sequences_panel.set_hold(payload.get("person_hold"))
+            return
+        if mtype == "run_queue":
+            if self.sequences_panel is not None and isinstance(payload.get("run_queue"), dict):
+                self.sequences_panel.set_queue(payload["run_queue"])
             return
         if mtype == "state_reset":
             # an experiment's end state replaced the file: resync everything

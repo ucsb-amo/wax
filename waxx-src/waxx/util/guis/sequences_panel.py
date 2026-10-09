@@ -27,7 +27,16 @@ Above the cards: the person hold (:mod:`~waxx.util.device_state.person_hold`).
 "Hold — a person has the machine" asks for a reason and puts it on at the
 server; while it is on the row says since when, by whom and why, and the same
 button releases it.  The server also puts it on by itself when liveOD's Reset
-is pressed for a run that is not an agent's.
+is pressed for a run that is not an agent's.  Under it, one line on the run
+queue (:meth:`SequencesPanel.set_queue`, from ``status_json`` alone): its
+state and how many jobs are queued; the queue itself is shown and driven in
+the monitor server's own panel (Server Dashboard).
+
+Requests go through the GUI's own sender (a MonitorClient found by
+discovery) -- or, when the host passes ``requester`` (the monitor server's
+own window: a direct call into the server), through that callable on a
+worker thread (:class:`~waxx.util.guis.request_runner.RequestRunner`), with
+no discovery and no socket.
 """
 
 from __future__ import annotations
@@ -52,6 +61,8 @@ from waxx.util.guis.composite_panel import (
 )
 from waxx.util.guis.device_summary import reset_title
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
+from waxx.util.guis.request_runner import RequestRunner
+from waxx.util.guis.run_queue_panel import QueueSummaryLine
 
 #: How often an open log asks the server for new lines.
 LOG_POLL_MS = 1000
@@ -317,6 +328,8 @@ class SequenceCard(QFrame):
             runs = int(info.get("runs") or 0)
             if state in ("running", "stopping"):
                 parts.append(f"{runs} saved since {_clock(info.get('started'))}")
+                if info.get("owner"):
+                    parts.append(f"owner {info['owner']}")
             elif state in ("stopped", "latched") and info.get("ended"):
                 parts.append(f"{runs} saved · ended {_clock(info.get('ended'))}")
             last = info.get("last") or {}
@@ -524,12 +537,16 @@ class SequencesPanel(QWidget):
     reset_requested = pyqtSignal()
 
     def __init__(self, log_line: Callable[[str], None] | None = None, parent=None,
-                 start_sender: bool = True):
+                 start_sender: bool = True, requester: Callable[[dict], dict] | None = None,
+                 synchronous_requests: bool = False, show_hold: bool = True,
+                 show_queue: bool = True, runner: RequestRunner | None = None):
         super().__init__(parent)
         self._log_line = log_line
         self._reachable = False
         self._req = 0
         self._requests: dict[int, Callable[[dict], None]] = {}
+        self._show_hold = bool(show_hold)
+        self._show_queue = bool(show_queue)
         self.loop_cards: dict[str, SequenceCard] = {}
         #: The last file chosen for a pick loop (the dialog opens there).
         self._last_pick = ""
@@ -538,6 +555,9 @@ class SequencesPanel(QWidget):
         box.setSpacing(8)
         self.hold_row = HoldRow(self)
         box.addWidget(self.hold_row)
+        #: "Queue: <state> (<n> queued) -- ..." (status_json only)
+        self.queue_line = QueueSummaryLine()
+        box.addWidget(self.queue_line)
         self.empty = _small("")
         box.addWidget(self.empty)
         self._cards = QVBoxLayout()
@@ -549,7 +569,13 @@ class SequencesPanel(QWidget):
 
         self._sender = _OpSender(self)
         self._sender.requested.connect(self._on_requested)
-        if start_sender:
+        #: with a requester (or a host's runner), requests go through it -- no
+        #: discovery, no socket
+        self._own_runner = runner is None and requester is not None
+        self._runner = runner if runner is not None else (
+            RequestRunner(requester, synchronous=synchronous_requests, parent=self)
+            if requester is not None else None)
+        if start_sender and self._runner is None:
             self._sender.start()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.poll_logs)
@@ -580,6 +606,8 @@ class SequencesPanel(QWidget):
         ``person_hold`` broadcast); None: the server has none (older code)."""
         before = self.hold_row.held
         self.hold_row.set_info(info)
+        if not self._show_hold:
+            self.hold_row.hide()
         if isinstance(info, dict) and bool(info.get("active")) != before \
                 and self._log_line is not None:
             self._log_line("[hold] " + (describe_hold(info) if info.get("active")
@@ -618,6 +646,13 @@ class SequencesPanel(QWidget):
         if not ok:
             return None
         return text.strip() or "a person has the machine"
+
+    def set_queue(self, info: dict | None) -> None:
+        """The run queue's summary (``status_json`` ``run_queue``, or its
+        ``run_queue`` broadcast); None: the server has none (older code)."""
+        self.queue_line.set_info(info)
+        if not self._show_queue:
+            self.queue_line.hide()
 
     def set_loops(self, loops: dict | None) -> None:
         """The server's loops (``status_json`` ``run_loops``)."""
@@ -733,7 +768,9 @@ class SequencesPanel(QWidget):
                 self.on_run_loop(reply.get("loop"))
             elif card is not None:
                 card.set_message(f"✕ not started: {reply.get('msg')}")
-        request = {"type": "run_loop", "action": "start", "loop": key}
+        # a person is clicking: the loop is a person's (the run queue stops
+        # only agent / queue / idle-started loops for its jobs)
+        request = {"type": "run_loop", "action": "start", "loop": key, "owner": "person"}
         if path is not None:
             request["path"] = path
         self.send_request(request, done)
@@ -809,6 +846,9 @@ class SequencesPanel(QWidget):
         req = self._req
         obj = dict(obj)
         obj.setdefault("client", self._sender.client_name)
+        if self._runner is not None:
+            self._runner.send(obj, on_reply)
+            return req
         if on_reply is not None:
             self._requests[req] = on_reply
         self._sender.request(req, obj)
@@ -834,5 +874,7 @@ class SequencesPanel(QWidget):
 
     def shutdown(self) -> None:
         self._timer.stop()
+        if self._runner is not None and self._own_runner:
+            self._runner.shutdown()
         self._sender.stop()
         self._sender.wait(2000)

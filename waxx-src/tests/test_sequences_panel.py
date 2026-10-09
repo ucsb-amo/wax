@@ -95,6 +95,7 @@ def test_loop_card_starts_and_stops_through_the_server(panel):
         LOOP, state="running", run_id=81000, started=time.time(),
         text="run 81000 in progress (1st of the loop)")})
     assert (req["type"], req["action"], req["loop"]) == ("run_loop", "start", "auto_tof")
+    assert req["owner"] == "person"                         # a person clicked Start
     assert card.pill.text() == "RUNNING" and "run 81000" in card.status.text()
     assert card.stop_button.isEnabled() and not card.start_button.isEnabled()
     card.stop_button.click()
@@ -483,3 +484,46 @@ def test_the_dialog_grays_points_without_a_stop_value_and_checks_like_the_server
     assert ok.isEnabled() and d.settings() == pytest.approx(
         {"start": 0.5e-3, "stop": 2.5e-3, "n": 5, "repeats": 20})
     d.close()
+
+
+# --- the run queue line, and a host's requester ------------------------------------------
+
+QUEUE = {"enabled": True, "state": "running", "text": "job 2 (rabi) running, run 85600",
+         "current": {"id": 2, "state": "running"}, "next": [3],
+         "counts": {"queued": 2, "running": 1}, "alarm": None}
+
+
+def test_the_queue_line_follows_status_json_and_broadcasts(gui):
+    seq = gui.sequences_panel
+    assert seq.queue_line.isHidden()
+    gui._on_status_detail({"state": STATES.READY, "sub_state": "running", "run_queue": QUEUE})
+    assert not seq.queue_line.isHidden()
+    assert seq.queue_line.label.text() == ("Queue: running (2 queued) -- open the Monitor "
+                                           "panel in the Server Dashboard")
+    gui._on_state_broadcast({"type": "run_queue", "run_queue": dict(QUEUE, state="idle",
+                                                                    counts={"queued": 0})})
+    assert seq.queue_line.label.text().startswith("Queue: idle (0 queued)")
+    gui._on_status_detail({"state": STATES.READY, "sub_state": "running"})   # older server
+    assert seq.queue_line.isHidden()
+
+
+def test_a_hosts_requester_carries_the_requests(qapp):
+    """With a requester the panel never uses its own sender (no discovery)."""
+    asked = []
+
+    def requester(obj):
+        asked.append(dict(obj))
+        return {"status": "ok", "loop": dict(LOOP, state="running")}
+    p = sp.SequencesPanel(requester=requester, synchronous_requests=True, show_hold=False,
+                          show_queue=False)
+    p.confirm = lambda title, text, verb="Send": True
+    p.set_reachable(True)
+    p.set_loops({"auto_tof": LOOP})
+    p.set_hold({"active": False})
+    p.set_queue(QUEUE)
+    assert p.hold_row.isHidden() and p.queue_line.isHidden()
+    p.loop_cards["auto_tof"].start_button.click()
+    assert asked[-1]["type"] == "run_loop" and asked[-1]["owner"] == "person"
+    assert p._sender.requests == []
+    assert p.loop_cards["auto_tof"].pill.text() == "RUNNING"
+    p.shutdown()
