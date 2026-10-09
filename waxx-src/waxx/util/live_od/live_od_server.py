@@ -1552,15 +1552,21 @@ class LiveODServer(QThread, NetServer):
         complete (END_RUN came) and only its write remains, so it is neither
         marked "aborting" nor left with an Abort pending (which a later
         RUN_EXITED / ABORT_RUN / INIT_RUN would turn into deleting its file).
-        True when ignored; one WARNING per run. Any thread."""
+        True when ignored. Call it once per press: an INFO line every press, and
+        one WARNING per run. Any thread."""
         if not self._run_file.saving:
             return False
         run_id = self._current_run_id
+        logger.info(self.reset_ignored_text())
         if self._reset_during_save_warned != run_id:
             self._reset_during_save_warned = run_id
             logger.warning(f"Reset pressed during the save of run {run_id}: ignored, "
                            f"the run is complete.")
         return True
+
+    def reset_ignored_text(self) -> str:
+        """What a press of Reset during the save is told (window, remote viewer)."""
+        return f"Reset ignored: run {self._current_run_id} is being saved (it is complete)"
 
     def _abort_reply_limit(self) -> float:
         """How long an Abort may wait for the experiment's answer before it is shown
@@ -1780,7 +1786,8 @@ class LiveODServer(QThread, NetServer):
         if self.reset_ignored_during_save():
             # the run is complete and being written: nothing to abort, and the
             # window is not asked to reset (it would interrupt the writer)
-            return {"ok": True, "ignored": True, "saving": True}
+            return {"ok": True, "ignored": True, "saving": True,
+                    "run_id": self._current_run_id, "message": self.reset_ignored_text()}
         if self.exited_run_pending():
             logger.warning("RESET requested by remote viewer: the run's experiment has "
                            "exited; closing the run now (its file is kept).")

@@ -124,6 +124,10 @@ class StatusStrip(QWidget):
         self._n_shots = 0
         self._stalled = False
         self._camera_widget = None
+        self._notice = ""                       # transient text in the run label
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(self.clear_notice)
 
         bold = QFont()
         bold.setBold(True)
@@ -232,6 +236,23 @@ class StatusStrip(QWidget):
         self._render_timing()
         self._emit_title()
 
+    def show_notice(self, text: str, seconds: float = 8.0):
+        """Show ``text`` in place of the run label for ``seconds`` (each call
+        shows it again and restarts the time): something a button press did
+        that must be seen, not only logged."""
+        self._notice = str(text)
+        self._notice_timer.start(int(max(0.0, float(seconds)) * 1000))
+        self._render_run_label()
+
+    def clear_notice(self):
+        self._notice_timer.stop()
+        self._notice = ""
+        self._restyle()
+        self._render_run_label()
+
+    def notice(self) -> str:
+        return self._notice
+
     def set_next_run_id(self, run_id):
         """The id the next saved run will get: shown until the first run starts,
         and in the run label's tooltip after that."""
@@ -279,6 +300,11 @@ class StatusStrip(QWidget):
 
     def _render_run_label(self):
         nxt = f"Next run: {self._next_run_id}" if self._next_run_id is not None else "Next run: (unavailable)"
+        if self._notice:
+            self.run_label.setText(self._notice)
+            self.run_label.setToolTip(self._notice)
+            self.run_label.setStyleSheet(f"color: {theme.color('error')};")
+            return
         if self._run_start is None:
             self.run_label.setText(nxt)
             return

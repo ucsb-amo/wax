@@ -73,36 +73,47 @@ def test_poll_says_a_save_is_running(held):
 
 
 @pytest.fixture
-def warnings_seen():
-    """WARNING+ messages of the liveOD logger (it may not propagate to the root)."""
+def records_seen():
+    """(level, message) of the liveOD logger's INFO+ records (it may not
+    propagate to the root)."""
     import logging
     got = []
 
     class ListHandler(logging.Handler):
         def emit(self, record):
-            got.append(record.getMessage())
-    handler = ListHandler(logging.WARNING)
+            got.append((record.levelno, record.getMessage()))
+    handler = ListHandler(logging.INFO)
     log = logging.getLogger("waxx.live_od")
+    old_level = log.level
+    log.setLevel(logging.INFO)
     log.addHandler(handler)
     yield got
     log.removeHandler(handler)
+    log.setLevel(old_level)
 
 
-def test_a_reset_during_the_save_is_ignored_with_one_warning(held, warnings_seen):
+def test_a_reset_during_the_save_is_ignored_and_said(held, records_seen):
     """The run is complete (END_RUN came): a Reset, from a remote viewer or the
-    window's button, neither marks it aborting nor leaves an Abort pending."""
+    window's button, neither marks it aborting nor leaves an Abort pending; every
+    press is answered and logged (INFO), the WARNING comes once per run."""
+    import logging
     srv, init, gate = held
+    rid = init["run_id"]
     state_before = srv._handle_poll({"tag": "POLL"})["run_state"]
+    text = f"Reset ignored: run {rid} is being saved (it is complete)"
     assert srv._handle_reset({"tag": "RESET"}) == {"ok": True, "ignored": True,
-                                                   "saving": True}
+                                                   "saving": True, "run_id": rid,
+                                                   "message": text}
     assert srv.note_reset_requested() is False           # the window's path
     srv._handle_reset({"tag": "RESET"})
     poll = srv._handle_poll({"tag": "POLL"})
     assert poll["reset_requested"] is False and poll["run_state"] == state_before
     assert srv._abort_requested_at is None
-    said = [m for m in warnings_seen if "during the save" in m]
-    assert said == [f"Reset pressed during the save of run {init['run_id']}: ignored, "
-                    f"the run is complete."]
+    warned = [m for lvl, m in records_seen if lvl >= logging.WARNING and "save" in m]
+    assert warned == [f"Reset pressed during the save of run {rid}: ignored, "
+                      f"the run is complete."]
+    infos = [m for lvl, m in records_seen if lvl == logging.INFO and m == text]
+    assert len(infos) == 3                               # one per press
     gate.set()
     _wait(lambda: not srv._run_in_progress)
     assert os.path.exists(init["filepath"]) and srv._last_outcome["outcome"] == "saved"

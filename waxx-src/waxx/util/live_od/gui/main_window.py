@@ -630,7 +630,8 @@ class LiveODWindow(QWidget):
         to find out. (A remote viewer's RESET still reaches reset() unchanged.)"""
         self.abort_button = QPushButton('Abort')
         self.abort_button.setToolTip(
-            "Stop the run now and delete its data file. No confirmation: it has to be fast.")
+            "Stop the run now and delete its data file; ignored while a run is being saved "
+            "(it is complete then). No confirmation: it has to be fast.")
         self.abort_button.clicked.connect(self._on_abort_clicked)
         # fixed width: the button turns bold red during a run, and nothing that
         # happens when a run starts may change the window's width
@@ -1409,7 +1410,12 @@ class LiveODWindow(QWidget):
             # Reset (one WARNING), and nothing here is interrupted -- the camera
             # thread and data handler may still be finishing the file's write.
             if srv.reset_ignored_during_save():
-                self.msg("Reset ignored: the run is being saved (it is complete).")
+                # visible on every press, not only in the log
+                text = srv.reset_ignored_text()
+                strip = getattr(self, 'status_strip', None)
+                if strip is not None:
+                    strip.show_notice(text)
+                self.msg(text + ".")
                 return
             if srv.exited_run_pending():
                 srv.close_exited_run_now("Reset pressed")

@@ -426,6 +426,9 @@ class _Srv:
         self.calls.append(("ignored_during_save",)) if self.saving else None
         return self.saving
 
+    def reset_ignored_text(self):
+        return "Reset ignored: run 85600 is being saved (it is complete)"
+
     def exited_run_pending(self):
         return self.exited
 
@@ -470,3 +473,80 @@ def test_the_window_reset_during_a_save_interrupts_nothing(app):
     assert win.live_od_server.calls == [("ignored_during_save",)]
     assert win.the_baby is not None and "being saved" in win.messages[-1]
     assert not hasattr(win.live_od_server, "_reset_requested")
+
+
+def test_a_reset_during_a_save_shows_on_the_status_strip_every_press(app):
+    """Second review: visible, not only a log line -- on every press."""
+    from waxx.util.live_od.gui.main_window import LiveODWindow
+    from waxx.util.live_od.gui.status_strip import StatusStrip
+    win = _Win(_Srv(saving=True))
+    win.status_strip = StatusStrip()
+    text = "Reset ignored: run 85600 is being saved (it is complete)"
+    for press in range(2):
+        LiveODWindow.reset(win)
+        assert win.status_strip.notice() == text
+        assert win.status_strip.run_label.text() == text
+        win.status_strip.clear_notice()                 # as its timer does
+    assert win.live_od_server.calls == [("ignored_during_save",)] * 2
+    assert win.messages == [text + "."] * 2
+    assert win.status_strip.run_label.text().startswith("Next run")
+
+
+def test_the_status_strip_notice_goes_by_itself(app):
+    from waxx.util.live_od.gui.status_strip import StatusStrip
+    from PyQt6.QtWidgets import QApplication
+    import time
+    strip = StatusStrip()
+    strip.show_notice("hello", seconds=0.05)
+    assert strip.run_label.text() == "hello"
+    t0 = time.monotonic()
+    while strip.notice() and time.monotonic() - t0 < 3:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert strip.notice() == "" and strip.run_label.text().startswith("Next run")
+
+
+def test_the_abort_tooltips_say_a_save_is_left_alone():
+    import inspect
+    from waxx.util.live_od.gui import main_window, remote_viewer_window
+    for module in (main_window, remote_viewer_window):
+        assert "ignored while a run is being" in inspect.getsource(module)
+
+
+# -- the remote viewer shows an ignored Reset on every press --------------------------
+
+class _Remote:
+    """Just what RemoteViewerWindow._show_reply / _show_reply_notice use."""
+
+    def __init__(self):
+        from PyQt6.QtWidgets import QLabel, QPlainTextEdit
+        from types import SimpleNamespace
+        from waxx.util.live_od.gui.remote_viewer_window import RemoteViewerWindow
+        self.viewer_window = SimpleNamespace(output_window=QPlainTextEdit())
+        self.run_id_label = QLabel("Run 85600 — saving")
+        self.reply_notice_text = RemoteViewerWindow.reply_notice_text
+        # the signal's queued hop to the GUI thread, done in place here
+        self._reply_notice_signal = SimpleNamespace(
+            emit=lambda text: RemoteViewerWindow._show_reply_notice(self, text))
+
+
+def test_the_remote_viewer_shows_an_ignored_reset_every_press(app):
+    from waxx.util.live_od.gui.remote_viewer_window import RemoteViewerWindow
+    win = _Remote()
+    reply = {"ok": True, "ignored": True, "saving": True, "run_id": 85600,
+             "message": "Reset ignored: run 85600 is being saved (it is complete)"}
+    for _ in range(2):
+        RemoteViewerWindow._show_reply(win, "Reset", reply)
+    lines = win.viewer_window.output_window.toPlainText().splitlines()
+    assert lines == [reply["message"]] * 2
+    assert win.run_id_label.text() == reply["message"]
+
+
+def test_the_remote_viewer_words_a_reply_without_a_message(app):
+    from waxx.util.live_od.gui.remote_viewer_window import RemoteViewerWindow
+    text = RemoteViewerWindow.reply_notice_text
+    assert text("Reset", {"ok": True, "ignored": True, "saving": True, "run_id": 7}) == \
+        "Reset ignored: run 7 is being saved (it is complete)"
+    assert text("RUN_EXITED", {"ok": False, "saving": True, "error": "refused, x"}) == \
+        "refused, x"
+    assert text("Reset", {"ok": True}) == "" and text("Reset", None) == ""
