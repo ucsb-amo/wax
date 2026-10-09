@@ -117,7 +117,7 @@ def emit_command(key, run_id, analysis, opts=None) -> str:
 def process_result(result: CalResult, config, *, params_cls=None, write_back: bool = False,
                    allow_no_unc: bool = False, out: Callable = print,
                    date: Optional[str] = None, run_value=None,
-                   overrides: Optional[dict] = None) -> CalResult:
+                   overrides: Optional[dict] = None, extra_flags=()) -> CalResult:
     """Check, record, print, and (if allowed) apply one result. Never raises.
 
     ``run_value``: the key's value in the run itself (its params). When known it
@@ -156,6 +156,7 @@ def process_result(result: CalResult, config, *, params_cls=None, write_back: bo
                            f"the run's value"))
     evaluate(result, pol, allow_no_unc=allow_no_unc)
     result.flags.extend(extra)
+    result.flags.extend(dict(f) for f in extra_flags)
 
     ledger, recorded = None, False
     try:
@@ -310,6 +311,30 @@ def _expt_name(expt) -> str:
         return str(expt._expt_file_stem())
     except Exception:
         return ""
+
+
+def offline_run_flags(ad, key) -> list:
+    """Flags for a run analysed after the fact (kcal emit), from what its file
+    says -- the offline counterpart of _why_not_calibrate:
+
+    - ``run_incomplete``: liveOD saved it with ``data_complete=False``; or it was
+      saved with ``save_on_underflow``, where a run that stopped early can still
+      be marked complete and the file does not record how many shots were taken
+      (so completeness cannot be confirmed);
+    - ``key_scanned``: the key was one of the run's xvars."""
+    flags = []
+    ri = getattr(ad, "run_info", None)
+    if ri is not None and getattr(ri, "data_complete", True) is False:
+        flags.append(_flag("run_incomplete", f"the run was saved INCOMPLETE "
+                                             f"({getattr(ri, 'incomplete_reason', '') or 'no reason recorded'})"))
+    elif ri is not None and int(_scalar(getattr(ri, "save_on_underflow", 0)) or 0):
+        flags.append(_flag("run_incomplete", "the run was saved with save_on_underflow: it may "
+                                             "have stopped short of its declared shots, and the "
+                                             "file does not record how many were taken"))
+    names = [str(n) for n in (getattr(ad, "xvarnames", None) or [])]
+    if key in names:
+        flags.append(_flag("key_scanned", f"{key} was scanned in this run ({names})"))
+    return flags
 
 
 def _why_not_calibrate(expt) -> str:

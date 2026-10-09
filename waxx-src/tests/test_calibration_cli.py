@@ -316,3 +316,35 @@ def test_kcal_apply_refused_by_an_unresolved_backup_is_journaled(env, monkeypatc
     assert env.params_file.read_bytes() == raw and backup.read_bytes() == b"original bytes"
     ev = [e for e in led.events() if e["event"] == "apply"]
     assert len(ev) == 1 and ev[0]["ok"] is False and "left unverified" in ev[0]["reason"]
+
+
+# ---- R2: kcal emit checks the run it analyses ------------------------------------------------
+
+@pytest.mark.parametrize("run_info, xvars, codes, text", [
+    (dict(data_complete=False, incomplete_reason="60/63 images received"), [],
+     ["run_incomplete"], "saved INCOMPLETE (60/63 images received)"),
+    (dict(data_complete=True, save_on_underflow=1), [],
+     ["run_incomplete"], "save_on_underflow"),
+    (dict(data_complete=True, save_on_underflow=0), ["t_pi"],
+     ["key_scanned"], "t_pi was scanned in this run"),
+    (dict(data_complete=True, save_on_underflow=0), ["t_raman_pulse"], [], None),
+])
+def test_kcal_emit_flags_incomplete_runs_and_scanned_keys(env, monkeypatch, run_info, xvars,
+                                                         codes, text):
+    from types import SimpleNamespace
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    cfg = importlib.import_module(env.cfg).CFG
+    ad = SimpleNamespace(tag=85600, params=SimpleNamespace(t_pi=6.6403e-06), xvarnames=xvars,
+                         run_info=SimpleNamespace(**run_info))
+    monkeypatch.setattr(cfg, "loader", lambda rid, needs_images=False: ad)
+    raw = env.params_file.read_bytes()
+    code, out = kcal("emit", "t_pi", "--run", "85600", "--analysis", "fake_emit")
+    rec = Ledger(env.ledger).load("t_pi", 85600)
+    assert [f["code"] for f in rec.flags] == codes
+    if text:
+        assert text in out and "never written back" in out
+        code, out = kcal("apply", "t_pi", "--run", "85600")
+        assert code == 2 and "REFUSED: flagged" in out
+    else:
+        assert "not applied: write_back is off" in out
+    assert env.params_file.read_bytes() == raw

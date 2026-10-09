@@ -37,7 +37,7 @@ from typing import Optional
 from waxx.calibration import writeback
 from waxx.calibration.analysis import list_analyses, needs_images, resolve, run_analysis
 from waxx.calibration.config import ENV_VAR, load_config
-from waxx.calibration.emit import _fmt_value_unc, cal_line, process_result
+from waxx.calibration.emit import _fmt_value_unc, cal_line, offline_run_flags, process_result
 from waxx.calibration.policy import policy_for
 from waxx.calibration.record import evaluate
 
@@ -161,7 +161,8 @@ def cmd_emit(cfg, args, out):
     res.run_id = args.run
     res.fit.setdefault("emitted_by", f"kcal emit ({_who()})")
     process_result(res, cfg, params_cls=cls, write_back=False, out=out,
-                   run_value=getattr(getattr(ad, "params", None), args.key, None))
+                   run_value=getattr(getattr(ad, "params", None), args.key, None),
+                   extra_flags=offline_run_flags(ad, args.key))
     return 0 if (res.fit_ok and not res.deferred) else 1
 
 
