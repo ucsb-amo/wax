@@ -2,8 +2,10 @@
 
 ``find_assignment(key, params_cls)`` walks ``params_cls.__mro__`` most-derived
 first. In each class's body (its source file, read with ``inspect``) it looks
-for every statement that assigns ``self.<key>``. The first class that has any
-decides:
+for every statement that assigns ``self.<key>``. EVERY class is read: an
+assignment of the key outside an ``__init__`` in any of them (a compute_*
+method that compute_derived re-runs every shot, the class body) refuses the
+key as derived. Otherwise the most-derived class that assigns it decides:
 
 - exactly one plain single-line ``self.<key> = <numeric literal>`` inside
   ``__init__`` -> that line is the target;
@@ -13,16 +15,22 @@ decides:
   plain assignment (derived or computed)";
 - no class assigns it -> refused the same way.
 
-A class earlier in the MRO whose source cannot be read stops the walk (it may
-assign the key where this cannot see).
+A class in the MRO whose source cannot be read refuses the key (it may assign
+it where this cannot see).
 
-``apply`` comments the old line in place (``# `` + the line, same indentation)
-and inserts the new one directly below, tagged ``#<run_id>, <YYYY-MM-DD>`` and
-the note. The file keeps its encoding and newline style; it is written to a
-temp file and os.replace'd under ``<file>.lock``, and only if it has not changed
-since it was read. Then the module is re-executed (a reload) and the class
-instantiated: the attribute must equal the written literal exactly, else the
-original bytes go back and the write-back is refused.
+``apply`` takes ``<file>.lock`` first, then reads the file once and both parses
+and edits from those bytes: it comments the old line in place (``# `` + the
+line, same indentation) and inserts the new one directly below, tagged
+``#<run_id>, <YYYY-MM-DD>`` and the note. Encoding and newline style are kept.
+The original is copied to ``<file>.kcal-backup``; the new bytes go in by temp +
+os.replace, only if the file still holds the bytes that were parsed. Then every
+module from the target class's down to the run's params class is re-executed
+(a reload), and both classes are instantiated and ``compute_derived()`` run:
+the attribute must equal the written literal exactly. On any failure
+(KeyboardInterrupt included) the original bytes go back; if that restore fails
+as well, ``FILE LEFT MODIFIED, original at <backup>`` is printed and reported,
+and the backup is kept. The backup is removed only once the file holds
+verified new bytes or the original bytes again.
 
 ``revert`` re-activates the nearest commented assignment above the active line
 the same way, tagged ``#reverted <date>``.
@@ -35,9 +43,11 @@ edits.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime
 import inspect
 import math
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -84,6 +94,8 @@ class WritebackReport:
     new_value: object = None
     dry_run: bool = False
     written: bool = False
+    left_modified: bool = False         # a failed write whose restore also failed
+    backup: Optional[str] = None        # the original's copy, kept when left_modified
 
     def to_dict(self):
         return asdict(self)
@@ -187,13 +199,18 @@ def _assigns_key(target, key):
     return False
 
 
-def _scan_class(cls, key):
+def _norm(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _scan_class(cls, key, sources=None):
     """(source, class node, [(node, enclosing function name)]) of every
-    statement in ``cls``'s body that assigns self.<key>."""
+    statement in ``cls``'s body that assigns self.<key>. ``sources`` maps a
+    normalised path to an already-read _Source (the bytes held under the lock)."""
     path = inspect.getsourcefile(cls)
     if not path:
         raise WritebackRefused(f"cannot find the source file of {cls.__qualname__}")
-    src = _Source.read(path)
+    src = (sources or {}).get(_norm(path)) or _Source.read(path)
     tree = ast.parse(src.text(), filename=str(path))
     node = _class_node(tree, cls)
     if node is None:
@@ -216,19 +233,31 @@ def _scan_class(cls, key):
     return src, node, hits
 
 
-def find_assignment(key: str, params_cls) -> Target:
-    """The one line a write-back of ``key`` may change. Raises WritebackRefused."""
+def find_assignment(key: str, params_cls, _sources=None) -> Target:
+    """The one line a write-back of ``key`` may change. Raises WritebackRefused.
+
+    Every class in the MRO is read: an assignment of the key anywhere but an
+    ``__init__`` (a compute_* method that compute_derived re-runs, the class
+    body) makes the key derived, whichever class it is in. The target is the
+    one plain line in the ``__init__`` of the most-derived class that assigns it."""
     rx = _active_re(key)
+    target = None
     for cls in params_cls.__mro__:
         if cls is object:
             continue
         try:
-            src, node, hits = _scan_class(cls, key)
+            src, node, hits = _scan_class(cls, key, _sources)
         except (TypeError, OSError) as e:
-            raise WritebackRefused(f"cannot read the source of {cls.__qualname__} ({e}), which "
-                                   f"comes before any assignment of {key} in the MRO of "
-                                   f"{params_cls.__qualname__}")
-        if not hits:
+            raise WritebackRefused(f"cannot read the source of {cls.__qualname__} ({e}), in the "
+                                   f"MRO of {params_cls.__qualname__}: cannot tell whether it "
+                                   f"assigns {key}")
+        for n, func in hits:
+            if func != "__init__":
+                raise WritebackRefused(
+                    f"self.{key} at {src.path}:{n.lineno} is assigned in "
+                    f"{cls.__qualname__}.{func or '<class body>'}, not __init__: a derived "
+                    f"quantity (compute_derived would overwrite a written value)")
+        if target is not None or not hits:
             continue
         where = f"{cls.__qualname__} ({src.path})"
         plain = []
@@ -241,24 +270,23 @@ def find_assignment(key: str, params_cls) -> Target:
                                        f"assignment (derived or computed)")
             plain.append((n, func, m))
         if len(plain) > 1:
-            lines = ", ".join(f"{n.lineno} (in {f or 'the class body'})" for n, f, _ in plain)
+            lines = ", ".join(str(n.lineno) for n, _, _ in plain)
             raise WritebackRefused(f"ambiguous: self.{key} is assigned on {len(plain)} active lines "
-                                   f"in {where} (lines {lines})")
+                                   f"in {where}.__init__ (lines {lines})")
         n, func, m = plain[0]
-        if func != "__init__":
-            raise WritebackRefused(f"self.{key} at {src.path}:{n.lineno} is assigned in "
-                                   f"{func or 'the class body'}, not __init__: a derived quantity")
         literal = m.group("literal")
         try:
             parse_literal(literal)
         except PrecisionError:
             raise WritebackRefused(f"self.{key} = {literal} at {src.path}:{n.lineno} is not a "
                                    f"plain numeric literal (derived or computed)")
-        return Target(key, str(src.path), cls.__qualname__, cls.__module__, n.lineno,
-                      _strip_eol(src.lines[n.lineno - 1]), m.group("indent"), literal,
-                      m.group("comment") or "", func)
-    raise WritebackRefused(f"self.{key} is not a plain assignment (derived or computed): no class "
-                           f"in the MRO of {params_cls.__qualname__} assigns it")
+        target = Target(key, str(src.path), cls.__qualname__, cls.__module__, n.lineno,
+                        _strip_eol(src.lines[n.lineno - 1]), m.group("indent"), literal,
+                        m.group("comment") or "", func)
+    if target is None:
+        raise WritebackRefused(f"self.{key} is not a plain assignment (derived or computed): no "
+                               f"class in the MRO of {params_cls.__qualname__} assigns it")
+    return target
 
 
 def history_lines(key: str, params_cls):
@@ -291,23 +319,78 @@ def _class_by_qualname(params_cls, qualname):
 
 # ---- verify -------------------------------------------------------------------------------
 
-def _reexec_and_get(target: Target, key: str):
-    """Re-execute the target's module from its source (a reload: same module
-    object, fresh code -- compiled from the file, so no stale bytecode cache
-    can stand in for it), instantiate the class, return the attribute."""
-    mod = sys.modules.get(target.module)
-    if mod is None or not getattr(mod, "__file__", None) or \
-            Path(mod.__file__).resolve() != Path(target.file).resolve():
-        raise WritebackRefused(f"cannot verify: module {target.module} is not imported from "
-                               f"{target.file}")
-    text = Path(target.file).read_bytes().decode("utf-8-sig")
-    code = compile(text, target.file, "exec")
-    exec(code, mod.__dict__)
-    obj = mod
-    for part in target.cls_name.split("."):
+def _chain_modules(target: Target, params_cls):
+    """The modules from the target class's down to ``params_cls``'s, base
+    first: re-executing them in this order rebuilds every class between them
+    on the new source."""
+    mro = list(params_cls.__mro__)
+    idx = next((i for i, c in enumerate(mro)
+                if c.__qualname__ == target.cls_name and c.__module__ == target.module), None)
+    if idx is None:
+        raise WritebackRefused(f"cannot verify: {target.cls_name} is not in the MRO of "
+                               f"{params_cls.__qualname__}")
+    mods = []
+    for c in reversed(mro[:idx + 1]):
+        if c.__module__ in mods:
+            continue
+        mod = sys.modules.get(c.__module__)
+        try:
+            src_file = inspect.getsourcefile(c)
+        except TypeError:
+            src_file = None
+        if mod is None or not getattr(mod, "__file__", None) or not src_file or \
+                _norm(mod.__file__) != _norm(src_file):
+            raise WritebackRefused(f"cannot verify: module {c.__module__} (of "
+                                   f"{c.__qualname__}) is not imported from its source file")
+        mods.append(c.__module__)
+    return mods
+
+
+def _reexec(module_names):
+    """Re-execute each module from its source file into its own module object
+    (a reload: fresh code compiled from the file, so no stale bytecode cache
+    can stand in for it)."""
+    for name in module_names:
+        mod = sys.modules[name]
+        text = Path(mod.__file__).read_bytes().decode("utf-8-sig")
+        exec(compile(text, mod.__file__, "exec"), mod.__dict__)
+
+
+def _get(module_name, qualname):
+    obj = sys.modules[module_name]
+    for part in qualname.split("."):
         obj = getattr(obj, part)
-    inst = obj()
+    return obj
+
+
+def _value_after(cls, key):
+    """getattr(cls(), key) after compute_derived(), as a run would see it."""
+    inst = cls()
+    cd = getattr(inst, "compute_derived", None)
+    if callable(cd):
+        cd()
     return getattr(inst, key)
+
+
+def _verify(target: Target, key, expected, params_cls):
+    """None when the target class and the run's class both give ``expected``
+    after a re-execution of their modules and compute_derived(), else why not."""
+    try:
+        mods = _chain_modules(target, params_cls)
+        _reexec(mods)
+        checks = [(target.module, target.cls_name)]
+        if (params_cls.__module__, params_cls.__qualname__) not in checks:
+            checks.append((params_cls.__module__, params_cls.__qualname__))
+        for mod_name, qual in checks:
+            got = _value_after(_get(mod_name, qual), key)
+            if not _equal(got, expected):
+                return (f"verification failed: after the write, {qual}().{key} is {got!r} "
+                        f"(after compute_derived), not the written {expected!r}")
+        return None
+    except WritebackRefused as e:
+        return str(e)
+    except Exception as e:
+        return f"verification failed: re-executing / instantiating raised {e!r}"
 
 
 def _equal(got, expected) -> bool:
@@ -319,32 +402,54 @@ def _equal(got, expected) -> bool:
         return False
 
 
-def _write_verified(target: Target, src: _Source, new_lines, expected, key):
-    """Write ``new_lines`` if the file is unchanged since ``src`` was read,
-    verify, restore on failure. Returns None or the refusal text."""
-    with file_lock(target.file, timeout=LOCK_TIMEOUT_S):
-        now = Path(target.file).read_bytes()
-        if now != src.raw:
-            return f"{target.file} changed since it was read; nothing written (try again)"
-        replace_bytes(target.file, src.encode(new_lines))
-        why = None
-        try:
-            got = _reexec_and_get(target, key)
-            if not _equal(got, expected):
-                why = (f"verification failed: after the write, {target.cls_name}().{key} is "
-                       f"{got!r}, not the written {expected!r}")
-        except Exception as e:
-            why = f"verification failed: re-executing {target.module} raised {e!r}"
-        if why is None:
-            return None
-        replace_bytes(target.file, src.raw)
-        try:
-            _reexec_and_get(target, key)
-        except Exception as e:
-            why += f"; the original file is back, but re-executing it raised {e!r}"
-        else:
-            why += "; the original file is back"
-        return why
+def _restore(path: Path, src: _Source, target, params_cls, backup: Path) -> bool:
+    """Put the original bytes back. True once the file holds them again."""
+    try:
+        replace_bytes(path, src.raw)
+        if path.read_bytes() != src.raw:
+            raise OSError("the file does not hold the original bytes after the restore")
+    except BaseException as e:
+        print(f"!! [cal] FILE LEFT MODIFIED: {path} holds an UNVERIFIED write-back and could "
+              f"not be restored ({e!r}); original at {backup}", flush=True)
+        return False
+    try:
+        _reexec(_chain_modules(target, params_cls))       # module state back to the original
+    except BaseException:
+        pass
+    return True
+
+
+def _write_verified(target: Target, src: _Source, new_lines, expected, key, params_cls):
+    """Under the caller's lock: write ``new_lines`` if the file still holds
+    ``src``'s bytes, verify, restore on any failure (also on KeyboardInterrupt).
+    The original goes to ``<file>.kcal-backup`` first; that copy is removed only
+    once the file holds verified new bytes or the original bytes again.
+    Returns (refusal text or None, left_modified, backup path)."""
+    path = Path(target.file)
+    backup = Path(str(path) + ".kcal-backup")
+    if path.read_bytes() != src.raw:
+        return (f"{path} changed since it was read; nothing written (try again)", False, None)
+    replace_bytes(backup, src.raw)
+    why, written, ok, left_modified = None, False, False, False
+    try:
+        replace_bytes(path, src.encode(new_lines))
+        written = True
+        why = _verify(target, key, expected, params_cls)
+        ok = why is None
+    except Exception as e:
+        why = f"{type(e).__name__} while writing: {e}"
+    finally:
+        if written and not ok:
+            left_modified = not _restore(path, src, target, params_cls, backup)
+        if not left_modified:
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+    if why is not None:
+        why += (f"; FILE LEFT MODIFIED, original at {backup}" if left_modified
+                else "; the original file is back" if written else "")
+    return why, left_modified, (str(backup) if left_modified else None)
 
 
 # ---- apply / revert ---------------------------------------------------------------------
@@ -357,60 +462,84 @@ def _one_line(note):
     return " ".join(str(note).split())
 
 
-def apply(key: str, result, params_cls, *, dry_run: bool = False, note: str = "",
-          allow_no_unc: bool = False, date: Optional[str] = None) -> WritebackReport:
-    """Write ``result`` (a CalResult) for ``key``, or refuse. See the module doc."""
-    rep = WritebackReport(False, "apply", key, dry_run=dry_run)
-    try:
-        if getattr(result, "key", key) != key:
-            raise WritebackRefused(f"the result is for {result.key!r}, not {key!r}")
-        if getattr(result, "deferred", False):
-            raise WritebackRefused("the analysis was deferred; there is no value")
-        if result.fit.get("ok", True) is False:
-            raise WritebackRefused(f"the analysis failed ({result.fit.get('reason', '')})")
-        if result.flags:
-            raise WritebackRefused("the result is flagged: " +
-                                   "; ".join(f["text"] for f in result.flags))
-        try:
-            if not math.isfinite(float(result.value)):
-                raise ValueError
-        except (TypeError, ValueError):
-            raise WritebackRefused(f"value {result.value!r} is not finite")
-        if result.unc is not None:
-            try:
-                if not math.isfinite(float(result.unc)):
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise WritebackRefused(f"uncertainty {result.unc!r} is not finite")
-        t = find_assignment(key, params_cls)
-        rep.file, rep.old_line = t.file, t.line
-        old = parse_literal(t.literal)
-        rep.old_value = old.value()
-        try:
-            new_literal = format_value(result.value, result.unc, old, allow_no_unc=allow_no_unc)
-        except PrecisionError as e:
-            raise WritebackRefused(str(e))
-        tag = f"#{result.run_id}, {date or _today()}"
-        if note:
-            tag += f" {_one_line(note)}"
-        src = _Source.read(t.file)
+def _locked_edit(rep, key, params_cls, build, dry_run):
+    """Find, edit and write ``key``'s line from one read of the file, all under
+    its lock. ``build(t, src)`` returns (new line text without indent, expected
+    value). Fills ``rep``; raises WritebackRefused."""
+    t0 = find_assignment(key, params_cls)                 # which file to lock
+    lock = contextlib.nullcontext() if dry_run else file_lock(t0.file, timeout=LOCK_TIMEOUT_S)
+    with lock:
+        src = _Source.read(t0.file)
+        t = find_assignment(key, params_cls, _sources={_norm(t0.file): src})
+        if _norm(t.file) != _norm(t0.file):
+            raise WritebackRefused(f"the assignment of {key} moved to {t.file} while this ran; "
+                                   f"nothing written (try again)")
         orig = src.lines[t.line_no - 1]
+        if _strip_eol(orig) != t.line:
+            raise WritebackRefused(f"{t.file}:{t.line_no} is not the line that was parsed; "
+                                   f"nothing written")
+        rep.file, rep.old_line = t.file, t.line
+        rep.old_value = parse_literal(t.literal).value()
+        body, expected = build(t, src)
         eol = _eol(orig, default=_eol(src.lines[0]) if src.lines else "\n")
         commented = t.indent + "# " + _strip_eol(orig).lstrip(" \t")
-        new_line = f"{t.indent}self.{key} = {new_literal} {tag}"
+        new_line = t.indent + body
         rep.commented_line, rep.new_line = commented, new_line
-        rep.new_value = parse_literal(new_literal).value()
+        rep.new_value = expected
         rep.line_no = t.line_no + 1
         if dry_run:
             rep.ok = True
             return rep
         new_lines = list(src.lines)
         new_lines[t.line_no - 1: t.line_no] = [commented + eol, new_line + _eol(orig, "")]
-        why = _write_verified(t, src, new_lines, rep.new_value, key)
+        why, rep.left_modified, rep.backup = _write_verified(t, src, new_lines, expected, key,
+                                                             params_cls)
         if why:
             raise WritebackRefused(why)
         rep.ok = rep.written = True
         return rep
+
+
+def _check_result(key, result):
+    if getattr(result, "key", key) != key:
+        raise WritebackRefused(f"the result is for {result.key!r}, not {key!r}")
+    if getattr(result, "deferred", False):
+        raise WritebackRefused("the analysis was deferred; there is no value")
+    if result.fit.get("ok", True) is False:
+        raise WritebackRefused(f"the analysis failed ({result.fit.get('reason', '')})")
+    if result.flags:
+        raise WritebackRefused("the result is flagged: " +
+                               "; ".join(f["text"] for f in result.flags))
+    try:
+        if not math.isfinite(float(result.value)):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise WritebackRefused(f"value {result.value!r} is not finite")
+    if result.unc is not None:
+        try:
+            if not math.isfinite(float(result.unc)):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise WritebackRefused(f"uncertainty {result.unc!r} is not finite")
+
+
+def apply(key: str, result, params_cls, *, dry_run: bool = False, note: str = "",
+          allow_no_unc: bool = False, date: Optional[str] = None) -> WritebackReport:
+    """Write ``result`` (a CalResult) for ``key``, or refuse. See the module doc."""
+    rep = WritebackReport(False, "apply", key, dry_run=dry_run)
+
+    def build(t, src):
+        try:
+            new_literal = format_value(result.value, result.unc, parse_literal(t.literal),
+                                       allow_no_unc=allow_no_unc)
+        except PrecisionError as e:
+            raise WritebackRefused(str(e))
+        tag = f"#{result.run_id}, {date or _today()}" + (f" {_one_line(note)}" if note else "")
+        return f"self.{key} = {new_literal} {tag}", parse_literal(new_literal).value()
+
+    try:
+        _check_result(key, result)
+        return _locked_edit(rep, key, params_cls, build, dry_run)
     except WritebackRefused as e:
         rep.reason = str(e)
         return rep
@@ -423,24 +552,17 @@ def revert(key: str, params_cls, *, dry_run: bool = False,
            date: Optional[str] = None) -> WritebackReport:
     """Re-activate the nearest commented assignment above the active line."""
     rep = WritebackReport(False, "revert", key, dry_run=dry_run)
-    try:
-        t = find_assignment(key, params_cls)
-        rep.file, rep.old_line = t.file, t.line
-        rep.old_value = parse_literal(t.literal).value()
-        src = _Source.read(t.file)
-        tree = ast.parse(src.text())
-        node = _class_node(tree, _class_by_qualname(params_cls, t.cls_name))
+
+    def build(t, src):
+        node = _class_node(ast.parse(src.text()), _class_by_qualname(params_cls, t.cls_name))
         com = _commented_re(key)
-        prev = None
         for i in range(t.line_no - 1, node.lineno, -1):
             m = com.match(_strip_eol(src.lines[i - 1]))
             if m:
-                prev = (i, m)
                 break
-        if prev is None:
+        else:
             raise WritebackRefused(f"no commented assignment of self.{key} above line "
                                    f"{t.line_no} in {t.file}: nothing to revert to")
-        i, m = prev
         literal = m.group("literal")
         try:
             lit = parse_literal(literal)
@@ -449,23 +571,10 @@ def revert(key: str, params_cls, *, dry_run: bool = False,
                                    f"numeric literal: {literal}")
         was = (m.group("comment") or "").lstrip("#").strip()
         tag = f"#reverted {date or _today()}" + (f"; was #{was}" if was else "")
-        orig = src.lines[t.line_no - 1]
-        eol = _eol(orig, default="\n")
-        commented = t.indent + "# " + _strip_eol(orig).lstrip(" \t")
-        new_line = f"{t.indent}self.{key} = {literal} {tag}"
-        rep.commented_line, rep.new_line = commented, new_line
-        rep.new_value = lit.value()
-        rep.line_no = t.line_no + 1
-        if dry_run:
-            rep.ok = True
-            return rep
-        new_lines = list(src.lines)
-        new_lines[t.line_no - 1: t.line_no] = [commented + eol, new_line + _eol(orig, "")]
-        why = _write_verified(t, src, new_lines, rep.new_value, key)
-        if why:
-            raise WritebackRefused(why)
-        rep.ok = rep.written = True
-        return rep
+        return f"self.{key} = {literal} {tag}", lit.value()
+
+    try:
+        return _locked_edit(rep, key, params_cls, build, dry_run)
     except WritebackRefused as e:
         rep.reason = str(e)
         return rep

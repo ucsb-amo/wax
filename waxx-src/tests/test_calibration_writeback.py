@@ -110,7 +110,7 @@ def test_find_the_one_active_line(modules):
 
 @pytest.mark.parametrize("key, why", [
     ("dup", "ambiguous"),
-    ("derived_x", "ambiguous"),
+    ("derived_x", "derived quantity"),
     ("only_in_method", "derived quantity"),
     ("expr", "not a plain numeric literal"),
     ("tup_a", "not a plain assignment"),
@@ -167,6 +167,7 @@ def test_dry_run_writes_nothing(modules):
     ("only_in_method", result(key="only_in_method"), "derived"),
     ("expr", result(key="expr"), "not a plain numeric literal"),
     ("dup", result(key="dup"), "ambiguous"),
+    ("derived_x", result(key="derived_x"), "derived quantity"),
     ("N_iter", result(key="N_iter", value=50.5, unc=0.1), "not an integer"),
 ])
 def test_apply_refusals_leave_the_file_alone(modules, key, r, why):
@@ -254,20 +255,47 @@ def test_revert_reactivates_the_previous_value(modules):
     assert path.read_bytes() == raw
 
 
-def test_a_file_changed_meanwhile_is_not_overwritten(modules, monkeypatch):
+N_REPEATS_LINE = "        self.N_repeats = 1\n"
+
+
+def test_an_edit_before_the_lock_is_parsed_not_clobbered(modules, monkeypatch):
+    """A person saves the file between the first look and the lock: the edit is
+    read under the lock and the right line is changed (S1)."""
     mod, path = modules(BASE)
     real_lock = writeback.file_lock
 
     @contextlib.contextmanager
-    def sneaky(target, timeout=1.0):
+    def person_saves_first(target, timeout=1.0):
+        text = Path(target).read_text()
+        Path(target).write_text(text.replace(N_REPEATS_LINE,
+                                             N_REPEATS_LINE + "        # a\n        # b\n"))
         with real_lock(target, timeout=timeout) as lk:
-            Path(target).write_bytes(Path(target).read_bytes() + b"# edited by a person\n")
             yield lk
-    monkeypatch.setattr(writeback, "file_lock", sneaky)
+    monkeypatch.setattr(writeback, "file_lock", person_saves_first)
+    rep = writeback.apply("t_pi", result(), mod.Params, date="2026-10-09")
+    assert rep.ok, rep.reason
+    ls = lines(path)
+    i = ls.index("        # a")
+    assert ls[i:i + 2] == ["        # a", "        # b"]
+    assert ls[rep.line_no - 2] == "        # self.t_pi = 6.6403e-06 #85412, 2026-10-07"
+    assert ls[rep.line_no - 1] == "        self.t_pi = 6.612e-06 #85600, 2026-10-09"
+
+
+def test_lines_inserted_between_parse_and_write_refuse(modules, monkeypatch):
+    """An editor that ignores the lock inserts lines after the parse: the write
+    is refused and the file keeps exactly that edit (S1)."""
+    mod, path = modules(BASE)
+    real_format = writeback.format_value
+    edited = BASE.replace(N_REPEATS_LINE, N_REPEATS_LINE + "        # inserted\n")
+
+    def editor_inserts(*a, **k):
+        path.write_text(edited)
+        return real_format(*a, **k)
+    monkeypatch.setattr(writeback, "format_value", editor_inserts)
     rep = writeback.apply("t_pi", result(), mod.Params)
     assert not rep.ok and "changed since it was read" in rep.reason
-    assert path.read_bytes().endswith(b"# edited by a person\n")
-    assert "self.t_pi = 6.6403e-06 #85412, 2026-10-07" in [l.strip() for l in lines(path)]
+    assert path.read_text() == edited
+    assert not list(path.parent.glob("*.kcal-backup"))
 
 
 def test_a_held_lock_refuses(modules):
@@ -312,3 +340,125 @@ def test_works_on_a_waxx_params_subclass(modules):
     rep = writeback.apply("t_apd_slack", result(key="t_apd_slack", value=1.2e-5, unc=1e-7),
                           mod.P, dry_run=True)
     assert rep.ok and rep.file.endswith("expt_params.py") and not rep.written
+
+
+# ---- S2: restore on any failure, backup until verified --------------------------------
+
+def test_keyboard_interrupt_during_verify_restores(modules, monkeypatch):
+    mod, path = modules(BASE)
+    raw = path.read_bytes()
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(writeback, "_verify", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        writeback.apply("t_pi", result(), mod.Params)
+    assert path.read_bytes() == raw
+    assert not list(path.parent.glob("*.kcal-backup")) and not list(path.parent.glob("*.lock"))
+
+
+def test_a_failed_restore_says_file_left_modified(modules, monkeypatch, capsys):
+    mod, path = modules(BASE)
+    raw = path.read_bytes()
+    real = writeback.replace_bytes
+    calls = []
+
+    def flaky(p, data, **k):
+        calls.append(Path(p).name)
+        if len(calls) == 3:                      # backup, new bytes, then the restore
+            raise PermissionError("held open by an editor")
+        return real(p, data, **k)
+    monkeypatch.setattr(writeback, "replace_bytes", flaky)
+    monkeypatch.setattr(writeback, "_verify", lambda *a, **k: "verification failed: test")
+    rep = writeback.apply("t_pi", result(), mod.Params)
+    assert not rep.ok and rep.left_modified
+    assert "FILE LEFT MODIFIED, original at" in rep.reason
+    backup = Path(rep.backup)
+    assert backup.read_bytes() == raw and path.read_bytes() != raw
+    assert "FILE LEFT MODIFIED" in capsys.readouterr().out
+
+
+def test_backup_removed_after_success(modules):
+    mod, path = modules(BASE)
+    assert writeback.apply("t_pi", result(), mod.Params).ok
+    assert not list(path.parent.glob("*.kcal-backup"))
+
+
+# ---- S3: derived anywhere in the MRO; compute_derived in the verify ------------------
+
+DERIVING_BASE = '''\
+class Base:
+    def __init__(self):
+        self.amp = 0.41
+
+    def compute_amp(self):
+        self.amp = 2 * 0.2
+'''
+
+LITERAL_SUB = '''\
+from {base} import Base
+
+
+class Sub(Base):
+    def __init__(self):
+        super().__init__()
+        self.amp = 0.5
+'''
+
+SETATTR_DERIVED = '''\
+class P:
+    def __init__(self):
+        self.amp = 0.41
+
+    def compute_derived(self):
+        setattr(self, "amp", 1.0)       # invisible to the source scan
+'''
+
+
+def test_a_base_class_method_deriving_the_key_refuses(modules):
+    base, _ = modules(DERIVING_BASE, prefix="calderb")
+    sub, spath = modules(LITERAL_SUB.format(base=base.__name__), prefix="calders")
+    raw = spath.read_bytes()
+    rep = writeback.apply("amp", result(key="amp", value=0.5123, unc=0.0011), sub.Sub)
+    assert not rep.ok and "Base.compute_amp" in rep.reason and "derived quantity" in rep.reason
+    assert spath.read_bytes() == raw
+
+
+def test_verify_runs_compute_derived(modules):
+    mod, path = modules(SETATTR_DERIVED)
+    raw = path.read_bytes()
+    rep = writeback.apply("amp", result(key="amp", value=0.5123, unc=0.0011), mod.P)
+    assert not rep.ok and "after compute_derived" in rep.reason and "original file is back" in rep.reason
+    assert path.read_bytes() == raw
+
+
+# ---- S4: the run's class is checked too ----------------------------------------------
+
+SETATTR_SUB = '''\
+from {base} import Params
+
+
+class Sub(Params):
+    def __init__(self):
+        super().__init__()
+        for k in ("t_pi",):
+            setattr(self, k, 1.0)       # the run's class overrides it unseen
+'''
+
+
+def test_the_runs_class_must_see_the_value(modules):
+    base, bpath = modules(BASE, prefix="calrunb")
+    sub, _ = modules(SETATTR_SUB.format(base=base.__name__), prefix="calruns")
+    raw = bpath.read_bytes()
+    rep = writeback.apply("t_pi", result(), sub.Sub)
+    assert not rep.ok and "Sub().t_pi is 1.0" in rep.reason
+    assert bpath.read_bytes() == raw
+    assert base.Params().t_pi == 6.6403e-06                 # module state back too
+
+
+def test_subclass_run_sees_a_base_write(modules):
+    base, bpath = modules(BASE, prefix="calrunb")
+    sub, _ = modules(SUB.format(base=base.__name__), prefix="calruns")
+    rep = writeback.apply("t_pi", result(), sub.Sub, date="2026-10-09")
+    assert rep.ok, rep.reason
+    assert sub.Sub().t_pi == 6.612e-06 and base.Params().t_pi == 6.612e-06
