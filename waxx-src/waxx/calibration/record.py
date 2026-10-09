@@ -45,6 +45,11 @@ class CalResult:
     analysis: str = ""
     # the params class of the run ("module:qualname"), where a write-back goes
     params_class: str = ""
+    # the params the run's prepare() assigned itself, {key: value}; None = unknown
+    overrides: Optional[dict] = None
+    # the literal in the params file when the result was emitted (old_value is
+    # the run's own value when that is known: the baseline of rel_change)
+    file_value: Optional[float] = None
 
     def __post_init__(self):
         if not self.timestamp:
@@ -80,7 +85,7 @@ class CalResult:
     def from_dict(cls, d: dict) -> "CalResult":
         names = {f.name for f in fields(cls)}
         kw = {k: v for k, v in d.items() if k in names}
-        for k in ("value", "unc", "old_value", "rel_change"):
+        for k in ("value", "unc", "old_value", "rel_change", "file_value"):
             if k in kw and kw[k] is not None:
                 kw[k] = float(kw[k])
         return cls(**kw)

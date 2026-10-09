@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 ENV_VAR = "WAXX_CALIBRATION_CONFIG"
 DEFAULT_BUDGET_S = 30.0
+DEFAULT_LOAD_BUDGET_S = 60.0
 
 
 def import_object(spec: str):
@@ -45,10 +46,14 @@ class CalibrationConfig:
     # the params class write-backs go to when a record names none: a class or
     # 'module:Class'
     params_class: Union[None, type, str] = None
-    # run_id -> atomdata-like object; None = waxa.atomdata(run_id, roi_id='auto', lite=False)
-    loader: Optional[Callable[[int], Any]] = None
+    # (run_id, needs_images=bool) -> atomdata-like object, read-only. None =
+    # waxa.atomdata(run_id, roi_id='auto' | None, lite=False, ignore_images=not needs_images)
+    loader: Optional[Callable[..., Any]] = None
     # seconds an analysis may take inside a run's end() before it is deferred
     budget_s: float = DEFAULT_BUDGET_S
+    # seconds the run's load may take inside end() before every declared
+    # calibration of the run is deferred
+    load_budget_s: float = DEFAULT_LOAD_BUDGET_S
 
     def get_ledger_dir(self) -> Path:
         d = self.ledger_dir() if callable(self.ledger_dir) else self.ledger_dir
@@ -70,11 +75,15 @@ class CalibrationConfig:
             raise RuntimeError("no params class: the CalibrationConfig names none")
         return import_object(spec) if isinstance(spec, str) else spec
 
-    def load_run(self, run_id: int):
+    def load_run(self, run_id: int, needs_images: bool = False):
+        """The run, read-only. Without images (the default) the camera frames,
+        OD and ROI are skipped (atomdata ignore_images=True); never a lite load
+        (that can write a lite copy next to the data)."""
         if self.loader is not None:
-            return self.loader(int(run_id))
+            return self.loader(int(run_id), needs_images=bool(needs_images))
         from waxa import atomdata
-        return atomdata(int(run_id), roi_id="auto", lite=False)
+        return atomdata(int(run_id), roi_id="auto" if needs_images else None, lite=False,
+                        ignore_images=not needs_images)
 
 
 def load_config(spec: Optional[str] = None) -> CalibrationConfig:

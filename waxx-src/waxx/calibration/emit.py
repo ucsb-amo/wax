@@ -16,15 +16,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
+
 from waxx.calibration import writeback
-from waxx.calibration.analysis import failed_result, resolve, run_analysis
+from waxx.calibration.analysis import (call_with_budget, failed_result, needs_images, resolve,
+                                       run_analysis)
 from waxx.calibration.policy import policy_for
-from waxx.calibration.record import CalResult, evaluate
+from waxx.calibration.record import CalResult, _flag, _jsonable, evaluate
 
 VETO_ENV = "WAXX_CAL_NO_WRITE_BACK"
 RUN_FILE_ATTR = "calibration_emitted"
@@ -88,10 +92,39 @@ def cal_line(r: CalResult, unit: str = "") -> str:
 
 # ---- the pipeline -------------------------------------------------------------------------
 
+def _scalar(x):
+    """A finite float, or None (arrays -- a scanned param --, strings, NaN)."""
+    if isinstance(x, bool):
+        return None
+    try:
+        arr = np.asarray(x)
+        if arr.ndim != 0:
+            return None
+        f = float(arr)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def emit_command(key, run_id, analysis, opts=None) -> str:
+    """The kcal command that redoes an analysis offline (S9)."""
+    cmd = f"kcal emit {key} --run {int(run_id)} --analysis {analysis}"
+    if opts:
+        cmd += " --opts '" + json.dumps(_jsonable(opts)) + "'"
+    return cmd
+
+
 def process_result(result: CalResult, config, *, params_cls=None, write_back: bool = False,
                    allow_no_unc: bool = False, out: Callable = print,
-                   date: Optional[str] = None) -> CalResult:
-    """Check, record, print, and (if allowed) apply one result. Never raises."""
+                   date: Optional[str] = None, run_value=None,
+                   overrides: Optional[dict] = None) -> CalResult:
+    """Check, record, print, and (if allowed) apply one result. Never raises.
+
+    ``run_value``: the key's value in the run itself (its params). When known it
+    is the baseline of the change check, and a params file whose literal now
+    differs from it (edited during the run, or overridden by the run) flags the
+    result ``file_changed``. ``overrides``: the run's own param assignments,
+    recorded with the result."""
     key = result.key
     try:
         policy = config.get_policy()
@@ -101,10 +134,28 @@ def process_result(result: CalResult, config, *, params_cls=None, write_back: bo
              f"without it, and not writing it back", out)
         write_back = False
     pol = policy_for(policy, key)
+    extra = []
+    if overrides is not None:
+        result.overrides = dict(overrides)
     if params_cls is not None:
         result.params_class = f"{params_cls.__module__}:{params_cls.__qualname__}"
-        result.set_old_value(writeback.current_value(key, params_cls))
+        try:
+            result.file_value = writeback.current_value(key, params_cls)
+        except Exception as e:
+            result.file_value = None
+            extra.append(_flag("old_value_unavailable",
+                               f"the value in the params file could not be read "
+                               f"({type(e).__name__}: {e})"))
+    rv = _scalar(run_value)
+    fv = _scalar(result.file_value)
+    result.set_old_value(rv if rv is not None else result.file_value)
+    if rv is not None and fv is not None and rv != fv:
+        extra.append(_flag("file_changed",
+                           f"the params file now says {fv!r}, the run used {rv!r} (edited during "
+                           f"the run, or the run set it itself); the change is measured from "
+                           f"the run's value"))
     evaluate(result, pol, allow_no_unc=allow_no_unc)
+    result.flags.extend(extra)
 
     ledger, recorded = None, False
     try:
@@ -153,6 +204,13 @@ def process_result(result: CalResult, config, *, params_cls=None, write_back: bo
     return result
 
 
+def _overrides_of(expt):
+    keys = getattr(expt, "_param_overrides", None)
+    if keys is None:
+        return None
+    return {k: _jsonable(getattr(expt.params, k, None)) for k in sorted(keys)}
+
+
 def run_declared(expt, declarations, *, out: Callable = print, date: Optional[str] = None) -> list:
     """The emit for one finished run (see the module doc). Returns the results."""
     if not declarations:
@@ -167,16 +225,45 @@ def run_declared(expt, declarations, *, out: Callable = print, date: Optional[st
         _say(f"[cal] not run ({keys}): {why}", out)
         return []
     rid = int(expt.run_info.run_id)
-    try:
-        ad = config.load_run(rid)
-    except Exception as e:
-        _say(f"[cal] not run ({keys}): could not load run {rid} ({type(e).__name__}: {e})", out)
+    scanned = set(getattr(expt, "xvarnames", []) or [])
+    todo, funcs = [], {}
+    for d in declarations:
+        if d.key in scanned:
+            _say(f"[cal] not run ({d.key}): it was scanned in this run", out)
+            continue
+        try:
+            funcs[d.key] = resolve(d.analysis, config.registry_modules)
+        except Exception as e:
+            funcs[d.key] = e
+        todo.append(d)
+    if not todo:
+        return []
+    want_images = False
+    for d in todo:
+        f = funcs[d.key]
+        if not isinstance(f, Exception) and needs_images(f, d.opts):
+            want_images = True
+    done, ad, err = call_with_budget(lambda: config.load_run(rid, needs_images=want_images),
+                                     config.load_budget_s, name=f"calibration-load:{rid}")
+    if not done or err is not None:
+        why = (f"loading run {rid} took longer than {config.load_budget_s:g} s" if not done
+               else f"could not load run {rid} ({type(err).__name__}: {err})")
+        _say(f"[cal] not run ({', '.join(d.key for d in todo)}): {why}", out)
+        for d in todo:
+            _say(f"[cal]   to analyse it offline: {emit_command(d.key, rid, d.analysis, d.opts)}", out)
+        if not done:                                   # deferred: recorded, so it is not lost
+            results = []
+            for d in todo:
+                r = failed_result(d.key, why + "; deferred", analysis=d.analysis, deferred=True)
+                r.run_id, r.expt_file = rid, _expt_name(expt)
+                results.append(_process(expt, config, d, r, out, date))
+            return results
         return []
     params_cls = type(expt.params)
     results = []
-    for d in declarations:
+    for d in todo:
         try:
-            results.append(_one(expt, config, d, ad, rid, params_cls, out, date))
+            results.append(_one(expt, config, d, funcs[d.key], ad, rid, out, date))
         except Exception as e:              # belt and braces: process_result never raises
             _say(f"[cal] WARNING: calibrating {d.key} failed ({type(e).__name__}: {e})", out)
     paths = list(_paths(getattr(expt.run_info, "filepath", None)))
@@ -186,11 +273,17 @@ def run_declared(expt, declarations, *, out: Callable = print, date: Optional[st
     return results
 
 
-def _one(expt, config, d: Declaration, ad, rid, params_cls, out, date):
-    try:
-        func = resolve(d.analysis, config.registry_modules)
-    except Exception as e:
-        result = failed_result(d.key, f"analysis {d.analysis!r} not found ({e})", analysis=d.analysis)
+def _process(expt, config, d, result, out, date):
+    return process_result(result, config, params_cls=type(expt.params), write_back=d.write_back,
+                          allow_no_unc=d.allow_no_unc, out=out, date=date,
+                          run_value=getattr(expt.params, d.key, None),
+                          overrides=_overrides_of(expt))
+
+
+def _one(expt, config, d: Declaration, func, ad, rid, out, date):
+    if isinstance(func, Exception):
+        result = failed_result(d.key, f"analysis {d.analysis!r} not found ({func})",
+                               analysis=d.analysis)
     else:
         fig = None
         try:
@@ -206,8 +299,10 @@ def _one(expt, config, d: Declaration, ad, rid, params_cls, out, date):
     if result.deferred:
         _say(f"[cal] {d.key}: the analysis {d.analysis!r} took longer than "
              f"{config.budget_s:g} s and is deferred (no value this run)", out)
-    return process_result(result, config, params_cls=params_cls, write_back=d.write_back,
-                          allow_no_unc=d.allow_no_unc, out=out, date=date)
+    r = _process(expt, config, d, result, out, date)
+    if result.deferred or not result.fit_ok:
+        _say(f"[cal]   to analyse it offline: {emit_command(d.key, rid, d.analysis, d.opts)}", out)
+    return r
 
 
 def _expt_name(expt) -> str:
@@ -254,13 +349,27 @@ def _paths(fp):
 
 # ---- the run file's root attribute ------------------------------------------------------
 
+_LOCK_ERRNOS = (32, 33)                    # sharing / lock violation (WinError and errno)
+_LOCK_TEXT = re.compile(r"unable to lock file|errno = (32|33)\b|WinError (32|33)\b", re.I)
+
+
+def _is_lock_error(e: BaseException) -> bool:
+    """Another process holds the file: worth a retry. Anything else is not."""
+    if isinstance(e, BlockingIOError):
+        return True
+    if getattr(e, "winerror", None) in _LOCK_ERRNOS or getattr(e, "errno", None) in _LOCK_ERRNOS:
+        return True
+    return bool(_LOCK_TEXT.search(str(e)))
+
+
 def record_in_run_file(paths, results, *, out: Callable = print, tries: int = 5,
                        wait: float = 1.0) -> bool:
     """Add (or extend) the root attribute ``calibration_emitted`` of the saved
     run file: a JSON list of the records. Only that attribute is ever written;
-    an existing value must be a prefix of the new list (records are only
-    appended), and the file must say ``run_complete``. Opened 'r+' (it is never
-    created), held only for the write, retried while another process holds it."""
+    an existing value must be a list (records are only appended), and the file
+    must say ``run_complete``. Opened 'r+' (it is never created), held only for
+    the write; retried only while another process holds a lock on it -- any
+    other error fails at once."""
     if not results:
         return False
     path = next((p for p in paths if os.path.isfile(p)), None)
@@ -287,13 +396,13 @@ def record_in_run_file(paths, results, *, out: Callable = print, tries: int = 5,
                         raise ValueError(f"existing {RUN_FILE_ATTR} is not a list")
                 f.attrs[RUN_FILE_ATTR] = json.dumps(records + new)
             return True
-        except (OSError, BlockingIOError) as e:
+        except Exception as e:
+            if not _is_lock_error(e):
+                _say(f"[cal] WARNING: {RUN_FILE_ATTR} not written to {path} "
+                     f"({type(e).__name__}: {e}); the ledger has the records", out)
+                return False
             last = e
             time.sleep(wait)
-        except Exception as e:
-            _say(f"[cal] WARNING: {RUN_FILE_ATTR} not written to {path} ({type(e).__name__}: {e})",
-                 out)
-            return False
     _say(f"[cal] WARNING: {RUN_FILE_ATTR} not written to {path} after {tries} tries ({last!r}); "
          f"the ledger has the records", out)
     return False
@@ -307,7 +416,8 @@ def emit_direct(expt, key, value, unc, *, write_back=False, allow_no_unc=False,
     checks / ledger / write-back as a declared calibration (after end())."""
     known = set(CalResult.__dataclass_fields__) - {"key", "value", "unc", "flags", "applied",
                                                    "applied_file", "applied_line", "old_value",
-                                                   "rel_change", "params_class", "timestamp"}
+                                                   "rel_change", "params_class", "timestamp",
+                                                   "overrides", "file_value"}
     unknown = sorted(set(meta) - known)
     if unknown:
         raise TypeError(f"emit_calibration got unknown field(s) {unknown}")
@@ -322,6 +432,7 @@ def emit_direct(expt, key, value, unc, *, write_back=False, allow_no_unc=False,
              f"(emit_calibration belongs after self.end())", out)
         return r
     process_result(r, config, params_cls=type(expt.params), write_back=write_back,
-                   allow_no_unc=allow_no_unc, out=out, date=date)
+                   allow_no_unc=allow_no_unc, out=out, date=date,
+                   run_value=getattr(expt.params, key, None), overrides=_overrides_of(expt))
     record_in_run_file(list(_paths(getattr(expt.run_info, "filepath", None))), [r], out=out)
     return r

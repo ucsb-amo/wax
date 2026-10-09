@@ -109,7 +109,7 @@ def make_run(lab, *, policy=None, budget_s=5.0, loader=None, n_bad=0):
     ad = SimpleNamespace(n=63, bad=n_bad, run_info=SimpleNamespace(filepath=np.array([str(lab.run_file)])))
     e.calibration_config = CalibrationConfig(
         ledger_dir=lab.ledger, policy=policy or {}, registry_modules=[lab.reg],
-        params_class=None, loader=loader or (lambda rid: ad), budget_s=budget_s)
+        params_class=None, loader=loader or (lambda rid, needs_images=False: ad), budget_s=budget_s)
     e._cal_declarations, e.calibration_results = [], []
     e._param_overrides = None
     e.run_info = SimpleNamespace(save_data=1, run_id=85600, filepath=str(lab.run_file))
@@ -268,7 +268,7 @@ def test_runs_that_must_not_be_calibrated(lab, capsys, change, why):
 
 
 def test_a_run_that_cannot_be_loaded_emits_nothing(lab, capsys):
-    def no_load(rid):
+    def no_load(rid, needs_images=False):
         raise OSError("drive not mapped")
     e = make_run(lab, loader=no_load)
     e.calibrates("t_pi", "fake_pi")
@@ -361,3 +361,120 @@ def test_end_wax_survives_a_broken_emit(lab, capsys, monkeypatch):
     e.end_wax("rabi_flop.py", notify=False)
     assert "[cal] WARNING: the calibration step failed (ZeroDivisionError: bug); the run's " \
            "data is saved and unaffected." in capsys.readouterr().out
+
+
+# ---- S5: an unreadable params file costs the write-back, never the record ---------------
+
+def test_unreadable_params_file_flags_and_still_records(lab, capsys, monkeypatch):
+    from waxx.calibration import writeback
+
+    def broken(*a, **k):
+        raise SyntaxError("half-saved file")
+    monkeypatch.setattr(writeback, "current_value", broken)
+    e = make_run(lab)
+    e.calibrates("t_pi", "fake_pi")
+    raw = lab.params_file.read_bytes()
+    e._emit_calibrations()
+    out = capsys.readouterr().out
+    assert "could not be read (SyntaxError: half-saved file)" in out and "not applied: flagged" in out
+    rec = json.loads((lab.ledger / "t_pi" / "85600.json").read_text())
+    assert [f["code"] for f in rec["flags"]] == ["old_value_unavailable"]
+    assert lab.params_file.read_bytes() == raw
+
+
+# ---- S7: the run's own value and overrides ----------------------------------------------
+
+def test_overrides_are_recorded(lab):
+    e = make_run(lab)
+    e.params.amp = 0.5
+    e._param_overrides = frozenset({"amp"})
+    e.calibrates("t_pi", "fake_pi", write_back=False)
+    e._emit_calibrations()
+    rec = json.loads((lab.ledger / "t_pi" / "85600.json").read_text())
+    assert rec["overrides"] == {"amp": 0.5} and rec["file_value"] == 6.6403e-06
+    e2 = make_run(lab)                                   # unknown overrides stay unknown
+    e2.calibrates("amp", "fake_pi", write_back=False, opts={"value": 0.42, "unc": 0.01})
+    e2._emit_calibrations()
+    assert json.loads((lab.ledger / "amp" / "85600.json").read_text())["overrides"] is None
+
+
+def test_a_file_edited_during_the_run_is_flagged(lab, capsys):
+    e = make_run(lab)
+    e.params.t_pi = 6.5e-06                    # what the run used; the file says 6.6403e-06
+    e.calibrates("t_pi", "fake_pi")
+    raw = lab.params_file.read_bytes()
+    e._emit_calibrations()
+    out = capsys.readouterr().out
+    assert "was 6.5e-06, +1.72 %" in out                 # measured from the run's value
+    assert "the params file now says 6.6403e-06, the run used 6.5e-06" in out
+    assert lab.params_file.read_bytes() == raw
+    rec = json.loads((lab.ledger / "t_pi" / "85600.json").read_text())
+    assert [f["code"] for f in rec["flags"]] == ["file_changed"]
+
+
+# ---- S8: the load has its own budget; images only when an analysis needs them ----------
+
+def test_a_slow_load_defers_every_declaration(lab, capsys):
+    gate = threading.Event()
+
+    def slow_load(rid, needs_images=False):
+        gate.wait(10)
+        raise RuntimeError("too late")
+    e = make_run(lab, loader=slow_load)
+    e.calibration_config.load_budget_s = 0.2
+    e.calibrates("t_pi", "fake_pi")
+    try:
+        e._emit_calibrations()
+    finally:
+        gate.set()
+    out = capsys.readouterr().out
+    assert "[cal] not run (t_pi): loading run 85600 took longer than 0.2 s" in out
+    assert "kcal emit t_pi --run 85600 --analysis fake_pi" in out
+    rec = json.loads((lab.ledger / "t_pi" / "85600.json").read_text())
+    assert rec["deferred"] is True and not rec["applied"]
+
+
+def test_images_are_loaded_only_when_an_analysis_needs_them(lab):
+    seen = []
+    ad = SimpleNamespace(n=63, bad=0, run_info=SimpleNamespace(filepath=str(lab.run_file)))
+
+    def loader(rid, needs_images=False):
+        seen.append(needs_images)
+        return ad
+    e = make_run(lab, loader=loader)
+    e.calibrates("t_pi", "fake_pi", write_back=False)
+    e._emit_calibrations()
+    mod = sys.modules[f"{lab.reg}.fake_pi"]
+    mod.NEEDS_IMAGES = True
+    e2 = make_run(lab, loader=loader)
+    e2.calibrates("t_pi", "fake_pi", write_back=False)
+    e2._emit_calibrations()
+    assert seen == [False, True]
+
+
+def test_failed_analysis_prints_the_offline_command(lab, capsys):
+    e = make_run(lab)
+    e.calibrates("t_pi", "boom", opts={"x": 1})
+    e._emit_calibrations()
+    out = capsys.readouterr().out
+    assert "[cal]   to analyse it offline: kcal emit t_pi --run 85600 --analysis boom --opts '{\"x\": 1}'" in out
+
+
+# ---- N3: only lock errors are retried ------------------------------------------------------
+
+@pytest.mark.parametrize("err, attempts", [
+    (OSError("Unable to synchronously open file (unable to lock file, errno = 33)"), 3),
+    (PermissionError(13, "Permission denied"), 1),
+    (OSError("Unable to synchronously open file (file signature not found)"), 1),
+])
+def test_run_file_retries_only_lock_errors(lab, monkeypatch, capsys, err, attempts):
+    calls = []
+
+    def fake_file(*a, **k):
+        calls.append(1)
+        raise err
+    monkeypatch.setattr(h5py, "File", fake_file)
+    r = emit.CalResult(key="t_pi", value=1.0, unc=0.1)
+    assert emit.record_in_run_file([str(lab.run_file)], [r], tries=3, wait=0) is False
+    assert len(calls) == attempts
+    assert "not written" in capsys.readouterr().out

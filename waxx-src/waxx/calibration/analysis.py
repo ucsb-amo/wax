@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import math
 import pkgutil
+import sys
 import threading
 import time
 from typing import Callable, Optional, Sequence
@@ -89,6 +90,37 @@ def failed_result(key: str, reason: str, *, analysis: str = "", deferred: bool =
                      fit={"ok": False, "reason": reason}, deferred=deferred)
 
 
+def call_with_budget(fn: Callable, budget_s: float, name: str = "calibration"):
+    """``fn()`` in a daemon thread, waited on for ``budget_s``. Returns
+    ``(finished, value, error)``; past the budget the thread is left running
+    (never killed). Never raises."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:                    # recorded, never re-raised
+            box["error"] = e
+
+    th = threading.Thread(target=target, daemon=True, name=name)
+    th.start()
+    th.join(budget_s)
+    if th.is_alive():
+        return False, None, None
+    return True, box.get("value"), box.get("error")
+
+
+def needs_images(func: Callable, opts: Optional[dict] = None) -> bool:
+    """Whether the analysis needs the camera images (OD, atom number): its
+    ``needs_images`` attribute (a bool, or a callable taking the opts), else
+    its module's ``NEEDS_IMAGES``, else False -- the run is then loaded without
+    them (faster, and no image work inside end())."""
+    flag = getattr(func, "needs_images", None)
+    if flag is None:
+        flag = getattr(sys.modules.get(getattr(func, "__module__", ""), None), "NEEDS_IMAGES", False)
+    return bool(flag(dict(opts or {})) if callable(flag) else flag)
+
+
 def run_analysis(func: Callable, ad, key: str, opts: Optional[dict] = None, *,
                  budget_s: float = 30.0, figure_path=None, name: str = "") -> CalResult:
     """``func(ad, key, **opts)`` in a daemon thread, waited on for ``budget_s``.
@@ -100,26 +132,15 @@ def run_analysis(func: Callable, ad, key: str, opts: Optional[dict] = None, *,
     opts = dict(opts or {})
     if figure_path is not None:
         opts.setdefault("figure_path", str(figure_path))
-    box = {}
-
-    def target():
-        try:
-            box["result"] = func(ad, key, **opts)
-        except BaseException as e:                    # recorded, never re-raised
-            box["error"] = e
-
     t0 = time.monotonic()
-    th = threading.Thread(target=target, daemon=True, name=f"calibration:{key}")
-    th.start()
-    th.join(budget_s)
+    done, res, err = call_with_budget(lambda: func(ad, key, **opts), budget_s,
+                                      name=f"calibration:{key}")
     elapsed = time.monotonic() - t0
-    if th.is_alive():
+    if not done:
         return failed_result(key, f"did not finish within the {budget_s:g} s budget; deferred",
                              analysis=name, deferred=True)
-    if "error" in box:
-        e = box["error"]
-        return failed_result(key, f"the analysis raised {type(e).__name__}: {e}", analysis=name)
-    res = box.get("result")
+    if err is not None:
+        return failed_result(key, f"the analysis raised {type(err).__name__}: {err}", analysis=name)
     if not isinstance(res, CalResult):
         return failed_result(key, f"the analysis returned {type(res).__name__}, not a CalResult",
                              analysis=name)
