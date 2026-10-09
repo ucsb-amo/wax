@@ -39,6 +39,14 @@ def file_lock(target, timeout: float = 10.0, poll: float = 0.05, stale_s: float 
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
+        except PermissionError:
+            # Windows: the previous holder's lock file is being deleted (delete
+            # pending) -- it is still held for this purpose; try again. A real
+            # permission problem shows up as this error after the timeout.
+            if time.monotonic() - t0 > timeout:
+                raise
+            time.sleep(poll)
+            continue
         except FileExistsError:
             try:
                 age = time.time() - lock.stat().st_mtime
