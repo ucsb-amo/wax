@@ -208,7 +208,7 @@ def run_through(q, run_id, outcome="saved", code=0, lines=()):
 # --- scheduling ---------------------------------------------------------------------------
 
 def test_order_is_priority_then_due_then_id(q, expts):
-    a = submit(q, expts, "rabi")
+    a = submit(q, expts, "rabi", priority=0)
     b = submit(q, expts, "tof", priority=5)
     c = submit(q, expts, "cal", priority=5, due=q.clock.t + 60)
     d = submit(q, expts, "cal", priority=5)
@@ -315,7 +315,7 @@ def test_pause_scopes_and_the_person_hold(q, expts):
 def test_the_launch_command_environment_and_log(q, expts, tmp_path):
     a = submit(q, expts, label="rabi scan!", argv=["-a", "x=1"], owner="agent",
                write_back=False)
-    b = submit(q, expts, "tof")
+    b = submit(q, expts, "tof", priority=0)       # after the agent's job (same priority)
     q.tick()
     call = q.spawner.calls[0]
     path = str((expts / "rabi.py").resolve())
@@ -1220,3 +1220,77 @@ def test_a_file_outside_the_roots_is_refused_even_by_a_dotdot_path(tmp_path, exp
     assert reply["status"] == "error" and "outside the folders" in reply["msg"]
     reply = queue.submit({"path": str(expts / "JP" / ".." / "rabi.py")})
     assert reply["status"] == "error" and "outside the folders" in reply["msg"]
+
+
+# --- nits N6-N9 -------------------------------------------------------------------------------
+
+def test_a_cancelled_running_job_stops_its_chain(q, expts):
+    ids = submit(q, expts, repeat=3)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("Run ID: 101")
+    q.live.start_run(101)
+    q.tick()
+    q.cancel({"id": ids[0], "owner": "person", "by": "jp"})
+    q.tick()
+    proc.write("RuntimeError: Acquisition for run 101 aborted.")
+    q.live.end_run(101, "discarded")
+    proc.code = 1
+    q.tick()
+    assert job(q, ids[0])["state"] == "cancelled"
+    assert [job(q, i)["state"] for i in ids[1:]] == ["cancelled", "cancelled"]
+    assert job(q, ids[1])["reason"].startswith(f"chain repeat-{ids[0]} stopped")
+
+
+def test_a_cancelled_queued_job_does_not_stop_its_chain(q, expts):
+    ids = submit(q, expts, repeat=3)
+    q.cancel({"id": ids[1], "owner": "person", "by": "jp"})
+    q.tick()
+    assert job(q, ids[0])["state"] == "running" and job(q, ids[2])["state"] == "queued"
+
+
+@pytest.mark.parametrize("ended, state", [("saved", "running"), ("failed", "skipped")])
+def test_an_after_job_no_longer_kept_resolves_from_the_journal(tmp_path, expts, q, ended,
+                                                              state):
+    a = submit(q, expts)
+    q.tick()
+    run_through(q, 101, outcome="saved" if ended == "saved" else "saved_incomplete")
+    b = submit(q, expts, "tof", after=[a])
+    q.cancel({"id": b, "owner": "person", "by": "jp"})      # (only to stop it launching)
+    again = make_queue(tmp_path, expts)
+    del again._jobs[a]                                       # pruned from queue.json
+    c = submit(again, expts, "tof", after=[a])
+    again.tick()
+    assert job(again, c)["state"] == state
+
+
+def test_an_after_job_found_nowhere_skips_and_unissued_ids_are_refused(q, expts):
+    reply = q.submit({"path": str(expts / "rabi.py"), "after": [999]})
+    assert reply["status"] == "error" and "unknown job" in reply["msg"]
+    a = submit(q, expts)
+    del q._jobs[a]                                           # known to no record at all
+    b = submit(q, expts, after=[a])
+    q.tick()
+    assert job(q, b)["state"] == "skipped"
+
+
+@pytest.mark.parametrize("due", [float("nan"), float("inf"), "nan"])
+def test_a_due_that_is_not_a_finite_time_is_refused(q, expts, due):
+    reply = q.submit({"path": str(expts / "rabi.py"), "due": due})
+    assert reply["status"] == "error" and "finite" in reply["msg"]
+
+
+def test_a_persons_job_goes_to_the_front_unless_a_priority_is_given(q, expts):
+    agent = submit(q, expts, owner="agent")
+    person = submit(q, expts)
+    given = submit(q, expts, priority=0)
+    assert job(q, person)["priority"] == rq.PERSON_PRIORITY == 10
+    assert job(q, agent)["priority"] == 0 and job(q, given)["priority"] == 0
+    assert q.list()["next"] == [person, agent, given]
+
+
+def test_a_queued_run_with_restart_already_off_prints_nothing(monkeypatch, capsys):
+    from waxx.base import expt
+    monkeypatch.setenv("WAXX_LAUNCHER", rq.LAUNCHER)
+    assert expt._queue_restart_monitor(False) is False
+    assert capsys.readouterr().out == ""

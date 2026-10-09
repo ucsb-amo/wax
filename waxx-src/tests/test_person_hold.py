@@ -175,6 +175,9 @@ def server(qapp, monkeypatch, tmp_path):
     s.polls = [_poll(False)]
     s._live_od = lambda: s.polls[0]
     s.run_queue.poll_every_s = 0.0                     # every tick looks at liveOD
+    s.run_queue._spawn = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no job is launched in these tests"))
+    s.run_queue._adopt = lambda pid, started: None     # never a real process
     s.loops["auto_tof"]._poll = lambda: _poll(False)
     s.ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
     yield s
@@ -325,3 +328,38 @@ def test_an_older_live_od_is_watched_by_the_level_with_one_warning(caplog):
         hold.observe_poll(_poll(False, 900))
         assert hold.observe_poll(_poll(True, 900))
     assert len([r for r in caplog.records if "no reset_count" in r.getMessage()]) == 1
+
+
+# --- a hold ends a loop as a Stop does (review N8) ---------------------------------------------
+
+def test_a_hold_ends_a_loop_saying_so_and_starts_the_monitor(tmp_path):
+    import threading
+    from waxx.util.device_state.run_loop import LoopSpec, RunLoop
+    expt = tmp_path / "auto_tof.py"
+    expt.write_text("x = 1\n")
+    hold = PersonHold(clock=Clock())
+    started = []
+    live = lambda: _poll(False)                               # noqa: E731
+    gate = threading.Event()
+
+    class Proc:
+        pid = 1
+
+        def __init__(self):
+            self.stdout = iter(["Run ID: 101\n"])
+
+        def wait(self):
+            hold.hold("mine", "jp")                           # pressed during the run
+            return 0
+    loop = RunLoop(LoopSpec("auto_tof", "BEC TOF loop", str(expt)),
+                   poll=lambda: dict(live(), last_outcome={"run_id": 101, "outcome": "saved"}),
+                   spawn=lambda command, extra_env=None: Proc(), held=hold.text,
+                   start_monitor=started.append, gap_s=0., poll_s=0.01)
+    assert loop.start()["status"] == "ok"
+    loop.join(5)
+    info = loop.info()
+    assert info["state"] == "latched" and info["text"].startswith("person hold since")
+    assert "does not run while it is on" in info["text"]
+    assert len(started) == 1                                  # as for a Stop
+    assert loop.start()["msg"].startswith("person hold since")
+    assert gate is not None

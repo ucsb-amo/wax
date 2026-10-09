@@ -341,6 +341,7 @@ class MonitorUDPServer(UdpServer):
         # Experiments the GUIs may run back to back -- only these files.
         self.loops = {spec.key: RunLoop(spec, fence=self._current_run_pending,
                                         busy=self._loop_busy,
+                                        held=lambda: self.person_hold.text(),
                                         start_monitor=self.start_monitor_signal.emit,
                                         on_change=self._on_loop_change, journal=self.journal)
                       for spec in run_loops}
@@ -785,11 +786,10 @@ class MonitorUDPServer(UdpServer):
         return dict(source.since(obj.get("after", 0)), status="ok")
 
     def _loop_busy(self) -> str:
-        """Why something of this server's own holds the machine, for the
-        loops: a state reset, or a person's hold."""
-        if self.reset.running:
-            return "a state reset is running"
-        return self.person_hold.text()
+        """Why something of this server's own holds the core, for the loops: a
+        state reset.  (A person's hold reaches them as ``held``: a loop ends
+        on it as on a Stop.)"""
+        return "a state reset is running" if self.reset.running else ""
 
     def _on_loop_change(self, info) -> None:
         self._broadcaster.send({"type": "run_loop", "loop": info})

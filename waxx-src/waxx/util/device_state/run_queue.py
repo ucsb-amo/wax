@@ -141,6 +141,8 @@ OWNER_ENV = "WAXX_OWNER"
 #: applied: vetoed by WAXX_CAL_NO_WRITE_BACK"); this branch only sets it.
 NO_WRITE_BACK_ENV = "WAXX_CAL_NO_WRITE_BACK"
 
+#: A person's job's priority when none is given (an agent's: 0).
+PERSON_PRIORITY = 10
 #: An eligible job waiting this long with nothing running raises the alarm.
 ALARM_S = 600.0
 #: liveOD is polled at most this often for the hold's watch and the status
@@ -386,6 +388,8 @@ class RunQueue:
         self._owed_since: float | None = None
         self._alarm: dict | None = None
         self._own_abort_ids: set = set()
+        #: dependencies no longer kept in queue.json: their state from the journal
+        self._dep_cache: dict[int, str] = {}
         #: the last gate's kind: "free" | "live" | "blocked" (see _gate)
         self._gate_kind = ""
         #: the run id of the job that ended last (its fence may still be up)
@@ -491,7 +495,10 @@ class RunQueue:
         if owner not in OWNERS:
             raise QueueError(f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
         try:
-            priority = int(obj.get("priority") or 0)
+            # a person's `ar` goes to the front: priority 10 unless given
+            priority = (int(obj.get("priority")) if obj.get("priority") is not None
+                        else PERSON_PRIORITY if str(obj.get("owner") or "person") == "person"
+                        else 0)
         except (TypeError, ValueError):
             raise QueueError(f"priority must be an integer, not {obj.get('priority')!r}")
         due = obj.get("due")
@@ -500,6 +507,8 @@ class RunQueue:
                 due = float(due)
             except (TypeError, ValueError):
                 raise QueueError(f"due must be epoch seconds or null, not {due!r}")
+            if due != due or due in (float("inf"), float("-inf")):
+                raise QueueError(f"due must be a finite time, not {obj.get('due')!r}")
         after = obj.get("after") or []
         if not isinstance(after, (list, tuple)):
             after = [after]
@@ -527,7 +536,8 @@ class RunQueue:
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
         sha = file_sha256(path)
         with self._lock:
-            unknown = [a for a in after if a not in self._jobs]
+            unknown = [a for a in after if a not in self._jobs
+                       and self._dep_state(a) == "failed" and a >= self._next_id]
             if unknown:
                 raise QueueError(f"after names unknown job(s): {', '.join(map(str, unknown))}")
             first = self._next_id
@@ -807,8 +817,7 @@ class RunQueue:
             return f"it is {job.state}"
         if job.due is not None and job.due > now:
             return f"due at {_clock_text(job.due)}"
-        waits = [a for a in job.after if (self._jobs.get(a) is None
-                                           or self._jobs[a].state != "saved")]
+        waits = [a for a in job.after if self._dep_state(a) != "saved"]
         if waits:
             return "waiting for job " + ", ".join(map(str, waits))
         if self._paused.get("all"):
@@ -820,6 +829,31 @@ class RunQueue:
         if job.owner == "agent" and self.hold.active:
             return self.hold.text()
         return ""
+
+    def _dep_state(self, job_id: int) -> str:
+        """A dependency's state: its record, or -- for a job no longer kept in
+        queue.json (beyond KEEP_ENDED, or lost with an unreadable file) -- its
+        last end in the journal; a job found nowhere counts as "failed" (its
+        dependents are skipped, never left waiting)."""
+        dep = self._jobs.get(job_id)
+        if dep is not None:
+            return dep.state
+        cached = self._dep_cache.get(job_id)
+        if cached is None:
+            cached = "failed"
+            try:
+                with open(self._path("journal.jsonl"), "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("kind") == "run_queue_end" and rec.get("job") == job_id:
+                            cached = str(rec.get("state") or "failed")
+            except (OSError, TypeError):
+                pass
+            self._dep_cache[job_id] = cached
+        return cached
 
     def _order(self, now: float) -> list[Job]:
         """The eligible jobs, the next one first."""
@@ -844,7 +878,10 @@ class RunQueue:
     def tick(self) -> None:
         """One step: follow the job in the slot, settle dependencies, stop or
         restart a loop, launch the next job when the machine is free, and the
-        alarm.  Called by one thread."""
+        alarm.  Called by one thread: the monitor server's watch, every
+        ``WATCH_S`` (0.5 s).  liveOD is polled at most every
+        ``poll_every_s`` (:data:`POLL_EVERY_S`, 2 s) for the hold's watch and
+        the slot's job, and afresh before a launch, an Abort and an outcome."""
         if not self._tick_lock.acquire(blocking=False):
             return
         try:
@@ -918,10 +955,13 @@ class RunQueue:
                     if job.state != "queued":
                         continue
                     for a in job.after:
-                        dep = self._jobs.get(a)
-                        if dep is not None and dep.state in ENDED and dep.state != "saved":
-                            self._end(job, "skipped", f"job {a} ended {dep.state}"
-                                      + (f" ({dep.reason})" if dep.reason else ""))
+                        state = self._dep_state(a)
+                        if state in ENDED and state != "saved":
+                            dep = self._jobs.get(a)
+                            why = (dep.reason if dep is not None else
+                                   "no longer in queue.json; from the journal")
+                            self._end(job, "skipped", f"job {a} ended {state}"
+                                      + (f" ({why})" if why else ""))
                             changed = True
                             break
         if changed:
@@ -1374,7 +1414,7 @@ class RunQueue:
             elif proc is None and state == "saved":
                 reason = (f"its process ended while the monitor server was down; liveOD "
                           f"recorded run {job.run_id} saved")
-            self._end(job, state, reason)
+            self._end(job, state, reason, stop_chain=state in ("failed", "cancelled"))
             self._current = None
             self._last_end_t = self._clock()
             self._last_ended_run_id = job.run_id
@@ -1462,15 +1502,18 @@ class RunQueue:
 
     # -- ending jobs and chains ---------------------------------------------------------------
 
-    def _end(self, job: Job, state: str, reason: str) -> None:
+    def _end(self, job: Job, state: str, reason: str, stop_chain: bool | None = None) -> None:
         """Put a job in an ended state (under the lock), journal it, and stop
-        its chain when it failed or was skipped."""
+        its chain (``stop_chain`` None: when it failed or was skipped; a
+        running job that was cancelled stops it too)."""
         job.state = state
         job.reason = reason
         job.ended_at = self._clock()
         self._record("run_queue_end", job=job.id, state=state, reason=reason,
                      run_id=job.run_id, exit_code=job.exit_code, outcome=job.outcome)
-        if state in ("failed", "skipped") and job.chain and job.stop_on_failure:
+        if stop_chain is None:
+            stop_chain = state in ("failed", "skipped")
+        if stop_chain and job.chain and job.stop_on_failure:
             for other in sorted(self._jobs.values(), key=lambda j: j.id):
                 if other.chain == job.chain and other.state == "queued" and other.id != job.id:
                     other.state = "cancelled"

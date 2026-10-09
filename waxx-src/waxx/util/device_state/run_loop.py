@@ -196,8 +196,9 @@ class _LiveOD:
     reachable") although liveOD was up.  POLL is read-only, so repeating it is
     safe; the exit notice is not repeated.
 
-    One request at a time (a lock): the monitor server shares one of these
-    between its threads (the person hold's watch and the run queue)."""
+    One request at a time (a lock).  Each RunLoop makes its own (a loop polls
+    while its run starts, and between runs); the monitor server keeps one
+    more for its watch thread -- the run queue and the person hold."""
 
     def __init__(self):
         self._client = None
@@ -264,6 +265,7 @@ class RunLoop:
                  run_exited: Callable[[int, str], dict] | None = None,
                  fence: Callable[[], dict | None] | None = None,
                  busy: Callable[[], str] | None = None,
+                 held: Callable[[], str] | None = None,
                  start_monitor: Callable[[str], None] | None = None,
                  on_change: Callable[[dict], None] | None = None, journal=None,
                  spawn=None, clock: Callable[[], float] = time.time,
@@ -276,6 +278,7 @@ class RunLoop:
         self._run_exited = run_exited or getattr(self._poll, "run_exited", None)
         self._fence = fence
         self._busy = busy
+        self._held = held
         self._start_monitor = start_monitor
         self._on_change = on_change
         self._journal = journal
@@ -510,6 +513,11 @@ class RunLoop:
     def _gate(self) -> tuple[str, bool] | None:
         """(why the machine is not free, whether the monitor may be started
         then) -- or None when it is free."""
+        held = self._held() if self._held is not None else ""
+        if held:
+            # a person has the machine: the loop ends as on a Stop (the
+            # monitor is started), and the text says it is the hold
+            return f"{held} -- the loop does not run while it is on", True
         busy = self._busy() if self._busy is not None else ""
         if busy:
             return busy, False

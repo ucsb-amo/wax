@@ -54,7 +54,8 @@ def server(qapp, monkeypatch, tmp_path, expts):
     s.live = Live()
     s._live_od = s.live                               # the queue calls it late
     s.spawner = Spawner()
-    s.run_queue._spawn = s.spawner
+    s.run_queue._spawn = s.spawner                    # never the real detached launcher
+    s.run_queue._adopt = lambda pid, started: None    # never a real process
     s.run_queue.poll_every_s, s.run_queue._gap_s, s.run_queue._outcome_wait_s = 0., 0., 0.
     loop = s.loops["auto_tof"]
     loop._poll = s.live

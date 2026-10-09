@@ -79,7 +79,7 @@ def _queue_restart_monitor(restart_monitor):
     queue's next job follows at once, and the monitor server starts the
     monitor itself when the queue runs out (or starts again the loop it
     stopped).  Says so in one line; any other run keeps ``restart_monitor``."""
-    if os.environ.get("WAXX_LAUNCHER") != QUEUE_LAUNCHER:
+    if os.environ.get("WAXX_LAUNCHER") != QUEUE_LAUNCHER or not restart_monitor:
         return restart_monitor
     print(f"[Monitor] launched by the run queue (job {os.environ.get('WAXX_QUEUE_JOB') or '?'}"
           "): the monitor is not restarted at the end of this run -- the monitor server "
