@@ -140,9 +140,26 @@ def test_calibrates_checks_in_prepare(lab):
         e.calibrates("t_nope", "fake_pi")
     with pytest.raises(LookupError, match="no analysis 'nothing'"):
         e.calibrates("amp", "nothing")
+    lab.params_mod.Params.helper = lambda self: None
+    e.params = lab.params_mod.Params()
+    with pytest.raises(ValueError, match="is a method"):
+        e.calibrates("helper", "fake_pi")
+    e.xvarnames = ["amp"]
+    with pytest.raises(ValueError, match="is scanned"):
+        e.calibrates("amp", "fake_pi")
+    e.xvarnames = []
     e.calibration_config = None
     with pytest.raises(RuntimeError, match="no calibration_config"):
         e.calibrates("amp", "fake_pi")
+
+
+def test_a_key_scanned_after_it_was_declared_is_not_run(lab, capsys):
+    e = make_run(lab)
+    e.calibrates("amp", "fake_pi")
+    e.xvarnames = ["amp"]
+    e._emit_calibrations()
+    assert "[cal] not run (amp): it was scanned in this run" in capsys.readouterr().out
+    assert not lab.ledger.exists()
 
 
 # ---- the emit ----------------------------------------------------------------------

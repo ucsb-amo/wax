@@ -323,6 +323,12 @@ class Expt(Scanner, Dealer, Scribe):
         from waxx.calibration.emit import Declaration
         if not isinstance(key, str) or not hasattr(self.params, key):
             raise ValueError(f"calibrates: {key!r} is not a param of {type(self.params).__name__}")
+        if callable(getattr(self.params, key)):
+            raise ValueError(f"calibrates: {key!r} is a method of {type(self.params).__name__}, "
+                             f"not a param")
+        if key in (getattr(self, "xvarnames", None) or []):
+            raise ValueError(f"calibrates: {key!r} is scanned in this run; a scanned param "
+                             f"cannot be calibrated by it")
         if any(d.key == key for d in self._cal_declarations):
             raise ValueError(f"calibrates: {key!r} is declared twice")
         cfg = getattr(self, "calibration_config", None)
