@@ -408,12 +408,25 @@ def test_edit_dialog_reports_only_changed_fields(qapp):
 
 
 def test_parse_due():
-    base = time.mktime((2026, 10, 9, 12, 0, 0, 0, 0, -1))
+    import datetime
+    base = datetime.datetime(2026, 10, 9, 12, 0).timestamp()
     assert rqp._parse_due("", base) is None
     assert rqp._parse_due("13:30", base) == base + 5400
-    assert rqp._parse_due("11:00", base) == base + 23 * 3600         # tomorrow
+    assert rqp._parse_due("11:00", base) == datetime.datetime(2026, 10, 10, 11, 0).timestamp()
+    # by the calendar: across the DST change (2026-11-01 in the US) 11:00 is 11:00
+    sat = datetime.datetime(2026, 10, 31, 12, 0).timestamp()
+    assert rqp._parse_due("11:00", sat) == datetime.datetime(2026, 11, 1, 11, 0).timestamp()
+    assert rqp._parse_due("2026-10-12 08:15", base) == \
+        datetime.datetime(2026, 10, 12, 8, 15).timestamp()
+    assert rqp._parse_due(str(int(base) + 60), base) == int(base) + 60   # epoch, as kq --at
     with pytest.raises(ValueError):
         rqp._parse_due("soon", base)
+    # the dialog reads back what it shows for another day ("MM-DD HH:MM")
+    later = datetime.datetime.now().replace(second=0, microsecond=0) + \
+        datetime.timedelta(days=3)
+    shown = rqp._clock(later.timestamp())
+    assert len(shown) == len("10-12 08:15")
+    assert rqp._parse_due(shown) == later.timestamp()
 
 
 def test_unknown_request_detection():

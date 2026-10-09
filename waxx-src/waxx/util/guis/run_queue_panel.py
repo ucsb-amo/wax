@@ -616,31 +616,35 @@ def split_argv(text: str) -> list[str]:
 
 
 def _parse_due(text: str, now: float | None = None) -> float | None:
-    """"" -> None; "HH:MM" -> the next such time (today, or tomorrow if it has
-    passed); "YYYY-MM-DD HH:MM" -> that time.  ValueError when unreadable."""
+    """A due time as the dialog takes it -> epoch seconds (None for "").
+
+    * ``HH:MM[:SS]`` or epoch seconds: :func:`kq.parse_at` -- the same rule
+      as ``kq --at`` (the next such time, by the calendar: a time already
+      past today is tomorrow's, and a DST change is no hour off);
+    * ``MM-DD HH:MM[:SS]`` (the form :func:`_clock` shows for another day)
+      -- that day this year;
+    * ``YYYY-MM-DD HH:MM[:SS]``.
+
+    ValueError when unreadable."""
+    import datetime  # noqa: PLC0415
+
+    from waxx.util.device_state.kq import parse_at  # noqa: PLC0415
     text = text.strip()
     if not text:
         return None
-    now = time.time() if now is None else now
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+    now = time.time() if now is None else float(now)
+    year = datetime.datetime.fromtimestamp(now).year
+    for fmt, prefix in (("%Y-%m-%d %H:%M", ""), ("%Y-%m-%d %H:%M:%S", ""),
+                        ("%Y-%m-%d %H:%M", f"{year}-"), ("%Y-%m-%d %H:%M:%S", f"{year}-")):
         try:
-            return time.mktime(time.strptime(text, fmt))
+            return datetime.datetime.strptime(prefix + text, fmt).timestamp()
         except ValueError:
             pass
-    for fmt in ("%H:%M", "%H:%M:%S"):
-        try:
-            hm = time.strptime(text, fmt)
-        except ValueError:
-            continue
-        day = time.localtime(now)
-        t = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, hm.tm_hour, hm.tm_min,
-                         hm.tm_sec, 0, 0, -1))
-        if t <= now:
-            tomorrow = time.localtime(now + 86400)
-            t = time.mktime((tomorrow.tm_year, tomorrow.tm_mon, tomorrow.tm_mday, hm.tm_hour,
-                             hm.tm_min, hm.tm_sec, 0, 0, -1))
-        return t
-    raise ValueError(f"not a time: {text!r} (HH:MM or YYYY-MM-DD HH:MM)")
+    try:
+        return parse_at(text, now)
+    except ValueError:
+        raise ValueError(f"due: not a time: {text!r} (HH:MM, MM-DD HH:MM or "
+                         "YYYY-MM-DD HH:MM)") from None
 
 
 class EditJobDialog(QDialog):
@@ -669,7 +673,8 @@ class EditJobDialog(QDialog):
         #: the due time as first shown: left as it is, the job's own value stays
         self._due_shown = _clock(job.get("due")) if job.get("due") else ""
         self.due = QLineEdit(self._due_shown)
-        self.due.setPlaceholderText("blank: now; HH:MM or YYYY-MM-DD HH:MM")
+        self.due.setPlaceholderText("blank: no due time; HH:MM (next), MM-DD HH:MM, "
+                                    "YYYY-MM-DD HH:MM")
         self.allow_drift = QCheckBox("run it even if the file changes before launch")
         self.allow_drift.setChecked(bool(job.get("allow_drift")))
         self.paused = QCheckBox("paused (this job stays queued until unpaused)")
