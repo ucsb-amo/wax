@@ -10,6 +10,13 @@ Commands::
 
     kq run <file.py> [ARG...] [options] [-- argv...]   submit, then follow its output
     kq submit <file.py> [ARG...] [options] [-- argv...]   submit only (= run --detach)
+    kq insert <file.py> [ARG...] (--at-index N | --before ID | --after ID) [options]
+                                              run, placed at that position
+    kq move <id> (--to N | --before ID | --after ID)    put a queued job elsewhere
+    kq edit <id> [--argv ...] [--label L] [--after-saved ID ...] [--chain C]
+            [--stop-on-failure | --no-stop-on-failure] [--no-write-back |
+            --write-back-default] [--at T | --no-at] [--allow-drift |
+            --no-allow-drift] [--pause | --unpause]     change a queued job
     kq list [--all] [--state S ...] [--json]  the jobs and the queue's state
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
@@ -38,11 +45,28 @@ its file) -- and kq prints "abort requested; waiting for the run to end" and
 follows the job to its end; anything else, or no terminal, leaves the run going and prints how
 to follow or cancel it.  A second Ctrl-C while following an abort leaves too.
 
+Order: the queue runs the eligible job nearest the front.  A new job goes to
+the end, except that a person's job is placed ahead of every queued agent job
+(``--at-end`` opts out); ``--priority`` is only a placement hint within its
+owner's block.  ``kq insert`` places a job, ``kq move`` moves a queued one.
+Positions count from 1 (the front), as ``kq list`` shows them.  ``--after`` on
+run / submit means "only after these jobs have saved" (also spelt
+``--after-saved``); on insert and move ``--after ID`` is a position, so insert
+takes ``--after-saved`` for the dependency.
+
 Owner: kq acts for a person unless the environment has ``WAXX_OWNER=agent``
-(the agents' skill sets it; ``--agent`` is a convenience for the same).  Every
-request that changes something carries the owner: an agent cannot cancel a
-person's job, release a person's hold or resume a person's pause.  Without
-``--priority`` the queue gives the owner's default.  ``by`` is ``user@host``.
+(the agents' skill sets it; ``--agent`` is a convenience for the same); an
+agent's jobs carry ``WAXX_AGENT_LABEL`` as their submitter when it is set.
+Every request that changes something carries the owner: an agent cannot
+cancel, move or edit a person's job, release a person's hold or resume a
+person's pause (the server's refusal is printed as it words it).  ``by`` is
+``user@host``.
+
+``kq list`` shows each job's position, submitter, experiment class, an
+estimate (marked ``est.``: the median of the last saved runs of the same file,
+or liveOD's shot count for the running job -- an estimate, not a promise), and
+why it waits; a ``*`` after the label marks a queued job whose file changed
+since submit (it is skipped at launch unless drift is allowed).
 
 Output: kq's own lines are ASCII; the experiment's lines are written as they
 are, with any character the terminal cannot show replaced.  Errors go to
@@ -95,6 +119,9 @@ EXIT_INTERRUPTED = 130
 
 NO_QUEUE_TEXT = ("no run queue is beaconing; use artiq_run --device-db %db% <file> for a "
                  "direct run, or start the Server Dashboard")
+
+#: The commands that submit a job.
+RUN_COMMANDS = ("run", "submit", "insert")
 
 #: Lines of ended jobs shown by a plain ``kq list``.
 LIST_ENDED = 10
@@ -326,18 +353,30 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", metavar="command", parser_class=_Parser)
     sub.required = True
 
-    def run_options(sp):
+    def run_options(sp, insert=False):
         sp.add_argument("file", help="the experiment file (.py)")
         sp.add_argument("args", nargs="*", metavar="ARG",
                         help="the experiment's arguments (key=value), as after the file "
                              "in artiq_run; words starting with - go after --")
         sp.add_argument("--label", help="a short name (default: the file's stem)")
         sp.add_argument("--priority", type=int, default=None,
-                        help="higher goes first (default: the queue's, by owner)")
+                        help="placement hint within the owner's block (higher first)")
         sp.add_argument("--at", dest="at", metavar="HH:MM|EPOCH",
                         help="not before this time (local HH:MM: the next such time)")
-        sp.add_argument("--after", type=int, nargs="+", action="extend", default=[],
-                        metavar="ID", help="only after these jobs have saved")
+        deps = ("--after-saved",) if insert else ("--after", "--after-saved")
+        sp.add_argument(*deps, dest="after", type=int, nargs="+", action="extend",
+                        default=[], metavar="ID", help="only after these jobs have saved")
+        if insert:
+            where = sp.add_mutually_exclusive_group(required=True)
+            where.add_argument("--at-index", type=int, metavar="N",
+                               help="at position N (1: the front)")
+            where.add_argument("--before", type=int, metavar="ID", help="before queued job ID")
+            where.add_argument("--after", dest="after_id", type=int, metavar="ID",
+                               help="after queued job ID (a position, not a dependency)")
+        else:
+            sp.add_argument("--at-end", action="store_true",
+                            help="at the end of the queue (a person's job otherwise goes "
+                                 "ahead of every queued agent job)")
         sp.add_argument("--repeat", type=int, default=1, help="N runs, one job each (a chain)")
         sp.add_argument("--chain", help="chain name (jobs of a chain stop together)")
         sp.add_argument("--no-stop-on-failure", action="store_true",
@@ -358,6 +397,52 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("--detach", action="store_true", help="submit only; do not follow")
     sp = sub.add_parser("submit", help="submit only (= run --detach)")
     run_options(sp)
+    sp = sub.add_parser("insert", help="run a job placed at a position (follows it, as run)")
+    run_options(sp, insert=True)
+    sp.add_argument("--detach", action="store_true", help="insert only; do not follow")
+
+    sp = sub.add_parser("move", help="put a queued job elsewhere in the order")
+    sp.add_argument("id", type=int)
+    where = sp.add_mutually_exclusive_group(required=True)
+    where.add_argument("--to", type=int, metavar="N", help="to position N (1: the front)")
+    where.add_argument("--before", type=int, metavar="ID", help="before queued job ID")
+    where.add_argument("--after", type=int, metavar="ID", help="after queued job ID")
+    sp.add_argument("--token")
+    sp.add_argument("--agent", action="store_true", help="as an agent")
+
+    sp = sub.add_parser("edit", help="change a queued job")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--argv", nargs="*", metavar="ARG",
+                    help="the experiment's arguments, replaced (none: cleared; words "
+                         "starting with - go after --)")
+    sp.add_argument("--label")
+    sp.add_argument("--after-saved", dest="after", type=int, nargs="*", metavar="ID",
+                    help="only after these jobs have saved, replaced (none: cleared)")
+    sp.add_argument("--chain", help="chain name ('' clears it)")
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--stop-on-failure", dest="stop_on_failure", action="store_const",
+                      const=True)
+    flag.add_argument("--no-stop-on-failure", dest="stop_on_failure", action="store_const",
+                      const=False)
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--no-write-back", dest="write_back", action="store_const",
+                      const="veto", help="ask that the write-back be vetoed")
+    flag.add_argument("--write-back-default", dest="write_back", action="store_const",
+                      const="default", help="drop that request")
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--at", dest="at", metavar="HH:MM|EPOCH")
+    flag.add_argument("--no-at", dest="at", action="store_const", const="",
+                      help="no due time")
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--allow-drift", dest="allow_drift", action="store_const", const=True)
+    flag.add_argument("--no-allow-drift", dest="allow_drift", action="store_const",
+                      const=False)
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--pause", dest="paused", action="store_const", const=True,
+                      help="this job is not launched until --unpause")
+    flag.add_argument("--unpause", dest="paused", action="store_const", const=False)
+    sp.add_argument("--token")
+    sp.add_argument("--agent", action="store_true", help="as an agent")
 
     sp = sub.add_parser("list", help="the jobs and the queue's state")
     sp.add_argument("--all", action="store_true", help="every job the server keeps")
@@ -434,7 +519,11 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             owner=owner, priority=args.priority, due=due, after=args.after,
             repeat=args.repeat, chain=args.chain,
             stop_on_failure=False if args.no_stop_on_failure else None,
-            write_back=False if args.no_write_back else None, allow_drift=args.allow_drift)
+            write_back=False if args.no_write_back else None, allow_drift=args.allow_drift,
+            at_end=getattr(args, "at_end", False),
+            at_index=(None if getattr(args, "at_index", None) is None
+                      else args.at_index - 1),
+            before_id=getattr(args, "before", None), after_id=getattr(args, "after_id", None))
     except KeyboardInterrupt:
         safe_write(ctx.out, "\n")
         ctx.warn("[kq] interrupted while submitting: the job may be queued -- check kq list")
@@ -450,7 +539,9 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             else f"job {ids[0]}")
     due_text = f", due {_when(due)}" if due else ""
     if args.cmd == "submit" or getattr(args, "detach", False):
-        ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text}")
+        placed = _position(ctx, ids[0], tokens.get(ids[0]))
+        ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
+                f"({placed})")
         ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
         return EXIT_OK
     # from here on a Ctrl-C anywhere goes to _interrupted: the job ids are
@@ -486,16 +577,18 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
 
 
 def _position(ctx: _Ctx, jid: int, token) -> str:
+    """"position 2 of 5; <why it waits>" for a job just submitted (positions
+    count from 1, the front)."""
     try:
-        listed = ctx.client.list(states=("queued",) + IN_SLOT)
         described = ctx.client.describe(jid, token)
     except RunQueueError:
         return "position unknown"
-    nxt = listed.get("next") or []
-    why = described.get("waiting") or ""
-    if jid in nxt:
-        return f"position {nxt.index(jid) + 1}; {why or 'launching'}"
-    return f"not yet eligible; {why}" if why else "state " + str(described["job"].get("state"))
+    job = described.get("job") or {}
+    why = described.get("waiting") or job.get("waiting") or ""
+    pos = job.get("position")
+    if pos is not None:
+        return f"position {int(pos) + 1}; {why or 'launching'}"
+    return f"{job.get('state')}; {why}" if why else f"{job.get('state')}"
 
 
 def _cancel_queued(ctx: _Ctx, ids, tokens, owner) -> list[int]:
@@ -586,21 +679,69 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
         return EXIT_INTERRUPTED
 
 
-def _list_rows(jobs: list[dict]) -> list[list[str]]:
-    rows = [["id", "state", "owner", "label", "run_id", "prio", "due", "chain", "reason"]]
+def _duration_text(seconds) -> str:
+    seconds = float(seconds)
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def est_text(est: dict | None, state: str) -> str:
+    """The estimate column, always marked "est." (an estimate from earlier
+    runs of the same file, or liveOD's shot count -- not a promise)."""
+    est = est or {}
+    if state in ENDED or not est:
+        return "-"
+    if state in IN_SLOT and est.get("eta_end"):
+        return f"est. end {_when(est['eta_end'])}"
+    if est.get("eta_start"):
+        return f"est. start {_when(est['eta_start'])}"
+    if est.get("duration_s") is not None:
+        return f"est. {_duration_text(est['duration_s'])}"
+    return "-"
+
+
+def _note(view: dict, row: dict | None) -> str:
+    """The last column: why a queued job waits, an abort requested for the
+    job in the slot, why an ended job ended."""
+    state = view.get("state")
+    if state in IN_SLOT and view.get("cancel"):
+        c = view["cancel"]
+        text = (f"abort requested by {c.get('by') or '?'}"
+                + (f": {c.get('abort_note')}" if c.get("abort_note") else ""))
+    elif state in ENDED:
+        text = str(view.get("reason") or "")
+    else:
+        text = str((row or {}).get("waiting") or view.get("waiting") or "")
+        if view.get("paused"):
+            text = f"PAUSED by {view.get('paused_by') or '?'}" + (f"; {text}" if text else "")
+    return text[:67] + "..." if len(text) > 70 else text
+
+
+def _list_rows(jobs: list[dict], rows: dict) -> list[list[str]]:
+    """The table: the server's ``rows`` (by id) for position, submitter, class
+    and estimate, the job views for the rest."""
+    table = [["pos", "id", "state", "owner", "submitter", "label", "class", "run_id", "est",
+              "waiting / reason"]]
     for j in jobs:
-        reason = str(j.get("reason") or "")
-        if j.get("state") in IN_SLOT and j.get("cancel"):
-            c = j["cancel"]
-            reason = (f"abort requested by {c.get('by') or '?'}"
-                      + (f": {c.get('abort_note')}" if c.get("abort_note") else ""))
-        if len(reason) > 70:
-            reason = reason[:67] + "..."
-        rows.append([str(j.get("id")), str(j.get("state")), str(j.get("owner")),
-                     str(j.get("label")), "-" if j.get("run_id") is None else str(j["run_id"]),
-                     str(j.get("priority", 0)), _when(j.get("due")),
-                     str(j.get("chain") or "-"), reason or "-"])
-    return rows
+        row = rows.get(j.get("id")) or {}
+        pos = row.get("position", j.get("position"))
+        label = str(j.get("label")) + ("*" if j.get("source_changed") else "")
+        run_id = row.get("run_id", j.get("run_id"))
+        table.append([
+            "-" if pos is None else str(int(pos) + 1), str(j.get("id")), str(j.get("state")),
+            str(j.get("owner")), str(row.get("submitter") or j.get("submitter") or "-"),
+            label, str(row.get("expt_class") or j.get("expt_class") or "-"),
+            "-" if run_id is None else str(run_id),
+            est_text(row.get("est", j.get("estimate")), str(j.get("state"))),
+            _note(j, row) or "-"])
+    return table
+
+
+SOURCE_CHANGED_NOTE = ("* source changed since submit: the job is skipped at launch unless "
+                       "drift is allowed (kq edit <id> --allow-drift)")
 
 
 def _cmd_list(ctx: _Ctx, args) -> int:
@@ -611,16 +752,22 @@ def _cmd_list(ctx: _Ctx, args) -> int:
         keep = {j["id"] for j in ended[-LIST_ENDED:]}
         jobs = [j for j in jobs if j.get("state") not in ENDED or j["id"] in keep]
     if args.json:
-        ctx.say(json.dumps({"jobs": jobs, "next": reply.get("next"),
-                            "run_queue": reply.get("run_queue")}, indent=1, default=str))
+        ids = {j["id"] for j in jobs}
+        ctx.say(json.dumps({"jobs": jobs,
+                            "rows": [r for r in reply.get("rows") or [] if r.get("id") in ids],
+                            "next": reply.get("next"), "run_queue": reply.get("run_queue")},
+                           indent=1, default=str))
         return EXIT_OK
-    rows = _list_rows(jobs)
-    widths = [max(len(ascii_text(r[i])) for r in rows) for i in range(len(rows[0]) - 1)]
-    if len(rows) > 1:
-        for r in rows:
+    rows = {r.get("id"): r for r in reply.get("rows") or []}
+    table = _list_rows(jobs, rows)
+    widths = [max(len(ascii_text(r[i])) for r in table) for i in range(len(table[0]) - 1)]
+    if len(table) > 1:
+        for r in table:
             ctx.say("  ".join(c.ljust(w) for c, w in zip(r[:-1], widths)) + "  " + r[-1])
     else:
         ctx.say("(no jobs)")
+    if any(j.get("source_changed") for j in jobs):
+        ctx.say(SOURCE_CHANGED_NOTE)
     ctx.say(queue_line(reply.get("run_queue") or {}))
     return EXIT_OK
 
@@ -633,18 +780,31 @@ def _cmd_show(ctx: _Ctx, args) -> int:
     j = reply["job"]
     ctx.say(f"{_job_word(j)}: {j.get('state')}"
             + (f" -- {j.get('reason')}" if j.get("reason") else ""))
+    if j.get("position") is not None:
+        ctx.say(f"  position: {int(j['position']) + 1}")
     if reply.get("waiting"):
         ctx.say(f"  waiting: {reply['waiting']}")
-    for key in ("path", "argv", "cwd", "owner", "priority", "chain", "after", "run_id",
-                "exit_code", "log_path", "submitted_by", "token"):
+    if j.get("paused"):
+        ctx.say(f"  PAUSED (this job) by {j.get('paused_by') or '?'} since "
+                f"{_when(j.get('paused_since'))}")
+    if j.get("source_changed"):
+        ctx.say("  source changed since submit: skipped at launch unless drift is allowed")
+    for key in ("path", "expt_class", "argv", "cwd", "owner", "submitter", "priority", "chain",
+                "after", "run_id", "exit_code", "log_path", "submitted_by", "token"):
         val = j.get(key)
         if val not in (None, "", []):
             ctx.say(f"  {key}: {val}")
+    cal = j.get("calibrates_declared")
+    if cal is not None:
+        ctx.say("  calibrates (declared in the file): " + (", ".join(map(str, cal)) or "none"))
     if j.get("repeat_of", 1) > 1:
         ctx.say(f"  repeat: {j.get('repeat_index')} of {j.get('repeat_of')}")
     for key in ("due", "submitted_at", "launched_at", "ended_at"):
         if j.get(key):
             ctx.say(f"  {key}: {_when(j[key])}")
+    est = j.get("estimate")
+    if est and j.get("state") not in ENDED:
+        ctx.say(f"  {est_text(est, str(j.get('state')))} -- basis: {est.get('basis') or '?'}")
     if j.get("write_back") is False:
         # the queue passes WAXX_CAL_NO_WRITE_BACK=1; nothing reads it until the
         # calibration write-back branch lands
@@ -665,6 +825,55 @@ def _cmd_show(ctx: _Ctx, args) -> int:
         ctx.say("  last lines:")
         for line in tail:
             ctx.say(f"    | {line}")
+    return EXIT_OK
+
+
+def _cmd_move(ctx: _Ctx, args) -> int:
+    reply = ctx.client.move(args.id, to_index=None if args.to is None else args.to - 1,
+                            before_id=args.before, after_id=args.after, token=args.token,
+                            owner=_owner(args))
+    job = reply.get("job") or {"id": args.id}
+    pos = reply.get("position")
+    ctx.say(f"[kq] {_job_word(job)} moved to position "
+            + ("?" if pos is None else str(int(pos) + 1)))
+    return EXIT_OK
+
+
+def _cmd_edit(ctx: _Ctx, args) -> int:
+    fields = {}
+    if args.argv is not None:
+        fields["argv"] = list(args.argv)
+    if args.label is not None:
+        fields["label"] = args.label
+    if args.after is not None:
+        fields["after"] = list(args.after)
+    if args.chain is not None:
+        fields["chain"] = args.chain or None
+    if args.stop_on_failure is not None:
+        fields["stop_on_failure"] = args.stop_on_failure
+    if args.write_back is not None:
+        fields["write_back"] = False if args.write_back == "veto" else None
+    if args.at is not None:
+        if args.at == "":
+            fields["due"] = None
+        else:
+            try:
+                fields["due"] = parse_at(args.at)
+            except ValueError as exc:
+                ctx.warn(f"kq: {exc}")
+                return EXIT_USAGE
+    if args.allow_drift is not None:
+        fields["allow_drift"] = args.allow_drift
+    if args.paused is not None:
+        fields["paused"] = args.paused
+    if not fields:
+        ctx.warn("kq: nothing to change (kq edit --help lists the fields)")
+        return EXIT_USAGE
+    reply = ctx.client.edit(args.id, fields, token=args.token, owner=_owner(args))
+    job = reply.get("job") or {"id": args.id}
+    changed = reply.get("changed") or []
+    ctx.say(f"[kq] {_job_word(job)}: "
+            + (f"changed {', '.join(changed)}" if changed else "nothing changed"))
     return EXIT_OK
 
 
@@ -792,6 +1001,7 @@ def _cmd_status(ctx: _Ctx, args) -> int:
 
 
 _COMMANDS = {"list": _cmd_list, "show": _cmd_show, "tail": _cmd_tail, "cancel": _cmd_cancel,
+             "move": _cmd_move, "edit": _cmd_edit,
              "pause": _cmd_pause, "resume": _cmd_resume, "hold": _cmd_hold,
              "release": _cmd_release, "status": _cmd_status}
 
@@ -821,21 +1031,24 @@ def main(argv=None, *, client_factory=None, out=None, err=None, ask=None,
         # (kq run f.py a=1 --label x b=2); anything else left over is an error
         args, extra = parser.parse_known_args(words)
         if extra:
-            if args.cmd in ("run", "submit") and not any(w.startswith("-") for w in extra):
+            if args.cmd in RUN_COMMANDS and not any(w.startswith("-") for w in extra):
                 args.args = list(args.args) + extra
             else:
                 parser.error("unrecognized arguments: " + " ".join(extra)
                              + (" (experiment options go after --)"
-                                if args.cmd in ("run", "submit") else ""))
+                                if args.cmd in RUN_COMMANDS else ""))
     except SystemExit as exc:
         return EXIT_OK if exc.code in (0, None) else EXIT_USAGE
-    if expt_argv and args.cmd not in ("run", "submit"):
-        safe_write(err, "kq: arguments after -- are for kq run / kq submit only\n")
+    if expt_argv and args.cmd == "edit":
+        args.argv = list(args.argv or []) + expt_argv
+    elif expt_argv and args.cmd not in RUN_COMMANDS:
+        safe_write(err, "kq: arguments after -- are for kq run / submit / insert / edit "
+                        "only\n")
         return EXIT_USAGE
     ctx = _Ctx(client_factory or (lambda: RunQueueClient()), out, err,
                ask or _default_ask, isatty or _default_isatty)
     try:
-        if args.cmd in ("run", "submit"):
+        if args.cmd in RUN_COMMANDS:
             if args.repeat < 1:
                 ctx.warn("kq: --repeat must be at least 1")
                 return EXIT_USAGE

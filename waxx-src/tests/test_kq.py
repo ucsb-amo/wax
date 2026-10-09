@@ -211,8 +211,12 @@ def test_an_older_monitor_server_exits_4(server, expts):
 # --- Ctrl-C -----------------------------------------------------------------------------------
 
 def _interrupt_on(server, action):
+    """Ctrl-C at the first ``action`` request (once: the interrupt path asks too)."""
+    fired = []
+
     def on_request(obj):
-        if obj.get("action") == action:
+        if obj.get("action") == action and not fired:
+            fired.append(obj)
             raise KeyboardInterrupt
     server.on_request = on_request
 
@@ -224,7 +228,7 @@ def test_ctrl_c_during_the_submit_says_the_job_may_be_queued(server, q, expts):
 
 
 def test_ctrl_c_right_after_the_submit_cancels_the_job_and_names_it(server, q, expts):
-    _interrupt_on(server, "list")                 # the position lookup after the submit
+    _interrupt_on(server, "describe")                # the position lookup after the submit
     r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "2")
     assert r.code == 130 and "cancelled jobs 1, 2 (not started)" in r.out
     assert [q.describe({"id": i})["job"]["state"] for i in (1, 2)] == ["cancelled"] * 2
@@ -255,7 +259,7 @@ def test_ctrl_c_between_two_jobs_of_a_repeat(server, q, expts):
 
 def test_a_queue_error_inside_the_interrupt_still_exits_130(server, q, expts):
     def on_request(obj):
-        if obj.get("action") == "list":
+        if obj.get("action") == "describe" and not server.silent:
             server.silent = 10 ** 6               # the server goes quiet from the Ctrl-C on
             raise KeyboardInterrupt
 
@@ -352,8 +356,9 @@ def test_list_show_and_status(server, q, expts):
     r = kq(server, "list")
     assert r.code == 0
     header, *rows, state = r.out.splitlines()
-    assert header.split()[:5] == ["id", "state", "owner", "label", "run_id"]
-    assert [row.split()[0] for row in rows] == ["2", "1"]          # the queue's order
+    assert header.split()[:9] == ["pos", "id", "state", "owner", "submitter", "label",
+                                  "class", "run_id", "est"]
+    assert [row.split()[:2] for row in rows] == [["1", "2"], ["2", "1"]]   # pos, id
     assert state.startswith("queue: waiting") and "next: 2, 1" in state
     j = json.loads(kq(server, "list", "--json").out)
     assert [x["id"] for x in j["jobs"]] == [2, 1] and j["next"] == [2, 1]
@@ -563,3 +568,147 @@ def test_ascii_text():
 def test_module_help_and_epilog_are_ascii():
     assert kqmod.__doc__.isascii() and kqmod.EPILOG.isascii()
     assert os.path.basename(kqmod.__file__) == "kq.py"
+
+
+# --- the order: placement, insert, move (phase 1b) --------------------------------------------
+
+def _next(q):
+    return q.list()["next"]
+
+
+def test_a_persons_job_goes_ahead_of_agent_jobs_unless_at_end(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"), "--agent")
+    kq(server, "submit", str(expts / "tof.py"), "--agent")
+    r = kq(server, "submit", str(expts / "rabi.py"))
+    assert "(position 1;" in r.out and _next(q) == [3, 1, 2]
+    r = kq(server, "submit", str(expts / "tof.py"), "--at-end")
+    assert sent(server, "submit")[-1]["at_end"] is True
+    assert "(position 4;" in r.out and _next(q) == [3, 1, 2, 4]
+    assert "priority" not in sent(server, "submit")[-1]
+
+
+def test_insert_places_a_job(server, q, expts):
+    for name in ("rabi", "tof", "rabi"):
+        kq(server, "submit", str(expts / f"{name}.py"))
+    r = kq(server, "insert", str(expts / "tof.py"), "--at-index", "2", "--detach")
+    assert r.code == 0 and "(position 2;" in r.out
+    s = sent(server, "insert")[-1]
+    assert s["at_index"] == 1 and "after_id" not in s and s["after"] == []
+    assert _next(q) == [1, 4, 2, 3]
+    kq(server, "insert", str(expts / "tof.py"), "--before", "1", "--detach")
+    kq(server, "insert", str(expts / "tof.py"), "--after", "3", "--after-saved", "1",
+       "--detach")
+    s = sent(server, "insert")[-1]
+    assert s["after_id"] == 3 and s["after"] == [1]               # position vs dependency
+    assert _next(q)[0] == 5 and q.describe({"id": 6})["job"]["after"] == [1]
+    assert kq(server, "insert", str(expts / "tof.py"), "--detach").code == 2   # no position
+    r = kq(server, "insert", str(expts / "tof.py"), "--before", "99", "--detach")
+    assert r.code == 6 and "before_id 99 is not a queued job" in r.err
+
+
+def test_insert_follows_like_run(server, q, expts):
+    Script(server, run_steps(q))
+    r = kq(server, "insert", str(expts / "rabi.py"), "--at-index", "1")
+    assert r.code == 0 and "Run ID: 101" in r.out and "saved (run 101)" in r.out
+
+
+def test_move(server, q, expts):
+    for name in ("rabi", "tof", "rabi"):
+        kq(server, "submit", str(expts / f"{name}.py"))
+    r = kq(server, "move", "3", "--to", "1")
+    assert r.code == 0 and "[kq] job 3 (rabi) moved to position 1" in r.out
+    assert sent(server, "move")[-1]["to_index"] == 0 and _next(q) == [3, 1, 2]
+    kq(server, "move", "3", "--after", "2")
+    assert _next(q) == [1, 2, 3]
+    kq(server, "move", "1", "--before", "3")
+    assert _next(q) == [2, 1, 3]
+    r = kq(server, "move", "1", "--to", "1", "--agent")
+    assert r.code == 6 and "a person's job: an agent may not move it" in r.err
+    q.tick()                                                   # job 2 launches
+    r = kq(server, "move", "2", "--to", "2")
+    assert r.code == 6 and "only queued jobs move" in r.err
+    assert kq(server, "move", "1").code == 2                   # no position
+
+
+def test_edit(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"), "a=1", "--chain", "c1")
+    kq(server, "submit", str(expts / "tof.py"))
+    r = kq(server, "edit", "1", "--argv", "b=2", "c=3", "--label", "renamed",
+           "--after-saved", "2", "--no-stop-on-failure", "--no-write-back", "--at", "23:59",
+           "--allow-drift", "--pause")
+    assert r.code == 0 and r.out.startswith("[kq] job 1 (renamed): changed ")
+    j = q.describe({"id": 1})["job"]
+    assert j["argv"] == ["b=2", "c=3"] and j["label"] == "renamed" and j["after"] == [2]
+    assert j["stop_on_failure"] is False and j["write_back"] is False and j["due"]
+    assert j["allow_drift"] is True and j["paused"] is True
+    assert sent(server, "edit")[-1]["owner"] == "person"
+    r = kq(server, "edit", "1", "--argv", "--after-saved", "--chain", "", "--no-at",
+           "--write-back-default", "--no-allow-drift", "--unpause")
+    j = q.describe({"id": 1})["job"]
+    assert r.code == 0 and j["argv"] == [] and j["after"] == [] and j["chain"] is None
+    assert j["due"] is None and j["write_back"] is None and not j["allow_drift"]
+    assert not j["paused"]
+    kq(server, "edit", "1", "--", "-c", "Rabi")
+    assert q.describe({"id": 1})["job"]["argv"] == ["-c", "Rabi"]
+    assert kq(server, "edit", "1").code == 2                   # nothing to change
+    assert kq(server, "edit", "1", "--at", "1430").code == 2
+    r = kq(server, "edit", "1", "--label", "x", "--agent")
+    assert r.code == 6 and "a person's job: an agent may not edit it" in r.err
+    r = kq(server, "edit", "2", "--after-saved", "2")
+    assert r.code == 6 and "wait for itself" in r.err
+
+
+# --- list and show: position, submitter, class, estimate, source changed ----------------------
+
+CAL_EXPT = '''"""a calibration."""
+from artiq.experiment import EnvExperiment
+class RabiCal(EnvExperiment):
+    def prepare(self):
+        self.calibrates("t_raman_pi_pulse", "calibrations/raman.py")
+'''
+
+
+def test_list_and_show_columns(server, q, expts, monkeypatch):
+    cal = expts / "cal.py"
+    cal.write_text(CAL_EXPT)
+    steps = run_steps(q)
+
+    def end_later():
+        q.clock.t += 600.0                                     # a 10-minute run
+        steps[2]()
+
+    Script(server, steps[:2] + [end_later])
+    assert kq(server, "run", str(cal)).code == 0               # a saved run to estimate from
+    monkeypatch.setenv("WAXX_AGENT_LABEL", "night-driver")
+    kq(server, "submit", str(cal), "--agent")
+    kq(server, "submit", str(expts / "tof.py"), "--agent")
+    kq(server, "edit", "3", "--pause", "--agent")
+    (expts / "tof.py").write_text("changed\n")
+    r = kq(server, "list")
+    lines = r.out.splitlines()
+    row2 = next(ln for ln in lines if ln.split()[1] == "2")
+    assert row2.split()[:7] == ["1", "2", "queued", "agent", "night-driver", "cal", "RabiCal"]
+    assert "est. start" in row2
+    row3 = next(ln for ln in lines if ln.split()[1] == "3")
+    assert "tof*" in row3 and "PAUSED by jp@kong" in row3
+    assert kqmod.SOURCE_CHANGED_NOTE in r.out
+    row1 = next(ln for ln in lines if ln.split()[1] == "1")
+    assert row1.split()[:3] == ["-", "1", "saved"]
+    j = json.loads(kq(server, "list", "--json").out)
+    assert {r_["id"] for r_ in j["rows"]} == {1, 2, 3}
+    r = kq(server, "show", "2")
+    assert "calibrates (declared in the file): t_raman_pi_pulse" in r.out
+    assert "est. start" in r.out and "basis: median of the last 1 saved run(s)" in r.out
+    assert "submitter: night-driver" in r.out and "expt_class: RabiCal" in r.out
+    r = kq(server, "show", "3")
+    assert "PAUSED (this job) by jp@kong" in r.out and "source changed since submit" in r.out
+    assert "calibrates (declared in the file): none" in r.out
+
+
+def test_est_text():
+    assert kqmod.est_text({"duration_s": 90}, "queued") == "est. 90s"
+    assert kqmod.est_text({"duration_s": 900}, "queued") == "est. 15m"
+    assert kqmod.est_text({"duration_s": 9000}, "queued") == "est. 2.5h"
+    assert kqmod.est_text({"eta_end": time.time()}, "running").startswith("est. end ")
+    assert kqmod.est_text({"duration_s": None, "basis": "x"}, "queued") == "-"
+    assert kqmod.est_text({"duration_s": 5}, "saved") == "-"
