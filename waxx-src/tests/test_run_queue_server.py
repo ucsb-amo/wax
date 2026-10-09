@@ -102,12 +102,15 @@ def test_the_request_contract(server, expts, tmp_path):
     assert server.ask({"type": "run_queue", "action": "pause", "scope": "agent",
                        "by": "jp"})["run_queue"]["paused"]["agent"]["by"] == "jp"
     assert server.ask({"type": "run_queue", "action": "resume", "scope": "agent",
-                       "by": "jp"})["status"] == "ok"
-    assert server.ask({"type": "run_queue", "action": "cancel", "id": 1,
-                       "by": "jp"})["job"]["state"] == "cancelled"
+                       "by": "jp", "owner": "person"})["status"] == "ok"
+    no_owner = server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp"})
+    assert no_owner["status"] == "error" and "owner is required" in no_owner["msg"]
+    assert server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp",
+                       "owner": "person"})["job"]["state"] == "cancelled"
     held = server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
-    assert held["person_hold"]["active"]
-    assert server.ask({"type": "run_queue", "action": "release", "by": "jp"})["status"] == "ok"
+    assert held["person_hold"]["active"] and held["person_hold"]["owner"] == "person"
+    assert server.ask({"type": "run_queue", "action": "release", "by": "jp",
+                       "owner": "person"})["status"] == "ok"
     bad = server.ask({"type": "run_queue", "action": "explode"})
     assert bad["status"] == "error" and "known: submit" in bad["msg"]
     kinds = [e["kind"] for e in server.journal.tail(100)]

@@ -288,18 +288,18 @@ def test_pause_scopes_and_the_person_hold(q, expts):
     q.tick()
     assert q.spawner.calls == []
     assert "all jobs paused by jp" in q.describe({"id": person})["waiting"]
-    q.resume({"scope": "all", "by": "jp"})
+    q.resume({"scope": "all", "by": "jp", "owner": "person"})
     q.pause({"scope": "agent", "by": "jp"})
     q.tick()
     assert job(q, person)["state"] == "running" and job(q, agent)["state"] == "queued"
     run_through(q, 101)
-    q.resume({"scope": "agent", "by": "jp"})
+    q.resume({"scope": "agent", "by": "jp", "owner": "person"})
     q.hold_request({"reason": "aligning", "by": "jp@kong"})
     q.tick()
     assert job(q, agent)["state"] == "queued"
     assert q.describe({"id": agent})["waiting"].startswith("person hold since")
     assert q.info()["state"] == "held"
-    q.release_request({"by": "jp"})
+    q.release_request({"by": "jp", "owner": "person"})
     q.tick()
     assert job(q, agent)["state"] == "running"
     assert q.resume({"scope": "agent"})["status"] == "error"
@@ -464,7 +464,7 @@ def test_a_job_killed_hard_is_reported_to_live_od(q, expts):
 
 def test_cancel_a_queued_job(q, expts):
     a, b = submit(q, expts), submit(q, expts)
-    assert q.cancel({"id": b, "by": "jp"})["job"]["state"] == "cancelled"
+    assert q.cancel({"id": b, "by": "jp", "owner": "person"})["job"]["state"] == "cancelled"
     assert q.cancel({"id": b})["status"] == "error"
     assert q.cancel({"id": 999})["status"] == "error"
     assert q.cancel({"id": a, "token": "nope"})["status"] == "error"
@@ -510,7 +510,7 @@ def test_no_abort_while_live_od_saves_and_a_late_cancel_still_saves(q, expts):
     proc.write("Run ID: 101")
     q.live.start_run(101, save_in_progress=True)
     q.tick()
-    q.cancel({"id": a, "by": "jp"})
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
     q.tick()
     assert q.live.resets == [] and "saving" in job(q, a)["cancel"]["abort_note"]
     q.live.end_run(101)
@@ -523,7 +523,7 @@ def test_an_agent_may_not_abort_a_persons_running_job(q, expts):
     a = submit(q, expts)
     q.tick()
     reply = q.cancel({"id": a, "by": "agent-7", "owner": "agent"})
-    assert reply["status"] == "error" and "person's run" in reply["msg"]
+    assert reply["status"] == "error" and "person's job" in reply["msg"]
     assert job(q, a)["cancel"] is None
 
 
@@ -932,7 +932,7 @@ def test_no_loop_restart_under_a_hold_but_the_monitor_starts(tmp_path, expts):
     run_through(q, 101)
     q.tick()
     assert loop.starts == [] and len(q.monitor_starts) == 1
-    q.release_request({"by": "jp"})
+    q.release_request({"by": "jp", "owner": "person"})
     q.tick()
     assert loop.starts == [("run queue", None)]
 
@@ -1053,7 +1053,7 @@ def test_live_od_refusing_the_abort_leaves_it_to_try_again(q, expts):
     q.spawner.procs[-1].write("Run ID: 101")
     q.live.start_run(101)
     q.tick()
-    q.cancel({"id": a, "by": "jp"})
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
     real = q._live_od_reset
     q._live_od_reset = lambda run_id=None, source=None: {"ok": False, "refused": True,
                                                          "error": "not the run in progress"}
@@ -1094,3 +1094,46 @@ def test_a_persons_reset_before_an_agents_jobs_run_id_holds(q, expts):
     q.live.press("person")
     q.tick()
     assert q.hold.active and job(q, a)["cancel"] is None
+
+
+# --- owners (review S11) --------------------------------------------------------------------
+
+def test_cancel_needs_an_owner_and_an_agent_never_cancels_a_persons_job(q, expts):
+    person, agent = submit(q, expts), submit(q, expts, owner="agent")
+    for obj, words in [({"id": person}, "owner is required"),
+                       ({"id": person, "owner": "robot"}, "owner must be one of"),
+                       ({"id": person, "owner": "agent"}, "a person's job")]:
+        reply = q.cancel(obj)
+        assert reply["status"] == "error" and words in reply["msg"]
+    assert job(q, person)["state"] == "queued"
+    assert q.cancel({"id": agent, "owner": "agent", "by": "a7"})["status"] == "ok"
+    assert q.cancel({"id": person, "owner": "person", "by": "jp"})["status"] == "ok"
+
+
+def test_an_agent_cannot_resume_a_persons_pause_nor_replace_it(q):
+    assert q.pause({"scope": "all", "by": "jp"})["run_queue"]["paused"]["all"]["owner"] == "person"
+    assert "may not resume" in q.resume({"scope": "all", "owner": "agent"})["msg"]
+    assert "may not replace" in q.pause({"scope": "all", "owner": "agent"})["msg"]
+    assert "owner is required" in q.resume({"scope": "all"})["msg"]
+    assert q.resume({"scope": "all", "owner": "person", "by": "jp"})["status"] == "ok"
+    q.pause({"scope": "agent", "by": "a7", "owner": "agent"})
+    assert q.resume({"scope": "agent", "owner": "agent", "by": "a7"})["status"] == "ok"
+
+
+def test_an_agent_cannot_release_a_persons_hold(q):
+    q.hold_request({"reason": "mine", "by": "jp"})                     # a person's
+    reply = q.release_request({"by": "a7", "owner": "agent"})
+    assert reply["status"] == "error" and "may not release" in reply["msg"]
+    assert "owner is required" in q.release_request({"by": "jp"})["msg"]
+    assert q.release_request({"by": "jp", "owner": "person"})["status"] == "ok"
+    q.hold_request({"reason": "agent's own", "by": "a7", "owner": "agent"})
+    assert q.release_request({"by": "a7", "owner": "agent"})["status"] == "ok"
+
+
+def test_a_hold_set_by_live_od_or_an_unreadable_file_is_a_persons(tmp_path):
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll({"ok": True, "reset_count": 0})
+    hold.observe_poll({"ok": True, "reset_count": 1,
+                       "last_reset": {"source": "person", "run_id": 3}})
+    assert hold.info()["owner"] == "person"
+    assert hold.release("a7", owner="agent")["status"] == "error"

@@ -56,6 +56,15 @@ stays ``running`` until its process ends; it then ends ``cancelled`` (or
 own button does: the run stops at its next shot and liveOD discards its file.
 An agent may not cancel a person's running job.
 
+**Owners.**  A job's ``owner`` (submit) and the asker's ``owner`` on cancel,
+release and resume ("person" | "agent"; required on those three, refused
+without) decide what an agent may undo: an agent may not cancel a person's
+job, release a person's hold or resume (or replace) a person's pause.  A
+hold or pause records who put it on (``owner``, "person" when absent; liveOD's
+Reset and the fail-closed hold/pause are a person's).  The kq client sets
+``owner`` from the environment variable ``WAXX_OWNER`` ("person" when unset;
+the run-experiment skill sets "agent"); the Device Control GUI sends "person".
+
 **Pause / hold.**  ``pause`` with scope "agent" or "all" stops new launches for
 those jobs (the running one is not touched); ``resume`` lifts it.  A person's
 hold is pause("agent") with provenance (since, by, reason) and is never lifted
@@ -238,6 +247,18 @@ class Job:
     def from_dict(cls, d: Mapping) -> "Job":
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in dict(d).items() if k in known})
+
+
+def requester_owner(obj: Mapping) -> tuple[str, str]:
+    """``(owner, "")`` from a request's required ``owner`` ("person" |
+    "agent": who is asking -- the kq client sends WAXX_OWNER, the Device
+    Control GUI "person"), or ``("", why it is refused)``."""
+    owner = obj.get("owner")
+    if owner not in OWNERS:
+        return "", (f"owner is required ({' or '.join(OWNERS)}: who is asking)"
+                    if owner in (None, "") else
+                    f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
+    return str(owner), ""
 
 
 class QueueError(ValueError):
@@ -507,24 +528,26 @@ class RunQueue:
         return job
 
     def cancel(self, obj: Mapping) -> dict:
-        """``{"id", "token"?, "by", "owner"?}``: a queued job is cancelled; a
-        running one gets liveOD's Abort for its run (never a kill) and ends
-        when its process does."""
+        """``{"id", "token"?, "by", "owner"}``: a queued job is cancelled; a
+        launching or running one gets liveOD's Abort for its run (never a
+        kill) and ends when its process does.  ``owner`` -- who asks, "person"
+        or "agent" -- is required: an agent may not cancel a person's job."""
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
-        as_owner = str(obj.get("owner") or "person")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
         with self._lock:
             try:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
+            if job.owner == "person" and as_owner == "agent" and job.state not in ENDED:
+                return {"status": "error",
+                        "msg": f"{job.name} is a person's job: an agent may not cancel it"}
             if job.state == "queued":
                 self._end(job, "cancelled", f"cancelled by {by}")
                 reply = {"status": "ok", "job": job.to_dict()}
             elif job.state in ("launching", "running"):
-                if job.owner == "person" and as_owner == "agent":
-                    return {"status": "error",
-                            "msg": f"{job.name} is a person's run in progress: an agent may "
-                                   "not abort it"}
                 if job.cancel is None:
                     job.cancel = {"by": by, "at": self._clock(), "abort_sent": False,
                                   "abort_note": ""}
@@ -571,17 +594,28 @@ class RunQueue:
         return out
 
     def pause(self, obj: Mapping) -> dict:
-        """``{"scope": "agent" | "all", "by", "reason"}``."""
+        """``{"scope": "agent" | "all", "by", "reason", "owner"}`` (``owner``:
+        who pauses, "person" when absent; stored -- an agent may not resume a
+        person's pause)."""
         scope = str(obj.get("scope") or "agent")
         if scope not in PAUSE_SCOPES:
             return {"status": "error", "msg": f"scope must be one of {', '.join(PAUSE_SCOPES)}"}
+        owner = str(obj.get("owner") or "person")
+        if owner not in OWNERS:
+            return {"status": "error", "msg": f"owner must be one of {', '.join(OWNERS)}"}
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
         reason = str(obj.get("reason") or "")
         with self._lock:
-            self._paused[scope] = {"by": by, "since": self._clock(), "reason": reason}
+            held = self._paused.get(scope)
+            if held and held.get("owner", "person") == "person" and owner == "agent":
+                return {"status": "error",
+                        "msg": f"{scope} jobs are already paused by a person ({held.get('by')})"
+                               ": an agent may not replace that pause"}
+            self._paused[scope] = {"by": by, "since": self._clock(), "reason": reason,
+                                   "owner": owner}
         log.warning("Run queue: %s jobs paused by %s%s.", "agent" if scope == "agent" else "all",
                     by, f": {reason}" if reason else "")
-        self._record("run_queue_pause", scope=scope, by=by, reason=reason)
+        self._record("run_queue_pause", scope=scope, by=by, reason=reason, owner=owner)
         self._save()
         self._notify()
         return {"status": "ok", "run_queue": self.info()}
@@ -591,26 +625,43 @@ class RunQueue:
         if scope not in PAUSE_SCOPES:
             return {"status": "error", "msg": f"scope must be one of {', '.join(PAUSE_SCOPES)}"}
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
         with self._lock:
-            if self._paused.get(scope) is None:
+            paused = self._paused.get(scope)
+            if paused is None:
                 return {"status": "error", "msg": f"{scope} jobs are not paused"}
+            if paused.get("owner", "person") == "person" and as_owner == "agent":
+                return {"status": "error",
+                        "msg": f"{scope} jobs were paused by a person ({paused.get('by')}): an "
+                               "agent may not resume them"}
             self._paused[scope] = None
         log.info("Run queue: %s jobs resumed by %s.", scope, by)
-        self._record("run_queue_resume", scope=scope, by=by)
+        self._record("run_queue_resume", scope=scope, by=by, owner=as_owner)
         self._save()
         self._notify()
         return {"status": "ok", "run_queue": self.info()}
 
     def hold_request(self, obj: Mapping) -> dict:
+        """``{"reason", "by", "owner"}`` (``owner`` "person" when absent;
+        stored -- an agent may not release a person's hold)."""
+        owner = str(obj.get("owner") or "person")
+        if owner not in OWNERS:
+            return {"status": "error", "msg": f"owner must be one of {', '.join(OWNERS)}"}
         reply = self.hold.hold(str(obj.get("reason") or ""),
                                str(obj.get("by") or obj.get("operator") or obj.get("client")
-                                   or ""))
+                                   or ""), owner=owner)
         self._notify()
         return reply
 
     def release_request(self, obj: Mapping) -> dict:
+        """``{"by", "owner"}``; ``owner`` -- who asks -- is required."""
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
         reply = self.hold.release(str(obj.get("by") or obj.get("operator")
-                                      or obj.get("client") or ""))
+                                      or obj.get("client") or ""), owner=as_owner)
         self._notify()
         return reply
 
@@ -1543,7 +1594,8 @@ class RunQueue:
                + " -- check it, then resume")
         now = self._clock()
         for scope in PAUSE_SCOPES:
-            self._paused[scope] = {"by": "monitor server", "since": now, "reason": why}
+            self._paused[scope] = {"by": "monitor server", "since": now, "reason": why,
+                                   "owner": "person"}
         self._next_id = self._next_id_from_journal()
         log.error("Run queue: %s. The queue starts EMPTY and PAUSED (all jobs); the journal "
                   "has the jobs' history.", why)

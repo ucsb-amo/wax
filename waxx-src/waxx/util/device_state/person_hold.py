@@ -40,6 +40,9 @@ log = logging.getLogger(__name__)
 
 #: A reminder line in the server log this often while the hold is on.
 REMINDER_S = 1800.0
+_OFF = {"active": False, "since": None, "by": "", "reason": "", "source": "", "run_id": None,
+        "owner": ""}
+
 #: Who sets the hold when liveOD's Reset is pressed.
 LIVE_OD_RESET_BY = "liveOD"
 
@@ -56,8 +59,10 @@ class PersonHold:
 
     ``info()`` is what ``status_json`` serves as ``person_hold``:
     ``{"active": bool, "since": epoch | None, "by": str, "reason": str,
-    "source": "request" | "live_od_reset" | "", "run_id": int | None}``
-    (``run_id``: the run liveOD had when its Reset set the hold).
+    "source": "request" | "live_od_reset" | "unreadable_file" | "", "run_id": int |
+    None, "owner": "person" | "agent" | ""}`` (``run_id``: the run liveOD had
+    when its Reset set the hold; ``owner``: who put it on -- an agent may not
+    release a person's hold).
 
     ``path``: where the hold is kept across restarts (None: memory only).
     ``journal``: an :class:`~waxx.util.device_state.op_journal.OpJournal`
@@ -75,8 +80,7 @@ class PersonHold:
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._save_seq = self._saved_seq = 0
-        self._s = {"active": False, "since": None, "by": "", "reason": "", "source": "",
-                   "run_id": None}
+        self._s = dict(_OFF)
         self._last_reminder: float | None = None
         #: liveOD's reset_requested at the last POLL seen (None: none seen yet)
         #: -- the fallback for a liveOD without reset counts
@@ -107,37 +111,45 @@ class PersonHold:
     # -- requests -----------------------------------------------------------------
 
     def hold(self, reason: str = "", by: str = "", *, source: str = "request",
-             run_id=None) -> dict:
-        """Put the hold on.  Already on: nothing changes (the first hold's
-        since/by/reason stay) and the reply says ``already``."""
+             run_id=None, owner: str = "person") -> dict:
+        """Put the hold on (``owner``: who puts it on).  Already on: nothing
+        changes (the first hold's since/by/reason/owner stay) and the reply
+        says ``already``."""
         reason = str(reason or "").strip() or "a person has the machine"
         by = str(by or "").strip() or "?"
         with self._lock:
             if self._s["active"]:
                 return {"status": "ok", "already": True, "person_hold": dict(self._s)}
             self._s = {"active": True, "since": self._clock(), "by": by, "reason": reason,
-                       "source": source, "run_id": run_id}
+                       "source": source, "run_id": run_id, "owner": owner}
             self._last_reminder = self._s["since"]
             info = dict(self._s)
         log.warning("PERSON HOLD on: %s -- agents' runs wait until it is released.",
                     describe(info))
-        self._record("run_queue_hold", by=by, reason=reason, source=source, run_id=run_id)
+        self._record("run_queue_hold", by=by, reason=reason, source=source, run_id=run_id,
+                     owner=owner)
         self._save()
         self._notify()
         return {"status": "ok", "person_hold": info}
 
-    def release(self, by: str = "") -> dict:
+    def release(self, by: str = "", owner: str = "person") -> dict:
+        """Lift the hold (``owner``: who asks).  An agent may not lift a
+        person's hold (one a person put on, liveOD's Reset set, or the server
+        set on an unreadable file)."""
         by = str(by or "").strip() or "?"
         with self._lock:
             if not self._s["active"]:
                 return {"status": "error", "msg": "no person hold is on"}
+            if owner == "agent" and self._s.get("owner", "person") != "agent":
+                return {"status": "error",
+                        "msg": f"the hold is a person's ({describe(self._s)}): an agent may not "
+                               "release it"}
             held = dict(self._s)
-            self._s = {"active": False, "since": None, "by": "", "reason": "", "source": "",
-                       "run_id": None}
+            self._s = dict(_OFF)
             self._last_reminder = None
             info = dict(self._s)
         log.warning("Person hold released by %s (it was %s).", by, describe(held))
-        self._record("run_queue_release", by=by, held_since=held["since"],
+        self._record("run_queue_release", by=by, owner=owner, held_since=held["since"],
                      held_by=held["by"], reason=held["reason"])
         self._save()
         self._notify()
@@ -261,7 +273,7 @@ class PersonHold:
             self._s = {"active": True, "since": self._clock(), "by": "monitor server",
                        "reason": f"could not read the hold file ({why})"
                                  + (f"; kept as {aside}" if aside else ""),
-                       "source": "unreadable_file", "run_id": None}
+                       "source": "unreadable_file", "run_id": None, "owner": "person"}
             self._last_reminder = self._clock()
             original = self.path
             if not aside:
@@ -277,7 +289,8 @@ class PersonHold:
         if data.get("active"):
             self._s = {"active": True, "since": data.get("since"), "by": str(data.get("by") or ""),
                        "reason": str(data.get("reason") or ""),
-                       "source": str(data.get("source") or ""), "run_id": data.get("run_id")}
+                       "source": str(data.get("source") or ""), "run_id": data.get("run_id"),
+                       "owner": str(data.get("owner") or "person")}
             self._last_reminder = self._clock()
             log.warning("PERSON HOLD still on from before the server restarted: %s",
                         describe(self._s))

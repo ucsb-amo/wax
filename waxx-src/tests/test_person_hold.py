@@ -194,7 +194,8 @@ def test_server_hold_requests_status_and_broadcast(server, tmp_path):
     # the loops: Start refused, naming the hold
     refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
     assert refused["status"] == "error" and refused["msg"].startswith("person hold since ")
-    assert server.ask({"type": "run_queue", "action": "release", "by": "jp"})["status"] == "ok"
+    assert server.ask({"type": "run_queue", "action": "release", "by": "jp",
+                       "owner": "person"})["status"] == "ok"
     assert server.ask({"type": "run_queue", "action": "release"})["status"] == "error"
     assert "unknown run_queue action" in server.ask({"type": "run_queue",
                                                      "action": "nonsense"})["msg"]

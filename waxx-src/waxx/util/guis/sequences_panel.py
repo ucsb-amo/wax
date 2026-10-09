@@ -588,13 +588,13 @@ class SequencesPanel(QWidget):
     def toggle_hold(self) -> bool:
         """The hold button: put the hold on (asking for a reason) or release it."""
         if self.hold_row.held:
-            request = {"type": "run_queue", "action": "release",
+            request = {"type": "run_queue", "action": "release", "owner": "person",
                        "by": self._hold_by()}
         else:
             reason = self.ask_hold_reason()
             if reason is None:
                 return False
-            request = {"type": "run_queue", "action": "hold", "reason": reason,
+            request = {"type": "run_queue", "action": "hold", "reason": reason, "owner": "person",
                        "by": self._hold_by()}
 
         def done(reply):
