@@ -182,14 +182,14 @@ def server(qapp, monkeypatch, tmp_path):
 
 
 def test_server_hold_requests_status_and_broadcast(server, tmp_path):
-    assert server.run_queue_dir == str(tmp_path / "logs" / "run_queue")
+    assert server.run_queue_dir == str(tmp_path / "run_queue_default")   # conftest's local default
     status = json.loads(server.generate_reply("status_json"))
     assert status["person_hold"]["active"] is False
     reply = server.ask({"type": "run_queue", "action": "hold", "reason": "aligning",
                         "by": "jp@kong"})
     assert reply["status"] == "ok" and reply["person_hold"]["by"] == "jp@kong"
     assert json.loads(server.generate_reply("status_json"))["person_hold"]["active"]
-    assert (tmp_path / "logs" / "run_queue" / "person_hold.json").is_file()
+    assert (tmp_path / "run_queue_default" / "person_hold.json").is_file()
     assert {"type": "person_hold", "person_hold": reply["person_hold"]} in server._broadcaster.sent
     # the loops: Start refused, naming the hold
     refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})

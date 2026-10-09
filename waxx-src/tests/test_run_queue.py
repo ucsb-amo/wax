@@ -545,6 +545,38 @@ def test_a_job_whose_process_went_while_the_server_was_down(tmp_path, expts, q, 
     assert j["state"] == state and words in j["reason"] and j["exit_code"] is None
 
 
+# --- local folder, and the ops journal written outside the lock (review R2) --------------------
+
+def test_the_default_folder_is_local(monkeypatch, tmp_path):
+    from pathlib import Path
+    monkeypatch.delenv(rq.DIR_ENV, raising=False)
+    assert rq.default_dir() == str(Path.home() / ".waxx" / "run_queue")
+    monkeypatch.setenv(rq.DIR_ENV, str(tmp_path / "q"))
+    assert rq.default_dir() == str(tmp_path / "q")
+
+
+def test_the_ops_journal_copy_is_never_written_under_the_lock(tmp_path, expts):
+    seen = []
+
+    class SlowShareJournal(Journal):
+        def record(self, kind, **fields):
+            seen.append((kind, queue._lock._is_owned()))
+            super().record(kind, **fields)
+
+    queue = None
+    queue = make_queue(tmp_path, expts, journal=SlowShareJournal())
+    submit(queue, expts)
+    assert queue.submit({"path": str(expts / "rabi.py"), "after": [999]})["status"] == "error"
+    queue.tick()
+    run_through(queue, 101)
+    queue.cancel({"id": 99})
+    assert [k for k, _ in seen][:2] == ["run_queue_submit", "run_queue_refused"]
+    assert "run_queue_end" in [k for k, _ in seen]
+    assert not any(owned for _, owned in seen)
+    lines = (tmp_path / "logs" / "run_queue" / "journal.jsonl").read_text().splitlines()
+    assert len(lines) == len(seen)                       # nothing lost, nothing doubled
+
+
 # --- the alarm ----------------------------------------------------------------------------
 
 def test_the_alarm(q, expts, caplog):

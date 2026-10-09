@@ -23,7 +23,7 @@ from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
 from waxx.util.device_state.person_hold import PersonHold
-from waxx.util.device_state.run_queue import RunQueue
+from waxx.util.device_state.run_queue import RunQueue, default_dir as default_queue_dir
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -282,11 +282,12 @@ class MonitorUDPServer(UdpServer):
                  run_queue_dir=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
         # The run queue's folder (its queue, journal, job logs, the person
-        # hold): given, or "run_queue" beside the ops journal's folder (the
-        # lab's <LOG_DIR>/ops_journal -> <LOG_DIR>/run_queue).  None: memory only.
-        if run_queue_dir is None and journal_dir:
-            run_queue_dir = os.path.join(os.path.dirname(os.path.abspath(journal_dir)),
-                                         "run_queue")
+        # hold) is on LOCAL disk: given, or run_queue.default_dir()
+        # (~/.waxx/run_queue, or $WAXX_RUN_QUEUE_DIR).  Never the data share:
+        # an experiment's output is written to its job log as it runs, and an
+        # SMB hiccup there would stall the experiment's prints.
+        if run_queue_dir is None:
+            run_queue_dir = default_queue_dir()
         self.run_queue_dir = run_queue_dir
         # regenerate_state: a callable -> {"dds", "ttl", "dac"} with every
         # channel at the lab's defaults (from its device frames); None: not offered.
