@@ -1835,3 +1835,17 @@ def test_a_negative_index_is_refused(q, expts):
     reply = q.move({"id": a, "to_index": -3, "owner": "person"})
     assert reply["status"] == "error" and "0 or more" in reply["msg"]
     assert q.insert({"path": str(expts / "rabi.py"), "at_index": 99})["status"] == "ok"
+
+
+def test_a_pathological_source_is_listed_without_class_or_calibrations(q, expts, monkeypatch,
+                                                                       caplog):
+    import ast
+
+    def deep(*a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+    monkeypatch.setattr(ast, "parse", deep)
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.run_queue"):
+        assert rq.describe_source(expts / "rabi.py") == ("", [])
+        a = submit(q, expts)
+    assert job(q, a)["expt_class"] == "" and job(q, a)["calibrates_declared"] == []
+    assert any("listed without them" in r.getMessage() for r in caplog.records)

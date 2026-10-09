@@ -217,6 +217,17 @@ def describe_source(path) -> tuple[str, list]:
     none or more than one), and the first argument of every
     ``self.calibrates('<key>', ...)`` call with a string key, in order, once
     each.  ("", []) when the file cannot be read or parsed."""
+    try:
+        return _read_source(path)
+    except Exception as exc:                          # noqa: BLE001
+        # a pathological file (RecursionError / MemoryError from ast, ...):
+        # the listing goes without; the job is submitted all the same
+        log.warning("Run queue: could not read %s's class and calibrations (%r); listed "
+                    "without them.", path, exc)
+        return "", []
+
+
+def _read_source(path) -> tuple[str, list]:
     import ast  # noqa: PLC0415
     try:
         tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
