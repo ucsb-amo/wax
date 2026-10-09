@@ -193,10 +193,29 @@ class PersonHold:
         except FileNotFoundError:
             return
         except Exception as exc:                      # noqa: BLE001
-            log.error("Could not read the person hold from %s (%s): starting with NO hold -- "
-                      "check whether one was on.", self.path, exc)
+            data = exc
+        if not isinstance(data, dict):
+            # fail closed: a hold that may have been on is taken to be on, and
+            # the file is kept (moved aside, never overwritten) for a person
+            aside = move_aside(self.path)
+            why = data if isinstance(data, Exception) else f"not a JSON object: {data!r:.80}"
+            self._s = {"active": True, "since": self._clock(), "by": "monitor server",
+                       "reason": f"could not read the hold file ({why})"
+                                 + (f"; kept as {aside}" if aside else ""),
+                       "source": "unreadable_file", "run_id": None}
+            self._last_reminder = self._clock()
+            original = self.path
+            if not aside:
+                self.path = None              # never overwrite the unreadable original
+            log.error("Could not read the person hold from %s (%s): starting HELD -- a person "
+                      "must release it. %s", original, why,
+                      f"The file was moved to {aside}." if aside
+                      else "The file could not be moved aside: the hold is kept in memory only.")
+            self._record("run_queue_hold", by="monitor server", reason=self._s["reason"],
+                         source="unreadable_file", run_id=None)
+            self._save()
             return
-        if isinstance(data, dict) and data.get("active"):
+        if data.get("active"):
             self._s = {"active": True, "since": data.get("since"), "by": str(data.get("by") or ""),
                        "reason": str(data.get("reason") or ""),
                        "source": str(data.get("source") or ""), "run_id": data.get("run_id")}
@@ -242,6 +261,23 @@ class PersonHold:
             self._on_change(self.info())
         except Exception:                             # noqa: BLE001
             log.exception("Person hold change notification failed")
+
+
+def move_aside(path: str) -> str:
+    """Rename an unreadable state file to ``<name>.unreadable-<YYYYmmdd-HHMMSS>``
+    (never deleted, never overwritten); the new name, or "" when it could not
+    be moved."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = f"{path}.unreadable-{stamp}"
+    n = 1
+    while os.path.exists(target):
+        target, n = f"{path}.unreadable-{stamp}-{n}", n + 1
+    try:
+        os.rename(path, target)
+    except OSError as exc:
+        log.error("Could not move the unreadable %s aside: %s", path, exc)
+        return ""
+    return target
 
 
 def describe(info: dict | None) -> str:

@@ -304,6 +304,8 @@ class RunQueue:
         self._save_lock = threading.Lock()
         self._save_seq = 0
         self._saved_seq = 0
+        #: an unreadable queue.json that could not be moved aside is never overwritten
+        self._no_save = False
         #: records waiting to be copied to the ops journal (flush_journal)
         self._mirror: deque = deque()
         self._mirror_lock = threading.Lock()
@@ -1203,7 +1205,7 @@ class RunQueue:
         a snapshot older than the one last written is not written -- the file
         never goes back to an earlier state.  Deadlock-free whatever lock the
         caller holds (the save lock is never held while taking the queue's)."""
-        if not self.enabled:
+        if not self.enabled or self._no_save:
             return
         with self._lock:
             self._save_seq += 1
@@ -1229,22 +1231,59 @@ class RunQueue:
                 log.error("Run queue: could not store the queue in %s (%s).",
                           self._path("queue.json"), exc)
 
+    def _load_failed(self, exc) -> None:
+        """queue.json could not be read: fail closed.  The file is moved aside
+        (timestamped, never overwritten -- if it cannot be moved, the queue
+        never writes queue.json this session), the queue starts empty with
+        every scope paused (a person looks, then resumes), and job ids go on
+        from the journal's highest."""
+        from waxx.util.device_state.person_hold import move_aside  # noqa: PLC0415
+        original = self._path("queue.json")
+        aside = move_aside(original)
+        if not aside:
+            self._no_save = True
+        why = (f"queue.json could not be read ({exc}); "
+               + (f"moved to {aside}" if aside else "left in place, not overwritten")
+               + " -- check it, then resume")
+        now = self._clock()
+        for scope in PAUSE_SCOPES:
+            self._paused[scope] = {"by": "monitor server", "since": now, "reason": why}
+        self._next_id = self._next_id_from_journal()
+        log.error("Run queue: %s. The queue starts EMPTY and PAUSED (all jobs); the journal "
+                  "has the jobs' history.", why)
+        self._record("run_queue_load_failed", error=str(exc), moved_to=aside or None,
+                     next_id=self._next_id)
+        self._record("run_queue_pause", scope="all", by="monitor server", reason=why)
+        self._save()
+
+    def _next_id_from_journal(self) -> int:
+        highest = 0
+        try:
+            with open(self._path("journal.jsonl"), "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        highest = max(highest, int(json.loads(line).get("job") or 0))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+        except OSError:
+            pass
+        return highest + 1
+
     def _load(self) -> None:
         if not self.enabled:
             return
         try:
             with open(self._path("queue.json"), "r", encoding="utf-8") as f:
                 data = json.load(f)
+            jobs = [Job.from_dict(d) for d in data.get("jobs") or []]
+            next_id = max([int(data.get("next_id") or 1)] + [j.id + 1 for j in jobs])
         except FileNotFoundError:
             return
         except Exception as exc:                      # noqa: BLE001
-            log.error("Run queue: could not read %s (%s): starting EMPTY -- the jobs in it are "
-                      "not run; the journal has their history.", self._path("queue.json"), exc)
-            self._record("run_queue_load_failed", error=str(exc))
+            self._load_failed(exc)
             return
-        jobs = [Job.from_dict(d) for d in data.get("jobs") or []]
         self._jobs = {j.id: j for j in jobs}
-        self._next_id = max([int(data.get("next_id") or 1)] + [j.id + 1 for j in jobs])
+        self._next_id = next_id
         for scope in PAUSE_SCOPES:
             self._paused[scope] = (data.get("paused") or {}).get(scope) or None
         self._resume_loop = data.get("resume_loop") or None

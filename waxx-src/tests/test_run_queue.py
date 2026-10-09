@@ -604,6 +604,52 @@ def test_the_holds_file_never_goes_back_either(tmp_path):
     assert json.loads((tmp_path / "h.json").read_text())["active"] is False
 
 
+# --- unreadable files fail closed (review S6) --------------------------------------------------
+
+def test_an_unreadable_queue_file_is_moved_aside_and_everything_paused(tmp_path, expts, q):
+    a = submit(q, expts)
+    folder = tmp_path / "logs" / "run_queue"
+    (folder / "queue.json").write_text("{ this is not json")
+    again = make_queue(tmp_path, expts)
+    moved = [p.name for p in folder.iterdir() if p.name.startswith("queue.json.unreadable-")]
+    assert len(moved) == 1
+    assert (folder / moved[0]).read_text() == "{ this is not json"     # kept as it was
+    info = again.info()
+    assert info["paused"]["all"] and info["paused"]["agent"]
+    assert "could not be read" in info["paused"]["all"]["reason"]
+    assert submit(again, expts) == a + 1                 # ids go on from the journal
+    again.tick()
+    assert again.spawner.calls == []                     # nothing runs until a person resumes
+    assert "run_queue_load_failed" in again.journal.kinds
+
+
+def test_an_unreadable_queue_file_that_cannot_be_moved_is_never_overwritten(
+        tmp_path, expts, monkeypatch):
+    from waxx.util.device_state import person_hold
+    folder = tmp_path / "logs" / "run_queue"
+    folder.mkdir(parents=True)
+    (folder / "queue.json").write_text("garbage")
+    monkeypatch.setattr(person_hold.os, "rename", lambda a, b: (_ for _ in ()).throw(
+        PermissionError("in use")))
+    again = make_queue(tmp_path, expts)
+    submit(again, expts)
+    assert (folder / "queue.json").read_text() == "garbage"
+    assert again.info()["paused"]["all"]
+
+
+def test_an_unreadable_hold_file_starts_held(tmp_path):
+    path = tmp_path / "person_hold.json"
+    path.write_text("not json at all")
+    hold = PersonHold(str(path))
+    info = hold.info()
+    assert info["active"] and info["by"] == "monitor server"
+    assert info["reason"].startswith("could not read the hold file")
+    moved = [p for p in tmp_path.iterdir() if p.name.startswith("person_hold.json.unreadable-")]
+    assert len(moved) == 1 and moved[0].read_text() == "not json at all"
+    assert json.loads(path.read_text())["active"] is True      # the hold is kept on
+    assert PersonHold(str(path)).active
+
+
 # --- the alarm ----------------------------------------------------------------------------
 
 def test_the_alarm(q, expts, caplog):
