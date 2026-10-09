@@ -190,6 +190,11 @@ def submit(q, expts, name="rabi", **kw):
     return reply["ids"] if len(reply["ids"]) > 1 else reply["ids"][0]
 
 
+def qj(q, job_id):
+    """The job's queue_job as its experiment sends it: "<id>:<token>"."""
+    return f"{job_id}:{job(q, job_id)['token']}"
+
+
 def job(q, job_id):
     return q.describe({"id": job_id})["job"]
 
@@ -321,7 +326,7 @@ def test_the_launch_command_environment_and_log(q, expts, tmp_path):
     path = str((expts / "rabi.py").resolve())
     assert call["command"] == f'%kpy% & artiq_run --device-db "%db%" {path} -a x=1'
     env = call["env"]
-    assert env["WAXX_LAUNCHER"] == "kq" and env["WAXX_QUEUE_JOB"] == str(a)
+    assert env["WAXX_LAUNCHER"] == "kq" and env["WAXX_QUEUE_JOB"] == qj(q, a)
     assert env["WAXX_OWNER"] == "agent" and env["PYTHONUNBUFFERED"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["WAXX_CAL_NO_WRITE_BACK"] == "1"
@@ -658,17 +663,17 @@ def test_the_jobs_run_is_known_from_live_od_without_its_output(q, expts):
     q.tick()
     proc = q.spawner.procs[-1]
     proc.write("compiling", "shot 1/9")                  # WAX_VERBOSITY=0: no Run ID line
-    q.live.start_run(555, launcher="run_loop", queue_job=str(a), client_pid=1)
+    q.live.start_run(555, launcher="run_loop", queue_job=qj(q, a), client_pid=1)
     q.tick()
     assert job(q, a)["run_id"] is None                   # not the queue's launch: ignored
-    q.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
     q.tick()
     j = job(q, a)
     assert j["run_id"] == 101 and j["client_pid"] == 7101
     rec = [e for e in q.journal.entries if e["kind"] == "run_queue_run_id"][-1]
     assert rec["via"] == "liveOD"
     q.live.end_run(101)
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     proc.code = 0
     q.tick()
     assert job(q, a)["state"] == "saved"
@@ -678,7 +683,7 @@ def test_a_run_known_only_from_its_outcome(q, expts):
     a = submit(q, expts)
     q.tick()
     q.live.end_run(101)                                  # it ran and ended between polls
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     q.spawner.procs[-1].code = 0
     q.tick()
     assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
@@ -726,7 +731,7 @@ def test_a_launching_job_is_never_launched_again_and_is_adopted_from_live_od(
     again._adopt = lambda pid, started: adopted if pid == 7101 else None
     again.tick()
     assert again.spawner.calls == [] and job(again, a)["state"] == "launching"
-    again.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    again.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
     again.tick()
     j = job(again, a)
     assert j["state"] == "running" and j["run_id"] == 101 and j["adopted"]
@@ -764,7 +769,7 @@ def test_a_hung_launcher_stalls_nothing_and_its_job_is_found_in_live_od(q, expts
     assert job(q, a)["state"] == "launching" and "run_queue_launch_unknown" in q.journal.kinds
     assert q.list()["status"] == "ok"                 # requests answer meanwhile
     q.live.end_run(101)
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     q.tick()
     assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
 
@@ -1416,7 +1421,7 @@ def test_a_watch_returned_after_adopting_from_live_od_is_closed(q, expts):
     q.tick()
     adopted = Proc("unused", 7101)
     q._adopt = lambda pid, started: adopted if pid == 7101 else None
-    q.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
     q.tick()
     assert job(q, a)["state"] == "running" and job(q, a)["adopted"]
     gate.set()
@@ -1424,3 +1429,26 @@ def test_a_watch_returned_after_adopting_from_live_od_is_closed(q, expts):
     while not closed and time.monotonic() - t0 < 5:
         time.sleep(0.01)
     assert closed == [True]
+
+
+# --- queue_job is "<id>:<token>" (review NEW-3) --------------------------------------------------
+
+def test_another_queues_run_with_the_same_job_id_is_never_taken_for_this_one(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    assert job(q, a)["state"] == "launching"
+    # an old run from another folder's queue: job id a too, another token
+    q.live.end_run(99)
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=f"{a}:000000")
+    q.tick()
+    assert job(q, a)["state"] == "launching"              # not "finished" by it
+    q.live.start_run(100, launcher="kq", queue_job=str(a), client_pid=1)   # id alone
+    q.tick()
+    assert job(q, a)["run_id"] is None
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
+    q._adopt = lambda pid, started: Proc("unused", 7101) if pid == 7101 else None
+    q.tick()
+    assert job(q, a)["state"] == "running" and job(q, a)["run_id"] == 101
+    gate.set()

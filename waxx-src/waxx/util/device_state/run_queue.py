@@ -43,7 +43,7 @@ allows drift.  The command is ``ar_command(path) + argv``, run detached
 with ``WAXX_LAUNCHER=kq``, ``WAXX_QUEUE_JOB=<id>``, ``WAXX_OWNER=<owner>``,
 ``PYTHONUNBUFFERED=1`` and, for a write-back veto, ``WAXX_CAL_NO_WRITE_BACK=1``;
 its output goes to ``<dir>/logs/<id>_<label>.out``.  The job's run is known
-from liveOD: the experiment sends ``queue_job`` (WAXX_QUEUE_JOB) at INIT_RUN
+from liveOD: the experiment sends ``queue_job`` (WAXX_QUEUE_JOB = "<id>:<token>") at INIT_RUN
 and POLL / last_outcome carry it next to ``launcher`` and ``client_pid`` (the
 experiment's own pid); the "Run ID:" line in the log (printed whatever
 WAX_VERBOSITY when a launcher is set) is the fallback.
@@ -274,6 +274,12 @@ class Job:
     @property
     def name(self) -> str:
         return f"job {self.id} ({self.label})"
+
+    @property
+    def queue_job(self) -> str:
+        """"<id>:<token>": the job's WAXX_QUEUE_JOB, sent by its experiment at
+        INIT_RUN and reported by liveOD (POLL, last_outcome) as queue_job."""
+        return f"{self.id}:{self.token}"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1123,7 +1129,7 @@ class RunQueue:
         # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         env[run_gate.LAUNCHER_ENV] = LAUNCHER
-        env[JOB_ENV] = str(job.id)
+        env[JOB_ENV] = job.queue_job
         env[OWNER_ENV] = job.owner
         if job.write_back is False:
             env[NO_WRITE_BACK_ENV] = "1"
@@ -1252,7 +1258,7 @@ class RunQueue:
         """A ``launching`` job with no process to follow: the server stopped
         while launching it, or its launcher never answered.  It is never
         launched again.  Its run is looked for in liveOD (launcher "kq",
-        queue_job = its id): a run in progress is adopted (its experiment's
+        queue_job = "<id>:<token>"): a run in progress is adopted (its experiment's
         pid), a recorded outcome judges it; after :data:`ORPHAN_WAIT_S` with
         neither it ends failed ("server stopped while launching -- check")."""
         poll = self._last_poll
@@ -1348,10 +1354,12 @@ class RunQueue:
     @staticmethod
     def _is_job_run(job: Job, record) -> bool:
         """A liveOD POLL reply or last_outcome record is about ``job``'s run:
-        launched by the queue, with this job's id (``queue_job``, sent by the
+        launched by the queue, with this job's id AND token (``queue_job``
+        "<id>:<token>": ids start again at 1 in another queue folder, so an id
+        alone could match an old run's record; sent by the
         experiment at INIT_RUN from WAXX_QUEUE_JOB)."""
         return (isinstance(record, dict) and record.get("launcher") == LAUNCHER
-                and str(record.get("queue_job") or "") == str(job.id)
+                and str(record.get("queue_job") or "") == job.queue_job
                 and bool(record.get("run_id")))
 
     def _identify(self, job: Job, poll) -> None:

@@ -66,8 +66,8 @@ def _safe_repr(value) -> str:
 
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
-    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job id,
-    str; "" when absent). A client that predates them sends none; a malformed
+    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job,
+    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent). A client that predates them sends none; a malformed
     value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
