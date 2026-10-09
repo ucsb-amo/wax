@@ -55,7 +55,7 @@ class FakeServer:
                                               f"(fake server, {obj.get('action')})"}
         if method is None:
             return {"status": "error", "msg": f"unknown run_queue action {obj.get('action')!r}"}
-        return json.loads(json.dumps(getattr(self.q, method)(obj), default=repr))
+        return json.loads(json.dumps(getattr(self.q, method)(obj)))   # as the server
 
     def get_status(self):
         if self.silent:
@@ -65,7 +65,7 @@ class FakeServer:
                   "run_loops": self.run_loops}
         if self.known:
             status.update(run_queue=self.q.info(), person_hold=self.q.hold.info())
-        return json.loads(json.dumps(status, default=repr))
+        return json.loads(json.dumps(status))
 
     def actions(self):
         return [o.get("action") for o, _ in self.requests]
