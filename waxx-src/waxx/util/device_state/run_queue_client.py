@@ -281,6 +281,12 @@ class RunQueueClient:
                 if on_lost is not None:
                     on_lost("the monitor server answers again")
             lines = reply.get("lines") or []
+            # the cursor moves before the lines are written: a Ctrl-C while
+            # writing loses the rest of this batch on a resumed follow (kq
+            # tail shows them) rather than printing any line twice
+            cursor["offset"] = int(reply.get("offset") or cursor["offset"])
+            cursor["state"] = reply.get("state")
+            cursor["run_id"] = reply.get("run_id")
             for line in lines:
                 safe_write(out, line + "\n")
             if lines:
@@ -288,9 +294,6 @@ class RunQueueClient:
                     out.flush()
                 except Exception:                     # noqa: BLE001
                     pass
-            cursor["offset"] = int(reply.get("offset") or cursor["offset"])
-            cursor["state"] = reply.get("state")
-            cursor["run_id"] = reply.get("run_id")
             if reply.get("done"):
                 break
             state = reply.get("state")

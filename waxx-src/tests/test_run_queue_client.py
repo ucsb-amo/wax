@@ -209,6 +209,28 @@ def test_no_monitor_server_beaconing_is_no_run_queue(monkeypatch):
         RunQueueClient()
 
 
+def test_a_ctrl_c_while_writing_never_repeats_a_line_on_resume(client, server, q, expts):
+    jid = client.submit(str(expts / "rabi.py"))["ids"][0]
+    Script(server, run_steps(q))
+
+    class Out(io.StringIO):
+        armed = True
+
+        def write(self, text):
+            if self.armed and text.startswith("shot 1/2"):
+                self.armed = False
+                raise KeyboardInterrupt
+            return super().write(text)
+
+    out, cursor = Out(), {}
+    with pytest.raises(KeyboardInterrupt):
+        client.follow(jid, out=out, cursor=cursor)
+    assert client.follow(jid, out=out, cursor=cursor)["state"] == "saved"
+    lines = out.getvalue().splitlines()
+    assert len(lines) == len(set(lines)) and lines.count("Run ID: 101") == 1
+    assert lines[-1] == "shot 2/2"                     # "shot 1/2" was lost, not repeated
+
+
 def test_an_older_monitor_server_without_a_queue_is_no_run_queue(client, server):
     server.known = False
     with pytest.raises(NoRunQueue, match="no run queue"):
