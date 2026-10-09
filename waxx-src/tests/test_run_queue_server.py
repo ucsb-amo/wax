@@ -118,6 +118,29 @@ def test_the_request_contract(server, expts, tmp_path):
     assert json.loads(lines[0])["kind"] == "run_queue_submit"
 
 
+def test_tail_and_a_queued_only_cancel_through_the_server(server, expts):
+    def ask(**kw):
+        return server.ask(dict({"type": "run_queue"}, **kw))
+
+    a = ask(action="submit", path=str(expts / "rabi.py"))["ids"][0]
+    t = ask(action="tail", id=a, offset=0)
+    assert t["status"] == "ok" and t["state"] == "queued" and t["lines"] == []
+    server.watch_tick()
+    server.spawner.procs[-1].write("Run ID: 85600", "shot 1/2")
+    t = ask(action="tail", id=a, offset=0)
+    assert t["lines"][-2:] == ["Run ID: 85600", "shot 1/2"] and not t["done"]
+    refused = ask(action="cancel", id=a, by="jp", queued_only=True)
+    assert refused["status"] == "error" and refused["state"] == "running"
+    assert server.live.resets == []
+    sent = len(server._broadcaster.sent)
+    records = len(server.journal.tail(1000))
+    ask(action="tail", id=a, offset=0)                # polled often: no broadcast, no journal
+    assert len(server._broadcaster.sent) == sent and len(server.journal.tail(1000)) == records
+    _run(server, 85600)
+    t2 = ask(action="tail", id=a, offset=t["offset"])
+    assert t2["done"] and t2["state"] == "saved" and t2["run_id"] == 85600
+
+
 def test_the_monitors_own_experiment_is_refused(server, expts):
     reply = server.ask({"type": "run_queue", "action": "submit",
                         "path": str(expts / "monitor.py")})

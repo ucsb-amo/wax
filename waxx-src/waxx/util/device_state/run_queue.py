@@ -41,9 +41,13 @@ since submit is *skipped* ("source changed since submit") unless the job
 allows drift.  The command is ``ar_command(path) + argv``, run detached
 (:mod:`~waxx.util.device_state.detached`: the job survives a server restart)
 with ``WAXX_LAUNCHER=kq``, ``WAXX_QUEUE_JOB=<id>``, ``WAXX_OWNER=<owner>``,
-``PYTHONUNBUFFERED=1`` and, for a write-back veto, ``WAXX_CAL_NO_WRITE_BACK=1``;
-its output goes to ``<dir>/logs/<id>_<label>.out``.  "Run ID:" is read from
-that log; the experiment's own pid comes from liveOD's POLL (``client_pid``).
+``PYTHONUNBUFFERED=1``, ``PYTHONIOENCODING=utf-8:backslashreplace`` and, for a
+write-back veto, ``WAXX_CAL_NO_WRITE_BACK=1``; its output goes to
+``<dir>/logs/<id>_<label>.out`` (the launcher opens the file and the child
+writes its UTF-8 bytes into it as they are).  "Run ID:" is read from that log;
+the experiment's own pid comes from liveOD's POLL (``client_pid``).  The
+``tail`` request serves the log from a byte offset, so the ``kq`` client
+(:mod:`~waxx.util.device_state.kq`) on any PC can follow it.
 
 **Cancel.**  A queued job is cancelled at once.  A running job is never
 terminated: the queue sends liveOD's Abort (RESET) for it -- only when liveOD's
@@ -132,6 +136,12 @@ KEEP_ENDED = 500
 MAX_REPEAT = 1000
 #: Lines of a job's output kept in memory for its judging and ``describe``.
 TAIL_LINES = 25
+#: Most bytes of a job's log one ``tail`` request returns.
+TAIL_CHUNK = 64 * 1024
+#: The job's stdio encoding: the child writes UTF-8 bytes to its log file
+#: whatever the server PC's code page (a cp1252 pipe would raise on a
+#: character it cannot encode and end the experiment); never-raising errors.
+CHILD_IO_ENCODING = "utf-8:backslashreplace"
 
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -348,8 +358,7 @@ class RunQueue:
                          repeat_of=job.repeat_of, by=job.submitted_by)
         self._save()
         self._notify()
-        # TODO(kq client): `ar <file>` / `kq submit` attach here, then follow the
-        # job by `describe` and tail its log_path (phase 1, client part).
+        # the kq client (run_queue_client.py) follows the job by `tail` from here
         return {"status": "ok", "ids": [j.id for j in jobs],
                 "jobs": [j.to_dict() for j in jobs]}
 
@@ -461,9 +470,11 @@ class RunQueue:
         return job
 
     def cancel(self, obj: Mapping) -> dict:
-        """``{"id", "token"?, "by", "owner"?}``: a queued job is cancelled; a
-        running one gets liveOD's Abort for its run (never a kill) and ends
-        when its process does."""
+        """``{"id", "token"?, "by", "owner"?, "queued_only"?}``: a queued job is
+        cancelled; a running one gets liveOD's Abort for its run (never a
+        kill) and ends when its process does.  ``queued_only``: refuse unless
+        the job is still queued (a client's cancel meant for a queued job
+        must not abort one that has just launched)."""
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
         as_owner = str(obj.get("owner") or "person")
         with self._lock:
@@ -471,6 +482,9 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
+            if obj.get("queued_only") and job.state != "queued":
+                return {"status": "error", "state": job.state,
+                        "msg": f"{job.name} is {job.state}, not queued: not cancelled"}
             if job.state == "queued":
                 self._end(job, "cancelled", f"cancelled by {by}")
                 reply = {"status": "ok", "job": job.to_dict()}
@@ -524,6 +538,66 @@ class RunQueue:
                    "waiting": self._why_waiting(job, self._clock()),
                    "tail": list(self._tails.get(job.id, ()))}
         return out
+
+    def tail(self, obj: Mapping) -> dict:
+        """``{"id", "token"?, "offset"}`` -> ``{"lines", "offset", "done",
+        "state", "run_id"}``: the job's log file read on this machine from byte
+        ``offset`` (so a client on any PC follows a log that lives on the
+        server's disk), at most :data:`TAIL_CHUNK` bytes, whole lines only --
+        the last, unterminated line comes once the job has ended (or alone
+        when one line is longer than a chunk).  Lines are decoded as UTF-8
+        with errors replaced; ``offset`` is the next byte to ask for.
+        ``done``: the job has ended and its log is read to the end.  A queued
+        job has no log yet (no lines, offset unchanged)."""
+        try:
+            offset = int(obj.get("offset") or 0)
+        except (TypeError, ValueError):
+            return {"status": "error", "msg": f"offset must be an integer, not "
+                                              f"{obj.get('offset')!r}"}
+        if offset < 0:
+            return {"status": "error", "msg": f"offset must be 0 or more, not {offset}"}
+        with self._lock:
+            try:
+                job = self._find(obj)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+            # the state before the read: an ended job's log is complete
+            state, path, run_id = job.state, job.log_path, job.run_id
+        ended = state in ENDED
+        reply = {"status": "ok", "lines": [], "offset": offset, "done": False,
+                 "state": state, "run_id": run_id}
+        if not path:
+            reply["done"] = ended
+            return reply
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if offset > size:
+                    return {"status": "error",
+                            "msg": f"offset {offset} is past the end of job {job.id}'s log "
+                                   f"({size} bytes)"}
+                f.seek(offset)
+                data = f.read(TAIL_CHUNK)
+        except FileNotFoundError:
+            reply["done"] = ended
+            return reply
+        except OSError as exc:
+            return {"status": "error", "msg": f"job {job.id}'s log cannot be read: {exc}"}
+        at_end = offset + len(data) >= size
+        cut = data.rfind(b"\n") + 1
+        if cut == 0 and len(data) == TAIL_CHUNK:
+            cut = len(data)                            # one line longer than a chunk
+        if ended and at_end:
+            cut = len(data)                            # the final, unterminated line
+        chunk = data[:cut]
+        text = chunk.decode("utf-8", errors="replace")
+        if text.endswith("\n"):
+            text = text[:-1]
+        reply["lines"] = [ln.rstrip("\r") for ln in text.split("\n")] if chunk else []
+        reply["offset"] = offset + len(chunk)
+        reply["done"] = ended and reply["offset"] >= size
+        return reply
 
     def pause(self, obj: Mapping) -> dict:
         """``{"scope": "agent" | "all", "by", "reason"}``."""
@@ -824,7 +898,7 @@ class RunQueue:
             command = ar_command(_quote(job.path))
             if job.argv:
                 command += " " + " ".join(_quote(a) for a in job.argv)
-            env = dict(os.environ, PYTHONUNBUFFERED="1")
+            env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING=CHILD_IO_ENCODING)
             env[run_gate.LAUNCHER_ENV] = LAUNCHER
             env[JOB_ENV] = str(job.id)
             env[OWNER_ENV] = job.owner
@@ -834,11 +908,11 @@ class RunQueue:
                 env.pop(NO_WRITE_BACK_ENV, None)
             try:
                 with open(log_path, "ab") as f:
-                    f.write((f"── run queue {time.strftime('%Y-%m-%d %H:%M:%S')}: {job.name}, "
+                    f.write((f"-- run queue {time.strftime('%Y-%m-%d %H:%M:%S')}: {job.name}, "
                              f"owner {job.owner}, sha256 {sha[:12]}"
                              + (" (drift allowed: file changed since submit)"
                                 if sha != job.sha256 else "")
-                             + f" ──\n$ {command}\n").encode("utf-8"))
+                             + f" --\n$ {command}\n").encode("utf-8"))
                 proc = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
             except OSError as exc:
                 log.error("Run queue: could not start %s: %r", job.name, exc)
