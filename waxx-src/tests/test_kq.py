@@ -135,6 +135,14 @@ def test_experiment_arguments_after_the_file_as_in_artiq_run(server, expts):
     assert r.code == 0, r.err
     assert sent(server, "submit")[-1]["argv"] == ["n=3", "m=x", "-c", "Rabi"]
     assert kq(server, "submit", str(expts / "rabi.py"), "-c", "Rabi").code == 2
+    r = kq(server, "submit", str(expts / "rabi.py"), "a=1", "--label", "x", "b=2")
+    assert r.code == 0 and sent(server, "submit")[-1]["argv"] == ["a=1", "b=2"]
+    assert sent(server, "submit")[-1]["label"] == "x"
+    r = kq(server, "submit", str(expts / "rabi.py"), "a=1", "--label", "x", "b=2", "-q")
+    assert r.code == 2 and "experiment options go after --" in r.err
+    assert kq(server, "list", "stray").code == 2
+    r = kq(server, "submit", str(expts / "rabi.py"), "x=50%")
+    assert r.code == 6 and "not allowed" in r.err
 
 
 def test_agent_flag_and_environment(server, expts, monkeypatch):

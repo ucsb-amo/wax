@@ -20,8 +20,12 @@ Commands::
     kq release                                lift the person's hold
     kq status [--json]                        the queue's state (not occupancy)
 
-Words after the file (``key=value``, as artiq_run takes them) and everything
-after ``--`` are passed to the experiment: ``kq run x.py n=3 -- -c MyExpt``.
+Words after the file (``key=value``, as artiq_run takes them, before or after
+kq's options) and everything after ``--`` are passed to the experiment:
+``kq run x.py n=3 --label scan m=2 -- -c MyExpt``.  Words starting with ``-``
+must go after ``--``.  The queue refuses an argument (or a path) holding any
+of ``& | < > ^ % " !`` -- e.g. ``x=50%``, which artiq_run itself accepts --
+and one ending in a backslash: such a run goes through artiq_run directly.
 
 ``kq run`` prints ``[kq] job <id> queued (position k; <why it waits>)``, then
 the job's output exactly as the experiment writes it ("Run ID: N" included),
@@ -809,7 +813,16 @@ def main(argv=None, *, client_factory=None, out=None, err=None, ask=None,
     words, expt_argv = _split_argv(argv)
     parser = build_parser(out=out, err=err)
     try:
-        args = parser.parse_args(words)
+        # parse_known_args: experiment words may come after kq's options too
+        # (kq run f.py a=1 --label x b=2); anything else left over is an error
+        args, extra = parser.parse_known_args(words)
+        if extra:
+            if args.cmd in ("run", "submit") and not any(w.startswith("-") for w in extra):
+                args.args = list(args.args) + extra
+            else:
+                parser.error("unrecognized arguments: " + " ".join(extra)
+                             + (" (experiment options go after --)"
+                                if args.cmd in ("run", "submit") else ""))
     except SystemExit as exc:
         return EXIT_OK if exc.code in (0, None) else EXIT_USAGE
     if expt_argv and args.cmd not in ("run", "submit"):
