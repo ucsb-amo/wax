@@ -3,7 +3,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
+                             QMessageBox, QTabWidget)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 
@@ -45,6 +46,26 @@ def _run_name(run_id, expt) -> str:
     if run_id:
         return f"run {run_id} ({expt or 'experiment'})"
     return expt or "an experiment"
+
+
+class _TappedBroadcaster:
+    """The server's broadcaster, with every payload also handed to ``tap``
+    (the server's own window shows its broadcasts without listening on the
+    network).  Anything else is the wrapped broadcaster's."""
+
+    def __init__(self, inner, tap):
+        self._inner = inner
+        self._tap = tap
+
+    def send(self, payload):
+        try:
+            self._tap(payload)
+        except Exception:                             # noqa: BLE001
+            log.debug("broadcast tap failed", exc_info=True)
+        return self._inner.send(payload)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 @dataclass
@@ -271,6 +292,10 @@ class MonitorUDPServer(UdpServer):
     #: A run loop ended: start the monitor unless it is running (the owner
     #: decides; the argument says why).
     start_monitor_signal = pyqtSignal(str)
+    #: Every payload this server broadcasts (from whichever thread sent it),
+    #: for the server's own window: its Queue and State tabs follow the
+    #: broadcasts without listening on the network.
+    broadcast_sent = pyqtSignal(object)
 
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
@@ -302,7 +327,7 @@ class MonitorUDPServer(UdpServer):
 
         self.config_file_path = config_file_path
         self._version = int(time.time())
-        self._broadcaster = StateBroadcaster()
+        self._broadcaster = _TappedBroadcaster(StateBroadcaster(), self.broadcast_sent.emit)
         self.ops = OpQueue()
         self.journal = OpJournal(journal_dir)
 
@@ -1417,6 +1442,25 @@ class MonitorUDPServer(UdpServer):
 
 
 class MonitorServerGUI(QWidget):
+    """The monitor server's own window (the Server Dashboard embeds it).
+
+    Three tabs: **Queue** (:class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`),
+    **State** (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`)
+    and **Monitor** -- the monitor experiment's big status button (click: start
+    it, or restart it after a confirm).  Both panels act through a direct call
+    into this window's server (:meth:`direct_request`: ``generate_reply`` on a
+    worker thread, the way a TCP client's request is answered -- no
+    discovery, no socket), get ``status_json`` the same way every
+    :data:`STATUS_POLL_MS` while the window is visible, and the server's
+    broadcasts through ``MonitorUDPServer.broadcast_sent``.  Requests from
+    the panels are answered on their worker thread while the server's own
+    thread answers network clients; the queue, hold, loops, connections and
+    journal they reach lock for themselves (the queue's requests "may come
+    from any thread")."""
+
+    #: How often the window asks its server for status_json (while visible).
+    STATUS_POLL_MS = 1000
+
     def __init__(self,
                 monitor_expt_path,
                 config_file_path=None,
@@ -1459,7 +1503,7 @@ class MonitorServerGUI(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.setWindowIcon(eye_icon)
-        self.setGeometry(100, 100, 250, 80)
+        self.setGeometry(100, 100, 1100, 620)
 
         # Everything the monitor reports goes through logging (stderr, line
         # buffered) rather than print, so it shows up promptly in the terminal
@@ -1501,6 +1545,15 @@ class MonitorServerGUI(QWidget):
         self.monitor_check_timer.timeout.connect(self.check_monitor_status)
         self.monitor_check_timer.start()
 
+        # the Queue and State tabs: the server's broadcasts, and its
+        # status_json while the window is visible
+        self.udp_server.broadcast_sent.connect(self._on_broadcast)
+        self.status_poll_timer = QTimer(self)
+        self.status_poll_timer.setInterval(self.STATUS_POLL_MS)
+        self.status_poll_timer.timeout.connect(self.poll_status)
+        self.status_poll_timer.start()
+        QTimer.singleShot(0, self.poll_status)
+
     @staticmethod
     def _create_eye_icon(size=64):
         pixmap = QPixmap(size, size)
@@ -1516,15 +1569,62 @@ class MonitorServerGUI(QWidget):
         return QIcon(pixmap)
 
     def setup_ui(self):
+        from waxx.util.guis.monitor_state_panel import MonitorStatePanel  # noqa: PLC0415
+        from waxx.util.guis.request_runner import RequestRunner  # noqa: PLC0415
+        from waxx.util.guis.run_queue_panel import RunQueuePanel  # noqa: PLC0415
+
         layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
         self.status_indicator = QPushButton("NOT READY")
         self.status_indicator.clicked.connect(self.on_button_clicked)
         font = QFont()
         font.setPointSize(24)
         font.setBold(True)
         self.status_indicator.setFont(font)
-        layout.addWidget(self.status_indicator)
+
+        # one worker thread for the panels' requests and the status poll
+        self.request_runner = RequestRunner(self.direct_request, parent=self)
+        self.queue_panel = RunQueuePanel(runner=self.request_runner)
+        self.state_panel = MonitorStatePanel(runner=self.request_runner)
+        monitor_page = QWidget()
+        monitor_box = QVBoxLayout(monitor_page)
+        monitor_box.addWidget(self.status_indicator)
+        monitor_box.addStretch(1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.queue_panel, "Queue")
+        self.tabs.addTab(self.state_panel, "State")
+        self.tabs.addTab(monitor_page, "Monitor")
+        layout.addWidget(self.tabs)
         self.setLayout(layout)
+
+    # --- the Queue and State tabs ---------------------------------------------------
+
+    def direct_request(self, obj: dict) -> dict:
+        """A request to this window's own server, answered as a TCP client's
+        would be (``generate_reply``) -- the panels' requester."""
+        return json.loads(self.udp_server.generate_reply(json.dumps(obj)))
+
+    def _status_json(self) -> dict:
+        return json.loads(self.udp_server.generate_reply("status_json"))
+
+    def poll_status(self) -> None:
+        """status_json for the panels (skipped while the window is hidden)."""
+        if not self.isVisible() or getattr(self, "_status_polling", False):
+            return
+        self._status_polling = True
+        self.request_runner.call(self._status_json, self._on_status)
+
+    def _on_status(self, status) -> None:
+        self._status_polling = False
+        status = status if isinstance(status, dict) else None
+        self.queue_panel.set_state(status)
+        self.state_panel.set_state(status)
+
+    def _on_broadcast(self, payload) -> None:
+        if not isinstance(payload, dict):
+            return
+        self.queue_panel.on_broadcast(payload)
+        self.state_panel.on_broadcast(payload)
 
     def setup_udp_server(self):
         self.server_thread = QThread()
@@ -1672,6 +1772,17 @@ class MonitorServerGUI(QWidget):
         # server was already running) none of these exist, and an
         # AttributeError traceback here would bury the message saying why.
         log.info("Closing monitor server GUI...")
+        for name in ("status_poll_timer",):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
+        for name in ("queue_panel", "state_panel"):
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel.shutdown()
+        runner = getattr(self, "request_runner", None)
+        if runner is not None:
+            runner.shutdown()
         udp_server = getattr(self, "udp_server", None)
         if udp_server is not None:
             udp_server.stop()
