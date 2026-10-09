@@ -1826,3 +1826,12 @@ def test_source_hashing_happens_outside_the_lock(q, expts, monkeypatch):
     (expts / "rabi.py").write_text("# touched\n")      # new mtime: hashed again
     assert q.list()["jobs"][0]["source_changed"] is True
     assert seen and not any(seen)
+
+
+def test_a_negative_index_is_refused(q, expts):
+    a = submit(q, expts, at_end=True)
+    reply = q.insert({"path": str(expts / "rabi.py"), "at_index": -1})
+    assert reply["status"] == "error" and "0 or more" in reply["msg"]
+    reply = q.move({"id": a, "to_index": -3, "owner": "person"})
+    assert reply["status"] == "error" and "0 or more" in reply["msg"]
+    assert q.insert({"path": str(expts / "rabi.py"), "at_index": 99})["status"] == "ok"

@@ -701,7 +701,8 @@ class RunQueue:
                          obj: Mapping) -> int:
         """Where a job goes among ``queued`` (rank order): the position the
         request names -- ``before_id`` / ``after_id`` (a queued job),
-        ``at_index`` / ``to_index`` (0-based, clamped), ``at_end`` -- or, by
+        ``at_index`` / ``to_index`` (0-based; past the end means the end;
+        negative is refused), ``at_end`` -- or, by
         default, the owner rule: a person's job ahead of every queued agent
         job (after the person jobs of equal or higher priority), an agent's
         job at the end of the agent jobs of equal or higher priority."""
@@ -727,7 +728,9 @@ class RunQueue:
                     index = int(obj[key])
                 except (TypeError, ValueError):
                     raise QueueError(f"{key} must be an integer, not {obj[key]!r}")
-                return max(0, min(index, len(queued)))
+                if index < 0:
+                    raise QueueError(f"{key} must be 0 or more, not {index}")
+                return min(index, len(queued))
         if obj.get("at_end"):
             return len(queued)
         for i, other in enumerate(queued):
