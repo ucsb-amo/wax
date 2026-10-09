@@ -12,6 +12,11 @@ requires-python = "==3.13.*"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.scripts]
+# calibration write-backs (waxx.calibration.cli); config from --config module:attr
+# or $WAXX_CALIBRATION_CONFIG
+kcal = "waxx.calibration.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/ucsb-amo/wax-ucsb/waxx"
 [tool.setuptools.packages.find]
