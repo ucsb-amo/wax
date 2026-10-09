@@ -3,8 +3,9 @@
 The lab's use: the BEC TOF loop (kexp: ``experiments/tools/auto_tof.py``),
 started and stopped from a card on the Device Control GUI's Composite tab.  It
 runs in the monitor server because that process outlives the GUIs and already
-launches experiments the lab's way (``%kpy% & ar <file>``, as
-:class:`~waxx.util.device_state.state_reset.StateReset` does).
+launches experiments directly (``%kpy% & artiq_run --device-db "%db%" <file>``,
+:func:`~waxx.util.device_state.monitor_manager.ar_command`), as
+:class:`~waxx.util.device_state.state_reset.StateReset` does.
 
 One run at a time:
 
@@ -89,7 +90,7 @@ ACTIVE = ("running", "stopping")
 
 
 #: Characters refused in a picked file's path: the run is launched through the
-#: shell (``%kpy% & ar <file>``).
+#: shell (:func:`~waxx.util.device_state.monitor_manager.ar_command`).
 _SHELL_CHARS = set('&|<>^%"!')
 
 
@@ -618,7 +619,7 @@ class RunLoop:
         reason += " (sent by the monitor server's run loop)"
         try:
             # require_known_dead stays False here: the loop never kills its child,
-            # and proc.wait() returned because the shell ended after `ar` did, so
+            # and proc.wait() returned because the shell ended after artiq_run did, so
             # an unknown pid (older client) still means the experiment has exited.
             # A pid liveOD knows to be alive is never told (the helper's rule).
             sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=poll,

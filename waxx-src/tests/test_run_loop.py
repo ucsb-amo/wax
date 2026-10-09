@@ -779,6 +779,16 @@ def test_a_client_on_another_host_is_never_waived(expt, monkeypatch):
     assert loop.start()["status"] == "error"
 
 
+def test_launches_from_the_server_go_straight_to_artiq_run():
+    """`ar` becomes the run queue's submit client (phase 1): the server's own
+    launches (monitor, loops, state reset, queue jobs) must not go through it."""
+    from waxx.util.device_state.monitor_manager import MonitorManager, ar_command
+    assert ar_command("x.py") == r'%kpy% & artiq_run --device-db "%db%" x.py'
+    assert ar_command('"C:/M testing/x.py"').endswith(' "C:/M testing/x.py"')
+    assert " ar " not in ar_command("x.py")
+    assert MonitorManager("C:/m/monitor.py").launch_command == ar_command("C:/m/monitor.py")
+
+
 def test_the_loop_tells_its_runs_who_launched_them(monkeypatch):
     from waxx.util.device_state import run_loop
     seen = {}

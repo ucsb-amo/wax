@@ -9,7 +9,8 @@ what marks the state trusted again.
 
 :class:`StateReset` launches that file on request (the Device Control GUI's
 Run <reset experiment> button, through the monitor server), the same way the monitor
-experiment is launched (``%kpy% & ar <file>``), and follows it to the end.  It
+experiment is launched (``%kpy% & artiq_run --device-db "%db%" <file>``,
+:func:`~waxx.util.device_state.monitor_manager.ar_command`), and follows it to the end.  It
 never marks anything trusted itself: a reset that fails, is killed, or exits
 without reporting its end state leaves the state untrusted and says why.
 
