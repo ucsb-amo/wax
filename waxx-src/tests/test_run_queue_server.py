@@ -88,7 +88,8 @@ def test_the_request_contract(server, expts, tmp_path):
             "due", "after", "chain", "stop_on_failure", "write_back", "allow_drift",
             "repeat_index", "repeat_of", "submitted_at", "submitted_by", "state", "reason",
             "pid", "pid_started", "client_pid", "run_id", "log_path", "exit_code",
-            "outcome", "launched_at", "ended_at", "cancel", "adopted", "rank"} == set(j)
+            "outcome", "launched_at", "ended_at", "cancel", "adopted", "rank", "expt_class",
+            "calibrates_declared", "submitter"} == set(j)
     assert j["state"] == "queued" and j["owner"] == "agent"
     status = json.loads(server.generate_reply("status_json"))
     rq = status["run_queue"]

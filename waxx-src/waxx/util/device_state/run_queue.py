@@ -210,6 +210,49 @@ def _clock_text(t) -> str:
         return "?"
 
 
+def describe_source(path) -> tuple[str, list]:
+    """``(expt_class, calibrates_declared)`` from an experiment file's source,
+    read with :mod:`ast` (never imported): the single public class that
+    subclasses ``EnvExperiment`` or defines ``scan_kernel`` ("" when there is
+    none or more than one), and the first argument of every
+    ``self.calibrates('<key>', ...)`` call with a string key, in order, once
+    each.  ("", []) when the file cannot be read or parsed."""
+    import ast  # noqa: PLC0415
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return "", []
+    classes = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
+            continue
+        bases = [ast.unparse(b).split(".")[-1] for b in node.bases]
+        scan = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == "scan_kernel" for n in node.body)
+        if "EnvExperiment" in bases or scan:
+            classes.append(node.name)
+    keys: list = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "calibrates" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str) and node.args[0].value not in keys):
+            keys.append(node.args[0].value)
+    return (classes[0] if len(classes) == 1 else ""), keys
+
+
+def _since_text(t) -> str:
+    """"15:48", or "Oct 08 15:48" when not today."""
+    try:
+        t = float(t)
+        if time.strftime("%Y%m%d", time.localtime(t)) == time.strftime("%Y%m%d"):
+            return time.strftime("%H:%M", time.localtime(t))
+        return time.strftime("%b %d %H:%M", time.localtime(t))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
 def file_sha256(path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -279,6 +322,14 @@ class Job:
     #: the job's place in the queue: the scheduler takes the eligible job with
     #: the lowest rank (ties: lowest id); set at submit, changed by `move`
     rank: float | None = None
+    #: from the file's source at submit (ast, never imported): its experiment
+    #: class ("" when not one clear class) and the keys of its
+    #: self.calibrates('<key>', ...) calls -- "declared in source"
+    expt_class: str = ""
+    calibrates_declared: list = field(default_factory=list)
+    #: who submitted it, for listings: a person's "<user>@<pc>" (`by`), an
+    #: agent's label (WAXX_AGENT_LABEL) or "agent@<host>"
+    submitter: str = ""
 
     @property
     def name(self) -> str:
@@ -420,6 +471,8 @@ class RunQueue:
         self._own_abort_ids: set = set()
         #: dependencies no longer kept in queue.json: their state from the journal
         self._dep_cache: dict[int, str] = {}
+        #: (path, mtime_ns, size) -> sha256, for source_changed on listings
+        self._sha_cache: dict = {}
         #: the last gate's kind: "free" | "live" | "blocked" (see _gate)
         self._gate_kind = ""
         #: the run id of the job that ended last (its fence may still be up)
@@ -563,7 +616,15 @@ class RunQueue:
         label = _LABEL_RE.sub("_", str(obj.get("label") or path.stem)).strip("_") or path.stem
         label = label[:60]
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
+        if owner == "agent":
+            submitter = str(obj.get("agent_label") or "").strip() or \
+                f"agent@{obj.get('host') or obj.get('client') or '?'}"
+        else:
+            submitter = by or "?"
         sha = file_sha256(path)
+        expt_class, calibrates = describe_source(path)
+        # TODO(INIT_RUN): the live list of calibrated keys, sent by the
+        # experiment at prepare, overrides calibrates_declared once known.
         with self._lock:
             unknown = [a for a in after if a not in self._jobs
                        and self._dep_state(a) == "failed" and a >= self._next_id]
@@ -584,7 +645,8 @@ class RunQueue:
                           stop_on_failure=stop, write_back=write_back,
                           allow_drift=bool(obj.get("allow_drift")), repeat_index=i + 1,
                           repeat_of=repeat, submitted_at=now, submitted_by=by,
-                          rank=ranks[i])
+                          rank=ranks[i], expt_class=expt_class,
+                          calibrates_declared=list(calibrates), submitter=submitter)
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
@@ -669,6 +731,102 @@ class RunQueue:
     def _positions(self) -> dict[int, int]:
         """Job id -> 0-based position among the queued jobs (rank order)."""
         return {j.id: i for i, j in enumerate(self._queued_in_order())}
+
+    def _duration_estimate(self, job: Job) -> tuple[float | None, str]:
+        """(seconds, basis): the median launch-to-end time of the last 5 saved
+        runs of the same file (jobs the queue still keeps), or (None, why)."""
+        runs = sorted((j for j in self._jobs.values()
+                       if j.path == job.path and j.state == "saved"
+                       and j.launched_at and j.ended_at and j.id != job.id),
+                      key=lambda j: j.ended_at)[-5:]
+        if not runs:
+            return None, "no saved run of this file to go by"
+        times = sorted(j.ended_at - j.launched_at for j in runs)
+        mid = len(times) // 2
+        median = times[mid] if len(times) % 2 else (times[mid - 1] + times[mid]) / 2
+        return median, f"median of the last {len(runs)} saved run(s) of this file"
+
+    def _running_end(self, job: Job, now: float) -> tuple[float | None, str]:
+        """(epoch, basis): when the job in the slot should end -- from liveOD's
+        shots (expected x measured period) once it has taken one, else its
+        launch time + the duration estimate."""
+        poll = self._last_poll
+        if self._is_job_run(job, poll):
+            n = poll.get("n_shots") or 0
+            want = poll.get("n_shots_expected")
+            init_age, last_age = poll.get("init_run_age_s"), poll.get("last_shot_age_s")
+            if n and want and init_age is not None and last_age is not None and init_age >= last_age:
+                period = (init_age - last_age) / n
+                end = now - last_age + max(0, int(want) - int(n)) * period
+                return end, (f"liveOD: shot {n} of {want}, {period:.1f} s per shot (the save "
+                             "is not included)")
+        dur, basis = self._duration_estimate(job)
+        if dur is None or not job.launched_at:
+            return None, basis
+        return job.launched_at + dur, basis
+
+    def _source_changed(self, job: Job) -> bool | None:
+        """Whether a queued job's file differs from the one submitted (None
+        when it cannot be read); hashed again only when its size or mtime moved."""
+        try:
+            st = os.stat(job.path)
+        except OSError:
+            return None
+        key = (job.path, st.st_mtime_ns, st.st_size)
+        sha = self._sha_cache.get(key)
+        if sha is None:
+            try:
+                sha = file_sha256(job.path)
+            except OSError:
+                return None
+            self._sha_cache = {k: v for k, v in self._sha_cache.items() if k[0] != job.path}
+            self._sha_cache[key] = sha
+        return sha != job.sha256
+
+    def _views(self, jobs: list[Job], now: float) -> list[dict]:
+        """Each job as list/describe show it: its record plus ``position``,
+        ``waiting``, ``source_changed`` (queued jobs) and ``estimate`` --
+        ``{duration_s, eta_start, eta_end, basis}``, all ESTIMATES: the
+        duration from the last saved runs of the same file; for the job in the
+        slot its expected end; for a queued job its expected start (now + the
+        slot's remaining time + the durations of the queued jobs ahead of it;
+        null when any of them is unknown)."""
+        positions = self._positions()
+        cur = self._jobs.get(self._current) if self._current is not None else None
+        ahead_s: float | None = 0.0
+        if cur is not None:
+            end, _ = self._running_end(cur, now)
+            ahead_s = None if end is None else max(0.0, end - now)
+        start_of: dict[int, float | None] = {}
+        for q in self._queued_in_order():
+            start_of[q.id] = None if ahead_s is None else now + ahead_s
+            dur, _ = self._duration_estimate(q)
+            ahead_s = None if (ahead_s is None or dur is None) else ahead_s + dur
+        out = []
+        for job in jobs:
+            dur, basis = self._duration_estimate(job)
+            estimate = {"duration_s": dur, "eta_start": None, "eta_end": None, "basis": basis}
+            view = dict(job.to_dict(), position=positions.get(job.id),
+                        waiting=self._why_waiting(job, now), source_changed=None,
+                        estimate=estimate)
+            if job.state == "queued":
+                view["source_changed"] = self._source_changed(job)
+                estimate["eta_start"] = start_of.get(job.id)
+                if estimate["eta_start"] is not None and dur is not None:
+                    estimate["eta_end"] = estimate["eta_start"] + dur
+            elif job.state in IN_SLOT:
+                estimate["eta_end"], estimate["basis"] = self._running_end(job, now)
+            out.append(view)
+        return out
+
+    @staticmethod
+    def _row(view: dict) -> dict:
+        """The compact listing (kq list's columns)."""
+        return {"position": view.get("position"), "id": view["id"], "state": view["state"],
+                "owner": view["owner"], "submitter": view.get("submitter") or "",
+                "label": view["label"], "expt_class": view.get("expt_class") or "",
+                "run_id": view.get("run_id"), "est": view.get("estimate"),
+                "waiting": view.get("waiting") or ""}
 
     def insert(self, obj: Mapping) -> dict:
         """``submit`` at a position the request names (``at_index`` |
@@ -784,9 +942,11 @@ class RunQueue:
                           key=lambda j: j.id)
             jobs = [j for j in ended + slot + self._queued_in_order()
                     if not states or j.state in states]
-            out = [dict(j.to_dict(), position=positions.get(j.id)) for j in jobs]
-            order = [j.id for j in self._order(self._clock())]
-        return {"status": "ok", "jobs": out, "next": order, "run_queue": self.info()}
+            now = self._clock()
+            out = self._views(jobs, now)
+            order = [j.id for j in self._order(now)]
+        return {"status": "ok", "jobs": out, "rows": [self._row(v) for v in out],
+                "next": order, "run_queue": self.info()}
 
     def describe(self, obj: Mapping) -> dict:
         """``{"id", "token"?}`` -> the job, why it waits, its last lines."""
@@ -795,9 +955,8 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
-            out = {"status": "ok",
-                   "job": dict(job.to_dict(), position=self._positions().get(job.id)),
-                   "waiting": self._why_waiting(job, self._clock()),
+            view = self._views([job], self._clock())[0]
+            out = {"status": "ok", "job": view, "waiting": view["waiting"],
                    "tail": list(self._tails.get(job.id, ()))}
         return out
 
@@ -990,18 +1149,18 @@ class RunQueue:
         if job.state != "queued":
             return f"it is {job.state}"
         if job.due is not None and job.due > now:
-            return f"due at {_clock_text(job.due)}"
+            return f"due {_since_text(job.due)}"
         waits = [a for a in job.after if self._dep_state(a) != "saved"]
         if waits:
-            return "waiting for job " + ", ".join(map(str, waits))
+            return "after " + ", ".join(f"#{a} ({self._dep_state(a)})" for a in waits)
         if self._paused.get("all"):
             p = self._paused["all"]
-            return f"all jobs paused by {p.get('by')}"
+            return f"all jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
         if job.owner == "agent" and self._paused.get("agent"):
             p = self._paused["agent"]
-            return f"agent jobs paused by {p.get('by')}"
+            return f"agent jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
         if job.owner == "agent" and self.hold.active:
-            return self.hold.text()
+            return f"held: {self.hold.info().get('reason')}"
         return ""
 
     def _dep_state(self, job_id: int) -> str:
@@ -1044,10 +1203,11 @@ class RunQueue:
         if own:
             return own
         if self._current is not None:
-            return f"job {self._current} is in the slot"
+            cur = self._jobs.get(self._current)
+            return f"after #{self._current} ({cur.state if cur else 'in the slot'})"
         order = self._order(now)
         if order and order[0].id != job.id:
-            return f"job {order[0].id} goes first"
+            return f"#{order[0].id} goes first"
         return self._waiting or "launching"
 
     def tick(self) -> None:

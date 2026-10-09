@@ -234,7 +234,7 @@ def test_one_slot_and_the_next_waits_for_the_process_to_exit(q, expts):
     q.tick()
     q.tick()
     assert [job(q, a)["state"], job(q, b)["state"]] == ["running", "queued"]
-    assert "job %d is in the slot" % a in q.describe({"id": b})["waiting"]
+    assert q.describe({"id": b})["waiting"] == "after #%d (running)" % a
     run_through(q, 101)
     q.tick()
     assert job(q, b)["state"] == "running"
@@ -244,7 +244,7 @@ def test_after_waits_for_saved_and_skips_on_a_failure(q, expts):
     a = submit(q, expts)
     b = submit(q, expts, "tof", after=[a])
     q.tick()
-    assert "waiting for job %d" % a in q.describe({"id": b})["waiting"]
+    assert q.describe({"id": b})["waiting"] == "after #%d (running)" % a
     run_through(q, 101, outcome="saved_incomplete")
     q.tick()
     assert job(q, a)["state"] == "failed" and "saved_incomplete" in job(q, a)["reason"]
@@ -307,7 +307,7 @@ def test_pause_scopes_and_the_person_hold(q, expts):
     q.hold_request({"reason": "aligning", "by": "jp@kong"})
     q.tick()
     assert job(q, agent)["state"] == "queued"
-    assert q.describe({"id": agent})["waiting"].startswith("person hold since")
+    assert q.describe({"id": agent})["waiting"] == "held: aligning"
     assert q.info()["state"] == "held"
     q.release_request({"by": "jp", "owner": "person"})
     q.tick()
@@ -1569,3 +1569,93 @@ def test_an_older_queue_file_without_ranks_keeps_id_order(tmp_path, expts, q):
     path.write_text(json.dumps(data))
     again = make_queue(tmp_path, expts)
     assert _order_ids(again) == [a, b]
+
+
+# --- richer listing (phase 1b-2) ---------------------------------------------------------------
+
+SOURCE = """
+from artiq.experiment import *
+from kexp import Base
+
+class _Helper: pass
+
+class rabi_flop(EnvExperiment, Base):
+    def prepare(self):
+        self.calibrates('t_raman_pi_pulse', analysis='rabi_pi_time', write_back=True)
+        self.calibrates("frequency_raman_transition")
+        self.calibrates('t_raman_pi_pulse')
+        other.calibrates('not_self')
+    def scan_kernel(self): pass
+"""
+
+
+def test_the_source_is_read_with_ast(tmp_path):
+    f = tmp_path / "rabi.py"
+    f.write_text(SOURCE)
+    assert rq.describe_source(f) == ("rabi_flop", ["t_raman_pi_pulse",
+                                                   "frequency_raman_transition"])
+    (tmp_path / "two.py").write_text("class A(EnvExperiment): pass\nclass B(EnvExperiment): pass\n")
+    assert rq.describe_source(tmp_path / "two.py") == ("", [])
+    (tmp_path / "bad.py").write_text("def (:\n")
+    assert rq.describe_source(tmp_path / "bad.py") == ("", [])
+    (tmp_path / "k.py").write_text("class auto_tof(Base):\n    def scan_kernel(self): pass\n")
+    assert rq.describe_source(tmp_path / "k.py")[0] == "auto_tof"
+
+
+def test_submit_records_class_calibrations_and_submitter(q, expts):
+    (expts / "rabi.py").write_text(SOURCE)
+    a = q.submit({"path": str(expts / "rabi.py"), "by": "jp@kong"})["ids"][0]
+    b = q.submit({"path": str(expts / "rabi.py"), "owner": "agent",
+                  "agent_label": "cal-agent-3", "by": "x"})["ids"][0]
+    c = q.submit({"path": str(expts / "rabi.py"), "owner": "agent", "host": "kong"})["ids"][0]
+    ja = job(q, a)
+    assert ja["expt_class"] == "rabi_flop"
+    assert ja["calibrates_declared"] == ["t_raman_pi_pulse", "frequency_raman_transition"]
+    assert ja["submitter"] == "jp@kong"
+    assert job(q, b)["submitter"] == "cal-agent-3" and job(q, c)["submitter"] == "agent@kong"
+
+
+def test_estimates_from_saved_runs_and_live_od_shots(q, expts):
+    durations = [100.0, 300.0, 200.0]
+    for i, d in enumerate(durations):                      # three saved runs of rabi.py
+        submit(q, expts, at_end=True)
+        q.tick()
+        q.clock.t += d
+        run_through(q, 101 + i)
+    queued = [submit(q, expts, at_end=True) for _ in range(2)]
+    tof = submit(q, expts, "tof", at_end=True)             # never ran: unknown
+    q.tick()                                               # queued[0] is launched
+    proc = q.spawner.procs[-1]
+    run_id = 200
+    proc.write(f"Run ID: {run_id}")
+    q.live.start_run(run_id, launcher="kq", queue_job=qj(q, queued[0]), n_shots=10,
+                     n_shots_expected=40, init_run_age_s=50.0, last_shot_age_s=0.0)
+    q.tick()
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    running = views[queued[0]]["estimate"]
+    assert running["eta_end"] == pytest.approx(q.clock.t + 30 * 5.0)   # 5 s per shot
+    assert "shot 10 of 40" in running["basis"]
+    nxt = views[queued[1]]["estimate"]
+    assert nxt["duration_s"] == 200.0 and "median of the last 3" in nxt["basis"]
+    assert nxt["eta_start"] == pytest.approx(q.clock.t + 150.0)
+    assert nxt["eta_end"] == pytest.approx(q.clock.t + 350.0)
+    assert views[tof]["estimate"]["duration_s"] is None
+    assert views[tof]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 350.0)
+    rows = q.list()["rows"]
+    assert set(rows[0]) == {"position", "id", "state", "owner", "submitter", "label",
+                            "expt_class", "run_id", "est", "waiting"}
+
+
+def test_source_changed_and_precise_waiting(q, expts):
+    a = submit(q, expts, due=q.clock.t + 3600)
+    b = submit(q, expts, "tof", after=[a], at_end=True)
+    c = submit(q, expts, owner="agent", at_end=True)
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    assert views[a]["source_changed"] is False
+    assert views[a]["waiting"].startswith("due ")
+    assert views[b]["waiting"] == f"after #{a} (queued)"
+    (expts / "rabi.py").write_text("# changed\n")
+    assert {v["id"]: v for v in q.list()["jobs"]}[a]["source_changed"] is True
+    q.pause({"scope": "agent", "by": "jp"})
+    waiting = q.describe({"id": c})["waiting"]
+    assert waiting.startswith("agent jobs paused by jp since ")
