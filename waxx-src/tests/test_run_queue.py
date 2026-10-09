@@ -641,6 +641,65 @@ def test_a_job_whose_process_went_while_the_server_was_down(tmp_path, expts, q, 
     assert j["state"] == state and words in j["reason"] and j["exit_code"] is None
 
 
+# --- local folder, and the ops journal written outside the lock (review R2) --------------------
+
+def test_the_default_folder_is_local(monkeypatch, tmp_path):
+    from pathlib import Path
+    monkeypatch.delenv(rq.DIR_ENV, raising=False)
+    assert rq.default_dir() == str(Path.home() / ".waxx" / "run_queue")
+    monkeypatch.setenv(rq.DIR_ENV, str(tmp_path / "q"))
+    assert rq.default_dir() == str(tmp_path / "q")
+
+
+def test_the_ops_journal_copy_is_never_written_under_the_lock(tmp_path, expts):
+    seen = []
+
+    class SlowShareJournal(Journal):
+        def record(self, kind, **fields):
+            seen.append((kind, queue._lock._is_owned()))
+            super().record(kind, **fields)
+
+    queue = None
+    queue = make_queue(tmp_path, expts, journal=SlowShareJournal())
+    submit(queue, expts)
+    assert queue.submit({"path": str(expts / "rabi.py"), "after": [999]})["status"] == "error"
+    queue.tick()
+    run_through(queue, 101)
+    queue.cancel({"id": 99})
+    assert [k for k, _ in seen][:2] == ["run_queue_submit", "run_queue_refused"]
+    assert "run_queue_end" in [k for k, _ in seen]
+    assert not any(owned for _, owned in seen)
+    lines = (tmp_path / "logs" / "run_queue" / "journal.jsonl").read_text().splitlines()
+    assert len(lines) == len(seen)                       # nothing lost, nothing doubled
+
+
+# --- saves never go back in time (review S5) ---------------------------------------------------
+
+def test_an_older_snapshot_is_never_written_after_a_newer_one(q, expts, tmp_path):
+    submit(q, expts)
+    path = tmp_path / "logs" / "run_queue" / "queue.json"
+    written = json.loads(path.read_text())["seq"]
+    # a snapshot numbered before the one on disk (another thread's, slower to
+    # reach the file) is dropped
+    q._save_seq = written - 1
+    submit(q, expts, "tof")                          # numbers its snapshot `written`
+    assert json.loads(path.read_text())["seq"] == written
+    q._save_seq = written + 5
+    q._save()
+    assert json.loads(path.read_text())["seq"] == written + 6
+
+
+def test_the_holds_file_never_goes_back_either(tmp_path):
+    hold = PersonHold(str(tmp_path / "h.json"))
+    hold.hold("mine", "jp")
+    hold._saved_seq = 99                             # a newer write is on disk
+    hold.release("jp")                               # older-numbered: not written
+    assert json.loads((tmp_path / "h.json").read_text())["active"] is True
+    hold._save_seq = 200
+    hold._save()
+    assert json.loads((tmp_path / "h.json").read_text())["active"] is False
+
+
 # --- the alarm ----------------------------------------------------------------------------
 
 def test_the_alarm(q, expts, caplog):

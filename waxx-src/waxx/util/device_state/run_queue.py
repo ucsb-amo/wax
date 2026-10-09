@@ -74,10 +74,13 @@ queue's jobs do not restart it; see ``WAXX_LAUNCHER`` in ``Expt.end_wax``).
 :data:`ALARM_S` raises an alarm: one WARNING (and journal record) per
 :data:`ALARM_S`, ``alarm`` in the status, cleared by the next launch.
 
-**Records.**  ``<dir>/queue.json`` holds every job not yet ended and the last
+**Records.**  ``<dir>`` is on local disk (the server's default:
+:func:`default_dir`, ``~/.waxx/run_queue``).  ``<dir>/queue.json`` holds every job not yet ended and the last
 :data:`KEEP_ENDED` ended ones (atomic replace on every change);
 ``<dir>/journal.jsonl`` gets one line per transition (append only), and the
-server's ops journal the same records (kinds ``run_queue_*``).  At a server
+server's ops journal the same records (kinds ``run_queue_*``; copied by
+:meth:`RunQueue.flush_journal` outside the queue's lock, since the ops journal
+appends to the lab's share synchronously).  At a server
 restart the queue is read back; a running job whose process is still alive
 (same pid, same creation time) is adopted and followed as before; one whose
 process is gone is judged from liveOD's record (saved, or failed "server
@@ -144,6 +147,18 @@ TAIL_CHUNK = 64 * 1024
 CHILD_IO_ENCODING = "utf-8:backslashreplace"
 
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+#: Environment variable that moves the queue's folder (tests point it at a
+#: temporary folder; a lab may point it at another LOCAL folder).
+DIR_ENV = "WAXX_RUN_QUEUE_DIR"
+
+
+def default_dir() -> str:
+    """The queue's folder when the server is given none: ``$WAXX_RUN_QUEUE_DIR``,
+    else ``~/.waxx/run_queue`` -- local disk, next to the other ~/.waxx state
+    (the job logs are written by the running experiments: a network share
+    hiccup there would stall their output)."""
+    return os.environ.get(DIR_ENV) or str(Path.home() / ".waxx" / "run_queue")
 
 
 def _clock_text(t) -> str:
@@ -295,6 +310,13 @@ class RunQueue:
         self._lock = threading.RLock()
         self._tick_lock = threading.Lock()
         self._abort_lock = threading.Lock()
+        #: queue.json snapshots: the last numbered, the last written (_save)
+        self._save_lock = threading.Lock()
+        self._save_seq = 0
+        self._saved_seq = 0
+        #: records waiting to be copied to the ops journal (flush_journal)
+        self._mirror: deque = deque()
+        self._mirror_lock = threading.Lock()
         self._jobs: dict[int, Job] = {}
         self._next_id = 1
         self._paused: dict[str, dict | None] = {"agent": None, "all": None}
@@ -316,6 +338,7 @@ class RunQueue:
         self._alarm: dict | None = None
         self._own_abort_ids: set = set()
         self._load()
+        self.flush_journal()
 
     # -- paths ----------------------------------------------------------------------
 
@@ -345,6 +368,7 @@ class RunQueue:
             self._record("run_queue_refused", what="submit", msg=str(exc),
                          path=str(obj.get("path") or ""), by=str(obj.get("by") or ""))
             log.warning("Run queue: submit refused: %s", exc)
+            self.flush_journal()
             return {"status": "error", "msg": str(exc)}
         for job in jobs:
             log.info("Run queue: %s submitted by %s (%s, owner %s, priority %d%s).", job.name,
@@ -774,6 +798,7 @@ class RunQueue:
             self._alarm_tick(self._clock())
         finally:
             self._tick_lock.release()
+            self.flush_journal()
 
     def _poll_now(self) -> dict | None:
         """A fresh POLL (fed to the person hold's watch); None when liveOD does
@@ -1247,9 +1272,16 @@ class RunQueue:
     # -- persistence -----------------------------------------------------------------------
 
     def _save(self) -> None:
+        """Write queue.json.  Two threads may save at once (a request and the
+        tick): each snapshot gets a sequence number under the queue's lock, and
+        a snapshot older than the one last written is not written -- the file
+        never goes back to an earlier state.  Deadlock-free whatever lock the
+        caller holds (the save lock is never held while taking the queue's)."""
         if not self.enabled:
             return
         with self._lock:
+            self._save_seq += 1
+            seq = self._save_seq
             jobs = sorted(self._jobs.values(), key=lambda j: j.id)
             ended = [j for j in jobs if j.state in ENDED]
             keep = {j.id for j in ended[-KEEP_ENDED:]} | {j.id for j in jobs
@@ -1258,14 +1290,18 @@ class RunQueue:
                     "jobs": [j.to_dict() for j in jobs if j.id in keep],
                     "paused": {k: (dict(v) if v else None) for k, v in self._paused.items()},
                     "resume_loop": dict(self._resume_loop) if self._resume_loop else None,
-                    "own_abort_ids": sorted(self._own_abort_ids)[-200:]}
-        try:
-            from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
-            os.makedirs(self.directory, exist_ok=True)
-            atomic_write(self._path("queue.json"), data)
-        except Exception as exc:                      # noqa: BLE001
-            log.error("Run queue: could not store the queue in %s (%s).",
-                      self._path("queue.json"), exc)
+                    "own_abort_ids": sorted(self._own_abort_ids)[-200:], "seq": seq}
+        with self._save_lock:
+            if seq <= self._saved_seq:
+                return                    # a newer snapshot is already on disk
+            try:
+                from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
+                os.makedirs(self.directory, exist_ok=True)
+                atomic_write(self._path("queue.json"), data)
+                self._saved_seq = seq
+            except Exception as exc:                  # noqa: BLE001
+                log.error("Run queue: could not store the queue in %s (%s).",
+                          self._path("queue.json"), exc)
 
     def _load(self) -> None:
         if not self.enabled:
@@ -1338,12 +1374,28 @@ class RunQueue:
             except OSError as exc:
                 log.error("Run queue: could not append to its journal (%s).", exc)
         if self._journal is not None:
-            try:
-                self._journal.record(kind, **fields)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not journal %s", kind)
+            # the ops journal appends to the lab's share synchronously: the copy
+            # is written by flush_journal(), never while the queue's lock is held
+            self._mirror.append((kind, fields))
+
+    def flush_journal(self) -> None:
+        """Copy the records made since the last flush to the ops journal.
+        Called at the end of every request and tick, outside the lock."""
+        if self._journal is None:
+            return
+        is_owned = getattr(self._lock, "_is_owned", None)
+        if is_owned is not None and is_owned():
+            return                        # under the lock: the next flush writes them
+        with self._mirror_lock:
+            while self._mirror:
+                kind, fields = self._mirror.popleft()
+                try:
+                    self._journal.record(kind, **fields)
+                except Exception:                     # noqa: BLE001
+                    log.exception("Could not journal %s", kind)
 
     def _notify(self) -> None:
+        self.flush_journal()
         if self._on_change is None:
             return
         try:

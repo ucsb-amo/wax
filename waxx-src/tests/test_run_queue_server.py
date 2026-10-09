@@ -92,7 +92,7 @@ def test_the_request_contract(server, expts, tmp_path):
     status = json.loads(server.generate_reply("status_json"))
     rq = status["run_queue"]
     assert rq["enabled"] and rq["counts"]["queued"] == 1 and rq["next"] == [1]
-    assert rq["directory"] == str(tmp_path / "logs" / "run_queue")
+    assert rq["directory"] == str(tmp_path / "run_queue_default")   # conftest's local default
     assert status["person_hold"] == rq["person_hold"]
     assert any(p.get("type") == "run_queue" for p in server._broadcaster.sent)
     listed = server.ask({"type": "run_queue", "action": "list"})
@@ -114,7 +114,7 @@ def test_the_request_contract(server, expts, tmp_path):
     for kind in ("run_queue_submit", "run_queue_pause", "run_queue_resume", "run_queue_end",
                  "run_queue_hold", "run_queue_release"):
         assert kind in kinds
-    lines = (tmp_path / "logs" / "run_queue" / "journal.jsonl").read_text().splitlines()
+    lines = (tmp_path / "run_queue_default" / "journal.jsonl").read_text().splitlines()
     assert json.loads(lines[0])["kind"] == "run_queue_submit"
 
 
