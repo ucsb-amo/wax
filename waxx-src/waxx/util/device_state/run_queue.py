@@ -703,6 +703,13 @@ class RunQueue:
 
     # -- state ----------------------------------------------------------------------
 
+    def eligible_or_running(self) -> str:
+        """"" unless a job is in the slot (launching, running, ending) or one
+        is eligible to launch now; else which.  Queued jobs that are due
+        later, held, paused or waiting on another job do not count: they
+        leave a loop's Start and a monitor restart alone."""
+        return self.monitor_busy()
+
     def monitor_busy(self) -> str:
         """Why a monitor (re)start must wait ("" when it need not): a job is
         in the slot, or one is eligible to launch now."""

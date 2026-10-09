@@ -210,7 +210,8 @@ class MonitorUDPServer(UdpServer):
       launches the next when the machine is free.  ``status_json`` has
       ``run_queue`` and ``person_hold``; changes are broadcast as
       ``run_queue`` and ``person_hold``.  A loop's Start is refused while
-      the queue has jobs queued or running.
+      the queue has a job in its slot or one eligible to launch now (jobs due
+      later, held or paused leave the loop alone).
 
     Host-side connections this server holds between runs (the tweezer AWG;
     :class:`~waxx.util.device_state.connections.ConnectionService`, each in
@@ -743,10 +744,12 @@ class MonitorUDPServer(UdpServer):
         if other is not None and other is not loop:
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
-        if self.run_queue.has_work():
-            # the queue starts the loop it stopped again itself once it has run out
-            msg = (f"the run queue has work ({self.run_queue.work_text()}) -- {loop.spec.title} "
-                   "can start when it has run out (a loop the queue stopped starts again by "
+        busy = self.run_queue.eligible_or_running()
+        if busy:
+            # the queue starts the loop it stopped again itself once it has run
+            # out; jobs due later, held or paused leave the loop alone
+            msg = (f"the run queue has a job to run now ({busy}) -- {loop.spec.title} can "
+                   "start when it has run out (a loop the queue stopped starts again by "
                    "itself)")
             log.warning("%s: start refused: %s", loop.spec.title, msg)
             self.journal.record("run_loop_refused", loop=loop.spec.key, expt=loop.expt,

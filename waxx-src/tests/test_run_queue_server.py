@@ -226,7 +226,8 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     assert len(server.spawner.calls) == 1
     # a person's Start meanwhile is refused, naming the queue's work
     refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
-    assert refused["status"] == "error" and "the run queue has work (job 1" in refused["msg"]
+    assert refused["status"] == "error"
+    assert "the run queue has a job to run now (the run queue's job 1" in refused["msg"]
     release.clear()                                      # the loop's next run will wait
     _run(server, 85600)                                  # its last tick starts the loop
     assert loop.info()["state"] == "running", loop.info()["text"]   # started again by the queue
@@ -236,6 +237,26 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     loop.stop()
     release.set()
     loop.join(5)
+
+
+def test_jobs_due_later_held_or_paused_leave_a_loop_start_alone(server, expts):
+    import time as _time
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001,
+                                                           threading.Event())
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "due": _time.time() + 3600})
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    server.ask({"type": "run_queue", "action": "release", "by": "jp", "owner": "person"})
+    server.ask({"type": "run_queue", "action": "pause", "scope": "agent", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
+    assert reply["status"] == "ok", reply
+    loop.stop()
+    loop.join(6)
 
 
 def test_a_persons_stop_request_cancels_the_queues_restart_and_starters_are_kept(
