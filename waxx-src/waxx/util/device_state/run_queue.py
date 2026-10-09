@@ -1565,6 +1565,10 @@ class RunQueue:
         with self._lock:
             if job.state != "queued":                  # cancelled meanwhile
                 return False
+            if self._blocked_by(job, self._clock()):
+                # paused, held, edited (paused / due / after) while the gate
+                # polled liveOD outside the lock: it stays queued
+                return False
             if unreadable is not None:
                 self._end(job, "skipped", f"the file cannot be read at launch ({unreadable})")
                 skipped = True

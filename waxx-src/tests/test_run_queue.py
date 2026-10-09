@@ -1749,3 +1749,36 @@ def test_an_agents_requested_position_is_clamped_behind_the_persons_jobs(q, expt
     assert p3["clamped"] is False and _order_ids(q)[0] == p3["ids"][0]
     r = q.move({"id": a2, "to_index": 0, "owner": "person", "by": "jp"})
     assert r["clamped"] is False and _order_ids(q)[0] == a2
+
+
+# --- a change landing while the gate polls is honoured at launch (review S-b) ---------------------
+
+@pytest.mark.parametrize("change", [
+    lambda q, a: q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": True}}),
+    lambda q, a: q.edit({"id": a, "owner": "person", "fields": {"due": q.clock.t + 600}}),
+    lambda q, a: q.pause({"scope": "all", "by": "jp"}),
+])
+def test_a_pause_or_edit_between_the_gate_and_the_launch_keeps_the_job_queued(q, expts, change):
+    a = submit(q, expts)
+    real_gate = q._gate
+
+    def gate_then_change():
+        why = real_gate()                                # liveOD polled outside the lock...
+        change(q, a)                                     # ...and a request lands meanwhile
+        return why
+    q._gate = gate_then_change
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q.spawner.calls == []
+
+
+def test_a_hold_between_the_gate_and_the_launch_keeps_an_agents_job_queued(q, expts):
+    a = submit(q, expts, owner="agent")
+    real_gate = q._gate
+
+    def gate_then_hold():
+        why = real_gate()
+        q.hold_request({"reason": "mine", "by": "jp"})
+        return why
+    q._gate = gate_then_hold
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q.spawner.calls == []
