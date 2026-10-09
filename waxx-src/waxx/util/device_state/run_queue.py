@@ -115,6 +115,7 @@ from typing import Callable, Mapping
 
 from waxx.util.device_state import run_gate
 from waxx.util.device_state.monitor_manager import ar_command, environment_report
+from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_loop import (
     RUN_ID_RE, _SHELL_CHARS, judge_run, live_od_outcome, tell_live_od_exited)
@@ -209,6 +210,16 @@ def file_sha256(path) -> str:
         for block in iter(lambda: f.read(1 << 16), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _close(proc) -> None:
+    """Close a process watch (its handle); never raises."""
+    close = getattr(proc, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:                             # noqa: BLE001
+            log.exception("Run queue: closing a process watch failed")
 
 
 def _quote(arg: str) -> str:
@@ -1130,15 +1141,25 @@ class RunQueue:
             self._launch_failed(job, OSError(f"cannot write its log {log_path}: {exc}"))
             return True
         result: dict = {}
+        record: dict = {}
 
         def spawn():
             try:
-                result["proc"] = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
+                proc = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
             except BaseException as exc:              # noqa: BLE001
                 result["error"] = exc
+                return
+            with self._lock:
+                result["proc"] = proc
+                abandoned = self._spawning is not record
+            if abandoned:
+                # the queue stopped waiting for this launch (it adopted the run
+                # from liveOD, or gave the job up): its watch is not followed
+                _close(proc)
         thread = threading.Thread(target=spawn, daemon=True, name=f"run-queue-launch-{job.id}")
-        self._spawning = {"job": job.id, "thread": thread, "result": result,
-                          "since": self._clock(), "warned": False}
+        record.update({"job": job.id, "thread": thread, "result": result,
+                       "since": self._clock(), "warned": False})
+        self._spawning = record
         thread.start()
         thread.join(self._spawn_join_s)                # usually done at once
         self._follow_launch(job)
@@ -1159,7 +1180,15 @@ class RunQueue:
                 sp["warned"] = True
                 log.warning("Run queue: %s: its launch has not finished after %.0f s; the slot "
                             "stays taken (the job is looked for in liveOD).", job.name, waited)
-            self._follow_orphan(job, keep_waiting=True)
+            if waited <= LAUNCH_TIMEOUT_S + ORPHAN_WAIT_S:
+                self._follow_orphan(job, keep_waiting=True)
+                return
+            # the launch thread never came back: stop waiting for it (a late
+            # answer is closed by the thread itself) and treat the job as an
+            # orphan -- found in liveOD, or ended failed now
+            self._abandon_spawn()
+            self._record("run_queue_launch_abandoned", job=job.id, waited_s=round(waited, 1))
+            self._follow_orphan(job)
             return
         self._spawning = None
         result = sp["result"]
@@ -1176,6 +1205,15 @@ class RunQueue:
             return
         self._launch_failed(job, exc)
 
+    def _abandon_spawn(self) -> None:
+        """Stop waiting for the launch thread: a watch it already returned is
+        closed here, one it returns later is closed by the thread."""
+        with self._lock:
+            sp, self._spawning = self._spawning, None
+            proc = (sp or {}).get("result", {}).get("proc")
+        if proc is not None:
+            _close(proc)
+
     def _launched(self, job: Job, proc) -> None:
         with self._lock:
             if job.state != "launching":
@@ -1189,8 +1227,7 @@ class RunQueue:
                 job.pid_started = getattr(proc, "started", None)
                 self._procs[job.id] = proc
         if close:
-            if hasattr(proc, "close"):
-                proc.close()
+            _close(proc)
             return
         log.info("Run queue: %s launched (pid %s).", job.name, job.pid)
         self._record("run_queue_launch", job=job.id, pid=job.pid, log_path=job.log_path,
@@ -1231,7 +1268,7 @@ class RunQueue:
                     job.client_pid = poll.get("client_pid")
                     job.adopted = True
                 if keep_waiting:
-                    self._spawning = None          # the launch thread's answer is not needed
+                    self._abandon_spawn()          # the launch thread's answer is not needed
                 log.warning("Run queue: %s was launching; its run %s is in liveOD (pid %s): "
                             "followed.", job.name, job.run_id, job.client_pid)
                 self._record("run_queue_adopted", job=job.id, pid=job.client_pid,
@@ -1623,6 +1660,16 @@ class RunQueue:
 
     def _alarm_tick(self, now: float) -> None:
         with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            stuck = (cur is not None and cur.state == "launching"
+                     and now - float(cur.launched_at or now) > SPAWN_WARN_S)
+        if stuck:
+            self._raise_alarm(now, cur, now - float(cur.launched_at),
+                              f"{cur.name} has been launching for "
+                              f"{(now - float(cur.launched_at)) / 60.0:.1f} min (its launcher "
+                              "has not answered and no run of it is in liveOD)")
+            return
+        with self._lock:
             owed = self._current is None and bool(self._order(now))
             nxt = self._order(now)[0] if owed else None
         if owed and self._gate_kind != "blocked":
@@ -1643,16 +1690,21 @@ class RunQueue:
         waited = now - self._owed_since
         if waited <= self.alarm_s:
             return
+        self._raise_alarm(now, nxt, waited,
+                          f"{nxt.name} has been ready to start for {waited / 60.0:.0f} min and "
+                          f"nothing has launched -- {self._waiting or 'the reason is not known'}")
+
+    def _raise_alarm(self, now: float, job: Job, waited: float, text: str) -> None:
+        """One WARNING and journal record per alarm_s while the alarm holds."""
         if self._alarm is not None and now - self._alarm["warned"] < self.alarm_s:
             return
         first = self._alarm is None
-        self._alarm = {"since": self._owed_since, "warned": now, "job": nxt.id,
-                       "waited_s": waited, "why": self._waiting}
-        log.warning("RUN QUEUE ALARM: %s has been ready to start for %.0f min and nothing has "
-                    "launched -- %s", nxt.name, waited / 60.0,
-                    self._waiting or "the reason is not known")
-        self._record("run_queue_alarm", job=nxt.id, waited_s=round(waited, 1),
-                     why=self._waiting, first=first)
+        why = self._waiting if job.state == "queued" else text
+        self._alarm = {"since": now - waited, "warned": now, "job": job.id,
+                       "waited_s": waited, "why": why}
+        log.warning("RUN QUEUE ALARM: %s", text)
+        self._record("run_queue_alarm", job=job.id, waited_s=round(waited, 1), why=why,
+                     first=first)
         self._notify()
 
     def _clear_alarm(self, why: str) -> None:

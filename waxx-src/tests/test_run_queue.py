@@ -1294,3 +1294,133 @@ def test_a_queued_run_with_restart_already_off_prints_nothing(monkeypatch, capsy
     monkeypatch.setenv("WAXX_LAUNCHER", rq.LAUNCHER)
     assert expt._queue_restart_monitor(False) is False
     assert capsys.readouterr().out == ""
+
+
+# --- a launcher that never answers (review NEW-2, NEW-6) ---------------------------------------
+
+class _SilentLauncher:
+    """Popen stand-in for the launcher: takes the job, never answers; its
+    stdout's close() would wait on the reader's lock (as BufferedReader does)."""
+    instances = []
+
+    def __init__(self, *a, **kw):
+        import threading as _th
+        self.pid = 4040
+
+        class In:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, data):
+                self.text += data
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+        self.stdin = In()
+        self.reading = _th.Lock()
+        self.released = _th.Event()
+        launcher = self
+
+        class Out:
+            closed_while_reading = False
+
+            def readline(self):
+                with launcher.reading:
+                    launcher.released.wait(30)
+                    return ""
+
+            def close(self):
+                if launcher.reading.locked():
+                    Out.closed_while_reading = True
+                    with launcher.reading:                 # would block, as the real one
+                        pass
+
+        class Err:
+            def read(self):
+                return ""
+
+            def close(self):
+                pass
+        self.stdout, self.stderr = Out(), Err()
+        _SilentLauncher.instances.append(self)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the detached launcher is Windows-only")
+def test_a_silent_launcher_raises_unknown_without_hanging_and_sends_a_deadline(monkeypatch,
+                                                                               tmp_path):
+    from waxx.util.device_state import detached
+    _SilentLauncher.instances = []
+    monkeypatch.setattr(detached, "Popen", _SilentLauncher)
+    t0 = time.monotonic()
+    with pytest.raises(detached.LaunchUnknown):
+        detached.launch("echo x", cwd=str(tmp_path), env={}, log_path=str(tmp_path / "l"),
+                        timeout=0.3)
+    assert time.monotonic() - t0 < 5                       # did not wait for the launcher
+    fake = _SilentLauncher.instances[0]
+    assert not type(fake.stdout).closed_while_reading       # stdout left to the reader
+    job = json.loads(fake.stdin.text.splitlines()[0])
+    assert job["not_after"] == pytest.approx(time.time(), abs=5)
+    fake.released.set()
+
+
+def test_a_late_launcher_refuses_to_start_the_command(monkeypatch, tmp_path):
+    from waxx.util.device_state import detached
+    monkeypatch.setattr(detached, "Popen", lambda *a, **k: pytest.fail("started anyway"))
+    with pytest.raises(TimeoutError, match="too late"):
+        detached._start_job({"command": "echo x", "log_path": str(tmp_path / "l"),
+                             "not_after": 100.0}, now=101.0)
+
+
+def _hung_spawner():
+    import threading as _th
+    gate, closed = _th.Event(), []
+    proc = Proc("unused", 6060)
+    proc.close = lambda: closed.append(True)
+
+    def spawn(command, cwd, env, log_path):
+        gate.wait(10)
+        return proc
+    return spawn, gate, closed
+
+
+def test_a_launch_thread_that_never_returns_is_given_up_with_an_alarm(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    assert job(q, a)["state"] == "launching"
+    q.clock.t += rq.SPAWN_WARN_S + 1
+    q.tick()
+    alarm = q.info()["alarm"]
+    assert alarm is not None and alarm["job"] == a and "launching" in alarm["why"]
+    from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
+    q.clock.t += LAUNCH_TIMEOUT_S + rq.ORPHAN_WAIT_S
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "failed" and j["reason"].startswith("server stopped while launching")
+    assert "run_queue_launch_abandoned" in q.journal.kinds
+    gate.set()                                             # the launch answers at last
+    t0 = time.monotonic()
+    while not closed and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert closed == [True]                                # its watch is closed, not followed
+
+
+def test_a_watch_returned_after_adopting_from_live_od_is_closed(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    adopted = Proc("unused", 7101)
+    q._adopt = lambda pid, started: adopted if pid == 7101 else None
+    q.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    q.tick()
+    assert job(q, a)["state"] == "running" and job(q, a)["adopted"]
+    gate.set()
+    t0 = time.monotonic()
+    while not closed and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert closed == [True]
