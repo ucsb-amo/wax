@@ -277,6 +277,13 @@ def test_run_exited_without_a_run_id_sends_nothing():
     assert client.sent == []
 
 
+def test_run_exited_through_a_sender_of_its_own():
+    got = []
+    out = tell_live_od_run_exited(None, 85528, "x", poll=_running(),
+                                  send=lambda rid, why: got.append((rid, why)) or {"ok": True})
+    assert out["sent"] and out["ok"] and got == [(85528, "x")]
+
+
 def test_run_exited_uses_a_poll_in_hand():
     client = FakeLiveOD(error=AssertionError("must not poll"))
     out = tell_live_od_run_exited(client, 85528, "x", poll=_running())

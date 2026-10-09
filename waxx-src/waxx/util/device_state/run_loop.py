@@ -11,7 +11,12 @@ One run at a time:
 * Before every run the machine must be free: liveOD reachable, no run in
   progress there and no Abort pending, no other run announced to the server,
   nothing else of the server's (a state reset) holding the core.  At Start a
-  failed check refuses the Start; later it ends the loop.
+  failed check refuses the Start; later it ends the loop.  liveOD's side is
+  read by :func:`waxx.util.device_state.run_gate.classify`: a run in progress
+  whose process is known to be gone (an Abort pending or not) is *waived* --
+  one WARNING naming it, and the launch goes ahead (liveOD finalizes or
+  supersedes it at the next INIT_RUN).  An Abort pending with no run in
+  progress still ends the loop.
 * A run that ends cleanly -- exit code 0 and liveOD outcome ``saved`` -- is
   followed by the next.  Anything else ends the loop and it stays off
   (*latched*) until someone presses Start again: an Abort in liveOD (during a
@@ -59,7 +64,7 @@ from typing import Callable, Iterable, Mapping
 
 from waxx.util.device_state.monitor_manager import (
     _INTERRUPTED_SIGNATURES, _diagnose, _matches, ar_command, environment_report)
-from waxx.util.device_state import loop_scan
+from waxx.util.device_state import loop_scan, run_gate
 from waxx.util.device_state.loop_scan import ScanSettingsError, ScanSpec
 from waxx.util.device_state.output_log import OutputLog
 from waxx.util.device_state.state_reset import describe_expt
@@ -169,8 +174,11 @@ def resolve_pick(spec: LoopSpec, path) -> tuple[Path | None, str]:
 
 def _spawn(command: str, extra_env: Mapping | None = None):
     # unbuffered: the run's "Run ID:" line arrives when printed, and is not lost
-    # in a buffer when the process is killed
-    env = dict(os.environ, PYTHONUNBUFFERED="1", **(extra_env or {}))
+    # in a buffer when the process is killed. WAXX_LAUNCHER: the run tells
+    # liveOD at INIT_RUN that this loop launched it (run_gate).
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env[run_gate.LAUNCHER_ENV] = "run_loop"
+    env.update(extra_env or {})
     return Popen(command, stdout=PIPE, stderr=STDOUT, universal_newlines=True,
                  bufsize=1, errors="replace", shell=True, env=env)
 
@@ -258,6 +266,8 @@ class RunLoop:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._own_run_ids: deque = deque(maxlen=20)
+        #: (run id, state) of the last dead run the gate waived (warned once)
+        self._waived: tuple | None = None
         self._stop_by = ""
         self._external = ""
         self._about, self._about_key = "", None
@@ -476,12 +486,34 @@ class RunLoop:
             poll = self._poll()
         except Exception as exc:
             return f"liveOD is not reachable ({exc}) -- a run could not save", True
+        # liveOD's side is the shared classifier's (the fence was handled above,
+        # with this loop's own runs exempt)
+        verdict = run_gate.classify(poll, None)
+        if verdict.state == "free":
+            return None
         if poll.get("run_in_progress"):
-            return (f"run {poll.get('run_id')} ({poll.get('expt_name') or 'experiment'}) "
-                    "is in progress in liveOD"), False
+            if verdict.waivable:
+                # its process is gone: the next INIT_RUN finalizes (an Abort
+                # pending) or supersedes it -- no person needs to step in.
+                # Said once per run (Start and the first launch both ask).
+                key = (verdict.run_id, verdict.state)
+                if key != self._waived:
+                    self._waived = key
+                    log.warning("%s: run %s is %s in liveOD and is waived: %s",
+                                self.spec.title, verdict.run_id, verdict.state,
+                                verdict.reason)
+                    self._record("run_loop_waived", run_id=verdict.run_id,
+                                 state=verdict.state, reason=verdict.reason)
+                return None
+            text = (f"run {poll.get('run_id')} ({poll.get('expt_name') or 'experiment'}) "
+                    "is in progress in liveOD")
+            if verdict.state in ("wedged", "reset_pending"):
+                text += f" -- {verdict.reason}"
+            return text, False
         if poll.get("reset_requested"):
+            # no run: a person's Abort between runs ends the loop, as before
             return "an Abort is pending in liveOD", True
-        return None
+        return verdict.reason, False
 
     def _one_run(self) -> tuple[str, str, bool] | None:
         """Launch the experiment once and follow it; None when it saved."""
@@ -573,7 +605,9 @@ class RunLoop:
             reason += f"; last line: {tail[-1]}"
         reason += " (sent by the monitor server's run loop)"
         try:
-            reply = self._run_exited(live_id, reason)
+            sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=poll,
+                                                    send=self._run_exited)
+            reply = sent["reply"] if sent["sent"] else {"ok": False, "error": sent["why"]}
         except Exception as exc:
             log.error("%s: run %s is still in progress in liveOD after its process exited, "
                       "and telling liveOD failed: %s", self.spec.title, live_id, exc)

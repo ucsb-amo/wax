@@ -378,17 +378,19 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
 
 # -- telling liveOD a run's process has exited ------------------------------------------
 
-def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = None) -> dict:
+def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = None,
+                            send: Callable[[int, str], dict] | None = None) -> dict:
     """Send liveOD RUN_EXITED for run ``run_id`` on behalf of its process, which
     has exited -- only if that run is still liveOD's current run, in progress,
     and liveOD has not already heard of the exit (``run_state`` "exited").
     The process's own notice (an atexit handler) never ran when it was killed
-    or crashed hard.
+    or crashed hard.  No run token is sent: liveOD matches the run id instead.
 
     ``client`` has ``poll()`` and ``_send_recv(msg)`` (a LiveODClient);
-    ``poll`` is a POLL reply already in hand.  Returns ``{"sent": bool,
-    "ok": bool, "why": str, "reply": dict | None}``; raises only if sending
-    the notice itself fails."""
+    ``poll`` is a POLL reply already in hand; ``send(run_id, reason)``, if
+    given, sends the notice instead of ``client`` (the run loop's own sender).
+    Returns ``{"sent": bool, "ok": bool, "why": str, "reply": dict | None}``;
+    raises only if polling or sending the notice itself fails."""
     if run_id is None:
         return {"sent": False, "ok": False, "why": "no run id", "reply": None}
     if poll is None:
@@ -403,8 +405,11 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False,
                 "why": f"liveOD's current run is {poll.get('run_id')}, not {run_id}",
                 "reply": None}
-    reply = client._send_recv({"tag": "RUN_EXITED", "run_id": int(run_id),
-                               "reason": str(reason)})
+    if send is not None:
+        reply = send(int(run_id), str(reason))
+    else:
+        reply = client._send_recv({"tag": "RUN_EXITED", "run_id": int(run_id),
+                                   "reason": str(reason)})
     ok = bool(isinstance(reply, dict) and reply.get("ok"))
     return {"sent": True, "ok": ok, "why": "sent" if ok else f"liveOD refused: {reply}",
             "reply": reply}

@@ -653,3 +653,93 @@ def test_the_exit_notice_is_sent_once(fake_client):
     with pytest.raises(ConnectionError):
         _LiveOD().run_exited(84100, "test")
     assert len(fake_client.made) == 1 and len(fake_client.made[0].sent) == 1
+
+
+# -- the gate's liveOD verdict comes from run_gate (2026-10-09) ---------------------------
+
+class ClientLive(FakeLive):
+    """FakeLive whose POLL also names the run's client (and any ``extra`` keys)."""
+
+    def __init__(self, **client):
+        super().__init__()
+        self.client, self.extra = client, {}
+
+    def __call__(self):
+        reply = super().__call__()
+        reply.update(self.client)
+        reply.update(self.extra)
+        return reply
+
+
+def _stuck(reset, host=None, **extra):
+    """liveOD holding run 85528 (as on 2026-10-09), its client pid 4242."""
+    import socket
+    live = ClientLive(client_pid=4242, client_host=host or socket.gethostname(),
+                      launcher="run_lock")
+    live.run_in_progress, live.run_id, live.reset_requested = True, 85528, reset
+    live.extra = extra
+    return live
+
+
+@pytest.mark.parametrize("reset, state", [(True, "reset_pending"), (False, "dead_client")])
+def test_a_run_whose_process_is_gone_is_waived_with_one_warning(expt, monkeypatch, caplog,
+                                                                 reset, state):
+    from waxx.util.device_state import run_gate
+    monkeypatch.setattr(run_gate, "_default_pid_alive", lambda pid: False)
+    live = _stuck(reset)
+    loop = None
+
+    def init_run():                       # the next INIT_RUN finalizes the dead run
+        live.run_in_progress, live.reset_requested, live.run_id = False, False, 101
+        loop.stop()
+
+    loop = _loop(expt, live, [FakeProc(live, 101, before=init_run)])
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.run_loop"):
+        assert loop.start()["status"] == "ok"
+        loop.join(5)
+    info = loop.info()
+    assert info["state"] == "stopped" and info["runs"] == 1
+    waived = [r for r in caplog.records if "waived" in r.getMessage()]
+    assert len(waived) == 1
+    assert "85528" in waived[0].getMessage() and state in waived[0].getMessage()
+    assert "pid 4242" in waived[0].getMessage()
+    assert loop.journal.kinds.count("run_loop_waived") == 1
+
+
+@pytest.mark.parametrize("reset, extra, alive, words", [
+    (True, {}, True, "an Abort is pending in liveOD, waiting"),
+    (False, {"n_shots": 3, "init_run_age_s": 6000.0, "last_shot_age_s": 5000.0}, True,
+     "WEDGED"),
+])
+def test_a_run_whose_process_lives_still_refuses(expt, monkeypatch, reset, extra, alive, words):
+    from waxx.util.device_state import run_gate
+    monkeypatch.setattr(run_gate, "_default_pid_alive", lambda pid: alive)
+    loop = _loop(expt, _stuck(reset, **extra), [])
+    reply = loop.start()
+    assert reply["status"] == "error"
+    assert "run 85528 (someone_else) is in progress in liveOD" in reply["msg"]
+    assert words in reply["msg"]
+    assert "run_loop_waived" not in loop.journal.kinds
+
+
+def test_a_client_on_another_host_is_never_waived(expt, monkeypatch):
+    from waxx.util.device_state import run_gate
+
+    def never(pid):
+        raise AssertionError("a pid on another host must not be checked")
+    monkeypatch.setattr(run_gate, "_default_pid_alive", never)
+    loop = _loop(expt, _stuck(True, host="some-other-pc"), [])
+    assert loop.start()["status"] == "error"
+
+
+def test_the_loop_tells_its_runs_who_launched_them(monkeypatch):
+    from waxx.util.device_state import run_loop
+    seen = {}
+
+    def popen(command, **kw):
+        seen.update(kw["env"])
+        return "proc"
+    monkeypatch.setattr(run_loop, "Popen", popen)
+    assert run_loop._spawn("ar x.py", {"WAXX_LOOP_SCAN": "{}"}) == "proc"
+    assert seen["WAXX_LAUNCHER"] == "run_loop"
+    assert seen["PYTHONUNBUFFERED"] == "1" and seen["WAXX_LOOP_SCAN"] == "{}"
