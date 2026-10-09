@@ -493,3 +493,23 @@ def test_pid_alive_on_an_exited_child_whose_handle_we_hold():
 
 def test_pid_alive_is_conservative_for_nonsense():
     assert run_gate.pid_alive(0) is True
+
+
+# -- the monitor server's run queue (review B1) ------------------------------------------
+
+def test_the_queues_job_in_its_slot_or_about_to_launch_is_busy():
+    base = {"state": 2, "run_pending": None, "run_loops": {},
+            "person_hold": {"active": False}}
+    assert run_gate.loops_verdict(dict(base, run_queue={"current": None, "next": []})) is None
+    assert run_gate.loops_verdict(base) is None                     # an older server
+    v = run_gate.loops_verdict(dict(base, run_queue={
+        "current": {"id": 12, "label": "rabi", "state": "running", "run_id": 85600},
+        "next": [13]}))
+    assert v.state == "live" and v.blocks and v.run_id == 85600
+    assert "job 12 (rabi) running (run 85600)" in v.reason
+    v = run_gate.loops_verdict(dict(base, run_queue={"current": None, "next": [13]}))
+    assert v.state == "live" and "job 13 ready to start" in v.reason
+    # the hold is said first
+    held = dict(base, person_hold={"active": True, "since": 1.0, "by": "jp", "reason": "x"},
+                run_queue={"current": None, "next": [13]})
+    assert run_gate.loops_verdict(held).state == "held"
