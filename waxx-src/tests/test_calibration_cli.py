@@ -348,3 +348,15 @@ def test_kcal_emit_flags_incomplete_runs_and_scanned_keys(env, monkeypatch, run_
     else:
         assert "not applied: write_back is off" in out
     assert env.params_file.read_bytes() == raw
+
+
+def test_allow_no_unc_does_not_clear_a_stored_no_unc_flag(env, monkeypatch, capsys):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    r = record(unc=None)
+    r.flags = [{"code": "no_unc", "text": "no uncertainty was given"}]
+    Ledger(env.ledger).write_record(r)
+    code, out = kcal("apply", "t_pi", "--run", "85600", "--allow-no-unc")
+    assert code == 2 and "no uncertainty was given" in out
+    with pytest.raises(SystemExit):
+        cli.main(["apply", "--help"])
+    assert "does NOT clear a no_unc flag" in " ".join(capsys.readouterr().out.split())

@@ -62,7 +62,11 @@ def _parser():
     a.add_argument("--run", type=int, required=True)
     a.add_argument("--dry-run", action="store_true")
     a.add_argument("--note", default="")
-    a.add_argument("--allow-no-unc", action="store_true")
+    a.add_argument("--allow-no-unc", action="store_true",
+                   help="accept a result without an uncertainty (written with its full repr). "
+                        "It does NOT clear a no_unc flag the record was emitted with "
+                        "(declare allow_no_unc=True in the experiment for that): stored "
+                        "flags always refuse")
     a.add_argument("--force", action="store_true",
                    help="apply although the ledger has a newer emit / apply (journaled)")
     a.add_argument("--params")
@@ -73,7 +77,11 @@ def _parser():
     c = sub.add_parser("check", help="the flags a ledger result has (writes nothing)")
     c.add_argument("key")
     c.add_argument("--run", type=int, required=True)
-    c.add_argument("--allow-no-unc", action="store_true")
+    c.add_argument("--allow-no-unc", action="store_true",
+                   help="accept a result without an uncertainty (written with its full repr). "
+                        "It does NOT clear a no_unc flag the record was emitted with "
+                        "(declare allow_no_unc=True in the experiment for that): stored "
+                        "flags always refuse")
     c.add_argument("--params")
     sub.add_parser("analyses", help="the analyses in the registry")
     return p
