@@ -190,6 +190,11 @@ def submit(q, expts, name="rabi", **kw):
     return reply["ids"] if len(reply["ids"]) > 1 else reply["ids"][0]
 
 
+def qj(q, job_id):
+    """The job's queue_job as its experiment sends it: "<id>:<token>"."""
+    return f"{job_id}:{job(q, job_id)['token']}"
+
+
 def job(q, job_id):
     return q.describe({"id": job_id})["job"]
 
@@ -207,20 +212,21 @@ def run_through(q, run_id, outcome="saved", code=0, lines=()):
 
 # --- scheduling ---------------------------------------------------------------------------
 
-def test_order_is_priority_then_due_then_id(q, expts):
-    a = submit(q, expts, "rabi", priority=0)
-    b = submit(q, expts, "tof", priority=5)
-    c = submit(q, expts, "cal", priority=5, due=q.clock.t + 60)
-    d = submit(q, expts, "cal", priority=5)
-    assert q.list()["next"] == [b, d, a]                      # c is not due yet
+def test_the_lowest_rank_eligible_job_goes_and_gates_never_reorder(q, expts):
+    a = submit(q, expts, "rabi")
+    b = submit(q, expts, "tof", at_end=True)
+    c = submit(q, expts, "cal", at_end=True, due=q.clock.t + 60)   # gated by its due time
+    d = submit(q, expts, "cal", at_end=True)
+    assert [j["id"] for j in q.list()["jobs"]] == [a, b, c, d]     # rank order
+    assert [j["position"] for j in q.list()["jobs"]] == [0, 1, 2, 3]
+    assert q.list()["next"] == [a, b, d]                           # c waits, keeps its place
     q.clock.t += 61
-    assert q.list()["next"] == [b, d, c, a]
+    assert q.list()["next"] == [a, b, c, d]
     q.tick()
-    assert job(q, b)["state"] == "running" and len(q.spawner.calls) == 1
+    assert job(q, a)["state"] == "running"
     run_through(q, 101)
-    assert job(q, b)["state"] == "saved" and job(q, b)["run_id"] == 101
     q.tick()
-    assert job(q, d)["state"] == "running"
+    assert job(q, b)["state"] == "running"
 
 
 def test_one_slot_and_the_next_waits_for_the_process_to_exit(q, expts):
@@ -228,7 +234,7 @@ def test_one_slot_and_the_next_waits_for_the_process_to_exit(q, expts):
     q.tick()
     q.tick()
     assert [job(q, a)["state"], job(q, b)["state"]] == ["running", "queued"]
-    assert "job %d is in the slot" % a in q.describe({"id": b})["waiting"]
+    assert q.describe({"id": b})["waiting"] == "after #%d (running)" % a
     run_through(q, 101)
     q.tick()
     assert job(q, b)["state"] == "running"
@@ -238,7 +244,7 @@ def test_after_waits_for_saved_and_skips_on_a_failure(q, expts):
     a = submit(q, expts)
     b = submit(q, expts, "tof", after=[a])
     q.tick()
-    assert "waiting for job %d" % a in q.describe({"id": b})["waiting"]
+    assert q.describe({"id": b})["waiting"] == "after #%d (running)" % a
     run_through(q, 101, outcome="saved_incomplete")
     q.tick()
     assert job(q, a)["state"] == "failed" and "saved_incomplete" in job(q, a)["reason"]
@@ -301,7 +307,7 @@ def test_pause_scopes_and_the_person_hold(q, expts):
     q.hold_request({"reason": "aligning", "by": "jp@kong"})
     q.tick()
     assert job(q, agent)["state"] == "queued"
-    assert q.describe({"id": agent})["waiting"].startswith("person hold since")
+    assert q.describe({"id": agent})["waiting"] == "held: aligning"
     assert q.info()["state"] == "held"
     q.release_request({"by": "jp", "owner": "person"})
     q.tick()
@@ -315,13 +321,13 @@ def test_pause_scopes_and_the_person_hold(q, expts):
 def test_the_launch_command_environment_and_log(q, expts, tmp_path):
     a = submit(q, expts, label="rabi scan!", argv=["-a", "x=1"], owner="agent",
                write_back=False)
-    b = submit(q, expts, "tof", priority=0)       # after the agent's job (same priority)
+    b = submit(q, expts, "tof", at_end=True)      # after the agent's job
     q.tick()
     call = q.spawner.calls[0]
     path = str((expts / "rabi.py").resolve())
     assert call["command"] == f'%kpy% & artiq_run --device-db "%db%" {path} -a x=1'
     env = call["env"]
-    assert env["WAXX_LAUNCHER"] == "kq" and env["WAXX_QUEUE_JOB"] == str(a)
+    assert env["WAXX_LAUNCHER"] == "kq" and env["WAXX_QUEUE_JOB"] == qj(q, a)
     assert env["WAXX_OWNER"] == "agent" and env["PYTHONUNBUFFERED"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["WAXX_CAL_NO_WRITE_BACK"] == "1"
@@ -760,17 +766,17 @@ def test_the_jobs_run_is_known_from_live_od_without_its_output(q, expts):
     q.tick()
     proc = q.spawner.procs[-1]
     proc.write("compiling", "shot 1/9")                  # WAX_VERBOSITY=0: no Run ID line
-    q.live.start_run(555, launcher="run_loop", queue_job=str(a), client_pid=1)
+    q.live.start_run(555, launcher="run_loop", queue_job=qj(q, a), client_pid=1)
     q.tick()
     assert job(q, a)["run_id"] is None                   # not the queue's launch: ignored
-    q.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
     q.tick()
     j = job(q, a)
     assert j["run_id"] == 101 and j["client_pid"] == 7101
     rec = [e for e in q.journal.entries if e["kind"] == "run_queue_run_id"][-1]
     assert rec["via"] == "liveOD"
     q.live.end_run(101)
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     proc.code = 0
     q.tick()
     assert job(q, a)["state"] == "saved"
@@ -780,7 +786,7 @@ def test_a_run_known_only_from_its_outcome(q, expts):
     a = submit(q, expts)
     q.tick()
     q.live.end_run(101)                                  # it ran and ended between polls
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     q.spawner.procs[-1].code = 0
     q.tick()
     assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
@@ -828,7 +834,7 @@ def test_a_launching_job_is_never_launched_again_and_is_adopted_from_live_od(
     again._adopt = lambda pid, started: adopted if pid == 7101 else None
     again.tick()
     assert again.spawner.calls == [] and job(again, a)["state"] == "launching"
-    again.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    again.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
     again.tick()
     j = job(again, a)
     assert j["state"] == "running" and j["run_id"] == 101 and j["adopted"]
@@ -866,7 +872,7 @@ def test_a_hung_launcher_stalls_nothing_and_its_job_is_found_in_live_od(q, expts
     assert job(q, a)["state"] == "launching" and "run_queue_launch_unknown" in q.journal.kinds
     assert q.list()["status"] == "ok"                 # requests answer meanwhile
     q.live.end_run(101)
-    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=qj(q, a))
     q.tick()
     assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
 
@@ -1382,13 +1388,18 @@ def test_a_due_that_is_not_a_finite_time_is_refused(q, expts, due):
     assert reply["status"] == "error" and "finite" in reply["msg"]
 
 
-def test_a_persons_job_goes_to_the_front_unless_a_priority_is_given(q, expts):
-    agent = submit(q, expts, owner="agent")
-    person = submit(q, expts)
-    given = submit(q, expts, priority=0)
-    assert job(q, person)["priority"] == rq.PERSON_PRIORITY == 10
-    assert job(q, agent)["priority"] == 0 and job(q, given)["priority"] == 0
-    assert q.list()["next"] == [person, agent, given]
+def test_placement_a_person_ahead_of_agents_priority_within_the_block(q, expts):
+    a1 = submit(q, expts, owner="agent")
+    a2 = submit(q, expts, owner="agent", priority=5)       # ahead of the agent's 0
+    p1 = submit(q, expts)                                  # a person: ahead of all agents
+    p2 = submit(q, expts, priority=3)                      # ahead of the person's 0
+    p3 = submit(q, expts, at_end=True)                     # unless at the end
+    order = [j["id"] for j in q.list()["jobs"]]
+    assert order == [p2, p1, a2, a1, p3]
+    assert job(q, a2)["priority"] == 5                     # kept for display
+    ids = submit(q, expts, owner="agent", repeat=3)        # a repeat stays together
+    order = [j["id"] for j in q.list()["jobs"]]
+    assert order[order.index(ids[0]):order.index(ids[0]) + 3] == ids
 
 
 def test_a_queued_run_with_restart_already_off_prints_nothing(monkeypatch, capsys):
@@ -1396,3 +1407,419 @@ def test_a_queued_run_with_restart_already_off_prints_nothing(monkeypatch, capsy
     monkeypatch.setenv("WAXX_LAUNCHER", rq.LAUNCHER)
     assert expt._queue_restart_monitor(False) is False
     assert capsys.readouterr().out == ""
+
+
+# --- a launcher that never answers (review NEW-2, NEW-6) ---------------------------------------
+
+class _SilentLauncher:
+    """Popen stand-in for the launcher: takes the job, never answers; its
+    stdout's close() would wait on the reader's lock (as BufferedReader does)."""
+    instances = []
+
+    def __init__(self, *a, **kw):
+        import threading as _th
+        self.pid = 4040
+
+        class In:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, data):
+                self.text += data
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+        self.stdin = In()
+        self.reading = _th.Lock()
+        self.released = _th.Event()
+        launcher = self
+
+        class Out:
+            closed_while_reading = False
+
+            def readline(self):
+                with launcher.reading:
+                    launcher.released.wait(30)
+                    return ""
+
+            def close(self):
+                if launcher.reading.locked():
+                    Out.closed_while_reading = True
+                    with launcher.reading:                 # would block, as the real one
+                        pass
+
+        class Err:
+            def read(self):
+                return ""
+
+            def close(self):
+                pass
+        self.stdout, self.stderr = Out(), Err()
+        _SilentLauncher.instances.append(self)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the detached launcher is Windows-only")
+def test_a_silent_launcher_raises_unknown_without_hanging_and_sends_a_deadline(monkeypatch,
+                                                                               tmp_path):
+    from waxx.util.device_state import detached
+    _SilentLauncher.instances = []
+    monkeypatch.setattr(detached, "Popen", _SilentLauncher)
+    t0 = time.monotonic()
+    with pytest.raises(detached.LaunchUnknown):
+        detached.launch("echo x", cwd=str(tmp_path), env={}, log_path=str(tmp_path / "l"),
+                        timeout=0.3)
+    assert time.monotonic() - t0 < 5                       # did not wait for the launcher
+    fake = _SilentLauncher.instances[0]
+    assert not type(fake.stdout).closed_while_reading       # stdout left to the reader
+    job = json.loads(fake.stdin.text.splitlines()[0])
+    assert job["not_after"] == pytest.approx(time.time(), abs=5)
+    fake.released.set()
+
+
+def test_a_late_launcher_refuses_to_start_the_command(monkeypatch, tmp_path):
+    from waxx.util.device_state import detached
+    monkeypatch.setattr(detached, "Popen", lambda *a, **k: pytest.fail("started anyway"))
+    with pytest.raises(TimeoutError, match="too late"):
+        detached._start_job({"command": "echo x", "log_path": str(tmp_path / "l"),
+                             "not_after": 100.0}, now=101.0)
+
+
+def _hung_spawner():
+    import threading as _th
+    gate, closed = _th.Event(), []
+    proc = Proc("unused", 6060)
+    proc.close = lambda: closed.append(True)
+
+    def spawn(command, cwd, env, log_path):
+        gate.wait(10)
+        return proc
+    return spawn, gate, closed
+
+
+def test_a_launch_thread_that_never_returns_is_given_up_with_an_alarm(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    assert job(q, a)["state"] == "launching"
+    q.clock.t += rq.SPAWN_WARN_S + 1
+    q.tick()
+    alarm = q.info()["alarm"]
+    assert alarm is not None and alarm["job"] == a and "launching" in alarm["why"]
+    from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
+    q.clock.t += LAUNCH_TIMEOUT_S + rq.ORPHAN_WAIT_S
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "failed" and j["reason"].startswith("server stopped while launching")
+    assert "run_queue_launch_abandoned" in q.journal.kinds
+    gate.set()                                             # the launch answers at last
+    t0 = time.monotonic()
+    while not closed and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert closed == [True]                                # its watch is closed, not followed
+
+
+def test_a_watch_returned_after_adopting_from_live_od_is_closed(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    adopted = Proc("unused", 7101)
+    q._adopt = lambda pid, started: adopted if pid == 7101 else None
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
+    q.tick()
+    assert job(q, a)["state"] == "running" and job(q, a)["adopted"]
+    gate.set()
+    t0 = time.monotonic()
+    while not closed and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert closed == [True]
+
+
+# --- queue_job is "<id>:<token>" (review NEW-3) --------------------------------------------------
+
+def test_another_queues_run_with_the_same_job_id_is_never_taken_for_this_one(q, expts):
+    spawn, gate, closed = _hung_spawner()
+    q._spawn, q._spawn_join_s = spawn, 0.0
+    a = submit(q, expts)
+    q.tick()
+    assert job(q, a)["state"] == "launching"
+    # an old run from another folder's queue: job id a too, another token
+    q.live.end_run(99)
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=f"{a}:000000")
+    q.tick()
+    assert job(q, a)["state"] == "launching"              # not "finished" by it
+    q.live.start_run(100, launcher="kq", queue_job=str(a), client_pid=1)   # id alone
+    q.tick()
+    assert job(q, a)["run_id"] is None
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101)
+    q._adopt = lambda pid, started: Proc("unused", 7101) if pid == 7101 else None
+    q.tick()
+    assert job(q, a)["state"] == "running" and job(q, a)["run_id"] == 101
+    gate.set()
+
+
+# --- a blocked gate never defers the monitor (review NEW-4) ---------------------------------------
+
+def test_a_blocked_gate_never_defers_a_monitor_restart(q, expts):
+    a = submit(q, expts)
+    q.live.down = True                                   # liveOD unreachable: blocked
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q._gate_kind == "blocked"
+    assert q.monitor_busy() == ""                        # the monitor may start
+    assert q.eligible_or_running()                       # (a loop Start still waits)
+    q.live.down = False
+    q.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    q.tick()                                             # someone's live run: legitimate
+    assert q._gate_kind == "live" and "about to launch" in q.monitor_busy()
+
+
+# --- no launch without its "launching" state on disk (review NEW-5) --------------------------------
+
+def test_a_launch_that_cannot_be_saved_first_is_refused(q, expts, monkeypatch):
+    a = submit(q, expts)
+    real = rq.os.makedirs
+
+    def full_disk(path, exist_ok=False):
+        raise OSError("disk full")
+    monkeypatch.setattr(rq.os, "makedirs", full_disk)        # every queue write fails
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "queued" and "could not be saved" in j["reason"]
+    assert q.spawner.calls == []
+    monkeypatch.setattr(rq.os, "makedirs", real)
+    q.tick()
+    assert q.spawner.calls == [] and "could not be saved" in q.info()["waiting"]
+    assert "run_queue_launch_refused" in q.journal.kinds
+    q.clock.t += rq.SAVE_RETRY_S + 1
+    q.tick()
+    assert job(q, a)["state"] == "running" and len(q.spawner.calls) == 1
+
+
+def test_save_says_whether_it_wrote(q):
+    assert q._save() is True
+    q._no_save = True
+    assert q._save() is False
+
+
+# --- explicit order: insert and move (phase 1b-1) ------------------------------------------------
+
+def _order_ids(q):
+    return [j["id"] for j in q.list()["jobs"] if j["state"] == "queued"]
+
+
+def test_insert_at_a_position(q, expts):
+    a, b, c = (submit(q, expts, at_end=True) for _ in range(3))
+    d = q.insert({"path": str(expts / "rabi.py"), "at_index": 1, "owner": "agent"})["ids"][0]
+    e = q.insert({"path": str(expts / "rabi.py"), "before_id": a})["ids"][0]
+    f = q.insert({"path": str(expts / "rabi.py"), "after_id": c})["ids"][0]
+    assert _order_ids(q) == [e, a, d, b, c, f]
+    assert "needs a position" in q.insert({"path": str(expts / "rabi.py")})["msg"]
+    reply = q.insert({"path": str(expts / "rabi.py"), "before_id": a, "at_index": 0})
+    assert "give one position" in reply["msg"]
+    assert "not a queued job" in q.insert({"path": str(expts / "rabi.py"),
+                                           "before_id": 999})["msg"]
+
+
+def test_move_by_index_and_next_to_a_job_and_who_may(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True, owner="agent")
+    c = submit(q, expts, at_end=True)
+    reply = q.move({"id": c, "to_index": 0, "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["position"] == 0
+    assert _order_ids(q) == [c, a, b]
+    q.move({"id": c, "after_id": b, "owner": "person", "by": "jp"})
+    assert _order_ids(q) == [a, b, c]
+    assert "a person's job" in q.move({"id": a, "to_index": 2, "owner": "agent"})["msg"]
+    assert q.move({"id": b, "to_index": 0, "owner": "agent", "by": "a7"})["status"] == "ok"
+    assert _order_ids(q) == [b, a, c]
+    assert "owner is required" in q.move({"id": b, "to_index": 0})["msg"]
+    assert "needs to_index" in q.move({"id": b, "owner": "person"})["msg"]
+    assert "next to itself" in q.move({"id": b, "before_id": b, "owner": "person"})["msg"]
+    moves = [e for e in q.journal.entries if e["kind"] == "run_queue_move"]
+    assert moves[0]["from_position"] == 2 and moves[0]["to_position"] == 0
+
+
+def test_a_launching_or_running_job_never_moves(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    reply = q.move({"id": a, "to_index": 0, "owner": "person"})
+    assert reply["status"] == "error" and "only queued jobs move" in reply["msg"]
+
+
+def test_ranks_are_rebalanced_when_the_gap_runs_out(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    ids = []
+    for _ in range(60):                                   # always between a and the last one
+        ids.append(q.insert({"path": str(expts / "rabi.py"), "after_id": a})["ids"][0])
+    order = _order_ids(q)
+    assert order[0] == a and order[-1] == b and order[1:-1] == list(reversed(ids))
+    ranks = [j["rank"] for j in q.list()["jobs"] if j["state"] == "queued"]
+    assert ranks == sorted(ranks) and len(set(ranks)) == len(ranks)
+
+
+def test_an_older_queue_file_without_ranks_keeps_id_order(tmp_path, expts, q):
+    a, b = submit(q, expts, at_end=True), submit(q, expts, at_end=True)
+    path = tmp_path / "logs" / "run_queue" / "queue.json"
+    data = json.loads(path.read_text())
+    for j in data["jobs"]:
+        j.pop("rank")
+    path.write_text(json.dumps(data))
+    again = make_queue(tmp_path, expts)
+    assert _order_ids(again) == [a, b]
+
+
+# --- richer listing (phase 1b-2) ---------------------------------------------------------------
+
+SOURCE = """
+from artiq.experiment import *
+from kexp import Base
+
+class _Helper: pass
+
+class rabi_flop(EnvExperiment, Base):
+    def prepare(self):
+        self.calibrates('t_raman_pi_pulse', analysis='rabi_pi_time', write_back=True)
+        self.calibrates("frequency_raman_transition")
+        self.calibrates('t_raman_pi_pulse')
+        other.calibrates('not_self')
+    def scan_kernel(self): pass
+"""
+
+
+def test_the_source_is_read_with_ast(tmp_path):
+    f = tmp_path / "rabi.py"
+    f.write_text(SOURCE)
+    assert rq.describe_source(f) == ("rabi_flop", ["t_raman_pi_pulse",
+                                                   "frequency_raman_transition"])
+    (tmp_path / "two.py").write_text("class A(EnvExperiment): pass\nclass B(EnvExperiment): pass\n")
+    assert rq.describe_source(tmp_path / "two.py") == ("", [])
+    (tmp_path / "bad.py").write_text("def (:\n")
+    assert rq.describe_source(tmp_path / "bad.py") == ("", [])
+    (tmp_path / "k.py").write_text("class auto_tof(Base):\n    def scan_kernel(self): pass\n")
+    assert rq.describe_source(tmp_path / "k.py")[0] == "auto_tof"
+
+
+def test_submit_records_class_calibrations_and_submitter(q, expts):
+    (expts / "rabi.py").write_text(SOURCE)
+    a = q.submit({"path": str(expts / "rabi.py"), "by": "jp@kong"})["ids"][0]
+    b = q.submit({"path": str(expts / "rabi.py"), "owner": "agent",
+                  "agent_label": "cal-agent-3", "by": "x"})["ids"][0]
+    c = q.submit({"path": str(expts / "rabi.py"), "owner": "agent", "host": "kong"})["ids"][0]
+    ja = job(q, a)
+    assert ja["expt_class"] == "rabi_flop"
+    assert ja["calibrates_declared"] == ["t_raman_pi_pulse", "frequency_raman_transition"]
+    assert ja["submitter"] == "jp@kong"
+    assert job(q, b)["submitter"] == "cal-agent-3" and job(q, c)["submitter"] == "agent@kong"
+
+
+def test_estimates_from_saved_runs_and_live_od_shots(q, expts):
+    durations = [100.0, 300.0, 200.0]
+    for i, d in enumerate(durations):                      # three saved runs of rabi.py
+        submit(q, expts, at_end=True)
+        q.tick()
+        q.clock.t += d
+        run_through(q, 101 + i)
+    queued = [submit(q, expts, at_end=True) for _ in range(2)]
+    tof = submit(q, expts, "tof", at_end=True)             # never ran: unknown
+    q.tick()                                               # queued[0] is launched
+    proc = q.spawner.procs[-1]
+    run_id = 200
+    proc.write(f"Run ID: {run_id}")
+    q.live.start_run(run_id, launcher="kq", queue_job=qj(q, queued[0]), n_shots=10,
+                     n_shots_expected=40, init_run_age_s=50.0, last_shot_age_s=0.0)
+    q.tick()
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    running = views[queued[0]]["estimate"]
+    assert running["eta_end"] == pytest.approx(q.clock.t + 30 * 5.0)   # 5 s per shot
+    assert "shot 10 of 40" in running["basis"]
+    nxt = views[queued[1]]["estimate"]
+    assert nxt["duration_s"] == 200.0 and "median of the last 3" in nxt["basis"]
+    assert nxt["eta_start"] == pytest.approx(q.clock.t + 150.0)
+    assert nxt["eta_end"] == pytest.approx(q.clock.t + 350.0)
+    assert views[tof]["estimate"]["duration_s"] is None
+    assert views[tof]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 350.0)
+    rows = q.list()["rows"]
+    assert set(rows[0]) == {"position", "id", "state", "owner", "submitter", "label",
+                            "expt_class", "run_id", "est", "waiting"}
+
+
+def test_source_changed_and_precise_waiting(q, expts):
+    a = submit(q, expts, due=q.clock.t + 3600)
+    b = submit(q, expts, "tof", after=[a], at_end=True)
+    c = submit(q, expts, owner="agent", at_end=True)
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    assert views[a]["source_changed"] is False
+    assert views[a]["waiting"].startswith("due ")
+    assert views[b]["waiting"] == f"after #{a} (queued)"
+    (expts / "rabi.py").write_text("# changed\n")
+    assert {v["id"]: v for v in q.list()["jobs"]}[a]["source_changed"] is True
+    q.pause({"scope": "agent", "by": "jp"})
+    waiting = q.describe({"id": c})["waiting"]
+    assert waiting.startswith("agent jobs paused by jp since ")
+
+
+# --- edit (phase 1b-3) ----------------------------------------------------------------------
+
+def test_edit_a_queued_job_and_its_journal(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    reply = q.edit({"id": b, "owner": "person", "by": "jp", "fields": {
+        "argv": ["-a", "x=2"], "label": "rabi v2!", "after": [a], "chain": "c1",
+        "stop_on_failure": True, "write_back": False, "due": q.clock.t + 10,
+        "allow_drift": True}})
+    assert reply["status"] == "ok" and set(reply["changed"]) == {
+        "argv", "label", "after", "chain", "stop_on_failure", "write_back", "due",
+        "allow_drift"}
+    j = job(q, b)
+    assert j["argv"] == ["-a", "x=2"] and j["label"] == "rabi_v2" and j["after"] == [a]
+    rec = [e for e in q.journal.entries if e["kind"] == "run_queue_edit"][-1]
+    assert rec["before"]["label"] == "rabi" and rec["after"]["label"] == "rabi_v2"
+    assert rec["by"] == "jp" and rec["owner"] == "person"
+
+
+def test_edit_refusals(q, expts):
+    a = submit(q, expts, at_end=True)
+    agent = submit(q, expts, owner="agent", at_end=True)
+    for obj, words in [
+            ({"id": a, "owner": "person"}, "edit needs fields"),
+            ({"id": a, "owner": "person", "fields": {"path": "x"}}, "not editable: path"),
+            ({"id": a, "owner": "agent", "fields": {"label": "x"}}, "a person's job"),
+            ({"id": a, "fields": {"label": "x"}}, "owner is required"),
+            ({"id": a, "owner": "person", "fields": {"argv": ["a&b"]}}, "not allowed"),
+            ({"id": a, "owner": "person", "fields": {"due": float("nan")}}, "finite"),
+            ({"id": a, "owner": "person", "fields": {"write_back": True}}, "may only veto"),
+            ({"id": a, "owner": "person", "fields": {"after": [a]}}, "wait for itself"),
+            ({"id": a, "owner": "person", "fields": {"paused": "yes"}}, "true or false")]:
+        reply = q.edit(obj)
+        assert reply["status"] == "error" and words in reply["msg"], (obj, reply)
+    q.edit({"id": agent, "owner": "agent", "fields": {"after": [a]}})
+    reply = q.edit({"id": a, "owner": "person", "fields": {"after": [agent]}})
+    assert "cycle" in reply["msg"]
+    assert q.edit({"id": agent, "owner": "agent", "fields": {"label": "mine"}})["status"] == "ok"
+
+
+def test_a_launching_or_running_job_is_not_edited(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    reply = q.edit({"id": a, "owner": "person", "fields": {"label": "x"}})
+    assert reply["status"] == "error" and "only queued jobs" in reply["msg"]
+
+
+def test_a_paused_job_waits_keeps_its_place_and_others_go(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": True}})
+    assert q.describe({"id": a})["waiting"].startswith("paused (this job) by jp since ")
+    q.tick()
+    assert job(q, a)["state"] == "queued" and job(q, b)["state"] == "running"
+    assert [v["id"] for v in q.list()["jobs"] if v["state"] == "queued"] == [a]
+    run_through(q, 101)
+    q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": False}})
+    assert job(q, a)["paused_by"] == "" and job(q, a)["paused_since"] is None
+    q.tick()
+    assert job(q, a)["state"] == "running"

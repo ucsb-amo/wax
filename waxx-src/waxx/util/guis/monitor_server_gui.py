@@ -219,11 +219,15 @@ class MonitorUDPServer(UdpServer):
       (:mod:`~waxx.util.device_state.run_queue`): ``submit`` (``path``,
       ``argv``, ``cwd``, ``label``, ``owner``, ``priority``, ``due``,
       ``after``, ``repeat``, ``chain``, ``stop_on_failure``, ``write_back``,
-      ``allow_drift``, ``by``), ``cancel`` (``id``, ``token``, ``by``,
-      ``owner``, ``queued_only``), ``list`` (``states``, ``limit``),
-      ``describe`` (``id``), ``tail`` (``id``, ``token``, ``offset``: the
-      job's log from that byte, read here for a client on any PC; not
-      logged or journaled), ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
+      ``allow_drift``, ``by``, ``at_end``), ``insert`` (submit at
+      ``at_index`` / ``before_id`` / ``after_id``), ``move`` (``id``,
+      ``to_index`` / ``before_id`` / ``after_id``, ``owner``, ``by``),
+      ``edit`` (``id``, ``owner``, ``by``, ``fields``), ``cancel`` (``id``,
+      ``token``, ``by``, ``owner``, ``queued_only``), ``list`` (``states``,
+      ``limit``), ``describe`` (``id``), ``tail`` (``id``, ``token`` --
+      required when the job has one --, ``offset``: the job's log from that
+      byte, read here for a client on any PC; not logged or journaled),
+      ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
       ``reason``), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
       a person's hold on the machine
       (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
@@ -824,7 +828,8 @@ class MonitorUDPServer(UdpServer):
     # --- the run queue and the person hold ---------------------------------------------
 
     #: run_queue actions -> the RunQueue method that answers them
-    _QUEUE_ACTIONS = {"submit": "submit", "cancel": "cancel", "list": "list",
+    _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
+                      "cancel": "cancel", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
                       "resume": "resume", "hold": "hold_request", "release": "release_request"}
 
@@ -837,7 +842,7 @@ class MonitorUDPServer(UdpServer):
         if method is None:
             return {"status": "error", "msg": f"unknown run_queue action {action!r} "
                                               f"(known: {', '.join(self._QUEUE_ACTIONS)})"}
-        if action == "submit":
+        if action in ("submit", "insert"):
             monitor = self.status.expt_path
             try:
                 same = bool(monitor) and bool(obj.get("path")) and (

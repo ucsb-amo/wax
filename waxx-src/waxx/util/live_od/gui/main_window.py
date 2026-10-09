@@ -191,7 +191,7 @@ class LiveODWindow(QWidget):
         self.live_od_server.shot_timing_signal.connect(self.on_shot_timing)
         self.live_od_server.run_done_signal.connect(self.on_run_done)
         self.live_od_server.exited_run_signal.connect(self.on_run_exited)
-        self.live_od_server.reset_signal.connect(self.reset)
+        self.live_od_server.reset_signal.connect(self._reset_from_server)
         self.live_od_server.camera_control_signal.connect(self.on_remote_camera_control)
         self.live_od_server.run_state_signal.connect(self.on_run_state)
         self.live_od_server.set_camera_state_provider(self._camera_state_report)
@@ -1300,7 +1300,7 @@ class LiveODWindow(QWidget):
         boundary and the unusable file is deleted.
         """
         self.msg(f"Data file unusable ({reason}) — aborting run.", logging.ERROR)
-        self.reset()
+        self.reset(source="liveod")
 
     def on_run_exited(self, how: str):
         """The server closed a run whose experiment exited with frames still due
@@ -1398,7 +1398,16 @@ class LiveODWindow(QWidget):
     def update_image_count(self, count, total):
         self.viewer_window.update_image_count(count, total)
 
-    def reset(self):
+    def _reset_from_server(self):
+        """The server's reset_signal: a remote RESET it has already set (and
+        counted), or a run it finalized itself.  Never sets the Abort again."""
+        self.reset(source=None)
+
+    def reset(self, source: str | None = "person"):
+        """Reset the run: interrupt the camera thread and data handler.
+        ``source``: who starts it -- "person" (this window's Abort button),
+        "liveod" (an unusable data file), or None (asked by the server, which
+        has set or cleared the Abort itself)."""
         # A run whose experiment is gone: its experiment exited with frames still
         # due (the server closes the run and keeps its file -- interrupting the
         # camera thread here would delete it), or an Abort nobody has answered
@@ -1437,15 +1446,18 @@ class LiveODWindow(QWidget):
                 not getattr(self, '_run_active', False) and
                 getattr(self, 'the_baby', None) is None):
             return
-        # Ensure the ZMQ server flag is set regardless of whether this was
-        # triggered by the local button or by the remote viewer (which goes
-        # through _handle_reset first, but this is idempotent). request_reset
-        # counts the press once (POLL's reset_count); from this window's own
-        # button it is a person's.
-        if hasattr(self, 'live_od_server'):
+        # Set the server's Abort only when this window starts the reset: its
+        # own button (source "person") or an unusable data file ("liveod").
+        # Asked by the server (source None: a remote RESET, already set and
+        # counted with its own source -- "queue", "agent", "person" -- or a
+        # run the server finalized itself) the flag is never touched: the
+        # experiment's ABORT_RUN may have cleared it before this slot runs,
+        # and setting it again would abort the NEXT run and count a person's
+        # Reset nobody pressed.
+        if hasattr(self, 'live_od_server') and source is not None:
             srv = self.live_od_server
             if hasattr(srv, 'request_reset'):
-                srv.request_reset("person")
+                srv.request_reset(source)
             else:
                 srv._reset_requested = True
                 srv.note_reset_requested()

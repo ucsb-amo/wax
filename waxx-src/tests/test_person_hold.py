@@ -179,6 +179,8 @@ def server(qapp, monkeypatch, tmp_path):
         AssertionError("no job is launched in these tests"))
     s.run_queue._adopt = lambda pid, started: None     # never a real process
     s.loops["auto_tof"]._poll = lambda: _poll(False)
+    s.loops["auto_tof"]._spawn = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no loop run is launched in these tests"))
     s.ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
     yield s
     s.sock.close()

@@ -43,7 +43,7 @@ def _poll(srv):
 def test_poll_counts_every_abort_by_source(srv):
     poll = _poll(srv)
     assert poll["reset_count"] == 0 and poll["last_reset"] is None
-    assert poll["reset_counts"] == {"person": 0, "queue": 0, "agent": 0}
+    assert poll["reset_counts"] == {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
     run = _init(srv)["run_id"]
     assert srv._handle_reset({"tag": "RESET", "source": "queue", "run_id": run})["ok"]
     poll = _poll(srv)
@@ -91,3 +91,63 @@ def test_the_right_run_id_and_token_are_accepted(srv):
                              "run_token": reply["run_token"]})
     assert out["ok"] and out["reset_count"] == 1
     assert _poll(srv)["reset_counts"]["agent"] == 1
+
+
+# -- the window's reset(): only its own button counts a person's Reset (review NEW-1) --------
+
+def _window(srv):
+    from types import SimpleNamespace
+    from waxx.util.live_od.gui.main_window import LiveODWindow
+
+    class Win:
+        reset = LiveODWindow.reset
+        _reset_from_server = LiveODWindow._reset_from_server
+
+        def __init__(self):
+            self.live_od_server = srv
+            self.messages = []
+            self._run_active = True
+            self.the_baby = None
+            self.data_handler = None
+            self.camera_nanny = SimpleNamespace(interrupted=False)
+
+        def msg(self, text, level=None):
+            self.messages.append(text)
+
+        def _update_run_buttons(self):
+            pass
+    return Win()
+
+
+def test_a_remote_queue_reset_is_never_recounted_as_a_persons(srv):
+    run = _init(srv)["run_id"]
+    srv._handle_reset({"tag": "RESET", "source": "queue", "run_id": run})
+    # the experiment's ABORT_RUN clears the flag before the GUI thread's slot runs
+    srv._reset_requested = False
+    _window(srv)._reset_from_server()                 # the queued reset_signal
+    poll = _poll(srv)
+    assert poll["reset_counts"] == {"person": 0, "queue": 1, "agent": 0, "liveod": 0}
+    assert poll["reset_requested"] is False           # not re-armed for the next run
+
+
+def test_a_finalized_runs_signal_sets_nothing(srv):
+    _init(srv)
+    _window(srv)._reset_from_server()                 # e.g. a run the server finalized
+    poll = _poll(srv)
+    assert poll["reset_count"] == 0 and poll["reset_requested"] is False
+
+
+def test_the_windows_own_button_is_a_persons_reset(srv):
+    _init(srv)
+    _window(srv).reset()
+    poll = _poll(srv)
+    assert poll["reset_counts"]["person"] == 1 and poll["reset_requested"] is True
+    assert poll["last_reset"]["source"] == "person"
+
+
+def test_an_unusable_data_file_aborts_as_liveod_not_a_person(srv):
+    _init(srv)
+    _window(srv).reset(source="liveod")
+    poll = _poll(srv)
+    assert poll["reset_counts"]["liveod"] == 1 and poll["reset_counts"]["person"] == 0
+    assert poll["reset_requested"] is True

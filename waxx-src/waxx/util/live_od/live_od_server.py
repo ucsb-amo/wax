@@ -66,8 +66,8 @@ def _safe_repr(value) -> str:
 
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
-    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job id,
-    str; "" when absent). A client that predates them sends none; a malformed
+    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job,
+    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent). A client that predates them sends none; a malformed
     value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
@@ -178,7 +178,7 @@ class LiveODServer(QThread, NetServer):
                                 "queue_job": ""}
         # every Abort set (request_reset), for POLL's reset_count / last_reset
         self._reset_count = 0
-        self._reset_counts = {"person": 0, "queue": 0, "agent": 0}
+        self._reset_counts = {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
         self._last_reset = None
         # the run a Reset during its save was last warned about (one WARNING each)
         self._reset_during_save_warned = None
@@ -1789,8 +1789,9 @@ class LiveODServer(QThread, NetServer):
         self._set_run_state("exited", detail)
         self.run_done_signal.emit()
 
-    #: Who may send RESET (its optional ``source``; "person" when absent).
-    RESET_SOURCES = ("person", "queue", "agent")
+    #: Who may send RESET (its optional ``source``; "person" when absent);
+    #: "liveod": liveOD's own abort of a run whose data file is unusable.
+    RESET_SOURCES = ("person", "queue", "agent", "liveod")
 
     def request_reset(self, source: str = "person") -> bool:
         """Set the pending Abort (``_reset_requested``) for the run in progress
