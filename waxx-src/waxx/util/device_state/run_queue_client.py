@@ -48,6 +48,8 @@ NO_QUEUE_MSG = "no run queue (monitor server) is beaconing"
 #: agent; anything else, or unset, is a person).  The queue sets it for its
 #: own jobs; the agents' skill sets it for agents.
 OWNER_ENV = "WAXX_OWNER"
+#: An agent's name for its jobs (the queue shows it as the submitter).
+AGENT_LABEL_ENV = "WAXX_AGENT_LABEL"
 
 
 def owner_from_env() -> str:
@@ -159,19 +161,53 @@ class RunQueueClient:
                priority: int | None = None, due: float | None = None,
                after: Iterable[int] = (), repeat: int = 1, chain: str | None = None,
                stop_on_failure: bool | None = None, write_back: bool | None = None,
-               allow_drift: bool = False) -> dict:
+               allow_drift: bool = False, at_end: bool = False,
+               at_index: int | None = None, before_id: int | None = None,
+               after_id: int | None = None) -> dict:
         """Queue ``path`` (absolute on the server's machine; a relative path is
-        made absolute here).  ``priority`` None: the server's default for the
-        owner.  ``write_back`` may only be None or False (a veto).
-        -> ``{"status": "ok", "ids": [...], "jobs": [...]}``."""
-        return self._ask("submit", {
+        made absolute here).  Placement: by default the server's owner rule (a
+        person's job ahead of every queued agent job); ``at_end`` opts out;
+        ``at_index`` (0-based among the queued jobs) / ``before_id`` /
+        ``after_id`` place it there (the ``insert`` action; give at most one).
+        ``priority`` (None: not sent) is only a placement hint within the
+        owner's block.  ``write_back`` may only be None or False (a veto).
+        ``agent_label`` comes from ``WAXX_AGENT_LABEL`` when set; ``host`` is
+        this machine's name.  -> ``{"status": "ok", "ids": [...], "jobs": [...]}``."""
+        position = {"at_index": None if at_index is None else int(at_index),
+                    "before_id": None if before_id is None else int(before_id),
+                    "after_id": None if after_id is None else int(after_id)}
+        action = "insert" if any(v is not None for v in position.values()) else "submit"
+        return self._ask(action, dict({
             "path": os.path.abspath(str(path)), "argv": [str(a) for a in argv],
             "cwd": cwd, "label": label, "owner": self._owner(owner),
             "priority": None if priority is None else int(priority),
             "due": None if due is None else float(due), "after": [int(a) for a in after],
             "repeat": int(repeat), "chain": chain, "stop_on_failure": stop_on_failure,
-            "write_back": write_back, "allow_drift": bool(allow_drift), "by": self.by},
-            retry=False)
+            "write_back": write_back, "allow_drift": bool(allow_drift),
+            "at_end": True if at_end else None,
+            "agent_label": os.environ.get(AGENT_LABEL_ENV, "").strip() or None,
+            "host": socket.gethostname(), "by": self.by}, **position), retry=False)
+
+    def move(self, job_id: int, *, to_index: int | None = None, before_id: int | None = None,
+             after_id: int | None = None, token: str | None = None,
+             owner: str | None = None) -> dict:
+        """Put queued job ``job_id`` elsewhere in the order: ``to_index``
+        (0-based among the queued jobs) or ``before_id`` / ``after_id`` (one).
+        An agent may move only agent jobs.  -> ``{"job", "position"}``."""
+        return self._ask("move", {"id": int(job_id), "token": token,
+                                  "to_index": None if to_index is None else int(to_index),
+                                  "before_id": None if before_id is None else int(before_id),
+                                  "after_id": None if after_id is None else int(after_id),
+                                  "owner": self._owner(owner), "by": self.by}, retry=False)
+
+    def edit(self, job_id: int, fields: dict, *, token: str | None = None,
+             owner: str | None = None) -> dict:
+        """Change a queued job: ``fields`` from argv, label, after, chain,
+        stop_on_failure, write_back (None | False), due (epoch | None),
+        allow_drift, paused.  An agent may edit only agent jobs.  -> ``{"job",
+        "changed": [names]}``."""
+        return self._ask("edit", {"id": int(job_id), "token": token, "fields": dict(fields),
+                                  "owner": self._owner(owner), "by": self.by}, retry=False)
 
     def cancel(self, job_id: int, *, token: str | None = None, owner: str | None = None,
                queued_only: bool = False) -> dict:

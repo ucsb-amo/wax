@@ -15,12 +15,14 @@ from test_run_queue import make_queue
 from waxx.util.device_state.run_queue_client import (
     NO_QUEUE_MSG, NoRunQueue, RunQueueClient, RunQueueError, safe_write)
 
-ACTIONS = {"submit": "submit", "cancel": "cancel", "list": "list", "describe": "describe",
+ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
+           "cancel": "cancel", "list": "list", "describe": "describe",
            "tail": "tail", "pause": "pause", "resume": "resume", "hold": "hold_request",
            "release": "release_request"}
 #: The fake is stricter than the server (which requires owner on cancel,
-#: release and resume): the client must send it on every change.
-OWNER_REQUIRED = ("submit", "cancel", "pause", "resume", "hold", "release")
+#: release, resume, move and edit): the client must send it on every change.
+OWNER_REQUIRED = ("submit", "insert", "move", "edit", "cancel", "pause", "resume", "hold",
+                  "release")
 
 
 class FakeServer:
@@ -136,7 +138,9 @@ def client(server):
 
 # --- requests --------------------------------------------------------------------------
 
-def test_every_action_sends_its_request(client, server, expts):
+def test_every_action_sends_its_request(client, server, expts, monkeypatch):
+    import socket
+    monkeypatch.delenv("WAXX_AGENT_LABEL", raising=False)
     reply = client.submit(str(expts / "rabi.py"), argv=["-a", "x=1"], priority=3,
                           owner="agent", label="r1", write_back=False)
     assert reply["ids"] == [1] and reply["jobs"][0]["owner"] == "agent"
@@ -145,7 +149,7 @@ def test_every_action_sends_its_request(client, server, expts):
     assert sent == {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
                     "argv": ["-a", "x=1"], "label": "r1", "owner": "agent", "priority": 3,
                     "after": [], "repeat": 1, "write_back": False, "allow_drift": False,
-                    "by": "jp@kong"}
+                    "host": socket.gethostname(), "by": "jp@kong"}
     token = reply["jobs"][0]["token"]
     assert client.list()["next"] == [1]
     assert client.describe(1, token)["job"]["label"] == "r1"
@@ -160,6 +164,28 @@ def test_every_action_sends_its_request(client, server, expts):
                        "resume": 1, "hold": 1, "release": 1, "cancel": 1}
     assert server.requests[-1][0]["queued_only"] is True
     assert client.status()["run_queue"]["counts"]["cancelled"] == 1
+
+
+def test_placement_move_and_edit_requests(client, server, q, expts, monkeypatch):
+    monkeypatch.setenv("WAXX_AGENT_LABEL", "fb-driver")
+    a = client.submit(str(expts / "rabi.py"), owner="agent")["ids"][0]
+    assert q.describe({"id": a})["job"]["submitter"] == "fb-driver"
+    b = client.submit(str(expts / "tof.py"), owner="agent", at_end=True)["ids"][0]
+    assert server.requests[-1][0]["at_end"] is True
+    c = client.submit(str(expts / "tof.py"), owner="agent", at_index=0)["ids"][0]
+    sent = server.requests[-1][0]
+    assert sent["action"] == "insert" and sent["at_index"] == 0
+    assert client.list()["next"] == [c, a, b]
+    d = client.submit(str(expts / "tof.py"), owner="agent", after_id=a)["ids"][0]
+    assert client.list()["next"] == [c, a, d, b]
+    reply = client.move(b, before_id=c, owner="agent")
+    assert reply["position"] == 0 and client.list()["next"] == [b, c, a, d]
+    assert [a for o, a in server.requests if o["action"] == "move"] == [1]   # never re-sent
+    reply = client.edit(d, {"label": "renamed", "paused": True}, owner="agent")
+    assert sorted(reply["changed"]) == ["label", "paused"]
+    assert server.requests[-1][0]["fields"] == {"label": "renamed", "paused": True}
+    with pytest.raises(RunQueueError, match="not editable"):
+        client.edit(d, {"path": "x.py"})
 
 
 def test_a_relative_path_is_made_absolute_here(client, server, expts, monkeypatch):
