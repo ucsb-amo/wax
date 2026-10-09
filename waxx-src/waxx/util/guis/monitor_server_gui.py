@@ -23,6 +23,7 @@ from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
 from waxx.util.device_state.person_hold import PersonHold
+from waxx.util.device_state.run_queue import RunQueue
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -193,13 +194,23 @@ class MonitorUDPServer(UdpServer):
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
-    * ``run_queue`` (``action``) — ``hold`` (``reason``, ``by``) / ``release``
-      (``by``): a person's hold on the machine
+    * ``run_queue`` (``action``) — the run queue
+      (:mod:`~waxx.util.device_state.run_queue`): ``submit`` (``path``,
+      ``argv``, ``cwd``, ``label``, ``owner``, ``priority``, ``due``,
+      ``after``, ``repeat``, ``chain``, ``stop_on_failure``, ``write_back``,
+      ``allow_drift``, ``by``), ``cancel`` (``id``, ``token``, ``by``,
+      ``owner``), ``list`` (``states``, ``limit``), ``describe`` (``id``),
+      ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
+      ``reason``), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
+      a person's hold on the machine
       (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
-      runs wait and the run loops do not run.  The server also sets it itself
-      when liveOD's Reset is pressed for a run that is not an agent's queued
-      run.  ``status_json`` has ``person_hold``; changes are broadcast as
-      ``person_hold``.
+      runs wait and the run loops do not run.  The server also sets the hold
+      itself when liveOD's Reset is pressed for a run that is not an agent's
+      queued run.  The queue's thread (the watch) follows its job and
+      launches the next when the machine is free.  ``status_json`` has
+      ``run_queue`` and ``person_hold``; changes are broadcast as
+      ``run_queue`` and ``person_hold``.  A loop's Start is refused while
+      the queue has jobs queued or running.
 
     Host-side connections this server holds between runs (the tweezer AWG;
     :class:`~waxx.util.device_state.connections.ConnectionService`, each in
@@ -261,9 +272,10 @@ class MonitorUDPServer(UdpServer):
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
     RUN_PENDING_TTL_S = 120.0
-    #: liveOD is polled this often for the person hold's Reset watch (and,
-    #: between jobs, by the run queue).
-    WATCH_S = 2.0
+    #: The run queue's tick (it polls liveOD at most every
+    #: ``run_queue.POLL_EVERY_S`` for the person hold's Reset watch, and
+    #: afresh before a launch).
+    WATCH_S = 0.5
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
                  run_loops=(), connections=(), slm_reinit=None, state_generator=None,
@@ -330,6 +342,17 @@ class MonitorUDPServer(UdpServer):
                                         start_monitor=self.start_monitor_signal.emit,
                                         on_change=self._on_loop_change, journal=self.journal)
                       for spec in run_loops}
+
+        # The run queue: experiment jobs one at a time (run_queue.py), through
+        # the same liveOD link (called late, so it is always the current one),
+        # fence, monitor state and loops as the rest of the server.
+        self.run_queue = RunQueue(
+            run_queue_dir, poll=lambda: self._live_od(),
+            run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
+            live_od_reset=lambda: self._live_od.reset(), fence=self._current_run_pending,
+            monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
+            loops=self.loops, start_monitor=self.start_monitor_signal.emit,
+            hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change)
 
         # Host-side connections (the tweezer AWG), held here between runs.
         # Bad definitions cost the connections, never the server.
@@ -402,7 +425,8 @@ class MonitorUDPServer(UdpServer):
                                else None),
                 "state_generator": self._state_generator is not None,
                 "run_loops": {key: loop.info() for key, loop in self.loops.items()},
-                "person_hold": self.person_hold.info()}
+                "person_hold": self.person_hold.info(),
+                "run_queue": self.run_queue.info()}
 
     def _handle_structured(self, raw):
         try:
@@ -732,40 +756,59 @@ class MonitorUDPServer(UdpServer):
 
     # --- the run queue and the person hold ---------------------------------------------
 
+    #: run_queue actions -> the RunQueue method that answers them
+    _QUEUE_ACTIONS = {"submit": "submit", "cancel": "cancel", "list": "list",
+                      "describe": "describe", "pause": "pause", "resume": "resume",
+                      "hold": "hold_request", "release": "release_request"}
+
     def _reply_run_queue(self, obj: dict) -> dict:
-        """``{"type": "run_queue", "action": ...}``: ``hold`` (``reason``,
-        ``by``) and ``release`` (``by``) -- a person's hold."""
+        """``{"type": "run_queue", "action": ...}`` -- see
+        :mod:`waxx.util.device_state.run_queue` and the module docstring of
+        :class:`MonitorUDPServer` for each action's fields."""
         action = obj.get("action")
-        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
-        if action == "hold":
-            return self.person_hold.hold(str(obj.get("reason") or ""), by)
-        if action == "release":
-            return self.person_hold.release(by)
-        return {"status": "error", "msg": f"unknown run_queue action {action!r}"}
+        method = self._QUEUE_ACTIONS.get(str(action))
+        if method is None:
+            return {"status": "error", "msg": f"unknown run_queue action {action!r} "
+                                              f"(known: {', '.join(self._QUEUE_ACTIONS)})"}
+        if action == "submit":
+            monitor = self.status.expt_path
+            try:
+                same = bool(monitor) and bool(obj.get("path")) and (
+                    os.path.normcase(os.path.realpath(str(obj.get("path"))))
+                    == os.path.normcase(os.path.realpath(monitor)))
+            except (OSError, ValueError):
+                same = False
+            if same:
+                return {"status": "error",
+                        "msg": "that file is the monitor's own experiment: the monitor server "
+                               "runs it itself"}
+        try:
+            return getattr(self.run_queue, method)(obj)
+        except Exception as exc:                      # noqa: BLE001
+            log.exception("Run queue request %s failed", action)
+            return {"status": "error", "msg": f"the run queue failed on {action}: {exc!r}"}
+
+    def _queue_busy(self) -> str:
+        """Why something of this server's own holds the machine, for the run
+        queue's launches ("" when nothing): a state reset, or a monitor that
+        is starting (a job launched then would race it for the core)."""
+        if self.reset.running:
+            return "a state reset is running"
+        if self.status.state == STATES.LOADING:
+            return "the monitor is starting"
+        return ""
+
+    def _on_queue_change(self, info) -> None:
+        self._broadcaster.send({"type": "run_queue", "run_queue": info})
 
     def _on_person_hold_change(self, info) -> None:
         self._broadcaster.send({"type": "person_hold", "person_hold": info})
 
-    def _agent_run_ids(self) -> set:
-        """Run ids of the runs launched for an agent through this server (no
-        Reset of theirs sets the person hold)."""
-        return set()
-
-    def _own_abort_ids(self) -> set:
-        """Run ids this server itself sent liveOD's Abort for."""
-        return set()
-
     def watch_tick(self) -> None:
-        """One look at liveOD for the person hold: a Reset pressed for a run
-        that is not an agent's queued run puts the hold on; a reminder while
-        it is on."""
-        try:
-            poll = self._live_od()
-        except Exception:                             # noqa: BLE001
-            poll = None                               # liveOD down: nothing to see
-        if poll is not None:
-            self.person_hold.observe_poll(poll, self._agent_run_ids(), self._own_abort_ids())
-        self.person_hold.tick()
+        """One step of the run queue (:meth:`RunQueue.tick`): it follows its
+        job, launches the next when the machine is free, and feeds every
+        liveOD POLL to the person hold's Reset watch."""
+        self.run_queue.tick()
 
     def _watch_loop(self) -> None:
         while not self._watch_stop.wait(self.WATCH_S):

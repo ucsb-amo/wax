@@ -174,6 +174,7 @@ def server(qapp, monkeypatch, tmp_path):
                              run_loops=[LoopSpec("auto_tof", "BEC TOF loop", str(expt))])
     s.polls = [_poll(False)]
     s._live_od = lambda: s.polls[0]
+    s.run_queue.poll_every_s = 0.0                     # every tick looks at liveOD
     s.loops["auto_tof"]._poll = lambda: _poll(False)
     s.ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
     yield s
