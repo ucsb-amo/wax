@@ -330,14 +330,30 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
         st = GateState("free", rid, "no run in progress in liveOD")
 
     if fence_info is not None:
-        own = in_progress and fence_info["run_id"] is not None and fence_info["run_id"] == rid
-        if fence_info["active"] and not own and (st.state == "free" or st.waivable):
+        fid = fence_info["run_id"]
+        own = in_progress and fid is not None and fid == rid
+        # A run announces its fence after its INIT_RUN, so liveOD knows of it. A
+        # fence whose run liveOD shows as ended -- no longer in progress, or with
+        # an outcome recorded -- is left over: with the monitor off (the server
+        # lapses a fence only while READY), a run killed hard keeps its fence up
+        # until a person clears it.
+        last = poll.get("last_outcome") or {}
+        ended = fid is not None and ((not in_progress and rid == fid)
+                                     or last.get("run_id") == fid)
+        fence_info["ended"] = ended
+        if ended:
+            if st.state == "free":
+                st.reason += (f"; run {fid}'s fence on the monitor server is still up, but "
+                              "liveOD shows that run ended -- not counted")
+        elif fence_info["active"] and not own and (st.state == "free" or st.waivable):
             age = fence_info["age_s"]
-            st = GateState("live", fence_info["run_id"],
-                           f"run {fence_info['run_id']} ({fence_info['expt'] or 'experiment'}) "
-                           "announced itself to the monitor server"
-                           + (f" {age:.0f} s ago" if age is not None else "")
-                           + " and has not started yet"
+            if age is not None and age >= FENCE_TTL_S:
+                held = f" (fence held {age:.0f} s, monitor not READY)"
+            else:
+                held = f" {age:.0f} s ago" if age is not None else ""
+            st = GateState("live", fid,
+                           f"run {fid} ({fence_info['expt'] or 'experiment'}) announced "
+                           f"itself to the monitor server{held} and has not started yet"
                            + (f" (liveOD: {st.reason})" if st.state != "free" else ""))
         elif not fence_info["active"] and st.state == "free":
             st.reason += (f"; run {fence_info['run_id']}'s fence on the monitor server is "

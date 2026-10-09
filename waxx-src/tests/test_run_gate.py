@@ -232,6 +232,42 @@ def test_an_old_fence_stands_while_the_monitor_is_not_ready(state):
     fence = {"run_id": 85600, "expt": "rabi", "since": NOW - 10 * run_gate.FENCE_TTL_S}
     st = classify(_poll(), fence, now=NOW, pid_alive=_never, monitor_state=state)
     assert st.state == "live" and not st.waivable and st.run_id == 85600
+    assert "fence held 1200 s, monitor not READY" in st.reason
+
+
+@pytest.mark.parametrize("poll", [
+    # liveOD closed run 85600 (exit grace, or run_lock's RUN_EXITED): it is
+    # liveOD's last run, not in progress
+    _poll(run_id=85600, run_state="exited",
+          last_outcome={"run_id": 85600, "outcome": "exited"}),
+    # liveOD has moved on (a later no-save run ended), the outcome names 85600
+    _poll(run_id=0, last_outcome={"run_id": 85600, "outcome": "superseded"}),
+    # not in progress and liveOD's run id is the fence's, whatever the record says
+    _poll(run_id=85600, last_outcome={}),
+])
+@pytest.mark.parametrize("state", [2, None])
+def test_a_killed_runs_fence_with_the_monitor_off_does_not_count_once_liveod_closed_it(
+        poll, state):
+    # second review: a run killed hard with the monitor off keeps its fence up
+    # forever (the server lapses fences only while READY)
+    fence = {"run_id": 85600, "expt": "hf_bec", "since": NOW - 3600.0}
+    st = classify(poll, fence, now=NOW, pid_alive=_never, monitor_state=state)
+    assert st.state == "free" and not st.blocks
+    assert "liveOD shows that run ended -- not counted" in st.reason
+    assert st.detail["fence"]["ended"] is True
+
+
+@pytest.mark.parametrize("poll", [
+    # announced after its INIT_RUN, in progress in liveOD, no record of an end
+    _running(run_id=85600, n_shots=0, last_shot_age_s=None, init_run_age_s=30.0),
+    # liveOD shows only the run before it (e.g. a liveOD restarted since)
+    _poll(run_id=85599, last_outcome={"run_id": 85599, "outcome": "saved"}),
+])
+def test_an_announced_run_liveod_has_not_seen_end_is_still_live(poll):
+    fence = {"run_id": 85600, "expt": "hf_bec", "since": NOW - 20.0}
+    st = classify(poll, fence, now=NOW, pid_alive=_alive, monitor_state=2)
+    assert st.state == "live" and not st.waivable
+    assert st.detail["fence"]["ended"] is False
 
 
 def test_a_fence_without_a_date_counts():
