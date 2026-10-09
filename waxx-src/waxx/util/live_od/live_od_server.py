@@ -1135,6 +1135,18 @@ class LiveODServer(QThread, NetServer):
         if self._run_in_progress and not self._reset_requested:
             logger.warning(f"INIT_RUN while run {self._current_run_id} is still in progress: "
                            f"that run is superseded; its further messages will be ignored.")
+            # Its outcome, before the new token: nothing else records one (its file
+            # is closed with what it has by begin() below -- not saved, not
+            # deleted). liveOD cannot see whether its process is gone; it names
+            # the client it had.
+            c = self._current_client
+            who = (f"pid {c['client_pid']} on {c['client_host'] or '?'}"
+                   + (f", launched by {c['launcher']}" if c["launcher"] else "")
+                   if c["client_pid"] is not None else "client not recorded (older client)")
+            self._record_outcome("superseded",
+                                 f"superseded by a new INIT_RUN while in progress; its client "
+                                 f"was {who}; file closed with what it had, not saved, "
+                                 f"not deleted")
         # If the previous run was reset but the experiment process was killed
         # before sending ABORT_RUN, finalize that reset now. This keeps the
         # next run start non-blocking and stateless.  The GUI was already

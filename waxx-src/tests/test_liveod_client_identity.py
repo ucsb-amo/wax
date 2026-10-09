@@ -35,6 +35,28 @@ def _init_msg(**kw):
     return msg
 
 
+def test_a_superseded_run_gets_an_outcome_naming_its_client(srv):
+    """Review S4: a run in progress replaced by the next INIT_RUN (the gate's
+    dead_client waiver) had no outcome record at all."""
+    first = srv._handle_init_run(_init_msg(client_pid=4242, client_host="KONG",
+                                           launcher="run_lock"))
+    second = srv._handle_init_run(_init_msg(client_pid=5151, client_host="KONG"))
+    assert second["ok"] and second["run_id"] != first["run_id"]
+    last = srv._handle_poll({"tag": "POLL"})["last_outcome"]
+    assert last["run_id"] == first["run_id"] and last["outcome"] == "superseded"
+    assert "pid 4242 on KONG, launched by run_lock" in last["detail"]
+    assert last["client_pid"] == 4242                       # the superseded run's client
+    assert os.path.exists(first["filepath"])                # not deleted
+
+
+def test_a_superseded_run_from_an_older_client_says_so(srv):
+    first = srv._handle_init_run(_init_msg())
+    srv._handle_init_run(_init_msg())
+    last = srv._handle_poll({"tag": "POLL"})["last_outcome"]
+    assert last["run_id"] == first["run_id"] and last["outcome"] == "superseded"
+    assert "client not recorded" in last["detail"]
+
+
 def test_poll_shows_the_runs_client(srv):
     reply = srv._handle_init_run(_init_msg(client_pid=4242, client_host="KONG",
                                            launcher="run_lock"))
