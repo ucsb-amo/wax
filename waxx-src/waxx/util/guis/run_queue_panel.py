@@ -63,6 +63,7 @@ Machine-agnostic: nothing here knows the K machine.
 
 from __future__ import annotations
 
+import shlex
 import time
 from typing import Any, Callable
 
@@ -596,6 +597,24 @@ class JobTableModel(QAbstractTableModel):
 
 # -- dialogs -------------------------------------------------------------------------------
 
+def join_argv(argv) -> str:
+    """argv as one line: a word holding whitespace (or empty) in double
+    quotes -- :func:`split_argv` reads it back to the same list."""
+    return " ".join(_q(a) for a in argv)
+
+
+def split_argv(text: str) -> list[str]:
+    """Words of ``text``, shell-style: whitespace separates, "..." or '...'
+    keep a word with spaces together.  Backslashes are kept as they are (a
+    Windows path is not an escape sequence).  ValueError on an unclosed
+    quote."""
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.commenters = ""
+    return list(lexer)
+
+
 def _parse_due(text: str, now: float | None = None) -> float | None:
     """"" -> None; "HH:MM" -> the next such time (today, or tomorrow if it has
     passed); "YYYY-MM-DD HH:MM" -> that time.  ValueError when unreadable."""
@@ -634,8 +653,11 @@ class EditJobDialog(QDialog):
         self.setWindowTitle(f"Edit {job_name(job)}")
         box = QVBoxLayout(self)
         form = QFormLayout()
-        self.argv = QLineEdit(" ".join(str(a) for a in (job.get("argv") or [])))
-        self.argv.setPlaceholderText("key=value ... (as artiq_run takes them)")
+        #: argv as first shown (quoted); left as it is, the job's own list stays
+        self._argv_shown = join_argv(job.get("argv") or [])
+        self.argv = QLineEdit(self._argv_shown)
+        self.argv.setPlaceholderText('key=value ... (as artiq_run takes them; "a b" for a '
+                                     'word with spaces)')
         self.label = QLineEdit(str(job.get("label") or ""))
         self.after = QLineEdit(" ".join(str(a) for a in (job.get("after") or [])))
         self.after.setPlaceholderText("job ids, e.g. 12 13")
@@ -687,7 +709,14 @@ class EditJobDialog(QDialog):
             due = self.job.get("due")
         else:
             due = _parse_due(due_text)
-        return {"argv": self.argv.text().split(), "label": label, "after": after,
+        if self.argv.text() == self._argv_shown:
+            argv = [str(a) for a in (self.job.get("argv") or [])]
+        else:
+            try:
+                argv = split_argv(self.argv.text())
+            except ValueError as exc:
+                raise ValueError(f"argv: {exc}") from None
+        return {"argv": argv, "label": label, "after": after,
                 "chain": self.chain.text().strip() or None,
                 "stop_on_failure": self.stop_on_failure.isChecked(),
                 "write_back": False if self.no_write_back.isChecked() else None,

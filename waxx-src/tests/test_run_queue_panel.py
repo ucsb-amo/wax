@@ -576,3 +576,19 @@ def test_queue_summary_line(qapp):
                                  "Server Dashboard")
     line.set_info(dict(INFO, state="waiting", alarm={"job": 3}))
     assert line.label.text().startswith("Queue: waiting (3 queued) -- ALARM")
+
+
+def test_edit_dialog_leaves_argv_alone_unless_it_changed(qapp):
+    """B-2: argv with spaces in a word survives a label-only edit, and an
+    edited argv is split shell-style (quotes keep a word; backslashes stay)."""
+    job = _job(8, argv=["n=3", "note=a b", r"path=C:\x\y"])
+    d = rqp.EditJobDialog(job)
+    assert d.argv.text() == r'n=3 "note=a b" path=C:\x\y'
+    d.label.setText("only_the_label")
+    assert d.changes() == {"label": "only_the_label"}
+    d.argv.setText(r'n=4 "note=a b" path=C:\x\y')
+    assert d.changes()["argv"] == ["n=4", "note=a b", r"path=C:\x\y"]
+    d.argv.setText('n=4 "unclosed')
+    assert d.changes() is None and "argv" in d.problem.text()
+    assert rqp.split_argv(rqp.join_argv(["a b", "", "c"])) == ["a b", "", "c"]
+    d.deleteLater()
