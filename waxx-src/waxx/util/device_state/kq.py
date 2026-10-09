@@ -582,10 +582,14 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             placed = _position(ctx, ids[0], tokens.get(ids[0]))
             ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
                     f"({placed})")
+            if reply.get("clamped"):
+                ctx.say(CLAMPED_TEXT)
             ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
             return EXIT_OK
         ctx.say(f"[kq] {many} queued ({_position(ctx, ids[0], tokens.get(ids[0]))})"
                 f"{due_text}")
+        if reply.get("clamped"):
+            ctx.say(CLAMPED_TEXT)
         final = EXIT_OK
         for n, jid in enumerate(ids):
             cursor = {"offset": 0}
@@ -810,6 +814,8 @@ def _list_rows(jobs: list[dict], rows: dict) -> list[list[str]]:
     return table
 
 
+CLAMPED_TEXT = "[kq] position clamped behind person jobs"
+
 SOURCE_CHANGED_NOTE = ("* source changed since submit: the job is skipped at launch unless "
                        "drift is allowed (kq edit <id> --allow-drift)")
 
@@ -825,7 +831,9 @@ def _cmd_list(ctx: _Ctx, args) -> int:
         ids = {j["id"] for j in jobs}
         ctx.say(json.dumps({"jobs": jobs,
                             "rows": [r for r in reply.get("rows") or [] if r.get("id") in ids],
-                            "next": reply.get("next"), "run_queue": reply.get("run_queue")},
+                            "next": reply.get("next"), "run_queue": reply.get("run_queue"),
+                            "truncated": bool(reply.get("truncated")),
+                            "queued_total": reply.get("queued_total")},
                            indent=1, default=str))
         return EXIT_OK
     rows = {r.get("id"): r for r in reply.get("rows") or []}
@@ -836,6 +844,12 @@ def _cmd_list(ctx: _Ctx, args) -> int:
             ctx.say("  ".join(c.ljust(w) for c, w in zip(r[:-1], widths)) + "  " + r[-1])
     else:
         ctx.say("(no jobs)")
+    if reply.get("truncated"):
+        total = reply.get("queued_total")         # the server lists the first --limit
+        if isinstance(total, int):
+            ctx.say(f"... {total - min(int(args.limit), total)} more queued (use --limit)")
+        else:
+            ctx.say("... more queued (use --limit)")
     if any(j.get("source_changed") for j in jobs):
         ctx.say(SOURCE_CHANGED_NOTE)
     ctx.say(queue_line(reply.get("run_queue") or {}))
@@ -904,6 +918,8 @@ def _cmd_move(ctx: _Ctx, args) -> int:
     pos = reply.get("position")
     ctx.say(f"[kq] {_job_word(job)} moved to position "
             + ("?" if pos is None else str(int(pos) + 1)))
+    if reply.get("clamped"):
+        ctx.say(CLAMPED_TEXT)
     return EXIT_OK
 
 

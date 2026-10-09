@@ -697,6 +697,35 @@ def test_insert_follows_like_run(server, q, expts):
     assert r.code == 0 and "Run ID: 101" in r.out and "saved (run 101)" in r.out
 
 
+def test_an_agents_position_clamped_behind_person_jobs_is_said(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))                    # a person's job
+    r = kq(server, "insert", str(expts / "tof.py"), "--at-index", "1", "--detach", "--agent")
+    assert r.code == 0 and kqmod.CLAMPED_TEXT in r.out and _next(q) == [1, 2]
+    kq(server, "submit", str(expts / "tof.py"), "--agent")
+    r = kq(server, "move", "3", "--to", "1", "--agent")
+    assert r.code == 0 and kqmod.CLAMPED_TEXT in r.out and _next(q)[0] == 1
+    r = kq(server, "move", "3", "--to", "2")                        # a person: not clamped
+    assert kqmod.CLAMPED_TEXT not in r.out
+
+
+def test_a_position_below_1_is_the_servers_refusal(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))
+    kq(server, "submit", str(expts / "tof.py"))
+    r = kq(server, "move", "2", "--to", "0")
+    assert r.code == 6 and "to_index" in r.err
+    r = kq(server, "insert", str(expts / "tof.py"), "--at-index", "0", "--detach")
+    assert r.code == 6 and "at_index" in r.err
+
+
+def test_a_truncated_list_says_how_many_more(server, q, expts):
+    for _ in range(4):
+        kq(server, "submit", str(expts / "rabi.py"))
+    r = kq(server, "list", "--limit", "1")
+    assert "... 3 more queued (use --limit)" in r.out
+    assert json.loads(kq(server, "list", "--limit", "1", "--json").out)["queued_total"] == 4
+    assert "more queued" not in kq(server, "list").out
+
+
 def test_move(server, q, expts):
     for name in ("rabi", "tof", "rabi"):
         kq(server, "submit", str(expts / f"{name}.py"))
