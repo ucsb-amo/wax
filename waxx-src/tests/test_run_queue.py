@@ -212,20 +212,21 @@ def run_through(q, run_id, outcome="saved", code=0, lines=()):
 
 # --- scheduling ---------------------------------------------------------------------------
 
-def test_order_is_priority_then_due_then_id(q, expts):
-    a = submit(q, expts, "rabi", priority=0)
-    b = submit(q, expts, "tof", priority=5)
-    c = submit(q, expts, "cal", priority=5, due=q.clock.t + 60)
-    d = submit(q, expts, "cal", priority=5)
-    assert q.list()["next"] == [b, d, a]                      # c is not due yet
+def test_the_lowest_rank_eligible_job_goes_and_gates_never_reorder(q, expts):
+    a = submit(q, expts, "rabi")
+    b = submit(q, expts, "tof", at_end=True)
+    c = submit(q, expts, "cal", at_end=True, due=q.clock.t + 60)   # gated by its due time
+    d = submit(q, expts, "cal", at_end=True)
+    assert [j["id"] for j in q.list()["jobs"]] == [a, b, c, d]     # rank order
+    assert [j["position"] for j in q.list()["jobs"]] == [0, 1, 2, 3]
+    assert q.list()["next"] == [a, b, d]                           # c waits, keeps its place
     q.clock.t += 61
-    assert q.list()["next"] == [b, d, c, a]
+    assert q.list()["next"] == [a, b, c, d]
     q.tick()
-    assert job(q, b)["state"] == "running" and len(q.spawner.calls) == 1
+    assert job(q, a)["state"] == "running"
     run_through(q, 101)
-    assert job(q, b)["state"] == "saved" and job(q, b)["run_id"] == 101
     q.tick()
-    assert job(q, d)["state"] == "running"
+    assert job(q, b)["state"] == "running"
 
 
 def test_one_slot_and_the_next_waits_for_the_process_to_exit(q, expts):
@@ -320,7 +321,7 @@ def test_pause_scopes_and_the_person_hold(q, expts):
 def test_the_launch_command_environment_and_log(q, expts, tmp_path):
     a = submit(q, expts, label="rabi scan!", argv=["-a", "x=1"], owner="agent",
                write_back=False)
-    b = submit(q, expts, "tof", priority=0)       # after the agent's job (same priority)
+    b = submit(q, expts, "tof", at_end=True)      # after the agent's job
     q.tick()
     call = q.spawner.calls[0]
     path = str((expts / "rabi.py").resolve())
@@ -1285,13 +1286,18 @@ def test_a_due_that_is_not_a_finite_time_is_refused(q, expts, due):
     assert reply["status"] == "error" and "finite" in reply["msg"]
 
 
-def test_a_persons_job_goes_to_the_front_unless_a_priority_is_given(q, expts):
-    agent = submit(q, expts, owner="agent")
-    person = submit(q, expts)
-    given = submit(q, expts, priority=0)
-    assert job(q, person)["priority"] == rq.PERSON_PRIORITY == 10
-    assert job(q, agent)["priority"] == 0 and job(q, given)["priority"] == 0
-    assert q.list()["next"] == [person, agent, given]
+def test_placement_a_person_ahead_of_agents_priority_within_the_block(q, expts):
+    a1 = submit(q, expts, owner="agent")
+    a2 = submit(q, expts, owner="agent", priority=5)       # ahead of the agent's 0
+    p1 = submit(q, expts)                                  # a person: ahead of all agents
+    p2 = submit(q, expts, priority=3)                      # ahead of the person's 0
+    p3 = submit(q, expts, at_end=True)                     # unless at the end
+    order = [j["id"] for j in q.list()["jobs"]]
+    assert order == [p2, p1, a2, a1, p3]
+    assert job(q, a2)["priority"] == 5                     # kept for display
+    ids = submit(q, expts, owner="agent", repeat=3)        # a repeat stays together
+    order = [j["id"] for j in q.list()["jobs"]]
+    assert order[order.index(ids[0]):order.index(ids[0]) + 3] == ids
 
 
 def test_a_queued_run_with_restart_already_off_prints_nothing(monkeypatch, capsys):
@@ -1495,3 +1501,71 @@ def test_save_says_whether_it_wrote(q):
     assert q._save() is True
     q._no_save = True
     assert q._save() is False
+
+
+# --- explicit order: insert and move (phase 1b-1) ------------------------------------------------
+
+def _order_ids(q):
+    return [j["id"] for j in q.list()["jobs"] if j["state"] == "queued"]
+
+
+def test_insert_at_a_position(q, expts):
+    a, b, c = (submit(q, expts, at_end=True) for _ in range(3))
+    d = q.insert({"path": str(expts / "rabi.py"), "at_index": 1, "owner": "agent"})["ids"][0]
+    e = q.insert({"path": str(expts / "rabi.py"), "before_id": a})["ids"][0]
+    f = q.insert({"path": str(expts / "rabi.py"), "after_id": c})["ids"][0]
+    assert _order_ids(q) == [e, a, d, b, c, f]
+    assert "needs a position" in q.insert({"path": str(expts / "rabi.py")})["msg"]
+    reply = q.insert({"path": str(expts / "rabi.py"), "before_id": a, "at_index": 0})
+    assert "give one position" in reply["msg"]
+    assert "not a queued job" in q.insert({"path": str(expts / "rabi.py"),
+                                           "before_id": 999})["msg"]
+
+
+def test_move_by_index_and_next_to_a_job_and_who_may(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True, owner="agent")
+    c = submit(q, expts, at_end=True)
+    reply = q.move({"id": c, "to_index": 0, "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["position"] == 0
+    assert _order_ids(q) == [c, a, b]
+    q.move({"id": c, "after_id": b, "owner": "person", "by": "jp"})
+    assert _order_ids(q) == [a, b, c]
+    assert "a person's job" in q.move({"id": a, "to_index": 2, "owner": "agent"})["msg"]
+    assert q.move({"id": b, "to_index": 0, "owner": "agent", "by": "a7"})["status"] == "ok"
+    assert _order_ids(q) == [b, a, c]
+    assert "owner is required" in q.move({"id": b, "to_index": 0})["msg"]
+    assert "needs to_index" in q.move({"id": b, "owner": "person"})["msg"]
+    assert "next to itself" in q.move({"id": b, "before_id": b, "owner": "person"})["msg"]
+    moves = [e for e in q.journal.entries if e["kind"] == "run_queue_move"]
+    assert moves[0]["from_position"] == 2 and moves[0]["to_position"] == 0
+
+
+def test_a_launching_or_running_job_never_moves(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    reply = q.move({"id": a, "to_index": 0, "owner": "person"})
+    assert reply["status"] == "error" and "only queued jobs move" in reply["msg"]
+
+
+def test_ranks_are_rebalanced_when_the_gap_runs_out(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    ids = []
+    for _ in range(60):                                   # always between a and the last one
+        ids.append(q.insert({"path": str(expts / "rabi.py"), "after_id": a})["ids"][0])
+    order = _order_ids(q)
+    assert order[0] == a and order[-1] == b and order[1:-1] == list(reversed(ids))
+    ranks = [j["rank"] for j in q.list()["jobs"] if j["state"] == "queued"]
+    assert ranks == sorted(ranks) and len(set(ranks)) == len(ranks)
+
+
+def test_an_older_queue_file_without_ranks_keeps_id_order(tmp_path, expts, q):
+    a, b = submit(q, expts, at_end=True), submit(q, expts, at_end=True)
+    path = tmp_path / "logs" / "run_queue" / "queue.json"
+    data = json.loads(path.read_text())
+    for j in data["jobs"]:
+        j.pop("rank")
+    path.write_text(json.dumps(data))
+    again = make_queue(tmp_path, expts)
+    assert _order_ids(again) == [a, b]

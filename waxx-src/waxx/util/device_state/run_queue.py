@@ -25,9 +25,15 @@ launched and cancelled).
 **Scheduling.**  One slot.  A job is *eligible* when it is queued, its due time
 has passed, every job in ``after`` is saved, it is not paused (scope "all", or
 "agent" for an agent's job) and -- for an agent's job -- no person's hold is on
-(:mod:`~waxx.util.device_state.person_hold`).  Of the eligible jobs the one
-with the largest ``(priority, -due, -id)`` goes next (ARTIQ's scheduler key;
-no due time counts as 0).  It is launched only when the previous job's process
+(:mod:`~waxx.util.device_state.person_hold`).  The queue has an explicit
+order: every job has a ``rank`` and the eligible job with the lowest rank goes
+next (due times, dependencies, pauses and the hold only gate a job, they never
+reorder the queue).  At submit a job goes to the end, except that a person's job
+is placed ahead of every queued agent job (unless ``at_end``); ``priority`` is
+only a placement hint within its owner's block (higher first) and is kept for
+display.  ``insert`` submits at a position (``at_index`` / ``before_id`` /
+``after_id``); ``move`` puts a queued job elsewhere (an agent may move only
+agent jobs; launching or running jobs never move).  It is launched only when the previous job's process
 has exited and the machine is free: nothing of the server's own holds it
 (``server_busy``: a state reset, the monitor starting), no run loop is active,
 and liveOD + the run fence say free (:func:`run_gate.classify`; a dead run is
@@ -142,8 +148,6 @@ OWNER_ENV = "WAXX_OWNER"
 #: applied: vetoed by WAXX_CAL_NO_WRITE_BACK"); this branch only sets it.
 NO_WRITE_BACK_ENV = "WAXX_CAL_NO_WRITE_BACK"
 
-#: A person's job's priority when none is given (an agent's: 0).
-PERSON_PRIORITY = 10
 #: An eligible job waiting this long with nothing running raises the alarm.
 ALARM_S = 600.0
 #: liveOD is polled at most this often for the hold's watch and the status
@@ -272,6 +276,9 @@ class Job:
     #: running job was asked for
     cancel: dict | None = None
     adopted: bool = False
+    #: the job's place in the queue: the scheduler takes the eligible job with
+    #: the lowest rank (ties: lowest id); set at submit, changed by `move`
+    rank: float | None = None
 
     @property
     def name(self) -> str:
@@ -518,10 +525,9 @@ class RunQueue:
         if owner not in OWNERS:
             raise QueueError(f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
         try:
-            # a person's `ar` goes to the front: priority 10 unless given
-            priority = (int(obj.get("priority")) if obj.get("priority") is not None
-                        else PERSON_PRIORITY if str(obj.get("owner") or "person") == "person"
-                        else 0)
+            # a placement hint only (higher first within its owner's block at
+            # submit), kept for display; the order is the rank
+            priority = int(obj.get("priority") or 0)
         except (TypeError, ValueError):
             raise QueueError(f"priority must be an integer, not {obj.get('priority')!r}")
         due = obj.get("due")
@@ -568,6 +574,7 @@ class RunQueue:
                 chain = f"repeat-{first}"
             stop = obj.get("stop_on_failure")
             stop = bool(chain) if stop is None else bool(stop)
+            ranks = self._place(repeat, owner, priority, obj)
             now = self._clock()
             jobs = []
             for i in range(repeat):
@@ -576,11 +583,134 @@ class RunQueue:
                           priority=priority, due=due, after=list(after), chain=chain,
                           stop_on_failure=stop, write_back=write_back,
                           allow_drift=bool(obj.get("allow_drift")), repeat_index=i + 1,
-                          repeat_of=repeat, submitted_at=now, submitted_by=by)
+                          repeat_of=repeat, submitted_at=now, submitted_by=by,
+                          rank=ranks[i])
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
         return jobs
+
+    # -- the order ---------------------------------------------------------------------
+
+    def _queued_in_order(self, without: Job | None = None) -> list[Job]:
+        """The queued jobs in rank order (ties: id)."""
+        return sorted((j for j in self._jobs.values()
+                       if j.state == "queued" and j is not without),
+                      key=lambda j: (j.rank, j.id))
+
+    def _insert_index(self, queued: list[Job], owner: str, priority: int,
+                      obj: Mapping) -> int:
+        """Where a job goes among ``queued`` (rank order): the position the
+        request names -- ``before_id`` / ``after_id`` (a queued job),
+        ``at_index`` / ``to_index`` (0-based, clamped), ``at_end`` -- or, by
+        default, the owner rule: a person's job ahead of every queued agent
+        job (after the person jobs of equal or higher priority), an agent's
+        job at the end of the agent jobs of equal or higher priority."""
+        given = [k for k in ("before_id", "after_id", "at_index", "to_index")
+                 if obj.get(k) is not None]
+        if obj.get("at_end"):
+            given.append("at_end")
+        if len(given) > 1:
+            raise QueueError(f"give one position, not {', '.join(given)}")
+        ids = [j.id for j in queued]
+        for key, offset in (("before_id", 0), ("after_id", 1)):
+            if obj.get(key) is not None:
+                try:
+                    target = int(obj[key])
+                except (TypeError, ValueError):
+                    raise QueueError(f"{key} must be a job id, not {obj[key]!r}")
+                if target not in ids:
+                    raise QueueError(f"{key} {target} is not a queued job")
+                return ids.index(target) + offset
+        for key in ("at_index", "to_index"):
+            if obj.get(key) is not None:
+                try:
+                    index = int(obj[key])
+                except (TypeError, ValueError):
+                    raise QueueError(f"{key} must be an integer, not {obj[key]!r}")
+                return max(0, min(index, len(queued)))
+        if obj.get("at_end"):
+            return len(queued)
+        for i, other in enumerate(queued):
+            if owner == "person" and (other.owner == "agent" or other.priority < priority):
+                return i
+            if owner == "agent" and other.owner == "agent" and other.priority < priority:
+                return i
+        return len(queued)
+
+    def _ranks_at(self, queued: list[Job], index: int, n: int) -> list[float]:
+        """``n`` ranks between ``queued[index - 1]`` and ``queued[index]``
+        (the queued jobs are given new ranks 1, 2, 3... first when the gap is
+        too small to split)."""
+        def bounds():
+            lo = queued[index - 1].rank if index > 0 else None
+            hi = queued[index].rank if index < len(queued) else None
+            return lo, hi
+        lo, hi = bounds()
+        if lo is not None and hi is not None and (hi - lo) / (n + 1) < 1e-6:
+            for k, other in enumerate(queued):
+                other.rank = float(k + 1)
+            lo, hi = bounds()
+        if lo is None and hi is None:
+            top = max((j.rank for j in self._jobs.values() if j.rank is not None),
+                      default=0.0)
+            return [top + 1.0 + k for k in range(n)]
+        if hi is None:
+            return [lo + 1.0 + k for k in range(n)]
+        if lo is None:
+            return [hi - n + k for k in range(n)]
+        step = (hi - lo) / (n + 1)
+        return [lo + step * (k + 1) for k in range(n)]
+
+    def _place(self, n: int, owner: str, priority: int, obj: Mapping) -> list[float]:
+        queued = self._queued_in_order()
+        return self._ranks_at(queued, self._insert_index(queued, owner, priority, obj), n)
+
+    def _positions(self) -> dict[int, int]:
+        """Job id -> 0-based position among the queued jobs (rank order)."""
+        return {j.id: i for i, j in enumerate(self._queued_in_order())}
+
+    def insert(self, obj: Mapping) -> dict:
+        """``submit`` at a position the request names (``at_index`` |
+        ``before_id`` | ``after_id``; one is required)."""
+        if all(obj.get(k) is None for k in ("at_index", "before_id", "after_id")):
+            return {"status": "error",
+                    "msg": "insert needs a position: at_index, before_id or after_id"}
+        return self.submit(obj)
+
+    def move(self, obj: Mapping) -> dict:
+        """``{"id", "to_index" | "before_id" | "after_id", "owner", "by"}``: put
+        a queued job at another place in the order (launching / running jobs
+        never move).  An agent may move only agent jobs."""
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        if all(obj.get(k) is None for k in ("to_index", "before_id", "after_id")):
+            return {"status": "error", "msg": "move needs to_index, before_id or after_id"}
+        with self._lock:
+            try:
+                job = self._find(obj)
+                if job.state != "queued":
+                    raise QueueError(f"{job.name} is {job.state}: only queued jobs move")
+                if as_owner == "agent" and job.owner != "agent":
+                    raise QueueError(f"{job.name} is a person's job: an agent may not move it")
+                if job.id in (obj.get("before_id"), obj.get("after_id")):
+                    raise QueueError(f"{job.name} cannot be placed next to itself")
+                before = self._positions().get(job.id)
+                others = self._queued_in_order(without=job)
+                index = self._insert_index(others, job.owner, job.priority, obj)
+                old_rank = job.rank
+                job.rank = self._ranks_at(others, index, 1)[0]
+                after = self._positions().get(job.id)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+        log.info("Run queue: %s moved by %s from position %s to %s.", job.name, by, before, after)
+        self._record("run_queue_move", job=job.id, by=by, owner=as_owner, from_position=before,
+                     to_position=after, from_rank=old_rank, to_rank=job.rank)
+        self._save()
+        self._notify()
+        return {"status": "ok", "job": dict(job.to_dict(), position=after), "position": after}
 
     def _find(self, obj: Mapping) -> Job:
         try:
@@ -636,7 +766,10 @@ class RunQueue:
         return reply
 
     def list(self, obj: Mapping | None = None) -> dict:
-        """``{"states"?: [...], "limit"?: n}`` -> the jobs, newest last."""
+        """``{"states"?: [...], "limit"?: n}`` -> the jobs: the ended ones (by
+        id, the last ``limit``), then the one in the slot, then the queued ones
+        in rank order -- each with ``position`` (0-based among the queued jobs;
+        None for the others); ``next``: the eligible jobs in launch order."""
         obj = obj or {}
         states = obj.get("states")
         try:
@@ -644,11 +777,16 @@ class RunQueue:
         except (TypeError, ValueError):
             limit = 200
         with self._lock:
-            jobs = [j for j in sorted(self._jobs.values(), key=lambda j: j.id)
+            positions = self._positions()
+            ended = sorted((j for j in self._jobs.values() if j.state in ENDED),
+                           key=lambda j: j.id)[-limit:]
+            slot = sorted((j for j in self._jobs.values() if j.state in IN_SLOT),
+                          key=lambda j: j.id)
+            jobs = [j for j in ended + slot + self._queued_in_order()
                     if not states or j.state in states]
+            out = [dict(j.to_dict(), position=positions.get(j.id)) for j in jobs]
             order = [j.id for j in self._order(self._clock())]
-        return {"status": "ok", "jobs": [j.to_dict() for j in jobs[-limit:]],
-                "next": order, "run_queue": self.info()}
+        return {"status": "ok", "jobs": out, "next": order, "run_queue": self.info()}
 
     def describe(self, obj: Mapping) -> dict:
         """``{"id", "token"?}`` -> the job, why it waits, its last lines."""
@@ -657,7 +795,8 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
-            out = {"status": "ok", "job": job.to_dict(),
+            out = {"status": "ok",
+                   "job": dict(job.to_dict(), position=self._positions().get(job.id)),
                    "waiting": self._why_waiting(job, self._clock()),
                    "tail": list(self._tails.get(job.id, ()))}
         return out
@@ -891,11 +1030,12 @@ class RunQueue:
         return cached
 
     def _order(self, now: float) -> list[Job]:
-        """The eligible jobs, the next one first."""
+        """The eligible jobs, the next one first: lowest rank (ties: lowest
+        id).  Due times, dependencies, pauses and the hold only gate a job --
+        they never reorder the queue."""
         eligible = [j for j in self._jobs.values()
                     if j.state == "queued" and not self._blocked_by(j, now)]
-        return sorted(eligible, key=lambda j: (j.priority, -(j.due or 0.0), -j.id),
-                      reverse=True)
+        return sorted(eligible, key=lambda j: (j.rank, j.id))
 
     def _why_waiting(self, job: Job, now: float) -> str:
         if job.state != "queued":
@@ -1857,6 +1997,11 @@ class RunQueue:
             return
         self._jobs = {j.id: j for j in jobs}
         self._next_id = next_id
+        if any(j.state == "queued" and j.rank is None for j in jobs):
+            # a queue.json from before ranks: the queued jobs keep their id order
+            for k, j in enumerate(sorted((j for j in jobs if j.state == "queued"),
+                                         key=lambda j: j.id)):
+                j.rank = float(k + 1)
         for scope in PAUSE_SCOPES:
             self._paused[scope] = (data.get("paused") or {}).get(scope) or None
         self._resume_loop = data.get("resume_loop") or None
