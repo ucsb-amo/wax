@@ -198,8 +198,12 @@ class MonitorUDPServer(UdpServer):
       (:mod:`~waxx.util.device_state.run_queue`): ``submit`` (``path``,
       ``argv``, ``cwd``, ``label``, ``owner``, ``priority``, ``due``,
       ``after``, ``repeat``, ``chain``, ``stop_on_failure``, ``write_back``,
-      ``allow_drift``, ``by``), ``cancel`` (``id``, ``token``, ``by``,
-      ``owner``), ``list`` (``states``, ``limit``), ``describe`` (``id``),
+      ``allow_drift``, ``by``, ``at_end``), ``insert`` (submit at
+      ``at_index`` / ``before_id`` / ``after_id``), ``move`` (``id``,
+      ``to_index`` / ``before_id`` / ``after_id``, ``owner``, ``by``),
+      ``edit`` (``id``, ``owner``, ``by``, ``fields``), ``cancel`` (``id``,
+      ``token``, ``by``, ``owner``), ``list`` (``states``, ``limit``),
+      ``describe`` (``id``),
       ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
       ``reason``), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
       a person's hold on the machine
@@ -797,7 +801,7 @@ class MonitorUDPServer(UdpServer):
     # --- the run queue and the person hold ---------------------------------------------
 
     #: run_queue actions -> the RunQueue method that answers them
-    _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move",
+    _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
                       "cancel": "cancel", "list": "list",
                       "describe": "describe", "pause": "pause", "resume": "resume",
                       "hold": "hold_request", "release": "release_request"}

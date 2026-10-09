@@ -330,6 +330,10 @@ class Job:
     #: who submitted it, for listings: a person's "<user>@<pc>" (`by`), an
     #: agent's label (WAXX_AGENT_LABEL) or "agent@<host>"
     submitter: str = ""
+    #: this job alone paused (`edit` fields.paused): not launched until unpaused
+    paused: bool = False
+    paused_by: str = ""
+    paused_since: float | None = None
 
     @property
     def name(self) -> str:
@@ -364,6 +368,52 @@ def requester_owner(obj: Mapping) -> tuple[str, str]:
 
 class QueueError(ValueError):
     """A request the queue refuses (the message says why)."""
+
+
+def _checked_argv(argv) -> list:
+    argv = argv or []
+    if not isinstance(argv, (list, tuple)) or not all(isinstance(a, str) for a in argv):
+        raise QueueError("argv must be a list of strings")
+    for a in argv:
+        bad = sorted(_SHELL_CHARS & set(a))
+        if bad:
+            raise QueueError(f"an argument contains {' '.join(bad)} (not allowed): {a}")
+        if a.endswith("\\"):
+            # quoted, it would escape its own closing quote
+            raise QueueError(f"an argument ends in a backslash (not allowed): {a}")
+    return list(argv)
+
+
+def _checked_due(due):
+    if due is None:
+        return None
+    try:
+        value = float(due)
+    except (TypeError, ValueError):
+        raise QueueError(f"due must be epoch seconds or null, not {due!r}")
+    if value != value or value in (float("inf"), float("-inf")):
+        raise QueueError(f"due must be a finite time, not {due!r}")
+    return value
+
+
+def _checked_after(after) -> list:
+    after = after or []
+    if not isinstance(after, (list, tuple)):
+        after = [after]
+    try:
+        return [int(a) for a in after]
+    except (TypeError, ValueError):
+        raise QueueError(f"after must be a list of job ids, not {after!r}")
+
+
+def _checked_write_back(write_back):
+    if write_back is True:
+        raise QueueError("write_back true is not a submitter's to give: the experiment "
+                         "declares its write-back; a submitter may only veto it "
+                         "(write_back false)")
+    if write_back not in (None, False):
+        raise QueueError(f"write_back must be null or false, not {write_back!r}")
+    return write_back
 
 
 class RunQueue:
@@ -561,16 +611,7 @@ class RunQueue:
         if self._norm(path) in self._exclude:
             raise QueueError(f"{path.name} is the monitor's own experiment: the monitor server "
                              "runs it itself")
-        argv = obj.get("argv") or []
-        if not isinstance(argv, (list, tuple)) or not all(isinstance(a, str) for a in argv):
-            raise QueueError("argv must be a list of strings")
-        for a in argv:
-            bad = sorted(_SHELL_CHARS & set(a))
-            if bad:
-                raise QueueError(f"an argument contains {' '.join(bad)} (not allowed): {a}")
-            if a.endswith("\\"):
-                # quoted, it would escape its own closing quote
-                raise QueueError(f"an argument ends in a backslash (not allowed): {a}")
+        argv = _checked_argv(obj.get("argv"))
         cwd = str(obj.get("cwd") or path.parent)
         if not Path(cwd).is_dir():
             raise QueueError(f"no such working folder on the monitor server's machine: {cwd}")
@@ -583,21 +624,8 @@ class RunQueue:
             priority = int(obj.get("priority") or 0)
         except (TypeError, ValueError):
             raise QueueError(f"priority must be an integer, not {obj.get('priority')!r}")
-        due = obj.get("due")
-        if due is not None:
-            try:
-                due = float(due)
-            except (TypeError, ValueError):
-                raise QueueError(f"due must be epoch seconds or null, not {due!r}")
-            if due != due or due in (float("inf"), float("-inf")):
-                raise QueueError(f"due must be a finite time, not {obj.get('due')!r}")
-        after = obj.get("after") or []
-        if not isinstance(after, (list, tuple)):
-            after = [after]
-        try:
-            after = [int(a) for a in after]
-        except (TypeError, ValueError):
-            raise QueueError(f"after must be a list of job ids, not {obj.get('after')!r}")
+        due = _checked_due(obj.get("due"))
+        after = _checked_after(obj.get("after"))
         try:
             repeat = 1 if obj.get("repeat") is None else int(obj.get("repeat"))
         except (TypeError, ValueError):
@@ -606,13 +634,7 @@ class RunQueue:
             raise QueueError(f"repeat must be 1 to {MAX_REPEAT}, not {repeat}")
         chain = obj.get("chain")
         chain = str(chain).strip() if chain not in (None, "") else None
-        write_back = obj.get("write_back")
-        if write_back is True:
-            raise QueueError("write_back true is not a submitter's to give: the experiment "
-                             "declares its write-back; a submitter may only veto it "
-                             "(write_back false)")
-        if write_back not in (None, False):
-            raise QueueError(f"write_back must be null or false, not {write_back!r}")
+        write_back = _checked_write_back(obj.get("write_back"))
         label = _LABEL_RE.sub("_", str(obj.get("label") or path.stem)).strip("_") or path.stem
         label = label[:60]
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
@@ -827,6 +849,110 @@ class RunQueue:
                 "label": view["label"], "expt_class": view.get("expt_class") or "",
                 "run_id": view.get("run_id"), "est": view.get("estimate"),
                 "waiting": view.get("waiting") or ""}
+
+    #: the fields `edit` may change on a queued job
+    EDITABLE = ("argv", "label", "after", "chain", "stop_on_failure", "write_back", "due",
+                "allow_drift", "paused")
+
+    def edit(self, obj: Mapping) -> dict:
+        """``{"id", "owner", "by", "fields": {argv?, label?, after?, chain?,
+        stop_on_failure?, write_back?, due?, allow_drift?, paused?}}``: change
+        a QUEUED job (launching / running refused); each field checked as at
+        submit; ``paused`` pauses this job alone.  An agent may edit only
+        agent jobs.  Journaled (run_queue_edit) with every changed field's
+        value before and after.  The drift check at launch is unchanged."""
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        fields_ = obj.get("fields")
+        if not isinstance(fields_, Mapping) or not fields_:
+            return {"status": "error", "msg": "edit needs fields: {" +
+                    ", ".join(self.EDITABLE) + "}"}
+        unknown = sorted(set(fields_) - set(self.EDITABLE))
+        if unknown:
+            return {"status": "error", "msg": f"not editable: {', '.join(unknown)} (editable: "
+                                              f"{', '.join(self.EDITABLE)})"}
+        with self._lock:
+            try:
+                job = self._find(obj)
+                if job.state != "queued":
+                    raise QueueError(f"{job.name} is {job.state}: only queued jobs are edited")
+                if as_owner == "agent" and job.owner != "agent":
+                    raise QueueError(f"{job.name} is a person's job: an agent may not edit it")
+                new = self._checked_edit(job, fields_)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+            before, after = {}, {}
+            for key, value in new.items():
+                old = getattr(job, key)
+                if old == value:
+                    continue
+                before[key], after[key] = old, value
+                setattr(job, key, value)
+            if "paused" in after:
+                job.paused_by = by if job.paused else ""
+                job.paused_since = self._clock() if job.paused else None
+            view = self._views([job], self._clock())[0]
+        if after:
+            log.info("Run queue: %s edited by %s: %s", job.name, by,
+                     ", ".join(f"{k} {before[k]!r} -> {after[k]!r}" for k in after))
+            self._record("run_queue_edit", job=job.id, by=by, owner=as_owner, before=before,
+                         after=after)
+            self._save()
+        self._notify()
+        return {"status": "ok", "job": view, "changed": sorted(after)}
+
+    def _checked_edit(self, job: Job, fields_: Mapping) -> dict:
+        """The edit's new values, each checked as at submit (QueueError)."""
+        new = {}
+        if "argv" in fields_:
+            new["argv"] = _checked_argv(fields_["argv"])
+        if "label" in fields_:
+            label = _LABEL_RE.sub("_", str(fields_["label"] or "")).strip("_")[:60]
+            if not label:
+                raise QueueError("label is empty")
+            new["label"] = label
+        if "after" in fields_:
+            after = _checked_after(fields_["after"])
+            if job.id in after:
+                raise QueueError(f"{job.name} cannot wait for itself")
+            unknown = [a for a in after if a not in self._jobs
+                       and self._dep_state(a) == "failed" and a >= self._next_id]
+            if unknown:
+                raise QueueError(f"after names unknown job(s): {', '.join(map(str, unknown))}")
+            if self._waits_on(after, job.id):
+                raise QueueError(f"after {after} would make a cycle back to {job.name}")
+            new["after"] = after
+        if "chain" in fields_:
+            chain = fields_["chain"]
+            new["chain"] = str(chain).strip() if chain not in (None, "") else None
+        for key in ("stop_on_failure", "allow_drift", "paused"):
+            if key in fields_:
+                if not isinstance(fields_[key], bool):
+                    raise QueueError(f"{key} must be true or false, not {fields_[key]!r}")
+                new[key] = fields_[key]
+        if "write_back" in fields_:
+            new["write_back"] = _checked_write_back(fields_["write_back"])
+        if "due" in fields_:
+            new["due"] = _checked_due(fields_["due"])
+        return new
+
+    def _waits_on(self, after, target: int) -> bool:
+        """Whether any job in ``after`` (transitively, through its own
+        `after`) waits for job ``target``."""
+        seen, todo = set(), list(after)
+        while todo:
+            jid = todo.pop()
+            if jid == target:
+                return True
+            if jid in seen:
+                continue
+            seen.add(jid)
+            dep = self._jobs.get(jid)
+            if dep is not None:
+                todo.extend(dep.after)
+        return False
 
     def insert(self, obj: Mapping) -> dict:
         """``submit`` at a position the request names (``at_index`` |
@@ -1148,6 +1274,9 @@ class RunQueue:
         job's own conditions, not the machine's."""
         if job.state != "queued":
             return f"it is {job.state}"
+        if job.paused:
+            return (f"paused (this job) by {job.paused_by or '?'} since "
+                    f"{_since_text(job.paused_since)}")
         if job.due is not None and job.due > now:
             return f"due {_since_text(job.due)}"
         waits = [a for a in job.after if self._dep_state(a) != "saved"]
