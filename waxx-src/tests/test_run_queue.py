@@ -1849,3 +1849,19 @@ def test_a_pathological_source_is_listed_without_class_or_calibrations(q, expts,
         a = submit(q, expts)
     assert job(q, a)["expt_class"] == "" and job(q, a)["calibrates_declared"] == []
     assert any("listed without them" in r.getMessage() for r in caplog.records)
+
+
+def test_queued_etas_skip_blocked_jobs_ahead_and_say_so(q, expts):
+    for i in range(2):                                     # two saved runs: 100 s each
+        submit(q, expts, at_end=True)
+        q.tick()
+        q.clock.t += 100.0
+        run_through(q, 101 + i)
+    blocked = submit(q, expts, "tof", at_end=True, due=q.clock.t + 3600)   # unknown duration
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    assert views[a]["estimate"]["eta_start"] == pytest.approx(q.clock.t)
+    assert "ignores blocked jobs ahead" in views[a]["estimate"]["basis"]
+    assert views[b]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 100.0)
+    assert "ignores blocked" not in views[blocked]["estimate"]["basis"]

@@ -875,8 +875,9 @@ class RunQueue:
         ``{duration_s, eta_start, eta_end, basis}``, all ESTIMATES: the
         duration from the last saved runs of the same file; for the job in the
         slot its expected end; for a queued job its expected start (now + the
-        slot's remaining time + the durations of the queued jobs ahead of it;
-        null when any of them is unknown).
+        slot's remaining time + the durations of the ELIGIBLE queued jobs ahead
+        of it -- blocked ones (held, paused, due later, waiting) are left out
+        and the basis says so; null when any counted duration is unknown).
 
         Called under the lock; one pass: the order, the positions and the
         per-file medians are computed once.  Returns ``(views, pending)``:
@@ -892,8 +893,17 @@ class RunQueue:
             end, _ = self._running_end(cur, now, medians)
             ahead_s = None if end is None else max(0.0, end - now)
         start_of: dict[int, float | None] = {}
+        skipped_ahead: dict[int, bool] = {}
+        eligible = {j.id for j in order}
+        skipped = False
         for q in queued:
             start_of[q.id] = None if ahead_s is None else now + ahead_s
+            skipped_ahead[q.id] = skipped
+            if q.id not in eligible:
+                # held, paused, due later, waiting on another job: it is not
+                # expected to run before the jobs behind it -- left out
+                skipped = True
+                continue
             dur, _ = self._duration_estimate(q, medians)
             ahead_s = None if (ahead_s is None or dur is None) else ahead_s + dur
         out, pending = [], []
@@ -908,6 +918,8 @@ class RunQueue:
                 estimate["eta_start"] = start_of.get(job.id)
                 if estimate["eta_start"] is not None and dur is not None:
                     estimate["eta_end"] = estimate["eta_start"] + dur
+                if skipped_ahead.get(job.id):
+                    estimate["basis"] += "; est. (ignores blocked jobs ahead)"
             elif job.state in IN_SLOT:
                 estimate["eta_end"], estimate["basis"] = self._running_end(job, now, medians)
             out.append(view)
