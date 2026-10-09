@@ -216,8 +216,16 @@ def window(qapp, monkeypatch, tmp_path):
                              config_file_path=str(tmp_path / "state.json"),
                              journal_dir=str(tmp_path / "ops_journal"))
     w.request_runner.synchronous = True                            # answers at once
+    # the queue never launches a process or adopts one, even if ticked
+    from test_run_queue import Live, Spawner
+    queue = w.udp_server.run_queue
+    w.spawner = Spawner()
+    queue._spawn = w.spawner
+    queue._adopt = lambda pid, started: None
+    w.udp_server._live_od = Live()
     yield w
     w.close()
+    assert w.spawner.calls == []
 
 
 def test_the_window_has_queue_state_and_monitor_tabs(window, qapp):
