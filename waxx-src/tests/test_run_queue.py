@@ -665,6 +665,27 @@ def test_a_reset_on_an_agents_queued_run_sets_no_hold_but_a_persons_does(q, expt
     assert q.hold.active and q.hold.info()["run_id"] == 555
 
 
+# --- the experiment side: a queued run leaves the monitor to the server ------------------------
+
+def test_a_queued_run_does_not_restart_the_monitor(monkeypatch, capsys):
+    import inspect
+    from waxx.base import expt
+    monkeypatch.delenv("WAXX_LAUNCHER", raising=False)
+    assert expt._queue_restart_monitor(True) is True
+    monkeypatch.setenv("WAXX_LAUNCHER", "run_loop")
+    assert expt._queue_restart_monitor(True) is True
+    assert expt._queue_restart_monitor(False) is False
+    assert capsys.readouterr().out == ""
+    monkeypatch.setenv("WAXX_LAUNCHER", rq.LAUNCHER)
+    monkeypatch.setenv("WAXX_QUEUE_JOB", "12")
+    assert expt._queue_restart_monitor(True) is False
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1 and "run queue (job 12)" in out[0] and "not restarted" in out[0]
+    # end_wax applies it before anything else
+    src = inspect.getsource(expt.Expt.end_wax)
+    assert src.index("_queue_restart_monitor(restart_monitor)") < src.index("if restart_monitor")
+
+
 # --- the real detached launcher (Windows; runs `echo` only) -------------------------------------
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the detached launcher is Windows-only")
