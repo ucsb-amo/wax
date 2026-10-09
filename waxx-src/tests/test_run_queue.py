@@ -848,7 +848,7 @@ def test_an_unreadable_hold_file_starts_held(tmp_path):
 
 def test_the_alarm(q, expts, caplog):
     a = submit(q, expts)
-    q.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    q.live.down = True                                   # blocked: liveOD unreachable
     with caplog.at_level("WARNING", logger="waxx.util.device_state.run_queue"):
         q.tick()
         q.clock.t += 599
@@ -857,7 +857,7 @@ def test_the_alarm(q, expts, caplog):
         q.clock.t += 2
         q.tick()
         alarm = q.info()["alarm"]
-        assert alarm["job"] == a and "555" in alarm["why"]
+        assert alarm["job"] == a and "not reachable" in alarm["why"]
         q.clock.t += 300
         q.tick()
         q.clock.t += 301
@@ -865,10 +865,26 @@ def test_the_alarm(q, expts, caplog):
     warnings = [r for r in caplog.records if "RUN QUEUE ALARM" in r.getMessage()]
     assert len(warnings) == 2
     assert q.journal.kinds.count("run_queue_alarm") == 2
-    q.live.end_run(555)
+    q.live.down = False
     q.tick()
     assert q.info()["alarm"] is None and job(q, a)["state"] == "running"
     assert "run_queue_alarm_cleared" in q.journal.kinds
+
+
+def test_a_persons_legitimate_run_never_alarms_but_a_wedged_one_does(q, expts):
+    a = submit(q, expts)
+    q.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    for _ in range(4):                                   # 40 min of someone's live run
+        q.clock.t += 600
+        q.tick()
+    assert q.info()["alarm"] is None and "run_queue_alarm" not in q.journal.kinds
+    q.live.state.update(last_shot_age_s=5000.0, init_run_age_s=6000.0)   # now wedged
+    q.tick()
+    q.clock.t += 601
+    q.tick()
+    alarm = q.info()["alarm"]
+    assert alarm is not None and "WEDGED" in alarm["why"]
+    assert job(q, a)["state"] == "queued"
 
 
 # --- loops and the monitor ------------------------------------------------------------------

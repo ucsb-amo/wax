@@ -341,6 +341,8 @@ class RunQueue:
         self._owed_since: float | None = None
         self._alarm: dict | None = None
         self._own_abort_ids: set = set()
+        #: the last gate's kind: "free" | "live" | "blocked" (see _gate)
+        self._gate_kind = ""
         #: the run id of the job that ended last (its fence may still be up)
         self._last_ended_run_id: int | None = None
         #: the launch in progress: {"job", "thread", "result", "since", "warned"}
@@ -870,14 +872,23 @@ class RunQueue:
                 and fid == last)
 
     def _gate(self) -> str:
-        """Why the next job may not launch now ("" when it may)."""
+        """Why the next job may not launch now ("" when it may).  Sets
+        ``_gate_kind``: "free", "live" (someone's run is legitimately using
+        the machine: a run in progress or announced, a loop finishing its run
+        after a stop) or "blocked" (anything else -- wedged, an Abort pending,
+        liveOD unreachable or unknown, the server busy, a loop that does not
+        stop): only "blocked" runs the alarm's clock."""
+        self._gate_kind = "blocked"
         busy = self._server_busy() if self._server_busy is not None else ""
         if busy:
             return busy
         loop = self._active_loop()
         if loop is not None:
-            return (f"{loop.spec.title} is finishing its run in progress (asked to stop for "
-                    "the queue)")
+            if loop.info().get("state") == "stopping":
+                self._gate_kind = "live"
+                return (f"{loop.spec.title} is finishing its run in progress (asked to stop "
+                        "for the queue)")
+            return f"{loop.spec.title} is running and has not been asked to stop"
         poll = self._poll_now()
         if poll is None:
             return "liveOD is not reachable -- a run could not save"
@@ -887,8 +898,12 @@ class RunQueue:
         monitor = self._monitor_state() if self._monitor_state is not None else None
         verdict = run_gate.classify(poll, fence, monitor_state=monitor)
         if verdict.state == "free":
+            self._gate_kind = "free"
             return ""
+        if verdict.state == "live":
+            self._gate_kind = "live"
         if verdict.waivable:
+            self._gate_kind = "free"
             key = (verdict.run_id, verdict.state)
             if key != self._waived:
                 self._waived = key
@@ -1441,6 +1456,13 @@ class RunQueue:
         with self._lock:
             owed = self._current is None and bool(self._order(now))
             nxt = self._order(now)[0] if owed else None
+        if owed and self._gate_kind != "blocked":
+            # someone's run is legitimately using the machine (or it is free
+            # and the job launches): no alarm, and the clock starts again
+            self._owed_since = None
+            if self._alarm is not None:
+                self._clear_alarm("the machine is in legitimate use")
+            return
         if not owed:
             self._owed_since = None
             if self._alarm is not None:
