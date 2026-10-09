@@ -341,6 +341,8 @@ class RunQueue:
         self._owed_since: float | None = None
         self._alarm: dict | None = None
         self._own_abort_ids: set = set()
+        #: the run id of the job that ended last (its fence may still be up)
+        self._last_ended_run_id: int | None = None
         #: the launch in progress: {"job", "thread", "result", "since", "warned"}
         self._spawning: dict | None = None
         #: how long _launch waits for its launch thread before the tick follows it
@@ -858,6 +860,15 @@ class RunQueue:
                 return loop
         return None
 
+    def _own_ended_fence(self, fence: dict) -> bool:
+        """The run fence is the one the queue's last ended job left up (it
+        exited without lifting it): only that job's run id, and only a real
+        one (a positive int -- every save_data=False run is run id 0)."""
+        fid = fence.get("run_id")
+        last = self._last_ended_run_id
+        return (isinstance(fid, int) and not isinstance(fid, bool) and fid > 0
+                and fid == last)
+
     def _gate(self) -> str:
         """Why the next job may not launch now ("" when it may)."""
         busy = self._server_busy() if self._server_busy is not None else ""
@@ -871,8 +882,8 @@ class RunQueue:
         if poll is None:
             return "liveOD is not reachable -- a run could not save"
         fence = self._fence() if self._fence is not None else None
-        if fence and fence.get("run_id") in self.own_run_ids():
-            fence = None                  # a fence of the queue's own (ended) job
+        if fence and self._own_ended_fence(fence):
+            fence = None                  # the fence of the queue's own job that just ended
         monitor = self._monitor_state() if self._monitor_state is not None else None
         verdict = run_gate.classify(poll, fence, monitor_state=monitor)
         if verdict.state == "free":
@@ -1247,6 +1258,7 @@ class RunQueue:
             self._end(job, state, reason)
             self._current = None
             self._last_end_t = self._clock()
+            self._last_ended_run_id = job.run_id
             self._procs.pop(job.id, None)
         if proc is not None and hasattr(proc, "close"):
             try:

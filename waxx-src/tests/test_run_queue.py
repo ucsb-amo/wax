@@ -405,6 +405,22 @@ def test_a_foreign_fence_waits_but_the_queues_own_ended_runs_fence_does_not(q, e
     q._fence = lambda: {"run_id": 900, "expt": "other", "since": q.clock.t}
     q.tick()
     assert job(q, c)["state"] == "queued" and "run 900" in q.info()["waiting"]
+    # only the LAST ended job's fence, and only a real run id (review S7)
+    q._fence = lambda: {"run_id": 101, "expt": "rabi", "since": q.clock.t}   # an older one
+    q.tick()
+    assert job(q, c)["state"] == "queued" and "run 101" in q.info()["waiting"]
+
+
+def test_a_run_id_0_fence_is_never_the_queues_own(q, expts):
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("Run ID: 0")                              # a save_data=False run
+    q.live.end_run(0)
+    q._fence = lambda: {"run_id": 0, "expt": "nosave", "since": q.clock.t}
+    proc.code = 0
+    q.tick()                                             # a ends; b's gate sees the fence
+    assert job(q, b)["state"] == "queued" and "announced itself" in q.info()["waiting"]
 
 
 # --- outcomes -----------------------------------------------------------------------------
