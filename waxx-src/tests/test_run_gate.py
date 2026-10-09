@@ -201,11 +201,21 @@ def test_a_young_fence_makes_an_idle_machine_live():
     assert "announced itself" in st.reason and "10 s ago" in st.reason
 
 
-def test_a_fence_older_than_its_ttl_is_not_counted():
+@pytest.mark.parametrize("ready", [0, "READY"])
+def test_a_fence_older_than_its_ttl_is_not_counted_while_the_monitor_is_ready(ready):
     fence = {"run_id": 85600, "expt": "rabi", "since": NOW - run_gate.FENCE_TTL_S - 1}
-    st = classify(_poll(), fence, now=NOW, pid_alive=_never)
+    st = classify(_poll(), fence, now=NOW, pid_alive=_never, monitor_state=ready)
     assert st.state == "free" and "not counted" in st.reason
     assert st.detail["fence"]["active"] is False
+
+
+@pytest.mark.parametrize("state", [1, 2, "NOT_READY", None])
+def test_an_old_fence_stands_while_the_monitor_is_not_ready(state):
+    # review S6: the server lapses a fence only while READY (it clears it when
+    # the run takes the core); not READY or unknown: the fence stands
+    fence = {"run_id": 85600, "expt": "rabi", "since": NOW - 10 * run_gate.FENCE_TTL_S}
+    st = classify(_poll(), fence, now=NOW, pid_alive=_never, monitor_state=state)
+    assert st.state == "live" and not st.waivable and st.run_id == 85600
 
 
 def test_a_fence_without_a_date_counts():

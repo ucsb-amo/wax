@@ -207,15 +207,26 @@ def _num(value):
 
 # -- the verdict ----------------------------------------------------------------------
 
+def _monitor_ready(state) -> bool:
+    """The monitor server's ``status_json`` ``state`` is READY (0, or the name)."""
+    if isinstance(state, bool):
+        return False
+    return state == 0 or (isinstance(state, str) and state.upper() == "READY")
+
+
 def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
-             pid_alive: Callable[[int], bool] | None = None) -> GateState:
+             pid_alive: Callable[[int], bool] | None = None,
+             monitor_state=None) -> GateState:
     """The gate's verdict from liveOD's POLL reply and the monitor server's run
     fence (see the module docstring for the states and their rules).
 
     ``poll`` None, or a reply with ``ok`` False or without ``run_in_progress``,
     is ``unknown``.  ``fence`` None means no run is announced.  ``now`` (epoch
     seconds) dates the fence; ``pid_alive(pid)`` checks a client process on
-    this machine (default: :func:`pid_alive`)."""
+    this machine (default: :func:`pid_alive`).  ``monitor_state``: the monitor
+    server's ``status_json`` ``state`` -- the fence lapses after
+    :data:`FENCE_TTL_S` only while it is READY (as the server's own
+    ``_current_run_pending``); otherwise, or when not given, the fence stands."""
     now = time.time() if now is None else float(now)
     check = pid_alive if pid_alive is not None else _default_pid_alive
     if not isinstance(poll, dict) or poll.get("ok") is False:
@@ -252,8 +263,10 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
     if fence:
         since = _num(fence.get("since"))
         age = None if since is None else now - since
+        ready = _monitor_ready(monitor_state)
         fence_info = {"run_id": fence.get("run_id"), "expt": fence.get("expt") or "",
-                      "age_s": age, "active": age is None or age < FENCE_TTL_S}
+                      "age_s": age, "monitor_ready": ready,
+                      "active": age is None or age < FENCE_TTL_S or not ready}
     detail["fence"] = fence_info
 
     if in_progress:
@@ -307,8 +320,8 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
                            + (f" (liveOD: {st.reason})" if st.state != "free" else ""))
         elif not fence_info["active"] and st.state == "free":
             st.reason += (f"; run {fence_info['run_id']}'s fence on the monitor server is "
-                          f"{fence_info['age_s']:.0f} s old (over {FENCE_TTL_S:.0f} s) -- "
-                          "not counted")
+                          f"{fence_info['age_s']:.0f} s old (over {FENCE_TTL_S:.0f} s, monitor "
+                          "READY) -- not counted")
     st.detail = detail
     return st
 
@@ -431,7 +444,8 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
         return GateState("unknown", poll.get("run_id"),
                          f"the monitor server did not answer ({exc}) -- cannot read its run "
                          "fence", detail={"error": str(exc), "poll_run_id": poll.get("run_id")})
-    verdict = classify(poll, status.get("run_pending") or None, now=now, pid_alive=pid_alive)
+    verdict = classify(poll, status.get("run_pending") or None, now=now, pid_alive=pid_alive,
+                       monitor_state=status.get("state"))
     if verdict.state == "free" or verdict.waivable:
         loops = loops_verdict(status)
         if loops is not None:
