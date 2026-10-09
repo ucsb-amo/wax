@@ -235,6 +235,30 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     loop.join(5)
 
 
+def test_a_monitor_restart_waits_while_the_queue_has_work(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    restarts = []
+    server.reset_signal.connect(lambda: restarts.append("reset"))
+    forwarded = []
+    server.message_received.connect(forwarded.append)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.on_message_received("reset")                 # eligible: about to launch
+    server.watch_tick()
+    server.on_message_received("reset")                 # in the slot
+    server.on_message_received("run complete")
+    QApplication.processEvents()
+    assert restarts == [] and forwarded == []
+    kinds = [e["kind"] for e in server.journal.tail(100)]
+    assert kinds.count("run_queue_monitor_deferred") == 3
+    _run(server, 85600)
+    server.watch_tick()
+    QApplication.processEvents()
+    assert server.monitor_starts == ["the run queue has no job to run"]
+    server.on_message_received("reset")                 # the queue is idle: as before
+    QApplication.processEvents()
+    assert restarts == ["reset"]
+
+
 def test_a_state_reset_is_refused_while_a_queue_job_runs(server, expts):
     server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
     server.watch_tick()

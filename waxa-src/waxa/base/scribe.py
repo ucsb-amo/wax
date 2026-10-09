@@ -290,6 +290,15 @@ class Scribe():
         if getattr(self, '_monitor_restart_sent', False) or not hasattr(self, 'monitor'):
             return
         self._monitor_restart_sent = True
+        if os.environ.get('WAXX_LAUNCHER') == 'kq':
+            # launched by the monitor server's run queue (waxx run_queue.LAUNCHER;
+            # the same rule as waxx Expt.end_wax): the queue's next job follows,
+            # and the server starts the monitor when the queue runs out
+            print(f"[Monitor] run {getattr(self.run_info, 'run_id', '?')} aborted; launched "
+                  f"by the run queue (job {os.environ.get('WAXX_QUEUE_JOB') or '?'}): the "
+                  "monitor is not restarted here -- the monitor server starts it when the "
+                  "queue runs out.")
+            return
         self.monitor.signal_end()
 
     def _abort_shot(self, what="RTIOUnderflow") -> bool:

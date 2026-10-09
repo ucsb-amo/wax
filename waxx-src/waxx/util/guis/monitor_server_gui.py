@@ -382,6 +382,17 @@ class MonitorUDPServer(UdpServer):
         if m in ('status', 'status_json'):
             # Polled continuously; never logged, never forwarded.
             return
+        if m == 'reset' or "run complete" in m:
+            # a monitor (re)start takes the core: while the run queue has a job
+            # in its slot or one about to launch it is deferred -- the queue
+            # asks for the monitor itself when it runs out
+            busy = self.run_queue.monitor_busy()
+            if busy:
+                self.run_queue.defer_monitor(
+                    f"a client's {'monitor (re)start' if m == 'reset' else 'run complete'}",
+                    busy)
+                self.journal.record("message", text=m, deferred=busy)
+                return
         if m == 'reset':
             loop = active_loop(self.loops.values())
             if loop is not None:

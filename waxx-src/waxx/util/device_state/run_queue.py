@@ -612,8 +612,30 @@ class RunQueue:
 
     # -- state ----------------------------------------------------------------------
 
+    def monitor_busy(self) -> str:
+        """Why a monitor (re)start must wait ("" when it need not): a job is
+        in the slot, or one is eligible to launch now."""
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if cur is not None:
+                return f"the run queue's {cur.name} is {cur.state}"
+            order = self._order(self._clock())
+        if order:
+            return f"the run queue's {order[0].name} is about to launch"
+        return ""
+
+    def defer_monitor(self, what: str, why: str) -> None:
+        """A monitor (re)start asked for while the queue has work: not done
+        now; the queue asks for the monitor when it runs out."""
+        with self._lock:
+            self._owe_monitor = True
+        log.warning("Run queue: %s deferred -- %s; the monitor starts when the queue runs out.",
+                    what, why)
+        self._record("run_queue_monitor_deferred", what=what, why=why)
+        self.flush_journal()
+
     def current_job(self) -> dict | None:
-        """The job in the slot (running / ending), or None."""
+        """The job in the slot (launching / running / ending), or None."""
         with self._lock:
             cur = self._jobs.get(self._current) if self._current is not None else None
             return cur.to_dict() if cur is not None else None
