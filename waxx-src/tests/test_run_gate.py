@@ -270,6 +270,18 @@ def test_an_announced_run_liveod_has_not_seen_end_is_still_live(poll):
     assert st.detail["fence"]["ended"] is False
 
 
+@pytest.mark.parametrize("fid", [0, None, "85600", True, -3])
+def test_only_a_real_run_ids_fence_can_be_told_ended(fid):
+    # final review nit: every save_data=False run is run id 0, so liveOD's run id
+    # 0 (an earlier no-save run) says nothing about a fence of 0 -- a run that
+    # never sent INIT_RUN would otherwise read as ended
+    fence = {"run_id": fid, "expt": "nosave", "since": NOW - 20.0}
+    poll = _poll(run_id=0 if fid in (0, None, True, -3) else 85600,
+                 last_outcome={"run_id": 0, "outcome": "saved"})
+    st = classify(poll, fence, now=NOW, pid_alive=_never, monitor_state=2)
+    assert st.state == "live" and st.detail["fence"]["ended"] is False
+
+
 def test_a_fence_without_a_date_counts():
     st = classify(_poll(), {"run_id": 85600, "expt": "rabi"}, now=NOW, pid_alive=_never)
     assert st.state == "live"

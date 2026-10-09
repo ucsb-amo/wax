@@ -354,9 +354,14 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
         # an outcome recorded -- is left over: with the monitor off (the server
         # lapses a fence only while READY), a run killed hard keeps its fence up
         # until a person clears it.
+        # Only a real run id (a positive int) can be told ended: every
+        # save_data=False run is run id 0, so a fence of 0 says nothing about
+        # which run liveOD last had (one that never sent INIT_RUN, while POLL
+        # answers run id 0 for an earlier no-save run, would read as ended).
         last = poll.get("last_outcome") or {}
-        ended = fid is not None and ((not in_progress and rid == fid)
-                                     or last.get("run_id") == fid)
+        real_id = isinstance(fid, int) and not isinstance(fid, bool) and fid > 0
+        ended = real_id and ((not in_progress and rid == fid)
+                             or last.get("run_id") == fid)
         fence_info["ended"] = ended
         if ended:
             if st.state == "free":

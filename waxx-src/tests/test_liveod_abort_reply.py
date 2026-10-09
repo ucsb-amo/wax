@@ -488,7 +488,9 @@ def test_a_reset_during_a_save_shows_on_the_status_strip_every_press(app):
         assert win.status_strip.run_label.text() == text
         win.status_strip.clear_notice()                 # as its timer does
     assert win.live_od_server.calls == [("ignored_during_save",)] * 2
-    assert win.messages == [text + "."] * 2
+    # the server logs it once per press; the window adds no second log line
+    # when it has a strip (final review nit)
+    assert win.messages == []
     assert win.status_strip.run_label.text().startswith("Next run")
 
 

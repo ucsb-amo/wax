@@ -1410,12 +1410,15 @@ class LiveODWindow(QWidget):
             # Reset (one WARNING), and nothing here is interrupted -- the camera
             # thread and data handler may still be finishing the file's write.
             if srv.reset_ignored_during_save():
-                # visible on every press, not only in the log
+                # visible on every press, not only in the log: the status
+                # strip's notice (the server has logged the same text once
+                # already -- no second log line here, unless there is no strip)
                 text = srv.reset_ignored_text()
                 strip = getattr(self, 'status_strip', None)
                 if strip is not None:
                     strip.show_notice(text)
-                self.msg(text + ".")
+                else:
+                    self.msg(text + ".")
                 return
             if srv.exited_run_pending():
                 srv.close_exited_run_now("Reset pressed")
