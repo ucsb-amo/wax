@@ -70,6 +70,7 @@ Machine-agnostic: nothing here knows the K machine.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -272,25 +273,35 @@ def _report_end(ctx: _Ctx, job: dict) -> None:
 _HHMM = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
 
 
+#: A bare number below this is not taken as epoch seconds (1e9 s is 2001-09-09):
+#: ``--at 1430`` is a typo for 14:30, not 1970.
+MIN_EPOCH = 1e9
+
+
 def parse_at(text: str, now: float | None = None) -> float:
     """``HH:MM[:SS]`` (local; the next such time, so a time already past
-    today means tomorrow) or epoch seconds -> epoch seconds."""
+    today means tomorrow -- by the calendar, so a DST change is no hour off)
+    or epoch seconds (at least :data:`MIN_EPOCH`) -> epoch seconds."""
     now = time.time() if now is None else float(now)
     m = _HHMM.match(text.strip())
     if m:
         h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
         if not (0 <= h < 24 and 0 <= mi < 60 and 0 <= s < 60):
             raise ValueError(f"not a time of day: {text}")
-        lt = time.localtime(now)
-        due = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, s, 0, 0, -1))
+        day = datetime.datetime.fromtimestamp(now).date()
+        at = datetime.time(h, mi, s)
+        due = datetime.datetime.combine(day, at).timestamp()
         if due <= now:
-            lt = time.localtime(now + 86400)
-            due = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, s, 0, 0, -1))
+            due = datetime.datetime.combine(day + datetime.timedelta(days=1), at).timestamp()
         return due
     try:
-        return float(text)
+        value = float(text)
     except ValueError:
         raise ValueError(f"--at takes HH:MM or epoch seconds, not {text!r}") from None
+    if value < MIN_EPOCH:
+        raise ValueError(f"--at {text}: a bare number must be epoch seconds (at least "
+                         f"{MIN_EPOCH:.0f}); for a time of day write HH:MM")
+    return value
 
 
 # -- the parser -------------------------------------------------------------------------

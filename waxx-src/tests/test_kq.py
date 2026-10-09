@@ -150,9 +150,24 @@ def test_parse_at():
     assert kqmod.parse_at("15:30", now) == now + 5400
     assert kqmod.parse_at("13:00", now) == pytest.approx(now + 23 * 3600, abs=3600)
     assert kqmod.parse_at("1800000000") == 1.8e9
-    for bad in ("25:00", "noon"):
+    for bad in ("25:00", "noon", "1430", "86400"):
         with pytest.raises(ValueError):
             kqmod.parse_at(bad, now)
+
+
+def test_parse_at_tomorrow_is_a_calendar_day_across_a_dst_change():
+    import datetime as dt
+    # the night before the US spring-forward (2027-03-14): now + 86400 s
+    # would land on the 15th; the calendar says the 14th
+    now = dt.datetime(2027, 3, 13, 23, 30).timestamp()
+    assert kqmod.parse_at("23:00", now) == dt.datetime(2027, 3, 14, 23, 0).timestamp()
+    now = dt.datetime(2026, 10, 31, 23, 30).timestamp()          # before fall-back
+    assert kqmod.parse_at("23:00", now) == dt.datetime(2026, 11, 1, 23, 0).timestamp()
+
+
+def test_a_bare_small_number_for_at_is_refused(server, expts):
+    r = kq(server, "submit", str(expts / "rabi.py"), "--at", "1430")
+    assert r.code == 2 and "write HH:MM" in r.err and sent(server, "submit") == []
 
 
 def test_a_bad_at_is_a_usage_error(server, expts):
