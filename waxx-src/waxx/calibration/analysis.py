@@ -2,7 +2,9 @@
 
 An analysis is a function ``calibrate(ad, key, **opts) -> CalResult``. It only
 reads ``ad``; the one file it may write is its figure, at ``opts["figure_path"]``
-when given (the framework passes the ledger's ``<key>/<run_id>.png``). It reports
+when given (the framework passes the ledger's ``<key>/<run_id>.png``), written
+first to ``figure_tmp_path(figure_path)`` (a ``.tmp`` subfolder) and then
+os.replace'd; stale temp figures there are swept at the next emit. It reports
 how many shots it used (``n_used``) and every shot it left out
 (``excluded = {"count", "reason"}``), and takes its uncertainty from the fit (no
 uncertainty -> ``unc=None``, never a made-up one). On failure it returns a
@@ -17,14 +19,20 @@ package of the same name if it is callable.
 from __future__ import annotations
 
 import importlib
+import itertools
 import math
+import os
 import pkgutil
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from waxx.calibration.record import CalResult
+
+
+_TMP_COUNTER = itertools.count()
 
 
 class AnalysisNotFound(LookupError):
@@ -88,6 +96,42 @@ def list_analyses(registry_modules: Sequence[str]) -> list:
 def failed_result(key: str, reason: str, *, analysis: str = "", deferred: bool = False) -> CalResult:
     return CalResult(key=key, value=math.nan, unc=None, method=analysis, analysis=analysis,
                      fit={"ok": False, "reason": reason}, deferred=deferred)
+
+
+FIGURE_TMP_DIR = ".tmp"                 # beside the figure: <ledger>/<key>/.tmp/
+FIGURE_TMP_MAX_AGE_S = 3600.0          # older temp figures are swept at the next emit
+
+
+def figure_tmp_path(figure_path):
+    """Where an analysis writes its figure first (then os.replace onto
+    ``figure_path``): ``<dir>/.tmp/<name>.<pid>.<n>.tmp<suffix>``. A thread
+    killed at exit can leave one behind there, never next to the figures."""
+    fp = Path(figure_path)
+    d = fp.parent / FIGURE_TMP_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{fp.stem}.{os.getpid()}.{next(_TMP_COUNTER)}.tmp{fp.suffix}"
+
+
+def sweep_stale_figure_tmp(figure_dir, max_age_s: float = FIGURE_TMP_MAX_AGE_S) -> int:
+    """Remove temp figures older than ``max_age_s`` from ``<figure_dir>/.tmp``
+    (left by analyses killed mid-save). Only *.tmp.* files there are touched.
+    Returns how many were removed; never raises."""
+    n = 0
+    try:
+        d = Path(figure_dir) / FIGURE_TMP_DIR
+        if not d.is_dir():
+            return 0
+        now = time.time()
+        for f in d.glob("*.tmp.*"):
+            try:
+                if f.is_file() and now - f.stat().st_mtime > max_age_s:
+                    f.unlink()
+                    n += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return n
 
 
 def call_with_budget(fn: Callable, budget_s: float, name: str = "calibration"):

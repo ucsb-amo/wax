@@ -26,7 +26,7 @@ import numpy as np
 
 from waxx.calibration import writeback
 from waxx.calibration.analysis import (call_with_budget, failed_result, needs_images, resolve,
-                                       run_analysis)
+                                       run_analysis, sweep_stale_figure_tmp)
 from waxx.calibration.policy import policy_for
 from waxx.calibration.record import CalResult, _flag, _jsonable, evaluate
 
@@ -290,6 +290,7 @@ def _one(expt, config, d: Declaration, func, ad, rid, out, date):
         try:
             fig = config.get_ledger().figure_path(d.key, rid)
             fig.parent.mkdir(parents=True, exist_ok=True)
+            sweep_stale_figure_tmp(fig.parent)
         except Exception as e:
             _say(f"[cal] WARNING: no figure for {d.key} ({e!r})", out)
             fig = None

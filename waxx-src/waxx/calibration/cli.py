@@ -35,7 +35,8 @@ import sys
 from typing import Optional
 
 from waxx.calibration import writeback
-from waxx.calibration.analysis import list_analyses, needs_images, resolve, run_analysis
+from waxx.calibration.analysis import (list_analyses, needs_images, resolve, run_analysis,
+                                       sweep_stale_figure_tmp)
 from waxx.calibration.config import ENV_VAR, load_config
 from waxx.calibration.emit import _fmt_value_unc, cal_line, offline_run_flags, process_result
 from waxx.calibration.policy import policy_for
@@ -164,6 +165,7 @@ def cmd_emit(cfg, args, out):
     led = cfg.get_ledger()
     fig = led.figure_path(args.key, args.run)
     fig.parent.mkdir(parents=True, exist_ok=True)
+    sweep_stale_figure_tmp(fig.parent)
     res = run_analysis(func, ad, args.key, opts, budget_s=args.budget, figure_path=fig,
                        name=args.analysis)
     res.run_id = args.run

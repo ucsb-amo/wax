@@ -360,3 +360,25 @@ def test_allow_no_unc_does_not_clear_a_stored_no_unc_flag(env, monkeypatch, caps
     with pytest.raises(SystemExit):
         cli.main(["apply", "--help"])
     assert "does NOT clear a no_unc flag" in " ".join(capsys.readouterr().out.split())
+
+
+# ---- N4: temp figures live in .tmp and stale ones are swept ---------------------------------
+
+def test_figure_tmp_path_and_sweep(tmp_path):
+    import os
+    import time
+    from waxx.calibration.analysis import figure_tmp_path, sweep_stale_figure_tmp
+    fig = tmp_path / "t_pi" / "85600.png"
+    fig.parent.mkdir()
+    a, b = figure_tmp_path(fig), figure_tmp_path(fig)
+    assert a != b and a.parent == fig.parent / ".tmp" and a.name.endswith(".tmp.png")
+    old, new, other = a, b, fig.parent / ".tmp" / "keep_me.txt"
+    for f in (old, new, other):
+        f.write_bytes(b"x")
+    t = time.time() - 7200
+    os.utime(old, (t, t))
+    os.utime(other, (t, t))
+    fig.write_bytes(b"png")
+    assert sweep_stale_figure_tmp(fig.parent) == 1
+    assert not old.exists() and new.exists() and other.exists() and fig.exists()
+    assert sweep_stale_figure_tmp(tmp_path / "nowhere") == 0
