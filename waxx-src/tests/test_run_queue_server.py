@@ -288,7 +288,10 @@ def test_a_monitor_restart_waits_while_the_queue_has_work(server, expts, qapp):
     forwarded = []
     server.message_received.connect(forwarded.append)
     server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
-    server.on_message_received("reset")                 # eligible: about to launch
+    server.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    server.watch_tick()                                 # waits for someone's live run
+    server.on_message_received("reset")                 # eligible, gate live: deferred
+    server.live.end_run(555)
     server.watch_tick()
     server.on_message_received("reset")                 # in the slot
     server.on_message_received("run complete")

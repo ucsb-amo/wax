@@ -1452,3 +1452,18 @@ def test_another_queues_run_with_the_same_job_id_is_never_taken_for_this_one(q, 
     q.tick()
     assert job(q, a)["state"] == "running" and job(q, a)["run_id"] == 101
     gate.set()
+
+
+# --- a blocked gate never defers the monitor (review NEW-4) ---------------------------------------
+
+def test_a_blocked_gate_never_defers_a_monitor_restart(q, expts):
+    a = submit(q, expts)
+    q.live.down = True                                   # liveOD unreachable: blocked
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q._gate_kind == "blocked"
+    assert q.monitor_busy() == ""                        # the monitor may start
+    assert q.eligible_or_running()                       # (a loop Start still waits)
+    q.live.down = False
+    q.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    q.tick()                                             # someone's live run: legitimate
+    assert q._gate_kind == "live" and "about to launch" in q.monitor_busy()

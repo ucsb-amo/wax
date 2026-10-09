@@ -734,18 +734,30 @@ class RunQueue:
         """"" unless a job is in the slot (launching, running, ending) or one
         is eligible to launch now; else which.  Queued jobs that are due
         later, held, paused or waiting on another job do not count: they
-        leave a loop's Start and a monitor restart alone."""
-        return self.monitor_busy()
-
-    def monitor_busy(self) -> str:
-        """Why a monitor (re)start must wait ("" when it need not): a job is
-        in the slot, or one is eligible to launch now."""
+        leave a loop's Start alone."""
         with self._lock:
             cur = self._jobs.get(self._current) if self._current is not None else None
             if cur is not None:
                 return f"the run queue's {cur.name} is {cur.state}"
             order = self._order(self._clock())
         if order:
+            return f"the run queue's {order[0].name} is about to launch"
+        return ""
+
+    def monitor_busy(self) -> str:
+        """Why a monitor (re)start must wait ("" when it need not): a job is
+        in the slot, or one is eligible AND the queue's last gate found the
+        machine free or legitimately in use (it launches as soon as that run
+        ends).  A blocked gate (liveOD unreachable, a wedged run, the server
+        busy...) never defers it: the hardware must not be left without the
+        monitor while the queue cannot launch anyway."""
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if cur is not None:
+                return f"the run queue's {cur.name} is {cur.state}"
+            order = self._order(self._clock())
+            kind = self._gate_kind
+        if order and kind in ("free", "live"):
             return f"the run queue's {order[0].name} is about to launch"
         return ""
 
