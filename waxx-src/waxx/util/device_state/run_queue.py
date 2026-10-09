@@ -557,7 +557,7 @@ class RunQueue:
         "after", "repeat", "chain", "stop_on_failure", "write_back",
         "allow_drift", "by"}`` -> ``{"status": "ok", "jobs": [...], "ids": [...]}``."""
         try:
-            jobs = self._new_jobs(obj)
+            jobs, clamped = self._new_jobs(obj)
         except QueueError as exc:
             self._record("run_queue_refused", what="submit", msg=str(exc),
                          path=str(obj.get("path") or ""), by=str(obj.get("by") or ""))
@@ -578,7 +578,7 @@ class RunQueue:
         self._notify()
         # TODO(kq client): `ar <file>` / `kq submit` attach here, then follow the
         # job by `describe` and tail its log_path (phase 1, client part).
-        return {"status": "ok", "ids": [j.id for j in jobs],
+        return {"status": "ok", "ids": [j.id for j in jobs], "clamped": clamped,
                 "jobs": [j.to_dict() for j in jobs]}
 
     def _new_jobs(self, obj: Mapping) -> list[Job]:
@@ -657,7 +657,7 @@ class RunQueue:
                 chain = f"repeat-{first}"
             stop = obj.get("stop_on_failure")
             stop = bool(chain) if stop is None else bool(stop)
-            ranks = self._place(repeat, owner, priority, obj)
+            ranks, clamped = self._place(repeat, owner, priority, obj)
             now = self._clock()
             jobs = []
             for i in range(repeat):
@@ -672,7 +672,7 @@ class RunQueue:
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
-        return jobs
+        return jobs, clamped
 
     # -- the order ---------------------------------------------------------------------
 
@@ -682,8 +682,22 @@ class RunQueue:
                        if j.state == "queued" and j is not without),
                       key=lambda j: (j.rank, j.id))
 
-    def _insert_index(self, queued: list[Job], owner: str, priority: int,
-                      obj: Mapping) -> int:
+    def _insert_index(self, queued: list[Job], owner: str, priority: int, obj: Mapping,
+                      asker: str | None = None) -> tuple[int, bool]:
+        """``(index, clamped)``: :meth:`_requested_index`, except that an agent
+        (``asker``; the job's ``owner`` when not given) never places a job
+        ahead of a queued person job -- the index is moved to just after the
+        last one, and ``clamped`` says so.  A person is not restricted."""
+        index = self._requested_index(queued, owner, priority, obj)
+        if (asker or owner) != "agent":
+            return index, False
+        floor = max((i + 1 for i, j in enumerate(queued) if j.owner == "person"), default=0)
+        if index < floor:
+            return floor, True
+        return index, False
+
+    def _requested_index(self, queued: list[Job], owner: str, priority: int,
+                         obj: Mapping) -> int:
         """Where a job goes among ``queued`` (rank order): the position the
         request names -- ``before_id`` / ``after_id`` (a queued job),
         ``at_index`` / ``to_index`` (0-based, clamped), ``at_end`` -- or, by
@@ -746,9 +760,11 @@ class RunQueue:
         step = (hi - lo) / (n + 1)
         return [lo + step * (k + 1) for k in range(n)]
 
-    def _place(self, n: int, owner: str, priority: int, obj: Mapping) -> list[float]:
+    def _place(self, n: int, owner: str, priority: int,
+               obj: Mapping) -> tuple[list[float], bool]:
         queued = self._queued_in_order()
-        return self._ranks_at(queued, self._insert_index(queued, owner, priority, obj), n)
+        index, clamped = self._insert_index(queued, owner, priority, obj)
+        return self._ranks_at(queued, index, n), clamped
 
     def _positions(self) -> dict[int, int]:
         """Job id -> 0-based position among the queued jobs (rank order)."""
@@ -983,7 +999,8 @@ class RunQueue:
                     raise QueueError(f"{job.name} cannot be placed next to itself")
                 before = self._positions().get(job.id)
                 others = self._queued_in_order(without=job)
-                index = self._insert_index(others, job.owner, job.priority, obj)
+                index, clamped = self._insert_index(others, job.owner, job.priority, obj,
+                                                    asker=as_owner)
                 old_rank = job.rank
                 job.rank = self._ranks_at(others, index, 1)[0]
                 after = self._positions().get(job.id)
@@ -994,7 +1011,8 @@ class RunQueue:
                      to_position=after, from_rank=old_rank, to_rank=job.rank)
         self._save()
         self._notify()
-        return {"status": "ok", "job": dict(job.to_dict(), position=after), "position": after}
+        return {"status": "ok", "job": dict(job.to_dict(), position=after), "position": after,
+                "clamped": clamped}
 
     def _find(self, obj: Mapping) -> Job:
         try:
