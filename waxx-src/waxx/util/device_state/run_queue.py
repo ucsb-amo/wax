@@ -156,6 +156,8 @@ KEEP_ENDED = 500
 MAX_REPEAT = 1000
 #: Lines of a job's output kept in memory for its judging and ``describe``.
 TAIL_LINES = 25
+#: After a launch whose "launching" state could not be saved, launches wait this long.
+SAVE_RETRY_S = 30.0
 #: A launch taking longer than this is logged (once) while it is waited for.
 SPAWN_WARN_S = 60.0
 #: A job left "launching" with no process to follow (the server stopped while
@@ -382,6 +384,10 @@ class RunQueue:
         self._saved_seq = 0
         #: an unreadable queue.json that could not be moved aside is never overwritten
         self._no_save = False
+        #: the last queue.json write error; launches wait until this time after
+        #: a launch whose "launching" state could not be saved
+        self._save_error = ""
+        self._launch_blocked_until = 0.0
         #: records waiting to be copied to the ops journal (flush_journal)
         self._mirror: deque = deque()
         self._mirror_lock = threading.Lock()
@@ -1044,6 +1050,10 @@ class RunQueue:
         liveOD unreachable or unknown, the server busy, a loop that does not
         stop): only "blocked" runs the alarm's clock."""
         self._gate_kind = "blocked"
+        if self._clock() < self._launch_blocked_until:
+            return ("queue.json could not be saved ("
+                    + (self._save_error or "it is not to be overwritten")
+                    + "): launches wait until it can be")
         busy = self._server_busy() if self._server_busy is not None else ""
         if busy:
             return busy
@@ -1134,7 +1144,26 @@ class RunQueue:
             self._save()
             self._notify()
             return False
-        self._save()                                   # "launching" is on disk first
+        if not self._save():                           # "launching" is on disk first
+            # without it on disk a server restart could launch the job a second
+            # time: not launched; back in the queue, launches wait a while
+            with self._lock:
+                if job.state == "launching":
+                    job.state = "queued"
+                    job.reason = ("not launched: queue.json could not be saved ("
+                                  + (self._save_error or "it is not to be overwritten")
+                                  + ")")
+                    job.launched_at = None
+                    job.log_path = None
+                    self._current = None
+                    self._procs.pop(job.id, None)
+                self._launch_blocked_until = self._clock() + SAVE_RETRY_S
+            log.error("Run queue: %s not launched: its launch could not be saved first (%s); "
+                      "launches wait %.0f s.", job.name,
+                      self._save_error or "queue.json is not to be overwritten", SAVE_RETRY_S)
+            self._record("run_queue_launch_refused", job=job.id, reason=job.reason)
+            self._notify()
+            return True
         self._record("run_queue_launching", job=job.id, command=command, log_path=log_path,
                      owner=job.owner, drift=sha != job.sha256)
         # unbuffered: output reaches the log as printed; UTF-8: the log is read
@@ -1736,14 +1765,17 @@ class RunQueue:
 
     # -- persistence -----------------------------------------------------------------------
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         """Write queue.json.  Two threads may save at once (a request and the
         tick): each snapshot gets a sequence number under the queue's lock, and
         a snapshot older than the one last written is not written -- the file
         never goes back to an earlier state.  Deadlock-free whatever lock the
-        caller holds (the save lock is never held while taking the queue's)."""
+        caller holds (the save lock is never held while taking the queue's).
+        True when this state is on disk (written now, or a newer one already
+        is); False when nothing could be written (no folder, the file is not
+        to be overwritten, or the write failed)."""
         if not self.enabled or self._no_save:
-            return
+            return False
         with self._lock:
             self._save_seq += 1
             seq = self._save_seq
@@ -1758,15 +1790,18 @@ class RunQueue:
                     "own_abort_ids": sorted(self._own_abort_ids)[-200:], "seq": seq}
         with self._save_lock:
             if seq <= self._saved_seq:
-                return                    # a newer snapshot is already on disk
+                return True               # a newer snapshot is already on disk
             try:
                 from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
                 os.makedirs(self.directory, exist_ok=True)
                 atomic_write(self._path("queue.json"), data)
                 self._saved_seq = seq
+                return True
             except Exception as exc:                  # noqa: BLE001
                 log.error("Run queue: could not store the queue in %s (%s).",
                           self._path("queue.json"), exc)
+                self._save_error = str(exc)
+                return False
 
     def _load_failed(self, exc) -> None:
         """queue.json could not be read: fail closed.  The file is moved aside

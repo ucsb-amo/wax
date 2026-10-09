@@ -1467,3 +1467,31 @@ def test_a_blocked_gate_never_defers_a_monitor_restart(q, expts):
     q.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
     q.tick()                                             # someone's live run: legitimate
     assert q._gate_kind == "live" and "about to launch" in q.monitor_busy()
+
+
+# --- no launch without its "launching" state on disk (review NEW-5) --------------------------------
+
+def test_a_launch_that_cannot_be_saved_first_is_refused(q, expts, monkeypatch):
+    a = submit(q, expts)
+    real = rq.os.makedirs
+
+    def full_disk(path, exist_ok=False):
+        raise OSError("disk full")
+    monkeypatch.setattr(rq.os, "makedirs", full_disk)        # every queue write fails
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "queued" and "could not be saved" in j["reason"]
+    assert q.spawner.calls == []
+    monkeypatch.setattr(rq.os, "makedirs", real)
+    q.tick()
+    assert q.spawner.calls == [] and "could not be saved" in q.info()["waiting"]
+    assert "run_queue_launch_refused" in q.journal.kinds
+    q.clock.t += rq.SAVE_RETRY_S + 1
+    q.tick()
+    assert job(q, a)["state"] == "running" and len(q.spawner.calls) == 1
+
+
+def test_save_says_whether_it_wrote(q):
+    assert q._save() is True
+    q._no_save = True
+    assert q._save() is False
