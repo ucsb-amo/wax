@@ -261,6 +261,25 @@ def test_assess_combines_poll_and_fence():
     assert fenced.state == "live"
 
 
+@pytest.mark.parametrize("loop_state, busy", [("running", True), ("stopping", True),
+                                               ("stopped", False), ("latched", False),
+                                               ("idle", False)])
+def test_an_active_run_loop_is_busy(loop_state, busy):
+    # review S5: an agent must not launch between the TOF loop's runs
+    status = {"state": 0, "run_pending": None,
+              "run_loops": {"auto_tof": {"title": "BEC TOF loop", "state": loop_state}}}
+    st = assess(FakeLiveOD(_poll()), FakeMonitor(status), now=NOW, pid_alive=_never)
+    assert (st.state == "live" and not st.waivable) is busy
+    if busy:
+        assert "BEC TOF loop active" in st.reason and "stop it first" in st.reason
+    assert run_gate.active_loops(status) == (["BEC TOF loop"] if busy else [])
+
+
+def test_the_active_loop_states_are_the_run_loops():
+    from waxx.util.device_state.run_loop import ACTIVE
+    assert tuple(run_gate.LOOP_ACTIVE_STATES) == tuple(ACTIVE)
+
+
 def test_assess_failures_are_unknown():
     st = assess(FakeLiveOD(error=TimeoutError("no reply")), FakeMonitor({}), now=NOW)
     assert st.state == "unknown" and "no reply" in st.reason

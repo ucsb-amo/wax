@@ -371,35 +371,72 @@ def fetch_poll(live_od_client=None, timeout: float = 5.0) -> dict:
     return reply
 
 
-def fetch_fence(monitor_client=None, timeout: float = 5.0) -> dict | None:
-    """The monitor server's run fence (``run_pending`` of ``status_json``), or
-    None when no run is announced.  Raises when the server does not answer."""
+def fetch_monitor_status(monitor_client=None, timeout: float = 5.0) -> dict:
+    """The monitor server's ``status_json`` (its run fence ``run_pending``, its
+    ``state``, its ``run_loops``...).  Raises when the server does not answer."""
     if monitor_client is None:
         from waxx.util.comms_server.comm_client import MonitorClient  # noqa: PLC0415
         monitor_client = MonitorClient(discovery_timeout=timeout)
     status = monitor_client.get_status()
     if not isinstance(status, dict):
         raise RuntimeError("the monitor server did not answer status_json")
-    return status.get("run_pending") or None
+    return status
+
+
+def fetch_fence(monitor_client=None, timeout: float = 5.0) -> dict | None:
+    """The monitor server's run fence (``run_pending`` of ``status_json``), or
+    None when no run is announced.  Raises when the server does not answer."""
+    return fetch_monitor_status(monitor_client, timeout).get("run_pending") or None
+
+
+#: A run loop in these states (``RunLoop`` "running" / "stopping": run_loop.ACTIVE)
+#: launches runs of its own.
+LOOP_ACTIVE_STATES = ("running", "stopping")
+
+
+def active_loops(status: dict | None) -> list[str]:
+    """The monitor server's run loops (e.g. the TOF loop) that are active, by
+    title, from its ``status_json``: another launcher must not start a run
+    between their runs."""
+    loops = (status or {}).get("run_loops") or {}
+    return [str(info.get("title") or key) for key, info in loops.items()
+            if isinstance(info, dict) and info.get("state") in LOOP_ACTIVE_STATES]
+
+
+def loops_verdict(status: dict | None) -> GateState | None:
+    """``live`` (not waivable) while a run loop of the monitor server is active;
+    None otherwise."""
+    active = active_loops(status)
+    if not active:
+        return None
+    return GateState("live", None,
+                     f"{', '.join(active)} active on the monitor server -- stop it first",
+                     detail={"run_loops": active})
 
 
 def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
            now: float | None = None, pid_alive: Callable[[int], bool] | None = None
            ) -> GateState:
-    """Fetch POLL and the fence and :func:`classify` them.  Either one failing
-    gives ``unknown`` (counted as busy)."""
+    """Fetch POLL and the monitor's status and :func:`classify` them; an active
+    run loop of the monitor server is busy too.  Either fetch failing gives
+    ``unknown`` (counted as busy)."""
     try:
         poll = fetch_poll(live_od_client, timeout)
     except Exception as exc:                      # noqa: BLE001
         return GateState("unknown", None, f"liveOD did not answer POLL ({exc}) -- cannot "
                          "confirm the machine is free", detail={"error": str(exc)})
     try:
-        fence = fetch_fence(monitor_client, timeout)
+        status = fetch_monitor_status(monitor_client, timeout)
     except Exception as exc:                      # noqa: BLE001
         return GateState("unknown", poll.get("run_id"),
                          f"the monitor server did not answer ({exc}) -- cannot read its run "
                          "fence", detail={"error": str(exc), "poll_run_id": poll.get("run_id")})
-    return classify(poll, fence, now=now, pid_alive=pid_alive)
+    verdict = classify(poll, status.get("run_pending") or None, now=now, pid_alive=pid_alive)
+    if verdict.state == "free" or verdict.waivable:
+        loops = loops_verdict(status)
+        if loops is not None:
+            return loops
+    return verdict
 
 
 # -- telling liveOD a run's process has exited ------------------------------------------
