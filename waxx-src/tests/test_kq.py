@@ -135,6 +135,8 @@ def test_experiment_arguments_after_the_file_as_in_artiq_run(server, expts):
     assert r.code == 0, r.err
     assert sent(server, "submit")[-1]["argv"] == ["n=3", "m=x", "-c", "Rabi"]
     assert kq(server, "submit", str(expts / "rabi.py"), "-c", "Rabi").code == 2
+    r = kq(server, "submit", str(expts / "rabi.py"), "-1", "x=-2")    # as the docstring says
+    assert r.code == 0 and sent(server, "submit")[-1]["argv"] == ["-1", "x=-2"]
     r = kq(server, "submit", str(expts / "rabi.py"), "a=1", "--label", "x", "b=2")
     assert r.code == 0 and sent(server, "submit")[-1]["argv"] == ["a=1", "b=2"]
     assert sent(server, "submit")[-1]["label"] == "x"

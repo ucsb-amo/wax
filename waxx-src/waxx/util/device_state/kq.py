@@ -31,7 +31,8 @@ Commands::
 Words after the file (``key=value``, as artiq_run takes them, before or after
 kq's options) and everything after ``--`` are passed to the experiment:
 ``kq run x.py n=3 --label scan m=2 -- -c MyExpt``.  Words starting with ``-``
-must go after ``--``.  The queue refuses an argument (or a path) holding any
+must go after ``--``, except negative numbers (``-1``), which are taken as
+experiment arguments where they stand.  The queue refuses an argument (or a path) holding any
 of ``& | < > ^ % " !`` -- e.g. ``x=50%``, which artiq_run itself accepts --
 and one ending in a backslash: such a run goes through artiq_run directly.
 
