@@ -173,8 +173,8 @@ def test_kcal_apply_show_check_revert(env, monkeypatch):
 
     code, out = kcal("apply", "t_pi", "--run", "85600", "--note", "by hand")
     assert code == 0, out
-    assert "+ self.t_pi = 6.612e-06 #85600," in out and "by hand" in out
-    assert "self.t_pi = 6.612e-06 #85600" in env.params_file.read_text()
+    assert "+ self.t_pi = 6.6120e-06 #85600," in out and "by hand" in out
+    assert "self.t_pi = 6.6120e-06 #85600" in env.params_file.read_text()
     assert "(kcal revert t_pi undoes it)" in out
 
     code, out = kcal("show", "t_pi")

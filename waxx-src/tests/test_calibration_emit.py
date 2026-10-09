@@ -176,7 +176,7 @@ def test_simulated_end_of_run_emit(lab, capsys):
                         "was 6.6403e-06, -0.43 %)")
     assert lines[1] == (f"[cal] applied: {lab.params_file}:5 (kcal revert t_pi undoes it)")
     assert lines[2] == "[cal]   - self.t_pi = 6.6403e-06 #85412, 2026-10-07"
-    assert lines[3] == f"[cal]   + self.t_pi = 6.612e-06 #85600, {TODAY}"
+    assert lines[3] == f"[cal]   + self.t_pi = 6.6120e-06 #85600, {TODAY}"
     assert len(lines) == 4
     assert lab.params_mod.Params().t_pi == 6.612e-06
     # ledger

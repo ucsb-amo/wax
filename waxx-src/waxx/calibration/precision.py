@@ -6,12 +6,23 @@ The rule (user decision 2026-10-09):
 2. The existing line's LITERAL significant figures are a floor: the rule may only
    add digits, never remove them. Trailing zeros count (``150.0`` = 4,
    ``3.7785e-06`` = 5, ``250.e-6`` = 3); an all-zero literal counts as 1.
-3. Never more digits than Python's shortest round-trip repr of the value (those
-   are all the digits the float has).
+3. The rule never asks for more digits than Python's shortest round-trip repr
+   of the value (those are all the digits the float has). That cap never
+   shrinks the floor: when the repr is shorter than the floor, the written
+   value is padded with zeros up to it (``6.6e-06`` on a ``6.6403e-06`` line is
+   written ``6.6000e-06``; the zeros are exact).
 4. The format follows the existing literal: scientific stays scientific (a
    normalised mantissa ``d.ddd`` stays normalised; any other mantissa, e.g.
    ``250.e-6``, keeps its exponent; the exponent keeps its sign style, zero
-   padding and ``e``/``E``), plain decimal stays plain, and an int stays an int.
+   padding and ``e``/``E``), plain decimal stays plain, and an int stays an int
+   -- EXCEPT where that would need zeros that read as precision (user ruling
+   2026-10-09, option b): a decimal literal whose rounding place is above the
+   units place (12345.6 +/- 300 on ``1500.`` would be ``12350.``) is written in
+   normalised scientific notation at the same significant figures
+   (``1.235e4``), and a kept-exponent literal whose rounding place is above its
+   exponent's last place (``1230.e-6``) is written normalised (``1.23e-3``).
+   Rounding exactly at the units place / the exponent's last place needs no
+   padding and keeps the literal's style.
 5. An int literal takes only an integral value, written exactly (a count has
    nothing to round); a non-integral value for it is refused.
 6. No uncertainty: the full repr when ``allow_no_unc``, else refused.
@@ -166,10 +177,16 @@ def format_value(value, unc, old_line_literal, kind: Optional[str] = None, *,
             p_rule = p_repr                                   # all the digits there are
         else:
             p_rule = Decimal(repr(u)).adjusted() - 1          # 2nd significant digit of unc
-        p = max(min(p_rule, p_floor), p_repr)
+        # the repr caps the rule's extra digits, never the floor
+        p = min(max(p_rule, p_repr), p_floor)
     r = d.quantize(Decimal(1).scaleb(p), rounding=ROUND_HALF_EVEN)
     if kind == "decimal":
+        if p > 0 and r != 0:            # decimal style would pad zeros that read as precision
+            return lit.rebuild(_format_sci(r, p, lit, normalized=True))
         return lit.rebuild(_format_decimal(r, p))
+    if (lit.kind == "sci" and not lit.normalized_mantissa and r != 0
+            and p > lit.exponent):     # the kept exponent would need padded mantissa zeros
+        return lit.rebuild(_format_sci(r, p, lit, normalized=True))
     return lit.rebuild(_format_sci(r, p, lit))
 
 
@@ -190,8 +207,10 @@ def _format_decimal(r: Decimal, p: int) -> str:
     return s
 
 
-def _format_sci(r: Decimal, p: int, lit: Literal) -> str:
-    if lit.kind == "sci" and not lit.normalized_mantissa:
+def _format_sci(r: Decimal, p: int, lit: Literal, normalized: bool = False) -> str:
+    if normalized and r != 0:
+        E = r.adjusted()               # forced d.ddd (no padded zeros)
+    elif lit.kind == "sci" and not lit.normalized_mantissa:
         E = lit.exponent               # e.g. 250.e-6: keep the exponent (it names the unit)
     elif r == 0:
         E = lit.exponent if lit.kind == "sci" else 0

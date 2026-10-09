@@ -50,13 +50,48 @@ def test_rule_and_format(value, unc, old, new):
 def test_raman_frequency_keeps_the_lines_digits():
     """A ~12-figure value with a large stated uncertainty: the rule alone would
     write 41.235e6 (and lose the frequency); the line's 13 figures are a floor,
-    capped by the 12 the float has."""
+    and the float's 12 digits are padded with an exact zero up to it."""
     old = "41.23456789123e6"
     v = 41234570.1234
-    assert format_value(v, 5.0e4, old) == "41.2345701234e6"
+    assert format_value(v, 5.0e4, old) == "41.23457012340e6"
     assert float(format_value(v, 5.0e4, old)) == v
-    # same in plain decimal
-    assert format_value(412345701.2345, 5.0e4, "412345678.91234") == "412345701.2345"
+    # same in plain decimal (14 figures on the line, 13 in the float)
+    assert format_value(412345701.2345, 5.0e4, "412345678.91234") == "412345701.23450"
+
+
+# ---- S11 (user ruling 2026-10-09, option b) ------------------------------------------
+
+@pytest.mark.parametrize("value, unc, old, new", [
+    # decimal literal, rounding place above the units: scientific, same figures
+    (12345.6, 300.0, "1500.", "1.235e4"),
+    (-12345.6, 300.0, "1500.", "-1.235e4"),
+    (1523.7, 100.0, "150.", "1.52e3"),
+    (1523.7, 100.0, "150.0", "1524."),            # 4-figure floor: units place, no padding
+    (12345.6, 300.0, "float(1500.)", "float(1.235e4)"),
+    # decimal literal, rounding exactly at the units place: stays decimal
+    (12345.6, 30.0, "1500.", "12346."),
+    # kept-exponent sci literal, rounding place above its last place: normalised
+    (1.2345e-3, 2.0e-4, "250.e-6", "1.23e-3"),
+    (1.2345e-3, 2.0e-4, "250.e-06", "1.23e-03"),
+    # ...at its last place: no padding, exponent kept
+    (1.2345e-3, 2.0e-5, "250.e-6", "1234.e-6"),
+    (1.2345e-3, 2.0e-6, "250.e-6", "1234.5e-6"),
+    # the repr cap never shrinks the floor: padded to the line's figures
+    (6.6e-06, 1.0e-08, "6.6403e-06", "6.6000e-06"),
+    (6.612e-06, 2.1e-08, "6.6403e-06", "6.6120e-06"),
+    (151.0, 0.4, "150.0", "151.0"),
+    (0.1, 0.0, "0.1000", "0.1000"),
+    (2.5e-4, None, "250.0e-6", "250.0e-6"),
+    # zero is not padded into false precision either way
+    (0.0, 300.0, "1500.", "0."),
+])
+def test_s11_no_padding_that_reads_as_precision(value, unc, old, new):
+    got = format_value(value, unc, old, allow_no_unc=True)
+    assert got == new
+    inner = got.split("(")[-1].rstrip(")")
+    assert float(inner) == float(Decimal(inner))
+    if unc:
+        assert abs(float(inner) - value) <= 0.05 * unc + 1e-15 * abs(value)
 
 
 def test_int_literals_take_integral_values_exactly():
@@ -137,5 +172,12 @@ def test_property_error_bounded_and_digits_capped():
         written = parse_literal(got).sig_figs           # trailing zeros written count
         # never a digit below the repr's last one
         assert len(Decimal(got).normalize().as_tuple().digits) <= repr_digits, (v, u, lit, got)
-        # the line's figures are a floor (unless the repr has fewer)
-        assert written >= min(parse_literal(lit).sig_figs, repr_digits), (v, u, lit, got)
+        # the line's figures are a floor, always (padded with exact zeros if need be)
+        assert written >= parse_literal(lit).sig_figs, (v, u, lit, got)
+        # a decimal result only when the rounding place (computed here on its
+        # own) is at or below the units: never zeros padded left of the point
+        d = Decimal(repr(v))
+        p_rule = max(Decimal(repr(u)).adjusted() - 1, d.normalize().as_tuple().exponent)
+        p = min(p_rule, d.adjusted() - (parse_literal(lit).sig_figs - 1))
+        if parse_literal(got).kind == "decimal":
+            assert p <= 0, (v, u, lit, got)

@@ -135,7 +135,7 @@ def test_apply_comments_the_old_line_and_inserts_the_new(modules):
     assert rep.ok and rep.written, rep.reason
     assert rep.old_line == "        self.t_pi = 6.6403e-06 #85412, 2026-10-07"
     assert rep.commented_line == "        # self.t_pi = 6.6403e-06 #85412, 2026-10-07"
-    assert rep.new_line == "        self.t_pi = 6.612e-06 #85600, 2026-10-09 kcal test"
+    assert rep.new_line == "        self.t_pi = 6.6120e-06 #85600, 2026-10-09 kcal test"
     after = lines(path)
     i = before.index(rep.old_line)
     assert after[:i] == before[:i] and after[i + 2:] == before[i + 1:]
@@ -151,7 +151,7 @@ def test_dry_run_writes_nothing(modules):
     mod, path = modules(BASE)
     raw = path.read_bytes()
     rep = writeback.apply("t_pi", result(), mod.Params, dry_run=True, date="2026-10-09")
-    assert rep.ok and not rep.written and rep.new_line.strip().startswith("self.t_pi = 6.612e-06")
+    assert rep.ok and not rep.written and rep.new_line.strip().startswith("self.t_pi = 6.6120e-06")
     assert path.read_bytes() == raw
 
 
@@ -194,7 +194,7 @@ def test_raman_frequency_line_keeps_its_digits(modules):
     mod, path = modules(BASE)
     rep = writeback.apply("freq", result(key="freq", value=41234570.1234, unc=5.0e4),
                           mod.Params, date="2026-10-09")
-    assert rep.ok and "self.freq = 41.2345701234e6 #85600" in rep.new_line
+    assert rep.ok and "self.freq = 41.23457012340e6 #85600" in rep.new_line
     assert mod.Params().freq == 41234570.1234
 
 
@@ -247,7 +247,7 @@ def test_revert_reactivates_the_previous_value(modules):
     i = ls.index(rep.new_line)
     assert ls[i - 3:i] == ["        # self.t_pi = 6.0e-06 #100, 2026-01-01",
                            "        # self.t_pi = 6.6403e-06 #85412, 2026-10-07",
-                           "        # self.t_pi = 6.612e-06 #85600, 2026-10-09"]
+                           "        # self.t_pi = 6.6120e-06 #85600, 2026-10-09"]
     # nothing commented above: refused, file unchanged
     raw = path.read_bytes()
     rep = writeback.revert("amp", mod.Params)
@@ -278,7 +278,7 @@ def test_an_edit_before_the_lock_is_parsed_not_clobbered(modules, monkeypatch):
     i = ls.index("        # a")
     assert ls[i:i + 2] == ["        # a", "        # b"]
     assert ls[rep.line_no - 2] == "        # self.t_pi = 6.6403e-06 #85412, 2026-10-07"
-    assert ls[rep.line_no - 1] == "        self.t_pi = 6.612e-06 #85600, 2026-10-09"
+    assert ls[rep.line_no - 1] == "        self.t_pi = 6.6120e-06 #85600, 2026-10-09"
 
 
 def test_lines_inserted_between_parse_and_write_refuse(modules, monkeypatch):
@@ -322,7 +322,7 @@ def test_history_lines(modules):
     writeback.apply("t_pi", result(), mod.Params, date="2026-10-09")
     t, hist = writeback.history_lines("t_pi", mod.Params)
     assert [k for _, k, _ in hist] == ["commented", "commented", "active"]
-    assert hist[-1][2].strip().startswith("self.t_pi = 6.612e-06")
+    assert hist[-1][2].strip().startswith("self.t_pi = 6.6120e-06")
 
 
 def test_works_on_a_waxx_params_subclass(modules):
