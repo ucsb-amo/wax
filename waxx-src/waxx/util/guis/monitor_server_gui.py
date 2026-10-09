@@ -1449,7 +1449,11 @@ class MonitorUDPServer(UdpServer):
 
 
 class MonitorServerGUI(QWidget):
-    """The monitor server's own window (the Server Dashboard embeds it).
+    """The monitor server's own window, when the server is run as a GUI
+    (launched by hand).  The Server Dashboard does not embed it: it runs the
+    server headless (``monitor_server_headless``) and shows the same three
+    tabs over the network in
+    :class:`~waxx.util.guis.monitor_panel.MonitorServerPanel`.
 
     Three tabs: **Queue** (:class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`),
     **State** (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`)

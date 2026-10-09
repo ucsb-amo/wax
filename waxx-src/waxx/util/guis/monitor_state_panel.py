@@ -1,6 +1,7 @@
 """The monitor server's state at a glance: the "State" tab beside the run
-queue panel (:mod:`waxx.util.guis.run_queue_panel`) in the monitor server's
-own window.
+queue panel (:mod:`waxx.util.guis.run_queue_panel`) in the Server Dashboard's
+monitor panel (:mod:`waxx.util.guis.monitor_panel`, over the network)
+and in the monitor server's own window when it runs as a GUI.
 
 :class:`MonitorStatePanel` is fed like the queue panel -- :meth:`set_state`
 with the server's ``status_json`` dict (None when it does not answer),

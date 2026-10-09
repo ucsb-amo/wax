@@ -1,0 +1,209 @@
+"""The Server Dashboard's monitor panel (waxx.util.guis.monitor_panel): its
+link to the server (lazy discovery, a dropped client rediscovered, writes
+sent once, reads retried), the status poll and broadcasts feeding the Queue,
+State and Monitor tabs, the monitor experiment's button, and cleanup.
+
+Offscreen Qt.  The MonitorClient is a fake answering from a table: no
+discovery, no socket (socket.socket is replaced by one that fails the test),
+no broadcast listener (listener_factory=None, or a fake)."""
+import os
+import socket
+
+import pytest
+from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtWidgets import QApplication
+
+from waxx.util.guis import monitor_panel as mp
+
+STATUS = {"state": 2, "state_name": "NOT_READY", "sub_state": "never_started", "reason": "",
+          "since": 0, "pid": None, "expt_path": "C:/code/monitor.py",
+          "trust": {"trusted": True, "reason": "", "since": 0}, "run_pending": None,
+          "connections": {}, "run_loops": {}, "slm_reinit": None,
+          "person_hold": {"active": False},
+          "run_queue": {"enabled": True, "state": "idle", "text": "no jobs", "current": None,
+                        "next": [], "counts": {"queued": 0}, "alarm": None,
+                        "paused": {"agent": None, "all": None},
+                        "person_hold": {"active": False}, "resume_loop": None}}
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return QApplication.instance() or QApplication([])
+
+
+class _NoSocket:
+    def __init__(self, *a, **k):
+        raise AssertionError("the panel opened a socket")
+
+
+@pytest.fixture(autouse=True)
+def no_sockets(monkeypatch):
+    monkeypatch.setattr(socket, "socket", _NoSocket)
+
+
+class FakeClient:
+    """A MonitorClient's three calls, answered from tables."""
+
+    def __init__(self, n):
+        self.n = n
+        self.requests, self.texts = [], []
+        self.status = dict(STATUS)
+        self.answers = {"list": {"status": "ok", "jobs": [], "next": [],
+                                 "run_queue": STATUS["run_queue"]},
+                        "get_journal": {"status": "ok", "entries": []}}
+        self.silent = False
+
+    def request(self, obj, timeout=5.0, attempts=2):
+        self.requests.append((dict(obj), attempts))
+        if self.silent:
+            return None
+        return self.answers.get(obj.get("action") or obj.get("type"), {"status": "ok"})
+
+    def get_status(self):
+        return None if self.silent else dict(self.status)
+
+    def send_message(self, text, timeout=5.0, attempts=2):
+        self.texts.append((text, attempts))
+        return None if self.silent else "2"
+
+
+class Factory:
+    def __init__(self, fail_first=0):
+        self.made, self.fail_first = [], fail_first
+
+    def __call__(self, discovery_timeout):
+        if self.fail_first:
+            self.fail_first -= 1
+            raise RuntimeError("no monitor server beaconing")
+        client = FakeClient(len(self.made))
+        self.made.append(client)
+        return client
+
+
+class FakeListener(QObject):
+    state_received = pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.started = self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def wait(self, *a):
+        return True
+
+
+@pytest.fixture
+def factory():
+    return Factory()
+
+
+@pytest.fixture
+def panel(qapp, factory):
+    listeners = []
+
+    def make_listener():
+        listeners.append(FakeListener())
+        return listeners[-1]
+    p = mp.MonitorServerPanel(link=mp.MonitorLink(factory), listener_factory=make_listener,
+                              synchronous=True, by="jp@test")
+    p.listeners = listeners
+    p.confirms = []
+    p.confirm = lambda title, text: p.confirms.append((title, text)) or True
+    yield p
+    p.cleanup()
+
+
+def test_no_discovery_until_the_first_request(qapp, factory):
+    p = mp.MonitorServerPanel(link=mp.MonitorLink(factory), listener_factory=None,
+                              synchronous=True)
+    assert factory.made == []                                    # built, nothing discovered
+    assert [p.tabs.tabText(i) for i in range(p.tabs.count())] == ["Queue", "State", "Monitor"]
+    p.cleanup()
+    p.cleanup()                                                  # twice is harmless
+
+
+def test_show_polls_lists_listens_and_feeds_the_tabs(panel, factory, qapp):
+    panel.show()
+    qapp.processEvents()
+    client = factory.made[0]
+    assert panel.listeners and panel.listeners[0].started
+    assert panel.queue_panel.reachable and panel.queue_panel.queue_state() == "idle"
+    assert panel.state_panel.monitor_pill.text() == "NOT READY"
+    assert panel.monitor_tab.button.text() == "NOT READY"
+    sent = [obj for obj, _ in client.requests]
+    assert {"type": "run_queue", "action": "list", "limit": 200} in sent
+    # a broadcast from the listener reaches the tabs
+    panel.listeners[0].state_received.emit({"type": "person_hold",
+                                            "person_hold": {"active": True, "by": "x"}})
+    assert panel.queue_panel.hold_button.text() == "Release hold"
+    panel.listeners[0].state_received.emit({"type": "trust", "trust": {"trusted": False,
+                                                                       "reason": "r"}})
+    assert "UNTRUSTED" in panel.state_panel.trust_banner.text()
+    panel.hide()
+
+
+def test_writes_once_reads_retried(panel, factory):
+    panel.poll_status(force=True)
+    client = factory.made[0]
+    panel.queue_panel.ask_text = lambda *a, **k: "mine"
+    panel.queue_panel.toggle_hold()
+    panel.queue_panel.refresh_list()
+    by_action = {obj.get("action"): attempts for obj, attempts in client.requests}
+    assert by_action["hold"] == 1 and by_action["list"] == 2
+    hold = [obj for obj, _ in client.requests if obj.get("action") == "hold"][-1]
+    assert hold == {"type": "run_queue", "action": "hold", "reason": "mine", "owner": "person",
+                    "by": "jp@test"}
+
+
+def test_a_silent_server_is_rediscovered(panel, factory):
+    panel.poll_status(force=True)
+    first = factory.made[0]
+    first.silent = True
+    panel.poll_status(force=True)                                # no answer: client dropped
+    assert not panel.queue_panel.reachable
+    assert panel.monitor_tab.button.text() == "monitor server not answering"
+    panel.poll_status(force=True)                                # a fresh discovery
+    assert len(factory.made) == 2 and panel.queue_panel.reachable
+
+
+def test_no_server_found_is_an_error_reply_not_a_crash(qapp):
+    link = mp.MonitorLink(Factory(fail_first=1))
+    reply = link.request({"type": "run_queue", "action": "list"})
+    assert reply["status"] == "error" and "no monitor server found" in reply["msg"]
+    assert link.request({"type": "run_queue", "action": "list"})["status"] == "ok"
+
+
+def test_the_monitor_button(panel, factory):
+    panel.poll_status(force=True)
+    client = factory.made[0]
+    assert panel.monitor_tab.clicked()                            # NOT READY: start, no ask
+    assert client.texts == [("reset", 1)] and panel.confirms == []
+    client.status = dict(STATUS, state=0, state_name="READY", sub_state="running")
+    panel.poll_status(force=True)
+    assert panel.monitor_tab.button.text() == "READY"
+    panel.confirm = lambda title, text: False
+    assert not panel.monitor_tab.clicked()                        # READY: asks; declined
+    assert len(client.texts) == 1
+    client.status = dict(STATUS, sub_state="interrupted_by_run")
+    panel.poll_status(force=True)
+    asked = []
+    panel.confirm = lambda title, text: asked.append(text) or True
+    assert panel.monitor_tab.clicked()
+    assert "takes the core back" in asked[-1] and client.texts[-1] == ("reset", 1)
+    client.status = dict(STATUS, state=1, state_name="LOADING", sub_state="starting")
+    panel.poll_status(force=True)
+    assert not panel.monitor_tab.button.isEnabled() and not panel.monitor_tab.clicked()
+
+
+def test_cleanup_stops_the_poll_and_the_listener(panel, qapp):
+    panel.show()
+    qapp.processEvents()
+    listener = panel.listeners[0]
+    panel.cleanup()
+    assert listener.stopped and not panel.timer.isActive()
