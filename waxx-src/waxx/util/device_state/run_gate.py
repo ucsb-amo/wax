@@ -379,16 +379,23 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
 # -- telling liveOD a run's process has exited ------------------------------------------
 
 def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = None,
-                            send: Callable[[int, str], dict] | None = None) -> dict:
+                            send: Callable[[int, str], dict] | None = None,
+                            pid_alive: Callable[[int], bool] | None = None) -> dict:
     """Send liveOD RUN_EXITED for run ``run_id`` on behalf of its process, which
     has exited -- only if that run is still liveOD's current run, in progress,
     and liveOD has not already heard of the exit (``run_state`` "exited").
     The process's own notice (an atexit handler) never ran when it was killed
     or crashed hard.  No run token is sent: liveOD matches the run id instead.
 
+    Never sent while liveOD is saving the run (``run_state`` "saving": closing
+    it then would cut the save short), nor when liveOD names the run's client
+    process on this machine and that process is still alive (a launcher that
+    ran the experiment through a shell has only seen the shell exit).
+
     ``client`` has ``poll()`` and ``_send_recv(msg)`` (a LiveODClient);
     ``poll`` is a POLL reply already in hand; ``send(run_id, reason)``, if
-    given, sends the notice instead of ``client`` (the run loop's own sender).
+    given, sends the notice instead of ``client`` (the run loop's own sender);
+    ``pid_alive`` as for :func:`classify`.
     Returns ``{"sent": bool, "ok": bool, "why": str, "reply": dict | None}``;
     raises only if polling or sending the notice itself fails."""
     if run_id is None:
@@ -405,6 +412,12 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False,
                 "why": f"liveOD's current run is {poll.get('run_id')}, not {run_id}",
                 "reply": None}
+    if poll.get("run_state") == "saving":
+        return {"sent": False, "ok": False, "why": "liveOD is saving the run", "reply": None}
+    proc = _client(poll, pid_alive if pid_alive is not None else _default_pid_alive)
+    if proc["alive"] is True:
+        return {"sent": False, "ok": False,
+                "why": f"the run's process is still alive ({proc['why']})", "reply": None}
     if send is not None:
         reply = send(int(run_id), str(reason))
     else:

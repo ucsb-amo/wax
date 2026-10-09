@@ -254,21 +254,37 @@ def test_gate_state_round_trips_to_a_dict():
 
 def test_run_exited_is_sent_for_the_current_run():
     client = FakeLiveOD(_running())
-    out = tell_live_od_run_exited(client, 85528, "launcher: child exited (code 1)")
+    out = tell_live_od_run_exited(client, 85528, "launcher: child exited (code 1)",
+                                  pid_alive=_dead)
     assert out["sent"] and out["ok"]
     assert client.sent == [{"tag": "RUN_EXITED", "run_id": 85528,
                             "reason": "launcher: child exited (code 1)"}]
+
+
+def test_run_exited_is_sent_when_the_pid_cannot_be_checked():
+    # an older client (no pid), or one on another host: the launcher's word counts
+    for poll in (_running(client_pid=None), _running(client_host="other-pc")):
+        client = FakeLiveOD(poll)
+        assert tell_live_od_run_exited(client, 85528, "x", pid_alive=_never)["sent"]
 
 
 @pytest.mark.parametrize("poll, why", [
     (_running(run_id=85529), "current run is 85529"),
     (_running(run_state="exited"), "already knows"),
     (_poll(run_id=85528), "no run in progress"),
+    (_running(run_state="saving"), "saving"),
 ])
 def test_run_exited_is_not_sent_otherwise(poll, why):
     client = FakeLiveOD(poll)
-    out = tell_live_od_run_exited(client, 85528, "x")
+    out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)
     assert not out["sent"] and why in out["why"] and client.sent == []
+
+
+def test_run_exited_is_not_sent_while_the_runs_process_lives():
+    # the launcher saw its shell exit; liveOD's client pid on this host is alive
+    client = FakeLiveOD(_running())
+    out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_alive)
+    assert not out["sent"] and "still alive" in out["why"] and client.sent == []
 
 
 def test_run_exited_without_a_run_id_sends_nothing():
@@ -279,14 +295,14 @@ def test_run_exited_without_a_run_id_sends_nothing():
 
 def test_run_exited_through_a_sender_of_its_own():
     got = []
-    out = tell_live_od_run_exited(None, 85528, "x", poll=_running(),
+    out = tell_live_od_run_exited(None, 85528, "x", poll=_running(), pid_alive=_dead,
                                   send=lambda rid, why: got.append((rid, why)) or {"ok": True})
     assert out["sent"] and out["ok"] and got == [(85528, "x")]
 
 
 def test_run_exited_uses_a_poll_in_hand():
     client = FakeLiveOD(error=AssertionError("must not poll"))
-    out = tell_live_od_run_exited(client, 85528, "x", poll=_running())
+    out = tell_live_od_run_exited(client, 85528, "x", poll=_running(), pid_alive=_dead)
     assert out["sent"]
 
 

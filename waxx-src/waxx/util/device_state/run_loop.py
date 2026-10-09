@@ -607,13 +607,19 @@ class RunLoop:
         try:
             sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=poll,
                                                     send=self._run_exited)
-            reply = sent["reply"] if sent["sent"] else {"ok": False, "error": sent["why"]}
         except Exception as exc:
             log.error("%s: run %s is still in progress in liveOD after its process exited, "
                       "and telling liveOD failed: %s", self.spec.title, live_id, exc)
             self.output.mark(f"run {live_id}: liveOD still shows it in progress, and could "
                              f"not be told its process exited ({exc})", self._clock)
             return
+        if not sent["sent"]:
+            # liveOD is saving it, or its experiment process still lives
+            log.warning("%s: run %s is still in progress in liveOD after the loop's process "
+                        "for it exited (exit code %s); no exit notice sent: %s",
+                        self.spec.title, live_id, code, sent["why"])
+            return
+        reply = sent["reply"] if isinstance(sent["reply"], dict) else {"ok": sent["ok"]}
         ok = bool(reply.get("ok"))
         log.warning("%s: run %s was still in progress in liveOD after its process exited "
                     "(exit code %s); told liveOD: %s", self.spec.title, live_id, code,

@@ -293,6 +293,7 @@ def test_a_run_killed_hard_is_reported_to_live_od_by_the_loop(expt):
 @pytest.mark.parametrize("live_kw, run_id", [
     ({"run_state": "exited"}, 101),        # its own notice got through
     ({}, 102),                             # liveOD has another run
+    ({"run_state": "saving"}, 101),        # liveOD is saving it: never cut that short
 ])
 def test_no_notice_when_live_od_knows_or_has_another_run(expt, live_kw, run_id):
     live = DyingLive(101, **live_kw)
