@@ -343,8 +343,12 @@ def test_yes_at_the_prompt_sends_the_abort_and_cancels_the_rest(server, q, expts
 # --- the other commands --------------------------------------------------------------------
 
 def test_list_show_and_status(server, q, expts):
-    kq(server, "submit", str(expts / "rabi.py"), "--label", "r1", "--priority", "1")
+    kq(server, "submit", str(expts / "rabi.py"), "--label", "r1", "--priority", "1",
+       "--no-write-back")
     kq(server, "submit", str(expts / "tof.py"), "--priority", "3")
+    assert ("write-back veto requested (honoured once the calibration branch lands)"
+            in kq(server, "show", "1").out)
+    assert "write-back" not in kq(server, "show", "2").out
     r = kq(server, "list")
     assert r.code == 0
     header, *rows, state = r.out.splitlines()

@@ -343,7 +343,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
         sp.add_argument("--no-stop-on-failure", action="store_true",
                         help="a failed job does not cancel the rest of its chain")
         sp.add_argument("--no-write-back", action="store_true",
-                        help="veto the experiment's calibration write-back")
+                        help="ask that the experiment's calibration write-back be vetoed "
+                             "(honoured once the calibration branch lands)")
         sp.add_argument("--allow-drift", action="store_true",
                         help="run even if the file changed after submit")
         sp.add_argument("--cwd", help="working folder on the server's machine "
@@ -645,7 +646,9 @@ def _cmd_show(ctx: _Ctx, args) -> int:
         if j.get(key):
             ctx.say(f"  {key}: {_when(j[key])}")
     if j.get("write_back") is False:
-        ctx.say("  write-back: vetoed")
+        # the queue passes WAXX_CAL_NO_WRITE_BACK=1; nothing reads it until the
+        # calibration write-back branch lands
+        ctx.say("  write-back veto requested (honoured once the calibration branch lands)")
     if j.get("allow_drift"):
         ctx.say("  drift allowed")
     if j.get("outcome"):
