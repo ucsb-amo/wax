@@ -160,29 +160,54 @@ def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
     assert panel.table.textElideMode() == Qt.TextElideMode.ElideMiddle
 
 
+def _est(duration, start=None, end=None, basis="median of 3 saved runs"):
+    return {"duration_s": duration, "eta_start": start, "eta_end": end, "basis": basis}
+
+
+def _phase1b_jobs():
+    """As the 1b server lists them: ended, slot, queued in rank order --
+    here deliberately shuffled, to check the panel's own ordering."""
+    return [_job(3, position=2, rank=3.0, expt_class="Rabi", calibrates_declared=["t_pi"],
+                 submitter="agent:codex@kong", estimate=_est(125.0, NOW + 60, NOW + 185),
+                 source_changed=True, waiting="job 4 goes first"),
+            _job(4, position=0, rank=1.0, expt_class="Tof",
+                 estimate=_est(40.0, NOW + 10, NOW + 50), source_changed=False,
+                 waiting="launching"),
+            _job(2, "running", run_id=85600, owner="agent", position=None,
+                 estimate=_est(300.0, None, NOW + 100, "expected end")),
+            _job(5, position=1, rank=2.0, waiting="paused by jp@kong", paused=True,
+                 paused_by="jp@kong", paused_since=NOW - 60, estimate=_est(None, None, None,
+                                                                           "no saved runs")),
+            _job(1, "saved", position=None, estimate=_est(30.0))]
+
+
 def test_phase1b_fields_order_and_render(panel, server):
-    jobs = [_job(3, position=3, expt_class="Rabi", calibrates_declared=["t_pi"],
-                 submitter="agent:codex@kong", estimated_s=125.0, eta_start=NOW + 60,
-                 eta_end=NOW + 185, source_changed=True, waiting="job 4 goes first"),
-            _job(4, position=1, expt_class="Tof", estimated_s=40.0, eta_start=NOW + 10,
-                 eta_end=NOW + 50, source_changed=False, waiting="launching"),
-            _job(5, position=2, waiting=""),
-            _job(1, "saved", position=None)]
-    server.answers["list"] = _list_reply(jobs, nxt=(4, 5, 3))
+    server.answers["list"] = _list_reply(_phase1b_jobs(), nxt=(4, 3))
     panel.refresh_list()
-    assert [j["id"] for j in panel.model.jobs] == [4, 5, 3, 1]     # by position, then the rest
+    # ended, slot, then queued by position
+    assert [j["id"] for j in panel.model.jobs] == [1, 2, 4, 5, 3]
+    assert _cell(panel, 4, "position") == "1"                      # position 0, shown 1-based
     assert _cell(panel, 3, "position") == "3"
+    assert "counted from 0" in _cell(panel, 3, "position", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 2, "position") == "slot"
     assert _cell(panel, 3, "expt_class") == "Rabi [cal]"
     assert "t_pi" in _cell(panel, 3, "expt_class", Qt.ItemDataRole.ToolTipRole)
     assert _cell(panel, 3, "owner") == "person / agent:codex@kong"
     est = _cell(panel, 3, "est")
     assert est.startswith("~2.1 min") and "start " in est and "end " in est
     assert est.endswith(" est.")
+    assert "median of 3 saved runs" in _cell(panel, 3, "est", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 2, "est").startswith("~5.0 min end ")      # the slot: its end
+    assert _cell(panel, 5, "est") == ""                             # unknown: blank
+    assert _cell(panel, 1, "est") == "~30 s est."                   # ended: no times
     assert _cell(panel, 3, "source_changed") == "CHANGED"
     assert "skipped at launch" in _cell(panel, 3, "source_changed", Qt.ItemDataRole.ToolTipRole)
     assert _cell(panel, 4, "source_changed") == ""
     assert _cell(panel, 3, "waiting") == "job 4 goes first"        # the server's, as sent
-    assert _cell(panel, 5, "waiting") == ""
+    assert _cell(panel, 5, "state") == "queued (paused)"
+    assert "paused by jp@kong" in _cell(panel, 5, "state", Qt.ItemDataRole.ToolTipRole)
+    assert "rank 3" in _cell(panel, 3, "priority", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 3, "priority") == "10"
 
 
 def test_ended_jobs_can_be_hidden(panel):
@@ -307,16 +332,26 @@ def test_cancel_disabled_for_ended_jobs_and_after_a_cancel_was_asked(panel, serv
     assert _cell(panel, 2, "state") == "running (cancel asked)"
 
 
-def test_move_sends_the_request_and_unknown_disables_it(panel, server):
-    panel.select_job(3)
-    assert panel.move_buttons["top"].isEnabled()
-    panel.move_buttons["top"].click()
-    assert server.of("move")[-1] == {"type": "run_queue", "action": "move", "id": 3,
-                                     "token": "t3", "to": "top", "owner": "person",
-                                     "by": "jp@test"}
+def test_move_names_neighbours_by_id_and_unknown_disables_it(panel, server):
+    base = {"type": "run_queue", "action": "move", "id": 4, "token": "t4", "owner": "person",
+            "by": "jp@test"}
+    panel.select_job(4)                                          # queued: 3, 4, 5
+    for where, extra in (("up", {"before_id": 3}), ("down", {"after_id": 5}),
+                         ("top", {"to_index": 0}), ("bottom", {"to_index": 3})):
+        assert panel.move_buttons[where].isEnabled()
+        panel.move_buttons[where].click()
+        assert server.of("move")[-1] == dict(base, **extra)
+    panel.select_job(3)                                          # first: no up / top
+    assert not panel.move_buttons["up"].isEnabled()
+    assert not panel.move_buttons["top"].isEnabled()
+    assert "already first" in panel.move_buttons["up"].toolTip()
+    assert panel.move_buttons["down"].isEnabled()
+    panel.select_job(5)                                          # last: no down / bottom
+    assert not panel.move_buttons["down"].isEnabled()
+    assert not panel.move_buttons["bottom"].isEnabled()
     server.answers["move"] = {"status": "error",
                               "msg": "unknown run_queue action 'move' (known: submit, cancel)"}
-    panel.move_buttons["down"].click()
+    panel.move_buttons["up"].click()
     for b in panel.move_buttons.values():
         assert not b.isEnabled()
         assert "older code" in b.toolTip()
@@ -330,7 +365,7 @@ def test_move_sends_the_request_and_unknown_disables_it(panel, server):
 def test_actions_list_in_the_info_gates_1b_controls(panel):
     panel.set_state(_status(dict(INFO, actions=["list", "cancel", "move"])))
     panel.select_job(3)
-    assert panel.move_buttons["up"].isEnabled()
+    assert panel.move_buttons["down"].isEnabled()
     assert not panel.edit_button.isEnabled()
     assert "older code" in panel.edit_button.toolTip()
 
@@ -340,8 +375,8 @@ def test_edit_sends_only_the_changes_and_unknown_disables_it(panel, server):
     panel.edit_answer = {"label": "renamed", "argv": ["n=5"]}
     assert panel.edit_selected()
     assert server.of("edit")[-1] == {"type": "run_queue", "action": "edit", "id": 3,
-                                     "token": "t3", "changes": {"label": "renamed",
-                                                                "argv": ["n=5"]},
+                                     "token": "t3", "fields": {"label": "renamed",
+                                                               "argv": ["n=5"]},
                                      "owner": "person", "by": "jp@test"}
     server.answers["edit"] = {"status": "error", "msg": "unknown run_queue action 'edit'"}
     panel.edit_selected()
@@ -360,8 +395,9 @@ def test_edit_dialog_reports_only_changed_fields(qapp):
     d.after.setText("3, 4")
     d.no_write_back.setChecked(True)
     d.paused.setChecked(True)
+    d.allow_drift.setChecked(True)
     assert d.changes() == {"label": "other", "after": [3, 4], "write_back": False,
-                           "paused": True}
+                           "allow_drift": True, "paused": True}
     d.after.setText("x")
     assert d.changes() is None
     assert not d.buttons.button(d.buttons.StandardButton.Ok).isEnabled()

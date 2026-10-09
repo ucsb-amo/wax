@@ -81,7 +81,8 @@ def panel(qapp, monkeypatch):
 
 
 def test_renders_monitor_trust_fence_connections_slm(panel):
-    panel.set_state(dict(STATUS))
+    panel.set_state(dict(STATUS, run_pending=dict(STATUS["run_pending"],
+                                                  since=time.time() - 12.2)))
     assert panel.monitor_pill.text() == "NOT READY"
     assert "interrupted by run" in panel.monitor_line.text()
     assert "UNTRUSTED" in panel.trust_banner.text()
@@ -246,3 +247,42 @@ def test_the_window_feeds_its_panels_by_direct_calls(window, qapp):
     qp.toggle_hold()
     assert not window.udp_server.person_hold.info()["active"]
     window.hide()
+
+
+def test_queue_panel_against_the_real_queue(window, qapp, tmp_path):
+    """move / edit / cancel as the panel sends them, answered by the merged
+    server's own run queue (nothing launches: its watch thread never runs)."""
+    for name in ("a", "b", "c"):
+        (tmp_path / f"{name}.py").write_text(f'"""{name}."""\nclass {name.upper()}: pass\n')
+    ids = []
+    for name in ("a", "b", "c"):
+        reply = window.direct_request({"type": "run_queue", "action": "submit",
+                                       "path": str(tmp_path / f"{name}.py"), "by": "jp",
+                                       "owner": "person"})
+        assert reply["status"] == "ok", reply
+        ids += reply["ids"]
+    qp = window.queue_panel
+    qp.set_reachable(True)
+    qp.refresh_list()
+    assert [j["id"] for j in qp.model.queued_in_order()] == ids
+    assert [qp.model.position_text(j) for j in qp.model.queued_in_order()] == ["1", "2", "3"]
+    qp.select_job(ids[2])
+    assert qp.move_selected("top")
+    qp.refresh_list()
+    assert [j["id"] for j in qp.model.queued_in_order()] == [ids[2], ids[0], ids[1]]
+    qp.select_job(ids[0])
+    assert qp.move_selected("down")
+    qp.refresh_list()
+    assert [j["id"] for j in qp.model.queued_in_order()] == [ids[2], ids[1], ids[0]]
+    assert qp.move_buttons["up"].isEnabled() and not qp.move_buttons["down"].isEnabled()
+    qp.ask_edit = lambda job: {"label": "renamed", "paused": True}
+    assert qp.edit_selected()
+    assert "edit" in qp.message.text() and "done" in qp.message.text(), qp.message.text()
+    qp.refresh_list()
+    job = qp.selected_job()
+    assert job["label"] == "renamed" and job["paused"] and job["paused_by"]
+    assert qp.model.text(job, "state") == "queued (paused)"
+    qp.confirm = lambda *a, **k: True
+    assert qp.cancel_selected()
+    qp.refresh_list()
+    assert qp.model.jobs[0]["id"] == ids[0] and qp.model.jobs[0]["state"] == "cancelled"

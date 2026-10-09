@@ -23,19 +23,28 @@ What it shows:
   reason) with Hold / Release; the pause of agent jobs and of all jobs with
   Pause / Resume; the note that the queue will start a run loop it stopped
   (``resume_loop``);
-* the jobs, one row each, in the server's order (``position`` when the server
-  sends it, else the list's order): position, id, state, owner / submitter,
-  label, class, file (elided, full path in the tooltip), run id, priority,
-  due, after / chain, the estimate (``estimated_s`` / ``eta_start`` /
-  ``eta_end``, marked "est."), a source-changed warning, why it waits, and
-  when / by whom it was submitted.  Fields a server does not send are blank.
+* the jobs, one row each, in the server's order (phase 1b: ended, the slot,
+  then the queued jobs by ``position``; before it: the list's order):
+  place (the server's 0-based ``position`` shown from 1; "slot" for the job
+  in it), id, state ("(paused)" for a job paused alone), owner / submitter,
+  label, class (``expt_class``; "[cal]" when it declares calibrations), file
+  (elided, full path in the tooltip), run id, priority (a placement hint
+  only; the rank is in its tooltip), due, after / chain, the estimate
+  (``estimate`` = duration / eta_start / eta_end / basis, marked "est."), a
+  source-changed warning, why it waits (``waiting``; derived from the job's
+  fields for a server that does not send it), and when / by whom it was
+  submitted.  Fields a server does not send are blank.
 
 The controls act on the selected job: Cancel (asks first; for a job in the
 slot the question says that liveOD's Abort discards that run's data file --
-nothing else is offered until the queue can stop a run and keep its data),
-Move up / down / to top / to bottom (the ``move`` action), Edit (the ``edit``
-action: argv, label, after, chain, stop_on_failure, the write-back veto, due,
-paused), Show log (a window following the job's log through the ``tail``
+nothing else is offered until the queue can stop a run and keep its data; a
+queued job's cancel is sent ``queued_only``, so one that launched meanwhile
+is never aborted on a question about a queued job), Move up / down / to top
+/ to bottom (``move``: up / down name the neighbour by id -- ``before_id`` /
+``after_id`` -- top / bottom send ``to_index``), Edit (``edit`` with
+``fields``: argv, label, after, chain, stop_on_failure, the write-back veto,
+due, allow_drift, paused; only the fields changed), Show log (a window
+following the job's log through the ``tail``
 action: every 0.5 s while it runs, every 2 s while it is queued, until it has
 ended and its log is read to the end), and Copy kq command.  An action the
 server refuses as unknown (an older server) disables its control; so does an
@@ -184,16 +193,44 @@ def cancel_request(job: dict, by: str) -> dict:
     return obj
 
 
-def move_request(job: dict, where: str, by: str) -> dict:
+def move_request(job: dict, where: str, by: str, queued: list[dict]) -> dict | None:
+    """``move`` for ``job`` (``where`` in :data:`MOVE_WHERE`) given the queued
+    jobs in order: up = before the job ahead of it (``before_id``), down =
+    after the job behind it (``after_id``), top = ``to_index`` 0, bottom =
+    ``to_index`` len(queued) (the server clamps).  Neighbours are named by
+    id, so a queue that changed meanwhile never sends it somewhere else.
+    None when it cannot go that way (already first / last, not queued)."""
     if where not in MOVE_WHERE:
         raise ValueError(f"where must be one of {MOVE_WHERE}, not {where!r}")
-    return {"type": "run_queue", "action": MOVE_ACTION, "id": job.get("id"),
-            "token": job.get("token"), "to": where, "owner": OWNER, "by": by}
+    ids = [j.get("id") for j in queued]
+    if job.get("id") not in ids:
+        return None
+    i = ids.index(job.get("id"))
+    obj = {"type": "run_queue", "action": MOVE_ACTION, "id": job.get("id"),
+           "token": job.get("token"), "owner": OWNER, "by": by}
+    if where == "up":
+        if i == 0:
+            return None
+        obj["before_id"] = ids[i - 1]
+    elif where == "down":
+        if i == len(ids) - 1:
+            return None
+        obj["after_id"] = ids[i + 1]
+    elif where == "top":
+        if i == 0:
+            return None
+        obj["to_index"] = 0
+    else:
+        if i == len(ids) - 1:
+            return None
+        obj["to_index"] = len(ids)
+    return obj
 
 
-def edit_request(job: dict, changes: dict, by: str) -> dict:
+def edit_request(job: dict, fields: dict, by: str) -> dict:
+    """``edit``: only the ``fields`` that change (see :class:`EditJobDialog`)."""
     return {"type": "run_queue", "action": EDIT_ACTION, "id": job.get("id"),
-            "token": job.get("token"), "changes": dict(changes), "owner": OWNER, "by": by}
+            "token": job.get("token"), "fields": dict(fields), "owner": OWNER, "by": by}
 
 
 def tail_request(job_id, token, offset: int) -> dict:
@@ -253,10 +290,17 @@ def kq_commands(job: dict) -> dict[str, str]:
 
 # -- ordering and the table --------------------------------------------------------------
 
+def _group(job: dict) -> int:
+    state = job.get("state")
+    return 0 if state in ENDED else 1 if state in IN_SLOT else 2 if state == "queued" else 3
+
+
 def order_jobs(jobs: list[dict]) -> list[dict]:
-    """The server's order: by ``position`` where the server gives one (jobs
-    without one follow, in the list's order); the list's own order when no job
-    has one."""
+    """The server's order.  A server that sends ``position`` (0-based among
+    the queued jobs, None for the others) lists the ended jobs, then the one
+    in the slot, then the queued ones in rank order: that order is kept, the
+    queued jobs sorted by ``position`` (stable).  Without ``position``: the
+    list's own order."""
     jobs = [j for j in jobs if isinstance(j, dict)]
     if not any(j.get("position") is not None for j in jobs):
         return list(jobs)
@@ -265,10 +309,21 @@ def order_jobs(jobs: list[dict]) -> list[dict]:
         i, j = item
         pos = j.get("position")
         try:
-            return (0, float(pos), i) if pos is not None else (1, 0.0, i)
+            pos = float(pos) if pos is not None else float("inf")
         except (TypeError, ValueError):
-            return (1, 0.0, i)
+            pos = float("inf")
+        return (_group(j), pos, i)
     return [j for _, j in sorted(enumerate(jobs), key=key)]
+
+
+def _estimate(job: dict) -> dict:
+    """``{duration_s, eta_start, eta_end, basis}`` from the job's
+    ``estimate`` (phase 1b), or flat ``estimated_s`` / ``eta_*`` fields."""
+    est = job.get("estimate")
+    if isinstance(est, dict):
+        return est
+    return {"duration_s": job.get("estimated_s"), "eta_start": job.get("eta_start"),
+            "eta_end": job.get("eta_end"), "basis": ""}
 
 
 def derived_waiting(job: dict, info: dict, by_id: dict) -> str:
@@ -278,6 +333,8 @@ def derived_waiting(job: dict, info: dict, by_id: dict) -> str:
     if job.get("state") != "queued":
         return ""
     now = time.time()
+    if job.get("paused"):
+        return f"paused by {job.get('paused_by') or '?'}"
     due = job.get("due")
     if due is not None:
         try:
@@ -394,12 +451,21 @@ class JobTableModel(QAbstractTableModel):
 
     # -- cell text ---------------------------------------------------------------------
 
+    def queued_in_order(self) -> list[dict]:
+        """The queued jobs in the server's order (all of them, shown or not)."""
+        return [j for j in self._all if j.get("state") == "queued"]
+
     def position_text(self, job: dict) -> str:
+        """1-based place in the queue ("slot" for the job in it): the server's
+        0-based ``position`` + 1, or (before phase 1b) the place in ``next``."""
         if job.get("state") in IN_SLOT:
             return "slot"
         pos = job.get("position")
         if pos is not None:
-            return str(pos)
+            try:
+                return str(int(pos) + 1)
+            except (TypeError, ValueError):
+                return str(pos)
         nxt = list(self.info.get("next") or [])
         if job.get("id") in nxt:
             return str(nxt.index(job.get("id")) + 1)
@@ -414,6 +480,8 @@ class JobTableModel(QAbstractTableModel):
             s = str(job.get("state") or "")
             if job.get("cancel") and s in IN_SLOT:
                 s += " (cancel asked)"
+            elif job.get("paused") and s == "queued":
+                s += " (paused)"
             return s
         if key == "owner":
             who = job.get("submitter")
@@ -430,9 +498,7 @@ class JobTableModel(QAbstractTableModel):
         if key == "run_id":
             return "" if job.get("run_id") in (None, "") else str(job["run_id"])
         if key == "priority":
-            rank = job.get("rank")
-            prio = "" if job.get("priority") is None else str(job["priority"])
-            return f"{prio} / {rank}" if rank is not None else prio
+            return "" if job.get("priority") is None else str(job["priority"])
         if key == "due":
             return _clock(job.get("due"))
         if key == "after":
@@ -443,13 +509,14 @@ class JobTableModel(QAbstractTableModel):
                 parts.append(f"chain {job['chain']}")
             return " | ".join(parts)
         if key == "est":
+            est = _estimate(job)
             parts = []
-            if job.get("estimated_s") is not None:
-                parts.append(f"~{_dur(job['estimated_s'])}")
-            if job.get("eta_start") is not None and job.get("state") == "queued":
-                parts.append(f"start {_clock(job['eta_start'])}")
-            if job.get("eta_end") is not None and job.get("state") not in ENDED:
-                parts.append(f"end {_clock(job['eta_end'])}")
+            if est.get("duration_s") is not None:
+                parts.append(f"~{_dur(est['duration_s'])}")
+            if est.get("eta_start") is not None and job.get("state") == "queued":
+                parts.append(f"start {_clock(est['eta_start'])}")
+            if est.get("eta_end") is not None and job.get("state") not in ENDED:
+                parts.append(f"end {_clock(est['eta_end'])}")
             return (" ".join(parts) + " est.") if parts else ""
         if key == "source_changed":
             return "CHANGED" if job.get("source_changed") else ""
@@ -486,6 +553,20 @@ class JobTableModel(QAbstractTableModel):
             if isinstance(cancel, dict):
                 lines.append(f"cancel asked by {cancel.get('by')} at {_clock(cancel.get('at'), True)}"
                              + (" (Abort sent)" if cancel.get("abort_sent") else ""))
+            if job.get("paused"):
+                lines.append(f"paused by {job.get('paused_by') or '?'}"
+                             + (f" since {_clock(job['paused_since'])}"
+                                if job.get("paused_since") else ""))
+            return "\n".join(lines)
+        if key == "position" and job.get("position") is not None:
+            return (f"place {self.position_text(job)} in the queue's order (the server's "
+                    f"position {job['position']}, counted from 0)")
+        if key == "priority":
+            lines = ["priority: only a placement hint at submit (a person's job is placed "
+                     "ahead of agents' jobs); the order is the rank"]
+            if job.get("rank") is not None:
+                lines.append(f"rank {job['rank']:g}" if isinstance(job["rank"], (int, float))
+                             else f"rank {job['rank']}")
             return "\n".join(lines)
         if key == "label":
             argv = job.get("argv") or []
@@ -503,7 +584,8 @@ class JobTableModel(QAbstractTableModel):
                     + (" -- unless it allows drift (it does)" if job.get("allow_drift")
                        else " (it does not allow drift)") + ".")
         if key == "est":
-            return "An estimate from the queue's journal, not a promise."
+            basis = _estimate(job).get("basis")
+            return ("An estimate, not a promise" + (f": {basis}" if basis else "") + ".")
         if key == "owner":
             return f"submitted by {job.get('submitted_by') or '?'}"
         if key == "after" and job.get("chain"):
@@ -566,7 +648,9 @@ class EditJobDialog(QDialog):
         self._due_shown = _clock(job.get("due")) if job.get("due") else ""
         self.due = QLineEdit(self._due_shown)
         self.due.setPlaceholderText("blank: now; HH:MM or YYYY-MM-DD HH:MM")
-        self.paused = QCheckBox("paused (stays queued until unpaused)")
+        self.allow_drift = QCheckBox("run it even if the file changes before launch")
+        self.allow_drift.setChecked(bool(job.get("allow_drift")))
+        self.paused = QCheckBox("paused (this job stays queued until unpaused)")
         self.paused.setChecked(bool(job.get("paused")))
         form.addRow("argv", self.argv)
         form.addRow("label", self.label)
@@ -575,6 +659,7 @@ class EditJobDialog(QDialog):
         form.addRow("", self.stop_on_failure)
         form.addRow("", self.no_write_back)
         form.addRow("due", self.due)
+        form.addRow("", self.allow_drift)
         form.addRow("", self.paused)
         box.addLayout(form)
         self.problem = _small("", ERR_TEXT)
@@ -606,7 +691,8 @@ class EditJobDialog(QDialog):
                 "chain": self.chain.text().strip() or None,
                 "stop_on_failure": self.stop_on_failure.isChecked(),
                 "write_back": False if self.no_write_back.isChecked() else None,
-                "due": due, "paused": self.paused.isChecked()}
+                "due": due, "allow_drift": self.allow_drift.isChecked(),
+                "paused": self.paused.isChecked()}
 
     def changes(self) -> dict | None:
         try:
@@ -619,7 +705,8 @@ class EditJobDialog(QDialog):
                "chain": job.get("chain") or None,
                "stop_on_failure": bool(job.get("stop_on_failure")),
                "write_back": False if job.get("write_back") is False else None,
-               "due": job.get("due"), "paused": bool(job.get("paused"))}
+               "due": job.get("due"), "allow_drift": bool(job.get("allow_drift")),
+               "paused": bool(job.get("paused"))}
         return {k: v for k, v in values.items() if v != old[k]}
 
     def _update(self) -> None:
@@ -1143,11 +1230,16 @@ class RunQueuePanel(QWidget):
               "Cancel the job (asks first)",
               "its cancel has been asked for; the run ends at its next shot" if cancel_asked
               else f"it is {state}: nothing to cancel")
+        queued = self.model.queued_in_order()
         for where, b in self.move_buttons.items():
             if not self.supported(MOVE_ACTION):
                 setup(b, False, "", "this monitor server cannot reorder jobs (older code)")
+            elif state != "queued":
+                setup(b, False, "", "only a queued job can be moved")
             else:
-                setup(b, state == "queued", _MOVE_TIPS[where], "only a queued job can be moved")
+                can = move_request(job, where, self.by, queued) is not None
+                setup(b, can, _MOVE_TIPS[where],
+                      "it is already first" if where in ("up", "top") else "it is already last")
         if not self.supported(EDIT_ACTION):
             setup(self.edit_button, False, "", "this monitor server cannot edit jobs (older code)")
         else:
@@ -1238,7 +1330,10 @@ class RunQueuePanel(QWidget):
         job = self.selected_job()
         if job is None or job.get("state") != "queued" or not self.supported(MOVE_ACTION):
             return False
-        self.runner.send(move_request(job, where, self.by),
+        request = move_request(job, where, self.by, self.model.queued_in_order())
+        if request is None:
+            return False
+        self.runner.send(request,
                          self._done(f"move {job_name(job)} {where}", on_unknown=MOVE_ACTION))
         return True
 
