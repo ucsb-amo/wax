@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from subprocess import DEVNULL, PIPE, STDOUT, Popen
 
 _log = logging.getLogger(__name__)
@@ -206,15 +207,23 @@ def launch(command: str, *, cwd: str, env: dict, log_path: str,
                      creationflags=_NO_WINDOW, close_fds=True, text=True,
                      encoding="utf-8", errors="replace")
     watch = None
+    reader_owns_stdout = False
     try:
         try:
+            # not_after: a launcher that only gets to the command after the
+            # server has stopped waiting for it refuses to start it
             launcher.stdin.write(json.dumps({"command": command, "cwd": cwd,
-                                             "log_path": log_path}) + "\n")
+                                             "log_path": log_path,
+                                             "not_after": time.time() + timeout}) + "\n")
             launcher.stdin.flush()
         except OSError as exc:
             raise OSError(f"could not hand the command to the launcher: {exc}") from exc
         line = _read_line(launcher.stdout, timeout)
         if line is None:
+            # the reader thread is still blocked in readline: closing stdout
+            # here would wait on the reader's lock as long as the launcher
+            # lives -- the daemon reader keeps it, and the pipe goes with it
+            reader_owns_stdout = True
             raise LaunchUnknown(f"the launcher (pid {launcher.pid}) reported nothing within "
                                 f"{timeout:.0f} s: the command may or may not be running")
         try:
@@ -250,20 +259,35 @@ def launch(command: str, *, cwd: str, env: dict, log_path: str,
         return watch
     finally:
         for stream in (launcher.stdin, launcher.stdout, launcher.stderr):
+            if stream is launcher.stdout and reader_owns_stdout:
+                continue
             try:
                 stream.close()
             except Exception:                         # noqa: BLE001
                 pass
 
 
+def _start_job(job: dict, now: float | None = None):
+    """The launcher's work: start ``job["command"]`` -- unless its
+    ``not_after`` (epoch seconds) has passed, when the server has stopped
+    waiting for this launcher and may already be looking for the job
+    elsewhere: then nothing is started.  Returns the child's Popen, or raises
+    (the reason goes back to the server)."""
+    now = time.time() if now is None else now
+    not_after = job.get("not_after")
+    if not_after is not None and now > float(not_after):
+        raise TimeoutError(f"too late: the server stopped waiting {now - float(not_after):.1f} s "
+                           "ago; the command was not started")
+    with open(job["log_path"], "ab") as out:
+        return Popen(job["command"], shell=True, cwd=job.get("cwd") or None,
+                     stdin=DEVNULL, stdout=out, stderr=STDOUT,
+                     creationflags=_NO_WINDOW | _NEW_GROUP, close_fds=True)
+
+
 def _launcher_main() -> None:
     """The launcher process (see the module docstring)."""
     try:
-        job = json.loads(sys.stdin.readline())
-        with open(job["log_path"], "ab") as out:
-            child = Popen(job["command"], shell=True, cwd=job.get("cwd") or None,
-                          stdin=DEVNULL, stdout=out, stderr=STDOUT,
-                          creationflags=_NO_WINDOW | _NEW_GROUP, close_fds=True)
+        child = _start_job(json.loads(sys.stdin.readline()))
     except Exception as exc:                          # noqa: BLE001
         sys.stdout.write(json.dumps({"error": repr(exc)}) + "\n")
         sys.stdout.flush()

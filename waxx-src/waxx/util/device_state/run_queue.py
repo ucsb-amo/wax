@@ -25,9 +25,15 @@ launched and cancelled).
 **Scheduling.**  One slot.  A job is *eligible* when it is queued, its due time
 has passed, every job in ``after`` is saved, it is not paused (scope "all", or
 "agent" for an agent's job) and -- for an agent's job -- no person's hold is on
-(:mod:`~waxx.util.device_state.person_hold`).  Of the eligible jobs the one
-with the largest ``(priority, -due, -id)`` goes next (ARTIQ's scheduler key;
-no due time counts as 0).  It is launched only when the previous job's process
+(:mod:`~waxx.util.device_state.person_hold`).  The queue has an explicit
+order: every job has a ``rank`` and the eligible job with the lowest rank goes
+next (due times, dependencies, pauses and the hold only gate a job, they never
+reorder the queue).  At submit a job goes to the end, except that a person's job
+is placed ahead of every queued agent job (unless ``at_end``); ``priority`` is
+only a placement hint within its owner's block (higher first) and is kept for
+display.  ``insert`` submits at a position (``at_index`` / ``before_id`` /
+``after_id``); ``move`` puts a queued job elsewhere (an agent may move only
+agent jobs; launching or running jobs never move).  It is launched only when the previous job's process
 has exited and the machine is free: nothing of the server's own holds it
 (``server_busy``: a state reset, the monitor starting), no run loop is active,
 and liveOD + the run fence say free (:func:`run_gate.classify`; a dead run is
@@ -43,7 +49,7 @@ allows drift.  The command is ``ar_command(path) + argv``, run detached
 with ``WAXX_LAUNCHER=kq``, ``WAXX_QUEUE_JOB=<id>``, ``WAXX_OWNER=<owner>``,
 ``PYTHONUNBUFFERED=1`` and, for a write-back veto, ``WAXX_CAL_NO_WRITE_BACK=1``;
 its output goes to ``<dir>/logs/<id>_<label>.out``.  The job's run is known
-from liveOD: the experiment sends ``queue_job`` (WAXX_QUEUE_JOB) at INIT_RUN
+from liveOD: the experiment sends ``queue_job`` (WAXX_QUEUE_JOB = "<id>:<token>") at INIT_RUN
 and POLL / last_outcome carry it next to ``launcher`` and ``client_pid`` (the
 experiment's own pid); the "Run ID:" line in the log (printed whatever
 WAX_VERBOSITY when a launcher is set) is the fallback.
@@ -119,6 +125,7 @@ from typing import Callable, Mapping
 
 from waxx.util.device_state import run_gate
 from waxx.util.device_state.monitor_manager import ar_command, environment_report
+from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_loop import (
     RUN_ID_RE, _SHELL_CHARS, judge_run, live_od_outcome, tell_live_od_exited)
@@ -145,8 +152,6 @@ OWNER_ENV = "WAXX_OWNER"
 #: applied: vetoed by WAXX_CAL_NO_WRITE_BACK"); this branch only sets it.
 NO_WRITE_BACK_ENV = "WAXX_CAL_NO_WRITE_BACK"
 
-#: A person's job's priority when none is given (an agent's: 0).
-PERSON_PRIORITY = 10
 #: An eligible job waiting this long with nothing running raises the alarm.
 ALARM_S = 600.0
 #: liveOD is polled at most this often for the hold's watch and the status
@@ -161,6 +166,8 @@ MAX_REPEAT = 1000
 TAIL_LINES = 25
 #: Most bytes of a job's log one ``tail`` request returns.
 TAIL_CHUNK = 64 * 1024
+#: After a launch whose "launching" state could not be saved, launches wait this long.
+SAVE_RETRY_S = 30.0
 #: A launch taking longer than this is logged (once) while it is waited for.
 SPAWN_WARN_S = 60.0
 #: A job left "launching" with no process to follow (the server stopped while
@@ -209,12 +216,65 @@ def _clock_text(t) -> str:
         return "?"
 
 
+def describe_source(path) -> tuple[str, list]:
+    """``(expt_class, calibrates_declared)`` from an experiment file's source,
+    read with :mod:`ast` (never imported): the single public class that
+    subclasses ``EnvExperiment`` or defines ``scan_kernel`` ("" when there is
+    none or more than one), and the first argument of every
+    ``self.calibrates('<key>', ...)`` call with a string key, in order, once
+    each.  ("", []) when the file cannot be read or parsed."""
+    import ast  # noqa: PLC0415
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return "", []
+    classes = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
+            continue
+        bases = [ast.unparse(b).split(".")[-1] for b in node.bases]
+        scan = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and n.name == "scan_kernel" for n in node.body)
+        if "EnvExperiment" in bases or scan:
+            classes.append(node.name)
+    keys: list = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "calibrates" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str) and node.args[0].value not in keys):
+            keys.append(node.args[0].value)
+    return (classes[0] if len(classes) == 1 else ""), keys
+
+
+def _since_text(t) -> str:
+    """"15:48", or "Oct 08 15:48" when not today."""
+    try:
+        t = float(t)
+        if time.strftime("%Y%m%d", time.localtime(t)) == time.strftime("%Y%m%d"):
+            return time.strftime("%H:%M", time.localtime(t))
+        return time.strftime("%b %d %H:%M", time.localtime(t))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
 def file_sha256(path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 16), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _close(proc) -> None:
+    """Close a process watch (its handle); never raises."""
+    close = getattr(proc, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:                             # noqa: BLE001
+            log.exception("Run queue: closing a process watch failed")
 
 
 def _quote(arg: str) -> str:
@@ -265,10 +325,27 @@ class Job:
     #: running job was asked for
     cancel: dict | None = None
     adopted: bool = False
+    #: the job's place in the queue: the scheduler takes the eligible job with
+    #: the lowest rank (ties: lowest id); set at submit, changed by `move`
+    rank: float | None = None
+    #: from the file's source at submit (ast, never imported): its experiment
+    #: class ("" when not one clear class) and the keys of its
+    #: self.calibrates('<key>', ...) calls -- "declared in source"
+    expt_class: str = ""
+    calibrates_declared: list = field(default_factory=list)
+    #: who submitted it, for listings: a person's "<user>@<pc>" (`by`), an
+    #: agent's label (WAXX_AGENT_LABEL) or "agent@<host>"
+    submitter: str = ""
 
     @property
     def name(self) -> str:
         return f"job {self.id} ({self.label})"
+
+    @property
+    def queue_job(self) -> str:
+        """"<id>:<token>": the job's WAXX_QUEUE_JOB, sent by its experiment at
+        INIT_RUN and reported by liveOD (POLL, last_outcome) as queue_job."""
+        return f"{self.id}:{self.token}"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -371,6 +448,10 @@ class RunQueue:
         self._saved_seq = 0
         #: an unreadable queue.json that could not be moved aside is never overwritten
         self._no_save = False
+        #: the last queue.json write error; launches wait until this time after
+        #: a launch whose "launching" state could not be saved
+        self._save_error = ""
+        self._launch_blocked_until = 0.0
         #: records waiting to be copied to the ops journal (flush_journal)
         self._mirror: deque = deque()
         self._mirror_lock = threading.Lock()
@@ -396,6 +477,8 @@ class RunQueue:
         self._own_abort_ids: set = set()
         #: dependencies no longer kept in queue.json: their state from the journal
         self._dep_cache: dict[int, str] = {}
+        #: (path, mtime_ns, size) -> sha256, for source_changed on listings
+        self._sha_cache: dict = {}
         #: the last gate's kind: "free" | "live" | "blocked" (see _gate)
         self._gate_kind = ""
         #: the run id of the job that ended last (its fence may still be up)
@@ -500,10 +583,9 @@ class RunQueue:
         if owner not in OWNERS:
             raise QueueError(f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
         try:
-            # a person's `ar` goes to the front: priority 10 unless given
-            priority = (int(obj.get("priority")) if obj.get("priority") is not None
-                        else PERSON_PRIORITY if str(obj.get("owner") or "person") == "person"
-                        else 0)
+            # a placement hint only (higher first within its owner's block at
+            # submit), kept for display; the order is the rank
+            priority = int(obj.get("priority") or 0)
         except (TypeError, ValueError):
             raise QueueError(f"priority must be an integer, not {obj.get('priority')!r}")
         due = obj.get("due")
@@ -539,7 +621,15 @@ class RunQueue:
         label = _LABEL_RE.sub("_", str(obj.get("label") or path.stem)).strip("_") or path.stem
         label = label[:60]
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
+        if owner == "agent":
+            submitter = str(obj.get("agent_label") or "").strip() or \
+                f"agent@{obj.get('host') or obj.get('client') or '?'}"
+        else:
+            submitter = by or "?"
         sha = file_sha256(path)
+        expt_class, calibrates = describe_source(path)
+        # TODO(INIT_RUN): the live list of calibrated keys, sent by the
+        # experiment at prepare, overrides calibrates_declared once known.
         with self._lock:
             unknown = [a for a in after if a not in self._jobs
                        and self._dep_state(a) == "failed" and a >= self._next_id]
@@ -550,6 +640,7 @@ class RunQueue:
                 chain = f"repeat-{first}"
             stop = obj.get("stop_on_failure")
             stop = bool(chain) if stop is None else bool(stop)
+            ranks = self._place(repeat, owner, priority, obj)
             now = self._clock()
             jobs = []
             for i in range(repeat):
@@ -558,11 +649,231 @@ class RunQueue:
                           priority=priority, due=due, after=list(after), chain=chain,
                           stop_on_failure=stop, write_back=write_back,
                           allow_drift=bool(obj.get("allow_drift")), repeat_index=i + 1,
-                          repeat_of=repeat, submitted_at=now, submitted_by=by)
+                          repeat_of=repeat, submitted_at=now, submitted_by=by,
+                          rank=ranks[i], expt_class=expt_class,
+                          calibrates_declared=list(calibrates), submitter=submitter)
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
         return jobs
+
+    # -- the order ---------------------------------------------------------------------
+
+    def _queued_in_order(self, without: Job | None = None) -> list[Job]:
+        """The queued jobs in rank order (ties: id)."""
+        return sorted((j for j in self._jobs.values()
+                       if j.state == "queued" and j is not without),
+                      key=lambda j: (j.rank, j.id))
+
+    def _insert_index(self, queued: list[Job], owner: str, priority: int,
+                      obj: Mapping) -> int:
+        """Where a job goes among ``queued`` (rank order): the position the
+        request names -- ``before_id`` / ``after_id`` (a queued job),
+        ``at_index`` / ``to_index`` (0-based, clamped), ``at_end`` -- or, by
+        default, the owner rule: a person's job ahead of every queued agent
+        job (after the person jobs of equal or higher priority), an agent's
+        job at the end of the agent jobs of equal or higher priority."""
+        given = [k for k in ("before_id", "after_id", "at_index", "to_index")
+                 if obj.get(k) is not None]
+        if obj.get("at_end"):
+            given.append("at_end")
+        if len(given) > 1:
+            raise QueueError(f"give one position, not {', '.join(given)}")
+        ids = [j.id for j in queued]
+        for key, offset in (("before_id", 0), ("after_id", 1)):
+            if obj.get(key) is not None:
+                try:
+                    target = int(obj[key])
+                except (TypeError, ValueError):
+                    raise QueueError(f"{key} must be a job id, not {obj[key]!r}")
+                if target not in ids:
+                    raise QueueError(f"{key} {target} is not a queued job")
+                return ids.index(target) + offset
+        for key in ("at_index", "to_index"):
+            if obj.get(key) is not None:
+                try:
+                    index = int(obj[key])
+                except (TypeError, ValueError):
+                    raise QueueError(f"{key} must be an integer, not {obj[key]!r}")
+                return max(0, min(index, len(queued)))
+        if obj.get("at_end"):
+            return len(queued)
+        for i, other in enumerate(queued):
+            if owner == "person" and (other.owner == "agent" or other.priority < priority):
+                return i
+            if owner == "agent" and other.owner == "agent" and other.priority < priority:
+                return i
+        return len(queued)
+
+    def _ranks_at(self, queued: list[Job], index: int, n: int) -> list[float]:
+        """``n`` ranks between ``queued[index - 1]`` and ``queued[index]``
+        (the queued jobs are given new ranks 1, 2, 3... first when the gap is
+        too small to split)."""
+        def bounds():
+            lo = queued[index - 1].rank if index > 0 else None
+            hi = queued[index].rank if index < len(queued) else None
+            return lo, hi
+        lo, hi = bounds()
+        if lo is not None and hi is not None and (hi - lo) / (n + 1) < 1e-6:
+            for k, other in enumerate(queued):
+                other.rank = float(k + 1)
+            lo, hi = bounds()
+        if lo is None and hi is None:
+            top = max((j.rank for j in self._jobs.values() if j.rank is not None),
+                      default=0.0)
+            return [top + 1.0 + k for k in range(n)]
+        if hi is None:
+            return [lo + 1.0 + k for k in range(n)]
+        if lo is None:
+            return [hi - n + k for k in range(n)]
+        step = (hi - lo) / (n + 1)
+        return [lo + step * (k + 1) for k in range(n)]
+
+    def _place(self, n: int, owner: str, priority: int, obj: Mapping) -> list[float]:
+        queued = self._queued_in_order()
+        return self._ranks_at(queued, self._insert_index(queued, owner, priority, obj), n)
+
+    def _positions(self) -> dict[int, int]:
+        """Job id -> 0-based position among the queued jobs (rank order)."""
+        return {j.id: i for i, j in enumerate(self._queued_in_order())}
+
+    def _duration_estimate(self, job: Job) -> tuple[float | None, str]:
+        """(seconds, basis): the median launch-to-end time of the last 5 saved
+        runs of the same file (jobs the queue still keeps), or (None, why)."""
+        runs = sorted((j for j in self._jobs.values()
+                       if j.path == job.path and j.state == "saved"
+                       and j.launched_at and j.ended_at and j.id != job.id),
+                      key=lambda j: j.ended_at)[-5:]
+        if not runs:
+            return None, "no saved run of this file to go by"
+        times = sorted(j.ended_at - j.launched_at for j in runs)
+        mid = len(times) // 2
+        median = times[mid] if len(times) % 2 else (times[mid - 1] + times[mid]) / 2
+        return median, f"median of the last {len(runs)} saved run(s) of this file"
+
+    def _running_end(self, job: Job, now: float) -> tuple[float | None, str]:
+        """(epoch, basis): when the job in the slot should end -- from liveOD's
+        shots (expected x measured period) once it has taken one, else its
+        launch time + the duration estimate."""
+        poll = self._last_poll
+        if self._is_job_run(job, poll):
+            n = poll.get("n_shots") or 0
+            want = poll.get("n_shots_expected")
+            init_age, last_age = poll.get("init_run_age_s"), poll.get("last_shot_age_s")
+            if n and want and init_age is not None and last_age is not None and init_age >= last_age:
+                period = (init_age - last_age) / n
+                end = now - last_age + max(0, int(want) - int(n)) * period
+                return end, (f"liveOD: shot {n} of {want}, {period:.1f} s per shot (the save "
+                             "is not included)")
+        dur, basis = self._duration_estimate(job)
+        if dur is None or not job.launched_at:
+            return None, basis
+        return job.launched_at + dur, basis
+
+    def _source_changed(self, job: Job) -> bool | None:
+        """Whether a queued job's file differs from the one submitted (None
+        when it cannot be read); hashed again only when its size or mtime moved."""
+        try:
+            st = os.stat(job.path)
+        except OSError:
+            return None
+        key = (job.path, st.st_mtime_ns, st.st_size)
+        sha = self._sha_cache.get(key)
+        if sha is None:
+            try:
+                sha = file_sha256(job.path)
+            except OSError:
+                return None
+            self._sha_cache = {k: v for k, v in self._sha_cache.items() if k[0] != job.path}
+            self._sha_cache[key] = sha
+        return sha != job.sha256
+
+    def _views(self, jobs: list[Job], now: float) -> list[dict]:
+        """Each job as list/describe show it: its record plus ``position``,
+        ``waiting``, ``source_changed`` (queued jobs) and ``estimate`` --
+        ``{duration_s, eta_start, eta_end, basis}``, all ESTIMATES: the
+        duration from the last saved runs of the same file; for the job in the
+        slot its expected end; for a queued job its expected start (now + the
+        slot's remaining time + the durations of the queued jobs ahead of it;
+        null when any of them is unknown)."""
+        positions = self._positions()
+        cur = self._jobs.get(self._current) if self._current is not None else None
+        ahead_s: float | None = 0.0
+        if cur is not None:
+            end, _ = self._running_end(cur, now)
+            ahead_s = None if end is None else max(0.0, end - now)
+        start_of: dict[int, float | None] = {}
+        for q in self._queued_in_order():
+            start_of[q.id] = None if ahead_s is None else now + ahead_s
+            dur, _ = self._duration_estimate(q)
+            ahead_s = None if (ahead_s is None or dur is None) else ahead_s + dur
+        out = []
+        for job in jobs:
+            dur, basis = self._duration_estimate(job)
+            estimate = {"duration_s": dur, "eta_start": None, "eta_end": None, "basis": basis}
+            view = dict(job.to_dict(), position=positions.get(job.id),
+                        waiting=self._why_waiting(job, now), source_changed=None,
+                        estimate=estimate)
+            if job.state == "queued":
+                view["source_changed"] = self._source_changed(job)
+                estimate["eta_start"] = start_of.get(job.id)
+                if estimate["eta_start"] is not None and dur is not None:
+                    estimate["eta_end"] = estimate["eta_start"] + dur
+            elif job.state in IN_SLOT:
+                estimate["eta_end"], estimate["basis"] = self._running_end(job, now)
+            out.append(view)
+        return out
+
+    @staticmethod
+    def _row(view: dict) -> dict:
+        """The compact listing (kq list's columns)."""
+        return {"position": view.get("position"), "id": view["id"], "state": view["state"],
+                "owner": view["owner"], "submitter": view.get("submitter") or "",
+                "label": view["label"], "expt_class": view.get("expt_class") or "",
+                "run_id": view.get("run_id"), "est": view.get("estimate"),
+                "waiting": view.get("waiting") or ""}
+
+    def insert(self, obj: Mapping) -> dict:
+        """``submit`` at a position the request names (``at_index`` |
+        ``before_id`` | ``after_id``; one is required)."""
+        if all(obj.get(k) is None for k in ("at_index", "before_id", "after_id")):
+            return {"status": "error",
+                    "msg": "insert needs a position: at_index, before_id or after_id"}
+        return self.submit(obj)
+
+    def move(self, obj: Mapping) -> dict:
+        """``{"id", "to_index" | "before_id" | "after_id", "owner", "by"}``: put
+        a queued job at another place in the order (launching / running jobs
+        never move).  An agent may move only agent jobs."""
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        if all(obj.get(k) is None for k in ("to_index", "before_id", "after_id")):
+            return {"status": "error", "msg": "move needs to_index, before_id or after_id"}
+        with self._lock:
+            try:
+                job = self._find(obj)
+                if job.state != "queued":
+                    raise QueueError(f"{job.name} is {job.state}: only queued jobs move")
+                if as_owner == "agent" and job.owner != "agent":
+                    raise QueueError(f"{job.name} is a person's job: an agent may not move it")
+                if job.id in (obj.get("before_id"), obj.get("after_id")):
+                    raise QueueError(f"{job.name} cannot be placed next to itself")
+                before = self._positions().get(job.id)
+                others = self._queued_in_order(without=job)
+                index = self._insert_index(others, job.owner, job.priority, obj)
+                old_rank = job.rank
+                job.rank = self._ranks_at(others, index, 1)[0]
+                after = self._positions().get(job.id)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+        log.info("Run queue: %s moved by %s from position %s to %s.", job.name, by, before, after)
+        self._record("run_queue_move", job=job.id, by=by, owner=as_owner, from_position=before,
+                     to_position=after, from_rank=old_rank, to_rank=job.rank)
+        self._save()
+        self._notify()
+        return {"status": "ok", "job": dict(job.to_dict(), position=after), "position": after}
 
     def _find(self, obj: Mapping) -> Job:
         try:
@@ -624,7 +935,10 @@ class RunQueue:
         return reply
 
     def list(self, obj: Mapping | None = None) -> dict:
-        """``{"states"?: [...], "limit"?: n}`` -> the jobs, newest last."""
+        """``{"states"?: [...], "limit"?: n}`` -> the jobs: the ended ones (by
+        id, the last ``limit``), then the one in the slot, then the queued ones
+        in rank order -- each with ``position`` (0-based among the queued jobs;
+        None for the others); ``next``: the eligible jobs in launch order."""
         obj = obj or {}
         states = obj.get("states")
         try:
@@ -632,10 +946,17 @@ class RunQueue:
         except (TypeError, ValueError):
             limit = 200
         with self._lock:
-            jobs = [j for j in sorted(self._jobs.values(), key=lambda j: j.id)
+            positions = self._positions()
+            ended = sorted((j for j in self._jobs.values() if j.state in ENDED),
+                           key=lambda j: j.id)[-limit:]
+            slot = sorted((j for j in self._jobs.values() if j.state in IN_SLOT),
+                          key=lambda j: j.id)
+            jobs = [j for j in ended + slot + self._queued_in_order()
                     if not states or j.state in states]
-            order = [j.id for j in self._order(self._clock())]
-        return {"status": "ok", "jobs": [j.to_dict() for j in jobs[-limit:]],
+            now = self._clock()
+            out = self._views(jobs, now)
+            order = [j.id for j in self._order(now)]
+        return {"status": "ok", "jobs": out, "rows": [self._row(v) for v in out],
                 "next": order, "run_queue": self.info()}
 
     def describe(self, obj: Mapping) -> dict:
@@ -645,8 +966,8 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
-            out = {"status": "ok", "job": job.to_dict(),
-                   "waiting": self._why_waiting(job, self._clock()),
+            view = self._views([job], self._clock())[0]
+            out = {"status": "ok", "job": view, "waiting": view["waiting"],
                    "tail": list(self._tails.get(job.id, ()))}
         return out
 
@@ -795,18 +1116,30 @@ class RunQueue:
         """"" unless a job is in the slot (launching, running, ending) or one
         is eligible to launch now; else which.  Queued jobs that are due
         later, held, paused or waiting on another job do not count: they
-        leave a loop's Start and a monitor restart alone."""
-        return self.monitor_busy()
-
-    def monitor_busy(self) -> str:
-        """Why a monitor (re)start must wait ("" when it need not): a job is
-        in the slot, or one is eligible to launch now."""
+        leave a loop's Start alone."""
         with self._lock:
             cur = self._jobs.get(self._current) if self._current is not None else None
             if cur is not None:
                 return f"the run queue's {cur.name} is {cur.state}"
             order = self._order(self._clock())
         if order:
+            return f"the run queue's {order[0].name} is about to launch"
+        return ""
+
+    def monitor_busy(self) -> str:
+        """Why a monitor (re)start must wait ("" when it need not): a job is
+        in the slot, or one is eligible AND the queue's last gate found the
+        machine free or legitimately in use (it launches as soon as that run
+        ends).  A blocked gate (liveOD unreachable, a wedged run, the server
+        busy...) never defers it: the hardware must not be left without the
+        monitor while the queue cannot launch anyway."""
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if cur is not None:
+                return f"the run queue's {cur.name} is {cur.state}"
+            order = self._order(self._clock())
+            kind = self._gate_kind
+        if order and kind in ("free", "live"):
             return f"the run queue's {order[0].name} is about to launch"
         return ""
 
@@ -894,18 +1227,18 @@ class RunQueue:
         if job.state != "queued":
             return f"it is {job.state}"
         if job.due is not None and job.due > now:
-            return f"due at {_clock_text(job.due)}"
+            return f"due {_since_text(job.due)}"
         waits = [a for a in job.after if self._dep_state(a) != "saved"]
         if waits:
-            return "waiting for job " + ", ".join(map(str, waits))
+            return "after " + ", ".join(f"#{a} ({self._dep_state(a)})" for a in waits)
         if self._paused.get("all"):
             p = self._paused["all"]
-            return f"all jobs paused by {p.get('by')}"
+            return f"all jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
         if job.owner == "agent" and self._paused.get("agent"):
             p = self._paused["agent"]
-            return f"agent jobs paused by {p.get('by')}"
+            return f"agent jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
         if job.owner == "agent" and self.hold.active:
-            return self.hold.text()
+            return f"held: {self.hold.info().get('reason')}"
         return ""
 
     def _dep_state(self, job_id: int) -> str:
@@ -934,11 +1267,12 @@ class RunQueue:
         return cached
 
     def _order(self, now: float) -> list[Job]:
-        """The eligible jobs, the next one first."""
+        """The eligible jobs, the next one first: lowest rank (ties: lowest
+        id).  Due times, dependencies, pauses and the hold only gate a job --
+        they never reorder the queue."""
         eligible = [j for j in self._jobs.values()
                     if j.state == "queued" and not self._blocked_by(j, now)]
-        return sorted(eligible, key=lambda j: (j.priority, -(j.due or 0.0), -j.id),
-                      reverse=True)
+        return sorted(eligible, key=lambda j: (j.rank, j.id))
 
     def _why_waiting(self, job: Job, now: float) -> str:
         if job.state != "queued":
@@ -947,10 +1281,11 @@ class RunQueue:
         if own:
             return own
         if self._current is not None:
-            return f"job {self._current} is in the slot"
+            cur = self._jobs.get(self._current)
+            return f"after #{self._current} ({cur.state if cur else 'in the slot'})"
         order = self._order(now)
         if order and order[0].id != job.id:
-            return f"job {order[0].id} goes first"
+            return f"#{order[0].id} goes first"
         return self._waiting or "launching"
 
     def tick(self) -> None:
@@ -1093,6 +1428,10 @@ class RunQueue:
         liveOD unreachable or unknown, the server busy, a loop that does not
         stop): only "blocked" runs the alarm's clock."""
         self._gate_kind = "blocked"
+        if self._clock() < self._launch_blocked_until:
+            return ("queue.json could not be saved ("
+                    + (self._save_error or "it is not to be overwritten")
+                    + "): launches wait until it can be")
         busy = self._server_busy() if self._server_busy is not None else ""
         if busy:
             return busy
@@ -1183,14 +1522,33 @@ class RunQueue:
             self._save()
             self._notify()
             return False
-        self._save()                                   # "launching" is on disk first
+        if not self._save():                           # "launching" is on disk first
+            # without it on disk a server restart could launch the job a second
+            # time: not launched; back in the queue, launches wait a while
+            with self._lock:
+                if job.state == "launching":
+                    job.state = "queued"
+                    job.reason = ("not launched: queue.json could not be saved ("
+                                  + (self._save_error or "it is not to be overwritten")
+                                  + ")")
+                    job.launched_at = None
+                    job.log_path = None
+                    self._current = None
+                    self._procs.pop(job.id, None)
+                self._launch_blocked_until = self._clock() + SAVE_RETRY_S
+            log.error("Run queue: %s not launched: its launch could not be saved first (%s); "
+                      "launches wait %.0f s.", job.name,
+                      self._save_error or "queue.json is not to be overwritten", SAVE_RETRY_S)
+            self._record("run_queue_launch_refused", job=job.id, reason=job.reason)
+            self._notify()
+            return True
         self._record("run_queue_launching", job=job.id, command=command, log_path=log_path,
                      owner=job.owner, drift=sha != job.sha256)
         # unbuffered: output reaches the log as printed; UTF-8: the log is read
         # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         env[run_gate.LAUNCHER_ENV] = LAUNCHER
-        env[JOB_ENV] = str(job.id)
+        env[JOB_ENV] = job.queue_job
         env[OWNER_ENV] = job.owner
         if job.write_back is False:
             env[NO_WRITE_BACK_ENV] = "1"
@@ -1208,15 +1566,25 @@ class RunQueue:
             self._launch_failed(job, OSError(f"cannot write its log {log_path}: {exc}"))
             return True
         result: dict = {}
+        record: dict = {}
 
         def spawn():
             try:
-                result["proc"] = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
+                proc = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
             except BaseException as exc:              # noqa: BLE001
                 result["error"] = exc
+                return
+            with self._lock:
+                result["proc"] = proc
+                abandoned = self._spawning is not record
+            if abandoned:
+                # the queue stopped waiting for this launch (it adopted the run
+                # from liveOD, or gave the job up): its watch is not followed
+                _close(proc)
         thread = threading.Thread(target=spawn, daemon=True, name=f"run-queue-launch-{job.id}")
-        self._spawning = {"job": job.id, "thread": thread, "result": result,
-                          "since": self._clock(), "warned": False}
+        record.update({"job": job.id, "thread": thread, "result": result,
+                       "since": self._clock(), "warned": False})
+        self._spawning = record
         thread.start()
         thread.join(self._spawn_join_s)                # usually done at once
         self._follow_launch(job)
@@ -1237,7 +1605,15 @@ class RunQueue:
                 sp["warned"] = True
                 log.warning("Run queue: %s: its launch has not finished after %.0f s; the slot "
                             "stays taken (the job is looked for in liveOD).", job.name, waited)
-            self._follow_orphan(job, keep_waiting=True)
+            if waited <= LAUNCH_TIMEOUT_S + ORPHAN_WAIT_S:
+                self._follow_orphan(job, keep_waiting=True)
+                return
+            # the launch thread never came back: stop waiting for it (a late
+            # answer is closed by the thread itself) and treat the job as an
+            # orphan -- found in liveOD, or ended failed now
+            self._abandon_spawn()
+            self._record("run_queue_launch_abandoned", job=job.id, waited_s=round(waited, 1))
+            self._follow_orphan(job)
             return
         self._spawning = None
         result = sp["result"]
@@ -1254,6 +1630,15 @@ class RunQueue:
             return
         self._launch_failed(job, exc)
 
+    def _abandon_spawn(self) -> None:
+        """Stop waiting for the launch thread: a watch it already returned is
+        closed here, one it returns later is closed by the thread."""
+        with self._lock:
+            sp, self._spawning = self._spawning, None
+            proc = (sp or {}).get("result", {}).get("proc")
+        if proc is not None:
+            _close(proc)
+
     def _launched(self, job: Job, proc) -> None:
         with self._lock:
             if job.state != "launching":
@@ -1267,8 +1652,7 @@ class RunQueue:
                 job.pid_started = getattr(proc, "started", None)
                 self._procs[job.id] = proc
         if close:
-            if hasattr(proc, "close"):
-                proc.close()
+            _close(proc)
             return
         log.info("Run queue: %s launched (pid %s).", job.name, job.pid)
         self._record("run_queue_launch", job=job.id, pid=job.pid, log_path=job.log_path,
@@ -1293,7 +1677,7 @@ class RunQueue:
         """A ``launching`` job with no process to follow: the server stopped
         while launching it, or its launcher never answered.  It is never
         launched again.  Its run is looked for in liveOD (launcher "kq",
-        queue_job = its id): a run in progress is adopted (its experiment's
+        queue_job = "<id>:<token>"): a run in progress is adopted (its experiment's
         pid), a recorded outcome judges it; after :data:`ORPHAN_WAIT_S` with
         neither it ends failed ("server stopped while launching -- check")."""
         poll = self._last_poll
@@ -1309,7 +1693,7 @@ class RunQueue:
                     job.client_pid = poll.get("client_pid")
                     job.adopted = True
                 if keep_waiting:
-                    self._spawning = None          # the launch thread's answer is not needed
+                    self._abandon_spawn()          # the launch thread's answer is not needed
                 log.warning("Run queue: %s was launching; its run %s is in liveOD (pid %s): "
                             "followed.", job.name, job.run_id, job.client_pid)
                 self._record("run_queue_adopted", job=job.id, pid=job.client_pid,
@@ -1389,10 +1773,12 @@ class RunQueue:
     @staticmethod
     def _is_job_run(job: Job, record) -> bool:
         """A liveOD POLL reply or last_outcome record is about ``job``'s run:
-        launched by the queue, with this job's id (``queue_job``, sent by the
+        launched by the queue, with this job's id AND token (``queue_job``
+        "<id>:<token>": ids start again at 1 in another queue folder, so an id
+        alone could match an old run's record; sent by the
         experiment at INIT_RUN from WAXX_QUEUE_JOB)."""
         return (isinstance(record, dict) and record.get("launcher") == LAUNCHER
-                and str(record.get("queue_job") or "") == str(job.id)
+                and str(record.get("queue_job") or "") == job.queue_job
                 and bool(record.get("run_id")))
 
     def _identify(self, job: Job, poll) -> None:
@@ -1701,6 +2087,16 @@ class RunQueue:
 
     def _alarm_tick(self, now: float) -> None:
         with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            stuck = (cur is not None and cur.state == "launching"
+                     and now - float(cur.launched_at or now) > SPAWN_WARN_S)
+        if stuck:
+            self._raise_alarm(now, cur, now - float(cur.launched_at),
+                              f"{cur.name} has been launching for "
+                              f"{(now - float(cur.launched_at)) / 60.0:.1f} min (its launcher "
+                              "has not answered and no run of it is in liveOD)")
+            return
+        with self._lock:
             owed = self._current is None and bool(self._order(now))
             nxt = self._order(now)[0] if owed else None
         if owed and self._gate_kind != "blocked":
@@ -1721,16 +2117,21 @@ class RunQueue:
         waited = now - self._owed_since
         if waited <= self.alarm_s:
             return
+        self._raise_alarm(now, nxt, waited,
+                          f"{nxt.name} has been ready to start for {waited / 60.0:.0f} min and "
+                          f"nothing has launched -- {self._waiting or 'the reason is not known'}")
+
+    def _raise_alarm(self, now: float, job: Job, waited: float, text: str) -> None:
+        """One WARNING and journal record per alarm_s while the alarm holds."""
         if self._alarm is not None and now - self._alarm["warned"] < self.alarm_s:
             return
         first = self._alarm is None
-        self._alarm = {"since": self._owed_since, "warned": now, "job": nxt.id,
-                       "waited_s": waited, "why": self._waiting}
-        log.warning("RUN QUEUE ALARM: %s has been ready to start for %.0f min and nothing has "
-                    "launched -- %s", nxt.name, waited / 60.0,
-                    self._waiting or "the reason is not known")
-        self._record("run_queue_alarm", job=nxt.id, waited_s=round(waited, 1),
-                     why=self._waiting, first=first)
+        why = self._waiting if job.state == "queued" else text
+        self._alarm = {"since": now - waited, "warned": now, "job": job.id,
+                       "waited_s": waited, "why": why}
+        log.warning("RUN QUEUE ALARM: %s", text)
+        self._record("run_queue_alarm", job=job.id, waited_s=round(waited, 1), why=why,
+                     first=first)
         self._notify()
 
     def _clear_alarm(self, why: str) -> None:
@@ -1742,14 +2143,17 @@ class RunQueue:
 
     # -- persistence -----------------------------------------------------------------------
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         """Write queue.json.  Two threads may save at once (a request and the
         tick): each snapshot gets a sequence number under the queue's lock, and
         a snapshot older than the one last written is not written -- the file
         never goes back to an earlier state.  Deadlock-free whatever lock the
-        caller holds (the save lock is never held while taking the queue's)."""
+        caller holds (the save lock is never held while taking the queue's).
+        True when this state is on disk (written now, or a newer one already
+        is); False when nothing could be written (no folder, the file is not
+        to be overwritten, or the write failed)."""
         if not self.enabled or self._no_save:
-            return
+            return False
         with self._lock:
             self._save_seq += 1
             seq = self._save_seq
@@ -1764,15 +2168,18 @@ class RunQueue:
                     "own_abort_ids": sorted(self._own_abort_ids)[-200:], "seq": seq}
         with self._save_lock:
             if seq <= self._saved_seq:
-                return                    # a newer snapshot is already on disk
+                return True               # a newer snapshot is already on disk
             try:
                 from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
                 os.makedirs(self.directory, exist_ok=True)
                 atomic_write(self._path("queue.json"), data)
                 self._saved_seq = seq
+                return True
             except Exception as exc:                  # noqa: BLE001
                 log.error("Run queue: could not store the queue in %s (%s).",
                           self._path("queue.json"), exc)
+                self._save_error = str(exc)
+                return False
 
     def _load_failed(self, exc) -> None:
         """queue.json could not be read: fail closed.  The file is moved aside
@@ -1828,6 +2235,11 @@ class RunQueue:
             return
         self._jobs = {j.id: j for j in jobs}
         self._next_id = next_id
+        if any(j.state == "queued" and j.rank is None for j in jobs):
+            # a queue.json from before ranks: the queued jobs keep their id order
+            for k, j in enumerate(sorted((j for j in jobs if j.state == "queued"),
+                                         key=lambda j: j.id)):
+                j.rank = float(k + 1)
         for scope in PAUSE_SCOPES:
             self._paused[scope] = (data.get("paused") or {}).get(scope) or None
         self._resume_loop = data.get("resume_loop") or None

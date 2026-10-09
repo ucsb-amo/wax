@@ -799,7 +799,8 @@ class MonitorUDPServer(UdpServer):
     # --- the run queue and the person hold ---------------------------------------------
 
     #: run_queue actions -> the RunQueue method that answers them
-    _QUEUE_ACTIONS = {"submit": "submit", "cancel": "cancel", "list": "list",
+    _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move",
+                      "cancel": "cancel", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
                       "resume": "resume", "hold": "hold_request", "release": "release_request"}
 
@@ -812,7 +813,7 @@ class MonitorUDPServer(UdpServer):
         if method is None:
             return {"status": "error", "msg": f"unknown run_queue action {action!r} "
                                               f"(known: {', '.join(self._QUEUE_ACTIONS)})"}
-        if action == "submit":
+        if action in ("submit", "insert"):
             monitor = self.status.expt_path
             try:
                 same = bool(monitor) and bool(obj.get("path")) and (
