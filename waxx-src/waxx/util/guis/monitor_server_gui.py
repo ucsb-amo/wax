@@ -682,6 +682,14 @@ class MonitorUDPServer(UdpServer):
             self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
                                 client=client, msg=msg)
             return {"status": "error", "msg": msg}
+        queued = self._queue_slot_text()
+        if queued:
+            msg = (f"{queued} -- a reset would take the core from it. Wait for it to end "
+                   "(queued jobs wait while the reset runs)")
+            log.warning("State reset refused: %s", msg)
+            self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
+                                client=client, msg=msg)
+            return {"status": "error", "msg": msg}
         pending = self._current_run_pending()
         if pending is not None and not self.reset.running:
             msg = (f"a run is starting (run {pending.get('run_id')}, "
@@ -719,6 +727,16 @@ class MonitorUDPServer(UdpServer):
         if other is not None and other is not loop:
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
+        if self.run_queue.has_work():
+            # the queue starts the loop it stopped again itself once it has run out
+            msg = (f"the run queue has work ({self.run_queue.work_text()}) -- {loop.spec.title} "
+                   "can start when it has run out (a loop the queue stopped starts again by "
+                   "itself)")
+            log.warning("%s: start refused: %s", loop.spec.title, msg)
+            self.journal.record("run_loop_refused", loop=loop.spec.key, expt=loop.expt,
+                                who="@".join(p for p in (operator, client) if p) or "?",
+                                msg=msg)
+            return {"status": "error", "msg": msg}
         return loop.start(operator=operator, client=client, path=obj.get("path"))
 
     def _reply_output(self, obj: dict) -> dict:
@@ -787,6 +805,14 @@ class MonitorUDPServer(UdpServer):
         except Exception as exc:                      # noqa: BLE001
             log.exception("Run queue request %s failed", action)
             return {"status": "error", "msg": f"the run queue failed on {action}: {exc!r}"}
+
+    def _queue_slot_text(self) -> str:
+        """"the run queue's job 12 (rabi) is running" while a queue job is in
+        its slot, else ""."""
+        cur = self.run_queue.current_job()
+        if cur is None:
+            return ""
+        return f"the run queue's job {cur['id']} ({cur['label']}) is {cur['state']}"
 
     def _queue_busy(self) -> str:
         """Why something of this server's own holds the machine, for the run
@@ -881,7 +907,7 @@ class MonitorUDPServer(UdpServer):
         loop = active_loop(self.loops.values())
         if loop is not None:
             return f"{loop.spec.title} is running"
-        return ""
+        return self._queue_slot_text()
 
     def _on_slm_reinit_change(self, snapshot: dict) -> None:
         self._broadcaster.send({"type": "slm_reinit", "slm_reinit": snapshot})
@@ -1212,7 +1238,7 @@ class MonitorUDPServer(UdpServer):
         loop = active_loop(self.loops.values())
         if loop is not None:
             return f"{loop.spec.title} is running"
-        return ""
+        return self._queue_slot_text()
 
     @classmethod
     def _changed_channels(cls, old: dict, fresh: dict) -> list[str]:

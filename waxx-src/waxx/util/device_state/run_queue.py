@@ -571,6 +571,12 @@ class RunQueue:
 
     # -- state ----------------------------------------------------------------------
 
+    def current_job(self) -> dict | None:
+        """The job in the slot (running / ending), or None."""
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            return cur.to_dict() if cur is not None else None
+
     def has_work(self) -> bool:
         """Jobs queued or in the slot (a loop's Start is refused then)."""
         with self._lock:

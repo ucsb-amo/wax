@@ -170,3 +170,77 @@ def test_a_reset_on_a_persons_run_holds_but_not_on_an_agents_queued_run(server, 
     assert server.person_hold.active and server.person_hold.info()["run_id"] == 85601
     status = json.loads(server.generate_reply("status_json"))
     assert status["person_hold"]["reason"].startswith("Reset in liveOD at ")
+
+
+# --- the queue and the server's real run loop ------------------------------------------------
+
+class LoopProc:
+    """One run of the loop's experiment: prints its run id, waits for
+    ``release``, then liveOD records it saved; exit code 0."""
+
+    def __init__(self, live, run_id, release: threading.Event):
+        self.pid, self._live, self._run_id, self._release = 4242, live, run_id, release
+        self.stdout = self._out()
+
+    def _out(self):
+        self._live.start_run(self._run_id)
+        yield f"Run ID: {self._run_id}\n"
+        self._release.wait(5)
+        self._live.end_run(self._run_id)
+
+    def wait(self):
+        return 0
+
+
+def _wait_for(predicate, timeout=5.0):
+    import time
+    t0 = time.monotonic()
+    while not predicate() and time.monotonic() - t0 < timeout:
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    run_ids = iter([81001, 81002])
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, next(run_ids), release)
+    assert server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})["status"] == "ok"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"            # its run in progress finishes
+    assert server.spawner.calls == []
+    assert "BEC TOF loop is finishing its run" in server.run_queue.info()["waiting"]
+    assert server.run_queue.info()["resume_loop"]["key"] == "auto_tof"
+    release.set()
+    loop.join(5)
+    QApplication.processEvents()
+    assert loop.info()["state"] == "stopped" and loop.info()["runs"] == 1
+    assert server.monitor_starts == []                   # no monitor between loop and job
+    server.watch_tick()
+    assert len(server.spawner.calls) == 1
+    # a person's Start meanwhile is refused, naming the queue's work
+    refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
+    assert refused["status"] == "error" and "the run queue has work (job 1" in refused["msg"]
+    release.clear()                                      # the loop's next run will wait
+    _run(server, 85600)                                  # its last tick starts the loop
+    assert loop.info()["state"] == "running", loop.info()["text"]   # started again by the queue
+    assert server.monitor_starts == []
+    kinds = [e["kind"] for e in server.journal.tail(200)]
+    assert "run_queue_loop_stop" in kinds and "run_queue_loop_resume" in kinds
+    loop.stop()
+    release.set()
+    loop.join(5)
+
+
+def test_a_state_reset_is_refused_while_a_queue_job_runs(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    reply = server.ask({"type": "reset_state", "operator": "jp"})
+    assert reply["status"] == "error" and "the run queue's job 1 (rabi) is running" in reply["msg"]
+    assert "run queue's job 1" in server._regenerate_blocker()
+    from waxx.util.comms_server.comm_server import STATES
+    server.status.state = STATES.READY                   # even with a monitor up
+    assert "run queue's job 1" in server._slm_reinit_blocker()
