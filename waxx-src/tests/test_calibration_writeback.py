@@ -365,7 +365,7 @@ def test_a_failed_restore_says_file_left_modified(modules, monkeypatch, capsys):
 
     def flaky(p, data, **k):
         calls.append(Path(p).name)
-        if len(calls) == 3:                      # backup, new bytes, then the restore
+        if len(calls) == 2:                      # new bytes, then the restore (backup: 'xb')
             raise PermissionError("held open by an editor")
         return real(p, data, **k)
     monkeypatch.setattr(writeback, "replace_bytes", flaky)
@@ -462,3 +462,40 @@ def test_subclass_run_sees_a_base_write(modules):
     rep = writeback.apply("t_pi", result(), sub.Sub, date="2026-10-09")
     assert rep.ok, rep.reason
     assert sub.Sub().t_pi == 6.612e-06 and base.Params().t_pi == 6.612e-06
+
+
+def test_an_unresolved_backup_blocks_every_write_back(modules, monkeypatch):
+    """After a FILE LEFT MODIFIED, the backup holds the true original: no later
+    apply or revert may overwrite it."""
+    mod, path = modules(BASE)
+    raw = path.read_bytes()
+    real, real_verify = writeback.replace_bytes, writeback._verify
+    calls = []
+
+    def flaky(p, data, **k):
+        calls.append(1)
+        if len(calls) == 2:                      # new bytes, then the failing restore
+            raise PermissionError("held open by an editor")
+        return real(p, data, **k)
+    monkeypatch.setattr(writeback, "replace_bytes", flaky)
+    monkeypatch.setattr(writeback, "_verify", lambda *a, **k: "verification failed: test")
+    rep = writeback.apply("t_pi", result(), mod.Params)
+    assert rep.left_modified
+    backup = Path(rep.backup)
+    assert backup.read_bytes() == raw
+    monkeypatch.setattr(writeback, "replace_bytes", real)
+    monkeypatch.setattr(writeback, "_verify", real_verify)
+    modified = path.read_bytes()
+    for rep in (writeback.apply("t_pi", result(value=6.7e-06), mod.Params),
+                writeback.apply("t_pi", result(value=6.7e-06), mod.Params, dry_run=True),
+                writeback.revert("t_pi", mod.Params)):
+        assert not rep.ok and "a previous write-back was left unverified" in rep.reason
+        assert str(backup) in rep.reason
+    assert backup.read_bytes() == raw and path.read_bytes() == modified
+    # once a person restores the file and deletes the backup, write-backs work again
+    path.write_bytes(raw)
+    backup.unlink()
+    sys.modules.pop(mod.__name__)
+    importlib.invalidate_caches()
+    mod = importlib.import_module(mod.__name__)
+    assert writeback.apply("t_pi", result(), mod.Params, date="2026-10-09").ok

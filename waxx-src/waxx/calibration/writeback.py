@@ -419,6 +419,15 @@ def _restore(path: Path, src: _Source, target, params_cls, backup: Path) -> bool
     return True
 
 
+def _backup_path(path) -> Path:
+    return Path(str(path) + ".kcal-backup")
+
+
+def _backup_refusal(backup) -> str:
+    return (f"a previous write-back was left unverified; restore or delete {backup} first "
+            f"(it holds the file as it was before that write-back); nothing written")
+
+
 def _write_verified(target: Target, src: _Source, new_lines, expected, key, params_cls):
     """Under the caller's lock: write ``new_lines`` if the file still holds
     ``src``'s bytes, verify, restore on any failure (also on KeyboardInterrupt).
@@ -426,10 +435,16 @@ def _write_verified(target: Target, src: _Source, new_lines, expected, key, para
     once the file holds verified new bytes or the original bytes again.
     Returns (refusal text or None, left_modified, backup path)."""
     path = Path(target.file)
-    backup = Path(str(path) + ".kcal-backup")
+    backup = _backup_path(path)
     if path.read_bytes() != src.raw:
         return (f"{path} changed since it was read; nothing written (try again)", False, None)
-    replace_bytes(backup, src.raw)
+    try:
+        with open(backup, "xb") as f:                 # never over an existing backup
+            f.write(src.raw)
+            f.flush()
+            os.fsync(f.fileno())
+    except FileExistsError:
+        return (_backup_refusal(backup), False, None)
     why, written, ok, left_modified = None, False, False, False
     try:
         replace_bytes(path, src.encode(new_lines))
@@ -469,6 +484,8 @@ def _locked_edit(rep, key, params_cls, build, dry_run):
     t0 = find_assignment(key, params_cls)                 # which file to lock
     lock = contextlib.nullcontext() if dry_run else file_lock(t0.file, timeout=LOCK_TIMEOUT_S)
     with lock:
+        if _backup_path(t0.file).exists():           # a FILE LEFT MODIFIED is unresolved
+            raise WritebackRefused(_backup_refusal(_backup_path(t0.file)))
         src = _Source.read(t0.file)
         t = find_assignment(key, params_cls, _sources={_norm(t0.file): src})
         if _norm(t.file) != _norm(t0.file):

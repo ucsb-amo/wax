@@ -302,3 +302,17 @@ def test_kcal_oserror_is_one_line(env):
     spec = env.spec.replace(":CFG", ":BAD")
     code, out = kcal("--config", spec, "emit", "t_pi", "--run", "1", "--analysis", "fake_emit")
     assert code == 2 and out == "kcal emit: OSError: the data drive is not mapped"
+
+
+def test_kcal_apply_refused_by_an_unresolved_backup_is_journaled(env, monkeypatch):
+    monkeypatch.setenv(ENV_VAR, env.spec)
+    led = Ledger(env.ledger)
+    led.write_record(record())
+    backup = env.params_file.with_name(env.params_file.name + ".kcal-backup")
+    backup.write_bytes(b"original bytes")
+    raw = env.params_file.read_bytes()
+    code, out = kcal("apply", "t_pi", "--run", "85600")
+    assert code == 2 and "left unverified" in out
+    assert env.params_file.read_bytes() == raw and backup.read_bytes() == b"original bytes"
+    ev = [e for e in led.events() if e["event"] == "apply"]
+    assert len(ev) == 1 and ev[0]["ok"] is False and "left unverified" in ev[0]["reason"]
