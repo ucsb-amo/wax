@@ -56,6 +56,43 @@ def _arm_exit_hang_dump(seconds=T_ABORT_EXIT_HANG_DUMP, announce=True):
         pass
 
 
+def _same_value(a, b) -> bool:
+    try:
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            a, b = np.asarray(a), np.asarray(b)
+            if a.shape != b.shape:
+                return False
+            try:
+                return bool(np.array_equal(a, b, equal_nan=True))
+            except TypeError:
+                return bool(np.array_equal(a, b))
+        if a == b:
+            return True
+        return bool(a != a and b != b)                   # both NaN
+    except Exception:
+        return False
+
+
+def _keys_differing_from_default(params) -> set:
+    """Public keys of ``params`` whose value is not what a fresh
+    ``type(params)()`` (after compute_derived) has. Never raises: on a failure
+    to build the default it prints why and returns every public key (nothing
+    is then taken for a default)."""
+    try:
+        fresh = type(params)()
+        cd = getattr(fresh, "compute_derived", None)
+        if callable(cd):
+            cd()
+        dv = vars(fresh)
+        return {k for k, v in vars(params).items()
+                if not k.startswith("_") and (k not in dv or not _same_value(v, dv[k]))}
+    except Exception as e:
+        print(f"[params] WARNING: could not compare the params with a fresh "
+              f"{type(params).__name__} ({type(e).__name__}: {e}); every param counts as set "
+              f"by this run.")
+        return {k for k in vars(params) if not k.startswith("_")}
+
+
 def _fmt_duration(seconds):
     """'45s', '3m07s', '1h02m' (ASCII, for terminal progress lines)."""
     s = int(round(seconds))
@@ -251,11 +288,19 @@ class Expt(Scanner, Dealer, Scribe):
         (``self.p.x = ...``): the experiment's own overrides. A machine whose
         Base replaces self.params calls this again once its params object is
         set up. A params class without the recorder (waxx.config.expt_params
-        has it) leaves ``_param_overrides`` None: unknown, not empty."""
+        has it) leaves ``_param_overrides`` None: unknown, not empty.
+
+        Assignments made before this call (a params object built and changed
+        before it was handed to Base) are caught by value: every key whose
+        value differs from a fresh ``type(params)()`` (after its
+        compute_derived()) starts in the recorded set. That also counts any
+        non-default value Base itself set (the conservative direction), and
+        misses an earlier assignment equal to the default (which then makes no
+        difference to the run)."""
         p = getattr(self, "params", None)
         if p is not None and getattr(type(p), "_records_assignments", False):
             d = vars(p)
-            d["_assigned_keys"] = set()
+            d["_assigned_keys"] = _keys_differing_from_default(p)
             d["_record_assignments"] = True
 
     def _stop_param_override_recording(self):

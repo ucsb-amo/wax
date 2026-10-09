@@ -57,12 +57,15 @@ def test_records_only_what_prepare_assigns():
 def test_compute_derived_restores_recording_even_when_it_raises():
     class Bad(P):
         def compute_bad(self):
-            raise ValueError("boom")
+            if vars(self).get("_boom"):
+                raise ValueError("boom")
     p = Bad()
     e = expt_with(p)
     start(e)
+    vars(p)["_boom"] = True
     with pytest.raises(ValueError):
         p.compute_derived()
+    vars(p)["_boom"] = False
     p.amp = 0.9
     stop(e)
     assert e._param_overrides == frozenset({"amp"})
@@ -142,3 +145,41 @@ def test_a_recording_params_object_compiles_in_a_kernel():
     b = Broken()
     with pytest.raises(CompileError, match="no_such_param_xyz"):
         b.core.compile(Broken.run, [b], {}, attribute_writeback=True, print_as_rpc=False)
+
+
+# ---- S13: a params object changed before recording started ---------------------------
+
+def test_assignments_before_recording_are_caught_by_value():
+    p = P()
+    p.amp = 0.75                          # set before it reached Base
+    p.t_new = 1.0                         # a key the class does not have
+    p.t_x = 1.0                           # assigned, but equal to the default
+    p.compute_derived()
+    e = expt_with(p)
+    start(e)
+    p.N_repeats = 4
+    stop(e)
+    assert e._param_overrides == frozenset({"amp", "t_new", "N_repeats"})
+
+
+def test_arrays_and_nan_compare_by_value():
+    p = P()
+    p.arr_default = np.array([1.0, np.nan])
+    from waxx.base.expt import _same_value
+    assert _same_value(np.array([1.0, np.nan]), np.array([1.0, np.nan]))
+    assert not _same_value(np.array([1.0, 2.0]), np.array([1.0, 3.0]))
+    assert not _same_value(np.array([1.0]), np.array([1.0, 1.0]))
+    assert _same_value(float("nan"), float("nan"))
+    assert _same_value(np.int32(3), 3)
+
+
+def test_a_failed_default_counts_every_param(capsys):
+    class NoDefault(P):
+        def __init__(self, required):
+            super().__init__()
+    p = NoDefault(1)
+    e = expt_with(p)
+    start(e)
+    stop(e)
+    assert {"t_x", "amp", "N_repeats"} <= e._param_overrides
+    assert "every param counts as set by this run" in capsys.readouterr().out
