@@ -523,6 +523,7 @@ class RunQueue:
         self._dep_cache: dict[int, str] = {}
         #: (path, mtime_ns, size) -> sha256, for source_changed on listings
         self._sha_cache: dict = {}
+        self._sha_lock = threading.Lock()
         #: the last gate's kind: "free" | "live" | "blocked" (see _gate)
         self._gate_kind = ""
         #: the run id of the job that ended last (its fence may still be up)
@@ -770,21 +771,34 @@ class RunQueue:
         """Job id -> 0-based position among the queued jobs (rank order)."""
         return {j.id: i for i, j in enumerate(self._queued_in_order())}
 
-    def _duration_estimate(self, job: Job) -> tuple[float | None, str]:
-        """(seconds, basis): the median launch-to-end time of the last 5 saved
-        runs of the same file (jobs the queue still keeps), or (None, why)."""
-        runs = sorted((j for j in self._jobs.values()
-                       if j.path == job.path and j.state == "saved"
-                       and j.launched_at and j.ended_at and j.id != job.id),
-                      key=lambda j: j.ended_at)[-5:]
-        if not runs:
-            return None, "no saved run of this file to go by"
-        times = sorted(j.ended_at - j.launched_at for j in runs)
-        mid = len(times) // 2
-        median = times[mid] if len(times) % 2 else (times[mid - 1] + times[mid]) / 2
-        return median, f"median of the last {len(runs)} saved run(s) of this file"
+    def _medians(self) -> dict:
+        """path -> (median launch-to-end seconds, n) over the last 5 saved runs
+        of each file (jobs the queue still keeps); one pass over the jobs."""
+        by_path: dict = {}
+        for j in self._jobs.values():
+            if j.state == "saved" and j.launched_at and j.ended_at:
+                by_path.setdefault(j.path, []).append(j)
+        out = {}
+        for path, runs in by_path.items():
+            runs = sorted(runs, key=lambda j: j.ended_at)[-5:]
+            times = sorted(j.ended_at - j.launched_at for j in runs)
+            mid = len(times) // 2
+            out[path] = ((times[mid] if len(times) % 2 else (times[mid - 1] + times[mid]) / 2),
+                         len(runs))
+        return out
 
-    def _running_end(self, job: Job, now: float) -> tuple[float | None, str]:
+    def _duration_estimate(self, job: Job, medians: dict | None = None
+                           ) -> tuple[float | None, str]:
+        """(seconds, basis): the median launch-to-end time of the last 5 saved
+        runs of the same file (jobs the queue still keeps), or (None, why).
+        ``medians``: :meth:`_medians`, when the caller has it already."""
+        found = (medians if medians is not None else self._medians()).get(job.path)
+        if found is None:
+            return None, "no saved run of this file to go by"
+        return found[0], f"median of the last {found[1]} saved run(s) of this file"
+
+    def _running_end(self, job: Job, now: float, medians: dict | None = None
+                     ) -> tuple[float | None, str]:
         """(epoch, basis): when the job in the slot should end -- from liveOD's
         shots (expected x measured period) once it has taken one, else its
         launch time + the duration estimate."""
@@ -798,64 +812,92 @@ class RunQueue:
                 end = now - last_age + max(0, int(want) - int(n)) * period
                 return end, (f"liveOD: shot {n} of {want}, {period:.1f} s per shot (the save "
                              "is not included)")
-        dur, basis = self._duration_estimate(job)
+        dur, basis = self._duration_estimate(job, medians)
         if dur is None or not job.launched_at:
             return None, basis
         return job.launched_at + dur, basis
 
-    def _source_changed(self, job: Job) -> bool | None:
-        """Whether a queued job's file differs from the one submitted (None
-        when it cannot be read); hashed again only when its size or mtime moved."""
+    @staticmethod
+    def _stat_key(path: str):
+        """(path, mtime_ns, size), or None when the file cannot be read."""
         try:
-            st = os.stat(job.path)
+            st = os.stat(path)
         except OSError:
             return None
-        key = (job.path, st.st_mtime_ns, st.st_size)
-        sha = self._sha_cache.get(key)
-        if sha is None:
-            try:
-                sha = file_sha256(job.path)
-            except OSError:
-                return None
-            self._sha_cache = {k: v for k, v in self._sha_cache.items() if k[0] != job.path}
-            self._sha_cache[key] = sha
-        return sha != job.sha256
+        return (path, st.st_mtime_ns, st.st_size)
 
-    def _views(self, jobs: list[Job], now: float) -> list[dict]:
+    def _fill_source_changed(self, pending) -> None:
+        """Called OUTSIDE the lock: for each (view, key, sha at submit), set
+        the view's source_changed -- hashing a file again only when its size
+        or mtime moved since it was last hashed."""
+        for view, key, submitted in pending:
+            if key is None:
+                view["source_changed"] = None
+                continue
+            with self._sha_lock:
+                sha = self._sha_cache.get(key)
+            if sha is None:
+                try:
+                    sha = file_sha256(key[0])
+                except OSError:
+                    view["source_changed"] = None
+                    continue
+                with self._sha_lock:
+                    self._sha_cache = {k: v for k, v in self._sha_cache.items()
+                                       if k[0] != key[0]}
+                    self._sha_cache[key] = sha
+            view["source_changed"] = sha != submitted
+
+    def _source_changed(self, job: Job) -> bool | None:
+        """Whether a queued job's file differs from the one submitted (None
+        when it cannot be read) -- for one job, outside the lock."""
+        view: dict = {}
+        self._fill_source_changed([(view, self._stat_key(job.path), job.sha256)])
+        return view["source_changed"]
+
+    def _views(self, jobs: list[Job], now: float) -> tuple[list[dict], list]:
         """Each job as list/describe show it: its record plus ``position``,
         ``waiting``, ``source_changed`` (queued jobs) and ``estimate`` --
         ``{duration_s, eta_start, eta_end, basis}``, all ESTIMATES: the
         duration from the last saved runs of the same file; for the job in the
         slot its expected end; for a queued job its expected start (now + the
         slot's remaining time + the durations of the queued jobs ahead of it;
-        null when any of them is unknown)."""
-        positions = self._positions()
+        null when any of them is unknown).
+
+        Called under the lock; one pass: the order, the positions and the
+        per-file medians are computed once.  Returns ``(views, pending)``:
+        ``source_changed`` is filled by :meth:`_fill_source_changed` with
+        ``pending`` AFTER the lock is released (it may hash files)."""
+        queued = self._queued_in_order()
+        positions = {j.id: i for i, j in enumerate(queued)}
+        order = self._order(now)
+        medians = self._medians()
         cur = self._jobs.get(self._current) if self._current is not None else None
         ahead_s: float | None = 0.0
         if cur is not None:
-            end, _ = self._running_end(cur, now)
+            end, _ = self._running_end(cur, now, medians)
             ahead_s = None if end is None else max(0.0, end - now)
         start_of: dict[int, float | None] = {}
-        for q in self._queued_in_order():
+        for q in queued:
             start_of[q.id] = None if ahead_s is None else now + ahead_s
-            dur, _ = self._duration_estimate(q)
+            dur, _ = self._duration_estimate(q, medians)
             ahead_s = None if (ahead_s is None or dur is None) else ahead_s + dur
-        out = []
+        out, pending = [], []
         for job in jobs:
-            dur, basis = self._duration_estimate(job)
+            dur, basis = self._duration_estimate(job, medians)
             estimate = {"duration_s": dur, "eta_start": None, "eta_end": None, "basis": basis}
             view = dict(job.to_dict(), position=positions.get(job.id),
-                        waiting=self._why_waiting(job, now), source_changed=None,
+                        waiting=self._why_waiting(job, now, order), source_changed=None,
                         estimate=estimate)
             if job.state == "queued":
-                view["source_changed"] = self._source_changed(job)
+                pending.append((view, self._stat_key(job.path), job.sha256))
                 estimate["eta_start"] = start_of.get(job.id)
                 if estimate["eta_start"] is not None and dur is not None:
                     estimate["eta_end"] = estimate["eta_start"] + dur
             elif job.state in IN_SLOT:
-                estimate["eta_end"], estimate["basis"] = self._running_end(job, now)
+                estimate["eta_end"], estimate["basis"] = self._running_end(job, now, medians)
             out.append(view)
-        return out
+        return out, pending
 
     @staticmethod
     def _row(view: dict) -> dict:
@@ -909,7 +951,9 @@ class RunQueue:
             if "paused" in after:
                 job.paused_by = by if job.paused else ""
                 job.paused_since = self._clock() if job.paused else None
-            view = self._views([job], self._clock())[0]
+            views, pending = self._views([job], self._clock())
+            view = views[0]
+        self._fill_source_changed(pending)
         if after:
             log.info("Run queue: %s edited by %s: %s", job.name, by,
                      ", ".join(f"{k} {before[k]!r} -> {after[k]!r}" for k in after))
@@ -1070,27 +1114,33 @@ class RunQueue:
     def list(self, obj: Mapping | None = None) -> dict:
         """``{"states"?: [...], "limit"?: n}`` -> the jobs: the ended ones (by
         id, the last ``limit``), then the one in the slot, then the queued ones
-        in rank order -- each with ``position`` (0-based among the queued jobs;
-        None for the others); ``next``: the eligible jobs in launch order."""
+        in rank order (the first ``limit``; ``truncated`` true when there were
+        more, ``queued_total`` says how many) -- each with ``position`` (0-based
+        among the queued jobs; None for the others); ``next``: the eligible
+        jobs in launch order."""
         obj = obj or {}
         states = obj.get("states")
         try:
             limit = int(obj.get("limit") or 200)
         except (TypeError, ValueError):
             limit = 200
+        limit = max(1, limit)
         with self._lock:
-            positions = self._positions()
             ended = sorted((j for j in self._jobs.values() if j.state in ENDED),
                            key=lambda j: j.id)[-limit:]
             slot = sorted((j for j in self._jobs.values() if j.state in IN_SLOT),
                           key=lambda j: j.id)
-            jobs = [j for j in ended + slot + self._queued_in_order()
+            queued = self._queued_in_order()
+            truncated = len(queued) > limit
+            jobs = [j for j in ended + slot + queued[:limit]
                     if not states or j.state in states]
             now = self._clock()
-            out = self._views(jobs, now)
+            out, pending = self._views(jobs, now)
             order = [j.id for j in self._order(now)]
+        self._fill_source_changed(pending)
         return {"status": "ok", "jobs": out, "rows": [self._row(v) for v in out],
-                "next": order, "run_queue": self.info()}
+                "next": order, "truncated": truncated, "queued_total": len(queued),
+                "run_queue": self.info()}
 
     def describe(self, obj: Mapping) -> dict:
         """``{"id", "token"?}`` -> the job, why it waits, its last lines."""
@@ -1099,9 +1149,11 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
-            view = self._views([job], self._clock())[0]
+            views, pending = self._views([job], self._clock())
+            view = views[0]
             out = {"status": "ok", "job": view, "waiting": view["waiting"],
                    "tail": list(self._tails.get(job.id, ()))}
+        self._fill_source_changed(pending)
         return out
 
     def pause(self, obj: Mapping) -> dict:
@@ -1343,7 +1395,9 @@ class RunQueue:
                     if j.state == "queued" and not self._blocked_by(j, now)]
         return sorted(eligible, key=lambda j: (j.rank, j.id))
 
-    def _why_waiting(self, job: Job, now: float) -> str:
+    def _why_waiting(self, job: Job, now: float, order: list | None = None) -> str:
+        """Why a queued job is not launching (``order``: :meth:`_order`, when
+        the caller has it already)."""
         if job.state != "queued":
             return ""
         own = self._blocked_by(job, now)
@@ -1352,7 +1406,7 @@ class RunQueue:
         if self._current is not None:
             cur = self._jobs.get(self._current)
             return f"after #{self._current} ({cur.state if cur else 'in the slot'})"
-        order = self._order(now)
+        order = self._order(now) if order is None else order
         if order and order[0].id != job.id:
             return f"#{order[0].id} goes first"
         return self._waiting or "launching"

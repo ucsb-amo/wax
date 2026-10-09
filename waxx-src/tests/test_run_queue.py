@@ -1782,3 +1782,47 @@ def test_a_hold_between_the_gate_and_the_launch_keeps_an_agents_job_queued(q, ex
     q._gate = gate_then_hold
     q.tick()
     assert job(q, a)["state"] == "queued" and q.spawner.calls == []
+
+
+# --- list stays cheap with a long queue (review S-c) -----------------------------------------------
+
+def test_a_thousand_queued_jobs_list_quickly_and_are_capped(q, expts):
+    ids = submit(q, expts, repeat=1000, at_end=True)
+    assert len(ids) == 1000
+    held = []
+    real_views = q._views
+
+    def timed_views(jobs, now):
+        t0 = time.perf_counter()
+        out = real_views(jobs, now)
+        held.append(time.perf_counter() - t0)
+        return out
+    q._views = timed_views
+    t0 = time.perf_counter()
+    reply = q.list()
+    total = time.perf_counter() - t0
+    assert reply["truncated"] is True and reply["queued_total"] == 1000
+    queued = [v for v in reply["jobs"] if v["state"] == "queued"]
+    assert [v["position"] for v in queued] == list(range(200))
+    assert len(reply["rows"]) == 200
+    assert held[0] < 1.0, f"the lock was held {held[0]:.2f} s building the views"
+    assert total < 3.0, f"list took {total:.2f} s"
+    big = q.list({"limit": 2000})
+    assert big["truncated"] is False and len(big["jobs"]) == 1000
+    t0 = time.perf_counter()
+    q.describe({"id": ids[-1]})
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_source_hashing_happens_outside_the_lock(q, expts, monkeypatch):
+    submit(q, expts)
+    seen = []
+    real = rq.file_sha256
+
+    def watched(path):
+        seen.append(q._lock._is_owned())
+        return real(path)
+    monkeypatch.setattr(rq, "file_sha256", watched)
+    (expts / "rabi.py").write_text("# touched\n")      # new mtime: hashed again
+    assert q.list()["jobs"][0]["source_changed"] is True
+    assert seen and not any(seen)
