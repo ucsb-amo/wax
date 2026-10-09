@@ -187,6 +187,17 @@ def _who(client: dict) -> str:
     return text
 
 
+#: run_states during which an older liveOD (no ``save_in_progress`` in POLL)
+#: may be running an asynchronous END_RUN save.
+_MAYBE_SAVING_STATES = ("saving", "aborting", "no_reply")
+
+
+def _saving(poll: dict) -> bool:
+    """liveOD is saving the run: ``save_in_progress`` (liveOD from 2026-10-09
+    on), or ``run_state`` "saving" from an older one."""
+    return bool(poll.get("save_in_progress")) or poll.get("run_state") == "saving"
+
+
 def _num(value):
     try:
         return None if value is None else float(value)
@@ -220,6 +231,15 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
     in_progress = bool(poll.get("run_in_progress"))
     reset = bool(poll.get("reset_requested"))
     rid = poll.get("run_id")
+    if _saving(poll):
+        # First, before any client check: a run being saved is live whatever its
+        # process does (it has exited by design) and whatever run_state says (an
+        # Abort pressed during the save shows "aborting"). Closing it as aborted
+        # would delete the file being written.
+        return GateState("live", rid, f"run {rid} is being saved by liveOD",
+                         detail={k: poll.get(k) for k in (
+                             "run_in_progress", "run_id", "reset_requested", "run_state",
+                             "save_in_progress", "save_status")})
     client = _client(poll, check) if (in_progress or reset) else {
         "pid": poll.get("client_pid"), "host": poll.get("client_host"),
         "launcher": str(poll.get("launcher") or ""), "alive": None, "why": "not checked"}
@@ -293,8 +313,6 @@ def _by_timing(poll: dict, rid, client: dict, detail: dict) -> GateState:
     n = _num(poll.get("n_shots"))
     name = f"run {rid}" + (f" ({poll.get('expt_name')})" if poll.get("expt_name") else "")
     process = f"its process: {client['why']}"
-    if poll.get("run_state") == "saving":
-        return GateState("live", rid, f"{name} is being saved by liveOD")
     if last is None:
         if init is None:
             return GateState("live", rid, f"{name} is in progress in liveOD (POLL gives no "
@@ -412,8 +430,14 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False,
                 "why": f"liveOD's current run is {poll.get('run_id')}, not {run_id}",
                 "reply": None}
-    if poll.get("run_state") == "saving":
+    if poll.get("save_in_progress"):
         return {"sent": False, "ok": False, "why": "liveOD is saving the run", "reply": None}
+    if "save_in_progress" not in poll and poll.get("run_state") in _MAYBE_SAVING_STATES:
+        # an older liveOD does not say whether a save runs; during one an Abort
+        # shows "aborting"/"no_reply", and RUN_EXITED then deletes the file
+        return {"sent": False, "ok": False,
+                "why": f"liveOD may be saving the run (run_state {poll.get('run_state')!r}, "
+                       "no save_in_progress in POLL)", "reply": None}
     proc = _client(poll, pid_alive if pid_alive is not None else _default_pid_alive)
     if proc["alive"] is True:
         return {"sent": False, "ok": False,

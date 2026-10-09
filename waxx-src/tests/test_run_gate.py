@@ -114,6 +114,22 @@ def test_a_saving_run_is_live_whatever_its_shot_age():
     assert st.state == "live" and "saved" in st.reason
 
 
+# -- a run being saved (review B1) --------------------------------------------------------
+
+@pytest.mark.parametrize("poll", [
+    # Reset pressed during the save: run_state "aborting", Abort pending
+    _running(save_in_progress=True, reset_requested=True, run_state="aborting"),
+    _running(save_in_progress=True, reset_requested=True, run_state="no_reply"),
+    # its process has exited (as it does once END_RUN is sent): dead client + saving
+    _running(save_in_progress=True, run_state="saving"),
+    # an older liveOD: no save_in_progress, run_state "saving"
+    _running(run_state="saving"),
+])
+def test_a_run_being_saved_is_live_before_any_client_check(poll):
+    st = classify(poll, None, now=NOW, pid_alive=_never)
+    assert st.state == "live" and not st.waivable and "being saved" in st.reason
+
+
 # -- dead client / reset pending -------------------------------------------------------
 
 def test_dead_client_is_waivable_only_when_the_pid_is_dead_on_this_host():
@@ -278,6 +294,26 @@ def test_run_exited_is_not_sent_otherwise(poll, why):
     client = FakeLiveOD(poll)
     out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)
     assert not out["sent"] and why in out["why"] and client.sent == []
+
+
+@pytest.mark.parametrize("poll", [
+    _running(save_in_progress=True, reset_requested=True, run_state="aborting"),
+    _running(save_in_progress=True, run_state="running"),
+    # an older liveOD that may be saving: never during these states
+    _running(reset_requested=True, run_state="aborting"),
+    _running(reset_requested=True, run_state="no_reply"),
+    _running(run_state="saving"),
+])
+def test_run_exited_is_never_sent_during_a_save(poll):
+    client = FakeLiveOD(poll)
+    out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)
+    assert not out["sent"] and "sav" in out["why"] and client.sent == []
+
+
+def test_run_exited_for_an_abort_when_liveod_says_no_save_runs():
+    client = FakeLiveOD(_running(save_in_progress=False, reset_requested=True,
+                                 run_state="aborting"))
+    assert tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)["sent"]
 
 
 def test_run_exited_is_not_sent_while_the_runs_process_lives():

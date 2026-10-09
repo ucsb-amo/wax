@@ -1575,6 +1575,9 @@ class LiveODServer(QThread, NetServer):
         A superseded run's notice changes nothing; one after the run ended is ignored."""
         if not self._run_msg_ok(msg):
             return self._stale_run_reply("RUN_EXITED", msg)
+        refused = self._refuse_while_saving("RUN_EXITED")
+        if refused is not None:
+            return refused
         # A notice sent on the process's behalf (the monitor server's run loop,
         # which has no token) names the run instead; another run's changes nothing.
         if msg.get("run_id") is not None and msg.get("run_id") != self._current_run_id:
@@ -1644,8 +1647,27 @@ class LiveODServer(QThread, NetServer):
         waited = self.abort_unanswered_for()
         if waited is None or waited < ABORT_AGAIN_MIN_S:
             return False
+        if self._run_file.saving:
+            # the run is being saved: closing it as aborted would delete the
+            # file under the save (it ends the run itself when it is done)
+            logger.warning(f"Reset pressed again during run {self._current_run_id}'s save: "
+                           f"the save is left to finish; nothing is closed.")
+            return False
         self._abort_again = True
         return True
+
+    def _refuse_while_saving(self, tag: str):
+        """The reply refusing ``tag`` while the run's asynchronous save runs (None
+        when no save runs): closing the run then would cut the save short, and
+        closing it as aborted would delete the file being written. Nothing
+        changes; the save ends the run itself."""
+        if not self._run_file.saving:
+            return None
+        run_id = self._current_run_id
+        logger.warning(f"{tag} for run {run_id} refused: the run is being saved; nothing "
+                       f"changed (the save ends the run when it is done).")
+        return {"ok": False, "saving": True,
+                "error": f"run {run_id} is being saved; {tag} refused, nothing changed"}
 
     def _check_abort_again(self):
         """Server thread: carry out abort_again()."""
@@ -1783,6 +1805,9 @@ class LiveODServer(QThread, NetServer):
         if not self._run_msg_ok(msg):
             # a superseded run's abort must not discard the current run's file
             return self._stale_run_reply("ABORT_RUN", msg)
+        refused = self._refuse_while_saving("ABORT_RUN")
+        if refused is not None:
+            return refused
         logger.warning("Experiment acknowledged: run aborted.")
         # host mode: the aborted run's hold on its camera ends (a RESET alone keeps it)
         self._host_end_run("ABORT_RUN", record=False)
@@ -1830,6 +1855,12 @@ class LiveODServer(QThread, NetServer):
             # the current (or last) run's client: client_pid, client_host,
             # launcher (None/"" from a client that predates them)
             **self._current_client,
+            # an asynchronous END_RUN save is running (the run stays in progress
+            # until it ends, whatever run_state says -- an Abort pressed during
+            # it shows "aborting"); and the last save's state
+            "save_in_progress": self._run_file.saving,
+            "save_status": {k: v for k, v in self._run_file.status().items()
+                            if k in ("state", "phase", "run_id", "elapsed_s")},
             # which cameras this liveOD holds, and the one the live run is using
             "cameras": self._camera_states(),
             "run_camera_key": (self._current_camera_key
