@@ -347,6 +347,13 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     (default: stdout / stderr), in ASCII."""
 
     class _Parser(argparse.ArgumentParser):
+        def error(self, message):
+            if "--depends-on" in message and "invalid int value" in message:
+                # it takes every word after it: kq run f.py --depends-on 3 a=1
+                message += (" (--depends-on takes job ids up to the next option: put "
+                            "experiment arguments before it, or another option after it)")
+            super().error(message)
+
         def _print_message(self, message, file=None):
             if message:
                 stream = ((err or sys.stderr) if file is sys.stderr

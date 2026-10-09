@@ -665,6 +665,12 @@ def test_dependencies_are_depends_on_and_after_is_only_a_position(server, q, exp
             assert "--after " not in out.getvalue()
 
 
+def test_a_greedy_depends_on_gets_a_hint(server, expts):
+    r = kq(server, "submit", str(expts / "rabi.py"), "--depends-on", "1", "a=1")
+    assert r.code == 2 and "put experiment arguments before it" in r.err
+    assert sent(server, "submit") == []
+
+
 def test_insert_follows_like_run(server, q, expts):
     Script(server, run_steps(q))
     r = kq(server, "insert", str(expts / "rabi.py"), "--at-index", "1")
