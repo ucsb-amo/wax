@@ -124,9 +124,31 @@ class HeadlessMonitorServer(QObject):
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
         self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
+        self.udp_server.server_exit_signal.connect(self._server_exit)
         self.udp_server.message_received.connect(self._handle_message)
         self.server_thread.started.connect(self.udp_server.run)
         self.server_thread.start()
+
+    #: A requested exit waits this long, so the request's reply is sent first.
+    EXIT_DELAY_MS = 300
+
+    def _server_exit(self, code: int, why: str) -> None:
+        """The server accepted a ``server`` restart / shutdown request (its
+        reply is on its way): once it has gone out, stop the monitor
+        experiment and leave the Qt loop with ``code`` -- ``run()`` returns it,
+        so the process exits with it (3: the supervisor starts it again).
+        aboutToQuit then runs :meth:`shutdown`."""
+        log.warning("Monitor server exiting with code %d (%s).", code, why)
+        QTimer.singleShot(self.EXIT_DELAY_MS, lambda: self._exit_now(code))
+
+    def _exit_now(self, code: int) -> None:
+        try:
+            self.monitor_manager.stop()
+        except Exception:
+            log.exception("Error while stopping the monitor experiment")
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.exit(code)
 
     def _on_monitor_stopped(self, reason: str) -> None:
         log.warning("Monitor is not running: %s", reason)

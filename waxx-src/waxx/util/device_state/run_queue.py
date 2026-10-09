@@ -507,6 +507,8 @@ class RunQueue:
         #: a launch whose "launching" state could not be saved
         self._save_error = ""
         self._launch_blocked_until = 0.0
+        #: why no job may launch now ("" normally): the server restarting
+        self._stop_launching = ""
         #: records waiting to be copied to the ops journal (flush_journal)
         self._mirror: deque = deque()
         self._mirror_lock = threading.Lock()
@@ -1297,6 +1299,12 @@ class RunQueue:
         self._record("run_queue_monitor_deferred", what=what, why=why)
         self.flush_journal()
 
+    def stop_launching(self, why: str) -> None:
+        """No job launches from now on (the server is restarting or shutting
+        down); ``why`` is what the gate says.  "" lifts it."""
+        with self._lock:
+            self._stop_launching = str(why or "")
+
     def current_job(self) -> dict | None:
         """The job in the slot (launching / running / ending), or None."""
         with self._lock:
@@ -1577,6 +1585,8 @@ class RunQueue:
         liveOD unreachable or unknown, the server busy, a loop that does not
         stop): only "blocked" runs the alarm's clock."""
         self._gate_kind = "blocked"
+        if self._stop_launching:
+            return self._stop_launching
         if self._clock() < self._launch_blocked_until:
             return ("queue.json could not be saved ("
                     + (self._save_error or "it is not to be overwritten")
@@ -1648,6 +1658,8 @@ class RunQueue:
             if self._blocked_by(job, self._clock()):
                 # paused, held, edited (paused / due / after) while the gate
                 # polled liveOD outside the lock: it stays queued
+                return False
+            if self._stop_launching:                   # the server is restarting
                 return False
             if unreadable is not None:
                 self._end(job, "skipped", f"the file cannot be read at launch ({unreadable})")
