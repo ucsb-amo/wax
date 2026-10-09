@@ -242,7 +242,18 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
     this machine (default: :func:`pid_alive`).  ``monitor_state``: the monitor
     server's ``status_json`` ``state`` -- the fence lapses after
     :data:`FENCE_TTL_S` only while it is READY (as the server's own
-    ``_current_run_pending``); otherwise, or when not given, the fence stands."""
+    ``_current_run_pending``); otherwise, or when not given, the fence stands --
+    unless liveOD shows the fence's run as ended (then it is left over and not
+    counted).
+
+    Against a liveOD older than 2026-10-09 (no ``save_in_progress`` in POLL),
+    :func:`_saving` sees only ``run_state`` "saving": a run with a dead client
+    whose state reads "aborting" / "no_reply" is still a waivable
+    ``reset_pending`` here, while :func:`tell_live_od_run_exited` refuses to
+    send RUN_EXITED in those states (a save might be running). Intentional: the
+    waiver lets the next INIT_RUN finalize such a run, so the 85528 case still
+    clears; the helper's refusal only avoids the one message that could delete
+    a file under a save."""
     now = time.time() if now is None else float(now)
     check = pid_alive if pid_alive is not None else _default_pid_alive
     if not isinstance(poll, dict) or poll.get("ok") is False:
