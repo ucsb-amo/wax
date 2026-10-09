@@ -44,8 +44,10 @@ States (:class:`GateState`):
                    this machine, process gone): liveOD finalizes that run at
                    the next INIT_RUN (its file is discarded, as for any abort).
 ``dead_client``    a run is in progress, no Abort, and its client's process is
-                   known to be dead.  Waivable: the next INIT_RUN supersedes
-                   the run (its file is closed with what it has, not deleted).
+                   known to be dead -- or liveOD itself heard it exit
+                   (``run_state`` "exited", frames still due), pid or not.
+                   Waivable: the next INIT_RUN supersedes the run (its file is
+                   closed with what it has, not deleted).
 ``wedged``         a run is in progress, nothing has happened for longer than
                    the limits above, and its process is alive or cannot be
                    checked.  NOT waivable: a person must look.
@@ -191,9 +193,13 @@ def _client(poll: dict, alive: Callable[[int], bool]) -> dict:
 
 
 def _who(client: dict) -> str:
+    if client.get("pid") is None:
+        return f"pid not recorded; {client['why']}"
     text = f"pid {client['pid']} on {client['host']}"
     if client.get("launcher"):
         text += f", launched by {client['launcher']}"
+    if client.get("heard_exit"):
+        text += f"; {client['why']}"
     return text
 
 
@@ -264,6 +270,11 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
     client = _client(poll, check) if (in_progress or reset) else {
         "pid": poll.get("client_pid"), "host": poll.get("client_host"),
         "launcher": str(poll.get("launcher") or ""), "alive": None, "why": "not checked"}
+    if in_progress and poll.get("run_state") == "exited" and client["alive"] is not True:
+        # liveOD itself heard the process exit (its RUN_EXITED; the run waits for
+        # frames still due): dead, whether or not a pid was recorded
+        client = dict(client, alive=False, heard_exit=True,
+                      why="liveOD heard the run's process exit (run_state exited)")
     detail = {k: poll.get(k) for k in (
         "run_in_progress", "run_id", "reset_requested", "run_state", "expt_name", "n_shots",
         "n_shots_expected", "last_shot_age_s", "init_run_age_s")}

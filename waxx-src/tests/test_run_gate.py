@@ -139,6 +139,22 @@ def test_dead_client_is_waivable_only_when_the_pid_is_dead_on_this_host():
     assert st.detail["client"]["alive"] is False
 
 
+@pytest.mark.parametrize("client", [{"client_pid": None, "client_host": None},
+                                    {"client_host": "other-pc"}])
+def test_a_run_liveod_heard_exit_is_a_dead_client_without_a_pid(client):
+    # review N4: run_state "exited" while frames are still due
+    st = classify(_running(run_state="exited", last_shot_age_s=1.0, **client), None,
+                  now=NOW, pid_alive=_never)
+    assert st.state == "dead_client" and st.waivable
+    assert "run_state exited" in st.reason
+
+
+def test_an_exited_run_whose_pid_is_alive_is_not_waived():
+    st = classify(_running(run_state="exited", last_shot_age_s=1.0), None, now=NOW,
+                  pid_alive=_alive)
+    assert st.state == "live" and not st.waivable
+
+
 def test_the_host_comparison_ignores_case():
     st = classify(_running(client_host=HERE.swapcase()), None, now=NOW, pid_alive=_dead)
     assert st.state == "dead_client"
