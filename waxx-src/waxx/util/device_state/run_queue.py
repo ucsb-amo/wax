@@ -300,6 +300,10 @@ class RunQueue:
         self._lock = threading.RLock()
         self._tick_lock = threading.Lock()
         self._abort_lock = threading.Lock()
+        #: queue.json snapshots: the last numbered, the last written (_save)
+        self._save_lock = threading.Lock()
+        self._save_seq = 0
+        self._saved_seq = 0
         #: records waiting to be copied to the ops journal (flush_journal)
         self._mirror: deque = deque()
         self._mirror_lock = threading.Lock()
@@ -1194,9 +1198,16 @@ class RunQueue:
     # -- persistence -----------------------------------------------------------------------
 
     def _save(self) -> None:
+        """Write queue.json.  Two threads may save at once (a request and the
+        tick): each snapshot gets a sequence number under the queue's lock, and
+        a snapshot older than the one last written is not written -- the file
+        never goes back to an earlier state.  Deadlock-free whatever lock the
+        caller holds (the save lock is never held while taking the queue's)."""
         if not self.enabled:
             return
         with self._lock:
+            self._save_seq += 1
+            seq = self._save_seq
             jobs = sorted(self._jobs.values(), key=lambda j: j.id)
             ended = [j for j in jobs if j.state in ENDED]
             keep = {j.id for j in ended[-KEEP_ENDED:]} | {j.id for j in jobs
@@ -1205,14 +1216,18 @@ class RunQueue:
                     "jobs": [j.to_dict() for j in jobs if j.id in keep],
                     "paused": {k: (dict(v) if v else None) for k, v in self._paused.items()},
                     "resume_loop": dict(self._resume_loop) if self._resume_loop else None,
-                    "own_abort_ids": sorted(self._own_abort_ids)[-200:]}
-        try:
-            from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
-            os.makedirs(self.directory, exist_ok=True)
-            atomic_write(self._path("queue.json"), data)
-        except Exception as exc:                      # noqa: BLE001
-            log.error("Run queue: could not store the queue in %s (%s).",
-                      self._path("queue.json"), exc)
+                    "own_abort_ids": sorted(self._own_abort_ids)[-200:], "seq": seq}
+        with self._save_lock:
+            if seq <= self._saved_seq:
+                return                    # a newer snapshot is already on disk
+            try:
+                from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
+                os.makedirs(self.directory, exist_ok=True)
+                atomic_write(self._path("queue.json"), data)
+                self._saved_seq = seq
+            except Exception as exc:                  # noqa: BLE001
+                log.error("Run queue: could not store the queue in %s (%s).",
+                          self._path("queue.json"), exc)
 
     def _load(self) -> None:
         if not self.enabled:

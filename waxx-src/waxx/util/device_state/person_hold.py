@@ -70,6 +70,8 @@ class PersonHold:
         self._clock = clock
         self._reminder_s = float(reminder_s)
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self._save_seq = self._saved_seq = 0
         self._s = {"active": False, "since": None, "by": "", "reason": "", "source": "",
                    "run_id": None}
         self._last_reminder: float | None = None
@@ -203,15 +205,25 @@ class PersonHold:
                         describe(self._s))
 
     def _save(self) -> None:
+        """Write the hold's file.  A hold and a release racing each other:
+        each snapshot is numbered under the hold's lock, and an older one is
+        never written after a newer one."""
         if not self.path:
             return
-        try:
-            from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-            atomic_write(self.path, self.info())
-        except Exception as exc:                      # noqa: BLE001
-            log.error("Could not store the person hold in %s (%s); a server restart would "
-                      "drop it.", self.path, exc)
+        with self._lock:
+            self._save_seq += 1
+            seq, data = self._save_seq, dict(self._s)
+        with self._save_lock:
+            if seq <= self._saved_seq:
+                return
+            try:
+                from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
+                os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+                atomic_write(self.path, data)
+                self._saved_seq = seq
+            except Exception as exc:                  # noqa: BLE001
+                log.error("Could not store the person hold in %s (%s); a server restart "
+                          "would drop it.", self.path, exc)
 
     # -- out --------------------------------------------------------------------
 

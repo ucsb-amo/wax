@@ -577,6 +577,33 @@ def test_the_ops_journal_copy_is_never_written_under_the_lock(tmp_path, expts):
     assert len(lines) == len(seen)                       # nothing lost, nothing doubled
 
 
+# --- saves never go back in time (review S5) ---------------------------------------------------
+
+def test_an_older_snapshot_is_never_written_after_a_newer_one(q, expts, tmp_path):
+    submit(q, expts)
+    path = tmp_path / "logs" / "run_queue" / "queue.json"
+    written = json.loads(path.read_text())["seq"]
+    # a snapshot numbered before the one on disk (another thread's, slower to
+    # reach the file) is dropped
+    q._save_seq = written - 1
+    submit(q, expts, "tof")                          # numbers its snapshot `written`
+    assert json.loads(path.read_text())["seq"] == written
+    q._save_seq = written + 5
+    q._save()
+    assert json.loads(path.read_text())["seq"] == written + 6
+
+
+def test_the_holds_file_never_goes_back_either(tmp_path):
+    hold = PersonHold(str(tmp_path / "h.json"))
+    hold.hold("mine", "jp")
+    hold._saved_seq = 99                             # a newer write is on disk
+    hold.release("jp")                               # older-numbered: not written
+    assert json.loads((tmp_path / "h.json").read_text())["active"] is True
+    hold._save_seq = 200
+    hold._save()
+    assert json.loads((tmp_path / "h.json").read_text())["active"] is False
+
+
 # --- the alarm ----------------------------------------------------------------------------
 
 def test_the_alarm(q, expts, caplog):
