@@ -124,10 +124,12 @@ def test_loop_start_and_stop_go_through_the_requester_as_a_person(panel):
     card.start_button.click()
     req = [r for r in panel.server.requests if r.get("type") == "run_loop"][-1]
     assert (req["action"], req["loop"], req["owner"]) == ("start", "auto_tof", "person")
+    assert (req["by"], req["operator"]) == ("jp@test", "jp")
     assert card.pill.text() == "RUNNING"
     card.stop_button.click()
     req = [r for r in panel.server.requests if r.get("type") == "run_loop"][-1]
     assert (req["action"], req["loop"]) == ("stop", "auto_tof")
+    assert (req["by"], req["operator"]) == ("jp@test", "jp")
 
 
 def test_broadcasts_update_at_once(panel):

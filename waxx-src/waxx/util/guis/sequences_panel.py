@@ -62,6 +62,7 @@ from waxx.util.guis.composite_panel import (
 from waxx.util.guis.device_summary import reset_title
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 from waxx.util.guis.request_runner import RequestRunner
+from waxx.util.device_state.run_queue_client import default_by
 from waxx.util.guis.run_queue_panel import QueueSummaryLine
 
 #: How often an open log asks the server for new lines.
@@ -539,8 +540,14 @@ class SequencesPanel(QWidget):
     def __init__(self, log_line: Callable[[str], None] | None = None, parent=None,
                  start_sender: bool = True, requester: Callable[[dict], dict] | None = None,
                  synchronous_requests: bool = False, show_hold: bool = True,
-                 show_queue: bool = True, runner: RequestRunner | None = None):
+                 show_queue: bool = True, runner: RequestRunner | None = None,
+                 by: str | None = None):
         super().__init__(parent)
+        #: who is clicking (``user@host``): a loop's start / stop / configure
+        #: carry it as ``by`` and the user as ``operator`` (the server names
+        #: who started or stopped a loop from operator@client)
+        self.by = by or default_by()
+        self._operator = self.by.split("@", 1)[0]
         self._log_line = log_line
         self._reachable = False
         self._req = 0
@@ -846,6 +853,9 @@ class SequencesPanel(QWidget):
         req = self._req
         obj = dict(obj)
         obj.setdefault("client", self._sender.client_name)
+        if obj.get("type") == "run_loop" and obj.get("action") in ("start", "stop", "configure"):
+            obj.setdefault("operator", self._operator)
+            obj.setdefault("by", self.by)
         if self._runner is not None:
             self._runner.send(obj, on_reply)
             return req

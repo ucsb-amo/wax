@@ -181,7 +181,7 @@ class MonitorStatePanel(QWidget):
         # the Sequences tab's loop cards; their requests go through this
         # panel's runner (no discovery, no socket)
         self.sequences = SequencesPanel(start_sender=False, show_hold=False, show_queue=False,
-                                        runner=self.runner)
+                                        runner=self.runner, by=self.by)
         sec.addWidget(self.sequences)
         box.addWidget(frame)
 
