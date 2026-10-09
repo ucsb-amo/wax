@@ -48,7 +48,7 @@ def _say(text: str, out: Callable = print):
     try:
         out(text)
     except UnicodeEncodeError:                     # a pipe in a narrow code page
-        out(text.replace("±", "+/-").encode("ascii", "replace").decode("ascii"))
+        out(text.encode("ascii", "replace").decode("ascii"))
 
 
 # ---- formatting the [cal] line -------------------------------------------------------------
@@ -61,17 +61,17 @@ def _fmt_value_unc(v, u) -> str:
     if not math.isfinite(v):
         return f"{v!r}"
     if u is None:
-        return f"{v!r} ± (no uncertainty)"
+        return f"{v!r} +/- (no uncertainty)"
     try:
         u = float(u)
     except (TypeError, ValueError):
-        return f"{v!r} ± {u!r}"
+        return f"{v!r} +/- {u!r}"
     if not math.isfinite(u) or u <= 0:
-        return f"{v!r} ± {u!r}"
+        return f"{v!r} +/- {u!r}"
     p = math.floor(math.log10(u)) - 1                   # the uncertainty's 2nd digit
     e = math.floor(math.log10(abs(v))) if v != 0 else p + 1
     dec = max(0, min(15, e - p))
-    return f"{v:.{dec}e} ± {u:.1e}"
+    return f"{v:.{dec}e} +/- {u:.1e}"
 
 
 def cal_line(r: CalResult, unit: str = "") -> str:

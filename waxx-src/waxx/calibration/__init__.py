@@ -14,7 +14,7 @@ Usage, in an experiment's prepare()::
 
 What the terminal prints after the run is saved (values for illustration)::
 
-    [cal] t_raman_pi_pulse = 6.612e-06 ± 2.1e-08 s (#85600, 63 shots, 0 excluded; was 6.6403e-06, -0.43 %)
+    [cal] t_raman_pi_pulse = 6.612e-06 +/- 2.1e-08 s (#85600, 63 shots, 0 excluded; was 6.6403e-06, -0.43 %)
     [cal] applied: ...\\kexp\\config\\expt_params.py:312 (kcal revert t_raman_pi_pulse undoes it)
     [cal]   - self.t_raman_pi_pulse = 6.6403e-06 #85412, 2026-10-07
     [cal]   + self.t_raman_pi_pulse = 6.612e-06 #85600, 2026-10-09

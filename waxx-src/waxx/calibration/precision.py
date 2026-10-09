@@ -131,7 +131,7 @@ def _check_number(x, what) -> float:
 
 def format_value(value, unc, old_line_literal, kind: Optional[str] = None, *,
                  allow_no_unc: bool = False) -> str:
-    """The new literal for ``value`` (± ``unc``) on a line whose literal is now
+    """The new literal for ``value`` (+/- ``unc``) on a line whose literal is now
     ``old_line_literal`` (a string, wrapper included). ``kind`` overrides the
     literal's own kind ('int', 'decimal' or 'sci'). Raises PrecisionError when the
     rule cannot be met."""

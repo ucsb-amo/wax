@@ -223,7 +223,7 @@ class Expt(Scanner, Dealer, Scribe):
                 )
             elif self.run_info.save_data:
                 print(
-                    "[LiveOD] WARNING: No liveOD server connection — "
+                    "[LiveOD] WARNING: No liveOD server connection -- "
                     "data will not be saved (setup_camera=False)."
                 )
 
@@ -508,7 +508,7 @@ class Expt(Scanner, Dealer, Scribe):
         try:
             self.scope_data.close()
         except Exception as _e:
-            print(f"[end_wax] WARNING: scope_data.close() raised: {_e} — continuing.")
+            print(f"[end_wax] WARNING: scope_data.close() raised: {_e} -- continuing.")
 
         # Drain the per-shot auxiliary camera clients BEFORE the END_RUN
         # payload is serialized: finish() waits for in-flight snaps, writes
@@ -940,7 +940,7 @@ class Expt(Scanner, Dealer, Scribe):
                 cs.finish()
             except Exception as e:
                 print(f"[end_wax] WARNING: camera stream "
-                      f"'{getattr(cs, 'key', '?')}' finish() raised: {e} — continuing.")
+                      f"'{getattr(cs, 'key', '?')}' finish() raised: {e} -- continuing.")
 
         threads = [threading.Thread(target=one, args=(cs,), daemon=True,
                                     name=f"finish:{getattr(cs, 'key', '?')}")
@@ -1035,10 +1035,10 @@ class Expt(Scanner, Dealer, Scribe):
                 try:
                     reshaped = scope.reshape_data()
                 except Exception as _e:
-                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} — scope data will be empty for this run.")
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} -- scope data will be empty for this run.")
                     reshaped = None
                 if reshaped is None or not isinstance(reshaped, np.ndarray) or reshaped.ndim < 3 or reshaped.size == 0:
-                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) — omitting from payload.")
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) -- omitting from payload.")
                 else:
                     scope_data_list.append({
                         'label': str(scope.label),

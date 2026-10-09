@@ -153,8 +153,9 @@ def test_simulated_end_of_run_emit(lab, capsys):
     e._emit_calibrations()
     out = capsys.readouterr().out
     print(out)                                       # shown with -s: the terminal as it is
+    assert out.isascii()                             # console lines are ASCII (cp1252 pipes)
     lines = out.strip().splitlines()
-    assert lines[0] == ("[cal] t_pi = 6.612e-06 ± 2.1e-08 s (#85600, 63 shots, 0 excluded; "
+    assert lines[0] == ("[cal] t_pi = 6.612e-06 +/- 2.1e-08 s (#85600, 63 shots, 0 excluded; "
                         "was 6.6403e-06, -0.43 %)")
     assert lines[1] == (f"[cal] applied: {lab.params_file}:5 (kcal revert t_pi undoes it)")
     assert lines[2] == "[cal]   - self.t_pi = 6.6403e-06 #85412, 2026-10-07"
@@ -293,7 +294,7 @@ def test_emit_calibration_after_end_appends_to_the_run_file(lab, capsys):
     e._emit_calibrations()
     r = e.emit_calibration("amp", 0.4234, 0.0021, unit="V", n_used=63, method="mean")
     out = capsys.readouterr().out
-    assert "[cal] amp = 4.234e-01 ± 2.1e-03 V (#85600, 63 shots, 0 excluded; was 0.41, +3.27 %)" in out
+    assert "[cal] amp = 4.234e-01 +/- 2.1e-03 V (#85600, 63 shots, 0 excluded; was 0.41, +3.27 %)" in out
     assert "not applied: write_back is off" in out
     assert [x["key"] for x in run_file_records(lab.run_file)] == ["t_pi", "amp"]
     assert r.analysis == "emit_calibration" and e.calibration_results[-1] is r
