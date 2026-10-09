@@ -5,31 +5,40 @@ run's announcement (its *run fence*: the run finished ``prepare()`` and has not
 taken the core yet).  Until 2026-10-09 each launcher read those signals its own
 way, and a run whose process had been killed (85528: killed with its client,
 liveOD left with ``run_in_progress`` and a pending Abort) blocked every gate
-until a person stepped in.  :func:`classify` is the one reading now, used by
-the monitor server's run loop (:mod:`~waxx.util.device_state.run_loop`) and by
-the agents' ``occupancy.py``.
+until a person stepped in.  :func:`classify` is the one reading of liveOD
+now, used by the monitor server's run loop
+(:mod:`~waxx.util.device_state.run_loop`) and by the agents' ``occupancy.py``.
 
-Inputs (both plain dicts, so the rules are testable without a network):
+The run loop passes no fence: it keeps its own fence rule (any run announced
+to the monitor server that is not one of its own runs refuses, whatever its
+age -- the server itself lapses stale fences), and its own state is the loop.
+``occupancy.py`` and :func:`assess` pass the fence and the monitor's state,
+and count an active run loop (:func:`loops_verdict`) as busy.
+
+Inputs (plain dicts, so the rules are testable without a network):
 
 * liveOD's POLL reply -- ``run_in_progress``, ``run_id``, ``reset_requested``,
   ``init_run_age_s``, ``last_shot_age_s``, ``n_shots``, ``n_shots_expected``,
-  ``run_state``, ``last_outcome``, and since 2026-10-09 the run's client:
-  ``client_pid``, ``client_host``, ``launcher`` (sent by the experiment at
-  INIT_RUN; ``None``/"" from an older client or server);
+  ``run_state``, ``last_outcome``, and since 2026-10-09 the run's client
+  (``client_pid``, ``client_host``, ``launcher``: sent by the experiment at
+  INIT_RUN; ``None``/"" from an older client or server) and
+  ``save_in_progress`` / ``save_status`` (an asynchronous END_RUN save);
 * the monitor server's ``status_json`` ``run_pending`` (the fence): ``run_id``,
   ``expt``, ``since`` (epoch seconds), ``client``, ``token``; ``None`` when no
-  run is announced.
+  run is announced -- and its ``state`` (``monitor_state``).
 
 States (:class:`GateState`):
 
-``free``           no run in progress, no Abort pending, no fence younger than
-                   :data:`FENCE_TTL_S`.
-``live``           a run is in progress and alive by its timing: a shot within
-                   max(:data:`LIVE_MIN_S`, :data:`LIVE_SHOT_FACTOR` x its shot
-                   period), or no shot yet within :data:`YOUNG_RUN_S` of its
-                   INIT_RUN, or it is saving -- or a run has announced itself
-                   to the monitor server (fence) and not started yet.  Never
-                   waivable.
+``free``           no run in progress, no Abort pending, no fence (one older
+                   than :data:`FENCE_TTL_S` does not count while the monitor
+                   is READY).
+``live``           liveOD is saving the run (checked first, before anything
+                   about its client); or a run is in progress and alive by its
+                   timing: a shot within max(:data:`LIVE_MIN_S`,
+                   :data:`LIVE_SHOT_FACTOR` x its shot period), or no shot yet
+                   within :data:`YOUNG_RUN_S` of its INIT_RUN -- or a run has
+                   announced itself to the monitor server (fence) and not
+                   started yet.  Never waivable.
 ``reset_pending``  an Abort is pending in liveOD.  Waivable only when the
                    client's process is known to be dead (pid recorded, host is
                    this machine, process gone): liveOD finalizes that run at
