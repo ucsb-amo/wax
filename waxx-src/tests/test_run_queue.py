@@ -125,9 +125,11 @@ class FakeLoop:
         def __init__(self, key, title, pick=False):
             self.key, self.title, self.pick = key, title, pick
 
-    def __init__(self, key="auto_tof", title="BEC TOF loop", pick=False, path="x.py"):
+    def __init__(self, key="auto_tof", title="BEC TOF loop", pick=False, path="x.py",
+                 owner="person"):
         self.spec = self.Spec(key, title, pick)
         self.path = path
+        self.owner = owner
         self.state, self.text = "running", "started by jp"
         self.stops, self.starts = [], []
 
@@ -136,7 +138,8 @@ class FakeLoop:
         return self.state in ("running", "stopping")
 
     def info(self):
-        return {"state": self.state, "text": self.text}
+        return {"state": self.state, "text": self.text, "owner": self.owner,
+                "operator": "jp"}
 
     def stop(self, operator="", client="", start_monitor=True):
         self.stops.append((operator, start_monitor))
@@ -146,8 +149,9 @@ class FakeLoop:
     def finish_stop(self):
         self.state, self.text = "stopped", "stopped by run queue@kong after 3 saved runs"
 
-    def start(self, operator="", client="", path=None):
+    def start(self, operator="", client="", path=None, owner="person"):
         self.starts.append((operator, path))
+        self.owner = owner
         self.state = "running"
         return {"status": "ok"}
 
@@ -1137,3 +1141,58 @@ def test_a_hold_set_by_live_od_or_an_unreadable_file_is_a_persons(tmp_path):
                        "last_reset": {"source": "person", "run_id": 3}})
     assert hold.info()["owner"] == "person"
     assert hold.release("a7", owner="agent")["status"] == "error"
+
+
+
+# --- whose loop a job may stop; a Stop cancels the restart (review S13, S14) -----------------------
+
+def test_an_agents_job_never_stops_a_persons_loop_but_a_persons_job_does(tmp_path, expts):
+    loop = FakeLoop(owner="person")
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    a = submit(q, expts, owner="agent")
+    for _ in range(3):
+        q.clock.t += 600
+        q.tick()
+    assert loop.stops == [] and job(q, a)["state"] == "queued"
+    assert "started by a person" in q.info()["waiting"]
+    assert q.info()["alarm"] is None                     # a person's loop: legitimate use
+    submit(q, expts)                                     # a person's job
+    q.tick()
+    assert loop.stops == [("run queue", False)]
+
+
+@pytest.mark.parametrize("owner", ["agent", "queue"])
+def test_an_agents_job_stops_an_agents_or_the_queues_loop(tmp_path, expts, owner):
+    loop = FakeLoop(owner=owner)
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    submit(q, expts, owner="agent")
+    q.tick()
+    assert loop.stops == [("run queue", False)]
+
+
+def test_the_queue_starts_a_loop_again_as_queue(tmp_path, expts):
+    loop = FakeLoop(owner="agent")
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    submit(q, expts)
+    q.tick()
+    loop.finish_stop()
+    q.tick()
+    run_through(q, 101)
+    q.tick()
+    assert loop.starts and loop.owner == "queue"
+
+
+def test_someone_elses_stop_cancels_the_queues_restart(tmp_path, expts):
+    loop = FakeLoop()
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    submit(q, expts)
+    q.tick()
+    assert q.info()["resume_loop"]["key"] == "auto_tof"
+    q.loop_stopped_by_someone("auto_tof", "jp@kong")
+    assert q.info()["resume_loop"] is None
+    assert "run_queue_loop_resume_cancelled" in q.journal.kinds
+    loop.finish_stop()
+    q.tick()
+    run_through(q, 101)
+    q.tick()
+    assert loop.starts == [] and q.monitor_starts == ["the run queue has no job to run"]

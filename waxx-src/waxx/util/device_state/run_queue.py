@@ -894,7 +894,9 @@ class RunQueue:
         loop = self._active_loop()
         if order:
             if loop is not None:
-                self._stop_loop_for_jobs(loop, order[0])
+                stopper = next((j for j in order if self._may_stop(j, loop)), None)
+                if stopper is not None:
+                    self._stop_loop_for_jobs(loop, stopper)
             if self._last_end_t is not None and now - self._last_end_t < self._gap_s:
                 return
             why = self._gate()
@@ -939,10 +941,16 @@ class RunQueue:
             return busy
         loop = self._active_loop()
         if loop is not None:
-            if loop.info().get("state") == "stopping":
+            info = loop.info()
+            if info.get("state") == "stopping":
                 self._gate_kind = "live"
                 return (f"{loop.spec.title} is finishing its run in progress (asked to stop "
                         "for the queue)")
+            if (info.get("owner") or "person") == "person":
+                self._gate_kind = "live"          # a person's loop: legitimate use
+                return (f"{loop.spec.title} was started by a person "
+                        f"({info.get('operator') or info.get('client') or '?'}): an agent's "
+                        "job does not stop it")
             return f"{loop.spec.title} is running and has not been asked to stop"
         poll = self._poll_now()
         if poll is None:
@@ -1434,6 +1442,28 @@ class RunQueue:
 
     # -- loops and the monitor ----------------------------------------------------------------
 
+    @staticmethod
+    def _may_stop(job: Job, loop) -> bool:
+        """A person's job stops any loop; an agent's job only a loop the queue,
+        or an agent (the TOF-idle restart), started -- never a person's."""
+        if job.owner == "person":
+            return True
+        return (loop.info().get("owner") or "person") in ("queue", "agent")
+
+    def loop_stopped_by_someone(self, key: str, who: str) -> None:
+        """Someone (not the queue) asked a loop to stop: if the queue meant
+        to start that loop again once it runs out, it no longer does."""
+        with self._lock:
+            resume = self._resume_loop
+            if resume is None or resume.get("key") != key:
+                return
+            self._resume_loop = None
+        log.info("Run queue: %s stopped the loop %s: the queue will not start it again.", who,
+                 key)
+        self._record("run_queue_loop_resume_cancelled", loop=key, by=who)
+        self._save()
+        self._notify()
+
     def _stop_loop_for_jobs(self, loop, job: Job) -> None:
         if loop.info().get("state") != "running":
             # already stopping: by the queue (asked before), or by a person --
@@ -1482,7 +1512,7 @@ class RunQueue:
                                  state=info.get("state"), why=text)
                 else:
                     reply = loop.start(operator="run queue", client=self._host,
-                                       path=resume.get("path"))
+                                       path=resume.get("path"), owner="queue")
                     ok = reply.get("status") == "ok"
                     self._record("run_queue_loop_resume", loop=loop.spec.key, ok=ok,
                                  msg=reply.get("msg", ""))

@@ -87,6 +87,8 @@ _TAIL_SHOWN = 8
 #: the run in progress finishes first), ``stopped`` (ended by Stop),
 #: ``latched`` (ended by anything else; off until Start).
 ACTIVE = ("running", "stopping")
+#: Who may have started a loop (RunLoop.start's owner).
+LOOP_OWNERS = ("person", "agent", "queue")
 
 
 #: Characters refused in a picked file's path: the run is launched through the
@@ -357,8 +359,13 @@ class RunLoop:
 
     # -- requests ---------------------------------------------------------------
 
-    def start(self, operator: str = "", client: str = "", path=None) -> dict:
-        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`)."""
+    def start(self, operator: str = "", client: str = "", path=None,
+              owner: str = "person") -> dict:
+        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`).
+        ``owner``: who starts it -- "person" (the GUI), "agent" (an agent's
+        TOF-idle restart) or "queue" (the run queue starting again a loop it
+        stopped); kept in ``info()``: the run queue stops a person's loop only
+        for a person's job."""
         who = _who(operator, client)
         if self.spec.pick:
             full, why = resolve_pick(self.spec, path)
@@ -384,9 +391,10 @@ class RunLoop:
             self._wake.clear()
             self._s = {"state": "running", "text": f"started by {who}", "runs": 0,
                        "run_id": None, "last": None, "started": self._clock(),
-                       "ended": None, "operator": operator, "client": client}
+                       "ended": None, "operator": operator, "client": client,
+                       "owner": owner if owner in LOOP_OWNERS else "person"}
         log.info("%s: started by %s (%s).", self.spec.title, who, self.path)
-        self._record("run_loop_start", operator=operator, client=client)
+        self._record("run_loop_start", operator=operator, client=client, owner=owner)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"run-loop-{self.spec.key}")
         self._thread.start()

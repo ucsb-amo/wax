@@ -728,6 +728,10 @@ class MonitorUDPServer(UdpServer):
         client = str(obj.get("client") or "")
         action = obj.get("action")
         if action == "stop":
+            # someone stops it: the run queue must not start it again later
+            self.run_queue.loop_stopped_by_someone(loop.spec.key,
+                                                   "@".join(p for p in (operator, client) if p)
+                                                   or "?")
             return loop.stop(operator=operator, client=client)
         if action == "describe":
             return loop.describe(obj.get("path"))
@@ -749,7 +753,10 @@ class MonitorUDPServer(UdpServer):
                                 who="@".join(p for p in (operator, client) if p) or "?",
                                 msg=msg)
             return {"status": "error", "msg": msg}
-        return loop.start(operator=operator, client=client, path=obj.get("path"))
+        owner = str(obj.get("owner") or "person")
+        if owner not in ("person", "agent"):
+            return {"status": "error", "msg": f"owner must be person or agent, not {owner!r}"}
+        return loop.start(operator=operator, client=client, path=obj.get("path"), owner=owner)
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line

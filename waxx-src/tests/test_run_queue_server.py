@@ -238,6 +238,27 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     loop.join(5)
 
 
+def test_a_persons_stop_request_cancels_the_queues_restart_and_starters_are_kept(
+        server, expts, qapp):
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                        "owner": "agent"})
+    assert reply["status"] == "ok" and reply["loop"]["owner"] == "agent"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"            # an agent's loop: an agent's job stops it
+    assert server.run_queue.info()["resume_loop"]["key"] == "auto_tof"
+    server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof", "operator": "jp"})
+    assert server.run_queue.info()["resume_loop"] is None
+    assert "run_queue_loop_resume_cancelled" in [e["kind"] for e in server.journal.tail(50)]
+    release.set()
+    loop.join(5)
+
+
 def test_a_monitor_restart_waits_while_the_queue_has_work(server, expts, qapp):
     from PyQt6.QtWidgets import QApplication
     restarts = []
