@@ -1031,3 +1031,34 @@ def test_live_od_refusing_the_abort_leaves_it_to_try_again(q, expts):
     q._live_od_reset = real
     q.tick()
     assert q.live.resets == [101]
+
+
+# --- a person's Reset before the slot's job has a run id (review S17) -----------------------------
+
+def test_a_persons_reset_before_their_jobs_run_id_cancels_it(q, expts):
+    q.live.count_resets()
+    a = submit(q, expts)                                  # a person's job
+    q.tick()
+    q.live.press("person")                                # no run in progress: names no run
+    q.tick()
+    assert not q.hold.active
+    j = job(q, a)
+    assert j["cancel"]["by"] == "a person's Reset in liveOD" and not j["cancel"]["abort_sent"]
+    q.spawner.procs[-1].write("Run ID: 101")              # liveOD let the run through
+    q.live.start_run(101)
+    q.tick()
+    assert q.live.resets == [101] and q.live.sources == ["queue"]
+    q.spawner.procs[-1].write("RuntimeError: Acquisition for run 101 aborted.")
+    q.live.end_run(101, "discarded")
+    q.spawner.procs[-1].code = 1
+    q.tick()
+    assert job(q, a)["state"] == "cancelled"
+
+
+def test_a_persons_reset_before_an_agents_jobs_run_id_holds(q, expts):
+    q.live.count_resets()
+    a = submit(q, expts, owner="agent")
+    q.tick()
+    q.live.press("person")
+    q.tick()
+    assert q.hold.active and job(q, a)["cancel"] is None

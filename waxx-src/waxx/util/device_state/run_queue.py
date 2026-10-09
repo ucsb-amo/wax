@@ -757,8 +757,36 @@ class RunQueue:
             self._last_poll = None
             return None
         self._last_poll = poll
-        self.hold.observe_poll(poll, self.agent_run_ids(), self.own_abort_ids())
+        self.hold.observe_poll(poll, self.agent_run_ids(), self.own_abort_ids(),
+                               on_person_reset=self._claim_person_reset)
         return poll
+
+    def _claim_person_reset(self, last: dict) -> bool:
+        """A person pressed liveOD's Reset while the job in the slot has no
+        run id yet (it is launching or preparing; liveOD had no run, so the
+        Reset names none).  The person's own job: taken as that job's cancel
+        -- liveOD would spend that Abort on no run and let the run through, so
+        the queue sends its own Abort once the run has an id -- and no hold.
+        Anyone else's job (or a Reset naming a run): not claimed, the hold
+        goes on as for any person's Reset."""
+        if (last or {}).get("run_id") is not None:
+            return False
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if (cur is None or cur.run_id is not None or cur.owner != "person"
+                    or cur.state not in ("launching", "running")):
+                return False
+            if cur.cancel is None:
+                cur.cancel = {"by": "a person's Reset in liveOD", "at": self._clock(),
+                              "abort_sent": False,
+                              "abort_note": "Reset pressed before the run had an id: the queue "
+                                            "sends liveOD's Abort once it has one"}
+        log.warning("Run queue: a person pressed Reset in liveOD while %s (a person's job) had "
+                    "no run yet: taken as its cancel.", cur.name)
+        self._record("run_queue_cancel_requested", job=cur.id, by="a person's Reset in liveOD",
+                     run_id=None, via="live_od_reset")
+        self._save()
+        return True
 
     def _settle(self, now: float) -> None:
         """Skip jobs waiting for a job that will never be saved."""
