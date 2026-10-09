@@ -406,7 +406,7 @@ def test_list_show_and_status(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"), "--label", "r1", "--priority", "1",
        "--no-write-back")
     kq(server, "submit", str(expts / "tof.py"), "--priority", "3")
-    assert ("write-back veto requested (honoured once the calibration branch lands)"
+    assert ("write-back vetoed (WAXX_CAL_NO_WRITE_BACK=1)"
             in kq(server, "show", "1").out)
     assert "write-back" not in kq(server, "show", "2").out
     r = kq(server, "list")
