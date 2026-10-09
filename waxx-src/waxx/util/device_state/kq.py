@@ -13,7 +13,8 @@ Commands::
     kq insert <file.py> [ARG...] (--at-index N | --before ID | --after ID) [options]
                                               run, placed at that position
     kq move <id> (--to N | --before ID | --after ID)    put a queued job elsewhere
-    kq edit <id> [--argv ...] [--label L] [--after-saved ID ...] [--chain C]
+    kq edit <id> [--argv ...] [--label L] [--depends-on ID ... | --depends-on-none]
+            [--chain C]
             [--stop-on-failure | --no-stop-on-failure] [--no-write-back |
             --write-back-default] [--at T | --no-at] [--allow-drift |
             --no-allow-drift] [--pause | --unpause]     change a queued job
@@ -49,10 +50,11 @@ Order: the queue runs the eligible job nearest the front.  A new job goes to
 the end, except that a person's job is placed ahead of every queued agent job
 (``--at-end`` opts out); ``--priority`` is only a placement hint within its
 owner's block.  ``kq insert`` places a job, ``kq move`` moves a queued one.
-Positions count from 1 (the front), as ``kq list`` shows them.  ``--after`` on
-run / submit means "only after these jobs have saved" (also spelt
-``--after-saved``); on insert and move ``--after ID`` is a position, so insert
-takes ``--after-saved`` for the dependency.
+Positions count from 1 (the front), as ``kq list`` shows them.  ``--before ID``
+and ``--after ID`` are positions only (insert, move); a dependency -- "only
+after these jobs have saved" -- is ``--depends-on ID [ID ...]`` (run, submit,
+insert; on edit ``--depends-on`` replaces it and ``--depends-on-none`` clears
+it).
 
 Owner: kq acts for a person unless the environment has ``WAXX_OWNER=agent``
 (the agents' skill sets it; ``--agent`` is a convenience for the same); an
@@ -363,8 +365,7 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
                         help="placement hint within the owner's block (higher first)")
         sp.add_argument("--at", dest="at", metavar="HH:MM|EPOCH",
                         help="not before this time (local HH:MM: the next such time)")
-        deps = ("--after-saved",) if insert else ("--after", "--after-saved")
-        sp.add_argument(*deps, dest="after", type=int, nargs="+", action="extend",
+        sp.add_argument("--depends-on", dest="after", type=int, nargs="+", action="extend",
                         default=[], metavar="ID", help="only after these jobs have saved")
         if insert:
             where = sp.add_mutually_exclusive_group(required=True)
@@ -416,8 +417,11 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
                     help="the experiment's arguments, replaced (none: cleared; words "
                          "starting with - go after --)")
     sp.add_argument("--label")
-    sp.add_argument("--after-saved", dest="after", type=int, nargs="*", metavar="ID",
-                    help="only after these jobs have saved, replaced (none: cleared)")
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--depends-on", dest="after", type=int, nargs="+", metavar="ID",
+                      help="only after these jobs have saved (replaces the list)")
+    flag.add_argument("--depends-on-none", dest="after", action="store_const", const=[],
+                      help="no dependencies")
     sp.add_argument("--chain", help="chain name ('' clears it)")
     flag = sp.add_mutually_exclusive_group()
     flag.add_argument("--stop-on-failure", dest="stop_on_failure", action="store_const",

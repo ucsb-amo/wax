@@ -125,7 +125,7 @@ def test_run_options_reach_the_request(server, q, expts, monkeypatch):
     assert "jobs 1-2 (chain cal) queued: r1, owner agent" in r.out
     assert "kq tail 1 -f" in r.out
     assert sent(server, "tail") == []                         # submit does not follow
-    r = kq(server, "run", str(expts / "rabi.py"), "--detach", "--after", "1", "2")
+    r = kq(server, "run", str(expts / "rabi.py"), "--detach", "--depends-on", "1", "2")
     assert r.code == 0 and sent(server, "submit")[-1]["after"] == [1, 2]
 
 
@@ -596,7 +596,7 @@ def test_insert_places_a_job(server, q, expts):
     assert s["at_index"] == 1 and "after_id" not in s and s["after"] == []
     assert _next(q) == [1, 4, 2, 3]
     kq(server, "insert", str(expts / "tof.py"), "--before", "1", "--detach")
-    kq(server, "insert", str(expts / "tof.py"), "--after", "3", "--after-saved", "1",
+    kq(server, "insert", str(expts / "tof.py"), "--after", "3", "--depends-on", "1",
        "--detach")
     s = sent(server, "insert")[-1]
     assert s["after_id"] == 3 and s["after"] == [1]               # position vs dependency
@@ -604,6 +604,27 @@ def test_insert_places_a_job(server, q, expts):
     assert kq(server, "insert", str(expts / "tof.py"), "--detach").code == 2   # no position
     r = kq(server, "insert", str(expts / "tof.py"), "--before", "99", "--detach")
     assert r.code == 6 and "before_id 99 is not a queued job" in r.err
+
+
+def test_dependencies_are_depends_on_and_after_is_only_a_position(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))
+    for cmd in ("run", "submit"):
+        for flag in ("--after", "--after-saved"):
+            r = kq(server, cmd, str(expts / "tof.py"), flag, "1")
+            assert r.code == 2, (cmd, flag)
+    assert kq(server, "insert", str(expts / "tof.py"), "--at-index", "1", "--after-saved",
+              "1", "--detach").code == 2
+    assert kq(server, "edit", "1", "--after-saved", "1").code == 2
+    assert kq(server, "edit", "1", "--depends-on", "--depends-on-none").code == 2
+    assert len(sent(server, "submit")) == 1 and sent(server, "insert") == []
+    r = kq(server, "submit", str(expts / "tof.py"), "--depends-on", "1")
+    assert r.code == 0 and sent(server, "submit")[-1]["after"] == [1]
+    for cmd in ("run", "submit", "insert", "edit"):
+        out = io.StringIO()
+        kqmod.main([cmd, "--help"], out=out, err=io.StringIO())
+        assert "--depends-on" in out.getvalue() and "--after-saved" not in out.getvalue()
+        if cmd in ("run", "submit"):
+            assert "--after " not in out.getvalue()
 
 
 def test_insert_follows_like_run(server, q, expts):
@@ -634,7 +655,7 @@ def test_edit(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"), "a=1", "--chain", "c1")
     kq(server, "submit", str(expts / "tof.py"))
     r = kq(server, "edit", "1", "--argv", "b=2", "c=3", "--label", "renamed",
-           "--after-saved", "2", "--no-stop-on-failure", "--no-write-back", "--at", "23:59",
+           "--depends-on", "2", "--no-stop-on-failure", "--no-write-back", "--at", "23:59",
            "--allow-drift", "--pause")
     assert r.code == 0 and r.out.startswith("[kq] job 1 (renamed): changed ")
     j = q.describe({"id": 1})["job"]
@@ -642,7 +663,7 @@ def test_edit(server, q, expts):
     assert j["stop_on_failure"] is False and j["write_back"] is False and j["due"]
     assert j["allow_drift"] is True and j["paused"] is True
     assert sent(server, "edit")[-1]["owner"] == "person"
-    r = kq(server, "edit", "1", "--argv", "--after-saved", "--chain", "", "--no-at",
+    r = kq(server, "edit", "1", "--argv", "--depends-on-none", "--chain", "", "--no-at",
            "--write-back-default", "--no-allow-drift", "--unpause")
     j = q.describe({"id": 1})["job"]
     assert r.code == 0 and j["argv"] == [] and j["after"] == [] and j["chain"] is None
@@ -654,7 +675,7 @@ def test_edit(server, q, expts):
     assert kq(server, "edit", "1", "--at", "1430").code == 2
     r = kq(server, "edit", "1", "--label", "x", "--agent")
     assert r.code == 6 and "a person's job: an agent may not edit it" in r.err
-    r = kq(server, "edit", "2", "--after-saved", "2")
+    r = kq(server, "edit", "2", "--depends-on", "2")
     assert r.code == 6 and "wait for itself" in r.err
 
 
