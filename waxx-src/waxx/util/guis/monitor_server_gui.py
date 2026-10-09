@@ -21,7 +21,8 @@ from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
-from waxx.util.device_state.run_loop import RunLoop, active_loop
+from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
+from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -192,6 +193,13 @@ class MonitorUDPServer(UdpServer):
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
+    * ``run_queue`` (``action``) — ``hold`` (``reason``, ``by``) / ``release``
+      (``by``): a person's hold on the machine
+      (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
+      runs wait and the run loops do not run.  The server also sets it itself
+      when liveOD's Reset is pressed for a run that is not an agent's queued
+      run.  ``status_json`` has ``person_hold``; changes are broadcast as
+      ``person_hold``.
 
     Host-side connections this server holds between runs (the tweezer AWG;
     :class:`~waxx.util.device_state.connections.ConnectionService`, each in
@@ -253,10 +261,21 @@ class MonitorUDPServer(UdpServer):
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
     RUN_PENDING_TTL_S = 120.0
+    #: liveOD is polled this often for the person hold's Reset watch (and,
+    #: between jobs, by the run queue).
+    WATCH_S = 2.0
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
-                 run_loops=(), connections=(), slm_reinit=None, state_generator=None):
+                 run_loops=(), connections=(), slm_reinit=None, state_generator=None,
+                 run_queue_dir=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
+        # The run queue's folder (its queue, journal, job logs, the person
+        # hold): given, or "run_queue" beside the ops journal's folder (the
+        # lab's <LOG_DIR>/ops_journal -> <LOG_DIR>/run_queue).  None: memory only.
+        if run_queue_dir is None and journal_dir:
+            run_queue_dir = os.path.join(os.path.dirname(os.path.abspath(journal_dir)),
+                                         "run_queue")
+        self.run_queue_dir = run_queue_dir
         # regenerate_state: a callable -> {"dds", "ttl", "dac"} with every
         # channel at the lab's defaults (from its device frames); None: not offered.
         self._state_generator = state_generator
@@ -295,6 +314,15 @@ class MonitorUDPServer(UdpServer):
 
         self.reset = StateReset(reset_expt_path, on_change=self._on_reset_change,
                                 journal=self.journal)
+
+        # A person's hold on the machine (agents' runs wait while it is on),
+        # and the one liveOD link the server's own watch uses.
+        self.person_hold = PersonHold(
+            os.path.join(run_queue_dir, "person_hold.json") if run_queue_dir else None,
+            journal=self.journal, on_change=self._on_person_hold_change)
+        self._live_od = _LiveOD()
+        self._watch_stop = threading.Event()
+        self._watch_thread = None
 
         # Experiments the GUIs may run back to back -- only these files.
         self.loops = {spec.key: RunLoop(spec, fence=self._current_run_pending,
@@ -373,7 +401,8 @@ class MonitorUDPServer(UdpServer):
                 "slm_reinit": (self.slm_reinit.snapshot() if self.slm_reinit is not None
                                else None),
                 "state_generator": self._state_generator is not None,
-                "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
+                "run_loops": {key: loop.info() for key, loop in self.loops.items()},
+                "person_hold": self.person_hold.info()}
 
     def _handle_structured(self, raw):
         try:
@@ -426,6 +455,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_reset_state(obj))
         if mtype == "run_loop":
             return json.dumps(self._reply_run_loop(obj))
+        if mtype == "run_queue":
+            return json.dumps(self._reply_run_queue(obj))
         if mtype == "slm_reinit":
             return json.dumps(self._reply_slm_reinit(obj))
         if mtype == "regenerate_state":
@@ -542,6 +573,9 @@ class MonitorUDPServer(UdpServer):
         self._runner_thread = threading.Thread(target=self._runner_loop, daemon=True,
                                                name="monitor-op-runner")
         self._runner_thread.start()
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True,
+                                              name="monitor-run-queue-watch")
+        self._watch_thread.start()
         self.connections.start()
         if self.slm_reinit is not None:
             self.slm_reinit.start()
@@ -687,11 +721,58 @@ class MonitorUDPServer(UdpServer):
         return dict(source.since(obj.get("after", 0)), status="ok")
 
     def _loop_busy(self) -> str:
-        """Why something of this server's own holds the core, for the loops."""
-        return "a state reset is running" if self.reset.running else ""
+        """Why something of this server's own holds the machine, for the
+        loops: a state reset, or a person's hold."""
+        if self.reset.running:
+            return "a state reset is running"
+        return self.person_hold.text()
 
     def _on_loop_change(self, info) -> None:
         self._broadcaster.send({"type": "run_loop", "loop": info})
+
+    # --- the run queue and the person hold ---------------------------------------------
+
+    def _reply_run_queue(self, obj: dict) -> dict:
+        """``{"type": "run_queue", "action": ...}``: ``hold`` (``reason``,
+        ``by``) and ``release`` (``by``) -- a person's hold."""
+        action = obj.get("action")
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
+        if action == "hold":
+            return self.person_hold.hold(str(obj.get("reason") or ""), by)
+        if action == "release":
+            return self.person_hold.release(by)
+        return {"status": "error", "msg": f"unknown run_queue action {action!r}"}
+
+    def _on_person_hold_change(self, info) -> None:
+        self._broadcaster.send({"type": "person_hold", "person_hold": info})
+
+    def _agent_run_ids(self) -> set:
+        """Run ids of the runs launched for an agent through this server (no
+        Reset of theirs sets the person hold)."""
+        return set()
+
+    def _own_abort_ids(self) -> set:
+        """Run ids this server itself sent liveOD's Abort for."""
+        return set()
+
+    def watch_tick(self) -> None:
+        """One look at liveOD for the person hold: a Reset pressed for a run
+        that is not an agent's queued run puts the hold on; a reminder while
+        it is on."""
+        try:
+            poll = self._live_od()
+        except Exception:                             # noqa: BLE001
+            poll = None                               # liveOD down: nothing to see
+        if poll is not None:
+            self.person_hold.observe_poll(poll, self._agent_run_ids(), self._own_abort_ids())
+        self.person_hold.tick()
+
+    def _watch_loop(self) -> None:
+        while not self._watch_stop.wait(self.WATCH_S):
+            try:
+                self.watch_tick()
+            except Exception:
+                log.exception("Run queue / person hold watch tick failed")
 
     def _set_trust(self, trusted: bool, reason: str) -> None:
         self._trust = {"trusted": bool(trusted), "reason": reason, "since": time.time()}
@@ -1227,6 +1308,7 @@ class MonitorUDPServer(UdpServer):
 
     def stop(self):
         self._runner_stop.set()
+        self._watch_stop.set()
         if self.slm_reinit is not None:
             self.slm_reinit.stop()
         # Close the connections (bounded) while this process is still here;

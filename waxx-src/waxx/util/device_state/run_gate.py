@@ -54,6 +54,12 @@ States (:class:`GateState`):
 ``unknown``        POLL failed, or its reply lacks ``run_in_progress``, or the
                    fence could not be read.  Not waivable: anything unknown
                    counts as busy.
+``held``           a person has put a hold on the machine at the monitor
+                   server (its ``status_json`` ``person_hold``; see
+                   :mod:`~waxx.util.device_state.person_hold`).  Not waivable:
+                   an agent waits until a person releases it.  Reported by
+                   :func:`loops_verdict` / :func:`assess`, never by
+                   :func:`classify` (liveOD knows nothing of it).
 
 A client's pid is only checked on this machine: ``client_host`` must equal
 :func:`socket.gethostname` (case-insensitive).  On another host, or without a
@@ -70,7 +76,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
-STATES = ("free", "live", "reset_pending", "dead_client", "wedged", "unknown")
+STATES = ("free", "live", "reset_pending", "dead_client", "wedged", "unknown", "held")
 
 #: A run with no shot yet counts as live for this long after its INIT_RUN
 #: (compile, MOT load, warm-ups and the first shot).
@@ -437,9 +443,26 @@ def active_loops(status: dict | None) -> list[str]:
             if isinstance(info, dict) and info.get("state") in LOOP_ACTIVE_STATES]
 
 
+def hold_verdict(status: dict | None) -> GateState | None:
+    """``held`` (not waivable) while a person's hold is on at the monitor
+    server (``status_json`` ``person_hold``); None otherwise."""
+    hold = (status or {}).get("person_hold")
+    if not isinstance(hold, dict) or not hold.get("active"):
+        return None
+    from waxx.util.device_state.person_hold import describe  # noqa: PLC0415
+    return GateState("held", hold.get("run_id"), describe(hold),
+                     detail={"person_hold": dict(hold)})
+
+
 def loops_verdict(status: dict | None) -> GateState | None:
-    """``live`` (not waivable) while a run loop of the monitor server is active;
-    None otherwise."""
+    """What the monitor server itself has the machine for, from its
+    ``status_json``: a person's hold (``held``, see :func:`hold_verdict`), or
+    an active run loop (``live``); not waivable.  None when neither.  (The
+    name is older than the hold; :func:`assess` and the agents' occupancy
+    check both ask it.)"""
+    held = hold_verdict(status)
+    if held is not None:
+        return held
     active = active_loops(status)
     if not active:
         return None
@@ -451,9 +474,10 @@ def loops_verdict(status: dict | None) -> GateState | None:
 def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
            now: float | None = None, pid_alive: Callable[[int], bool] | None = None
            ) -> GateState:
-    """Fetch POLL and the monitor's status and :func:`classify` them; an active
-    run loop of the monitor server is busy too.  Either fetch failing gives
-    ``unknown`` (counted as busy)."""
+    """Fetch POLL and the monitor's status and :func:`classify` them; a
+    person's hold at the monitor server (``held``, reported first, whatever
+    liveOD says) and an active run loop are busy too.  Either fetch failing
+    gives ``unknown`` (counted as busy)."""
     try:
         poll = fetch_poll(live_od_client, timeout)
     except Exception as exc:                      # noqa: BLE001
@@ -465,6 +489,9 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
         return GateState("unknown", poll.get("run_id"),
                          f"the monitor server did not answer ({exc}) -- cannot read its run "
                          "fence", detail={"error": str(exc), "poll_run_id": poll.get("run_id")})
+    held = hold_verdict(status)
+    if held is not None:
+        return held
     verdict = classify(poll, status.get("run_pending") or None, now=now, pid_alive=pid_alive,
                        monitor_state=status.get("state"))
     if verdict.state == "free" or verdict.waivable:
