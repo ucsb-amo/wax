@@ -1761,3 +1761,65 @@ def test_source_changed_and_precise_waiting(q, expts):
     q.pause({"scope": "agent", "by": "jp"})
     waiting = q.describe({"id": c})["waiting"]
     assert waiting.startswith("agent jobs paused by jp since ")
+
+
+# --- edit (phase 1b-3) ----------------------------------------------------------------------
+
+def test_edit_a_queued_job_and_its_journal(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    reply = q.edit({"id": b, "owner": "person", "by": "jp", "fields": {
+        "argv": ["-a", "x=2"], "label": "rabi v2!", "after": [a], "chain": "c1",
+        "stop_on_failure": True, "write_back": False, "due": q.clock.t + 10,
+        "allow_drift": True}})
+    assert reply["status"] == "ok" and set(reply["changed"]) == {
+        "argv", "label", "after", "chain", "stop_on_failure", "write_back", "due",
+        "allow_drift"}
+    j = job(q, b)
+    assert j["argv"] == ["-a", "x=2"] and j["label"] == "rabi_v2" and j["after"] == [a]
+    rec = [e for e in q.journal.entries if e["kind"] == "run_queue_edit"][-1]
+    assert rec["before"]["label"] == "rabi" and rec["after"]["label"] == "rabi_v2"
+    assert rec["by"] == "jp" and rec["owner"] == "person"
+
+
+def test_edit_refusals(q, expts):
+    a = submit(q, expts, at_end=True)
+    agent = submit(q, expts, owner="agent", at_end=True)
+    for obj, words in [
+            ({"id": a, "owner": "person"}, "edit needs fields"),
+            ({"id": a, "owner": "person", "fields": {"path": "x"}}, "not editable: path"),
+            ({"id": a, "owner": "agent", "fields": {"label": "x"}}, "a person's job"),
+            ({"id": a, "fields": {"label": "x"}}, "owner is required"),
+            ({"id": a, "owner": "person", "fields": {"argv": ["a&b"]}}, "not allowed"),
+            ({"id": a, "owner": "person", "fields": {"due": float("nan")}}, "finite"),
+            ({"id": a, "owner": "person", "fields": {"write_back": True}}, "may only veto"),
+            ({"id": a, "owner": "person", "fields": {"after": [a]}}, "wait for itself"),
+            ({"id": a, "owner": "person", "fields": {"paused": "yes"}}, "true or false")]:
+        reply = q.edit(obj)
+        assert reply["status"] == "error" and words in reply["msg"], (obj, reply)
+    q.edit({"id": agent, "owner": "agent", "fields": {"after": [a]}})
+    reply = q.edit({"id": a, "owner": "person", "fields": {"after": [agent]}})
+    assert "cycle" in reply["msg"]
+    assert q.edit({"id": agent, "owner": "agent", "fields": {"label": "mine"}})["status"] == "ok"
+
+
+def test_a_launching_or_running_job_is_not_edited(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    reply = q.edit({"id": a, "owner": "person", "fields": {"label": "x"}})
+    assert reply["status"] == "error" and "only queued jobs" in reply["msg"]
+
+
+def test_a_paused_job_waits_keeps_its_place_and_others_go(q, expts):
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": True}})
+    assert q.describe({"id": a})["waiting"].startswith("paused (this job) by jp since ")
+    q.tick()
+    assert job(q, a)["state"] == "queued" and job(q, b)["state"] == "running"
+    assert [v["id"] for v in q.list()["jobs"] if v["state"] == "queued"] == [a]
+    run_through(q, 101)
+    q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": False}})
+    assert job(q, a)["paused_by"] == "" and job(q, a)["paused_since"] is None
+    q.tick()
+    assert job(q, a)["state"] == "running"

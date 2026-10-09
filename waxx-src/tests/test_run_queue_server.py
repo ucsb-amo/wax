@@ -89,7 +89,12 @@ def test_the_request_contract(server, expts, tmp_path):
             "repeat_index", "repeat_of", "submitted_at", "submitted_by", "state", "reason",
             "pid", "pid_started", "client_pid", "run_id", "log_path", "exit_code",
             "outcome", "launched_at", "ended_at", "cancel", "adopted", "rank", "expt_class",
-            "calibrates_declared", "submitter"} == set(j)
+            "calibrates_declared", "submitter", "paused", "paused_by", "paused_since"} == set(j)
+    # the edit, move and insert actions answer through the server
+    assert server.ask({"type": "run_queue", "action": "edit", "id": 1, "owner": "agent",
+                       "fields": {"label": "rabi2"}})["job"]["label"] == "rabi2"
+    assert server.ask({"type": "run_queue", "action": "move", "id": 1, "owner": "agent",
+                       "to_index": 0})["position"] == 0
     assert j["state"] == "queued" and j["owner"] == "agent"
     status = json.loads(server.generate_reply("status_json"))
     rq = status["run_queue"]
