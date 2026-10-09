@@ -2,9 +2,35 @@ import numpy as np
 from waxa.config.expt_params import ExptParams as ExptParamsWaxa
 
 class ExptParams(ExptParamsWaxa):
+    # Override recorder (waxx.base.expt.Expt.start_param_override_recording).
+    # While the instance's _record_assignments is True, every public attribute
+    # assigned through normal attribute syntax (self.p.x = ...) is added to its
+    # _assigned_keys set: the params an experiment's prepare() set itself.
+    # compute_derived() never records, and nothing else about params changes.
+    # Only state goes on the instance (no new methods: waxa's compute_derived
+    # calls every non-dunder callable of the object). Writes through vars() /
+    # __dict__ (xvar, adjust, the scan's per-shot updates) are not recorded.
+    _records_assignments = True
+
+    def __setattr__(self, name, value):
+        d = self.__dict__
+        if d.get("_record_assignments", False) and not name.startswith("_"):
+            d["_assigned_keys"].add(name)
+        object.__setattr__(self, name, value)
+
+    def compute_derived(self):
+        d = self.__dict__
+        if not d.get("_record_assignments", False):
+            return super().compute_derived()
+        d["_record_assignments"] = False
+        try:
+            return super().compute_derived()
+        finally:
+            d["_record_assignments"] = True
+
     def __init__(self):
         super().__init__()
-        
+
         self.beatlock_sign = -1
         self.N_offset_lock_reference_multiplier = 8
         self.frequency_minimum_offset_beatlock = 250.e6

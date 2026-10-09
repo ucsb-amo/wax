@@ -57,6 +57,43 @@ def _arm_exit_hang_dump(seconds=T_ABORT_EXIT_HANG_DUMP, announce=True):
         pass
 
 
+def _same_value(a, b) -> bool:
+    try:
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            a, b = np.asarray(a), np.asarray(b)
+            if a.shape != b.shape:
+                return False
+            try:
+                return bool(np.array_equal(a, b, equal_nan=True))
+            except TypeError:
+                return bool(np.array_equal(a, b))
+        if a == b:
+            return True
+        return bool(a != a and b != b)                   # both NaN
+    except Exception:
+        return False
+
+
+def _keys_differing_from_default(params) -> set:
+    """Public keys of ``params`` whose value is not what a fresh
+    ``type(params)()`` (after compute_derived) has. Never raises: on a failure
+    to build the default it prints why and returns every public key (nothing
+    is then taken for a default)."""
+    try:
+        fresh = type(params)()
+        cd = getattr(fresh, "compute_derived", None)
+        if callable(cd):
+            cd()
+        dv = vars(fresh)
+        return {k for k, v in vars(params).items()
+                if not k.startswith("_") and (k not in dv or not _same_value(v, dv[k]))}
+    except Exception as e:
+        print(f"[params] WARNING: could not compare the params with a fresh "
+              f"{type(params).__name__} ({type(e).__name__}: {e}); every param counts as set "
+              f"by this run.")
+        return {k for k in vars(params) if not k.startswith("_")}
+
+
 def _fmt_duration(seconds):
     """'45s', '3m07s', '1h02m' (ASCII, for terminal progress lines)."""
     s = int(round(seconds))
@@ -124,6 +161,18 @@ class Expt(Scanner, Dealer, Scribe):
         self.params = ExptParams()
         self.p = self.params
 
+        # Calibrations (waxx.calibration): what this run declares with
+        # self.calibrates(), and the results end_wax / emit_calibration made.
+        # The machine's Base sets calibration_config. Host-only.
+        self.calibration_config = None
+        self._cal_declarations = []
+        self.calibration_results = []
+        self._run_saved = False
+        # The params prepare() assigned itself (frozenset, from
+        # finish_prepare_wax on), or None when the params class cannot tell.
+        self._param_overrides = None
+        self.start_param_override_recording()
+
         self.images = []
         self.image_timestamps = []
 
@@ -173,6 +222,9 @@ class Expt(Scanner, Dealer, Scribe):
         a scan. This must be an RPC -- no kernel decorator.
         """
 
+        # what prepare() assigned ends here (nothing below is the experiment's)
+        self._stop_param_override_recording()
+
         if hasattr(self,'monitor'):
             self.monitor.init_monitor()
             self._adopt_monitor_snapshot()
@@ -209,7 +261,7 @@ class Expt(Scanner, Dealer, Scribe):
                 )
             elif self.run_info.save_data:
                 print(
-                    "[LiveOD] WARNING: No liveOD server connection — "
+                    "[LiveOD] WARNING: No liveOD server connection -- "
                     "data will not be saved (setup_camera=False)."
                 )
 
@@ -229,6 +281,93 @@ class Expt(Scanner, Dealer, Scribe):
             except Exception as e:
                 print(f"[Monitor] note: could not announce this run to the monitor "
                       f"server ({e!r}); composite ops are not fenced for it.")
+
+    # ---- param overrides and calibrations (waxx.calibration) -----------------
+
+    def start_param_override_recording(self):
+        """From now until finish_prepare_wax, record which params are assigned
+        (``self.p.x = ...``): the experiment's own overrides. A machine whose
+        Base replaces self.params calls this again once its params object is
+        set up. A params class without the recorder (waxx.config.expt_params
+        has it) leaves ``_param_overrides`` None: unknown, not empty.
+
+        Assignments made before this call (a params object built and changed
+        before it was handed to Base) are caught by value: every key whose
+        value differs from a fresh ``type(params)()`` (after its
+        compute_derived()) starts in the recorded set. That also counts any
+        non-default value Base itself set (the conservative direction), and
+        misses an earlier assignment equal to the default (which then makes no
+        difference to the run)."""
+        p = getattr(self, "params", None)
+        if p is not None and getattr(type(p), "_records_assignments", False):
+            d = vars(p)
+            d["_assigned_keys"] = _keys_differing_from_default(p)
+            d["_record_assignments"] = True
+
+    def _stop_param_override_recording(self):
+        p = getattr(self, "params", None)
+        d = vars(p) if p is not None else {}
+        if d.get("_record_assignments", False):
+            d["_record_assignments"] = False
+            self._param_overrides = frozenset(d.get("_assigned_keys", ()))
+
+    def calibrates(self, key, analysis, *, write_back=True, allow_no_unc=False, opts=None):
+        """Declare, in prepare(), that this run calibrates the param ``key``
+        with the analysis named ``analysis`` (found in the machine's registry;
+        see waxx.calibration). After the run is saved, end() analyses it,
+        records the result and, with ``write_back`` and nothing flagged and no
+        submitter veto (WAXX_CAL_NO_WRITE_BACK=1), writes it into the params
+        file. ``allow_no_unc`` accepts a result without an uncertainty;
+        ``opts`` goes to the analysis. Raises here, in prepare, when the key or
+        the analysis does not exist."""
+        from waxx.calibration.analysis import resolve
+        from waxx.calibration.emit import Declaration
+        if not isinstance(key, str) or not hasattr(self.params, key):
+            raise ValueError(f"calibrates: {key!r} is not a param of {type(self.params).__name__}")
+        if callable(getattr(self.params, key)):
+            raise ValueError(f"calibrates: {key!r} is a method of {type(self.params).__name__}, "
+                             f"not a param")
+        if key in (getattr(self, "xvarnames", None) or []):
+            raise ValueError(f"calibrates: {key!r} is scanned in this run; a scanned param "
+                             f"cannot be calibrated by it")
+        if any(d.key == key for d in self._cal_declarations):
+            raise ValueError(f"calibrates: {key!r} is declared twice")
+        cfg = getattr(self, "calibration_config", None)
+        if cfg is None:
+            raise RuntimeError("calibrates: this experiment has no calibration_config "
+                               "(the machine's Base sets one)")
+        resolve(analysis, cfg.registry_modules)
+        self._cal_declarations.append(Declaration(key, analysis, bool(write_back),
+                                                  bool(allow_no_unc), dict(opts or {})))
+
+    def emit_calibration(self, key, value, unc, *, write_back=False, allow_no_unc=False, **meta):
+        """Record a calibration the experiment computed itself, from analyze()
+        after self.end(): the same checks, ledger record, [cal] line and (with
+        ``write_back=True``) write-back as a declared one. ``meta``: CalResult
+        fields (unit, n_used, excluded, method, fit, figure_path, analysis).
+        Returns the CalResult, or None when it could not be built. Never raises."""
+        try:
+            from waxx.calibration.emit import emit_direct
+            r = emit_direct(self, key, value, unc, write_back=write_back,
+                            allow_no_unc=allow_no_unc, **meta)
+        except Exception as e:
+            print(f"[cal] WARNING: emit_calibration({key!r}) failed ({type(e).__name__}: {e})")
+            return None
+        self.calibration_results.append(r)
+        return r
+
+    def _emit_calibrations(self):
+        """end_wax, after the save: the declared calibrations. Never raises --
+        a calibration cannot turn a saved run into an error."""
+        decls = getattr(self, "_cal_declarations", None)
+        if not decls:
+            return
+        try:
+            from waxx.calibration.emit import run_declared
+            self.calibration_results.extend(run_declared(self, decls))
+        except Exception as e:
+            print(f"[cal] WARNING: the calibration step failed ({type(e).__name__}: {e}); "
+                  f"the run's data is saved and unaffected.")
 
     def pre_init_run(self):
         """Host, in finish_prepare_wax just before INIT_RUN: the last moment
@@ -421,7 +560,7 @@ class Expt(Scanner, Dealer, Scribe):
         try:
             self.scope_data.close()
         except Exception as _e:
-            print(f"[end_wax] WARNING: scope_data.close() raised: {_e} — continuing.")
+            print(f"[end_wax] WARNING: scope_data.close() raised: {_e} -- continuing.")
 
         # Drain the per-shot auxiliary camera clients BEFORE the END_RUN
         # payload is serialized: finish() waits for in-flight snaps, writes
@@ -441,7 +580,8 @@ class Expt(Scanner, Dealer, Scribe):
         if _client is not None:
             payload = self._serialize_end_payload(expt_filepath)
             _t1 = time.monotonic()
-            _client.end_run(payload)
+            _client.end_run(payload)            # raises unless the save completed
+            self._run_saved = True
             _t_end_run = time.monotonic() - _t1
             _t_save = float(_client.last_end_run_reply.get("save_s") or 0.)
         else:
@@ -476,6 +616,10 @@ class Expt(Scanner, Dealer, Scribe):
         console.info(f"[end] streams closed {_t_streams:.1f} s | liveOD end_run "
                      f"{_t_end_run:.1f} s (save {_t_save:.1f} s) | monitor {_t_monitor:.1f} s"
                      f"{pushed}{failed}")
+
+        # Declared calibrations: the run is saved and the monitor has its end
+        # state, so this costs the machine nothing. Never raises.
+        self._emit_calibrations()
 
         # Runs have hung after this point (2026-09-26, run 83102) with nothing
         # left to show why: if the process outlives this by a minute, its
@@ -848,7 +992,7 @@ class Expt(Scanner, Dealer, Scribe):
                 cs.finish()
             except Exception as e:
                 print(f"[end_wax] WARNING: camera stream "
-                      f"'{getattr(cs, 'key', '?')}' finish() raised: {e} — continuing.")
+                      f"'{getattr(cs, 'key', '?')}' finish() raised: {e} -- continuing.")
 
         threads = [threading.Thread(target=one, args=(cs,), daemon=True,
                                     name=f"finish:{getattr(cs, 'key', '?')}")
@@ -950,10 +1094,10 @@ class Expt(Scanner, Dealer, Scribe):
                 try:
                     reshaped = scope.reshape_data()
                 except Exception as _e:
-                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} — scope data will be empty for this run.")
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' reshape_data() raised: {_e} -- scope data will be empty for this run.")
                     reshaped = None
                 if reshaped is None or not isinstance(reshaped, np.ndarray) or reshaped.ndim < 3 or reshaped.size == 0:
-                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) — omitting from payload.")
+                    print(f"[_serialize_end_payload] WARNING: scope '{scope.label}' produced no usable data (shape={getattr(reshaped, 'shape', None)}) -- omitting from payload.")
                 else:
                     scope_data_list.append({
                         'label': str(scope.label),
