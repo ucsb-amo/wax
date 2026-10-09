@@ -123,6 +123,18 @@ class Expt(Scanner, Dealer, Scribe):
         self.params = ExptParams()
         self.p = self.params
 
+        # Calibrations (waxx.calibration): what this run declares with
+        # self.calibrates(), and the results end_wax / emit_calibration made.
+        # The machine's Base sets calibration_config. Host-only.
+        self.calibration_config = None
+        self._cal_declarations = []
+        self.calibration_results = []
+        self._run_saved = False
+        # The params prepare() assigned itself (frozenset, from
+        # finish_prepare_wax on), or None when the params class cannot tell.
+        self._param_overrides = None
+        self.start_param_override_recording()
+
         self.images = []
         self.image_timestamps = []
 
@@ -171,6 +183,9 @@ class Expt(Scanner, Dealer, Scribe):
         parameters that the user created in the experiment file at each step in
         a scan. This must be an RPC -- no kernel decorator.
         """
+
+        # what prepare() assigned ends here (nothing below is the experiment's)
+        self._stop_param_override_recording()
 
         if hasattr(self,'monitor'):
             self.monitor.init_monitor()
@@ -228,6 +243,79 @@ class Expt(Scanner, Dealer, Scribe):
             except Exception as e:
                 print(f"[Monitor] note: could not announce this run to the monitor "
                       f"server ({e!r}); composite ops are not fenced for it.")
+
+    # ---- param overrides and calibrations (waxx.calibration) -----------------
+
+    def start_param_override_recording(self):
+        """From now until finish_prepare_wax, record which params are assigned
+        (``self.p.x = ...``): the experiment's own overrides. A machine whose
+        Base replaces self.params calls this again once its params object is
+        set up. A params class without the recorder (waxx.config.expt_params
+        has it) leaves ``_param_overrides`` None: unknown, not empty."""
+        p = getattr(self, "params", None)
+        if p is not None and getattr(type(p), "_records_assignments", False):
+            d = vars(p)
+            d["_assigned_keys"] = set()
+            d["_record_assignments"] = True
+
+    def _stop_param_override_recording(self):
+        p = getattr(self, "params", None)
+        d = vars(p) if p is not None else {}
+        if d.get("_record_assignments", False):
+            d["_record_assignments"] = False
+            self._param_overrides = frozenset(d.get("_assigned_keys", ()))
+
+    def calibrates(self, key, analysis, *, write_back=True, allow_no_unc=False, opts=None):
+        """Declare, in prepare(), that this run calibrates the param ``key``
+        with the analysis named ``analysis`` (found in the machine's registry;
+        see waxx.calibration). After the run is saved, end() analyses it,
+        records the result and, with ``write_back`` and nothing flagged and no
+        submitter veto (WAXX_CAL_NO_WRITE_BACK=1), writes it into the params
+        file. ``allow_no_unc`` accepts a result without an uncertainty;
+        ``opts`` goes to the analysis. Raises here, in prepare, when the key or
+        the analysis does not exist."""
+        from waxx.calibration.analysis import resolve
+        from waxx.calibration.emit import Declaration
+        if not isinstance(key, str) or not hasattr(self.params, key):
+            raise ValueError(f"calibrates: {key!r} is not a param of {type(self.params).__name__}")
+        if any(d.key == key for d in self._cal_declarations):
+            raise ValueError(f"calibrates: {key!r} is declared twice")
+        cfg = getattr(self, "calibration_config", None)
+        if cfg is None:
+            raise RuntimeError("calibrates: this experiment has no calibration_config "
+                               "(the machine's Base sets one)")
+        resolve(analysis, cfg.registry_modules)
+        self._cal_declarations.append(Declaration(key, analysis, bool(write_back),
+                                                  bool(allow_no_unc), dict(opts or {})))
+
+    def emit_calibration(self, key, value, unc, *, write_back=False, allow_no_unc=False, **meta):
+        """Record a calibration the experiment computed itself, from analyze()
+        after self.end(): the same checks, ledger record, [cal] line and (with
+        ``write_back=True``) write-back as a declared one. ``meta``: CalResult
+        fields (unit, n_used, excluded, method, fit, figure_path, analysis).
+        Returns the CalResult, or None when it could not be built. Never raises."""
+        try:
+            from waxx.calibration.emit import emit_direct
+            r = emit_direct(self, key, value, unc, write_back=write_back,
+                            allow_no_unc=allow_no_unc, **meta)
+        except Exception as e:
+            print(f"[cal] WARNING: emit_calibration({key!r}) failed ({type(e).__name__}: {e})")
+            return None
+        self.calibration_results.append(r)
+        return r
+
+    def _emit_calibrations(self):
+        """end_wax, after the save: the declared calibrations. Never raises --
+        a calibration cannot turn a saved run into an error."""
+        decls = getattr(self, "_cal_declarations", None)
+        if not decls:
+            return
+        try:
+            from waxx.calibration.emit import run_declared
+            self.calibration_results.extend(run_declared(self, decls))
+        except Exception as e:
+            print(f"[cal] WARNING: the calibration step failed ({type(e).__name__}: {e}); "
+                  f"the run's data is saved and unaffected.")
 
     def pre_init_run(self):
         """Host, in finish_prepare_wax just before INIT_RUN: the last moment
@@ -440,7 +528,8 @@ class Expt(Scanner, Dealer, Scribe):
         if _client is not None:
             payload = self._serialize_end_payload(expt_filepath)
             _t1 = time.monotonic()
-            _client.end_run(payload)
+            _client.end_run(payload)            # raises unless the save completed
+            self._run_saved = True
             _t_end_run = time.monotonic() - _t1
             _t_save = float(_client.last_end_run_reply.get("save_s") or 0.)
         else:
@@ -475,6 +564,10 @@ class Expt(Scanner, Dealer, Scribe):
         console.info(f"[end] streams closed {_t_streams:.1f} s | liveOD end_run "
                      f"{_t_end_run:.1f} s (save {_t_save:.1f} s) | monitor {_t_monitor:.1f} s"
                      f"{pushed}{failed}")
+
+        # Declared calibrations: the run is saved and the monitor has its end
+        # state, so this costs the machine nothing. Never raises.
+        self._emit_calibrations()
 
         # Runs have hung after this point (2026-09-26, run 83102) with nothing
         # left to show why: if the process outlives this by a minute, its
