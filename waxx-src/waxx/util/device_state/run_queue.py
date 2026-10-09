@@ -1029,7 +1029,9 @@ class RunQueue:
         self._save()                                   # "launching" is on disk first
         self._record("run_queue_launching", job=job.id, command=command, log_path=log_path,
                      owner=job.owner, drift=sha != job.sha256)
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        # unbuffered: output reaches the log as printed; UTF-8: the log is read
+        # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         env[run_gate.LAUNCHER_ENV] = LAUNCHER
         env[JOB_ENV] = str(job.id)
         env[OWNER_ENV] = job.owner

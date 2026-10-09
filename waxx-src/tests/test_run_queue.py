@@ -323,6 +323,7 @@ def test_the_launch_command_environment_and_log(q, expts, tmp_path):
     env = call["env"]
     assert env["WAXX_LAUNCHER"] == "kq" and env["WAXX_QUEUE_JOB"] == str(a)
     assert env["WAXX_OWNER"] == "agent" and env["PYTHONUNBUFFERED"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["WAXX_CAL_NO_WRITE_BACK"] == "1"
     assert call["cwd"] == str(expts.resolve())
     assert call["log_path"] == str(tmp_path / "logs" / "run_queue" / "logs" / f"{a}_rabi_scan.out")
