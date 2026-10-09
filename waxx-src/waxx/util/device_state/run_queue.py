@@ -135,6 +135,10 @@ PAUSE_SCOPES = ("agent", "all")
 LAUNCHER = "kq"
 JOB_ENV = "WAXX_QUEUE_JOB"
 OWNER_ENV = "WAXX_OWNER"
+#: A submitter's write-back veto (submit "write_back": false) reaches the job as
+#: this variable = "1".  It is honoured by the calibration emit on the
+#: jep/calibration-writeback branch (waxx/calibration/emit.py: "[cal] not
+#: applied: vetoed by WAXX_CAL_NO_WRITE_BACK"); this branch only sets it.
 NO_WRITE_BACK_ENV = "WAXX_CAL_NO_WRITE_BACK"
 
 #: An eligible job waiting this long with nothing running raises the alarm.
