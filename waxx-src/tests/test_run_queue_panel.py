@@ -1,0 +1,542 @@
+"""The run queue panel (waxx.util.guis.run_queue_panel): the table built from
+a list reply (phase-1 fields, and the phase-1b fields present or absent), the
+exact request dicts its controls send (owner "person"), the cancel
+question, controls disabled by an "unknown action" reply, the log window's
+cursor, and the broadcast debounce.
+
+Offscreen Qt.  The requester is a fake that records each request and answers
+from a table; requests are answered synchronously.  No socket may be opened
+in this module (socket.socket is replaced by one that fails the test), no
+server is built, nothing beacons."""
+import os
+import socket
+import time
+
+import pytest
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication
+
+from waxx.util.guis import run_queue_panel as rqp
+from waxx.util.guis.request_runner import RequestRunner, is_unknown_request, normalize_reply
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return QApplication.instance() or QApplication([])
+
+
+class _NoSocket:
+    def __init__(self, *a, **k):
+        raise AssertionError("the panel opened a socket")
+
+
+@pytest.fixture(autouse=True)
+def no_sockets(monkeypatch):
+    monkeypatch.setattr(socket, "socket", _NoSocket)
+
+
+class FakeServer:
+    """Records requests; answers ``answers[action]`` (a dict or a callable of
+    the request), else ok."""
+
+    def __init__(self):
+        self.requests = []
+        self.answers = {}
+
+    def __call__(self, obj):
+        self.requests.append(dict(obj))
+        answer = self.answers.get(obj.get("action") or obj.get("type"))
+        if callable(answer):
+            return answer(obj)
+        if answer is not None:
+            return answer
+        return {"status": "ok"}
+
+    def of(self, action):
+        return [r for r in self.requests if r.get("action") == action]
+
+
+NOW = time.time()
+
+
+def _job(i, state="queued", **kw):
+    job = {"id": i, "token": f"t{i}", "path": f"C:/code/kexp/experiments/JP/expt_{i}.py",
+           "sha256": "ab" * 32, "label": f"expt_{i}", "argv": [], "cwd": "", "owner": "person",
+           "priority": 10, "due": None, "after": [], "chain": None, "stop_on_failure": False,
+           "write_back": None, "allow_drift": False, "repeat_index": 1, "repeat_of": 1,
+           "submitted_at": NOW - 600, "submitted_by": "jp@kong", "state": state, "reason": "",
+           "pid": None, "pid_started": None, "client_pid": None, "run_id": None,
+           "log_path": None, "exit_code": None, "outcome": None, "launched_at": None,
+           "ended_at": None, "cancel": None, "adopted": False}
+    job.update(kw)
+    return job
+
+
+INFO = {"enabled": True, "state": "running", "text": "job 2 (expt_2) running, run 85600",
+        "current": {"id": 2, "token": "t2", "label": "expt_2", "state": "running",
+                    "run_id": 85600, "owner": "agent", "cancel": None},
+        "next": [3], "waiting": "job 2 is in the slot",
+        "counts": {"queued": 3, "launching": 0, "running": 1, "ending": 0, "saved": 1,
+                   "failed": 0, "cancelled": 0, "skipped": 0},
+        "alarm": None, "paused": {"agent": None, "all": None},
+        "person_hold": {"active": False}, "resume_loop": None, "directory": "C:/q"}
+
+
+def _phase1_jobs():
+    return [_job(1, "saved", run_id=85599),
+            _job(2, "running", run_id=85600, owner="agent"),
+            _job(3),
+            _job(4, due=NOW + 3600),
+            _job(5, after=[3], chain="c1", stop_on_failure=True, argv=["n=3", "-c", "X y"])]
+
+
+def _list_reply(jobs, info=None, nxt=(3,)):
+    return {"status": "ok", "jobs": jobs, "next": list(nxt), "run_queue": dict(info or INFO)}
+
+
+def _status(info=None, **kw):
+    info = dict(info or INFO)
+    d = {"state": 0, "state_name": "READY", "run_queue": info,
+         "person_hold": info.get("person_hold")}
+    d.update(kw)
+    return d
+
+
+@pytest.fixture
+def server():
+    return FakeServer()
+
+
+@pytest.fixture
+def panel(qapp, server):
+    server.answers["list"] = _list_reply(_phase1_jobs())
+    p = rqp.RunQueuePanel(server, by="jp@test", synchronous=True)
+    p.confirms = []
+    p.confirm_answer = True
+    p.confirm = lambda title, text, yes="OK", no="Cancel": (
+        p.confirms.append((title, text, yes, no)) or p.confirm_answer)
+    p.text_answer = "mine"
+    p.ask_text = lambda title, prompt, default="": p.text_answer
+    p.edit_answer = None
+    p.ask_edit = lambda job: p.edit_answer
+    p.set_state(_status())
+    p.refresh_list()
+    yield p
+    p.shutdown()
+
+
+def _row(panel, job_id):
+    return panel.model.row_of(job_id)
+
+
+def _cell(panel, job_id, key, role=Qt.ItemDataRole.DisplayRole):
+    index = panel.model.index(_row(panel, job_id), rqp.COLUMN_KEYS.index(key))
+    return panel.model.data(index, role)
+
+
+# --- the table ----------------------------------------------------------------------------
+
+def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
+    assert [j["id"] for j in panel.model.jobs] == [1, 2, 3, 4, 5]
+    assert _cell(panel, 2, "position") == "slot"
+    assert _cell(panel, 3, "position") == "1"                      # next[0]
+    assert _cell(panel, 4, "position") == ""                       # not eligible now
+    assert _cell(panel, 2, "state") == "running"
+    assert _cell(panel, 2, "run_id") == "85600"
+    assert _cell(panel, 2, "owner") == "agent"
+    full = "C:/code/kexp/experiments/JP/expt_3.py"
+    assert _cell(panel, 3, "path") == full
+    assert full in _cell(panel, 3, "path", Qt.ItemDataRole.ToolTipRole)
+    for key in ("expt_class", "est", "source_changed"):
+        assert _cell(panel, 3, key) == ""
+    # why it waits is derived when the server does not say (before 1b)
+    assert _cell(panel, 4, "waiting").startswith("due at ")
+    assert _cell(panel, 5, "waiting") == "waiting for job 3"
+    assert _cell(panel, 5, "after") == "after 3 | chain c1"
+    assert _cell(panel, 3, "submitted").endswith("by jp@kong")
+    assert "argv: n=3 -c X y" == _cell(panel, 5, "label", Qt.ItemDataRole.ToolTipRole)
+    assert panel.table.textElideMode() == Qt.TextElideMode.ElideMiddle
+
+
+def test_phase1b_fields_order_and_render(panel, server):
+    jobs = [_job(3, position=3, expt_class="Rabi", calibrates_declared=["t_pi"],
+                 submitter="agent:codex@kong", estimated_s=125.0, eta_start=NOW + 60,
+                 eta_end=NOW + 185, source_changed=True, waiting="job 4 goes first"),
+            _job(4, position=1, expt_class="Tof", estimated_s=40.0, eta_start=NOW + 10,
+                 eta_end=NOW + 50, source_changed=False, waiting="launching"),
+            _job(5, position=2, waiting=""),
+            _job(1, "saved", position=None)]
+    server.answers["list"] = _list_reply(jobs, nxt=(4, 5, 3))
+    panel.refresh_list()
+    assert [j["id"] for j in panel.model.jobs] == [4, 5, 3, 1]     # by position, then the rest
+    assert _cell(panel, 3, "position") == "3"
+    assert _cell(panel, 3, "expt_class") == "Rabi [cal]"
+    assert "t_pi" in _cell(panel, 3, "expt_class", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 3, "owner") == "person / agent:codex@kong"
+    est = _cell(panel, 3, "est")
+    assert est.startswith("~2.1 min") and "start " in est and "end " in est
+    assert est.endswith(" est.")
+    assert _cell(panel, 3, "source_changed") == "CHANGED"
+    assert "skipped at launch" in _cell(panel, 3, "source_changed", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 4, "source_changed") == ""
+    assert _cell(panel, 3, "waiting") == "job 4 goes first"        # the server's, as sent
+    assert _cell(panel, 5, "waiting") == ""
+
+
+def test_ended_jobs_can_be_hidden(panel):
+    panel.ended_box.setChecked(False)
+    assert [j["id"] for j in panel.model.jobs] == [2, 3, 4, 5]
+    panel.ended_box.setChecked(True)
+    assert len(panel.model.jobs) == 5
+
+
+# --- the top strip --------------------------------------------------------------------------
+
+def test_summary_alarm_hold_pause_and_loop_note(panel):
+    info = dict(INFO, state="held", alarm={"since": NOW - 700, "job": 3, "waited_s": 700.0,
+                                           "why": "liveOD is not reachable"},
+                person_hold={"active": True, "since": NOW - 60, "by": "jp@kong",
+                             "reason": "aligning", "source": "request", "owner": "person",
+                             "run_id": None},
+                paused={"agent": {"by": "jp@kong", "since": NOW, "reason": "tea",
+                                  "owner": "person"}, "all": None},
+                resume_loop={"key": "auto_tof", "path": None, "since": NOW})
+    panel.set_state(_status(info))
+    assert panel.pill.text() == "held"
+    assert not panel.alarm.isHidden()
+    assert "job 3" in panel.alarm.text() and "liveOD is not reachable" in panel.alarm.text()
+    assert "11.7 min" in panel.alarm.text()
+    hold = panel.hold_label.text()
+    for word in ("jp@kong", "aligning", "owner person", "source request"):
+        assert word in hold
+    assert panel.hold_button.text() == "Release hold"
+    assert "PAUSED by jp@kong" in panel.pause_labels["agent"].text()
+    assert panel.pause_buttons["agent"].text() == "Resume agent"
+    assert panel.pause_buttons["all"].text() == "Pause all"
+    assert not panel.loop_note.isHidden() and "auto_tof" in panel.loop_note.text()
+    # launching shows as such
+    cur = _job(2, "launching")
+    panel.set_state(_status(dict(INFO, current=cur)))
+    assert panel.pill.text() == "launching"
+
+
+def test_unreachable_and_no_queue(panel):
+    panel.set_state(None)
+    assert not panel.reachable and not panel.cancel_button.isEnabled()
+    assert "not answering" in panel.summary.text()
+    panel.set_state({"state": 0, "state_name": "READY"})           # an older server
+    assert panel.reachable and not panel.has_queue
+    assert "no run queue" in panel.summary.text()
+    assert not panel.hold_button.isEnabled()
+
+
+# --- requests ----------------------------------------------------------------------------
+
+def test_hold_release_pause_resume_send_exact_requests(panel, server):
+    panel.toggle_hold()
+    assert server.requests[-1] == {"type": "run_queue", "action": "hold", "reason": "mine",
+                                   "owner": "person", "by": "jp@test"}
+    panel.hold = {"active": True}
+    panel.toggle_hold()
+    assert server.requests[-1] == {"type": "run_queue", "action": "release",
+                                   "owner": "person", "by": "jp@test"}
+    panel.text_answer = ""
+    panel.toggle_pause("agent")
+    assert server.requests[-1] == {"type": "run_queue", "action": "pause", "scope": "agent",
+                                   "reason": "", "owner": "person", "by": "jp@test"}
+    panel.info["paused"] = {"agent": None, "all": {"by": "x"}}
+    panel.toggle_pause("all")
+    assert server.requests[-1] == {"type": "run_queue", "action": "resume", "scope": "all",
+                                   "owner": "person", "by": "jp@test"}
+    n = len(server.requests)
+    panel.text_answer = None                                     # the dialog cancelled
+    panel.toggle_pause("agent")
+    assert len(server.requests) == n
+
+
+def test_cancel_a_queued_job(panel, server):
+    assert panel.select_job(3)
+    assert panel.cancel_button.isEnabled()
+    assert panel.cancel_selected()
+    title, text, yes, no = panel.confirms[-1]
+    assert "has not started" in text and "discard" not in text.lower()
+    assert server.of("cancel")[-1] == {"type": "run_queue", "action": "cancel", "id": 3,
+                                       "token": "t3", "owner": "person", "by": "jp@test",
+                                       "queued_only": True}
+
+
+def test_cancel_a_running_job_says_its_data_is_discarded(panel, server):
+    panel.select_job(2)
+    panel.confirm_answer = False
+    assert not panel.cancel_selected()
+    assert server.of("cancel") == []                             # declined: nothing sent
+    title, text, yes, no = panel.confirms[-1]
+    assert "Abort" in title
+    assert "DISCARDS THAT RUN'S DATA FILE" in text and "Reset" in text
+    assert "run 85600" in text
+    assert "no way yet to stop" in text                          # nothing else offered
+    assert yes == "Abort the run and discard its data" and no == "Keep it running"
+    panel.confirm_answer = True
+    server.answers["cancel"] = {"status": "ok", "pending": True, "job": _job(2, "running")}
+    assert panel.cancel_selected()
+    assert server.of("cancel")[-1] == {"type": "run_queue", "action": "cancel", "id": 2,
+                                       "token": "t2", "owner": "person", "by": "jp@test"}
+    assert "next shot" in panel.message.text()
+
+
+def test_a_queued_cancel_that_meets_a_launch_is_not_turned_into_an_abort(panel, server):
+    server.answers["cancel"] = {"status": "error", "state": "running",
+                                "msg": "job 3 (expt_3) is running, not queued: not cancelled"}
+    panel.select_job(3)
+    panel.cancel_selected()
+    assert len(server.of("cancel")) == 1                         # never re-sent by itself
+    assert "launched before the cancel" in panel.message.text()
+
+
+def test_cancel_disabled_for_ended_jobs_and_after_a_cancel_was_asked(panel, server):
+    panel.select_job(1)
+    assert not panel.cancel_button.isEnabled()
+    jobs = _phase1_jobs()
+    jobs[1]["cancel"] = {"by": "jp", "at": NOW, "abort_sent": True}
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    panel.select_job(2)
+    assert not panel.cancel_button.isEnabled()
+    assert _cell(panel, 2, "state") == "running (cancel asked)"
+
+
+def test_move_sends_the_request_and_unknown_disables_it(panel, server):
+    panel.select_job(3)
+    assert panel.move_buttons["top"].isEnabled()
+    panel.move_buttons["top"].click()
+    assert server.of("move")[-1] == {"type": "run_queue", "action": "move", "id": 3,
+                                     "token": "t3", "to": "top", "owner": "person",
+                                     "by": "jp@test"}
+    server.answers["move"] = {"status": "error",
+                              "msg": "unknown run_queue action 'move' (known: submit, cancel)"}
+    panel.move_buttons["down"].click()
+    for b in panel.move_buttons.values():
+        assert not b.isEnabled()
+        assert "older code" in b.toolTip()
+    n = len(server.requests)
+    assert not panel.move_selected("up")
+    assert len(server.requests) == n
+    panel.select_job(2)                                          # a running job: never movable
+    assert not panel.move_buttons["up"].isEnabled()
+
+
+def test_actions_list_in_the_info_gates_1b_controls(panel):
+    panel.set_state(_status(dict(INFO, actions=["list", "cancel", "move"])))
+    panel.select_job(3)
+    assert panel.move_buttons["up"].isEnabled()
+    assert not panel.edit_button.isEnabled()
+    assert "older code" in panel.edit_button.toolTip()
+
+
+def test_edit_sends_only_the_changes_and_unknown_disables_it(panel, server):
+    panel.select_job(3)
+    panel.edit_answer = {"label": "renamed", "argv": ["n=5"]}
+    assert panel.edit_selected()
+    assert server.of("edit")[-1] == {"type": "run_queue", "action": "edit", "id": 3,
+                                     "token": "t3", "changes": {"label": "renamed",
+                                                                "argv": ["n=5"]},
+                                     "owner": "person", "by": "jp@test"}
+    server.answers["edit"] = {"status": "error", "msg": "unknown run_queue action 'edit'"}
+    panel.edit_selected()
+    assert not panel.edit_button.isEnabled()
+    panel.edit_answer = None
+    n = len(server.requests)
+    assert not panel.edit_selected()
+    assert len(server.requests) == n
+
+
+def test_edit_dialog_reports_only_changed_fields(qapp):
+    job = _job(7, after=[3], chain="c", stop_on_failure=True, argv=["a=1"], due=NOW + 7200)
+    d = rqp.EditJobDialog(job)
+    assert d.changes() == {}
+    d.label.setText("other")
+    d.after.setText("3, 4")
+    d.no_write_back.setChecked(True)
+    d.paused.setChecked(True)
+    assert d.changes() == {"label": "other", "after": [3, 4], "write_back": False,
+                           "paused": True}
+    d.after.setText("x")
+    assert d.changes() is None
+    assert not d.buttons.button(d.buttons.StandardButton.Ok).isEnabled()
+    d.deleteLater()
+
+
+def test_parse_due():
+    base = time.mktime((2026, 10, 9, 12, 0, 0, 0, 0, -1))
+    assert rqp._parse_due("", base) is None
+    assert rqp._parse_due("13:30", base) == base + 5400
+    assert rqp._parse_due("11:00", base) == base + 23 * 3600         # tomorrow
+    with pytest.raises(ValueError):
+        rqp._parse_due("soon", base)
+
+
+def test_unknown_request_detection():
+    assert is_unknown_request({"status": "error", "msg": "unknown run_queue action 'move'"})
+    assert is_unknown_request({"status": "error", "msg": "unknown type get_journal"})
+    assert not is_unknown_request({"status": "error", "msg": "job 3 is running"})
+    assert not is_unknown_request({"status": "ok"})
+    assert normalize_reply(None)["no_reply"] and normalize_reply("x")["status"] == "error"
+
+
+def test_the_requester_raising_becomes_an_error_reply(qapp):
+    def boom(obj):
+        raise OSError("down")
+    got = []
+    RequestRunner(boom, synchronous=True).send({"type": "x"}, got.append)
+    assert got[0]["status"] == "error" and "down" in got[0]["msg"] and got[0]["no_reply"]
+
+
+def test_kq_commands(panel):
+    panel.select_job(5)
+    cmds = rqp.kq_commands(panel.selected_job())
+    assert cmds["submit"] == ("kq submit C:/code/kexp/experiments/JP/expt_5.py --label expt_5 "
+                              "--priority 10 --chain c1 -- n=3 -c \"X y\"")
+    assert cmds["tail"] == "kq tail 5 -f"
+    assert panel.copy_kq("tail") == "kq tail 5 -f"
+    agent = rqp.kq_commands(_job(9, owner="agent", write_back=False, path="C:/a b/x.py"))
+    assert agent["submit"].startswith('kq submit "C:/a b/x.py"')
+    assert "--no-write-back" in agent["submit"] and agent["submit"].endswith("--agent")
+
+
+# --- the log window -------------------------------------------------------------------------
+
+class LogServer(FakeServer):
+    """Serves a log the way the queue's tail does: whole lines from a byte
+    offset, ``done`` once ended and read to the end."""
+
+    def __init__(self, data: bytes, state="running"):
+        super().__init__()
+        self.data, self.state, self.silent = data, state, False
+
+    def __call__(self, obj):
+        self.requests.append(dict(obj))
+        if obj.get("action") != "tail":
+            return {"status": "ok"}
+        if self.silent:
+            return None
+        off = obj["offset"]
+        chunk = self.data[off:]
+        cut = chunk.rfind(b"\n") + 1
+        ended = self.state in ("saved", "failed", "cancelled", "skipped")
+        if ended:
+            cut = len(chunk)
+        text = chunk[:cut].decode()
+        lines = text[:-1].split("\n") if text.endswith("\n") else (text.split("\n") if text
+                                                                     else [])
+        new = off + cut
+        return {"status": "ok", "lines": lines if cut else [], "offset": new,
+                "done": ended and new >= len(self.data), "state": self.state, "run_id": 85600}
+
+
+def test_log_window_follows_with_a_cursor(qapp):
+    server = LogServer(b"Run ID: 85600\nshot 1/2\nshot 2")
+    p = rqp.RunQueuePanel(server, by="jp@test", synchronous=True)
+    try:
+        w = p.show_log(_job(2, "running"))
+        assert server.requests[0] == {"type": "run_queue", "action": "tail", "id": 2,
+                                      "token": "t2", "offset": 0}
+        assert w.text.toPlainText() == "Run ID: 85600\nshot 1/2"
+        assert w.offset == len(b"Run ID: 85600\nshot 1/2\n")
+        assert w.timer.isActive() and w.timer.interval() == rqp.TAIL_RUNNING_MS
+        # silence: asked again, the cursor stays
+        server.silent = True
+        w.fetch()
+        assert w.offset == len(b"Run ID: 85600\nshot 1/2\n") and not w.done
+        assert "not answering" in w.status.text() and w.timer.isActive()
+        server.silent = False
+        server.data += b"\nsaved\n"
+        server.state = "saved"
+        w.fetch()
+        assert server.requests[-1]["offset"] == len(b"Run ID: 85600\nshot 1/2\n")
+        assert w.text.toPlainText().splitlines()[-2:] == ["shot 2", "saved"]
+        assert w.done and not w.timer.isActive()
+        n = len(server.requests)
+        w.fetch()                                                  # done: never asked again
+        assert len(server.requests) == n
+        assert p.show_log(_job(2, "running")) is w                 # one window per job
+    finally:
+        p.shutdown()
+
+
+def test_log_window_queued_interval_refusal_and_no_rewind(qapp):
+    server = LogServer(b"", state="queued")
+    p = rqp.RunQueuePanel(server, by="jp@test", synchronous=True)
+    try:
+        w = p.show_log(_job(3))
+        assert w.timer.interval() == rqp.TAIL_QUEUED_MS and w.offset == 0
+        w.on_reply({"status": "ok", "lines": [], "offset": 0, "done": False,
+                    "state": "running"})
+        assert w.timer.interval() == rqp.TAIL_RUNNING_MS
+        w.offset = 100
+        w.on_reply({"status": "ok", "lines": [], "offset": 40, "done": False,
+                    "state": "running"})
+        assert w.offset == 100                                     # never back
+        w.on_reply({"status": "error", "msg": "job 3 has token t9, not t3"})
+        assert w.stopped and not w.timer.isActive() and "token" in w.status.text()
+        w2 = p.show_log(_job(4))
+        w2.on_reply({"status": "error", "msg": "unknown run_queue action 'tail'"})
+        assert w2.stopped and "older code" in w2.status.text()
+    finally:
+        p.shutdown()
+
+
+# --- refreshes --------------------------------------------------------------------------------
+
+def test_first_show_lists_and_broadcasts_are_debounced(qapp, server):
+    server.answers["list"] = _list_reply(_phase1_jobs())
+    p = rqp.RunQueuePanel(server, by="jp@test", synchronous=True)
+    try:
+        p.set_state(_status())
+        assert server.of("list") == []
+        p.show()
+        qapp.processEvents()
+        assert len(server.of("list")) == 1                          # on first show
+        assert server.of("list")[0] == {"type": "run_queue", "action": "list", "limit": 200}
+        for _ in range(5):
+            p.on_broadcast({"type": "run_queue", "run_queue": dict(INFO, text="x")})
+        assert len(server.of("list")) == 1                          # not yet
+        assert p.summary.text() == "x"                               # the summary at once
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 2                          # one list for five
+        p.on_broadcast({"type": "trust", "trust": {}})               # not the queue's
+        p.on_broadcast({"type": "person_hold", "person_hold": {"active": True, "by": "x"}})
+        assert p.hold_button.text() == "Release hold"
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 2
+        # a status_json whose queue changed asks for the list too (whose
+        # reply carries the same, current, info -- as the server's does)
+        server.answers["list"] = _list_reply(_phase1_jobs(), dict(INFO, next=[4, 3]), (4, 3))
+        p.set_state(_status(dict(INFO, next=[4, 3])))
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 3
+        p.set_state(_status(dict(INFO, next=[4, 3])))                # unchanged: no list
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 3
+        p.hide()
+    finally:
+        p.shutdown()
+
+
+def test_selection_survives_a_refresh(panel, server):
+    panel.select_job(4)
+    panel.refresh_list()
+    assert panel.selected_job()["id"] == 4
+
+
+def test_queue_summary_line(qapp):
+    line = rqp.QueueSummaryLine()
+    line.set_info(None)
+    assert line.isHidden()
+    line.set_info(dict(INFO))
+    assert not line.isHidden()
+    assert line.label.text() == ("Queue: running (3 queued) -- open the Monitor panel in the "
+                                 "Server Dashboard")
+    line.set_info(dict(INFO, state="waiting", alarm={"job": 3}))
+    assert line.label.text().startswith("Queue: waiting (3 queued) -- ALARM")
