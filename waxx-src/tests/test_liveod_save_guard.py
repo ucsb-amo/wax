@@ -154,7 +154,10 @@ def plain(app, tmp_path, monkeypatch):
     patch_payload_stash(monkeypatch, run_file, [])
     from waxx.util.live_od.live_od_server import LiveODServer
     saver = FakeSaver(tmp_path)
-    return LiveODServer(server_talk=None, data_saver=saver), saver
+    server = LiveODServer(server_talk=None, data_saver=saver)
+    yield server, saver
+    server._run_file.finish_writer()                 # close the last run's writer
+    assert server._run_file.writer_done.wait(10), "the run's ImageWriter did not finish"
 
 
 def _init(srv, **kw):

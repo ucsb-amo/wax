@@ -25,7 +25,12 @@ def srv(app, tmp_path, monkeypatch):
     from waxx.util.live_od.data import run_file
     patch_payload_stash(monkeypatch, run_file, [])
     from waxx.util.live_od.live_od_server import LiveODServer
-    return LiveODServer(server_talk=None, data_saver=FakeSaver(tmp_path))   # never started
+    server = LiveODServer(server_talk=None, data_saver=FakeSaver(tmp_path))  # never started
+    yield server
+    # the last run's ImageWriter thread holds its file open: let it close it
+    # (each INIT_RUN finished the one before)
+    server._run_file.finish_writer()
+    assert server._run_file.writer_done.wait(10), "the run's ImageWriter did not finish"
 
 
 def _init_msg(**kw):
