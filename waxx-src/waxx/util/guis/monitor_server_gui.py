@@ -462,8 +462,10 @@ class MonitorUDPServer(UdpServer):
     def _extra_status(self) -> dict:
         with self._runner_lock:
             runner = self.runner.info()
+        # one read: another thread may clear the fence between two
+        pending = self._run_pending
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
-                "run_pending": dict(self._run_pending) if self._run_pending else None,
+                "run_pending": dict(pending) if pending else None,
                 "runner": runner, "reset": self.reset.info(),
                 "connections": self.connections.snapshot(),
                 "slm_reinit": (self.slm_reinit.snapshot() if self.slm_reinit is not None
