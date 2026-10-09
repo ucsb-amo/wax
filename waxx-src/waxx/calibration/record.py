@@ -135,12 +135,13 @@ def evaluate(result: CalResult, policy_entry: Optional[dict] = None, *,
     - ``analysis_failed``: the analysis says its fit failed (``fit["ok"] is False``)
     - ``nonfinite``: the value, or a given uncertainty, is NaN or infinite
     - ``no_unc``: no uncertainty (unless ``allow_no_unc``)
+    - ``negative_unc`` / ``zero_unc``: an uncertainty below zero / exactly zero
     - ``rel_unc``: unc/|value| above the policy's ``max_rel_unc``
     - ``change``: |rel_change| above the policy's ``max_frac_change``
     - ``below_min`` / ``above_max``: the value outside the policy's ``min`` / ``max``
     - ``few_shots``: ``n_used`` below the policy's ``min_shots``
 
-    No policy entry (None or {}) -> only the first three. A deferred result
+    No policy entry (None or {}) -> only the first four. A deferred result
     (the analysis did not finish in its budget) has no value, so it is flagged
     ``analysis_failed`` too."""
     pol = dict(policy_entry or {})
@@ -161,7 +162,10 @@ def evaluate(result: CalResult, policy_entry: Optional[dict] = None, *,
     elif not _finite(result.unc):
         flags.append(_flag("nonfinite", f"uncertainty is not finite ({result.unc!r})"))
     elif float(result.unc) < 0:
-        flags.append(_flag("nonfinite", f"uncertainty is negative ({result.unc!r})"))
+        flags.append(_flag("negative_unc", f"uncertainty is negative ({result.unc!r})"))
+    elif float(result.unc) == 0:
+        flags.append(_flag("zero_unc", "uncertainty is exactly zero (no fit gives that; "
+                                       "an error bar was lost)"))
 
     if value_ok:
         v = float(result.value)

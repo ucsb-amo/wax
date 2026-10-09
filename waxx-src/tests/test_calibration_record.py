@@ -68,7 +68,8 @@ def test_rules_that_need_no_policy():
     assert codes(evaluate(res(value=math.nan), {})) == ["nonfinite"]
     assert codes(evaluate(res(value=math.inf), {})) == ["nonfinite"]
     assert codes(evaluate(res(unc=math.nan), {})) == ["nonfinite"]
-    assert codes(evaluate(res(unc=-1.0), {})) == ["nonfinite"]
+    assert codes(evaluate(res(unc=-1.0), {})) == ["negative_unc"]
+    assert codes(evaluate(res(unc=0.0), {})) == ["zero_unc"]
     assert codes(evaluate(res(unc=None), {})) == ["no_unc"]
     assert evaluate(res(unc=None), {}, allow_no_unc=True) == []
     d = res(value=math.nan, unc=None, deferred=True, fit={"ok": False, "reason": "budget"})
