@@ -8,8 +8,8 @@ a direct run when no queue answers.
 
 Commands::
 
-    kq run <file.py> [-- argv...] [options]   submit, then follow the job's output
-    kq submit <file.py> [-- argv...] [opts]   submit only (= kq run --detach)
+    kq run <file.py> [ARG...] [options] [-- argv...]   submit, then follow its output
+    kq submit <file.py> [ARG...] [options] [-- argv...]   submit only (= run --detach)
     kq list [--all] [--state S ...] [--json]  the jobs and the queue's state
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
@@ -19,6 +19,9 @@ Commands::
     kq hold [reason]                          a person's hold: agents' jobs wait
     kq release                                lift the person's hold
     kq status [--json]                        one line: queue, hold, alarm
+
+Words after the file (``key=value``, as artiq_run takes them) and everything
+after ``--`` are passed to the experiment: ``kq run x.py n=3 -- -c MyExpt``.
 
 ``kq run`` prints ``[kq] job <id> queued (position k; <why it waits>)``, then
 the job's output exactly as the experiment writes it ("Run ID: N" included),
@@ -297,6 +300,9 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
 
     def run_options(sp):
         sp.add_argument("file", help="the experiment file (.py)")
+        sp.add_argument("args", nargs="*", metavar="ARG",
+                        help="the experiment's arguments (key=value), as after the file "
+                             "in artiq_run; words starting with - go after --")
         sp.add_argument("--label", help="a short name (default: the file's stem)")
         sp.add_argument("--priority", type=int, default=None,
                         help="higher goes first (default: the queue's, by owner)")
@@ -393,7 +399,7 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             return EXIT_USAGE
     owner = _owner(args)
     reply = ctx.client.submit(
-        args.file, argv=expt_argv, cwd=args.cwd, label=args.label, owner=owner,
+        args.file, argv=list(args.args) + expt_argv, cwd=args.cwd, label=args.label, owner=owner,
         priority=args.priority, due=due, after=args.after, repeat=args.repeat,
         chain=args.chain, stop_on_failure=False if args.no_stop_on_failure else None,
         write_back=False if args.no_write_back else None, allow_drift=args.allow_drift)

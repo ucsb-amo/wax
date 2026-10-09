@@ -129,6 +129,14 @@ def test_run_options_reach_the_request(server, q, expts, monkeypatch):
     assert r.code == 0 and sent(server, "submit")[-1]["after"] == [1, 2]
 
 
+def test_experiment_arguments_after_the_file_as_in_artiq_run(server, expts):
+    r = kq(server, "submit", str(expts / "rabi.py"), "n=3", "m=x", "--label", "r", "--",
+           "-c", "Rabi")
+    assert r.code == 0, r.err
+    assert sent(server, "submit")[-1]["argv"] == ["n=3", "m=x", "-c", "Rabi"]
+    assert kq(server, "submit", str(expts / "rabi.py"), "-c", "Rabi").code == 2
+
+
 def test_agent_flag_and_environment(server, expts, monkeypatch):
     kq(server, "submit", str(expts / "rabi.py"), "--agent")
     assert sent(server, "submit")[-1]["owner"] == "agent"
