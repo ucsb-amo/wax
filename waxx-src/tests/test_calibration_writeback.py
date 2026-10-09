@@ -499,3 +499,35 @@ def test_an_unresolved_backup_blocks_every_write_back(modules, monkeypatch):
     importlib.invalidate_caches()
     mod = importlib.import_module(mod.__name__)
     assert writeback.apply("t_pi", result(), mod.Params, date="2026-10-09").ok
+
+
+def test_a_replace_that_lands_and_then_raises_is_still_undone(modules, monkeypatch):
+    """The restore is decided by the file's bytes: a write that reached the disk
+    before raising is put back."""
+    mod, path = modules(BASE)
+    raw = path.read_bytes()
+    real = writeback.replace_bytes
+    calls = []
+
+    def lands_then_raises(p, data, **k):
+        calls.append(1)
+        real(p, data, **k)
+        if len(calls) == 1:
+            raise OSError("reported a failure after the replace")
+    monkeypatch.setattr(writeback, "replace_bytes", lands_then_raises)
+    rep = writeback.apply("t_pi", result(), mod.Params)
+    assert not rep.ok and "the original file is back" in rep.reason
+    assert path.read_bytes() == raw
+    assert not list(path.parent.glob("*.kcal-backup"))
+
+
+def test_a_write_that_never_landed_says_so(modules, monkeypatch):
+    mod, path = modules(BASE)
+    raw = path.read_bytes()
+
+    def fails(p, data, **k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(writeback, "replace_bytes", fails)
+    rep = writeback.apply("t_pi", result(), mod.Params)
+    assert not rep.ok and "the file was not changed" in rep.reason
+    assert path.read_bytes() == raw and not list(path.parent.glob("*.kcal-backup"))

@@ -445,17 +445,23 @@ def _write_verified(target: Target, src: _Source, new_lines, expected, key, para
             os.fsync(f.fileno())
     except FileExistsError:
         return (_backup_refusal(backup), False, None)
-    why, written, ok, left_modified = None, False, False, False
+    why, ok, touched, left_modified = None, False, False, False
     try:
         replace_bytes(path, src.encode(new_lines))
-        written = True
         why = _verify(target, key, expected, params_cls)
         ok = why is None
     except Exception as e:
         why = f"{type(e).__name__} while writing: {e}"
     finally:
-        if written and not ok:
-            left_modified = not _restore(path, src, target, params_cls, backup)
+        if not ok:
+            # what the file holds decides, not how far the code got: a replace
+            # that raised after it landed still has to be undone
+            try:
+                touched = path.read_bytes() != src.raw
+            except OSError:
+                touched = True
+            if touched:
+                left_modified = not _restore(path, src, target, params_cls, backup)
         if not left_modified:
             try:
                 backup.unlink()
@@ -463,7 +469,7 @@ def _write_verified(target: Target, src: _Source, new_lines, expected, key, para
                 pass
     if why is not None:
         why += (f"; FILE LEFT MODIFIED, original at {backup}" if left_modified
-                else "; the original file is back" if written else "")
+                else "; the original file is back" if touched else "; the file was not changed")
     return why, left_modified, (str(backup) if left_modified else None)
 
 
