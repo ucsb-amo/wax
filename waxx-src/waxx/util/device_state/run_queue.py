@@ -1257,13 +1257,20 @@ class RunQueue:
         with self._lock:
             self._own_abort_ids.add(job.run_id)
         try:
-            reply = self._live_od_reset()
+            reply = self._live_od_reset(run_id=job.run_id, source="queue")
         except Exception as exc:                      # noqa: BLE001
             self._cancel_note(job, abort_note=f"sending the Abort failed: {exc}")
             log.error("Run queue: liveOD's Abort for run %s (%s) failed: %s", job.run_id,
                       job.name, exc)
             return
         ok = bool(isinstance(reply, dict) and reply.get("ok"))
+        if isinstance(reply, dict) and reply.get("refused"):
+            # liveOD's run is no longer this job's (it ended, or another
+            # started): nothing was aborted; tried again while the job runs
+            self._cancel_note(job, abort_note=f"liveOD refused the Abort: {reply.get('error')}")
+            log.warning("Run queue: liveOD refused the Abort for run %s (%s): %s", job.run_id,
+                        job.name, reply.get("error"))
+            return
         self._cancel_note(job, abort_sent=True,
                           abort_note="Abort sent" if ok else f"liveOD refused: {reply}")
         log.warning("Run queue: liveOD's Abort sent for run %s (%s): %s", job.run_id, job.name,

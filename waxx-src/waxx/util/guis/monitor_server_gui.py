@@ -350,7 +350,7 @@ class MonitorUDPServer(UdpServer):
         self.run_queue = RunQueue(
             run_queue_dir, poll=lambda: self._live_od(),
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
-            live_od_reset=lambda: self._live_od.reset(), fence=self._current_run_pending,
+            live_od_reset=lambda **kw: self._live_od.reset(**kw), fence=self._current_run_pending,
             monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
             loops=self.loops, start_monitor=self.start_monitor_signal.emit,
             hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change)

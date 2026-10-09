@@ -11,10 +11,13 @@ It is set
 * by a request -- ``{"type": "run_queue", "action": "hold", "reason", "by"}``,
   e.g. the Device Control GUI's "Hold -- a person has the machine" button on
   the Sequences tab;
-* by the server itself when liveOD's ``reset_requested`` turns on (the Reset /
-  Abort button) for a run that the run queue did NOT launch for an agent -- a
-  person's run, a run loop's run, or no run at all.  An agent resetting its own
-  run, and the queue's own Abort of a job it was asked to cancel, do not set it.
+* by the server itself when a person presses liveOD's Reset / Abort: liveOD
+  counts every Abort by source (POLL ``reset_counts`` / ``reset_count`` +
+  ``last_reset``) and a person's count going up sets the hold -- whatever run
+  it was for, and even if liveOD cleared the Abort again between two polls.
+  The queue's own Abort (source "queue") and an agent's (source "agent",
+  ``reset_liveod.py --own-run``) never set it.  A liveOD without the counts is
+  watched by the level of ``reset_requested`` (see :meth:`observe_poll`).
 
 and released only by a request (``"action": "release"``).  It never expires on
 its own: while it is on, the server logs a reminder every
@@ -76,7 +79,11 @@ class PersonHold:
                    "run_id": None}
         self._last_reminder: float | None = None
         #: liveOD's reset_requested at the last POLL seen (None: none seen yet)
+        #: -- the fallback for a liveOD without reset counts
         self._last_reset: bool | None = None
+        #: liveOD's person Reset count at the last POLL seen (None: none yet)
+        self._last_count: int | None = None
+        self._warned_level = False
         self._load()
 
     # -- state ------------------------------------------------------------------
@@ -154,15 +161,33 @@ class PersonHold:
                     (now - float(info["since"] or now)) / 60.0)
 
     def observe_poll(self, poll: dict | None, agent_run_ids: Iterable = (),
-                     own_abort_ids: Iterable = ()) -> bool:
-        """Read one liveOD POLL reply: when ``reset_requested`` has just turned
-        on and the run it is for is not one the queue launched for an agent
-        (``agent_run_ids``) nor one the queue itself aborted (``own_abort_ids``),
-        put the hold on.  The first POLL seen only sets the baseline (a Reset
-        already pending when the server starts is not taken as a new one).
-        Returns True when it set the hold."""
+                     own_abort_ids: Iterable = (),
+                     on_person_reset: Callable[[dict], bool] | None = None) -> bool:
+        """Read one liveOD POLL reply and put the hold on for a person's Reset.
+
+        liveOD from 2026-10-09 counts every Abort set, by source: a person's
+        Reset is ``reset_counts["person"]`` going up (or, with only
+        ``reset_count``, the count going up with ``last_reset.source``
+        "person").  A count sees a quick Reset that liveOD cleared again
+        between two POLLs, and the queue's own Abort ("queue") or an agent's
+        ("agent") never counts as a person's.  ``on_person_reset(last_reset)``
+        may claim the Reset first (True: no hold -- the run queue's cancel of
+        a person's own starting job).
+
+        An older liveOD (no count) is watched by the level of
+        ``reset_requested``, with one WARNING: a Reset just turned on whose run
+        is not one the queue launched for an agent (``agent_run_ids``) nor one
+        the queue aborted itself (``own_abort_ids``).  The first POLL seen only
+        sets the baseline.  Returns True when it set the hold."""
         if not isinstance(poll, dict) or poll.get("ok") is False:
             return False
+        if "reset_counts" in poll or "reset_count" in poll:
+            return self._observe_count(poll, on_person_reset)
+        if not self._warned_level:
+            self._warned_level = True
+            log.warning("liveOD gives no reset_count (it predates 2026-10-09): the person hold "
+                        "watches reset_requested's level, which misses a Reset liveOD clears "
+                        "between two polls. Restart liveOD to get the count.")
         reset = bool(poll.get("reset_requested"))
         previous, self._last_reset = self._last_reset, reset
         if previous is None or not reset or previous:
@@ -180,6 +205,40 @@ class PersonHold:
             return False
         self.hold(f"Reset in liveOD at {_clock_text(self._clock())}", LIVE_OD_RESET_BY,
                   source="live_od_reset", run_id=run_id)
+        return True
+
+    def _observe_count(self, poll: dict, on_person_reset) -> bool:
+        counts = poll.get("reset_counts")
+        last = poll.get("last_reset") if isinstance(poll.get("last_reset"), dict) else {}
+        if isinstance(counts, dict):
+            count = int(counts.get("person") or 0)
+            person = True
+        else:
+            count = int(poll.get("reset_count") or 0)
+            person = str(last.get("source") or "person") == "person"
+        previous, self._last_count = self._last_count, count
+        if previous is None or count == previous:
+            return False                 # the baseline, or no new Reset
+        if count < previous:
+            # liveOD restarted (its counts start again): a person's Reset since
+            # then shows as a count above zero with a person's last_reset
+            if count == 0 or str(last.get("source") or "person") != "person":
+                return False
+        if not person:
+            log.info("liveOD Reset (source %s) -- not a person's: no person hold.",
+                     last.get("source"))
+            return False
+        if on_person_reset is not None:
+            try:
+                if on_person_reset(dict(last)):
+                    return False
+            except Exception:                         # noqa: BLE001
+                log.exception("Person reset handler failed; the hold goes on")
+        if self.active:
+            return False
+        at = last.get("at") or self._clock()
+        self.hold(f"Reset in liveOD at {_clock_text(at)}", LIVE_OD_RESET_BY,
+                  source="live_od_reset", run_id=last.get("run_id"))
         return True
 
     # -- persistence -------------------------------------------------------------

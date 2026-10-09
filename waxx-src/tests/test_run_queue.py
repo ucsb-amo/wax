@@ -44,10 +44,30 @@ class Live:
         self.state.update(run_in_progress=False, run_state="exited")
         return {"ok": True}
 
-    def reset(self):
+    def reset(self, run_id=None, source="person"):
+        if run_id is not None and (not self.state["run_in_progress"]
+                                   or self.state["run_id"] != run_id):
+            return {"ok": False, "refused": True, "error": "not the run in progress"}
         self.resets.append(self.state["run_id"])
+        self.sources = getattr(self, "sources", []) + [source]
         self.state["reset_requested"] = True
+        if "reset_counts" in self.state:
+            self.press(source)
         return {"ok": True}
+
+    def count_resets(self):
+        """Behave as a liveOD from 2026-10-09: POLL carries reset counts."""
+        self.state.update(reset_count=0, reset_counts={"person": 0, "queue": 0, "agent": 0},
+                          last_reset=None)
+
+    def press(self, source="person"):
+        """An Abort counted by liveOD (the level is left to the caller)."""
+        self.state["reset_count"] += 1
+        self.state["reset_counts"][source] += 1
+        self.state["last_reset"] = {"at": 1.0, "count": self.state["reset_count"],
+                                    "run_id": self.state["run_id"]
+                                    if self.state["run_in_progress"] else None,
+                                    "source": source}
 
     def start_run(self, run_id, **extra):
         self.state.update(dict(dict(run_in_progress=True, run_id=run_id,
@@ -973,3 +993,41 @@ def test_the_detached_launcher_runs_a_command_outside_and_reads_its_exit_code(tm
     assert ProcessWatch.adopt(os.getpid(), me.started) is not None
     watch.close()
     me.close()
+
+
+# --- the queue's own Abort through liveOD's counts (review B2) ----------------------------------
+
+def test_the_queues_cancel_is_sourced_and_named_and_never_holds(q, expts):
+    q.live.count_resets()
+    a = submit(q, expts)                                  # a person's job
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.live.start_run(101)
+    q.tick()
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
+    q.tick()
+    assert q.live.resets == [101] and q.live.sources == ["queue"]
+    assert q.live.state["reset_counts"] == {"person": 0, "queue": 1, "agent": 0}
+    q.tick()
+    assert not q.hold.active                              # the queue's, not a person's
+    q.live.press("person")                                # then a person presses Reset
+    q.tick()
+    assert q.hold.active
+
+
+def test_live_od_refusing_the_abort_leaves_it_to_try_again(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.live.start_run(101)
+    q.tick()
+    q.cancel({"id": a, "by": "jp"})
+    real = q._live_od_reset
+    q._live_od_reset = lambda run_id=None, source=None: {"ok": False, "refused": True,
+                                                         "error": "not the run in progress"}
+    q.tick()
+    j = job(q, a)
+    assert not j["cancel"]["abort_sent"] and "refused" in j["cancel"]["abort_note"]
+    q._live_od_reset = real
+    q.tick()
+    assert q.live.resets == [101]

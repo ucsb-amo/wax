@@ -232,12 +232,18 @@ class _LiveOD:
         return self._call(lambda c: c._send_recv(
             {"tag": "RUN_EXITED", "run_id": int(run_id), "reason": reason}))
 
-    def reset(self) -> dict:
+    def reset(self, run_id=None, source: str = "queue") -> dict:
         """liveOD's RESET -- what its Abort button sends: the run in progress
         is aborted at its next shot and its file discarded (liveOD's own
-        rule).  Not run-id-targeted: the caller checks the run on a POLL just
-        before (the run queue's cancel of its own running job).  Not repeated."""
-        return self._call(lambda c: c._send_recv({"tag": "RESET"}))
+        rule).  ``run_id``: liveOD refuses it unless that run is the one in
+        progress (a liveOD from before 2026-10-09 ignores the field: the caller
+        also checks on a POLL just before); ``source`` ("queue" for the run
+        queue's cancel) tells liveOD's watchers it was not a person's press.
+        Not repeated."""
+        msg = {"tag": "RESET", "source": source}
+        if run_id is not None:
+            msg["run_id"] = int(run_id)
+        return self._call(lambda c: c._send_recv(msg))
 
 
 class RunLoop:

@@ -252,3 +252,75 @@ def test_the_hold_row_puts_the_hold_on_and_releases_it(qapp, monkeypatch):
         assert not row.button.isEnabled()
     finally:
         panel.shutdown()
+
+
+# --- the counter, not the level (review B2) ---------------------------------------------------
+
+def _counted(person=0, queue=0, agent=0, last=None, reset=False, run_id=None):
+    return {"ok": True, "run_in_progress": bool(run_id), "run_id": run_id,
+            "reset_requested": reset, "reset_count": person + queue + agent,
+            "reset_counts": {"person": person, "queue": queue, "agent": agent},
+            "last_reset": last}
+
+
+def test_a_quick_reset_between_two_polls_is_seen_by_the_count():
+    hold = PersonHold(clock=Clock())
+    assert not hold.observe_poll(_counted())                       # baseline
+    # pressed and cleared (ABORT_RUN / INIT_RUN) between the polls: the level
+    # never showed it
+    last = {"at": 1_000_000.0, "count": 1, "run_id": 900, "source": "person"}
+    assert hold.observe_poll(_counted(person=1, last=last, reset=False))
+    info = hold.info()
+    assert info["active"] and info["run_id"] == 900 and info["source"] == "live_od_reset"
+    assert not hold.observe_poll(_counted(person=1, last=last))     # same count: nothing new
+
+
+@pytest.mark.parametrize("source", ["queue", "agent"])
+def test_the_queues_and_an_agents_aborts_never_hold(source):
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    last = {"at": 1.0, "count": 1, "run_id": 900, "source": source}
+    assert not hold.observe_poll(_counted(**{source: 1}, last=last, reset=True))
+    assert not hold.active
+
+
+def test_a_persons_reset_hidden_behind_a_later_queue_abort_still_holds():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    last = {"at": 1.0, "count": 2, "run_id": 901, "source": "queue"}   # the later one
+    assert hold.observe_poll(_counted(person=1, queue=1, last=last))
+
+
+def test_only_reset_count_uses_last_reset_source():
+    hold = PersonHold(clock=Clock())
+    poll = {"ok": True, "reset_count": 0, "last_reset": None}
+    hold.observe_poll(poll)
+    assert not hold.observe_poll({"ok": True, "reset_count": 1,
+                                  "last_reset": {"source": "agent", "run_id": 5}})
+    assert hold.observe_poll({"ok": True, "reset_count": 2,
+                              "last_reset": {"source": "person", "run_id": 5}})
+
+
+def test_a_live_od_restart_resets_the_counts():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted(person=4))
+    assert not hold.observe_poll(_counted(person=0))           # restarted, nothing since
+    assert hold.observe_poll(_counted(person=1, last={"source": "person", "run_id": 1}))
+
+
+def test_a_claimed_reset_sets_no_hold():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    claimed = []
+    assert not hold.observe_poll(_counted(person=1, last={"source": "person", "run_id": None}),
+                                 on_person_reset=lambda last: claimed.append(last) or True)
+    assert claimed and not hold.active
+
+
+def test_an_older_live_od_is_watched_by_the_level_with_one_warning(caplog):
+    hold = PersonHold(clock=Clock())
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.person_hold"):
+        hold.observe_poll(_poll(False, 900))
+        hold.observe_poll(_poll(False, 900))
+        assert hold.observe_poll(_poll(True, 900))
+    assert len([r for r in caplog.records if "no reset_count" in r.getMessage()]) == 1
