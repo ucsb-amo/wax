@@ -631,3 +631,23 @@ def test_edit_dialog_leaves_argv_alone_unless_it_changed(qapp):
     assert d.changes() is None and "argv" in d.problem.text()
     assert rqp.split_argv(rqp.join_argv(["a b", "", "c"])) == ["a b", "", "c"]
     d.deleteLater()
+
+
+def test_every_status_poll_refreshes_the_slots_estimate(panel, server):
+    jobs = _phase1b_jobs()
+    server.answers["list"] = _list_reply(jobs, nxt=(4, 3))
+    panel.refresh_list()
+    fresh = dict(jobs[2], estimate=_est(300.0, None, NOW + 40, "liveOD: shot 9 of 10"))
+    server.answers["describe"] = {"status": "ok", "job": fresh, "waiting": ""}
+    n_list = len(server.of("list"))
+    panel.set_state(_status())
+    assert server.of("describe")[-1] == {"type": "run_queue", "action": "describe", "id": 2,
+                                         "token": "t2"}
+    assert time.strftime("%H:%M", time.localtime(NOW + 40)) in _cell(panel, 2, "est")
+    assert "shot 9 of 10" in _cell(panel, 2, "est", Qt.ItemDataRole.ToolTipRole)
+    assert [j["id"] for j in panel.model.jobs] == [1, 2, 4, 5, 3]      # order kept
+    panel.set_state(_status())
+    assert len(server.of("describe")) == 2                              # every poll
+    assert len(server.of("list")) == n_list                             # no full list
+    panel.set_state(_status(dict(INFO, current=None)))                  # nothing in the slot
+    assert len(server.of("describe")) == 2

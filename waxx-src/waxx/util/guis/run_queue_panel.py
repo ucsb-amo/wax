@@ -447,6 +447,23 @@ class JobTableModel(QAbstractTableModel):
     def _filter(self) -> None:
         self.jobs = [j for j in self._all if self.show_ended or j.get("state") not in ENDED]
 
+    def update_job(self, job: dict) -> bool:
+        """One job's fresh record (a ``describe`` reply) in place: its row
+        repaints, the order stays.  False when the job is not listed."""
+        for i, old in enumerate(self._all):
+            if old.get("id") == job.get("id") and old.get("token") == job.get("token"):
+                self._all[i] = dict(job)
+                self._by_id[job.get("id")] = self._all[i]
+                break
+        else:
+            return False
+        for row, shown in enumerate(self.jobs):
+            if shown.get("id") == job.get("id"):
+                self.jobs[row] = self._all[i]
+                self.dataChanged.emit(self.index(row, 0),
+                                      self.index(row, len(COLUMNS) - 1))
+        return True
+
     def row_of(self, job_id, token=None) -> int:
         for i, j in enumerate(self.jobs):
             if j.get("id") == job_id and (token is None or j.get("token") == token):
@@ -920,6 +937,7 @@ class RunQueuePanel(QWidget):
         self._listed_once = False
         self._listing = False
         self._list_again = False
+        self._describing = False
         self._summary_sig = None
         self._selected: tuple | None = None
         self._log_windows: dict = {}
@@ -1067,6 +1085,23 @@ class RunQueuePanel(QWidget):
         if isinstance(state.get("person_hold"), dict):
             self.hold = dict(state["person_hold"])
         self.set_info(state["run_queue"])
+        self.refresh_slot()
+
+    def refresh_slot(self) -> None:
+        """The job in the slot again (``describe``): its estimated end moves
+        with liveOD's shots, so every status poll refreshes that row."""
+        cur = self.info.get("current") or {}
+        if (not cur or self._describing or self._listing or not self._listed_once
+                or self.model.row_of(cur.get("id")) < 0):
+            return
+        self._describing = True
+
+        def done(reply: dict) -> None:
+            self._describing = False
+            if reply.get("status") == "ok" and isinstance(reply.get("job"), dict):
+                self.model.update_job(reply["job"])
+        self.runner.send({"type": "run_queue", "action": "describe", "id": cur.get("id"),
+                          "token": cur.get("token")}, done)
 
     def set_reachable(self, reachable: bool) -> None:
         if bool(reachable) != self.reachable:
