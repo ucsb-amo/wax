@@ -427,13 +427,20 @@ def test_run_exited_uses_a_poll_in_hand():
 
 # -- the real pid check ----------------------------------------------------------------------
 
-def test_pid_alive_on_this_process_and_on_an_exited_child():
+def test_pid_alive_on_this_process():
     assert run_gate.pid_alive(os.getpid())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="relies on a held process handle")
+def test_pid_alive_on_an_exited_child_whose_handle_we_hold():
+    # Windows does not reuse a pid while a handle to the process is open, and
+    # Popen keeps its handle until the object goes: the pid cannot have been
+    # given to another process when it is checked (review N5).
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
-    pid = child.pid
-    del child                                          # drop our handle to it
-    assert run_gate.pid_alive(pid) is False
+    assert child.returncode == 0
+    assert run_gate.pid_alive(child.pid) is False      # exited: exit code, not STILL_ACTIVE
+    assert child._handle                               # the handle was held throughout
 
 
 def test_pid_alive_is_conservative_for_nonsense():
