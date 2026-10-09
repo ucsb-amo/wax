@@ -75,7 +75,9 @@ LIVE_DEFAULT_S = 600.0
 #: (``MonitorServer.RUN_PENDING_TTL_S``); an older fence is not counted.
 FENCE_TTL_S = 120.0
 
-#: Launchers that set ``WAXX_LAUNCHER`` for the experiments they start.
+#: Launchers that set ``WAXX_LAUNCHER`` for the experiments they start; the
+#: skill's occupancy.py waives its run-file gap for their runs (one tuple,
+#: shared: occupancy imports it).
 KNOWN_LAUNCHERS = ("run_lock", "run_loop", "kq")
 #: The environment variable an experiment's launcher sets; the experiment sends
 #: it at INIT_RUN as ``launcher`` (``Expt._serialize_init_payload``).
@@ -107,7 +109,6 @@ class GateState:
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
-_ERROR_ACCESS_DENIED = 5
 _ERROR_INVALID_PARAMETER = 87
 
 
