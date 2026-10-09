@@ -66,15 +66,17 @@ def _safe_repr(value) -> str:
 
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
-    ``client_host`` and ``launcher`` (str, "" when absent). A client that
-    predates them sends none; a malformed value is dropped, never raised on."""
+    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job id,
+    str; "" when absent). A client that predates them sends none; a malformed
+    value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
         pid = int(pid) if pid is not None else None
     except (TypeError, ValueError):
         pid = None
     return {"client_pid": pid, "client_host": str(msg.get("client_host") or ""),
-            "launcher": str(msg.get("launcher") or "")}
+            "launcher": str(msg.get("launcher") or ""),
+            "queue_job": str(msg.get("queue_job") or "")}
 
 
 class LiveODServer(QThread, NetServer):
@@ -172,7 +174,12 @@ class LiveODServer(QThread, NetServer):
         # person). None/"" from a client that predates them. A launcher's gate
         # (waxx.util.device_state.run_gate) uses them to tell a run whose
         # process is gone from a live one.
-        self._current_client = {"client_pid": None, "client_host": "", "launcher": ""}
+        self._current_client = {"client_pid": None, "client_host": "", "launcher": "",
+                                "queue_job": ""}
+        # every Abort set (request_reset), for POLL's reset_count / last_reset
+        self._reset_count = 0
+        self._reset_counts = {"person": 0, "queue": 0, "agent": 0}
+        self._last_reset = None
         # the run a Reset during its save was last warned about (one WARNING each)
         self._reset_during_save_warned = None
         self._current_n_shots = 0
@@ -1782,7 +1789,63 @@ class LiveODServer(QThread, NetServer):
         self._set_run_state("exited", detail)
         self.run_done_signal.emit()
 
+    #: Who may send RESET (its optional ``source``; "person" when absent).
+    RESET_SOURCES = ("person", "queue", "agent")
+
+    def request_reset(self, source: str = "person") -> bool:
+        """Set the pending Abort (``_reset_requested``) for the run in progress
+        -- the Reset button's, the remote RESET's -- and count it: POLL's
+        ``reset_count`` goes up by one and ``last_reset`` says when, for which
+        run and from whom.  Already pending: nothing changes and it is not
+        counted again (the remote RESET and the window's own reset() both get
+        here for one press).  True when it was set now."""
+        if self._reset_requested:
+            self.note_reset_requested()
+            return False
+        source = source if source in self.RESET_SOURCES else "person"
+        self._reset_count += 1
+        self._reset_counts[source] += 1
+        self._last_reset = {"at": time.time(), "count": self._reset_count,
+                            "run_id": self._current_run_id if self._run_in_progress else None,
+                            "source": source}
+        self._reset_requested = True
+        self.note_reset_requested()
+        return True
+
+    def _reset_refusal(self, msg: dict) -> dict | None:
+        """A RESET naming a run (``run_id``, or ``run_token``) that is not the
+        run in progress is refused, so a late or mistaken Abort never hits the
+        next run; an unknown ``source`` is refused."""
+        source = msg.get("source")
+        if source is not None and source not in self.RESET_SOURCES:
+            return {"ok": False, "refused": True,
+                    "error": f"unknown RESET source {source!r} (known: "
+                             f"{', '.join(self.RESET_SOURCES)})"}
+        want = msg.get("run_id")
+        if want is not None:
+            try:
+                want = int(want)
+            except (TypeError, ValueError):
+                return {"ok": False, "refused": True, "error": f"bad run_id {want!r}"}
+            if not self._run_in_progress or want != self._current_run_id:
+                current = self._current_run_id if self._run_in_progress else None
+                logger.warning(f"RESET for run {want} refused: the run in progress is "
+                               f"{current if current is not None else 'none'}.")
+                return {"ok": False, "refused": True, "run_id": current,
+                        "error": f"RESET names run {want}, but the run in progress is "
+                                 f"{current if current is not None else 'none'}"}
+        token = msg.get("run_token")
+        if token and (not self._run_in_progress or str(token) != self._run_token):
+            return {"ok": False, "refused": True,
+                    "run_id": self._current_run_id if self._run_in_progress else None,
+                    "error": "RESET carries the token of a run that is not in progress"}
+        return None
+
     def _handle_reset(self, msg: dict) -> dict:
+        refused = self._reset_refusal(msg)
+        if refused is not None:
+            return refused
+        source = str(msg.get("source") or "person")
         if self.reset_ignored_during_save():
             # the run is complete and being written: nothing to abort, and the
             # window is not asked to reset (it would interrupt the writer)
@@ -1796,11 +1859,10 @@ class LiveODServer(QThread, NetServer):
         if self.abort_again():
             logger.warning("RESET requested again by remote viewer on an unanswered abort.")
             return {"ok": True, "closing_aborted_run": True}
-        logger.warning("RESET requested by remote viewer.")
-        self._reset_requested = True
-        self.note_reset_requested()
+        logger.warning(f"RESET requested by remote viewer (source: {source}).")
+        self.request_reset(source)
         self.reset_signal.emit()
-        return {"ok": True}
+        return {"ok": True, "reset_count": self._reset_count}
 
     def set_camera_state_provider(self, provider):
         """``provider()`` -> ``{camera_key: {"state", "camera_type", "serial_no"}}``,
@@ -1889,6 +1951,13 @@ class LiveODServer(QThread, NetServer):
         return {
             "ok": True,
             "reset_requested": self._reset_requested,
+            # every Abort set (Reset button or RESET), counted: a watcher sees a
+            # quick Reset that the level above hides (cleared by ABORT_RUN or
+            # the next INIT_RUN between two polls); last_reset: {at, count,
+            # run_id, source "person" | "queue" | "agent"} or None
+            "reset_count": self._reset_count,
+            "reset_counts": dict(self._reset_counts),      # by source
+            "last_reset": dict(self._last_reset) if self._last_reset else None,
             "run_in_progress": self._run_in_progress,
             "run_id": self._current_run_id,
             "n_shots": len(self._shot_timestamps),

@@ -144,3 +144,27 @@ def test_the_experiment_sends_its_pid_host_and_launcher(monkeypatch, env, launch
     assert payload["client_pid"] == os.getpid()
     assert payload["client_host"] == socket.gethostname()
     assert payload["launcher"] == launcher
+
+
+# -- the run queue's job (review S3) ----------------------------------------------------
+
+def test_the_queue_job_is_in_poll_and_the_last_outcome(srv):
+    poll = srv._handle_poll({"tag": "POLL"})
+    assert poll["queue_job"] == ""                            # before any run
+    reply = srv._handle_init_run(_init_msg(client_pid=4242, client_host="KONG",
+                                           launcher="kq", queue_job="17"))
+    poll = srv._handle_poll({"tag": "POLL"})
+    assert (poll["launcher"], poll["queue_job"]) == ("kq", "17")
+    srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": reply["run_id"], "reason": "x"})
+    last = srv._handle_poll({"tag": "POLL"})["last_outcome"]
+    assert last["queue_job"] == "17" and last["run_id"] == reply["run_id"]
+    srv._handle_init_run(_init_msg())                         # an older client: none
+    assert srv._handle_poll({"tag": "POLL"})["queue_job"] == ""
+
+
+def test_the_experiment_sends_its_queue_job(monkeypatch):
+    from waxx.base.expt import Expt
+    monkeypatch.delenv("WAXX_QUEUE_JOB", raising=False)
+    assert Expt._serialize_init_payload(_Stub())["queue_job"] == ""
+    monkeypatch.setenv("WAXX_QUEUE_JOB", "17")
+    assert Expt._serialize_init_payload(_Stub())["queue_job"] == "17"

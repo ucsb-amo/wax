@@ -87,6 +87,8 @@ _TAIL_SHOWN = 8
 #: the run in progress finishes first), ``stopped`` (ended by Stop),
 #: ``latched`` (ended by anything else; off until Start).
 ACTIVE = ("running", "stopping")
+#: Who may have started a loop (RunLoop.start's owner).
+LOOP_OWNERS = ("person", "agent", "queue")
 
 
 #: Characters refused in a picked file's path: the run is launched through the
@@ -194,8 +196,9 @@ class _LiveOD:
     reachable") although liveOD was up.  POLL is read-only, so repeating it is
     safe; the exit notice is not repeated.
 
-    One request at a time (a lock): the monitor server shares one of these
-    between its threads (the person hold's watch and the run queue)."""
+    One request at a time (a lock).  Each RunLoop makes its own (a loop polls
+    while its run starts, and between runs); the monitor server keeps one
+    more for its watch thread -- the run queue and the person hold."""
 
     def __init__(self):
         self._client = None
@@ -232,12 +235,18 @@ class _LiveOD:
         return self._call(lambda c: c._send_recv(
             {"tag": "RUN_EXITED", "run_id": int(run_id), "reason": reason}))
 
-    def reset(self) -> dict:
+    def reset(self, run_id=None, source: str = "queue") -> dict:
         """liveOD's RESET -- what its Abort button sends: the run in progress
         is aborted at its next shot and its file discarded (liveOD's own
-        rule).  Not run-id-targeted: the caller checks the run on a POLL just
-        before (the run queue's cancel of its own running job).  Not repeated."""
-        return self._call(lambda c: c._send_recv({"tag": "RESET"}))
+        rule).  ``run_id``: liveOD refuses it unless that run is the one in
+        progress (a liveOD from before 2026-10-09 ignores the field: the caller
+        also checks on a POLL just before); ``source`` ("queue" for the run
+        queue's cancel) tells liveOD's watchers it was not a person's press.
+        Not repeated."""
+        msg = {"tag": "RESET", "source": source}
+        if run_id is not None:
+            msg["run_id"] = int(run_id)
+        return self._call(lambda c: c._send_recv(msg))
 
 
 class RunLoop:
@@ -256,6 +265,7 @@ class RunLoop:
                  run_exited: Callable[[int, str], dict] | None = None,
                  fence: Callable[[], dict | None] | None = None,
                  busy: Callable[[], str] | None = None,
+                 held: Callable[[], str] | None = None,
                  start_monitor: Callable[[str], None] | None = None,
                  on_change: Callable[[dict], None] | None = None, journal=None,
                  spawn=None, clock: Callable[[], float] = time.time,
@@ -268,6 +278,7 @@ class RunLoop:
         self._run_exited = run_exited or getattr(self._poll, "run_exited", None)
         self._fence = fence
         self._busy = busy
+        self._held = held
         self._start_monitor = start_monitor
         self._on_change = on_change
         self._journal = journal
@@ -351,8 +362,13 @@ class RunLoop:
 
     # -- requests ---------------------------------------------------------------
 
-    def start(self, operator: str = "", client: str = "", path=None) -> dict:
-        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`)."""
+    def start(self, operator: str = "", client: str = "", path=None,
+              owner: str = "person") -> dict:
+        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`).
+        ``owner``: who starts it -- "person" (the GUI), "agent" (an agent's
+        TOF-idle restart) or "queue" (the run queue starting again a loop it
+        stopped); kept in ``info()``: the run queue stops a person's loop only
+        for a person's job."""
         who = _who(operator, client)
         if self.spec.pick:
             full, why = resolve_pick(self.spec, path)
@@ -378,9 +394,10 @@ class RunLoop:
             self._wake.clear()
             self._s = {"state": "running", "text": f"started by {who}", "runs": 0,
                        "run_id": None, "last": None, "started": self._clock(),
-                       "ended": None, "operator": operator, "client": client}
+                       "ended": None, "operator": operator, "client": client,
+                       "owner": owner if owner in LOOP_OWNERS else "person"}
         log.info("%s: started by %s (%s).", self.spec.title, who, self.path)
-        self._record("run_loop_start", operator=operator, client=client)
+        self._record("run_loop_start", operator=operator, client=client, owner=owner)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"run-loop-{self.spec.key}")
         self._thread.start()
@@ -496,6 +513,11 @@ class RunLoop:
     def _gate(self) -> tuple[str, bool] | None:
         """(why the machine is not free, whether the monitor may be started
         then) -- or None when it is free."""
+        held = self._held() if self._held is not None else ""
+        if held:
+            # a person has the machine: the loop ends as on a Stop (the
+            # monitor is started), and the text says it is the hold
+            return f"{held} -- the loop does not run while it is on", True
         busy = self._busy() if self._busy is not None else ""
         if busy:
             return busy, False

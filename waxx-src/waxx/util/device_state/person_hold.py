@@ -11,10 +11,13 @@ It is set
 * by a request -- ``{"type": "run_queue", "action": "hold", "reason", "by"}``,
   e.g. the Device Control GUI's "Hold -- a person has the machine" button on
   the Sequences tab;
-* by the server itself when liveOD's ``reset_requested`` turns on (the Reset /
-  Abort button) for a run that the run queue did NOT launch for an agent -- a
-  person's run, a run loop's run, or no run at all.  An agent resetting its own
-  run, and the queue's own Abort of a job it was asked to cancel, do not set it.
+* by the server itself when a person presses liveOD's Reset / Abort: liveOD
+  counts every Abort by source (POLL ``reset_counts`` / ``reset_count`` +
+  ``last_reset``) and a person's count going up sets the hold -- whatever run
+  it was for, and even if liveOD cleared the Abort again between two polls.
+  The queue's own Abort (source "queue") and an agent's (source "agent",
+  ``reset_liveod.py --own-run``) never set it.  A liveOD without the counts is
+  watched by the level of ``reset_requested`` (see :meth:`observe_poll`).
 
 and released only by a request (``"action": "release"``).  It never expires on
 its own: while it is on, the server logs a reminder every
@@ -37,6 +40,9 @@ log = logging.getLogger(__name__)
 
 #: A reminder line in the server log this often while the hold is on.
 REMINDER_S = 1800.0
+_OFF = {"active": False, "since": None, "by": "", "reason": "", "source": "", "run_id": None,
+        "owner": ""}
+
 #: Who sets the hold when liveOD's Reset is pressed.
 LIVE_OD_RESET_BY = "liveOD"
 
@@ -53,8 +59,10 @@ class PersonHold:
 
     ``info()`` is what ``status_json`` serves as ``person_hold``:
     ``{"active": bool, "since": epoch | None, "by": str, "reason": str,
-    "source": "request" | "live_od_reset" | "", "run_id": int | None}``
-    (``run_id``: the run liveOD had when its Reset set the hold).
+    "source": "request" | "live_od_reset" | "unreadable_file" | "", "run_id": int |
+    None, "owner": "person" | "agent" | ""}`` (``run_id``: the run liveOD had
+    when its Reset set the hold; ``owner``: who put it on -- an agent may not
+    release a person's hold).
 
     ``path``: where the hold is kept across restarts (None: memory only).
     ``journal``: an :class:`~waxx.util.device_state.op_journal.OpJournal`
@@ -72,11 +80,14 @@ class PersonHold:
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._save_seq = self._saved_seq = 0
-        self._s = {"active": False, "since": None, "by": "", "reason": "", "source": "",
-                   "run_id": None}
+        self._s = dict(_OFF)
         self._last_reminder: float | None = None
         #: liveOD's reset_requested at the last POLL seen (None: none seen yet)
+        #: -- the fallback for a liveOD without reset counts
         self._last_reset: bool | None = None
+        #: liveOD's person Reset count at the last POLL seen (None: none yet)
+        self._last_count: int | None = None
+        self._warned_level = False
         self._load()
 
     # -- state ------------------------------------------------------------------
@@ -100,37 +111,45 @@ class PersonHold:
     # -- requests -----------------------------------------------------------------
 
     def hold(self, reason: str = "", by: str = "", *, source: str = "request",
-             run_id=None) -> dict:
-        """Put the hold on.  Already on: nothing changes (the first hold's
-        since/by/reason stay) and the reply says ``already``."""
+             run_id=None, owner: str = "person") -> dict:
+        """Put the hold on (``owner``: who puts it on).  Already on: nothing
+        changes (the first hold's since/by/reason/owner stay) and the reply
+        says ``already``."""
         reason = str(reason or "").strip() or "a person has the machine"
         by = str(by or "").strip() or "?"
         with self._lock:
             if self._s["active"]:
                 return {"status": "ok", "already": True, "person_hold": dict(self._s)}
             self._s = {"active": True, "since": self._clock(), "by": by, "reason": reason,
-                       "source": source, "run_id": run_id}
+                       "source": source, "run_id": run_id, "owner": owner}
             self._last_reminder = self._s["since"]
             info = dict(self._s)
         log.warning("PERSON HOLD on: %s -- agents' runs wait until it is released.",
                     describe(info))
-        self._record("run_queue_hold", by=by, reason=reason, source=source, run_id=run_id)
+        self._record("run_queue_hold", by=by, reason=reason, source=source, run_id=run_id,
+                     owner=owner)
         self._save()
         self._notify()
         return {"status": "ok", "person_hold": info}
 
-    def release(self, by: str = "") -> dict:
+    def release(self, by: str = "", owner: str = "person") -> dict:
+        """Lift the hold (``owner``: who asks).  An agent may not lift a
+        person's hold (one a person put on, liveOD's Reset set, or the server
+        set on an unreadable file)."""
         by = str(by or "").strip() or "?"
         with self._lock:
             if not self._s["active"]:
                 return {"status": "error", "msg": "no person hold is on"}
+            if owner == "agent" and self._s.get("owner", "person") != "agent":
+                return {"status": "error",
+                        "msg": f"the hold is a person's ({describe(self._s)}): an agent may not "
+                               "release it"}
             held = dict(self._s)
-            self._s = {"active": False, "since": None, "by": "", "reason": "", "source": "",
-                       "run_id": None}
+            self._s = dict(_OFF)
             self._last_reminder = None
             info = dict(self._s)
         log.warning("Person hold released by %s (it was %s).", by, describe(held))
-        self._record("run_queue_release", by=by, held_since=held["since"],
+        self._record("run_queue_release", by=by, owner=owner, held_since=held["since"],
                      held_by=held["by"], reason=held["reason"])
         self._save()
         self._notify()
@@ -154,15 +173,33 @@ class PersonHold:
                     (now - float(info["since"] or now)) / 60.0)
 
     def observe_poll(self, poll: dict | None, agent_run_ids: Iterable = (),
-                     own_abort_ids: Iterable = ()) -> bool:
-        """Read one liveOD POLL reply: when ``reset_requested`` has just turned
-        on and the run it is for is not one the queue launched for an agent
-        (``agent_run_ids``) nor one the queue itself aborted (``own_abort_ids``),
-        put the hold on.  The first POLL seen only sets the baseline (a Reset
-        already pending when the server starts is not taken as a new one).
-        Returns True when it set the hold."""
+                     own_abort_ids: Iterable = (),
+                     on_person_reset: Callable[[dict], bool] | None = None) -> bool:
+        """Read one liveOD POLL reply and put the hold on for a person's Reset.
+
+        liveOD from 2026-10-09 counts every Abort set, by source: a person's
+        Reset is ``reset_counts["person"]`` going up (or, with only
+        ``reset_count``, the count going up with ``last_reset.source``
+        "person").  A count sees a quick Reset that liveOD cleared again
+        between two POLLs, and the queue's own Abort ("queue") or an agent's
+        ("agent") never counts as a person's.  ``on_person_reset(last_reset)``
+        may claim the Reset first (True: no hold -- the run queue's cancel of
+        a person's own starting job).
+
+        An older liveOD (no count) is watched by the level of
+        ``reset_requested``, with one WARNING: a Reset just turned on whose run
+        is not one the queue launched for an agent (``agent_run_ids``) nor one
+        the queue aborted itself (``own_abort_ids``).  The first POLL seen only
+        sets the baseline.  Returns True when it set the hold."""
         if not isinstance(poll, dict) or poll.get("ok") is False:
             return False
+        if "reset_counts" in poll or "reset_count" in poll:
+            return self._observe_count(poll, on_person_reset)
+        if not self._warned_level:
+            self._warned_level = True
+            log.warning("liveOD gives no reset_count (it predates 2026-10-09): the person hold "
+                        "watches reset_requested's level, which misses a Reset liveOD clears "
+                        "between two polls. Restart liveOD to get the count.")
         reset = bool(poll.get("reset_requested"))
         previous, self._last_reset = self._last_reset, reset
         if previous is None or not reset or previous:
@@ -182,6 +219,40 @@ class PersonHold:
                   source="live_od_reset", run_id=run_id)
         return True
 
+    def _observe_count(self, poll: dict, on_person_reset) -> bool:
+        counts = poll.get("reset_counts")
+        last = poll.get("last_reset") if isinstance(poll.get("last_reset"), dict) else {}
+        if isinstance(counts, dict):
+            count = int(counts.get("person") or 0)
+            person = True
+        else:
+            count = int(poll.get("reset_count") or 0)
+            person = str(last.get("source") or "person") == "person"
+        previous, self._last_count = self._last_count, count
+        if previous is None or count == previous:
+            return False                 # the baseline, or no new Reset
+        if count < previous:
+            # liveOD restarted (its counts start again): a person's Reset since
+            # then shows as a count above zero with a person's last_reset
+            if count == 0 or str(last.get("source") or "person") != "person":
+                return False
+        if not person:
+            log.info("liveOD Reset (source %s) -- not a person's: no person hold.",
+                     last.get("source"))
+            return False
+        if on_person_reset is not None:
+            try:
+                if on_person_reset(dict(last)):
+                    return False
+            except Exception:                         # noqa: BLE001
+                log.exception("Person reset handler failed; the hold goes on")
+        if self.active:
+            return False
+        at = last.get("at") or self._clock()
+        self.hold(f"Reset in liveOD at {_clock_text(at)}", LIVE_OD_RESET_BY,
+                  source="live_od_reset", run_id=last.get("run_id"))
+        return True
+
     # -- persistence -------------------------------------------------------------
 
     def _load(self) -> None:
@@ -193,13 +264,33 @@ class PersonHold:
         except FileNotFoundError:
             return
         except Exception as exc:                      # noqa: BLE001
-            log.error("Could not read the person hold from %s (%s): starting with NO hold -- "
-                      "check whether one was on.", self.path, exc)
+            data = exc
+        if not isinstance(data, dict):
+            # fail closed: a hold that may have been on is taken to be on, and
+            # the file is kept (moved aside, never overwritten) for a person
+            aside = move_aside(self.path)
+            why = data if isinstance(data, Exception) else f"not a JSON object: {data!r:.80}"
+            self._s = {"active": True, "since": self._clock(), "by": "monitor server",
+                       "reason": f"could not read the hold file ({why})"
+                                 + (f"; kept as {aside}" if aside else ""),
+                       "source": "unreadable_file", "run_id": None, "owner": "person"}
+            self._last_reminder = self._clock()
+            original = self.path
+            if not aside:
+                self.path = None              # never overwrite the unreadable original
+            log.error("Could not read the person hold from %s (%s): starting HELD -- a person "
+                      "must release it. %s", original, why,
+                      f"The file was moved to {aside}." if aside
+                      else "The file could not be moved aside: the hold is kept in memory only.")
+            self._record("run_queue_hold", by="monitor server", reason=self._s["reason"],
+                         source="unreadable_file", run_id=None)
+            self._save()
             return
-        if isinstance(data, dict) and data.get("active"):
+        if data.get("active"):
             self._s = {"active": True, "since": data.get("since"), "by": str(data.get("by") or ""),
                        "reason": str(data.get("reason") or ""),
-                       "source": str(data.get("source") or ""), "run_id": data.get("run_id")}
+                       "source": str(data.get("source") or ""), "run_id": data.get("run_id"),
+                       "owner": str(data.get("owner") or "person")}
             self._last_reminder = self._clock()
             log.warning("PERSON HOLD still on from before the server restarted: %s",
                         describe(self._s))
@@ -242,6 +333,23 @@ class PersonHold:
             self._on_change(self.info())
         except Exception:                             # noqa: BLE001
             log.exception("Person hold change notification failed")
+
+
+def move_aside(path: str) -> str:
+    """Rename an unreadable state file to ``<name>.unreadable-<YYYYmmdd-HHMMSS>``
+    (never deleted, never overwritten); the new name, or "" when it could not
+    be moved."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = f"{path}.unreadable-{stamp}"
+    n = 1
+    while os.path.exists(target):
+        target, n = f"{path}.unreadable-{stamp}-{n}", n + 1
+    try:
+        os.rename(path, target)
+    except OSError as exc:
+        log.error("Could not move the unreadable %s aside: %s", path, exc)
+        return ""
+    return target
 
 
 def describe(info: dict | None) -> str:

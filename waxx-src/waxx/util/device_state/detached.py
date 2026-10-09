@@ -26,10 +26,14 @@ through its Popen object.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
+import threading
 from subprocess import DEVNULL, PIPE, STDOUT, Popen
+
+_log = logging.getLogger(__name__)
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -37,6 +41,7 @@ _NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SYNCHRONIZE = 0x00100000
 _STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
 #: FILETIME (100 ns since 1601-01-01) -> epoch seconds
 _EPOCH_AS_FILETIME = 116444736000000000
 
@@ -76,14 +81,19 @@ class ProcessWatch:
 
     @classmethod
     def open(cls, pid: int) -> "ProcessWatch | None":
-        """A handle to process ``pid`` (Windows); None when there is none."""
+        """A watch on process ``pid`` (Windows).  None when Windows says there
+        is no such process; a watch with no handle -- following the pid's
+        liveness only, exit code unknown -- when the process exists but cannot
+        be opened (access denied): never taken for gone."""
         if sys.platform != "win32":
             return None
         ctypes, wintypes, k32 = _k32()
         handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False,
                                  int(pid))
         if not handle:
-            return None
+            if ctypes.get_last_error() == _ERROR_INVALID_PARAMETER:
+                return None                           # no such process
+            return cls(pid)                           # it exists; not ours to open
         return cls(pid, handle=handle)
 
     @classmethod
@@ -91,7 +101,9 @@ class ProcessWatch:
         """Take a process back after a restart: a watch on ``pid`` when it is
         alive and was created at ``started`` (None: not recorded -- then any
         live process with that pid is taken, which a reused pid could fool);
-        None when it is gone or is another process."""
+        None when it is gone or is provably another process (its creation time
+        differs).  A process that cannot be opened, or whose creation time
+        cannot be read, is followed by liveness (never called gone)."""
         try:
             pid = int(pid)
         except (TypeError, ValueError):
@@ -107,8 +119,8 @@ class ProcessWatch:
         if watch.poll() is not None:
             watch.close()
             return None
-        if started is not None and (watch.started is None
-                                    or abs(watch.started - float(started)) > SAME_PROCESS_S):
+        if (started is not None and watch.started is not None
+                and abs(watch.started - float(started)) > SAME_PROCESS_S):
             watch.close()
             return None
         return watch
@@ -155,11 +167,35 @@ def _creation_time(handle) -> float | None:
         return None
 
 
+class LaunchUnknown(OSError):
+    """The launcher did not say within its time whether it started the
+    command: the command may be running (the caller must look for it, not
+    start it again)."""
+
+
+def _read_line(stream, timeout: float) -> str | None:
+    """One line from ``stream``, read on a thread; None when none came within
+    ``timeout`` seconds (the thread is left to finish on its own)."""
+    out: list = []
+    reader = threading.Thread(target=lambda: out.append(stream.readline()), daemon=True,
+                              name="run-queue-launcher-reply")
+    reader.start()
+    reader.join(timeout)
+    return out[0] if out else None
+
+
 def launch(command: str, *, cwd: str, env: dict, log_path: str,
            timeout: float = LAUNCH_TIMEOUT_S) -> ProcessWatch:
     """Start ``command`` (a shell command line) detached, its output appended
-    to ``log_path``; return a :class:`ProcessWatch` on it.  Raises OSError
-    when it could not be started."""
+    to ``log_path``; return a :class:`ProcessWatch` on it.
+
+    Raises OSError when the command was certainly not started (the launcher
+    reported an error, or exited without a pid), :class:`LaunchUnknown` when
+    the launcher gave no answer within ``timeout`` (it may have started it).
+    Once the launcher has reported a pid, a watch is always returned: an error
+    after that (the "ok" write, the launcher's exit) is logged, never raised.
+    The launcher's pipes are closed on every path; the launcher itself is
+    never killed."""
     if sys.platform != "win32":
         with open(log_path, "ab") as out:
             popen = Popen(command, shell=True, cwd=cwd, env=env, stdin=DEVNULL, stdout=out,
@@ -169,36 +205,51 @@ def launch(command: str, *, cwd: str, env: dict, log_path: str,
                      stdin=PIPE, stdout=PIPE, stderr=PIPE, cwd=cwd, env=env,
                      creationflags=_NO_WINDOW, close_fds=True, text=True,
                      encoding="utf-8", errors="replace")
+    watch = None
     try:
-        launcher.stdin.write(json.dumps({"command": command, "cwd": cwd,
-                                         "log_path": log_path}) + "\n")
-        launcher.stdin.flush()
-        line = launcher.stdout.readline()
+        try:
+            launcher.stdin.write(json.dumps({"command": command, "cwd": cwd,
+                                             "log_path": log_path}) + "\n")
+            launcher.stdin.flush()
+        except OSError as exc:
+            raise OSError(f"could not hand the command to the launcher: {exc}") from exc
+        line = _read_line(launcher.stdout, timeout)
+        if line is None:
+            raise LaunchUnknown(f"the launcher (pid {launcher.pid}) reported nothing within "
+                                f"{timeout:.0f} s: the command may or may not be running")
         try:
             reply = json.loads(line) if line.strip() else {}
         except ValueError:
             reply = {"error": f"unreadable launcher reply {line!r}"}
         if "pid" not in reply:
-            launcher.stdin.close()
-            launcher.wait(timeout)
-            err = (launcher.stderr.read() or "").strip()
+            err = ""
+            try:
+                launcher.stdin.close()
+                launcher.wait(5.0)
+                err = (launcher.stderr.read() or "").strip()
+            except Exception:                         # noqa: BLE001
+                pass
             raise OSError(f"the launcher did not start the command: "
                           f"{reply.get('error') or err or 'no reply'}")
+        # a pid: from here on a watch is returned whatever happens
         watch = ProcessWatch.open(reply["pid"])
-        launcher.stdin.write("ok\n")                  # handle held: the launcher may go
-        launcher.stdin.flush()
-        launcher.stdin.close()
-        launcher.wait(timeout)
         if watch is None:
-            # it ended before a handle could be taken: its exit code is lost,
-            # but nothing else is (the log file has its output)
-            watch = ProcessWatch(reply["pid"], started=reply.get("started"))
+            # gone before a handle could be taken (the launcher held one until
+            # our "ok", so this is not a reused pid): it ran and ended; its
+            # output is in the log, its exit code is lost
+            watch = ProcessWatch(reply["pid"])
             watch._code = -1
+        try:
+            launcher.stdin.write("ok\n")              # handle held: the launcher may go
+            launcher.stdin.flush()
+            launcher.stdin.close()
+            launcher.wait(timeout)
+        except Exception as exc:                      # noqa: BLE001
+            _log.warning("launcher (pid %s) for pid %s did not finish cleanly: %r -- the "
+                         "command is followed anyway", launcher.pid, watch.pid, exc)
         return watch
-    except subprocess.TimeoutExpired as exc:
-        raise OSError(f"the launcher did not finish within {timeout:.0f} s") from exc
     finally:
-        for stream in (launcher.stdout, launcher.stderr):
+        for stream in (launcher.stdin, launcher.stdout, launcher.stderr):
             try:
                 stream.close()
             except Exception:                         # noqa: BLE001

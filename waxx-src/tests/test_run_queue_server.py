@@ -54,7 +54,8 @@ def server(qapp, monkeypatch, tmp_path, expts):
     s.live = Live()
     s._live_od = s.live                               # the queue calls it late
     s.spawner = Spawner()
-    s.run_queue._spawn = s.spawner
+    s.run_queue._spawn = s.spawner                    # never the real detached launcher
+    s.run_queue._adopt = lambda pid, started: None    # never a real process
     s.run_queue.poll_every_s, s.run_queue._gap_s, s.run_queue._outcome_wait_s = 0., 0., 0.
     loop = s.loops["auto_tof"]
     loop._poll = s.live
@@ -102,12 +103,15 @@ def test_the_request_contract(server, expts, tmp_path):
     assert server.ask({"type": "run_queue", "action": "pause", "scope": "agent",
                        "by": "jp"})["run_queue"]["paused"]["agent"]["by"] == "jp"
     assert server.ask({"type": "run_queue", "action": "resume", "scope": "agent",
-                       "by": "jp"})["status"] == "ok"
-    assert server.ask({"type": "run_queue", "action": "cancel", "id": 1,
-                       "by": "jp"})["job"]["state"] == "cancelled"
+                       "by": "jp", "owner": "person"})["status"] == "ok"
+    no_owner = server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp"})
+    assert no_owner["status"] == "error" and "owner is required" in no_owner["msg"]
+    assert server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp",
+                       "owner": "person"})["job"]["state"] == "cancelled"
     held = server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
-    assert held["person_hold"]["active"]
-    assert server.ask({"type": "run_queue", "action": "release", "by": "jp"})["status"] == "ok"
+    assert held["person_hold"]["active"] and held["person_hold"]["owner"] == "person"
+    assert server.ask({"type": "run_queue", "action": "release", "by": "jp",
+                       "owner": "person"})["status"] == "ok"
     bad = server.ask({"type": "run_queue", "action": "explode"})
     assert bad["status"] == "error" and "known: submit" in bad["msg"]
     kinds = [e["kind"] for e in server.journal.tail(100)]
@@ -129,7 +133,7 @@ def test_tail_and_a_queued_only_cancel_through_the_server(server, expts):
     server.spawner.procs[-1].write("Run ID: 85600", "shot 1/2")
     t = ask(action="tail", id=a, offset=0)
     assert t["lines"][-2:] == ["Run ID: 85600", "shot 1/2"] and not t["done"]
-    refused = ask(action="cancel", id=a, by="jp", queued_only=True)
+    refused = ask(action="cancel", id=a, by="jp", owner="person", queued_only=True)
     assert refused["status"] == "error" and refused["state"] == "running"
     assert server.live.resets == []
     sent = len(server._broadcaster.sent)
@@ -246,7 +250,8 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     assert len(server.spawner.calls) == 1
     # a person's Start meanwhile is refused, naming the queue's work
     refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
-    assert refused["status"] == "error" and "the run queue has work (job 1" in refused["msg"]
+    assert refused["status"] == "error"
+    assert "the run queue has a job to run now (the run queue's job 1" in refused["msg"]
     release.clear()                                      # the loop's next run will wait
     _run(server, 85600)                                  # its last tick starts the loop
     assert loop.info()["state"] == "running", loop.info()["text"]   # started again by the queue
@@ -256,6 +261,71 @@ def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, 
     loop.stop()
     release.set()
     loop.join(5)
+
+
+def test_jobs_due_later_held_or_paused_leave_a_loop_start_alone(server, expts):
+    import time as _time
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001,
+                                                           threading.Event())
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "due": _time.time() + 3600})
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    server.ask({"type": "run_queue", "action": "release", "by": "jp", "owner": "person"})
+    server.ask({"type": "run_queue", "action": "pause", "scope": "agent", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
+    assert reply["status"] == "ok", reply
+    loop.stop()
+    loop.join(6)
+
+
+def test_a_persons_stop_request_cancels_the_queues_restart_and_starters_are_kept(
+        server, expts, qapp):
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                        "owner": "agent"})
+    assert reply["status"] == "ok" and reply["loop"]["owner"] == "agent"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"            # an agent's loop: an agent's job stops it
+    assert server.run_queue.info()["resume_loop"]["key"] == "auto_tof"
+    server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof", "operator": "jp"})
+    assert server.run_queue.info()["resume_loop"] is None
+    assert "run_queue_loop_resume_cancelled" in [e["kind"] for e in server.journal.tail(50)]
+    release.set()
+    loop.join(5)
+
+
+def test_a_monitor_restart_waits_while_the_queue_has_work(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    restarts = []
+    server.reset_signal.connect(lambda: restarts.append("reset"))
+    forwarded = []
+    server.message_received.connect(forwarded.append)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.on_message_received("reset")                 # eligible: about to launch
+    server.watch_tick()
+    server.on_message_received("reset")                 # in the slot
+    server.on_message_received("run complete")
+    QApplication.processEvents()
+    assert restarts == [] and forwarded == []
+    kinds = [e["kind"] for e in server.journal.tail(100)]
+    assert kinds.count("run_queue_monitor_deferred") == 3
+    _run(server, 85600)
+    server.watch_tick()
+    QApplication.processEvents()
+    assert server.monitor_starts == ["the run queue has no job to run"]
+    server.on_message_received("reset")                 # the queue is idle: as before
+    QApplication.processEvents()
+    assert restarts == ["reset"]
 
 
 def test_a_state_reset_is_refused_while_a_queue_job_runs(server, expts):

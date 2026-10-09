@@ -486,15 +486,46 @@ def hold_verdict(status: dict | None) -> GateState | None:
                      detail={"person_hold": dict(hold)})
 
 
+def queue_verdict(status: dict | None) -> GateState | None:
+    """``live`` (not waivable) while the monitor server's run queue has a job
+    in its slot (``status_json["run_queue"]["current"]``: launching, running
+    or ending) or one about to launch (``next`` non-empty: eligible now, the
+    queue launches it as soon as the machine is free) -- as an active run
+    loop is busy between its runs.  None otherwise (an older server reports
+    no ``run_queue``)."""
+    queue = (status or {}).get("run_queue")
+    if not isinstance(queue, dict):
+        return None
+    cur = queue.get("current")
+    if isinstance(cur, dict) and cur:
+        return GateState("live", cur.get("run_id"),
+                         f"the monitor server's run queue has job {cur.get('id')} "
+                         f"({cur.get('label') or 'experiment'}) {cur.get('state') or 'running'}"
+                         + (f" (run {cur.get('run_id')})" if cur.get("run_id") else ""),
+                         detail={"run_queue": {"current": cur.get("id"),
+                                               "next": list(queue.get("next") or [])}})
+    nxt = list(queue.get("next") or [])
+    if nxt:
+        return GateState("live", None,
+                         f"the monitor server's run queue has job {nxt[0]} ready to start"
+                         + (f" ({len(nxt)} eligible)" if len(nxt) > 1 else ""),
+                         detail={"run_queue": {"current": None, "next": nxt}})
+    return None
+
+
 def loops_verdict(status: dict | None) -> GateState | None:
     """What the monitor server itself has the machine for, from its
-    ``status_json``: a person's hold (``held``, see :func:`hold_verdict`), or
-    an active run loop (``live``); not waivable.  None when neither.  (The
-    name is older than the hold; :func:`assess` and the agents' occupancy
-    check both ask it.)"""
+    ``status_json``: a person's hold (``held``, see :func:`hold_verdict`), the
+    run queue's job in its slot or about to launch (``live``, see
+    :func:`queue_verdict`), or an active run loop (``live``); not waivable.
+    None when none.  (The name is older than the hold and the queue;
+    :func:`assess` and the agents' occupancy check both ask it.)"""
     held = hold_verdict(status)
     if held is not None:
         return held
+    queued = queue_verdict(status)
+    if queued is not None:
+        return queued
     active = active_loops(status)
     if not active:
         return None

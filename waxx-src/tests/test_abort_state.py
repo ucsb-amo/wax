@@ -353,3 +353,24 @@ def test_the_monitor_experiment_and_a_run_without_one_report_nothing():
     bare = Run()
     del bare.monitor
     bare._report_abort_state("", *SNAP)                  # no AttributeError
+
+
+# --- a run the run queue launched (review S1) ------------------------------------------------
+
+@pytest.mark.parametrize("launcher, ends", [("kq", 0), ("run_loop", 1), (None, 1)])
+def test_an_aborted_queue_job_leaves_the_monitor_to_the_server(monkeypatch, capsys,
+                                                               launcher, ends):
+    if launcher is None:
+        monkeypatch.delenv("WAXX_LAUNCHER", raising=False)
+    else:
+        monkeypatch.setenv("WAXX_LAUNCHER", launcher)
+    monkeypatch.setenv("WAXX_QUEUE_JOB", "12")
+    run = Run()
+    with pytest.raises(RuntimeError):
+        run._abort_for_reset("during the camera wait")
+    run._report_abort_state("", *SNAP)
+    assert run.ends == ends
+    out = capsys.readouterr().out
+    assert ("not restarted here" in out) == (launcher == "kq")
+    if launcher == "kq":
+        assert out.count("not restarted here") == 1 and "job 12" in out

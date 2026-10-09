@@ -1439,10 +1439,16 @@ class LiveODWindow(QWidget):
             return
         # Ensure the ZMQ server flag is set regardless of whether this was
         # triggered by the local button or by the remote viewer (which goes
-        # through _handle_reset first, but this is idempotent).
+        # through _handle_reset first, but this is idempotent). request_reset
+        # counts the press once (POLL's reset_count); from this window's own
+        # button it is a person's.
         if hasattr(self, 'live_od_server'):
-            self.live_od_server._reset_requested = True
-            self.live_od_server.note_reset_requested()
+            srv = self.live_od_server
+            if hasattr(srv, 'request_reset'):
+                srv.request_reset("person")
+            else:
+                srv._reset_requested = True
+                srv.note_reset_requested()
         if hasattr(self, 'camera_nanny'):
             try:
                 self.camera_nanny.interrupted = True

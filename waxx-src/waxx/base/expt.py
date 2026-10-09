@@ -79,7 +79,7 @@ def _queue_restart_monitor(restart_monitor):
     queue's next job follows at once, and the monitor server starts the
     monitor itself when the queue runs out (or starts again the loop it
     stopped).  Says so in one line; any other run keeps ``restart_monitor``."""
-    if os.environ.get("WAXX_LAUNCHER") != QUEUE_LAUNCHER:
+    if os.environ.get("WAXX_LAUNCHER") != QUEUE_LAUNCHER or not restart_monitor:
         return restart_monitor
     print(f"[Monitor] launched by the run queue (job {os.environ.get('WAXX_QUEUE_JOB') or '?'}"
           "): the monitor is not restarted at the end of this run -- the monitor server "
@@ -218,7 +218,12 @@ class Expt(Scanner, Dealer, Scribe):
             self.run_info.filepath = response['filepath']
             self._ridstr = "Run ID: " + str(self.run_info.run_id)
             if response['run_id']:
-                console.info(f"Run ID: {self.run_info.run_id}")
+                if os.environ.get('WAXX_LAUNCHER'):
+                    # a launcher (the run queue, the run loop, run_lock) reads
+                    # this line from the output: never hidden by WAX_VERBOSITY
+                    print(f"Run ID: {self.run_info.run_id}", flush=True)
+                else:
+                    console.info(f"Run ID: {self.run_info.run_id}")
         else:
             if self.run_info.save_data and self.setup_camera:
                 raise RuntimeError(
@@ -953,6 +958,10 @@ class Expt(Scanner, Dealer, Scribe):
             'client_pid': os.getpid(),
             'client_host': socket.gethostname(),
             'launcher': str(os.environ.get('WAXX_LAUNCHER') or ''),
+            # the run queue's job this run is (WAXX_QUEUE_JOB, set by the
+            # queue): liveOD reports it in POLL and last_outcome, so the
+            # queue knows its job's run without reading the output
+            'queue_job': str(os.environ.get('WAXX_QUEUE_JOB') or ''),
         }
 
     def _serialize_end_payload(self, expt_filepath: str) -> dict:

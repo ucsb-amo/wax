@@ -212,7 +212,8 @@ class MonitorUDPServer(UdpServer):
       launches the next when the machine is free.  ``status_json`` has
       ``run_queue`` and ``person_hold``; changes are broadcast as
       ``run_queue`` and ``person_hold``.  A loop's Start is refused while
-      the queue has jobs queued or running.
+      the queue has a job in its slot or one eligible to launch now (jobs due
+      later, held or paused leave the loop alone).
 
     Host-side connections this server holds between runs (the tweezer AWG;
     :class:`~waxx.util.device_state.connections.ConnectionService`, each in
@@ -342,6 +343,7 @@ class MonitorUDPServer(UdpServer):
         # Experiments the GUIs may run back to back -- only these files.
         self.loops = {spec.key: RunLoop(spec, fence=self._current_run_pending,
                                         busy=self._loop_busy,
+                                        held=lambda: self.person_hold.text(),
                                         start_monitor=self.start_monitor_signal.emit,
                                         on_change=self._on_loop_change, journal=self.journal)
                       for spec in run_loops}
@@ -352,7 +354,7 @@ class MonitorUDPServer(UdpServer):
         self.run_queue = RunQueue(
             run_queue_dir, poll=lambda: self._live_od(),
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
-            live_od_reset=lambda: self._live_od.reset(), fence=self._current_run_pending,
+            live_od_reset=lambda **kw: self._live_od.reset(**kw), fence=self._current_run_pending,
             monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
             loops=self.loops, start_monitor=self.start_monitor_signal.emit,
             hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change)
@@ -384,6 +386,17 @@ class MonitorUDPServer(UdpServer):
         if m in ('status', 'status_json'):
             # Polled continuously; never logged, never forwarded.
             return
+        if m == 'reset' or "run complete" in m:
+            # a monitor (re)start takes the core: while the run queue has a job
+            # in its slot or one about to launch it is deferred -- the queue
+            # asks for the monitor itself when it runs out
+            busy = self.run_queue.monitor_busy()
+            if busy:
+                self.run_queue.defer_monitor(
+                    f"a client's {'monitor (re)start' if m == 'reset' else 'run complete'}",
+                    busy)
+                self.journal.record("message", text=m, deferred=busy)
+                return
         if m == 'reset':
             loop = active_loop(self.loops.values())
             if loop is not None:
@@ -719,6 +732,10 @@ class MonitorUDPServer(UdpServer):
         client = str(obj.get("client") or "")
         action = obj.get("action")
         if action == "stop":
+            # someone stops it: the run queue must not start it again later
+            self.run_queue.loop_stopped_by_someone(loop.spec.key,
+                                                   "@".join(p for p in (operator, client) if p)
+                                                   or "?")
             return loop.stop(operator=operator, client=client)
         if action == "describe":
             return loop.describe(obj.get("path"))
@@ -730,17 +747,22 @@ class MonitorUDPServer(UdpServer):
         if other is not None and other is not loop:
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
-        if self.run_queue.has_work():
-            # the queue starts the loop it stopped again itself once it has run out
-            msg = (f"the run queue has work ({self.run_queue.work_text()}) -- {loop.spec.title} "
-                   "can start when it has run out (a loop the queue stopped starts again by "
+        busy = self.run_queue.eligible_or_running()
+        if busy:
+            # the queue starts the loop it stopped again itself once it has run
+            # out; jobs due later, held or paused leave the loop alone
+            msg = (f"the run queue has a job to run now ({busy}) -- {loop.spec.title} can "
+                   "start when it has run out (a loop the queue stopped starts again by "
                    "itself)")
             log.warning("%s: start refused: %s", loop.spec.title, msg)
             self.journal.record("run_loop_refused", loop=loop.spec.key, expt=loop.expt,
                                 who="@".join(p for p in (operator, client) if p) or "?",
                                 msg=msg)
             return {"status": "error", "msg": msg}
-        return loop.start(operator=operator, client=client, path=obj.get("path"))
+        owner = str(obj.get("owner") or "person")
+        if owner not in ("person", "agent"):
+            return {"status": "error", "msg": f"owner must be person or agent, not {owner!r}"}
+        return loop.start(operator=operator, client=client, path=obj.get("path"), owner=owner)
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line
@@ -766,11 +788,10 @@ class MonitorUDPServer(UdpServer):
         return dict(source.since(obj.get("after", 0)), status="ok")
 
     def _loop_busy(self) -> str:
-        """Why something of this server's own holds the machine, for the
-        loops: a state reset, or a person's hold."""
-        if self.reset.running:
-            return "a state reset is running"
-        return self.person_hold.text()
+        """Why something of this server's own holds the core, for the loops: a
+        state reset.  (A person's hold reaches them as ``held``: a loop ends
+        on it as on a Stop.)"""
+        return "a state reset is running" if self.reset.running else ""
 
     def _on_loop_change(self, info) -> None:
         self._broadcaster.send({"type": "run_loop", "loop": info})

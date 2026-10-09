@@ -175,6 +175,9 @@ def server(qapp, monkeypatch, tmp_path):
     s.polls = [_poll(False)]
     s._live_od = lambda: s.polls[0]
     s.run_queue.poll_every_s = 0.0                     # every tick looks at liveOD
+    s.run_queue._spawn = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no job is launched in these tests"))
+    s.run_queue._adopt = lambda pid, started: None     # never a real process
     s.loops["auto_tof"]._poll = lambda: _poll(False)
     s.ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
     yield s
@@ -194,7 +197,8 @@ def test_server_hold_requests_status_and_broadcast(server, tmp_path):
     # the loops: Start refused, naming the hold
     refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
     assert refused["status"] == "error" and refused["msg"].startswith("person hold since ")
-    assert server.ask({"type": "run_queue", "action": "release", "by": "jp"})["status"] == "ok"
+    assert server.ask({"type": "run_queue", "action": "release", "by": "jp",
+                       "owner": "person"})["status"] == "ok"
     assert server.ask({"type": "run_queue", "action": "release"})["status"] == "error"
     assert "unknown run_queue action" in server.ask({"type": "run_queue",
                                                      "action": "nonsense"})["msg"]
@@ -252,3 +256,110 @@ def test_the_hold_row_puts_the_hold_on_and_releases_it(qapp, monkeypatch):
         assert not row.button.isEnabled()
     finally:
         panel.shutdown()
+
+
+# --- the counter, not the level (review B2) ---------------------------------------------------
+
+def _counted(person=0, queue=0, agent=0, last=None, reset=False, run_id=None):
+    return {"ok": True, "run_in_progress": bool(run_id), "run_id": run_id,
+            "reset_requested": reset, "reset_count": person + queue + agent,
+            "reset_counts": {"person": person, "queue": queue, "agent": agent},
+            "last_reset": last}
+
+
+def test_a_quick_reset_between_two_polls_is_seen_by_the_count():
+    hold = PersonHold(clock=Clock())
+    assert not hold.observe_poll(_counted())                       # baseline
+    # pressed and cleared (ABORT_RUN / INIT_RUN) between the polls: the level
+    # never showed it
+    last = {"at": 1_000_000.0, "count": 1, "run_id": 900, "source": "person"}
+    assert hold.observe_poll(_counted(person=1, last=last, reset=False))
+    info = hold.info()
+    assert info["active"] and info["run_id"] == 900 and info["source"] == "live_od_reset"
+    assert not hold.observe_poll(_counted(person=1, last=last))     # same count: nothing new
+
+
+@pytest.mark.parametrize("source", ["queue", "agent"])
+def test_the_queues_and_an_agents_aborts_never_hold(source):
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    last = {"at": 1.0, "count": 1, "run_id": 900, "source": source}
+    assert not hold.observe_poll(_counted(**{source: 1}, last=last, reset=True))
+    assert not hold.active
+
+
+def test_a_persons_reset_hidden_behind_a_later_queue_abort_still_holds():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    last = {"at": 1.0, "count": 2, "run_id": 901, "source": "queue"}   # the later one
+    assert hold.observe_poll(_counted(person=1, queue=1, last=last))
+
+
+def test_only_reset_count_uses_last_reset_source():
+    hold = PersonHold(clock=Clock())
+    poll = {"ok": True, "reset_count": 0, "last_reset": None}
+    hold.observe_poll(poll)
+    assert not hold.observe_poll({"ok": True, "reset_count": 1,
+                                  "last_reset": {"source": "agent", "run_id": 5}})
+    assert hold.observe_poll({"ok": True, "reset_count": 2,
+                              "last_reset": {"source": "person", "run_id": 5}})
+
+
+def test_a_live_od_restart_resets_the_counts():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted(person=4))
+    assert not hold.observe_poll(_counted(person=0))           # restarted, nothing since
+    assert hold.observe_poll(_counted(person=1, last={"source": "person", "run_id": 1}))
+
+
+def test_a_claimed_reset_sets_no_hold():
+    hold = PersonHold(clock=Clock())
+    hold.observe_poll(_counted())
+    claimed = []
+    assert not hold.observe_poll(_counted(person=1, last={"source": "person", "run_id": None}),
+                                 on_person_reset=lambda last: claimed.append(last) or True)
+    assert claimed and not hold.active
+
+
+def test_an_older_live_od_is_watched_by_the_level_with_one_warning(caplog):
+    hold = PersonHold(clock=Clock())
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.person_hold"):
+        hold.observe_poll(_poll(False, 900))
+        hold.observe_poll(_poll(False, 900))
+        assert hold.observe_poll(_poll(True, 900))
+    assert len([r for r in caplog.records if "no reset_count" in r.getMessage()]) == 1
+
+
+# --- a hold ends a loop as a Stop does (review N8) ---------------------------------------------
+
+def test_a_hold_ends_a_loop_saying_so_and_starts_the_monitor(tmp_path):
+    import threading
+    from waxx.util.device_state.run_loop import LoopSpec, RunLoop
+    expt = tmp_path / "auto_tof.py"
+    expt.write_text("x = 1\n")
+    hold = PersonHold(clock=Clock())
+    started = []
+    live = lambda: _poll(False)                               # noqa: E731
+    gate = threading.Event()
+
+    class Proc:
+        pid = 1
+
+        def __init__(self):
+            self.stdout = iter(["Run ID: 101\n"])
+
+        def wait(self):
+            hold.hold("mine", "jp")                           # pressed during the run
+            return 0
+    loop = RunLoop(LoopSpec("auto_tof", "BEC TOF loop", str(expt)),
+                   poll=lambda: dict(live(), last_outcome={"run_id": 101, "outcome": "saved"}),
+                   spawn=lambda command, extra_env=None: Proc(), held=hold.text,
+                   start_monitor=started.append, gap_s=0., poll_s=0.01)
+    assert loop.start()["status"] == "ok"
+    loop.join(5)
+    info = loop.info()
+    assert info["state"] == "latched" and info["text"].startswith("person hold since")
+    assert "does not run while it is on" in info["text"]
+    assert len(started) == 1                                  # as for a Stop
+    assert loop.start()["msg"].startswith("person hold since")
+    assert gate is not None
