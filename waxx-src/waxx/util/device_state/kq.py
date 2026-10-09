@@ -679,8 +679,9 @@ def _cmd_tail(ctx: _Ctx, args) -> int:
         _report_end(ctx, job)
         return exit_code_for(job)
     offset = 0
+    token = args.token or ctx.client.job_token(args.id)
     while True:
-        reply = ctx.client.tail(args.id, args.token, offset)
+        reply = ctx.client.tail(args.id, token, offset)
         for line in reply.get("lines") or []:
             safe_write(ctx.out, line + "\n")
         offset = int(reply.get("offset") or offset)

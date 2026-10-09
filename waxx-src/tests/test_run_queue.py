@@ -549,6 +549,10 @@ def test_a_queued_only_cancel_never_aborts_a_job_that_has_launched(q, expts):
 
 # --- tail: the job's log for a client on any PC ---------------------------------------------
 
+def tok(q, job_id):
+    return job(q, job_id)["token"]
+
+
 def _append(proc, data: bytes):
     with open(proc.log_path, "ab") as f:
         f.write(data)
@@ -556,37 +560,37 @@ def _append(proc, data: bytes):
 
 def test_tail_serves_whole_lines_from_an_offset_until_the_job_has_ended(q, expts):
     a = submit(q, expts)
-    t = q.tail({"id": a, "offset": 0})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": 0})
     assert t == {"status": "ok", "lines": [], "offset": 0, "done": False, "state": "queued",
                  "run_id": None}
     q.tick()
     proc = q.spawner.procs[-1]
-    t = q.tail({"id": a, "offset": 0})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": 0})
     assert t["state"] == "running" and not t["done"]
     assert t["lines"][0].startswith("-- run queue ") and t["lines"][1].startswith("$ ")
     assert all(line.isascii() for line in t["lines"])             # the queue's own header
     off = t["offset"]
     assert off == os.path.getsize(proc.log_path)
     _append(proc, b"Run ID: 101\r\nshot 1/3\nhal")
-    t = q.tail({"id": a, "offset": off})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": off})
     assert t["lines"] == ["Run ID: 101", "shot 1/3"]                # no partial line yet
     off = t["offset"]
-    assert q.tail({"id": a, "offset": off})["lines"] == []
+    assert q.tail({"id": a, "token": tok(q, a), "offset": off})["lines"] == []
     _append(proc, "f a line, 5 µs\n".encode("utf-8") + b"bad \xff byte\nlast words")
-    t = q.tail({"id": a, "offset": off})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": off})
     assert t["lines"] == ["half a line, 5 µs", "bad � byte"]
     off = t["offset"]
     q.live.start_run(101)
     q.tick()
-    assert q.tail({"id": a, "offset": off})["run_id"] == 101
+    assert q.tail({"id": a, "token": tok(q, a), "offset": off})["run_id"] == 101
     q.live.end_run(101, "saved")
     proc.code = 0
     q.tick()
     assert job(q, a)["state"] == "saved"
-    t = q.tail({"id": a, "offset": off})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": off})
     assert t["lines"] == ["last words"] and t["done"] and t["state"] == "saved"
     assert t["offset"] == os.path.getsize(proc.log_path)
-    t = q.tail({"id": a, "offset": t["offset"]})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": t["offset"]})
     assert t["lines"] == [] and t["done"]
 
 
@@ -599,7 +603,7 @@ def test_tail_reads_a_bounded_chunk_and_splits_an_overlong_line(q, expts, monkey
     _append(proc, b"x" * 40 + b"\nab\ncd\n")
     got, off = [], size
     for _ in range(10):
-        t = q.tail({"id": a, "offset": off})
+        t = q.tail({"id": a, "token": tok(q, a), "offset": off})
         assert t["offset"] - off <= 16
         got += t["lines"]
         off = t["offset"]
@@ -611,7 +615,7 @@ def test_tail_reads_a_bounded_chunk_and_splits_an_overlong_line(q, expts, monkey
 def test_a_cancelled_queued_job_is_done_at_once_in_tail(q, expts):
     a = submit(q, expts)
     q.cancel({"id": a, "by": "jp", "owner": "person"})
-    t = q.tail({"id": a, "offset": 0})
+    t = q.tail({"id": a, "token": tok(q, a), "offset": 0})
     assert t["done"] and t["state"] == "cancelled" and t["lines"] == []
 
 
@@ -620,11 +624,14 @@ def test_a_cancelled_queued_job_is_done_at_once_in_tail(q, expts):
     ({"id": 1, "token": "nope", "offset": 0}, "has token"),
     ({"id": 1, "offset": -1}, "0 or more"),
     ({"id": 1, "offset": "x"}, "must be an integer"),
-    ({"id": 1, "offset": 10 ** 9}, "past the end"),
+    ({"id": 1, "token": "OWN", "offset": 10 ** 9}, "past the end"),
+    ({"id": 1, "offset": 0}, "needs job 1's token"),
 ])
 def test_tail_refusals(q, expts, obj, words):
     submit(q, expts)
     q.tick()
+    if obj.get("token") == "OWN":
+        obj = dict(obj, token=tok(q, 1))
     reply = q.tail(obj)
     assert reply["status"] == "error" and words in reply["msg"], reply
 

@@ -251,6 +251,9 @@ def test_follow_copies_the_log_and_returns_the_final_job(client, server, q, expt
     assert lines[0].startswith("-- run queue ") and lines[1].startswith("$ ")
     assert lines[2:] == ["Run ID: 101", "shot 1/2", "shot 2/2"]
     assert waits and waits[0]["waiting"] == "launching"
+    # follow was given only the id: it took the token once and sent it with every tail
+    tails = [o for o, _ in server.requests if o["action"] == "tail"]
+    assert tails and all(o.get("token") == job["token"] for o in tails)
 
 
 def test_follow_goes_on_from_its_cursor_after_an_interrupt(client, server, q, expts):

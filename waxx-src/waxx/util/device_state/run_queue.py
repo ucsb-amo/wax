@@ -651,8 +651,11 @@ class RunQueue:
         return out
 
     def tail(self, obj: Mapping) -> dict:
-        """``{"id", "token"?, "offset"}`` -> ``{"lines", "offset", "done",
-        "state", "run_id"}``: the job's log file read on this machine from byte
+        """``{"id", "token", "offset"}`` -> ``{"lines", "offset", "done",
+        "state", "run_id"}``.  ``token`` is required when the job has one (a
+        follower must not read another queue's job that reused the id; the
+        client takes it from submit, or once from ``describe``).  The job's
+        log file is read on this machine from byte
         ``offset`` (so a client on any PC follows a log that lives on the
         server's disk), at most :data:`TAIL_CHUNK` bytes, whole lines only --
         the last, unterminated line comes once the job has ended (or alone
@@ -672,6 +675,10 @@ class RunQueue:
                 job = self._find(obj)
             except QueueError as exc:
                 return {"status": "error", "msg": str(exc)}
+            if job.token and not obj.get("token"):
+                return {"status": "error",
+                        "msg": f"tail needs job {job.id}'s token (describe / kq show "
+                               f"{job.id} gives it)"}
             # the state before the read: an ended job's log is complete
             state, path, run_id = job.state, job.log_path, job.run_id
         ended = state in ENDED

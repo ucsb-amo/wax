@@ -195,6 +195,12 @@ class RunQueueClient:
         """-> ``{"job": {...}, "waiting": str, "tail": [lines]}``."""
         return self._ask("describe", {"id": int(job_id), "token": token}, retry=True)
 
+    def job_token(self, job_id: int) -> str | None:
+        """Job ``job_id``'s token, from ``describe`` (for a follower that was
+        given only the id: from then on every ``tail`` names this job, not
+        another queue's job that reused the id)."""
+        return self.describe(job_id)["job"].get("token")
+
     def tail(self, job_id: int, token: str | None = None, offset: int = 0) -> dict:
         """The job's log from byte ``offset`` -> ``{"lines", "offset", "done",
         "state", "run_id"}`` (read on the server's machine)."""
@@ -260,6 +266,8 @@ class RunQueueClient:
         lost_since = None
         while True:
             try:
+                if not token:                         # given only the id: look it up once
+                    token = self.job_token(job_id)
                 reply = self.tail(job_id, token, cursor["offset"])
             except RunQueueError as exc:
                 if exc.reply is not None:             # a refusal, not silence
