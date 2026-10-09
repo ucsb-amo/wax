@@ -406,11 +406,17 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             ctx.warn(f"kq: {exc}")
             return EXIT_USAGE
     owner = _owner(args)
-    reply = ctx.client.submit(
-        args.file, argv=list(args.args) + expt_argv, cwd=args.cwd, label=args.label, owner=owner,
-        priority=args.priority, due=due, after=args.after, repeat=args.repeat,
-        chain=args.chain, stop_on_failure=False if args.no_stop_on_failure else None,
-        write_back=False if args.no_write_back else None, allow_drift=args.allow_drift)
+    try:
+        reply = ctx.client.submit(
+            args.file, argv=list(args.args) + expt_argv, cwd=args.cwd, label=args.label,
+            owner=owner, priority=args.priority, due=due, after=args.after,
+            repeat=args.repeat, chain=args.chain,
+            stop_on_failure=False if args.no_stop_on_failure else None,
+            write_back=False if args.no_write_back else None, allow_drift=args.allow_drift)
+    except KeyboardInterrupt:
+        safe_write(ctx.out, "\n")
+        ctx.warn("[kq] interrupted while submitting: the job may be queued -- check kq list")
+        return EXIT_INTERRUPTED
     jobs = reply.get("jobs") or []
     ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
     tokens = {int(j["id"]): j.get("token") for j in jobs}
@@ -425,32 +431,36 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
         ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text}")
         ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
         return EXIT_OK
-    ctx.say(f"[kq] {many} queued ({_position(ctx, ids[0], tokens.get(ids[0]))}){due_text}")
-    final = EXIT_OK
-    for n, jid in enumerate(ids):
-        if len(ids) > 1:
-            ctx.say(f"[kq] job {jid} ({n + 1} of {len(ids)})")
-        state = {"waiting": None}
+    # from here on a Ctrl-C anywhere goes to _interrupted: the job ids are
+    # known, a queued job is cancelled (queued_only) and its id printed
+    n, cursor = 0, {"offset": 0}
+    try:
+        ctx.say(f"[kq] {many} queued ({_position(ctx, ids[0], tokens.get(ids[0]))})"
+                f"{due_text}")
+        final = EXIT_OK
+        for n, jid in enumerate(ids):
+            cursor = {"offset": 0}
+            if len(ids) > 1:
+                ctx.say(f"[kq] job {jid} ({n + 1} of {len(ids)})")
+            state = {"waiting": None}
 
-        def on_wait(described, _state=state):
-            why = described.get("waiting") or ""
-            if why and why != _state["waiting"]:
-                if _state["waiting"] is not None:
-                    ctx.say(f"[kq] waiting: {why}")
-                _state["waiting"] = why
+            def on_wait(described, _state=state):
+                why = described.get("waiting") or ""
+                if why and why != _state["waiting"]:
+                    if _state["waiting"] is not None:
+                        ctx.say(f"[kq] waiting: {why}")
+                    _state["waiting"] = why
 
-        cursor = {"offset": 0}
-        try:
             job = ctx.client.follow(jid, tokens.get(jid), ctx.out, cursor=cursor,
                                     on_wait=on_wait, on_lost=lambda m: ctx.warn(f"[kq] {m}"),
                                     on_abort=lambda j: ctx.say(_abort_text(j)))
-        except KeyboardInterrupt:
-            return _interrupted(ctx, ids[n:], tokens, owner, cursor)
-        _report_end(ctx, job)
-        code = exit_code_for(job)
-        if code != EXIT_OK and final == EXIT_OK:
-            final = code
-    return final
+            _report_end(ctx, job)
+            code = exit_code_for(job)
+            if code != EXIT_OK and final == EXIT_OK:
+                final = code
+        return final
+    except KeyboardInterrupt:
+        return _interrupted(ctx, ids[n:], tokens, owner, cursor)
 
 
 def _position(ctx: _Ctx, jid: int, token) -> str:

@@ -187,6 +187,49 @@ def test_an_older_monitor_server_exits_4(server, expts):
 
 # --- Ctrl-C -----------------------------------------------------------------------------------
 
+def _interrupt_on(server, action):
+    def on_request(obj):
+        if obj.get("action") == action:
+            raise KeyboardInterrupt
+    server.on_request = on_request
+
+
+def test_ctrl_c_during_the_submit_says_the_job_may_be_queued(server, q, expts):
+    _interrupt_on(server, "submit")
+    r = kq(server, "run", str(expts / "rabi.py"))
+    assert r.code == 130 and "the job may be queued -- check kq list" in r.err
+
+
+def test_ctrl_c_right_after_the_submit_cancels_the_job_and_names_it(server, q, expts):
+    _interrupt_on(server, "list")                 # the position lookup after the submit
+    r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "2")
+    assert r.code == 130 and "cancelled jobs 1, 2 (not started)" in r.out
+    assert [q.describe({"id": i})["job"]["state"] for i in (1, 2)] == ["cancelled"] * 2
+    assert all(c.get("queued_only") for c in sent(server, "cancel"))
+
+
+def test_ctrl_c_between_two_jobs_of_a_repeat(server, q, expts):
+    q._gap_s = 1e9                                # job 2 stays queued after job 1 ends
+    steps = run_steps(q, run_id=101)
+    Script(server, steps)
+    calls = {"n": 0}
+    inner = server.on_request
+
+    def on_request(obj):
+        inner(obj)
+        if obj.get("action") == "describe" and q.describe({"id": 1})["job"]["state"] == "saved":
+            calls["n"] += 1
+            if calls["n"] == 1:                   # the final describe of job 1
+                raise KeyboardInterrupt
+
+    server.on_request = on_request
+    r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "2", tty=False)
+    assert r.code == 130
+    assert q.describe({"id": 1})["job"]["state"] == "saved"
+    assert q.describe({"id": 2})["job"]["state"] == "cancelled"
+    assert "cancelled queued job 2" in r.out
+
+
 def test_ctrl_c_while_queued_cancels_and_exits_130(server, q, expts):
     Script(server, [], interrupt_at={2})
     r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "3")
