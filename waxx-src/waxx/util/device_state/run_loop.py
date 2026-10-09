@@ -550,8 +550,12 @@ class RunLoop:
                 if run_id is None and not abort_seen:
                     # Before INIT_RUN an Abort is spent on no run (liveOD
                     # skips an id and lets this run through): notice it here.
+                    # Not the Abort of a dead run the gate waived: it stays set
+                    # until this run's INIT_RUN finalizes that run.
                     try:
-                        abort_seen = bool(self._poll().get("reset_requested"))
+                        poll = self._poll()
+                        abort_seen = (bool(poll.get("reset_requested"))
+                                      and not self._waived_reset(poll))
                     except Exception:
                         pass
                 continue
@@ -572,6 +576,15 @@ class RunLoop:
         code = proc.wait()
         self._tell_live_od_it_exited(run_id, code, list(tail), n)
         return self._judge(code, list(tail), run_id, abort_seen)
+
+    def _waived_reset(self, poll: dict) -> bool:
+        """POLL's pending Abort is the one of the dead run the gate waived: liveOD's
+        current run is still that run (no INIT_RUN since). An Abort a person
+        presses in that window cannot be told apart; liveOD spends it on the
+        dead run at this run's INIT_RUN."""
+        waived = self._waived
+        return (waived is not None and waived[1] == "reset_pending"
+                and poll.get("run_id") == waived[0])
 
     def _tell_live_od_it_exited(self, run_id, code, tail: list[str], n: int) -> None:
         """The run's process has exited. If liveOD still has the run in progress

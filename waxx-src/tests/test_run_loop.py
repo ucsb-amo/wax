@@ -707,6 +707,51 @@ def test_a_run_whose_process_is_gone_is_waived_with_one_warning(expt, monkeypatc
     assert loop.journal.kinds.count("run_loop_waived") == 1
 
 
+def test_a_waived_runs_abort_is_not_taken_for_a_new_one(expt, monkeypatch):
+    """Review S2: the waived run's reset_requested stays set while the next run
+    compiles (until its INIT_RUN); the loop must not read it as an Abort pressed
+    while the run was starting."""
+    from waxx.util.device_state import run_gate
+    monkeypatch.setattr(run_gate, "_default_pid_alive", lambda pid: False)
+    live = _stuck(True)
+    loop = None
+    polls_before = []
+
+    def compile_then_init_run():
+        n0 = live.polls
+        time.sleep(0.15)                  # compiling: the loop polls, reset still set
+        polls_before.append(live.polls - n0)
+        live.run_in_progress, live.reset_requested, live.run_id = False, False, 101
+        loop.stop()
+
+    loop = _loop(expt, live, [FakeProc(live, 101, before=compile_then_init_run)])
+    assert loop.start()["status"] == "ok"
+    loop.join(5)
+    info = loop.info()
+    assert polls_before and polls_before[0] >= 3           # it did look, several times
+    assert info["state"] == "stopped" and info["runs"] == 1, info["text"]
+    assert "spent it on no run" not in info["text"]
+
+
+def test_an_abort_for_another_run_id_still_counts_after_a_waiver(expt, monkeypatch):
+    from waxx.util.device_state import run_gate
+    monkeypatch.setattr(run_gate, "_default_pid_alive", lambda pid: False)
+    live = _stuck(True)
+    loop = None
+
+    def a_new_abort_then_init_run():
+        # liveOD's run is no longer the waived one, and an Abort is pending
+        live.run_in_progress, live.run_id, live.reset_requested = False, 85529, True
+        time.sleep(0.1)
+        live.reset_requested, live.run_id = False, 101
+
+    loop = _loop(expt, live, [FakeProc(live, 101, before=a_new_abort_then_init_run)])
+    loop.start()
+    loop.join(5)
+    assert loop.info()["state"] == "latched"
+    assert "spent it on no run" in loop.info()["text"]
+
+
 @pytest.mark.parametrize("reset, extra, alive, words", [
     (True, {}, True, "an Abort is pending in liveOD, waiting"),
     (False, {"n_shots": 3, "init_run_age_s": 6000.0, "last_shot_age_s": 5000.0}, True,
