@@ -245,6 +245,17 @@ def test_ctrl_c_between_two_jobs_of_a_repeat(server, q, expts):
     assert "cancelled queued job 2" in r.out
 
 
+def test_a_queue_error_inside_the_interrupt_still_exits_130(server, q, expts):
+    def on_request(obj):
+        if obj.get("action") == "list":
+            server.silent = 10 ** 6               # the server goes quiet from the Ctrl-C on
+            raise KeyboardInterrupt
+
+    server.on_request = on_request
+    r = kq(server, "run", str(expts / "rabi.py"))
+    assert r.code == 130 and "did not answer" in r.err and "kq tail 1 -f" in r.out
+
+
 def test_ctrl_c_while_queued_cancels_and_exits_130(server, q, expts):
     Script(server, [], interrupt_at={2})
     r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "3")

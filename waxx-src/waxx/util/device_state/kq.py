@@ -573,6 +573,12 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
         safe_write(ctx.out, "\n")
         ctx.say(f"[kq] interrupted: job {jid} is left as it is. {_leave_text(jid)}")
         return EXIT_INTERRUPTED
+    except RunQueueError as exc:
+        # still an interrupt: the person asked to stop; what the queue said goes
+        # with it, and the job is whatever the queue made of it
+        ctx.warn(f"kq: {exc}")
+        ctx.say(f"[kq] interrupted: job {jid} may be left as it was. {_leave_text(jid)}")
+        return EXIT_INTERRUPTED
 
 
 def _list_rows(jobs: list[dict]) -> list[list[str]]:
