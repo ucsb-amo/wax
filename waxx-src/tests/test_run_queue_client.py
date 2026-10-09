@@ -318,6 +318,27 @@ def test_follow_waits_out_silence_and_gives_up_after_lost_s(client, server, q, e
         client.follow(jid, out=io.StringIO(), lost_s=300.0, clock=clock)
 
 
+def test_a_silent_final_describe_does_not_hide_a_finished_job(client, server, q, expts):
+    jid = client.submit(str(expts / "rabi.py"))["ids"][0]
+    script = Script(server, run_steps(q))
+    calls = {"n": 0}
+
+    def on_request(obj):
+        script(obj)
+        if obj.get("action") == "describe" and q.describe({"id": jid})["job"]["state"] == "saved":
+            calls["n"] += 1
+            server.silent = 1                   # each final describe goes unanswered
+    server.on_request = on_request
+    job = client.follow(jid, out=io.StringIO())
+    assert calls["n"] == 5 and job["final_record_missing"]
+    assert job["state"] == "saved" and job["run_id"] == 101
+    assert "could not be read" in job["reason"]
+    # once it answers again, the record is the server's
+    calls["n"] = 0
+    server.on_request = script
+    assert "final_record_missing" not in client.follow(jid, out=io.StringIO())
+
+
 def test_follow_stops_on_a_refusal(client, server, expts):
     client.submit(str(expts / "rabi.py"))
     with pytest.raises(RunQueueError, match="has token"):

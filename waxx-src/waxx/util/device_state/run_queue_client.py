@@ -384,4 +384,24 @@ class RunQueueClient:
                         on_abort(described["job"])
             if not lines:
                 sleep(poll_s)
-        return self.describe(job_id, token)["job"]
+        return self._final_job(job_id, token, cursor, sleep, poll_s)
+
+    def _final_job(self, job_id, token, cursor, sleep, poll_s, tries: int = 5) -> dict:
+        """The ended job's record from ``describe``, asked a few times; when
+        the server stays silent, a record built from the last ``tail`` reply
+        (its state and run id; ``final_record_missing`` set) -- the job has
+        ended either way, so a lost reply must not read as a refusal."""
+        why = ""
+        for i in range(tries):
+            try:
+                return self.describe(job_id, token)["job"]
+            except RunQueueError as exc:
+                if exc.reply is not None:
+                    raise
+                why = exc.msg
+                if i < tries - 1:
+                    sleep(max(poll_s, 1.0))
+        return {"id": job_id, "token": token, "label": "?", "state": cursor.get("state"),
+                "run_id": cursor.get("run_id"), "exit_code": None,
+                "reason": f"its final record could not be read ({why}); kq show {job_id}",
+                "final_record_missing": True}
