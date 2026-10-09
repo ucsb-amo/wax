@@ -372,6 +372,18 @@ def test_submit_refusals(q, expts, obj, words):
     assert "run_queue_refused" in q.journal.kinds
 
 
+def test_the_submitters_copy_must_match_the_one_that_runs(q, expts):
+    path = str(expts / "rabi.py")
+    sha = rq.file_sha256(path)
+    assert q.submit({"path": path, "client_sha256": sha, "client_host": "pc2"})["status"] == "ok"
+    r = q.submit({"path": path, "client_sha256": "0" * 64, "client_host": "kong"})
+    assert r["status"] == "error" and "your copy differs from kong's" in r["msg"]
+    r = q.submit({"path": path, "client_host": "pc2"})              # could not hash it
+    assert r["status"] == "error" and "could not be read" in r["msg"]
+    assert q.submit({"path": path, "client_host": "KONG"})["status"] == "ok"   # same host
+    assert q.submit({"path": path})["status"] == "ok"               # an older client
+
+
 def test_a_spawn_failure_fails_the_job(q, expts):
     a = submit(q, expts)
     q.spawner.fail = "no shell"

@@ -561,7 +561,9 @@ class RunQueue:
     def submit(self, obj: Mapping) -> dict:
         """``{"path", "argv", "cwd", "label", "owner", "priority", "due",
         "after", "repeat", "chain", "stop_on_failure", "write_back",
-        "allow_drift", "by"}`` -> ``{"status": "ok", "jobs": [...], "ids": [...]}``."""
+        "allow_drift", "by", "client_sha256"?, "client_host"?}`` -> ``{"status":
+        "ok", "jobs": [...], "ids": [...]}``.  The submitter's own copy must
+        match this machine's (:meth:`_check_client_copy`)."""
         try:
             jobs = self._new_jobs(obj)
         except QueueError as exc:
@@ -649,6 +651,7 @@ class RunQueue:
         else:
             submitter = by or "?"
         sha = file_sha256(path)
+        self._check_client_copy(obj, path, sha)
         expt_class, calibrates = describe_source(path)
         # TODO(INIT_RUN): the live list of calibrated keys, sent by the
         # experiment at prepare, overrides calibrates_declared once known.
@@ -678,6 +681,24 @@ class RunQueue:
                 self._jobs[job.id] = job
                 jobs.append(job)
         return jobs
+
+    def _check_client_copy(self, obj: Mapping, path: Path, sha: str) -> None:
+        """The file that runs is this machine's copy, so it must be the one
+        the submitter means: a ``client_sha256`` (the client's hash of its own
+        file at that path) must equal this machine's; a client on another host
+        (``client_host``) that could not hash its file is refused, since
+        nothing shows the two copies agree.  A request without either (an
+        older client) is taken as before."""
+        theirs = obj.get("client_sha256")
+        if theirs:
+            if str(theirs).lower() != sha:
+                raise QueueError(f"your copy differs from {self._host}'s: {path} (the file "
+                                 f"that runs is {self._host}'s; it must match yours)")
+            return
+        host = str(obj.get("client_host") or "").strip()
+        if host and host.lower() != str(self._host).lower():
+            raise QueueError(f"{path}: the file that runs is {self._host}'s, and your copy on "
+                             f"{host} could not be read to check that it matches")
 
     # -- the order ---------------------------------------------------------------------
 

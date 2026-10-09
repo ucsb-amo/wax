@@ -91,6 +91,21 @@ def safe_write(out, text: str) -> None:
         out.write(text.encode(enc, "replace").decode(enc, "replace"))
 
 
+def local_sha256(path) -> str | None:
+    """SHA-256 of this machine's copy of ``path``; None when it cannot be read.
+    Sent with a submit: the server runs ITS copy at that path and refuses one
+    that differs (or, from another PC, one this client could not hash)."""
+    import hashlib  # noqa: PLC0415
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 16), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 def connect_monitor(discovery_timeout: float = 3.0):
     """The monitor server's client, found by discovery (imported here: the
     discovery module starts its listener when it is imported).  RuntimeError
@@ -172,14 +187,21 @@ class RunQueueClient:
         ``priority`` (None: not sent) is only a placement hint within the
         owner's block.  ``write_back`` may only be None or False (a veto).
         ``agent_label`` comes from ``WAXX_AGENT_LABEL`` when set; ``host`` is
-        this machine's name.  -> ``{"status": "ok", "ids": [...], "jobs": [...]}``."""
+        this machine's name.  ``client_sha256`` (this machine's hash of the
+        file, when readable) and ``client_host`` let the server refuse a path
+        whose copy on its machine -- the one that runs -- differs.  ``cwd`` is
+        made absolute here.  -> ``{"status": "ok", "ids": [...], "jobs": [...]}``."""
         position = {"at_index": None if at_index is None else int(at_index),
                     "before_id": None if before_id is None else int(before_id),
                     "after_id": None if after_id is None else int(after_id)}
         action = "insert" if any(v is not None for v in position.values()) else "submit"
+        path = os.path.abspath(str(path))
         return self._ask(action, dict({
-            "path": os.path.abspath(str(path)), "argv": [str(a) for a in argv],
-            "cwd": cwd, "label": label, "owner": self._owner(owner),
+            "path": path, "argv": [str(a) for a in argv],
+            # the file that runs is the server's copy: it must match this one
+            "client_sha256": local_sha256(path), "client_host": socket.gethostname(),
+            "cwd": None if cwd is None else os.path.abspath(str(cwd)),
+            "label": label, "owner": self._owner(owner),
             "priority": None if priority is None else int(priority),
             "due": None if due is None else float(due), "after": [int(a) for a in after],
             "repeat": int(repeat), "chain": chain, "stop_on_failure": stop_on_failure,

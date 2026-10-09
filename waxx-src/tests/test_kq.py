@@ -191,6 +191,19 @@ def test_a_repeat_is_followed_job_by_job(server, q, expts):
     assert r.out.count("Run ID: 10") == 2 and "[kq] job 2 (rabi) saved (run 102)" in r.out
 
 
+def test_a_copy_that_differs_from_the_servers_is_refused(server, q, expts, monkeypatch):
+    from waxx.util.device_state import run_queue_client as rqc
+    monkeypatch.setattr(rqc, "local_sha256", lambda path: "0" * 64)
+    r = kq(server, "submit", str(expts / "rabi.py"))
+    assert r.code == 6 and "your copy differs from kong's" in r.err
+    assert "the file that runs is kong's; it must match yours" in r.err
+    monkeypatch.setattr(rqc, "local_sha256", lambda path: None)     # unreadable here
+    monkeypatch.setattr(rqc.socket, "gethostname", lambda: "pc2")
+    r = kq(server, "submit", str(expts / "rabi.py"))
+    assert r.code == 6 and "could not be read" in r.err
+    assert q.list()["jobs"] == []
+
+
 def test_the_queue_refusing_exits_6(server, expts):
     r = kq(server, "run", str(expts / "nothing.py"))
     assert r.code == 6 and "no such file" in r.err and r.out == ""

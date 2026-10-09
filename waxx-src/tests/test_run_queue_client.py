@@ -13,7 +13,7 @@ import pytest
 
 from test_run_queue import make_queue
 from waxx.util.device_state.run_queue_client import (
-    NO_QUEUE_MSG, NoRunQueue, RunQueueClient, RunQueueError, safe_write)
+    NO_QUEUE_MSG, NoRunQueue, RunQueueClient, RunQueueError, local_sha256, safe_write)
 
 ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
            "cancel": "cancel", "list": "list", "describe": "describe",
@@ -149,7 +149,10 @@ def test_every_action_sends_its_request(client, server, expts, monkeypatch):
     assert sent == {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
                     "argv": ["-a", "x=1"], "label": "r1", "owner": "agent", "priority": 3,
                     "after": [], "repeat": 1, "write_back": False, "allow_drift": False,
-                    "host": socket.gethostname(), "by": "jp@kong"}
+                    "host": socket.gethostname(), "by": "jp@kong",
+                    "client_sha256": local_sha256(str(expts / "rabi.py")),
+                    "client_host": socket.gethostname()}
+    assert len(sent["client_sha256"]) == 64
     token = reply["jobs"][0]["token"]
     assert client.list()["next"] == [1]
     assert client.describe(1, token)["job"]["label"] == "r1"
