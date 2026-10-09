@@ -1141,8 +1141,15 @@ class LiveODServer(QThread, NetServer):
         # new run to abort on its first poll. (Before the new token: until
         # then the reset run's camera threads still count as its own. Before
         # begin() below: the reset run's file is still the one RunFile knows.)
-        if self._reset_requested:
+        # Only a run still in progress has anything to finalize: with none, the
+        # Abort was pressed between runs and is just cleared (below). Finalizing
+        # then recorded the previous run as "discarded/reset" and deleted its
+        # file if its save had failed (RunFile keeps the path for a retry).
+        if self._reset_requested and self._run_in_progress:
             self._finalize_reset_run(notify_gui=False)
+        elif self._reset_requested:
+            logger.info(f"INIT_RUN: an Abort pressed with no run in progress is cleared "
+                        f"(run {self._current_run_id} had already ended; nothing discarded).")
         self._adopt_run_token(token)
         # host mode: the previous run's hold on its camera ends; this run's stays
         self._host_commit_run(token)

@@ -108,6 +108,54 @@ def test_reset_during_save_closes_nothing_and_deletes_nothing(held):
     assert srv._last_outcome["outcome"] == "saved"
 
 
+@pytest.fixture
+def plain(app, tmp_path, monkeypatch):
+    from waxx.util.live_od.data import run_file
+    patch_payload_stash(monkeypatch, run_file, [])
+    from waxx.util.live_od.live_od_server import LiveODServer
+    saver = FakeSaver(tmp_path)
+    return LiveODServer(server_talk=None, data_saver=saver), saver
+
+
+def _init(srv, **kw):
+    msg = {"tag": "INIT_RUN", "save_data": True, "capture_images": False, "camera_key": "",
+           "params": {"N_img": 1}, "N_shots_with_repeats": 1, "expt_class": "save_guard"}
+    msg.update(kw)
+    return srv._handle_init_run(msg)
+
+
+def test_an_abort_between_runs_keeps_a_failed_saves_file(plain):
+    """Review S3: an Abort pressed with no run in progress used to be finalized at
+    the next INIT_RUN: the previous run recorded as discarded, and its file
+    deleted when its save had failed (the path is kept for a retry)."""
+    srv, saver = plain
+    saver.fail_save = True
+    first = _init(srv)
+    assert srv._handle_end_run({"run_token": first["run_token"]})["ok"] is False
+    assert not srv._run_in_progress and os.path.exists(first["filepath"])
+    assert srv._last_outcome["outcome"] == "save_failed"
+    srv._handle_reset({"tag": "RESET"})                  # Abort, no run in progress
+    assert srv._reset_requested
+    saver.fail_save = False
+    second = _init(srv)
+    assert second["ok"] and not srv._reset_requested
+    assert os.path.exists(first["filepath"])             # kept
+    # the failed run's record is not overwritten with "discarded / reset"
+    assert srv._last_outcome["run_id"] == first["run_id"]
+    assert srv._last_outcome["outcome"] == "save_failed"
+
+
+def test_an_abort_of_a_run_in_progress_is_still_finalized_at_init_run(plain):
+    srv, saver = plain
+    first = _init(srv)
+    srv._handle_reset({"tag": "RESET"})                  # its experiment never answers
+    second = _init(srv)
+    assert second["ok"]
+    assert not os.path.exists(first["filepath"])         # discarded, as for any abort
+    assert srv._last_outcome["run_id"] == first["run_id"]
+    assert srv._last_outcome["outcome"] == "discarded"
+
+
 def test_dead_client_during_save_is_live(held):
     srv, init, gate = held
     poll = srv._handle_poll({"tag": "POLL"})

@@ -174,6 +174,15 @@ def test_reset_pending_with_a_live_or_unknown_client_is_not_waivable(check, host
     assert st.state == "reset_pending" and not st.waivable
 
 
+def test_reset_pending_without_a_run_after_a_failed_save_is_not_waivable():
+    # review S3: an older liveOD's next INIT_RUN would delete the failed save's file
+    poll = _poll(reset_requested=True, client_pid=4242, client_host=HERE,
+                 last_outcome={"run_id": 85527, "outcome": "save_failed"})
+    st = classify(poll, None, now=NOW, pid_alive=_dead)
+    assert st.state == "reset_pending" and not st.waivable
+    assert "save failed" in st.reason and "pid" not in st.reason
+
+
 def test_reset_pending_without_a_run_follows_the_last_clients_pid():
     poll = _poll(reset_requested=True, client_pid=4242, client_host=HERE)
     assert classify(poll, None, now=NOW, pid_alive=_dead).waivable

@@ -275,15 +275,23 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
         else:
             st = _by_timing(poll, rid, client, detail)
     elif reset:
-        if client["alive"] is False:
+        last = poll.get("last_outcome") or {}
+        if last.get("outcome") == "save_failed":
+            # an older liveOD finalizes this Abort at the next INIT_RUN, which
+            # deletes the failed save's file (kept for a retry)
             st = GateState("reset_pending", rid,
-                           "an Abort is pending in liveOD with no run in progress; the last "
-                           f"run's process ({_who(client)}) is gone -- the next INIT_RUN clears "
-                           "it", True)
+                           "an Abort is pending in liveOD with no run in progress, and run "
+                           f"{last.get('run_id')}'s save failed (its file is kept for a "
+                           "retry) -- not waived: a person must look")
+        elif client["alive"] is False:
+            st = GateState("reset_pending", rid,
+                           "an Abort is pending in liveOD with no run in progress -- the next "
+                           "INIT_RUN clears it", True)
         else:
             st = GateState("reset_pending", rid,
-                           "an Abort is pending in liveOD with no run in progress "
-                           f"({client['why']}) -- the next INIT_RUN clears it")
+                           "an Abort is pending in liveOD with no run in progress -- the next "
+                           "INIT_RUN clears it (not waived: the last run's process is not "
+                           "known to be gone)")
     else:
         st = GateState("free", rid, "no run in progress in liveOD")
 
