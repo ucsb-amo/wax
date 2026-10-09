@@ -64,6 +64,19 @@ def _safe_repr(value) -> str:
         return f"<{type(value).__name__}: repr failed>"
 
 
+def _client_of(msg: dict) -> dict:
+    """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
+    ``client_host`` and ``launcher`` (str, "" when absent). A client that
+    predates them sends none; a malformed value is dropped, never raised on."""
+    pid = msg.get("client_pid")
+    try:
+        pid = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    return {"client_pid": pid, "client_host": str(msg.get("client_host") or ""),
+            "launcher": str(msg.get("launcher") or "")}
+
+
 class LiveODServer(QThread, NetServer):
     """ZMQ REP server embedded in the liveOD process.
 
@@ -154,6 +167,12 @@ class LiveODServer(QThread, NetServer):
         self._shot_durations: list = []  # rolling list of last 5 shot durations (excluding first shot)
         self._run_state = "idle"
         self._current_expt_name = ""    # the run's experiment file (class name from an older client)
+        # The run's client, from INIT_RUN: its process id and host, and who
+        # launched it (WAXX_LAUNCHER: "run_lock", "run_loop", ...; "" for a
+        # person). None/"" from a client that predates them. A launcher's gate
+        # (waxx.util.device_state.run_gate) uses them to tell a run whose
+        # process is gone from a live one.
+        self._current_client = {"client_pid": None, "client_host": "", "launcher": ""}
         self._current_n_shots = 0
         # Frames: how many the run asked for (N_img, 0 for a no-camera run) and
         # how many the DataHandler has taken off the camera queue so far
@@ -1051,6 +1070,7 @@ class LiveODServer(QThread, NetServer):
             "n_shots": len(self._shot_timestamps),
             "images_expected": self._images_expected,
             "images_received": self._images_received_now(),
+            **self._current_client,
         }
         get_log_buffer().end_run(
             outcome, detail,
@@ -1193,6 +1213,7 @@ class LiveODServer(QThread, NetServer):
         # The run goes by its experiment file's name; an experiment process from
         # before that was sent only gives the class.
         self._current_expt_name = str(msg.get('expt_file') or msg.get('expt_class', ''))
+        self._current_client = _client_of(msg)
         # {name: [min, max]} of the scan, for the units the viewer shows the xvars
         # in; an older experiment process does not send it
         self._current_xvar_ranges = dict(msg.get('xvar_ranges') or {})
@@ -1806,6 +1827,9 @@ class LiveODServer(QThread, NetServer):
             "images_received": self._images_received_now(),
             "grab_failure": self._grab_failure,
             "last_outcome": dict(self._last_outcome),
+            # the current (or last) run's client: client_pid, client_host,
+            # launcher (None/"" from a client that predates them)
+            **self._current_client,
             # which cameras this liveOD holds, and the one the live run is using
             "cameras": self._camera_states(),
             "run_camera_key": (self._current_camera_key
