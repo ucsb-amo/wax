@@ -42,8 +42,11 @@ allows drift.  The command is ``ar_command(path) + argv``, run detached
 (:mod:`~waxx.util.device_state.detached`: the job survives a server restart)
 with ``WAXX_LAUNCHER=kq``, ``WAXX_QUEUE_JOB=<id>``, ``WAXX_OWNER=<owner>``,
 ``PYTHONUNBUFFERED=1`` and, for a write-back veto, ``WAXX_CAL_NO_WRITE_BACK=1``;
-its output goes to ``<dir>/logs/<id>_<label>.out``.  "Run ID:" is read from
-that log; the experiment's own pid comes from liveOD's POLL (``client_pid``).
+its output goes to ``<dir>/logs/<id>_<label>.out``.  The job's run is known
+from liveOD: the experiment sends ``queue_job`` (WAXX_QUEUE_JOB) at INIT_RUN
+and POLL / last_outcome carry it next to ``launcher`` and ``client_pid`` (the
+experiment's own pid); the "Run ID:" line in the log (printed whatever
+WAX_VERBOSITY when a launcher is set) is the fallback.
 
 **Cancel.**  A queued job is cancelled at once.  A running job is never
 terminated: the queue sends liveOD's Abort (RESET) for it -- only when liveOD's
@@ -928,13 +931,44 @@ class RunQueue:
                 with self._lock:
                     job.run_id = int(m.group(1))
                 log.info("Run queue: %s is run %s.", job.name, job.run_id)
-                self._record("run_queue_run_id", job=job.id, run_id=job.run_id)
+                self._record("run_queue_run_id", job=job.id, run_id=job.run_id, via="output")
                 self._save()
                 self._notify()
+
+    @staticmethod
+    def _is_job_run(job: Job, record) -> bool:
+        """A liveOD POLL reply or last_outcome record is about ``job``'s run:
+        launched by the queue, with this job's id (``queue_job``, sent by the
+        experiment at INIT_RUN from WAXX_QUEUE_JOB)."""
+        return (isinstance(record, dict) and record.get("launcher") == LAUNCHER
+                and str(record.get("queue_job") or "") == str(job.id)
+                and bool(record.get("run_id")))
+
+    def _identify(self, job: Job, poll) -> None:
+        """The job's run id and experiment pid from liveOD (``queue_job``) --
+        the primary way; the "Run ID:" line in its output is the fallback (an
+        older liveOD or experiment that does not send ``queue_job``)."""
+        if not self._is_job_run(job, poll):
+            return
+        changed = False
+        with self._lock:
+            if job.run_id is None:
+                job.run_id = int(poll["run_id"])
+                changed = True
+            if job.client_pid is None and poll.get("client_pid"):
+                job.client_pid = poll.get("client_pid")
+                changed = True
+        if changed:
+            if job.run_id == poll.get("run_id"):
+                self._record("run_queue_run_id", job=job.id, run_id=job.run_id, via="liveOD",
+                             client_pid=job.client_pid)
+            self._save()
+            self._notify()
 
     def _follow(self, job: Job) -> None:
         self._take_lines(job, self._read_log(job))
         poll = self._last_poll
+        self._identify(job, poll)
         if (job.run_id is not None and job.client_pid is None and isinstance(poll, dict)
                 and poll.get("run_id") == job.run_id and poll.get("client_pid")):
             with self._lock:
@@ -954,6 +988,11 @@ class RunQueue:
         self._save()
         self._notify()
         self._take_lines(job, self._read_log(job), final=True)
+        if job.run_id is None:
+            fresh = self._poll_now()
+            if isinstance(fresh, dict):
+                self._identify(job, fresh)
+                self._identify(job, fresh.get("last_outcome"))
         known = proc is not None and getattr(proc, "exit_code_known", True) and code != -1
         exit_code = int(code) if known else None
         tail = list(self._tails.get(job.id, ()))

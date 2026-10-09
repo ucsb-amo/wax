@@ -66,15 +66,17 @@ def _safe_repr(value) -> str:
 
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
-    ``client_host`` and ``launcher`` (str, "" when absent). A client that
-    predates them sends none; a malformed value is dropped, never raised on."""
+    ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job id,
+    str; "" when absent). A client that predates them sends none; a malformed
+    value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
         pid = int(pid) if pid is not None else None
     except (TypeError, ValueError):
         pid = None
     return {"client_pid": pid, "client_host": str(msg.get("client_host") or ""),
-            "launcher": str(msg.get("launcher") or "")}
+            "launcher": str(msg.get("launcher") or ""),
+            "queue_job": str(msg.get("queue_job") or "")}
 
 
 class LiveODServer(QThread, NetServer):
@@ -172,7 +174,8 @@ class LiveODServer(QThread, NetServer):
         # person). None/"" from a client that predates them. A launcher's gate
         # (waxx.util.device_state.run_gate) uses them to tell a run whose
         # process is gone from a live one.
-        self._current_client = {"client_pid": None, "client_host": "", "launcher": ""}
+        self._current_client = {"client_pid": None, "client_host": "", "launcher": "",
+                                "queue_job": ""}
         # the run a Reset during its save was last warned about (one WARNING each)
         self._reset_during_save_warned = None
         self._current_n_shots = 0

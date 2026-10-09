@@ -604,6 +604,39 @@ def test_the_holds_file_never_goes_back_either(tmp_path):
     assert json.loads((tmp_path / "h.json").read_text())["active"] is False
 
 
+# --- the job's run from liveOD's queue_job (review S3) -----------------------------------------
+
+def test_the_jobs_run_is_known_from_live_od_without_its_output(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("compiling", "shot 1/9")                  # WAX_VERBOSITY=0: no Run ID line
+    q.live.start_run(555, launcher="run_loop", queue_job=str(a), client_pid=1)
+    q.tick()
+    assert job(q, a)["run_id"] is None                   # not the queue's launch: ignored
+    q.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    q.tick()
+    j = job(q, a)
+    assert j["run_id"] == 101 and j["client_pid"] == 7101
+    rec = [e for e in q.journal.entries if e["kind"] == "run_queue_run_id"][-1]
+    assert rec["via"] == "liveOD"
+    q.live.end_run(101)
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    proc.code = 0
+    q.tick()
+    assert job(q, a)["state"] == "saved"
+
+
+def test_a_run_known_only_from_its_outcome(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.live.end_run(101)                                  # it ran and ended between polls
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.spawner.procs[-1].code = 0
+    q.tick()
+    assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
+
+
 # --- unreadable files fail closed (review S6) --------------------------------------------------
 
 def test_an_unreadable_queue_file_is_moved_aside_and_everything_paused(tmp_path, expts, q):
