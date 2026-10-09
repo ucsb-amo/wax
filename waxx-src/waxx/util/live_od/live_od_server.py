@@ -173,6 +173,8 @@ class LiveODServer(QThread, NetServer):
         # (waxx.util.device_state.run_gate) uses them to tell a run whose
         # process is gone from a live one.
         self._current_client = {"client_pid": None, "client_host": "", "launcher": ""}
+        # the run a Reset during its save was last warned about (one WARNING each)
+        self._reset_during_save_warned = None
         self._current_n_shots = 0
         # Frames: how many the run asked for (N_img, 0 for a no-camera run) and
         # how many the DataHandler has taken off the camera queue so far
@@ -1524,11 +1526,29 @@ class LiveODServer(QThread, NetServer):
         """The GUI's own abort button was pressed (the remote path is _handle_reset).
         Starts the wait for the experiment's answer (_check_abort_reply); pressing
         Abort again neither restarts it nor turns "no_reply" back into "aborting"."""
+        if self.reset_ignored_during_save():
+            return False
         if self._run_in_progress:
             if self._abort_requested_at is None:
                 self._abort_requested_at = time.time()
             if self._run_state != "no_reply":
                 self._set_run_state("aborting")
+        return True
+
+    def reset_ignored_during_save(self) -> bool:
+        """A Reset while the run's asynchronous save runs is ignored: the run is
+        complete (END_RUN came) and only its write remains, so it is neither
+        marked "aborting" nor left with an Abort pending (which a later
+        RUN_EXITED / ABORT_RUN / INIT_RUN would turn into deleting its file).
+        True when ignored; one WARNING per run. Any thread."""
+        if not self._run_file.saving:
+            return False
+        run_id = self._current_run_id
+        if self._reset_during_save_warned != run_id:
+            self._reset_during_save_warned = run_id
+            logger.warning(f"Reset pressed during the save of run {run_id}: ignored, "
+                           f"the run is complete.")
+        return True
 
     def _abort_reply_limit(self) -> float:
         """How long an Abort may wait for the experiment's answer before it is shown
@@ -1745,6 +1765,10 @@ class LiveODServer(QThread, NetServer):
         self.run_done_signal.emit()
 
     def _handle_reset(self, msg: dict) -> dict:
+        if self.reset_ignored_during_save():
+            # the run is complete and being written: nothing to abort, and the
+            # window is not asked to reset (it would interrupt the writer)
+            return {"ok": True, "ignored": True, "saving": True}
         if self.exited_run_pending():
             logger.warning("RESET requested by remote viewer: the run's experiment has "
                            "exited; closing the run now (its file is kept).")

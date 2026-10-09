@@ -419,8 +419,12 @@ def test_an_experiment_that_dies_mid_abort_ends_the_abort(server, no_atexit):
 # ----------------------------------------------------------------------
 
 class _Srv:
-    def __init__(self, exited=False, again=False):
-        self.exited, self.again, self.calls = exited, again, []
+    def __init__(self, exited=False, again=False, saving=False):
+        self.exited, self.again, self.saving, self.calls = exited, again, saving, []
+
+    def reset_ignored_during_save(self):
+        self.calls.append(("ignored_during_save",)) if self.saving else None
+        return self.saving
 
     def exited_run_pending(self):
         return self.exited
@@ -455,3 +459,14 @@ def test_the_window_reset_leaves_a_gone_experiments_run_to_the_server(app, exite
     LiveODWindow.reset(win)
     assert win.live_od_server.calls == expected and win.messages
     assert win.the_baby is not None              # no interrupt: that path deletes the file
+
+
+def test_the_window_reset_during_a_save_interrupts_nothing(app):
+    """Review B1: the run is complete and being written; the server ignores the
+    Reset and the window touches neither its flag nor the camera threads."""
+    from waxx.util.live_od.gui.main_window import LiveODWindow
+    win = _Win(_Srv(saving=True))
+    LiveODWindow.reset(win)
+    assert win.live_od_server.calls == [("ignored_during_save",)]
+    assert win.the_baby is not None and "being saved" in win.messages[-1]
+    assert not hasattr(win.live_od_server, "_reset_requested")

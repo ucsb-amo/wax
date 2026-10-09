@@ -72,10 +72,50 @@ def test_poll_says_a_save_is_running(held):
     assert poll["save_in_progress"] is False and poll["save_status"]["state"] == "saved"
 
 
+@pytest.fixture
+def warnings_seen():
+    """WARNING+ messages of the liveOD logger (it may not propagate to the root)."""
+    import logging
+    got = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record):
+            got.append(record.getMessage())
+    handler = ListHandler(logging.WARNING)
+    log = logging.getLogger("waxx.live_od")
+    log.addHandler(handler)
+    yield got
+    log.removeHandler(handler)
+
+
+def test_a_reset_during_the_save_is_ignored_with_one_warning(held, warnings_seen):
+    """The run is complete (END_RUN came): a Reset, from a remote viewer or the
+    window's button, neither marks it aborting nor leaves an Abort pending."""
+    srv, init, gate = held
+    state_before = srv._handle_poll({"tag": "POLL"})["run_state"]
+    assert srv._handle_reset({"tag": "RESET"}) == {"ok": True, "ignored": True,
+                                                   "saving": True}
+    assert srv.note_reset_requested() is False           # the window's path
+    srv._handle_reset({"tag": "RESET"})
+    poll = srv._handle_poll({"tag": "POLL"})
+    assert poll["reset_requested"] is False and poll["run_state"] == state_before
+    assert srv._abort_requested_at is None
+    said = [m for m in warnings_seen if "during the save" in m]
+    assert said == [f"Reset pressed during the save of run {init['run_id']}: ignored, "
+                    f"the run is complete."]
+    gate.set()
+    _wait(lambda: not srv._run_in_progress)
+    assert os.path.exists(init["filepath"]) and srv._last_outcome["outcome"] == "saved"
+    assert srv.note_reset_requested() is True             # no save: as before
+
+
 def test_reset_during_save_closes_nothing_and_deletes_nothing(held):
     srv, init, gate = held
     path, rid = init["filepath"], init["run_id"]
-    srv._handle_reset({"tag": "RESET"})
+    # an Abort pending from before the save started (an older liveOD, or a race):
+    # the backstops still refuse to close the run under its save
+    srv._reset_requested = True
+    srv._set_run_state("aborting")
     poll = srv._handle_poll({"tag": "POLL"})
     assert poll["reset_requested"] and poll["run_state"] == "aborting"
     # the server refuses to close the run under its save

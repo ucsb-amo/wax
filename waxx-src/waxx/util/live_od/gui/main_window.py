@@ -1405,6 +1405,12 @@ class LiveODWindow(QWidget):
         # thread does the closing; the next pass of its loop, within 0.5 s.
         srv = getattr(self, 'live_od_server', None)
         if srv is not None:
+            # A run being saved is complete (END_RUN came): the server ignores the
+            # Reset (one WARNING), and nothing here is interrupted -- the camera
+            # thread and data handler may still be finishing the file's write.
+            if srv.reset_ignored_during_save():
+                self.msg("Reset ignored: the run is being saved (it is complete).")
+                return
             if srv.exited_run_pending():
                 srv.close_exited_run_now("Reset pressed")
                 self.msg("Reset: the run's experiment has exited; closing the run "
