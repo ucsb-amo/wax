@@ -448,13 +448,36 @@ def test_the_requester_raising_becomes_an_error_reply(qapp):
 def test_kq_commands(panel):
     panel.select_job(5)
     cmds = rqp.kq_commands(panel.selected_job())
-    assert cmds["submit"] == ("kq submit C:/code/kexp/experiments/JP/expt_5.py --label expt_5 "
-                              "--priority 10 --chain c1 -- n=3 -c \"X y\"")
+    # defaults left out: the label is the file's stem; stop-on-failure is a chain's default
+    assert cmds["submit"] == ("kq submit C:/code/kexp/experiments/JP/expt_5.py --priority 10 "
+                              "--depends-on 3 --chain c1 -- n=3 -c \"X y\"")
     assert cmds["tail"] == "kq tail 5 -f"
     assert panel.copy_kq("tail") == "kq tail 5 -f"
-    agent = rqp.kq_commands(_job(9, owner="agent", write_back=False, path="C:/a b/x.py"))
-    assert agent["submit"].startswith('kq submit "C:/a b/x.py"')
-    assert "--no-write-back" in agent["submit"] and agent["submit"].endswith("--agent")
+    agent = rqp.kq_commands(_job(9, owner="agent", write_back=False, path="C:/a b/x.py",
+                                 priority=0, label="other"))
+    assert agent["submit"] == ('kq submit "C:/a b/x.py" --label other --no-write-back '
+                               '--agent')
+    now = time.time()
+    rep = rqp.kq_commands(_job(10, priority=0, due=now + 3600, repeat_of=5, repeat_index=2,
+                               chain="repeat-7", stop_on_failure=True,
+                               path="C:/x/my scan.py", label="my_scan"), now=now)
+    assert rep["submit"] == (f'kq submit "C:/x/my scan.py" --at '
+                             f'{time.strftime("%H:%M", time.localtime(now + 3600))} '
+                             f'--repeat 5')
+    far = rqp.kq_commands(_job(11, priority=0, due=now + 3 * 86400, chain="mine",
+                               stop_on_failure=False), now=now)
+    assert f"--at {int(now + 3 * 86400)} --chain mine --no-stop-on-failure" in far["submit"]
+    past = rqp.kq_commands(_job(12, priority=0, due=now - 60), now=now)
+    assert "--at" not in past["submit"]
+    # kq itself reads them back
+    from waxx.util.device_state.kq import build_parser
+    for line, want in ((cmds["submit"], {"after": [3], "chain": "c1", "priority": 10}),
+                       (rep["submit"], {"repeat": 5, "chain": None}),
+                       (far["submit"], {"chain": "mine", "no_stop_on_failure": True}),
+                       (agent["submit"], {"label": "other", "no_write_back": True})):
+        args = build_parser().parse_args(rqp.split_argv(line)[1:])
+        for k, v in want.items():
+            assert getattr(args, k) == v, (line, k)
 
 
 # --- the log window -------------------------------------------------------------------------

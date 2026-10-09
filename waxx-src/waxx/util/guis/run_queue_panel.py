@@ -63,8 +63,10 @@ Machine-agnostic: nothing here knows the K machine.
 
 from __future__ import annotations
 
+import re
 import shlex
 import time
+from pathlib import PurePath
 from typing import Any, Callable
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QTimer, Qt
@@ -261,19 +263,52 @@ def _q(arg: str) -> str:
     return f'"{arg}"' if (" " in arg or "\t" in arg or not arg) else arg
 
 
-def kq_commands(job: dict) -> dict[str, str]:
-    """The kq command lines for a job: ``submit`` (the same job again),
-    ``tail`` (follow its log), ``show``, ``cancel``."""
+#: the queue's label rule (run_queue._LABEL_RE): the default label is the
+#: file's stem through it
+_LABEL_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _default_label(path: str) -> str:
+    stem = PurePath(str(path).replace("\\", "/")).stem
+    return (_LABEL_CHARS.sub("_", stem).strip("_") or stem)[:60]
+
+
+def kq_commands(job: dict, now: float | None = None) -> dict[str, str]:
+    """The kq command lines for a job: ``submit`` (the same submission
+    again), ``tail`` (follow its log), ``show``, ``cancel``.
+
+    ``submit`` names only what differs from kq's defaults: ``--label`` when
+    it is not the file's stem, ``--priority`` when not 0, ``--at`` for a due
+    time still ahead (HH:MM within the next day, else epoch seconds),
+    ``--depends-on`` for its dependencies, ``--repeat N`` for one of N
+    repeats (the queue names the new chain itself), ``--chain`` for a chain
+    of its own, ``--no-stop-on-failure`` when its chain goes on after a
+    failure, ``--no-write-back``, ``--allow-drift``, ``--cwd``, ``--agent``;
+    the experiment's own words after ``--``."""
+    now = time.time() if now is None else float(now)
     jid = job.get("id")
-    parts = ["kq", "submit", _q(job.get("path") or "")]
-    if job.get("label"):
+    path = str(job.get("path") or "")
+    parts = ["kq", "submit", _q(path)]
+    if job.get("label") and job["label"] != _default_label(path):
         parts += ["--label", _q(job["label"])]
-    if job.get("priority") is not None:
+    if job.get("priority"):
         parts += ["--priority", str(job["priority"])]
-    if job.get("chain"):
-        parts += ["--chain", _q(job["chain"])]
-        if not job.get("stop_on_failure"):
-            parts.append("--no-stop-on-failure")
+    due = job.get("due")
+    if isinstance(due, (int, float)) and due > now:
+        parts += ["--at", time.strftime("%H:%M", time.localtime(due)) if due - now < 86000
+                  else str(int(due))]
+    if job.get("after"):
+        parts += ["--depends-on"] + [str(a) for a in job["after"]]
+    repeat = int(job.get("repeat_of") or 1)
+    chain = job.get("chain") or None
+    if repeat > 1:
+        parts += ["--repeat", str(repeat)]
+        if chain and str(chain).startswith("repeat-"):
+            chain = None                  # the queue's own name for a repeat's chain
+    if chain:
+        parts += ["--chain", _q(chain)]
+    if (chain or repeat > 1) and not job.get("stop_on_failure"):
+        parts.append("--no-stop-on-failure")
     if job.get("write_back") is False:
         parts.append("--no-write-back")
     if job.get("allow_drift"):
