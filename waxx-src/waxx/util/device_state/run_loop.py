@@ -605,6 +605,10 @@ class RunLoop:
             reason += f"; last line: {tail[-1]}"
         reason += " (sent by the monitor server's run loop)"
         try:
+            # require_known_dead stays False here: the loop never kills its child,
+            # and proc.wait() returned because the shell ended after `ar` did, so
+            # an unknown pid (older client) still means the experiment has exited.
+            # A pid liveOD knows to be alive is never told (the helper's rule).
             sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=poll,
                                                     send=self._run_exited)
         except Exception as exc:

@@ -398,7 +398,8 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
 
 def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = None,
                             send: Callable[[int, str], dict] | None = None,
-                            pid_alive: Callable[[int], bool] | None = None) -> dict:
+                            pid_alive: Callable[[int], bool] | None = None,
+                            require_known_dead: bool = False) -> dict:
     """Send liveOD RUN_EXITED for run ``run_id`` on behalf of its process, which
     has exited -- only if that run is still liveOD's current run, in progress,
     and liveOD has not already heard of the exit (``run_state`` "exited").
@@ -413,7 +414,10 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
     ``client`` has ``poll()`` and ``_send_recv(msg)`` (a LiveODClient);
     ``poll`` is a POLL reply already in hand; ``send(run_id, reason)``, if
     given, sends the notice instead of ``client`` (the run loop's own sender);
-    ``pid_alive`` as for :func:`classify`.
+    ``pid_alive`` as for :func:`classify`.  ``require_known_dead``: send only
+    when liveOD's recorded client process is known to be gone (pid on this
+    machine, process dead) -- for a caller that cannot be sure the experiment
+    process itself has exited (it killed only the shell it started).
     Returns ``{"sent": bool, "ok": bool, "why": str, "reply": dict | None}``;
     raises only if polling or sending the notice itself fails."""
     if run_id is None:
@@ -442,6 +446,10 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
     if proc["alive"] is True:
         return {"sent": False, "ok": False,
                 "why": f"the run's process is still alive ({proc['why']})", "reply": None}
+    if require_known_dead and proc["alive"] is not False:
+        return {"sent": False, "ok": False,
+                "why": f"the run's process is not known to be gone ({proc['why']})",
+                "reply": None}
     if send is not None:
         reply = send(int(run_id), str(reason))
     else:

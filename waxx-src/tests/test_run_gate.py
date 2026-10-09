@@ -296,6 +296,22 @@ def test_run_exited_is_not_sent_otherwise(poll, why):
     assert not out["sent"] and why in out["why"] and client.sent == []
 
 
+@pytest.mark.parametrize("poll", [_running(client_pid=None),
+                                  _running(client_host="other-pc")])
+def test_require_known_dead_refuses_an_unknown_pid(poll):
+    # run_lock after Ctrl-C killed only its shell: the experiment may live on
+    client = FakeLiveOD(poll)
+    out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_never,
+                                  require_known_dead=True)
+    assert not out["sent"] and "not known to be gone" in out["why"] and client.sent == []
+
+
+def test_require_known_dead_sends_for_a_dead_pid():
+    client = FakeLiveOD(_running())
+    assert tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead,
+                                   require_known_dead=True)["sent"]
+
+
 @pytest.mark.parametrize("poll", [
     _running(save_in_progress=True, reset_requested=True, run_state="aborting"),
     _running(save_in_progress=True, run_state="running"),
