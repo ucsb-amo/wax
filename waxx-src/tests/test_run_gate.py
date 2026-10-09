@@ -377,6 +377,19 @@ def test_run_exited_is_not_sent_while_the_runs_process_lives():
     assert not out["sent"] and "still alive" in out["why"] and client.sent == []
 
 
+def test_a_failed_poll_is_not_read_as_no_run_in_progress():
+    # review S7: {"ok": False} has no run_in_progress either
+    out = tell_live_od_run_exited(FakeLiveOD(), 85528, "x",
+                                  poll={"ok": False, "error": "busy"}, pid_alive=_dead)
+    assert not out["sent"] and out["why"].startswith("POLL failed") and "busy" in out["why"]
+
+    class NoReply:
+        def poll(self):
+            return None
+    out = tell_live_od_run_exited(NoReply(), 85528, "x", pid_alive=_dead)
+    assert not out["sent"] and out["why"].startswith("POLL failed")
+
+
 def test_run_exited_without_a_run_id_sends_nothing():
     client = FakeLiveOD(_running())
     assert not tell_live_od_run_exited(client, None, "x")["sent"]

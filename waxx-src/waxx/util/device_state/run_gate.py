@@ -483,6 +483,9 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False, "why": "no run id", "reply": None}
     if poll is None:
         poll = client.poll()
+    if not isinstance(poll, dict) or poll.get("ok") is False:
+        error = poll.get("error") if isinstance(poll, dict) else poll
+        return {"sent": False, "ok": False, "why": f"POLL failed: {error!r}", "reply": None}
     if not poll.get("run_in_progress"):
         return {"sent": False, "ok": False, "why": "liveOD has no run in progress",
                 "reply": None}
