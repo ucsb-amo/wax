@@ -763,8 +763,9 @@ def test_a_run_whose_process_lives_still_refuses(expt, monkeypatch, reset, extra
     loop = _loop(expt, _stuck(reset, **extra), [])
     reply = loop.start()
     assert reply["status"] == "error"
-    assert "run 85528 (someone_else) is in progress in liveOD" in reply["msg"]
-    assert words in reply["msg"]
+    assert words in reply["msg"] and "85528" in reply["msg"]
+    assert reply["msg"].count("run 85528") == 1                         # named once (N2)
+    assert "is in progress in liveOD --" not in reply["msg"]
     assert "run_loop_waived" not in loop.journal.kinds
 
 

@@ -505,11 +505,10 @@ class RunLoop:
                     self._record("run_loop_waived", run_id=verdict.run_id,
                                  state=verdict.state, reason=verdict.reason)
                 return None
-            text = (f"run {poll.get('run_id')} ({poll.get('expt_name') or 'experiment'}) "
-                    "is in progress in liveOD")
             if verdict.state in ("wedged", "reset_pending"):
-                text += f" -- {verdict.reason}"
-            return text, False
+                return verdict.reason, False         # it names the run itself
+            return (f"run {poll.get('run_id')} ({poll.get('expt_name') or 'experiment'}) "
+                    "is in progress in liveOD"), False
         if poll.get("reset_requested"):
             # no run: a person's Abort between runs ends the loop, as before
             return "an Abort is pending in liveOD", True
