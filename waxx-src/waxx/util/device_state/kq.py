@@ -28,9 +28,10 @@ the job's output exactly as the experiment writes it ("Run ID: N" included),
 and exits with the experiment's result (see the exit codes).  Ctrl-C while
 the job is queued cancels it (and any later jobs of the same submission still
 queued).  Ctrl-C while it runs asks once on a terminal "abort the run? it
-discards its data file [y/N]": yes sends liveOD's Abort through the queue (the
-run stops at its next shot and liveOD discards its file) and follows the job
-to its end; anything else, or no terminal, leaves the run going and prints how
+discards its data file [y/N]": yes asks the queue to cancel it -- the queue
+then sends liveOD's Abort (the run stops at its next shot and liveOD discards
+its file) -- and kq prints "abort requested; waiting for the run to end" and
+follows the job to its end; anything else, or no terminal, leaves the run going and prints how
 to follow or cancel it.  A second Ctrl-C while following an abort leaves too.
 
 Owner: kq acts for a person unless the environment has ``WAXX_OWNER=agent``
@@ -187,10 +188,17 @@ def _when(t) -> str:
 
 
 def _hold_text(hold: dict | None) -> str:
+    """"person hold since 14:03:11 by jp@kong (owner person, source request):
+    reason" -- owner and source as the server gives them ("unreadable_file":
+    the server could not read its hold file and holds until a person releases)."""
     if not hold or not hold.get("active"):
         return ""
-    return (f"person hold since {_when(hold.get('since'))} by {hold.get('by') or '?'}: "
-            f"{hold.get('reason') or ''}").rstrip(": ")
+    extra = [f"owner {hold['owner']}" if hold.get("owner") else "",
+             f"source {hold['source']}" if hold.get("source") else ""]
+    extra = ", ".join(e for e in extra if e)
+    return (f"person hold since {_when(hold.get('since'))} by {hold.get('by') or '?'}"
+            + (f" ({extra})" if extra else "")
+            + (f": {hold.get('reason')}" if hold.get("reason") else ""))
 
 
 def _alarm_text(alarm: dict | None) -> str:
@@ -434,7 +442,8 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
         cursor = {"offset": 0}
         try:
             job = ctx.client.follow(jid, tokens.get(jid), ctx.out, cursor=cursor,
-                                    on_wait=on_wait, on_lost=lambda m: ctx.warn(f"[kq] {m}"))
+                                    on_wait=on_wait, on_lost=lambda m: ctx.warn(f"[kq] {m}"),
+                                    on_abort=lambda j: ctx.say(_abort_text(j)))
         except KeyboardInterrupt:
             return _interrupted(ctx, ids[n:], tokens, owner, cursor)
         _report_end(ctx, job)
@@ -467,6 +476,16 @@ def _cancel_queued(ctx: _Ctx, ids, tokens, owner) -> list[int]:
         except RunQueueError:
             pass
     return done
+
+
+def _abort_text(job: dict) -> str:
+    """The line for a job whose cancel has been asked while it runs: the
+    queue's tick sends liveOD's Abort; the run ends at its next shot."""
+    c = job.get("cancel") or {}
+    run = f"run {job['run_id']}" if job.get("run_id") is not None else "no run id yet"
+    return (f"[kq] abort requested for {_job_word(job)} ({run})"
+            + (f" by {c.get('by')}" if c.get("by") else "")
+            + "; waiting for the run to end")
 
 
 def _leave_text(jid: int) -> str:
@@ -502,10 +521,8 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
             if ctx.ask(f"[kq] {_job_word(job)} is running ({run}). abort the run? it "
                        "discards its data file [y/N] "):
                 reply = ctx.client.cancel(jid, token=tokens.get(jid), owner=owner)
-                note = (reply.get("job") or {}).get("cancel") or {}
-                ctx.say(f"[kq] Abort asked for {_job_word(job)} ({run})"
-                        + (f": {note.get('abort_note')}" if note.get("abort_note") else "")
-                        + "; following it to its end (Ctrl-C again leaves it)")
+                ctx.say(_abort_text(reply.get("job") or job) + " (Ctrl-C again leaves it)")
+                cursor["abort_reported"] = True
                 cancelled = _cancel_queued(ctx, rest, tokens, owner)
                 if cancelled:
                     ctx.say("[kq] cancelled queued job"
@@ -513,7 +530,8 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
                             + ", ".join(map(str, cancelled)))
                 try:
                     final = ctx.client.follow(jid, tokens.get(jid), ctx.out, cursor=cursor,
-                                              on_lost=lambda m: ctx.warn(f"[kq] {m}"))
+                                              on_lost=lambda m: ctx.warn(f"[kq] {m}"),
+                                              on_abort=lambda j: ctx.say(_abort_text(j)))
                 except KeyboardInterrupt:
                     safe_write(ctx.out, "\n")
                     ctx.say(f"[kq] left {_job_word(job)} ending on its own. {_leave_text(jid)}")
@@ -535,7 +553,9 @@ def _list_rows(jobs: list[dict]) -> list[list[str]]:
     for j in jobs:
         reason = str(j.get("reason") or "")
         if j.get("state") in IN_SLOT and j.get("cancel"):
-            reason = "cancel asked: " + str(j["cancel"].get("abort_note") or "")
+            c = j["cancel"]
+            reason = (f"abort requested by {c.get('by') or '?'}"
+                      + (f": {c.get('abort_note')}" if c.get("abort_note") else ""))
         if len(reason) > 70:
             reason = reason[:67] + "..."
         rows.append([str(j.get("id")), str(j.get("state")), str(j.get("owner")),
@@ -613,7 +633,8 @@ def _cmd_tail(ctx: _Ctx, args) -> int:
         cursor = {"offset": 0}
         try:
             job = ctx.client.follow(args.id, args.token, ctx.out, cursor=cursor,
-                                    on_lost=lambda m: ctx.warn(f"[kq] {m}"))
+                                    on_lost=lambda m: ctx.warn(f"[kq] {m}"),
+                                    on_abort=lambda j: ctx.say(_abort_text(j)))
         except KeyboardInterrupt:
             safe_write(ctx.out, "\n")
             ctx.say(f"[kq] stopped following job {args.id}; it is left as it is")
@@ -661,10 +682,8 @@ def _cmd_cancel(ctx: _Ctx, args) -> int:
             ctx.say("[kq] nothing cancelled")
             return EXIT_OK
     reply = ctx.client.cancel(args.id, token=args.token, owner=owner)
-    note = (reply.get("job") or {}).get("cancel") or {}
-    ctx.say(f"[kq] Abort asked for {_job_word(job)} ({run})"
-            + (f": {note.get('abort_note')}" if note.get("abort_note") else "")
-            + f"; it ends when its process does (kq show {args.id})")
+    ctx.say(_abort_text(reply.get("job") or job)
+            + f" (kq show {args.id}, kq tail {args.id} -f)")
     return EXIT_OK
 
 

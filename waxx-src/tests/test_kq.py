@@ -59,7 +59,7 @@ def kq(server, *argv, answer="n", tty=True):
     def factory():
         if server is None:
             raise NoRunQueue("no run queue (monitor server) is beaconing (not found)")
-        return RunQueueClient(server, by="jp@kong", sleep=lambda s: None)
+        return RunQueueClient(server, by="jp@kong", sleep=lambda s: None, wait_poll_s=0.0)
 
     code = kqmod.main(list(argv), client_factory=factory, out=out, err=err, ask=ask,
                       isatty=lambda: tty)
@@ -246,7 +246,8 @@ def test_yes_at_the_prompt_sends_the_abort_and_cancels_the_rest(server, q, expts
         q.tick()
 
     steps = run_steps(q)
-    Script(server, steps[:2] + [lambda: None, ends_aborted], interrupt_at={3})
+    # the cancel only records the request; the queue's next tick sends the Abort
+    Script(server, steps[:2] + [q.tick, ends_aborted], interrupt_at={3})
     r = kq(server, "run", str(expts / "rabi.py"), "--repeat", "2", answer="y")
     assert r.code == 3, (r.out, r.err)
     assert len(r.asked) == 1 and q.live.resets == [101]
@@ -254,7 +255,9 @@ def test_yes_at_the_prompt_sends_the_abort_and_cancels_the_rest(server, q, expts
     assert cancels[0]["id"] == 1 and not cancels[0].get("queued_only")
     assert cancels[0]["owner"] == "person"
     assert cancels[1]["id"] == 2 and cancels[1]["queued_only"]
-    assert "[kq] Abort asked for job 1 (rabi) (run 101)" in r.out
+    assert ("[kq] abort requested for job 1 (rabi) (run 101) by jp@kong; waiting for the run "
+            "to end (Ctrl-C again leaves it)") in r.out
+    assert r.out.count("abort requested") == 1
     assert "cancelled queued job 2" in r.out
     assert "CANCELLED" in r.err
     assert q.describe({"id": 2})["job"]["state"] == "cancelled"
@@ -359,15 +362,81 @@ def test_cancel(server, q, expts):
     r = kq(server, "cancel", "1", answer="n")
     assert r.code == 0 and "nothing cancelled" in r.out and q.live.resets == []
     r = kq(server, "cancel", "1", "--yes", tty=False)
-    assert r.code == 0 and "Abort asked for job 1" in r.out and q.live.resets == [101]
+    assert r.code == 0 and "abort requested for job 1 (rabi) (run 101)" in r.out
+    assert "waiting for the run to end" in r.out
+    assert q.live.resets == []                                 # sent by the tick, not the request
+    q.tick()
+    assert q.live.resets == [101]
     assert sent(server, "cancel")[-1]["owner"] == "person"
+    r = kq(server, "list")
+    assert "abort requested by jp@kong" in r.out
 
 
 def test_an_agent_cannot_abort_a_persons_job(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"))
     q.tick()
     r = kq(server, "cancel", "1", "--yes", "--agent")
-    assert r.code == 6 and "person's run" in r.err and q.live.resets == []
+    assert r.code == 6 and "a person's job: an agent may not cancel it" in r.err
+    q.tick()
+    assert q.live.resets == []
+
+
+def test_an_agent_cannot_release_a_persons_hold_or_resume_a_persons_pause(server, q,
+                                                                           monkeypatch):
+    kq(server, "hold", "mine")
+    kq(server, "pause", "--all")
+    monkeypatch.setenv("WAXX_OWNER", "agent")
+    r = kq(server, "release")
+    assert r.code == 6 and "an agent may not release it" in r.err
+    r = kq(server, "resume", "--all")
+    assert r.code == 6 and sent(server, "resume")[-1]["owner"] == "agent"
+    assert q.hold.info()["active"]
+    monkeypatch.delenv("WAXX_OWNER")
+    assert kq(server, "resume", "--all").code == 0 and kq(server, "release").code == 0
+
+
+def test_tail_follow_reports_an_abort_someone_else_asked_for(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))
+    steps = run_steps(q, outcome="discarded", code=1)
+
+    def cancel_elsewhere():
+        q.cancel({"id": 1, "by": "jp@other", "owner": "person"})
+        q.tick()
+
+    Script(server, steps[:2] + [cancel_elsewhere, lambda: None, steps[2]])
+    r = kq(server, "tail", "1", "-f")
+    assert r.code == 3 and q.live.resets == [101]
+    assert ("[kq] abort requested for job 1 (rabi) (run 101) by jp@other; waiting for the run "
+            "to end") in r.out
+    assert r.out.count("abort requested") == 1
+
+
+@pytest.mark.parametrize("extra, words", [
+    (["--", "folder" + "\\"], "ends in a backslash"),
+    (["--at", "inf"], "finite"),
+])
+def test_new_submit_refusals_are_shown_as_the_server_words_them(server, expts, extra, words):
+    r = kq(server, "submit", str(expts / "rabi.py"), *extra)
+    assert r.code == 6 and words in r.err and r.out == ""
+
+
+def test_a_file_outside_the_queues_roots_is_refused(server, tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}_elsewhere"
+    outside.mkdir()
+    (outside / "x.py").write_text("class x: pass\n")
+    r = kq(server, "submit", str(outside / "x.py"))
+    assert r.code == 6 and "outside the folders" in r.err
+
+
+def test_the_hold_shows_its_owner_and_source(server, q):
+    kq(server, "hold", "aligning")
+    r = kq(server, "status")
+    assert "(owner person, source request): aligning" in r.out
+    q.hold._s.update(source="unreadable_file", by="monitor server",
+                     reason="could not read the hold file (bad json)")
+    r = kq(server, "status")
+    assert r.code == 5 and "source unreadable_file" in r.out
+    assert "source unreadable_file" in kq(server, "list").out
 
 
 def test_usage_errors_and_help(server):

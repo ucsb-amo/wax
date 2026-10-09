@@ -107,7 +107,8 @@ class RunQueueClient:
     ``discovery_timeout`` s); :class:`NoRunQueue` when none answers.
     ``by``: who is asking (default ``user@host``).  ``connect``: makes the
     transport from ``discovery_timeout`` (default :func:`connect_monitor`).
-    ``sleep``: the wait between polls in :meth:`follow`.  ``owner``: who the
+    ``sleep``: the wait between polls in :meth:`follow`; ``wait_poll_s``: its
+    default interval between ``describe`` calls (why a job waits, a cancel).  ``owner``: who the
     client acts for, sent with every request that changes something
     ("person" | "agent"; default from ``WAXX_OWNER``, see
     :func:`owner_from_env`)."""
@@ -115,8 +116,10 @@ class RunQueueClient:
     def __init__(self, transport=None, *, discovery_timeout: float = 3.0,
                  by: str | None = None, timeout: float = 8.0,
                  connect: Callable[[float], object] | None = None,
-                 sleep: Callable[[float], None] = time.sleep, owner: str | None = None):
+                 sleep: Callable[[float], None] = time.sleep, owner: str | None = None,
+                 wait_poll_s: float = 5.0):
         self.sleep = sleep
+        self.wait_poll_s = float(wait_poll_s)
         self.owner = owner or owner_from_env()
         if transport is None:
             try:
@@ -229,8 +232,9 @@ class RunQueueClient:
 
     def follow(self, job_id: int, token: str | None = None, out=None, poll_s: float = 0.5,
                *, cursor: dict | None = None, on_wait: Callable[[dict], None] | None = None,
-               wait_poll_s: float = 5.0, lost_s: float = 600.0,
+               wait_poll_s: float | None = None, lost_s: float = 600.0,
                on_lost: Callable[[str], None] | None = None,
+               on_abort: Callable[[dict], None] | None = None,
                sleep: Callable[[float], None] | None = None,
                clock: Callable[[], float] = time.monotonic) -> dict:
         """Copy job ``job_id``'s log to ``out`` (default stdout) until the job
@@ -242,9 +246,14 @@ class RunQueueClient:
         while the job is queued, at most every ``wait_poll_s`` s (the caller
         prints why it waits).  A server that does not answer is retried; after
         ``lost_s`` s without an answer RunQueueError is raised.  ``on_lost(msg)``
-        is called once when answers stop and once when they come back."""
+        is called once when answers stop and once when they come back.
+        ``on_abort(job)`` is called once (``cursor["abort_reported"]``) when the
+        job in the slot has a cancel asked -- the queue's tick sends liveOD's
+        Abort; the follow goes on until the run ends -- looked for with
+        ``describe`` at most every ``wait_poll_s`` s."""
         out = sys.stdout if out is None else out
         sleep = sleep or self.sleep
+        wait_poll_s = self.wait_poll_s if wait_poll_s is None else float(wait_poll_s)
         cursor = cursor if cursor is not None else {}
         cursor.setdefault("offset", 0)
         last_wait = None
@@ -284,7 +293,11 @@ class RunQueueClient:
             cursor["run_id"] = reply.get("run_id")
             if reply.get("done"):
                 break
-            if reply.get("state") == "queued" and on_wait is not None:
+            state = reply.get("state")
+            watch = ((state == "queued" and on_wait is not None)
+                     or (state in IN_SLOT and on_abort is not None
+                         and not cursor.get("abort_reported")))
+            if watch:
                 now = clock()
                 if last_wait is None or now - last_wait >= wait_poll_s:
                     last_wait = now
@@ -294,8 +307,11 @@ class RunQueueClient:
                         if exc.reply is not None:
                             raise
                         described = None              # silence: the tail retry handles it
-                    if described is not None:
+                    if described is not None and state == "queued":
                         on_wait(described)
+                    elif described is not None and (described.get("job") or {}).get("cancel"):
+                        cursor["abort_reported"] = True
+                        on_abort(described["job"])
             if not lines:
                 sleep(poll_s)
         return self.describe(job_id, token)["job"]

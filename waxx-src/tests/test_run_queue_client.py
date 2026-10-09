@@ -18,6 +18,9 @@ from waxx.util.device_state.run_queue_client import (
 ACTIONS = {"submit": "submit", "cancel": "cancel", "list": "list", "describe": "describe",
            "tail": "tail", "pause": "pause", "resume": "resume", "hold": "hold_request",
            "release": "release_request"}
+#: The fake is stricter than the server (which requires owner on cancel,
+#: release and resume): the client must send it on every change.
+OWNER_REQUIRED = ("submit", "cancel", "pause", "resume", "hold", "release")
 
 
 class FakeServer:
@@ -47,6 +50,9 @@ class FakeServer:
         if obj.get("type") != "run_queue" or not self.known:
             return {"status": "error", "msg": f"unknown type {obj.get('type')}"}
         method = ACTIONS.get(obj.get("action"))
+        if obj.get("action") in OWNER_REQUIRED and obj.get("owner") not in ("person", "agent"):
+            return {"status": "error", "msg": "owner is required (person or agent) "
+                                              f"(fake server, {obj.get('action')})"}
         if method is None:
             return {"status": "error", "msg": f"unknown run_queue action {obj.get('action')!r}"}
         return json.loads(json.dumps(getattr(self.q, method)(obj), default=repr))
