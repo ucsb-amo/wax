@@ -112,11 +112,13 @@ from waxx.util.device_state.run_loop import (
 
 log = logging.getLogger(__name__)
 
-STATES = ("queued", "running", "ending", "saved", "failed", "cancelled", "skipped")
+STATES = ("queued", "launching", "running", "ending", "saved", "failed", "cancelled",
+          "skipped")
 #: States a job ends in.
 ENDED = ("saved", "failed", "cancelled", "skipped")
-#: States of the one job in the slot.
-IN_SLOT = ("running", "ending")
+#: States of the one job in the slot ("launching": saved before its process is
+#: started, so a server that dies meanwhile never starts it twice).
+IN_SLOT = ("launching", "running", "ending")
 OWNERS = ("person", "agent")
 PAUSE_SCOPES = ("agent", "all")
 
@@ -138,6 +140,13 @@ KEEP_ENDED = 500
 MAX_REPEAT = 1000
 #: Lines of a job's output kept in memory for its judging and ``describe``.
 TAIL_LINES = 25
+#: A launch taking longer than this is logged (once) while it is waited for.
+SPAWN_WARN_S = 60.0
+#: A job left "launching" with no process to follow (the server stopped while
+#: launching it, or the launcher never answered) is looked for in liveOD this
+#: long after its launch (INIT_RUN comes at the end of its prepare), then
+#: ended failed.
+ORPHAN_WAIT_S = 300.0
 
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -332,6 +341,10 @@ class RunQueue:
         self._owed_since: float | None = None
         self._alarm: dict | None = None
         self._own_abort_ids: set = set()
+        #: the launch in progress: {"job", "thread", "result", "since", "warned"}
+        self._spawning: dict | None = None
+        #: how long _launch waits for its launch thread before the tick follows it
+        self._spawn_join_s = 5.0
         self._load()
         self.flush_journal()
 
@@ -503,7 +516,7 @@ class RunQueue:
             if job.state == "queued":
                 self._end(job, "cancelled", f"cancelled by {by}")
                 reply = {"status": "ok", "job": job.to_dict()}
-            elif job.state == "running":
+            elif job.state in ("launching", "running"):
                 if job.owner == "person" and as_owner == "agent":
                     return {"status": "error",
                             "msg": f"{job.name} is a person's run in progress: an agent may "
@@ -517,12 +530,11 @@ class RunQueue:
                                 "goes to run %s (its file is discarded, as for any Abort); "
                                 "the job ends when its process does.", job.name, by,
                                 job.run_id if job.run_id is not None else "(no run id yet)")
+                # the tick sends liveOD's Abort (and retries): a request never
+                # waits on liveOD
                 reply = {"status": "ok", "job": job.to_dict(), "pending": True}
             else:
                 return {"status": "error", "msg": f"{job.name} is already {job.state}"}
-        if job.state == "running":
-            self._send_abort(job)
-            reply["job"] = job.to_dict()
         self._save()
         self._notify()
         return reply
@@ -720,6 +732,8 @@ class RunQueue:
             if self._last_poll_t is None or now - self._last_poll_t >= self.poll_every_s:
                 self._poll_now()
             self.hold.tick()
+            if self._current is None:
+                self._take_leftover()
             cur = self._jobs.get(self._current) if self._current is not None else None
             if cur is not None:
                 self._follow(cur)
@@ -828,78 +842,217 @@ class RunQueue:
 
     def _launch(self, job: Job) -> bool:
         """Launch ``job``; False when it was skipped at launch instead (the
-        next eligible job may go), True otherwise (launched, or failed to
-        start)."""
+        next eligible job may go), True otherwise.
+
+        The job is saved as ``launching`` (with its launch time) BEFORE its
+        process is started, and the process is started on a thread of its own
+        outside the queue's lock: the tick follows the launch (:meth:`_follow`),
+        a hung launcher stalls nothing else, and a server that dies meanwhile
+        finds a ``launching`` job at restart -- never launched again, looked
+        for in liveOD instead (:meth:`_follow_orphan`)."""
         # TODO(phase 2): warm-ahead / GO handshake and liveOD RESERVE/START
         # attach here (run-queue plan); nothing of it in phase 1.
         try:
             sha = file_sha256(job.path)
         except OSError as exc:
-            with self._lock:
-                if job.state == "queued":
-                    self._end(job, "skipped", f"the file cannot be read at launch ({exc})")
-            self._save()
-            self._notify()
-            return False
+            sha, unreadable = None, exc
+        else:
+            unreadable = None
         with self._lock:
             if job.state != "queued":                  # cancelled meanwhile
                 return False
-            if sha != job.sha256 and not job.allow_drift:
+            if unreadable is not None:
+                self._end(job, "skipped", f"the file cannot be read at launch ({unreadable})")
+                skipped = True
+            elif sha != job.sha256 and not job.allow_drift:
                 self._end(job, "skipped", "source changed since submit")
-                self._save()
-                self._notify()
-                return False
-            os.makedirs(self._path("logs"), exist_ok=True)
-            log_path = self._path("logs", f"{job.id}_{job.label}.out")
-            command = ar_command(_quote(job.path))
-            if job.argv:
-                command += " " + " ".join(_quote(a) for a in job.argv)
-            env = dict(os.environ, PYTHONUNBUFFERED="1")
-            env[run_gate.LAUNCHER_ENV] = LAUNCHER
-            env[JOB_ENV] = str(job.id)
-            env[OWNER_ENV] = job.owner
-            if job.write_back is False:
-                env[NO_WRITE_BACK_ENV] = "1"
+                skipped = True
             else:
-                env.pop(NO_WRITE_BACK_ENV, None)
-            try:
-                with open(log_path, "ab") as f:
-                    f.write((f"── run queue {time.strftime('%Y-%m-%d %H:%M:%S')}: {job.name}, "
-                             f"owner {job.owner}, sha256 {sha[:12]}"
-                             + (" (drift allowed: file changed since submit)"
-                                if sha != job.sha256 else "")
-                             + f" ──\n$ {command}\n").encode("utf-8"))
-                proc = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
-            except OSError as exc:
-                log.error("Run queue: could not start %s: %r", job.name, exc)
-                for line in environment_report():
-                    log.error("  %s", line)
+                skipped = False
+                log_path = self._path("logs", f"{job.id}_{job.label}.out")
+                command = ar_command(_quote(job.path))
+                if job.argv:
+                    command += " " + " ".join(_quote(a) for a in job.argv)
+                job.state = "launching"
+                job.launched_at = self._clock()
                 job.log_path = log_path
-                self._end(job, "failed", f"could not start: {exc!r}")
-                self._last_end_t = self._clock()
-                self._save()
-                self._notify()
-                return True
-            job.state = "running"
-            job.pid = int(proc.pid)
-            job.pid_started = getattr(proc, "started", None)
-            job.log_path = log_path
-            job.launched_at = self._clock()
-            self._current = job.id
-            self._procs[job.id] = proc
-            self._log_pos[job.id] = 0
-            self._log_partial[job.id] = ""
-            self._tails[job.id] = deque(maxlen=TAIL_LINES)
-            self._owe_monitor = True
-            self._owed_since = None
-        log.info("Run queue: %s launched (pid %s): %s", job.name, job.pid, command)
-        self._record("run_queue_launch", job=job.id, pid=job.pid, command=command,
-                     log_path=log_path, owner=job.owner, drift=sha != job.sha256)
+                self._current = job.id
+                self._procs[job.id] = None
+                self._log_pos[job.id] = 0
+                self._log_partial[job.id] = ""
+                self._tails[job.id] = deque(maxlen=TAIL_LINES)
+                self._owe_monitor = True
+                self._owed_since = None
+        if skipped:
+            self._save()
+            self._notify()
+            return False
+        self._save()                                   # "launching" is on disk first
+        self._record("run_queue_launching", job=job.id, command=command, log_path=log_path,
+                     owner=job.owner, drift=sha != job.sha256)
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env[run_gate.LAUNCHER_ENV] = LAUNCHER
+        env[JOB_ENV] = str(job.id)
+        env[OWNER_ENV] = job.owner
+        if job.write_back is False:
+            env[NO_WRITE_BACK_ENV] = "1"
+        else:
+            env.pop(NO_WRITE_BACK_ENV, None)
+        try:
+            os.makedirs(self._path("logs"), exist_ok=True)
+            with open(log_path, "ab") as f:
+                f.write((f"── run queue {time.strftime('%Y-%m-%d %H:%M:%S')}: {job.name}, "
+                         f"owner {job.owner}, sha256 {sha[:12]}"
+                         + (" (drift allowed: file changed since submit)"
+                            if sha != job.sha256 else "")
+                         + f" ──\n$ {command}\n").encode("utf-8"))
+        except OSError as exc:
+            self._launch_failed(job, OSError(f"cannot write its log {log_path}: {exc}"))
+            return True
+        result: dict = {}
+
+        def spawn():
+            try:
+                result["proc"] = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path)
+            except BaseException as exc:              # noqa: BLE001
+                result["error"] = exc
+        thread = threading.Thread(target=spawn, daemon=True, name=f"run-queue-launch-{job.id}")
+        self._spawning = {"job": job.id, "thread": thread, "result": result,
+                          "since": self._clock(), "warned": False}
+        thread.start()
+        thread.join(self._spawn_join_s)                # usually done at once
+        self._follow_launch(job)
         if self._alarm is not None:
             self._clear_alarm("a job was launched")
+        return True
+
+    def _follow_launch(self, job: Job) -> None:
+        """A ``launching`` job whose launch thread this server started: take
+        its process when the thread is done."""
+        sp = self._spawning
+        if sp is None or sp["job"] != job.id:
+            self._follow_orphan(job)
+            return
+        if sp["thread"].is_alive():
+            waited = self._clock() - sp["since"]
+            if waited > SPAWN_WARN_S and not sp["warned"]:
+                sp["warned"] = True
+                log.warning("Run queue: %s: its launch has not finished after %.0f s; the slot "
+                            "stays taken (the job is looked for in liveOD).", job.name, waited)
+            self._follow_orphan(job, keep_waiting=True)
+            return
+        self._spawning = None
+        result = sp["result"]
+        if "proc" in result:
+            self._launched(job, result["proc"])
+            return
+        exc = result.get("error")
+        from waxx.util.device_state.detached import LaunchUnknown  # noqa: PLC0415
+        if isinstance(exc, LaunchUnknown):
+            # it may be running: not failed, not launched again -- looked for
+            log.error("Run queue: %s: %s", job.name, exc)
+            self._record("run_queue_launch_unknown", job=job.id, error=str(exc))
+            self._follow_orphan(job)
+            return
+        self._launch_failed(job, exc)
+
+    def _launched(self, job: Job, proc) -> None:
+        with self._lock:
+            if job.state != "launching":
+                # ended meanwhile (an orphan check found its run's outcome):
+                # the process is not followed twice
+                close = True
+            else:
+                close = False
+                job.state = "running"
+                job.pid = int(proc.pid)
+                job.pid_started = getattr(proc, "started", None)
+                self._procs[job.id] = proc
+        if close:
+            if hasattr(proc, "close"):
+                proc.close()
+            return
+        log.info("Run queue: %s launched (pid %s).", job.name, job.pid)
+        self._record("run_queue_launch", job=job.id, pid=job.pid, log_path=job.log_path,
+                     owner=job.owner)
         self._save()
         self._notify()
-        return True
+
+    def _launch_failed(self, job: Job, exc) -> None:
+        log.error("Run queue: could not start %s: %r", job.name, exc)
+        for line in environment_report():
+            log.error("  %s", line)
+        with self._lock:
+            if job.state == "launching":
+                self._end(job, "failed", f"could not start: {exc!r}")
+            self._current = None
+            self._procs.pop(job.id, None)
+            self._last_end_t = self._clock()
+        self._save()
+        self._notify()
+
+    def _follow_orphan(self, job: Job, keep_waiting: bool = False) -> None:
+        """A ``launching`` job with no process to follow: the server stopped
+        while launching it, or its launcher never answered.  It is never
+        launched again.  Its run is looked for in liveOD (launcher "kq",
+        queue_job = its id): a run in progress is adopted (its experiment's
+        pid), a recorded outcome judges it; after :data:`ORPHAN_WAIT_S` with
+        neither it ends failed ("server stopped while launching -- check")."""
+        poll = self._last_poll
+        if self._is_job_run(job, poll) and poll.get("run_in_progress"):
+            proc = None
+            try:
+                proc = self._adopt(poll.get("client_pid"), None)
+            except Exception:                         # noqa: BLE001
+                proc = None
+            if proc is not None:
+                with self._lock:
+                    job.run_id = int(poll["run_id"])
+                    job.client_pid = poll.get("client_pid")
+                    job.adopted = True
+                if keep_waiting:
+                    self._spawning = None          # the launch thread's answer is not needed
+                log.warning("Run queue: %s was launching; its run %s is in liveOD (pid %s): "
+                            "followed.", job.name, job.run_id, job.client_pid)
+                self._record("run_queue_adopted", job=job.id, pid=job.client_pid,
+                             run_id=job.run_id, via="liveOD")
+                self._launched(job, proc)
+                return
+        last = poll.get("last_outcome") if isinstance(poll, dict) else None
+        if self._is_job_run(job, last):
+            with self._lock:
+                job.run_id = int(last["run_id"])
+                job.state = "running"
+                self._procs[job.id] = None
+            self._finish(job, None, -1)
+            return
+        if keep_waiting:
+            return
+        started = job.launched_at or job.submitted_at
+        if self._clock() - float(started or 0) < ORPHAN_WAIT_S:
+            return
+        with self._lock:
+            if job.state != "launching":
+                return
+            self._end(job, "failed", "server stopped while launching -- check (no run of this "
+                                     f"job appeared in liveOD within {ORPHAN_WAIT_S:.0f} s)")
+            self._current = None
+            self._last_end_t = self._clock()
+        log.error("Run queue: %s ended failed: it was launching when the server stopped (or "
+                  "its launcher never answered) and no run of it appeared in liveOD. Check "
+                  "that nothing of it is running.", job.name)
+        self._save()
+        self._notify()
+
+    def _take_leftover(self) -> None:
+        """A job left in the slot's states (after a restart several may be):
+        the one with a live process first, then the lowest id."""
+        with self._lock:
+            left = [j for j in self._jobs.values() if j.state in IN_SLOT]
+            if not left:
+                return
+            left.sort(key=lambda j: (self._procs.get(j.id) is None, j.id))
+            self._current = left[0].id
 
     # -- following the job in the slot ---------------------------------------------------
 
@@ -966,6 +1119,11 @@ class RunQueue:
             self._notify()
 
     def _follow(self, job: Job) -> None:
+        if job.state == "launching":
+            self._take_lines(job, self._read_log(job))
+            self._identify(job, self._last_poll)
+            self._follow_launch(job)
+            return
         self._take_lines(job, self._read_log(job))
         poll = self._last_poll
         self._identify(job, poll)
@@ -1062,43 +1220,51 @@ class RunQueue:
         with self._abort_lock:
             self._send_abort_once(job)
 
+    def _cancel_note(self, job: Job, **fields) -> None:
+        with self._lock:
+            if job.cancel is not None:
+                job.cancel.update(fields)
+
     def _send_abort_once(self, job: Job) -> None:
-        if job.cancel is None or job.cancel.get("abort_sent"):
+        with self._lock:
+            pending = job.cancel is not None and not job.cancel.get("abort_sent")
+        if not pending:
             return
         if job.run_id is None:
-            note = "no run id yet: the Abort goes once the run has one"
-            if job.cancel.get("abort_note") != note:
-                job.cancel["abort_note"] = note
+            self._cancel_note(job, abort_note="no run id yet: the Abort goes once the run has "
+                                              "one")
             return
         poll = self._poll_now()
         if poll is None:
-            job.cancel["abort_note"] = "liveOD is not reachable: the Abort is not sent yet"
+            self._cancel_note(job, abort_note="liveOD is not reachable: the Abort is not sent "
+                                              "yet")
             return
         if not poll.get("run_in_progress") or poll.get("run_id") != job.run_id:
-            job.cancel["abort_note"] = (f"liveOD's run in progress is "
-                                        f"{poll.get('run_id') if poll.get('run_in_progress') else 'none'}"
-                                        f", not {job.run_id}: no Abort sent")
+            current = poll.get("run_id") if poll.get("run_in_progress") else "none"
+            self._cancel_note(job, abort_note=f"liveOD's run in progress is {current}, not "
+                                              f"{job.run_id}: no Abort sent")
             return
         if poll.get("save_in_progress") or poll.get("run_state") == "saving":
-            job.cancel["abort_note"] = f"liveOD is saving run {job.run_id}: no Abort sent"
+            self._cancel_note(job, abort_note=f"liveOD is saving run {job.run_id}: no Abort "
+                                              "sent")
             return
         if poll.get("reset_requested"):
-            job.cancel.update(abort_sent=True, abort_note="an Abort was already pending")
+            self._cancel_note(job, abort_sent=True, abort_note="an Abort was already pending")
             return
         if self._live_od_reset is None:
-            job.cancel["abort_note"] = "this queue has no way to send liveOD's Abort"
+            self._cancel_note(job, abort_note="this queue has no way to send liveOD's Abort")
             return
         with self._lock:
             self._own_abort_ids.add(job.run_id)
         try:
             reply = self._live_od_reset()
         except Exception as exc:                      # noqa: BLE001
-            job.cancel["abort_note"] = f"sending the Abort failed: {exc}"
+            self._cancel_note(job, abort_note=f"sending the Abort failed: {exc}")
             log.error("Run queue: liveOD's Abort for run %s (%s) failed: %s", job.run_id,
                       job.name, exc)
             return
         ok = bool(isinstance(reply, dict) and reply.get("ok"))
-        job.cancel.update(abort_sent=True,
+        self._cancel_note(job, abort_sent=True,
                           abort_note="Abort sent" if ok else f"liveOD refused: {reply}")
         log.warning("Run queue: liveOD's Abort sent for run %s (%s): %s", job.run_id, job.name,
                     "acknowledged" if ok else reply)
@@ -1330,37 +1496,39 @@ class RunQueue:
         for job in sorted(jobs, key=lambda j: j.id):
             if job.state not in IN_SLOT:
                 continue
+            self._log_pos[job.id] = 0
+            self._log_partial[job.id] = ""
+            self._tails[job.id] = deque(maxlen=TAIL_LINES)
+            self._owe_monitor = True
+            if job.state == "launching":
+                # never launched again: looked for in liveOD (_follow_orphan)
+                self._procs[job.id] = None
+                log.warning("Run queue: %s was launching when the server stopped: not launched "
+                            "again; its run is looked for in liveOD.", job.name)
+                self._record("run_queue_launching_at_restart", job=job.id,
+                             launched_at=job.launched_at)
+                continue
             proc = None
             try:
                 proc = self._adopt(job.pid, job.pid_started)
             except Exception:                         # noqa: BLE001
                 proc = None
-            self._log_pos[job.id] = 0
-            self._log_partial[job.id] = ""
-            self._tails[job.id] = deque(maxlen=TAIL_LINES)
-            if proc is not None and self._current is None:
+            job.state = "running"
+            self._procs[job.id] = proc
+            if proc is not None:
                 job.adopted = True
-                job.state = "running"
-                self._current = job.id
-                self._procs[job.id] = proc
-                self._owe_monitor = True
                 log.warning("Run queue: %s (pid %s, run %s) was running when the server "
                             "stopped and still is: followed again.", job.name, job.pid,
                             job.run_id)
                 self._record("run_queue_adopted", job=job.id, pid=job.pid, run_id=job.run_id)
             else:
-                # its process is gone: judged at the first tick from liveOD's record
-                job.state = "running"
-                if self._current is None:
-                    self._current = job.id
-                    self._procs[job.id] = None
-                    log.warning("Run queue: %s (pid %s, run %s) was running when the server "
-                                "stopped; its process is gone -- judged from liveOD's record.",
-                                job.name, job.pid, job.run_id)
-                    self._record("run_queue_process_gone", job=job.id, pid=job.pid,
-                                 run_id=job.run_id)
-                else:
-                    self._end(job, "failed", "server restarted; process gone")
+                # judged when it comes to the slot, from liveOD's record
+                log.warning("Run queue: %s (pid %s, run %s) was running when the server "
+                            "stopped; its process is gone -- judged from liveOD's record.",
+                            job.name, job.pid, job.run_id)
+                self._record("run_queue_process_gone", job=job.id, pid=job.pid,
+                             run_id=job.run_id)
+        self._take_leftover()
         self._save()
 
     # -- out ------------------------------------------------------------------------------

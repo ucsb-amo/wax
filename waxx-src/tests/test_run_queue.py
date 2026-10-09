@@ -440,8 +440,11 @@ def test_cancel_a_running_job_sends_live_ods_abort_for_its_run_only(q, expts):
     a = submit(q, expts, owner="agent")
     q.tick()
     proc = q.spawner.procs[-1]
+    polls = q.live.polls
     reply = q.cancel({"id": a, "by": "agent-7", "owner": "agent"})
     assert reply["status"] == "ok" and reply["pending"]
+    assert q.live.resets == [] and q.live.polls == polls  # the request only records (S4)
+    q.tick()
     assert q.live.resets == []                        # no run id yet: nothing to abort
     assert "no run id yet" in job(q, a)["cancel"]["abort_note"]
     proc.write("Run ID: 101")
@@ -472,6 +475,7 @@ def test_no_abort_while_live_od_saves_and_a_late_cancel_still_saves(q, expts):
     q.live.start_run(101, save_in_progress=True)
     q.tick()
     q.cancel({"id": a, "by": "jp"})
+    q.tick()
     assert q.live.resets == [] and "saving" in job(q, a)["cancel"]["abort_note"]
     q.live.end_run(101)
     proc.code = 0
@@ -635,6 +639,127 @@ def test_a_run_known_only_from_its_outcome(q, expts):
     q.spawner.procs[-1].code = 0
     q.tick()
     assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
+
+
+# --- launching: saved before the spawn, never launched twice (review B3, S4, N1) ---------------
+
+def test_the_job_is_saved_launching_before_its_process_starts(q, expts, tmp_path):
+    seen = []
+    plain = q.spawner
+
+    def spawn(command, cwd, env, log_path):
+        data = json.loads((tmp_path / "logs" / "run_queue" / "queue.json").read_text())
+        seen.append([(j["id"], j["state"], j["launched_at"]) for j in data["jobs"]])
+        return plain(command, cwd, env, log_path)
+    q._spawn = spawn
+    a = submit(q, expts)
+    q.tick()
+    assert seen == [[(a, "launching", q.clock.t)]]
+    assert job(q, a)["state"] == "running"
+    kinds = q.journal.kinds
+    assert kinds.index("run_queue_launching") < kinds.index("run_queue_launch")
+
+
+def _restart_with_a_launching_job(tmp_path, expts, q):
+    a = submit(q, expts)
+    gate = __import__("threading").Event()
+
+    def hung(command, cwd, env, log_path):
+        gate.wait(5)
+        raise OSError("never mind")
+    q._spawn, q._spawn_join_s = hung, 0.0
+    q.tick()                                          # "launching" saved, spawn hanging
+    assert job(q, a)["state"] == "launching"
+    again = make_queue(tmp_path, expts)               # the server restarted meanwhile
+    gate.set()
+    return a, again
+
+
+def test_a_launching_job_is_never_launched_again_and_is_adopted_from_live_od(
+        tmp_path, expts, q):
+    a, again = _restart_with_a_launching_job(tmp_path, expts, q)
+    assert "run_queue_launching_at_restart" in again.journal.kinds
+    adopted = Proc(job(again, a)["log_path"], 7101)
+    again._adopt = lambda pid, started: adopted if pid == 7101 else None
+    again.tick()
+    assert again.spawner.calls == [] and job(again, a)["state"] == "launching"
+    again.live.start_run(101, launcher="kq", queue_job=str(a), client_pid=7101)
+    again.tick()
+    j = job(again, a)
+    assert j["state"] == "running" and j["run_id"] == 101 and j["adopted"]
+    again.live.end_run(101)
+    adopted.code = 0
+    again.tick()
+    assert job(again, a)["state"] == "saved" and again.spawner.calls == []
+
+
+def test_a_launching_job_judged_from_its_outcome_or_failed_after_the_wait(
+        tmp_path, expts, q):
+    a, again = _restart_with_a_launching_job(tmp_path, expts, q)
+    b = submit(again, expts)
+    again.clock.t += rq.ORPHAN_WAIT_S - 1
+    again.tick()
+    assert job(again, a)["state"] == "launching"      # still looked for
+    assert job(again, b)["state"] == "queued"         # the slot stays taken
+    again.clock.t += 2
+    again.tick()
+    j = job(again, a)
+    assert j["state"] == "failed" and j["reason"].startswith("server stopped while launching")
+    again.tick()
+    assert job(again, b)["state"] == "running"        # b goes; a was never launched again
+    assert len(again.spawner.calls) == 1
+
+
+def test_a_hung_launcher_stalls_nothing_and_its_job_is_found_in_live_od(q, expts):
+    from waxx.util.device_state.detached import LaunchUnknown
+    a = submit(q, expts)
+
+    def unknown(command, cwd, env, log_path):
+        raise LaunchUnknown("the launcher reported nothing within 30 s")
+    q._spawn = unknown
+    q.tick()
+    assert job(q, a)["state"] == "launching" and "run_queue_launch_unknown" in q.journal.kinds
+    assert q.list()["status"] == "ok"                 # requests answer meanwhile
+    q.live.end_run(101)
+    q.live.state["last_outcome"].update(launcher="kq", queue_job=str(a))
+    q.tick()
+    assert job(q, a)["state"] == "saved" and job(q, a)["run_id"] == 101
+
+
+def test_after_a_restart_the_live_process_is_followed_first_and_never_called_gone(
+        tmp_path, expts, q):
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.tick()
+    # (a state no single server leaves: two jobs in the slot's states)
+    data_path = tmp_path / "logs" / "run_queue" / "queue.json"
+    data = json.loads(data_path.read_text())
+    for j in data["jobs"]:
+        if j["id"] == b:
+            j.update(state="running", pid=5999, pid_started=1.0, run_id=102)
+    data_path.write_text(json.dumps(data))
+    alive = Proc(job(q, b)["log_path"] or job(q, a)["log_path"], 5999)
+    again = make_queue(tmp_path, expts,
+                       adopt=lambda pid, started: alive if pid == 5999 else None)
+    assert again.info()["current"]["id"] == b          # the live one first
+    again.tick()
+    assert job(again, b)["state"] == "running"         # not called gone
+    again.live.end_run(102)
+    alive.code = 0
+    again.tick()
+    assert job(again, b)["state"] == "saved"
+    again.tick()                                       # then a, whose process is gone
+    assert job(again, a)["state"] == "failed"
+    assert "process gone" in job(again, a)["reason"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
+def test_a_process_that_cannot_be_opened_is_unknown_not_gone(monkeypatch):
+    from waxx.util.device_state import detached
+    watch = detached.ProcessWatch(os.getpid())         # no handle: liveness only
+    assert watch.poll() is None and not watch.exit_code_known
+    assert detached.ProcessWatch.open(0x7FFFFFF0) is None      # no such process
 
 
 # --- unreadable files fail closed (review S6) --------------------------------------------------
