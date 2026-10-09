@@ -47,8 +47,7 @@ due, allow_drift, paused; only the fields changed), Show log (a window
 following the job's log through the ``tail``
 action: every 0.5 s while it runs, every 2 s while it is queued, until it has
 ended and its log is read to the end), and Copy kq command.  An action the
-server refuses as unknown (an older server) disables its control; so does an
-``actions`` list in the queue's info that does not name it.
+server refuses as unknown (an older server) disables its control.
 
 Every request that changes something carries ``owner`` "person" (a person is
 clicking) and ``by`` = ``user@host``.
@@ -99,7 +98,8 @@ OWNER = "person"
 #: The 1b actions a server may not have yet (disabled when refused as unknown).
 MOVE_ACTION = "move"
 EDIT_ACTION = "edit"
-#: Where a ``move`` request sends a job (its ``to`` field).
+#: The panel's four moves (:func:`move_request` turns each into the server's
+#: ``before_id`` / ``after_id`` / ``to_index``).
 MOVE_WHERE = ("up", "down", "top", "bottom")
 _MOVE_TIPS = {"up": "Move it one place earlier", "down": "Move it one place later",
               "top": "Make it the next job", "bottom": "Move it to the end of the queue"}
@@ -1129,13 +1129,6 @@ class RunQueuePanel(QWidget):
         self.info = dict(info or {})
         if isinstance(self.info.get("person_hold"), dict):
             self.hold = dict(self.info["person_hold"])
-        actions = self.info.get("actions")
-        if isinstance(actions, (list, tuple)):
-            for action in (MOVE_ACTION, EDIT_ACTION):
-                if action not in actions:
-                    self.unsupported.add(action)
-                else:
-                    self.unsupported.discard(action)
         self._show_summary()
         self.refresh_buttons()
         sig = self._signature(self.info)

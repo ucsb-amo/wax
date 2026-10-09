@@ -365,12 +365,12 @@ def test_move_names_neighbours_by_id_and_unknown_disables_it(panel, server):
     assert not panel.move_buttons["up"].isEnabled()
 
 
-def test_actions_list_in_the_info_gates_1b_controls(panel):
-    panel.set_state(_status(dict(INFO, actions=["list", "cancel", "move"])))
+def test_an_actions_list_in_the_info_gates_nothing(panel):
+    """The server sends no such list: move / edit are disabled only by an
+    "unknown action" reply."""
+    panel.set_state(_status(dict(INFO, actions=["list", "cancel"])))
     panel.select_job(3)
-    assert panel.move_buttons["down"].isEnabled()
-    assert not panel.edit_button.isEnabled()
-    assert "older code" in panel.edit_button.toolTip()
+    assert panel.move_buttons["down"].isEnabled() and panel.edit_button.isEnabled()
 
 
 def test_edit_sends_only_the_changes_and_unknown_disables_it(panel, server):
