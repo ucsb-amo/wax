@@ -187,7 +187,8 @@ class RunQueueClient:
                                     "by": self.by}, retry=False)
 
     def list(self, states: Iterable[str] | None = None, limit: int | None = None) -> dict:
-        """-> ``{"jobs": [...] oldest first, "next": [ids], "run_queue": info}``."""
+        """-> ``{"jobs": [...] in the server's order (ended by id, the slot,
+        then the queued in rank order), "next": [ids], "run_queue": info}``."""
         return self._ask("list", {"states": list(states) if states else None,
                                   "limit": limit}, retry=True)
 

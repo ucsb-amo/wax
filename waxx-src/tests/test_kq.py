@@ -353,14 +353,14 @@ def test_list_show_and_status(server, q, expts):
     assert r.code == 0
     header, *rows, state = r.out.splitlines()
     assert header.split()[:5] == ["id", "state", "owner", "label", "run_id"]
-    assert [row.split()[0] for row in rows] == ["1", "2"]
+    assert [row.split()[0] for row in rows] == ["2", "1"]          # the queue's order
     assert state.startswith("queue: waiting") and "next: 2, 1" in state
     j = json.loads(kq(server, "list", "--json").out)
-    assert [x["id"] for x in j["jobs"]] == [1, 2] and j["next"] == [2, 1]
+    assert [x["id"] for x in j["jobs"]] == [2, 1] and j["next"] == [2, 1]
     assert kq(server, "list", "--state", "saved").out.startswith("(no jobs)")
     r = kq(server, "show", "1")
     assert r.code == 0 and r.out.startswith("job 1 (r1): queued")
-    assert "waiting: job 2 goes first" in r.out
+    assert "waiting: #2 goes first" in r.out                       # the server's words
     assert json.loads(kq(server, "show", "1", "--json").out)["job"]["id"] == 1
     r = kq(server, "status")                                   # waiting jobs: not busy
     assert r.code == 0 and r.out.startswith("queue free | queue: waiting")
