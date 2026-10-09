@@ -578,7 +578,7 @@ class JobTableModel(QAbstractTableModel):
             if cal:
                 lines.append(f"declares calibrations: {cal}")
             if job.get("write_back") is False:
-                lines.append("write-back vetoed for this job")
+                lines.append("write-back vetoed (WAXX_CAL_NO_WRITE_BACK)")
             return "\n".join(lines)
         if key == "source_changed" and job.get("source_changed"):
             return ("The file changed since it was submitted: the job is skipped at launch"

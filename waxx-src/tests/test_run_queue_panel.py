@@ -192,6 +192,9 @@ def test_phase1b_fields_order_and_render(panel, server):
     assert _cell(panel, 2, "position") == "slot"
     assert _cell(panel, 3, "expt_class") == "Rabi [cal]"
     assert "t_pi" in _cell(panel, 3, "expt_class", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 4, "expt_class", Qt.ItemDataRole.ToolTipRole) is None
+    assert "write-back vetoed (WAXX_CAL_NO_WRITE_BACK)" == panel.model.tooltip(
+        dict(_job(9, write_back=False)), "expt_class")
     assert _cell(panel, 3, "owner") == "person / agent:codex@kong"
     est = _cell(panel, 3, "est")
     assert est.startswith("~2.1 min") and "start " in est and "end " in est
