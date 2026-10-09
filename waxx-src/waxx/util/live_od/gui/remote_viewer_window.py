@@ -256,6 +256,7 @@ class RemoteViewerWindow(QWidget):
     _discovery_done_signal   = pyqtSignal(str, int)   # ip, port
     _camera_request_done_signal = pyqtSignal(str)    # camera_key (worker -> GUI re-enable)
     _adjust_state_fetched_signal = pyqtSignal(list, object)  # specs, values dict
+    _reply_notice_signal = pyqtSignal(str)            # a request ignored/refused (worker -> GUI)
 
     def __init__(self, ip: str = None, port: int = None):
         super().__init__()
@@ -308,6 +309,7 @@ class RemoteViewerWindow(QWidget):
 
         # Connect discovery signals (emitted from worker thread)
         self._discovery_status_signal.connect(self._on_connection_status)
+        self._reply_notice_signal.connect(self._show_reply_notice)
         self._discovery_done_signal.connect(self._on_discovered)
         self._camera_request_done_signal.connect(self._on_camera_request_done)
         self._adjust_state_fetched_signal.connect(self._on_adjust_state_fetched)
@@ -428,8 +430,9 @@ class RemoteViewerWindow(QWidget):
             'background-color: #e53935; color: white; font-weight: bold; padding: 4px 14px;'
         )
         self.reset_button.setToolTip(
-            "Abort the active run and delete its data file; with no run active, "
-            "skip to the next run ID. No confirmation.")
+            "Abort the active run and delete its data file; ignored while a run is being "
+            "saved (it is complete then); with no run active, skip to the next run ID. "
+            "No confirmation.")
         self.reset_button.clicked.connect(self._on_reset_clicked)
         status_bar.addWidget(self.reset_button)
 
@@ -736,6 +739,7 @@ class RemoteViewerWindow(QWidget):
             reply = pickle.loads(sock.recv())
             if not reply.get('ok', True):
                 print(f"[RemoteViewer] {label} reply: {reply}")
+            self._show_reply(label, reply)
             return True
         except Exception as exc:
             print(f"[RemoteViewer] {label} failed: {exc}")
@@ -743,6 +747,33 @@ class RemoteViewerWindow(QWidget):
         finally:
             sock.close()
             ctx.term()
+
+    @staticmethod
+    def reply_notice_text(label: str, reply) -> str:
+        """The text for a reply that says the request was ignored or refused
+        (a Reset while the run is being saved); "" for any other reply."""
+        if not (isinstance(reply, dict) and (reply.get('ignored') or reply.get('saving'))):
+            return ""
+        text = str(reply.get('message') or reply.get('error') or '')
+        if not text:
+            what = "ignored" if reply.get('ignored') else "refused"
+            run = f"run {reply['run_id']} " if reply.get('run_id') else "the run "
+            text = f"{label} {what}: {run}is being saved (it is complete)"
+        return text
+
+    def _show_reply(self, label: str, reply: dict):
+        """Called on the request's (worker) thread: such a reply is shown on
+        every press, in the output window and the status label, on the GUI
+        thread (signal)."""
+        text = self.reply_notice_text(label, reply)
+        if text:
+            print(f"[RemoteViewer] {text}")
+            self._reply_notice_signal.emit(text)
+
+    def _show_reply_notice(self, text: str):
+        self.viewer_window.output_window.appendPlainText(text)
+        self.run_id_label.setText(text)
+        self.run_id_label.setToolTip(text)
 
     def _send_reset_to_server(self):
         ip, port = self._resolve_req_endpoint()
