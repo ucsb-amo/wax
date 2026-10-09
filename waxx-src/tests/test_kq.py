@@ -299,6 +299,20 @@ def test_ctrl_c_between_two_jobs_of_a_repeat(server, q, expts):
     assert "cancelled queued job 2" in r.out
 
 
+def test_a_second_ctrl_c_says_the_cancel_may_have_landed(server, q, expts):
+    def on_request(obj):
+        if obj.get("action") == "cancel":
+            q.cancel(dict(obj))                    # the cancel reaches the queue ...
+            raise KeyboardInterrupt                # ... and Ctrl-C comes before the reply
+    Script(server, [], interrupt_at={1})
+    inner = server.on_request
+    server.on_request = lambda obj: (inner(obj), on_request(obj))
+    r = kq(server, "run", str(expts / "rabi.py"))
+    assert r.code == 130
+    assert "a cancel of job 1 may or may not have reached the queue -- check kq show 1" in r.out
+    assert q.describe({"id": 1})["job"]["state"] == "cancelled"
+
+
 def test_a_queue_error_inside_the_interrupt_still_exits_130(server, q, expts):
     def on_request(obj):
         if obj.get("action") == "describe" and not server.silent:

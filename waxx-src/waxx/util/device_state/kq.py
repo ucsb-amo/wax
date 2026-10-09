@@ -722,7 +722,9 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
                                               on_abort=lambda j: ctx.say(_abort_text(j)))
                 except KeyboardInterrupt:
                     safe_write(ctx.out, "\n")
-                    ctx.say(f"[kq] left {_job_word(job)} ending on its own. {_leave_text(jid)}")
+                    ctx.say(f"[kq] stopped following {_job_word(job)}: its abort was "
+                            f"requested and it ends on its own (kq show {jid}). "
+                            f"{_leave_text(jid)}")
                     return EXIT_INTERRUPTED
                 _report_end(ctx, final)
                 return exit_code_for(final)
@@ -731,14 +733,18 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
                 + f". {_leave_text(jid)}")
         return EXIT_INTERRUPTED
     except KeyboardInterrupt:
+        # a second Ctrl-C while the interrupt was being handled: a cancel (or
+        # an abort) may already have reached the queue
         safe_write(ctx.out, "\n")
-        ctx.say(f"[kq] interrupted: job {jid} is left as it is. {_leave_text(jid)}")
+        ctx.say(f"[kq] interrupted again: a cancel of job {jid} may or may not have reached "
+                f"the queue -- check kq show {jid}. {_leave_text(jid)}")
         return EXIT_INTERRUPTED
     except RunQueueError as exc:
         # still an interrupt: the person asked to stop; what the queue said goes
         # with it, and the job is whatever the queue made of it
         ctx.warn(f"kq: {exc}")
-        ctx.say(f"[kq] interrupted: job {jid} may be left as it was. {_leave_text(jid)}")
+        ctx.say(f"[kq] interrupted: a cancel of job {jid} may or may not have reached the "
+                f"queue -- check kq show {jid}. {_leave_text(jid)}")
         return EXIT_INTERRUPTED
 
 
