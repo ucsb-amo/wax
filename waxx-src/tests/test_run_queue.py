@@ -348,7 +348,9 @@ def test_a_path_with_spaces_is_quoted(q, tmp_path):
 
 @pytest.mark.parametrize("obj, words", [
     ({"path": "rabi.py"}, "must be absolute"),
-    ({"path": "C:/no/such/file.py"}, "no such file"),
+    ({"path": "{expts}/missing.py"}, "no such file"),
+    ({"path": "C:/Windows/notepad.py"}, "outside the folders"),
+    ({"path": "{expts}/rabi.py", "argv": ["C:\\data\\"]}, "ends in a backslash"),
     ({"path": "{expts}/rabi.py", "argv": ["a&b"]}, "not allowed"),
     ({"path": "{expts}/rabi.py", "write_back": True}, "may only veto"),
     ({"path": "{expts}/rabi.py", "owner": "robot"}, "owner must be"),
@@ -1197,3 +1199,24 @@ def test_someone_elses_stop_cancels_the_queues_restart(tmp_path, expts):
     run_through(q, 101)
     q.tick()
     assert loop.starts == [] and q.monitor_starts == ["the run queue has no job to run"]
+
+
+# --- roots and resolved paths (review S16) -----------------------------------------------------
+
+def test_the_default_roots_are_the_code_tree_and_the_agents_folder(monkeypatch):
+    monkeypatch.delenv(rq.ROOTS_ENV, raising=False)
+    monkeypatch.setenv("code", r"C:\Users\x\code")
+    assert rq.default_roots() == [r"C:\Users\x\code", r"C:\lab\skynet_log"]
+    monkeypatch.setenv(rq.ROOTS_ENV, os.pathsep.join(["A", "B"]))
+    assert rq.default_roots() == ["A", "B"]
+
+
+def test_a_file_outside_the_roots_is_refused_even_by_a_dotdot_path(tmp_path, expts):
+    queue = make_queue(tmp_path, expts, roots=[str(expts / "JP")])
+    (expts / "JP").mkdir()
+    (expts / "JP" / "ok.py").write_text("x = 1\n")
+    assert queue.submit({"path": str(expts / "JP" / "ok.py")})["status"] == "ok"
+    reply = queue.submit({"path": str(expts / "rabi.py")})
+    assert reply["status"] == "error" and "outside the folders" in reply["msg"]
+    reply = queue.submit({"path": str(expts / "JP" / ".." / "rabi.py")})
+    assert reply["status"] == "error" and "outside the folders" in reply["msg"]

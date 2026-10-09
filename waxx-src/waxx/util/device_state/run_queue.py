@@ -168,6 +168,24 @@ _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 DIR_ENV = "WAXX_RUN_QUEUE_DIR"
 
 
+#: Environment variable listing the folders the queue runs files from
+#: (os.pathsep-separated); see :func:`default_roots`.
+ROOTS_ENV = "WAXX_RUN_QUEUE_ROOTS"
+
+
+def default_roots() -> list[str]:
+    """The folders a job's file must be inside: ``$WAXX_RUN_QUEUE_ROOTS``
+    (os.pathsep-separated), else the lab's code folder (``%code%``) and
+    ``C:\\lab\\skynet_log`` (agents' work).  A server may pass its own
+    (``RunQueue(roots=)``); the lab can override them there later."""
+    env = os.environ.get(ROOTS_ENV)
+    if env:
+        return [r for r in env.split(os.pathsep) if r]
+    roots = [os.environ.get("code") or ""]
+    roots.append(r"C:\lab\skynet_log")
+    return [r for r in roots if r]
+
+
 def default_dir() -> str:
     """The queue's folder when the server is given none: ``$WAXX_RUN_QUEUE_DIR``,
     else ``~/.waxx/run_queue`` -- local disk, next to the other ~/.waxx state
@@ -299,7 +317,7 @@ class RunQueue:
                  start_monitor: Callable[[str], None] | None = None,
                  hold: PersonHold | None = None, journal=None,
                  on_change: Callable[[dict], None] | None = None,
-                 spawn=None, adopt=None, exclude=(),
+                 spawn=None, adopt=None, exclude=(), roots=None,
                  clock: Callable[[], float] = time.time,
                  poll_every_s: float = POLL_EVERY_S, gap_s: float = GAP_S,
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
@@ -327,6 +345,8 @@ class RunQueue:
         self._spawn = spawn
         self._adopt = adopt
         self._exclude = {self._norm(p) for p in exclude if p}
+        #: the folders a job's file must be inside (default_roots())
+        self.roots = list(roots) if roots is not None else default_roots()
         self._clock = clock
         self.poll_every_s = float(poll_every_s)
         self._gap_s = float(gap_s)
@@ -438,6 +458,15 @@ class RunQueue:
         if not path.is_absolute():
             raise QueueError(f"the path must be absolute (the server's machine): {text}")
         path = path.resolve()
+        bad = sorted(_SHELL_CHARS & set(str(path)))
+        if bad:
+            # a link resolving to such a path: the command line would carry it
+            raise QueueError(f"the file's resolved path contains {' '.join(bad)} (not "
+                             f"allowed): {path}")
+        roots = [Path(r).resolve() for r in self.roots]
+        if not any(path == r or r in path.parents for r in roots):
+            raise QueueError(f"{path} is outside the folders the queue runs files from ("
+                             + ", ".join(str(r) for r in roots) + ")")
         if path.suffix.lower() != ".py":
             raise QueueError(f"not a Python file: {path}")
         if not path.is_file():
@@ -452,6 +481,9 @@ class RunQueue:
             bad = sorted(_SHELL_CHARS & set(a))
             if bad:
                 raise QueueError(f"an argument contains {' '.join(bad)} (not allowed): {a}")
+            if a.endswith("\\"):
+                # quoted, it would escape its own closing quote
+                raise QueueError(f"an argument ends in a backslash (not allowed): {a}")
         cwd = str(obj.get("cwd") or path.parent)
         if not Path(cwd).is_dir():
             raise QueueError(f"no such working folder on the monitor server's machine: {cwd}")
