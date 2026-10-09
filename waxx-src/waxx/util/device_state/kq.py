@@ -18,7 +18,7 @@ Commands::
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
     kq release                                lift the person's hold
-    kq status [--json]                        one line: queue, hold, alarm
+    kq status [--json]                        the queue's state (not occupancy)
 
 Words after the file (``key=value``, as artiq_run takes them) and everything
 after ``--`` are passed to the experiment: ``kq run x.py n=3 -- -c MyExpt``.
@@ -46,14 +46,17 @@ stderr.
 
 Exit codes:
 
-* 0 -- the job saved (run, tail -f); the request was done; status: free
+* 0 -- the job saved (run, tail -f); the request was done; status: queue free
 * 1 -- the job failed without an exit code of its own (or with 0)
 * N -- the job failed: the experiment's own exit code N
 * 2 -- bad command line
 * 3 -- the job was cancelled or skipped
 * 4 -- no run queue is beaconing (no monitor server, or one without a queue)
-* 5 -- status: busy (a job running or waiting, jobs held or paused, a person's
-  hold, or a run announced that is not a run loop's)
+* 5 -- status: queue busy -- a queue job is in the slot (launching, running,
+  ending) or a person's hold is on.  Queue state only: kq status never asks
+  liveOD, the run fence or the run loops, so a direct artiq_run run or a run
+  loop does not show; for machine occupancy use occupancy.py (agents) or the
+  dashboard
 * 6 -- the queue refused the request, or the monitor server did not answer
 * 130 -- interrupted (Ctrl-C): the job was left as it was, or cancelled while
   it was queued
@@ -96,7 +99,9 @@ job states: queued -> launching -> running -> ending -> saved | failed;
   or cancelled / skipped.
 exit codes: 0 saved / done / free, 1 failed (no exit code of its own),
   N the experiment's own exit code, 2 bad command line, 3 cancelled or skipped,
-  4 no run queue beaconing, 5 status busy, 6 refused or no answer,
+  4 no run queue beaconing, 5 status: queue busy (a job in the slot or a
+  person's hold; queue state only, not machine occupancy: use occupancy.py
+  (agents) or the dashboard), 6 refused or no answer,
   130 interrupted (Ctrl-C).
 direct runs, outside the queue: artiq_run --device-db %db% <file.py>
 """
@@ -376,7 +381,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp = sub.add_parser("release", help="lift the person's hold")
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
-    sp = sub.add_parser("status", help="one line: queue, hold, alarm (exit 0 free / 5 busy)")
+    sp = sub.add_parser("status", help="the queue's state, not machine occupancy (exit 0 "
+                                       "queue free / 5 a job in the slot or a hold)")
     sp.add_argument("--json", action="store_true")
     return p
 
@@ -729,43 +735,34 @@ def _cmd_release(ctx: _Ctx, args) -> int:
     return EXIT_OK
 
 
-def status_busy(status: dict) -> bool:
-    """``kq status``'s exit: busy when a job runs or waits, queued jobs are
-    held or paused, a person's hold is on, or a run is announced (the fence)
-    while no run loop is active (a loop's own runs do not count: the queue
-    stops a loop for a job)."""
+#: ``kq status`` reports the queue's state only, never the machine's.
+OCCUPANCY_NOTE = ("queue state only, not machine occupancy (liveOD, direct artiq_run "
+                  "runs, the run loops): for occupancy use occupancy.py (agents) or the "
+                  "dashboard")
+
+
+def queue_busy(status: dict) -> bool:
+    """``kq status``'s exit 5: a queue job is in the slot (launching,
+    running, ending) or a person's hold is on.  Queue state only: jobs
+    waiting (due later, after others, paused) do not count, and nothing here
+    asks liveOD, the run fence or the run loops."""
     rq = status.get("run_queue") or {}
     hold = status.get("person_hold") or rq.get("person_hold") or {}
-    loops = status.get("run_loops") or {}
-    loop_active = any((v or {}).get("state") in ("running", "stopping")
-                      for v in loops.values())
-    return (rq.get("state", "idle") != "idle" or bool(hold.get("active"))
-            or bool(rq.get("alarm")) or (bool(status.get("run_pending")) and not loop_active))
+    return rq.get("current") is not None or bool(hold.get("active"))
 
 
 def _cmd_status(ctx: _Ctx, args) -> int:
     status = ctx.client.status()
-    busy = status_busy(status)
+    busy = queue_busy(status)
     rq = status.get("run_queue") or {}
     if args.json:
-        ctx.say(json.dumps({"busy": busy, "run_queue": rq,
+        ctx.say(json.dumps({"queue_busy": busy, "run_queue": rq,
                             "person_hold": status.get("person_hold"),
-                            "monitor": status.get("state_name"),
-                            "run_pending": status.get("run_pending"),
-                            "run_loops": {k: {"state": (v or {}).get("state"),
-                                              "text": (v or {}).get("text")}
-                                          for k, v in (status.get("run_loops") or {}).items()}},
-                           indent=1, default=str))
+                            "note": OCCUPANCY_NOTE}, indent=1, default=str))
         return EXIT_BUSY if busy else EXIT_OK
-    parts = [queue_line(rq, status.get("person_hold")),
-             f"monitor: {status.get('state_name', '?')}"]
-    pend = status.get("run_pending")
-    if pend:
-        parts.append(f"run announced: {pend.get('run_id')} ({pend.get('expt') or '?'})")
-    for key, loop in (status.get("run_loops") or {}).items():
-        if (loop or {}).get("state") in ("running", "stopping"):
-            parts.append(f"loop {key}: {loop.get('state')}")
-    ctx.say(("BUSY | " if busy else "free | ") + " | ".join(parts))
+    ctx.say(("queue busy | " if busy else "queue free | ")
+            + queue_line(rq, status.get("person_hold")))
+    ctx.say(f"({OCCUPANCY_NOTE})")
     return EXIT_BUSY if busy else EXIT_OK
 
 

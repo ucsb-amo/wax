@@ -324,20 +324,26 @@ def test_list_show_and_status(server, q, expts):
     assert r.code == 0 and r.out.startswith("job 1 (r1): queued")
     assert "waiting: job 2 goes first" in r.out
     assert json.loads(kq(server, "show", "1", "--json").out)["job"]["id"] == 1
+    r = kq(server, "status")                                   # waiting jobs: not busy
+    assert r.code == 0 and r.out.startswith("queue free | queue: waiting")
+    j = json.loads(kq(server, "status", "--json").out)
+    assert j["queue_busy"] is False and "not machine occupancy" in j["note"]
+    q.tick()                                                   # a job in the slot
     r = kq(server, "status")
-    assert r.code == 5 and r.out.startswith("BUSY | queue: waiting")
-    assert json.loads(kq(server, "status", "--json").out)["busy"] is True
+    assert r.code == 5 and r.out.startswith("queue busy | queue: running")
 
 
-def test_status_is_free_when_idle_and_busy_under_a_hold_or_a_foreign_run(server, q):
+def test_status_is_queue_state_only(server, q, expts):
     r = kq(server, "status")
-    assert r.code == 0 and r.out.startswith("free | queue: idle") and "monitor: READY" in r.out
+    assert r.code == 0 and r.out.startswith("queue free | queue: idle")
+    assert "for occupancy use occupancy.py (agents) or the dashboard" in r.out
+    # a run announced outside the queue, or a run loop, is not the queue's state
     server.run_pending = {"run_id": 900, "expt": "someone.py"}
-    r = kq(server, "status")
-    assert r.code == 5 and "run announced: 900" in r.out
     server.run_loops = {"auto_tof": {"state": "running", "text": "x"}}
-    assert kq(server, "status").code == 0                     # the loop's own run
-    server.run_pending, server.run_loops = None, {}
+    r = kq(server, "status")
+    assert r.code == 0 and "900" not in r.out and "auto_tof" not in r.out
+    kq(server, "submit", str(expts / "rabi.py"), "--at", str(time.time() + 86400))
+    assert kq(server, "status").code == 0                      # due tomorrow: not busy
     kq(server, "hold", "aligning", "optics")
     r = kq(server, "status")
     assert r.code == 5 and "person hold since" in r.out and "aligning optics" in r.out
