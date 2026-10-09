@@ -157,7 +157,11 @@ def test_parse_at():
     now = time.mktime((2026, 10, 9, 14, 0, 0, 0, 0, -1))
     assert kqmod.parse_at("15:30", now) == now + 5400
     assert kqmod.parse_at("13:00", now) == pytest.approx(now + 23 * 3600, abs=3600)
-    assert kqmod.parse_at("1800000000") == 1.8e9
+    assert kqmod.parse_at("1800000000", now) == 1.8e9
+    with pytest.raises(ValueError, match="more than a year ahead"):
+        kqmod.parse_at(str(now + 400 * 86400), now)
+    with pytest.raises(ValueError, match="more than a year ahead"):
+        kqmod.parse_at("inf", now)
     for bad in ("25:00", "noon", "1430", "86400"):
         with pytest.raises(ValueError):
             kqmod.parse_at(bad, now)
@@ -543,7 +547,7 @@ def test_tail_follow_reports_an_abort_someone_else_asked_for(server, q, expts):
 
 @pytest.mark.parametrize("extra, words", [
     (["--", "folder" + "\\"], "ends in a backslash"),
-    (["--at", "inf"], "finite"),
+    (["--at", "nan"], "finite"),
 ])
 def test_new_submit_refusals_are_shown_as_the_server_words_them(server, expts, extra, words):
     r = kq(server, "submit", str(expts / "rabi.py"), *extra)

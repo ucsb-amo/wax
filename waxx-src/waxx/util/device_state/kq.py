@@ -312,12 +312,15 @@ _HHMM = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
 #: A bare number below this is not taken as epoch seconds (1e9 s is 2001-09-09):
 #: ``--at 1430`` is a typo for 14:30, not 1970.
 MIN_EPOCH = 1e9
+#: ``--at`` further ahead than this is refused (a typo, not a plan).
+MAX_AHEAD_S = 366 * 86400.0
 
 
 def parse_at(text: str, now: float | None = None) -> float:
     """``HH:MM[:SS]`` (local; the next such time, so a time already past
     today means tomorrow -- by the calendar, so a DST change is no hour off)
-    or epoch seconds (at least :data:`MIN_EPOCH`) -> epoch seconds."""
+    or epoch seconds (at least :data:`MIN_EPOCH`, at most a year ahead) ->
+    epoch seconds."""
     now = time.time() if now is None else float(now)
     m = _HHMM.match(text.strip())
     if m:
@@ -337,6 +340,8 @@ def parse_at(text: str, now: float | None = None) -> float:
     if value < MIN_EPOCH:
         raise ValueError(f"--at {text}: a bare number must be epoch seconds (at least "
                          f"{MIN_EPOCH:.0f}); for a time of day write HH:MM")
+    if value > now + MAX_AHEAD_S:
+        raise ValueError(f"--at {text}: more than a year ahead")
     return value
 
 
