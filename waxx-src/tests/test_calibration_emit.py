@@ -371,6 +371,36 @@ def test_end_wax_with_a_sub_scan_finishes_it_before_the_save_and_emits_after(lab
     assert "[cal] applied:" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("launcher", ["", "kq"])
+def test_end_wax_order_with_a_sub_scan_and_the_monitor(lab, capsys, monkeypatch, launcher):
+    # the whole end of a run with a sub-scan: its finish_run, END_RUN, the
+    # monitor's end state, then the declared calibration. A run the queue
+    # launched (WAXX_LAUNCHER=kq) sends its end state but never restarts the
+    # monitor (the queue starts it when it runs out); a direct run restarts it.
+    if launcher:
+        monkeypatch.setenv("WAXX_LAUNCHER", launcher)
+        monkeypatch.setenv("WAXX_QUEUE_JOB", "7:abc")
+    else:
+        monkeypatch.delenv("WAXX_LAUNCHER", raising=False)
+    e = make_run(lab)
+    e.calibrates("t_pi", "fake_pi")
+    order = []
+    wire_end(e, order)
+    e._subscan = SimpleNamespace(enabled=True, quiet=False,
+                                 finish_run=lambda: order.append("subscan"))
+    e.monitor = SimpleNamespace(
+        update_device_states=lambda **kw: order.append("monitor_state"),
+        signal_end=lambda: order.append("monitor_restart"))
+    e.end_wax("rabi_flop.py", notify=False)
+    expected = ["scope", "subscan", "end_run", "monitor_state"]
+    if not launcher:
+        expected.append("monitor_restart")
+    assert order == expected + ["emit"]
+    out = capsys.readouterr().out
+    assert "[cal] applied:" in out
+    assert ("launched by the run queue (job 7:abc)" in out) == bool(launcher)
+
+
 def test_end_wax_failed_save_raises_as_before_and_does_not_emit(lab):
     e = make_run(lab)
     e.calibrates("t_pi", "fake_pi")
