@@ -888,10 +888,18 @@ class MonitorUDPServer(UdpServer):
                 if loop.active:
                     # refused: the loop is not left to end without a monitor --
                     # asked again, it starts the monitor when it ends
-                    loop.stop(operator=by, client="server " + action, start_monitor=True)
-                    return refuse(f"{loop.spec.title} did not stop within "
-                                  f"{self.LOOP_STOP_WAIT_S:.0f} s (it starts the monitor when "
-                                  "it ends)")
+                    try:
+                        again = loop.stop(operator=by, client="server " + action,
+                                          start_monitor=True)
+                    except Exception:                 # noqa: BLE001
+                        log.exception("%s: asking it to start the monitor when it ends failed",
+                                      loop.spec.title)
+                        again = None
+                    if loop.active or (isinstance(again, dict) and again.get("status") == "ok"):
+                        return refuse(f"{loop.spec.title} did not stop within "
+                                      f"{self.LOOP_STOP_WAIT_S:.0f} s (it starts the monitor "
+                                      "when it ends)")
+                    # it ended between the check and the call: stopped, go on
         self.run_queue.stop_launching(f"the monitor server is {action}ing")
         busy = self._queue_slot_text()
         if busy:                                       # one slipped in meanwhile

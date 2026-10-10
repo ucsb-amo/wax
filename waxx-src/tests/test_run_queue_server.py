@@ -476,6 +476,28 @@ def test_a_loop_that_does_not_stop_in_time_is_asked_to_start_the_monitor(server,
     loop._s["state"] = "idle"
 
 
+@pytest.mark.parametrize("second", ["not_running", "raises"])
+def test_a_loop_that_ends_just_before_the_second_stop_does_not_break_the_request(
+        server, monkeypatch, second):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"
+    calls = []
+
+    def stop(**kw):
+        calls.append(kw["start_monitor"])
+        if len(calls) == 2:                               # it ended in between
+            loop._s["state"] = "stopped"
+            if second == "raises":
+                raise RuntimeError("the loop is gone")
+            return {"status": "error", "msg": "Auto TOF is not running"}
+        return {"status": "ok"}
+    monkeypatch.setattr(loop, "stop", stop)
+    monkeypatch.setattr(type(server), "LOOP_STOP_WAIT_S", 0.1)
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert calls == [False, True]
+    assert reply["status"] == "ok" and reply["exit_code"] == 3   # stopped after all: go on
+
+
 def test_a_refusal_after_stopping_a_loop_leaves_the_monitor_owed(server, expts, monkeypatch):
     loop = server.loops["auto_tof"]
     loop._s["state"] = "running"
