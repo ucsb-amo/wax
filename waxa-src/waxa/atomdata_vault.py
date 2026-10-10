@@ -2915,6 +2915,9 @@ class AtomdataVault(atomdata_base):
             uniform_roi = False
             kwargs.setdefault('ignore_images', True)
             kwargs.setdefault('sort', False)        # acquisition order: the points alternate
+            # never lite: atomdata(lite=True) regenerates a missing lite copy on the data drive, and
+            # analysis must not write run data (lab rules section 1); the sub-scan is small anyway
+            lite = False
 
         ads, skipped = [], []
         anchor_roi = roi_id

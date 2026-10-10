@@ -1322,8 +1322,23 @@ class atomdata_base():
         strip = lambda full: full[len(prefix):] if full.startswith(prefix) else full
         raw = {strip(full): arr for full, arr in self._subscan_raw.items()}
         order = [k for k in spec.get('keys', []) if k in raw] + [k for k in raw if k not in spec.get('keys', [])]
+        # A point that failed (status 2) or was never taken (0) holds the file's fill in its
+        # containers: 0.0 for a kernel container, which reads like a measurement. The view shows
+        # NaN in every float container for those rows; the raw arrays (ad._subscan_raw of the
+        # parent, i.e. the file) are untouched.
+        status = raw.get('status', None)
+        bad = None
+        if status is not None:
+            st = np.asarray(status).reshape(-1)
+            bad = st != 1
         for key in order:
-            vars(ad.data)[key] = raw[key]
+            arr = raw[key]
+            if (bad is not None and bad.any() and key != 'status'
+                    and np.issubdtype(np.asarray(arr).dtype, np.floating)
+                    and np.asarray(arr).shape[:1] == bad.shape):
+                arr = np.array(arr, dtype=float, copy=True)
+                arr[bad] = np.nan
+            vars(ad.data)[key] = arr
             ad.data.keys.append(key)
         t = vars(ad.data).get('time', None)
         ad.timestamp_shot_end = np.asarray(t, dtype=float).ravel() if t is not None else np.array([])
