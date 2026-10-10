@@ -362,6 +362,10 @@ class MonitorUDPServer(UdpServer):
         # The state file's content, kept in memory; re-read only when its
         # mtime says someone else wrote it (see _state()).
         self._state_lock = threading.RLock()
+        #: serialises the structured requests that may change something (see
+        #: _handle_structured): the TCP responder and the window's panels
+        #: (direct_request) may both be asking
+        self._request_lock = threading.RLock()
         self._state_cache: dict | None = None
         self._state_mtime = None
 
@@ -503,12 +507,50 @@ class MonitorUDPServer(UdpServer):
                 "person_hold": self.person_hold.info(),
                 "run_queue": self.run_queue.info()}
 
+    #: Structured requests that only read (no check-then-act): answered
+    #: without the request lock, so they are never held up behind one that
+    #: waits (a ``server`` request waits up to LOOP_STOP_WAIT_S for a loop).
+    _READ_TYPES = frozenset({"get_state", "get_version", "op_status", "get_journal", "output"})
+
+    @classmethod
+    def _reads_only(cls, mtype, obj: dict) -> bool:
+        if mtype in cls._READ_TYPES:
+            return True
+        if mtype == "run_queue":
+            return obj.get("action") in ("list", "describe", "tail")
+        if mtype == "run_loop":
+            return obj.get("action") == "describe"
+        if mtype == "slm_reinit":
+            return obj.get("action") == "status"
+        return False
+
     def _handle_structured(self, raw):
+        """One structured request.  Since the server's own window answers its
+        panels' requests on a worker thread (MonitorServerGUI.direct_request)
+        while the TCP responder answers network clients, two requests can now
+        arrive at once; the handlers' check-then-act steps (one loop at a
+        time, a restart refused while ..., a reset refused while ...) assumed
+        one caller.  Every structured request that may change something
+        therefore runs under one server-level lock (``_request_lock``, an
+        RLock); pure reads (:meth:`_reads_only`) and the plain-text
+        ``status_json`` do not take it.
+
+        The lock is held across a ``server`` request's wait for a loop to
+        stop (up to LOOP_STOP_WAIT_S): releasing it there would let a loop be
+        started under the restart.  Network clients lose nothing by it (the
+        TCP accept loop is single-threaded and was already busy for that
+        wait); the window's panels keep their status_json and reads."""
         try:
             obj = json.loads(raw)
         except Exception:
             return json.dumps({"status": "error", "msg": "invalid json"})
         mtype = obj.get("type")
+        if self._reads_only(mtype, obj):
+            return self._dispatch_structured(obj, mtype)
+        with self._request_lock:
+            return self._dispatch_structured(obj, mtype)
+
+    def _dispatch_structured(self, obj: dict, mtype):
         if self.exiting and self._starts_work(mtype, obj):
             return json.dumps({"status": "error", "msg": self.exiting})
         if mtype == "get_state":
