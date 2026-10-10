@@ -1629,7 +1629,9 @@ class LiveODServer(QThread, NetServer):
         and no ABORT_RUN that reached liveOD (LiveODClient.notify_exit, an atexit
         handler). ``reason``: the uncaught exception, "" when none was reported.
 
-        * During an abort: that is the abort's answer, taken exactly as ABORT_RUN.
+        * During an abort: that is the abort's answer, taken exactly as ABORT_RUN --
+          except a notice sent on the process's behalf (``run_id``, no run token)
+          for a run with data (:meth:`run_data_counts`): refused, nothing changes.
         * With camera frames still due: the camera thread still owns the run's
           file, so the run stays open (as after a crash until now); only the state
           says what happened.
@@ -1652,6 +1654,24 @@ class LiveODServer(QThread, NetServer):
             return {"ok": True, "ignored": True}
         why = str(msg.get("reason") or "") or "no exception reported"
         run_id = self._current_run_id
+        if self._reset_requested and msg.get("run_token") is None:
+            # sent on the process's behalf (run_id, no token) during an Abort:
+            # taken as the abort's answer it would discard the file, so a run
+            # with data is refused (user ruling 2026-10-09: data is never
+            # deleted unattended) -- the helper refuses too, but from a POLL
+            # that can be a moment old; these are this server's own counts
+            counts = self.run_data_counts()
+            from waxx.util.device_state.run_gate import run_has_data  # noqa: PLC0415
+            if run_has_data(counts):
+                text = (f"RUN_EXITED for run {run_id} refused: an Abort is pending and the run "
+                        f"has data (shots {counts['n_shots']}, frames "
+                        f"{counts['images_received']}, pushed arrays "
+                        f"{counts['aux_items_received']}); taken as the abort's answer it "
+                        f"would discard the file -- a person decides (Reset on a run whose "
+                        f"process is gone keeps the file)")
+                logger.warning(text + ".")
+                return {"ok": False, "refused": True, "abort_pending_with_data": True,
+                        "error": text, **counts}
         if self._reset_requested:
             logger.warning(f"RUN_EXITED: the experiment of run {run_id} exited during its "
                            f"abort ({why}); taken as the abort's acknowledgement.")
@@ -1683,6 +1703,13 @@ class LiveODServer(QThread, NetServer):
 
     # A run whose experiment is gone
     # ------------------------------------------------------------------
+
+    def run_data_counts(self) -> dict:
+        """The current run's data as POLL reports it (run_gate.DATA_FIELDS):
+        shots, camera frames and arrays pushed during the run."""
+        return {"n_shots": len(self._shot_timestamps),
+                "images_received": self._images_received_now(),
+                "aux_items_received": getattr(self, "_aux_items_received", 0)}
 
     def exited_run_pending(self) -> bool:
         """The current run's experiment exited with frames still due and the run is

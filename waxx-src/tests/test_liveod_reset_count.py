@@ -282,3 +282,62 @@ def test_a_reset_on_a_reused_pid_keeps_the_file(srv, monkeypatch):
     srv._check_exited_run()
     assert _poll(srv)["last_outcome"]["detail"] == srv.DEAD_CLIENT_RESET_WHY
     assert os.path.exists(run["filepath"])
+
+
+# -- RUN_EXITED on a process's behalf during an Abort (review F4) --------------------
+
+@pytest.mark.parametrize("data", ["shots", "pushed"])
+def test_a_notice_on_behalf_during_an_abort_on_a_run_with_data_is_refused(srv, monkeypatch, data):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)                              # alive when the Abort is set
+    if data == "shots":
+        srv._shot_timestamps = [1.0]
+    else:
+        srv._aux_items_received = 2
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    before = _poll(srv)
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "reason": "sent by a helper"})
+    assert reply["ok"] is False and reply["refused"] and reply["abort_pending_with_data"]
+    assert "a person decides" in reply["error"]
+    after = _poll(srv)                                     # nothing changed
+    assert after["run_in_progress"] and after["reset_requested"]
+    assert after["last_outcome"] == before["last_outcome"]
+    assert os.path.exists(run["filepath"])
+
+
+def test_a_notice_on_behalf_during_an_abort_on_an_empty_run_is_the_abort(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "reason": "sent by a helper"})
+    assert reply["ok"]
+    assert not _poll(srv)["run_in_progress"]
+    assert not os.path.exists(run["filepath"])             # nothing in it: discarded
+
+
+def test_the_processs_own_notice_during_an_abort_is_still_its_answer(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._shot_timestamps = [1.0]
+    srv._handle_reset({"tag": "RESET"})                    # a person's Abort
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_token": run["run_token"],
+                                    "reason": "uncaught KeyboardInterrupt"})
+    assert reply["ok"] and not _poll(srv)["run_in_progress"]
+    assert _poll(srv)["last_outcome"]["outcome"] == "discarded"
+
+
+def test_the_helper_reports_the_servers_refusal(srv, monkeypatch):
+    from waxx.util.device_state import run_gate
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    stale = _poll(srv)                                     # taken before the shot came
+    srv._shot_timestamps = [1.0]
+    out = run_gate.tell_live_od_run_exited(
+        None, run["run_id"], "sent by a helper", poll=stale, pid_alive=lambda pid: False,
+        send=lambda rid, why: srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": rid,
+                                                      "reason": why}))
+    assert out["sent"] and out["ok"] is False and "liveOD refused" in out["why"]
+    assert os.path.exists(run["filepath"]) and _poll(srv)["run_in_progress"]
