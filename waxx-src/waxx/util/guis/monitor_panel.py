@@ -236,9 +236,9 @@ class MonitorServerPanel(WidgetPanelBase):
                  synchronous: bool = False, by: str | None = None):
         super().__init__(parent)
         self.link = link or MonitorLink()
-        if listener_factory == "default":
-            from waxx.util.comms_server.state_broadcast import StateListener  # noqa: PLC0415
-            listener_factory = StateListener
+        # "default": a StateListener, imported at first show (importing the
+        # waxx.util.comms_server package starts the discovery listener;
+        # constructing this panel binds nothing)
         self._listener_factory = listener_factory
         self.listener = None
         self._polling = False
@@ -264,7 +264,11 @@ class MonitorServerPanel(WidgetPanelBase):
     def showEvent(self, event):                                 # noqa: N802
         super().showEvent(event)
         if self.listener is None and self._listener_factory is not None and not self._cleaned:
-            self.listener = self._listener_factory()
+            factory = self._listener_factory
+            if factory == "default":
+                from waxx.util.comms_server.state_broadcast import StateListener  # noqa: PLC0415
+                factory = StateListener
+            self.listener = factory()
             self.listener.state_received.connect(self.on_broadcast)
             self.listener.start()
         self.poll_status()

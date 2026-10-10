@@ -7,12 +7,9 @@ import os
 from pathlib import Path
 
 from beacon.discovery.server import NetServer
-
-class ReadyBit:
-    READY = 0
-    LOADING = 1
-    NOT_READY = 2
-STATES = ReadyBit()
+# the constants live in a module that imports nothing networked; the same
+# objects are re-exported here (comm_server.STATES, comm_server.ReadyBit)
+from waxx.util.device_state.ready_bit import ReadyBit, STATES  # noqa: F401
 
 class UdpServer(QObject, NetServer):
     """

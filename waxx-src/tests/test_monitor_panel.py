@@ -207,3 +207,32 @@ def test_cleanup_stops_the_poll_and_the_listener(panel, qapp):
     listener = panel.listeners[0]
     panel.cleanup()
     assert listener.stopped and not panel.timer.isActive()
+
+
+def test_constructing_the_panel_binds_nothing():
+    """Importing and building the panel (default listener factory, never
+    shown) must not import beacon.discovery: its package starts the
+    discovery listener, a socket bound to the discovery port, at import.
+    Checked in a fresh interpreter (this one has imported it already)."""
+    import subprocess
+    import sys
+    code = (
+        "import sys, os\n"
+        "os.environ['QT_QPA_PLATFORM'] = 'offscreen'\n"
+        "from PyQt6.QtWidgets import QApplication\n"
+        "app = QApplication([])\n"
+        "from waxx.util.guis import monitor_panel as mp\n"
+        "class C:\n"
+        "    def request(self, obj, timeout=5.0, attempts=2): return None\n"
+        "    def get_status(self): return None\n"
+        "    def send_message(self, text, timeout=5.0, attempts=2): return None\n"
+        "p = mp.MonitorServerPanel(link=mp.MonitorLink(lambda t: C()), synchronous=True)\n"
+        "loaded = sorted(m for m in sys.modules if m.startswith('beacon.discovery')\n"
+        "                or m.startswith('waxx.util.comms_server'))\n"
+        "p.cleanup()\n"
+        "print('LOADED', loaded)\n")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=env, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "LOADED []" in out.stdout, out.stdout
