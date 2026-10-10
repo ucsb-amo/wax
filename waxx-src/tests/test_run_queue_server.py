@@ -533,6 +533,29 @@ def test_nothing_new_starts_once_a_restart_is_accepted(server, expts, qapp):
     assert restarts == []
 
 
+def test_reads_are_answered_while_exiting(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "person"})
+    server._exiting = "server is restarting"             # as an accepted restart sets it
+    try:
+        refused = {"status": "error", "msg": "server is restarting"}
+        for req in ({"type": "run_queue", "action": "list"},
+                    {"type": "run_queue", "action": "describe", "path": str(expts / "rabi.py")},
+                    {"type": "get_journal", "n": 5},
+                    {"type": "get_version"},
+                    {"type": "poll"},
+                    {"type": "output", "kind": "run_loop", "key": "auto_tof"},
+                    {"type": "slm_reinit", "action": "status"}):
+            assert server.ask(req) != refused, req
+        # the job-log read: never refused for exiting (the panel branch serves it)
+        assert server._starts_work("run_queue", {"action": "tail", "id": 1}) is False
+        assert server.ask({"type": "run_queue", "action": "tail", "id": 1}) != refused
+        assert server._starts_work("slm_reinit", {"action": "now"}) is True
+        assert server.ask({"type": "slm_reinit", "action": "restart"}) == refused
+    finally:
+        server._exiting = ""
+
+
 def test_the_owners_and_the_queue_start_no_monitor_or_loop_while_exiting(tmp_path):
     from waxx.util.guis import monitor_server_headless as headless
     started = []

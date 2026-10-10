@@ -942,16 +942,25 @@ class MonitorUDPServer(UdpServer):
         return self._exiting
 
     #: Requests refused while the server is exiting (they would start work).
+    #: Every other type is answered: the reads (get_state, get_version, poll,
+    #: get_journal, output, op_status, a status read of slm_reinit) never are
+    #: refused, so an open log or job-log window keeps reading to the end.
     _WORK_TYPES = frozenset({"reset_state", "regenerate_state", "op", "run_scene", "server",
                              "connection"})
+    #: run_queue actions that only read (answered while exiting); "tail" is the
+    #: job-log read (the queue panel's), refused only as unknown where absent.
+    _QUEUE_READS = frozenset({"list", "describe", "tail"})
 
     def _starts_work(self, mtype, obj: dict) -> bool:
         if mtype in self._WORK_TYPES:
             return True
+        action = obj.get("action")
         if mtype == "run_loop":
-            return obj.get("action") in ("start", "configure")
+            return action in ("start", "configure")
         if mtype == "run_queue":
-            return obj.get("action") not in ("list", "describe")
+            return action not in self._QUEUE_READS
+        if mtype == "slm_reinit":
+            return action != "status"
         return False
 
     #: run_queue actions -> the RunQueue method that answers them
