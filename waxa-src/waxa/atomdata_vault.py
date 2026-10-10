@@ -2746,6 +2746,31 @@ class AtomdataVault(atomdata_base):
             )
         return rid == int(run_id)
 
+    @property
+    def cal(self):
+        """A vault of the source runs' interleaved sub-scans (``ad.cal`` of
+        each run that has one; None when none has), built on first use and
+        again after ``drop_runs``. Its ``shot_run_id`` says which run each
+        point came from."""
+        cached = getattr(self, '_cal_vault', None)
+        ids = tuple(int(r) for r in self.source_run_ids)
+        if cached is not None and cached[0] == ids:
+            return cached[1]
+        views = []
+        for rid in ids:
+            ad = self._source_atomdata_by_run_id.get(rid)
+            view = getattr(ad, 'cal', None) if ad is not None else None
+            if view is not None:
+                views.append(view)
+        vault = None
+        if views:
+            # acquisition order (sort=False): the points alternate by design
+            vault = AtomdataVault(views, lite=self._lite, ignore_images=True, uniform_roi=False,
+                                  sort=False, merge_overlap=self._merge_overlap,
+                                  skip_missing=self._skip_missing)
+        self._cal_vault = (ids, vault)
+        return vault
+
     def atomdata(self, run_id, *, copy_obj=False):
         """Return the already-loaded source ``atomdata`` for ``run_id``.
 
@@ -2869,7 +2894,7 @@ class AtomdataVault(atomdata_base):
     @classmethod
     def from_run_range(cls, start_id, stop_id, experiment_name=None,
                        skip_missing=True, roi_id=None, lite=True,
-                       uniform_roi=True, **kwargs):
+                       uniform_roi=True, part=None, **kwargs):
         """Build a vault from a contiguous run-id range ``[start_id, stop_id]``.
 
         Missing/aborted run-ids are skipped (``skip_missing``). If
@@ -2877,11 +2902,19 @@ class AtomdataVault(atomdata_base):
         filepath contains that substring are kept -- handy for an experiment
         builder that interleaves several experiment types. When ``uniform_roi``
         is True (default), subsequent runs reuse the first loaded run's ROI so
-        the selector opens at most once.
+        the selector opens at most once. ``part='cal'`` builds the vault from
+        each run's interleaved sub-scan (``ad.cal``) instead of its main scan;
+        runs without one are skipped and listed.
         """
         start_id, stop_id = int(start_id), int(stop_id)
         if stop_id < start_id:
             start_id, stop_id = stop_id, start_id
+        if part is not None and part != 'cal':
+            raise ValueError(f"part must be None or 'cal', got {part!r}")
+        if part is not None:
+            uniform_roi = False
+            kwargs.setdefault('ignore_images', True)
+            kwargs.setdefault('sort', False)        # acquisition order: the points alternate
 
         ads, skipped = [], []
         anchor_roi = roi_id
@@ -2890,12 +2923,19 @@ class AtomdataVault(atomdata_base):
             # subsequent load; otherwise honor the caller's roi_id per run.
             load_roi_id = anchor_roi if uniform_roi else roi_id
             try:
-                ad = atomdata(rid, roi_id=load_roi_id, lite=lite)
+                ad = atomdata(rid, roi_id=load_roi_id, lite=lite,
+                              ignore_images=bool(part is not None))
             except Exception:
                 if skip_missing:
                     skipped.append(rid)
                     continue
                 raise
+            if part is not None:
+                view = ad.cal
+                if view is None:
+                    skipped.append(rid)
+                    continue
+                ad = view
             if uniform_roi and anchor_roi is None:
                 anchor_roi = int(ad.run_info.run_id)
                 try:
