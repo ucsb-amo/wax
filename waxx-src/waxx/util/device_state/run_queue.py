@@ -1849,7 +1849,8 @@ class RunQueue:
         if self._is_job_run(job, poll) and poll.get("run_in_progress"):
             proc = None
             try:
-                proc = self._adopt(poll.get("client_pid"), None)
+                # its creation time too (F3): a reused pid is not adopted
+                proc = self._adopt(poll.get("client_pid"), poll.get("client_started"))
             except Exception:                         # noqa: BLE001
                 proc = None
             if proc is not None:

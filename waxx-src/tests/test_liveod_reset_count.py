@@ -242,3 +242,43 @@ def test_an_empty_dead_run_with_an_abort_is_discarded_at_the_next_init_run(srv, 
     _alive(monkeypatch, False)
     _init(srv)                                            # the gate waived it: next run
     assert not os.path.exists(run["filepath"])            # discarded, as today
+
+
+# -- a reused pid (review F3) ---------------------------------------------------------
+
+def _started_now(monkeypatch, value):
+    from waxx.util.device_state import detached
+    monkeypatch.setattr(detached, "process_started", lambda pid=None: value)
+
+
+@pytest.mark.parametrize("now, dead", [
+    (1000.0, False),             # the same process: alive, a normal Abort
+    (1000.004, False),           # within detached.SAME_PROCESS_S (rounding)
+    (2000.0, True),              # the pid was reused: the client is gone
+    (None, False),               # cannot be read: never taken for gone
+])
+def test_a_live_pid_is_the_client_only_when_its_creation_time_matches(srv, monkeypatch,
+                                                                       now, dead):
+    _init(srv, client_pid=4242, client_host=HERE, client_started=1000.0)
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, now)
+    assert srv.client_known_dead() is dead
+
+
+def test_without_a_recorded_creation_time_a_live_pid_is_the_client(srv, monkeypatch):
+    _init(srv, client_pid=4242, client_host=HERE)                 # an older client
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, 2000.0)
+    assert srv.client_known_dead() is False
+
+
+def test_a_reset_on_a_reused_pid_keeps_the_file(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE, client_started=1000.0)
+    srv._shot_timestamps = [1.0, 2.0]
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, 2000.0)                             # another process now
+    reply = srv._handle_reset({"tag": "RESET"})
+    assert reply["ok"] and reply["kept"]
+    srv._check_exited_run()
+    assert _poll(srv)["last_outcome"]["detail"] == srv.DEAD_CLIENT_RESET_WHY
+    assert os.path.exists(run["filepath"])

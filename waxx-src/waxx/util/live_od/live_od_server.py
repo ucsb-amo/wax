@@ -67,14 +67,22 @@ def _safe_repr(value) -> str:
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
     ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job,
-    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent). A client that predates them sends none; a malformed
+    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent)
+    and ``client_started`` (the client process's creation time, epoch s; None
+    when not sent). A client that predates them sends none; a malformed
     value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
         pid = int(pid) if pid is not None else None
     except (TypeError, ValueError):
         pid = None
+    started = msg.get("client_started")
+    try:
+        started = float(started) if started is not None else None
+    except (TypeError, ValueError):
+        started = None
     return {"client_pid": pid, "client_host": str(msg.get("client_host") or ""),
+            "client_started": started,
             "launcher": str(msg.get("launcher") or ""),
             "queue_job": str(msg.get("queue_job") or "")}
 
@@ -174,8 +182,8 @@ class LiveODServer(QThread, NetServer):
         # person). None/"" from a client that predates them. A launcher's gate
         # (waxx.util.device_state.run_gate) uses them to tell a run whose
         # process is gone from a live one.
-        self._current_client = {"client_pid": None, "client_host": "", "launcher": "",
-                                "queue_job": ""}
+        self._current_client = {"client_pid": None, "client_host": "", "client_started": None,
+                                "launcher": "", "queue_job": ""}
         # every Abort set (request_reset), for POLL's reset_count / last_reset
         self._reset_count = 0
         self._reset_counts = {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
@@ -1829,8 +1837,11 @@ class LiveODServer(QThread, NetServer):
         """The run in progress's client process is known to be gone: its pid
         was recorded at INIT_RUN, its host is this machine, and Windows says
         the process has ended (run_gate.pid_alive: OpenProcess, never
-        os.kill).  A client on another host, or without a pid, is never known
-        dead."""
+        os.kill) -- or the pid is alive but is provably another process: the
+        creation time the client sent (``client_started``) and the live pid's
+        differ by more than detached.SAME_PROCESS_S (the pid was reused).
+        A client on another host, or without a pid, is never known dead; nor
+        is a live pid whose creation time was not sent or cannot be read."""
         if not self._run_in_progress:
             return False
         client = self._current_client
@@ -1842,7 +1853,14 @@ class LiveODServer(QThread, NetServer):
             return False
         try:
             from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
-            return not pid_alive(pid)
+            if not pid_alive(pid):
+                return True
+            started = client.get("client_started")
+            if started is None:
+                return False
+            from waxx.util.device_state import detached  # noqa: PLC0415
+            now = detached.process_started(pid)
+            return now is not None and abs(now - float(started)) > detached.SAME_PROCESS_S
         except Exception:                             # noqa: BLE001
             return False
 

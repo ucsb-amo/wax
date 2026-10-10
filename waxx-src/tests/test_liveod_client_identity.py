@@ -168,3 +168,27 @@ def test_the_experiment_sends_its_queue_job(monkeypatch):
     assert Expt._serialize_init_payload(_Stub())["queue_job"] == ""
     monkeypatch.setenv("WAXX_QUEUE_JOB", "17")
     assert Expt._serialize_init_payload(_Stub())["queue_job"] == "17"
+
+
+# -- the client's creation time (review F3: a reused pid is not the client) -------------
+
+def test_the_experiment_sends_its_creation_time():
+    import sys
+    import time
+    from waxx.base.expt import Expt
+    from waxx.util.device_state import detached
+    started = Expt._serialize_init_payload(_Stub())["client_started"]
+    if sys.platform != "win32":
+        assert started is None
+        return
+    assert started is not None and started < time.time()
+    # read as ProcessWatch.adopt reads it: two readings agree
+    assert abs(detached.process_started(os.getpid()) - started) <= detached.SAME_PROCESS_S
+
+
+def test_poll_shows_the_clients_creation_time_and_drops_a_malformed_one(srv):
+    assert srv._handle_poll({"tag": "POLL"})["client_started"] is None
+    srv._handle_init_run(_init_msg(client_pid=4242, client_host="KONG", client_started=1.5e9))
+    assert srv._handle_poll({"tag": "POLL"})["client_started"] == 1.5e9
+    srv._handle_init_run(_init_msg(client_pid=4242, client_started="soon"))
+    assert srv._handle_poll({"tag": "POLL"})["client_started"] is None
