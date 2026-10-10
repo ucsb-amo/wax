@@ -87,12 +87,14 @@ class SubScan:
         self.xvardims = []
         self._point_values = {}
         self.n_points_per_event = 0
+        self.n_cycle = 1
         self.n_events = 0
         self.N = 0
         self.event_starts = []
         self.counter = 0
         self.enabled = True
         self.disabled_reason = ""
+        self.quiet = False
         self.finished = False
         self._snapshot = None
         self._point_keys = []
@@ -105,7 +107,10 @@ class SubScan:
 
     def xvar(self, key, values):
         """One of the point's parameters: ``values`` per event, zipped with the
-        other xvars (equal lengths). The key must be a parameter the kernel
+        other xvars (equal lengths). A 2-D ``values`` (n_cycle, n_points)
+        cycles over its rows event by event (event e takes row e % n_cycle),
+        e.g. a readout mode that alternates between events; every 2-D xvar
+        must have the same n_cycle. The key must be a parameter the kernel
         reads (it is plugged into ``params`` when missing, so a kernel writer
         exists for it)."""
         if self.finished:
@@ -114,11 +119,14 @@ class SubScan:
         if key in self._point_values:
             raise SubScanRefused(f"sub-scan xvar {key!r} given twice")
         self.expt.param_police(xvar(key, np.atleast_1d(values)))
-        values = np.atleast_1d(np.asarray(values))
-        if values.ndim != 1 or values.size == 0:
-            raise SubScanRefused(f"sub-scan xvar {key!r}: values must be a non-empty 1-D sequence")
+        values = np.asarray(values)
+        if values.ndim == 1:
+            values = values[None, :]
+        if values.ndim != 2 or values.size == 0:
+            raise SubScanRefused(f"sub-scan xvar {key!r}: values must be a non-empty 1-D sequence "
+                                 f"(per event) or 2-D (n_cycle, n_points)")
         if key not in vars(self.params):
-            vars(self.params)[key] = values[0]
+            vars(self.params)[key] = values[0, 0]
         self._point_values[key] = values
         self.point_keys.append(key)
 
@@ -137,6 +145,12 @@ class SubScan:
         if self.finished:
             return
         self.finished = True
+        if not self.enabled:
+            # disabled before the run was prepared (the experiment keeps the
+            # object so its kernel code type-checks): containers of zero
+            # length, nothing registered, nothing taken
+            self._init_empty()
+            return
         main_xvarnames = [str(k) for k in main_xvarnames]
         if setup_camera:
             raise SubScanRefused(
@@ -146,10 +160,15 @@ class SubScan:
                 f"liveOD knows about them.")
         if not self._point_values:
             raise SubScanRefused(f"sub-scan '{self.name}': no xvar declared")
-        lengths = {k: int(v.size) for k, v in self._point_values.items()}
+        lengths = {k: int(v.shape[1]) for k, v in self._point_values.items()}
         if len(set(lengths.values())) != 1:
             raise SubScanRefused(f"sub-scan '{self.name}': the xvars must have equal lengths "
                                  f"(zipped points), got {lengths}")
+        cycles = {k: int(v.shape[0]) for k, v in self._point_values.items() if v.shape[0] > 1}
+        if len(set(cycles.values())) > 1:
+            raise SubScanRefused(f"sub-scan '{self.name}': every cycling xvar must have the same "
+                                 f"number of rows, got {cycles}")
+        self.n_cycle = int(next(iter(cycles.values()))) if cycles else 1
         clash = [k for k in self.point_keys if k in main_xvarnames]
         if clash:
             raise SubScanRefused(f"sub-scan '{self.name}': {clash} are main-scan xvars")
@@ -170,12 +189,18 @@ class SubScan:
         if self.N == 0:
             self.disable("no schedule event fits a run of "
                          f"{n_data_shots} data shots (every {self.every_n_shots})")
+            self._init_empty()
             return
+        # event e takes row e % n_cycle of each xvar; the point order is
+        # reversed on every other cycle (not event), so a cycling value sees
+        # both orders equally
         for i, key in enumerate(self.point_keys):
-            per_event = self._point_values[key]
+            rows = self._point_values[key]
             parts = []
             for e in range(self.n_events):
-                parts.append(per_event[::-1] if (self.alternate and e % 2 == 1) else per_event)
+                row = rows[e % rows.shape[0]]
+                reverse = self.alternate and ((e // self.n_cycle) % 2 == 1)
+                parts.append(row[::-1] if reverse else row)
             full = np.concatenate(parts)
             self.point_xvars.append(xvar(key, full, position=i))
         # the scan axis is the first key; the containers' slot is its counter
@@ -205,9 +230,21 @@ class SubScan:
             vars(main)[full] = dc
             main.keys.append(full)
 
-    def disable(self, reason):
+    def _init_empty(self):
+        """Size the containers to zero points so the kernel code that names
+        them type-checks; they are never written, pushed or saved."""
+        self.xvardims = [0]
+        self.N = 0
+        if not self.data.keys:
+            self.data.init()
+
+    def disable(self, reason, quiet=False):
+        """No points this run. ``quiet``: an intended setting (the experiment
+        turned the sub-scan off), not a failure -- nothing is printed loudly
+        and nothing is recorded in the file."""
         self.enabled = False
         self.disabled_reason = str(reason)
+        self.quiet = bool(quiet)
         self.log["notes"].append(f"disabled: {reason}")
 
     def describe(self):
@@ -284,6 +321,15 @@ class SubScan:
             self.expt.push_shot_data(items, idx=(i,), final=True)
         self.log["points"].append(entry)
         self.counter += 1
+        # the experiment's host hook (a calibration policy's entry point);
+        # its errors are logged, never raised
+        hook = getattr(self.expt, "on_sub_scan_point", None)
+        if hook is not None:
+            try:
+                hook(self, i, bool(ok))
+            except Exception as e:
+                self.log["notes"].append(f"on_sub_scan_point({i}): {error_text(e)}")
+                print(f"[sub-scan] !! host error in on_sub_scan_point (the run goes on): {e!r}")
         return entry
 
     def finish_run(self):
@@ -303,6 +349,15 @@ class SubScan:
                     self.pushes_failed.append(full)
         elif failed:
             self.pushes_failed.extend(failed)
+        # the experiment's end-of-run hook (a policy's evaluation into the log)
+        hook = getattr(expt, "on_sub_scan_finish", None)
+        if hook is not None:
+            try:
+                hook(self)
+            except Exception as e:
+                self.log["notes"].append(f"on_sub_scan_finish: {error_text(e)}")
+                print(f"[sub-scan] !! host error in on_sub_scan_finish (the file still gets the "
+                      f"points): {e!r}")
         self.log["summary"] = {
             "n_points": int(self.N), "n_taken": int(self.counter), "n_ok": int(self.n_ok),
             "n_failed": int(self.n_failed), "enabled": bool(self.enabled),
@@ -316,7 +371,8 @@ class SubScan:
             "format": FORMAT, "name": self.name, "prefix": self.prefix,
             "every_n_shots": self.every_n_shots, "at_start": self.at_start,
             "alternate": self.alternate, "reads_params": list(self.reads_params),
-            "n_points_per_event": self.n_points_per_event, "n_events": self.n_events,
+            "n_points_per_event": self.n_points_per_event, "n_cycle": self.n_cycle,
+            "n_events": self.n_events,
             "N": self.N, "event_starts": list(self.event_starts),
             "xvarnames": list(self.xvarnames),
             "xvars": {x.key: np.asarray(x.values).tolist() for x in self.scan_xvars},

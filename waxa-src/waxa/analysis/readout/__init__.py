@@ -35,12 +35,13 @@ from .sz_response import (collapse_by_sz, fit_sz_response, group_by_x, interp_vs
                           pulse_time_to_angle_and_sz, sz_response)
 from .scope_pulses import DEFAULT_WINDOWS, ScopePulses, check_timing, find_pulse_edges, integrate_scope_pulses
 from .calibration import (DEFAULT_ENDPOINT_WINDOW, POOLING_P_LIMIT, Endpoints, NoiseEstimate,
-                          ReadoutCalibration, calibrate_readout, flop_coordinate)
+                          ReadoutCalibration, calibrate_readout, endpoint_groups, flop_coordinate)
 from .plotting import plot_pulses, plot_summary
 
 __all__ = [
     "DEFAULT_ENDPOINT_WINDOW", "DEFAULT_WINDOWS", "Endpoints", "NoiseEstimate", "POOLING_P_LIMIT",
-    "ReadoutCalibration", "ScopePulses", "calibrate_readout", "check_timing", "collapse_by_sz", "find_pulse_edges",
+    "ReadoutCalibration", "ScopePulses", "calibrate_readout", "check_timing", "collapse_by_sz",
+    "endpoint_groups", "find_pulse_edges",
     "fit_sz_response", "flop_coordinate", "group_by_x", "integrate_scope_pulses", "interp_vs_sz",
     "plot_pulses", "plot_summary", "pulse_time_to_angle_and_sz", "sz_response",
 ]

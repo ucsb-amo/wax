@@ -464,6 +464,28 @@ def _flop_dict(f):
     return d
 
 
+def endpoint_groups(signal_per_shot, contrast, min_sigma_factor=2.5):
+    """Does one end of a readout calibration split into two groups?
+
+    ``signal_per_shot``: the per-shot (pulse-averaged) readout of the shots at
+    one endpoint; ``contrast``: the up-down contrast the limit scales with. A
+    shot more than ``max(contrast / 2, min_sigma_factor x the robust sigma)``
+    from the endpoint's median counts as a second group -- the half-contrast
+    limit alone flagged ordinary scatter at low contrast (feedback drivers,
+    2026-10-07). Returns (flag, detail dict). NaNs are left out."""
+    s = np.asarray(signal_per_shot, float).ravel()
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return False, dict(n=0, median=np.nan, max_dev=np.nan, limit=np.nan, n_beyond=0, robust_sigma=np.nan)
+    med = float(np.median(s))
+    dev = np.abs(s - med)
+    mad_sigma = 1.4826 * float(np.median(dev))
+    lim = max(0.5 * abs(float(contrast)), float(min_sigma_factor) * mad_sigma)
+    n_bad = int(np.sum(dev > lim))
+    return n_bad > 0, dict(n=int(s.size), median=med, max_dev=float(dev.max()), limit=float(lim),
+                           n_beyond=n_bad, robust_sigma=mad_sigma)
+
+
 # --------------------------------------------------------------------- entry
 def calibrate_readout(t_pulse, signal, *, run=None, run_ids=None, timestamps=None, t_pi=None, t_offset=0.0,
                       sz_source="fit", pulses_used=None, degree="auto", endpoint_window=DEFAULT_ENDPOINT_WINDOW,

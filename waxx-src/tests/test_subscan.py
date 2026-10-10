@@ -111,6 +111,25 @@ def test_points_are_tiled_per_event_with_the_order_reversed_on_odd_events():
     assert np.allclose(sub2.point_xvars[1].values, [0, 1, 0, 1, 0, 1])
 
 
+def test_a_two_d_xvar_cycles_over_events_and_the_order_reverses_per_cycle():
+    e = _expt(n_data=9)                                   # events before shots 0, 2, 4, 6, 8
+    sub = e.add_sub_scan("cal", every_n_shots=2, at_start=True, alternate=True)
+    sub.xvar("t_pulse", [0.0, 2.0])
+    sub.xvar("mode", [[0.0, 0.0], [1.0, 1.0]])
+    sub.data.apd = sub.add_data_container(2)
+    _finish(e, sub)
+    assert sub.n_cycle == 2 and sub.n_events == 5 and sub.N == 10
+    # modes alternate event by event; the pair order reverses every other cycle of two events
+    assert np.allclose(sub.point_xvars[1].values, [0, 0, 1, 1, 0, 0, 1, 1, 0, 0])
+    assert np.allclose(sub.scan_xvars[0].values, [0, 2, 0, 2, 2, 0, 2, 0, 0, 2])
+    e2 = _expt(n_data=5)
+    sub2 = e2.add_sub_scan("cal")
+    sub2.xvar("a", [[0., 1.], [1., 0.]])
+    sub2.xvar("b", [[0., 1.], [1., 0.], [2., 2.]])
+    with pytest.raises(SubScanRefused, match="same number of rows"):
+        _finish(e2, sub2)
+
+
 def test_due_follows_the_data_shot_count():
     e = _expt(n_data=5)
     sub = _finish(e, _declare(e, every=2))
@@ -278,6 +297,22 @@ def test_disabled_loudly_without_a_liveod_that_takes_data(capsys):
 
 
 # -------------------------------------------------------------------- RPCs
+
+def test_the_host_hooks_are_called_and_their_errors_are_logged(capsys):
+    e = _expt(n_data=5)
+    sub = _finish(e, _declare(e))
+    seen = []
+    e.on_sub_scan_point = lambda s, i, ok: seen.append((i, ok)) or (1 / 0 if i == 1 else None)
+    e.on_sub_scan_finish = lambda s: seen.append("finish")
+    sub.begin_point()
+    sub.end_point(True)
+    sub.begin_point()
+    sub.end_point(False, "x")
+    sub.finish_run()
+    assert seen == [(0, True), (1, False), "finish"]
+    assert any("on_sub_scan_point(1)" in n for n in sub.log["notes"])
+    assert "host error in on_sub_scan_point" in capsys.readouterr().out
+
 
 def test_the_rpcs_never_raise_and_log_the_host_error(capsys):
     e = _expt(n_data=5)

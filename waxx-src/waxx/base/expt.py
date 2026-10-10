@@ -654,6 +654,8 @@ class Expt(Scanner, Dealer, Scribe):
         self._subscan_enabled = bool(sub.enabled)
         if sub.enabled:
             console.info("[sub-scan] " + sub.describe())
+        elif getattr(sub, "quiet", False):
+            console.info(f"[sub-scan] '{sub.name}' off this run ({sub.disabled_reason})")
         else:
             print(f"[sub-scan] !! '{sub.name}' is DISABLED this run: {sub.disabled_reason}. "
                   f"No interleaved points are taken; the data run proceeds.")
@@ -734,8 +736,9 @@ class Expt(Scanner, Dealer, Scribe):
         # recorded (aux_frames_dropped) before END_RUN is built
         self._close_shot_data_queue()
         # the sub-scan's log and description into the file's attrs (and any
-        # container whose slot push failed, pushed whole)
-        if self._subscan is not None:
+        # container whose slot push failed, pushed whole); a sub-scan turned
+        # off by the experiment leaves nothing
+        if self._subscan is not None and not (not self._subscan.enabled and getattr(self._subscan, "quiet", False)):
             try:
                 self._subscan.finish_run()
             except Exception as e:
