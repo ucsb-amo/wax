@@ -24,6 +24,7 @@ from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_queue import RunQueue, default_dir as default_queue_dir
+from waxx.util.dashboard.exit_codes import EXIT_RESTART
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -223,9 +224,11 @@ class MonitorUDPServer(UdpServer):
       for a shutdown.  Why it exists: the kexp server registry gives the
       monitor server no ``shutdown_request``, so the Server Dashboard's
       Restart / Stop on it is a pid-tree kill (whatever runs is cut off), and
-      its supervisor restarts a server only after a non-zero exit -- this
-      request is the clean way, and exit code 3 makes the supervisor start it
-      again.  A loop's Start is refused while
+      it restarts a server by itself only on a crash with restart_on_crash --
+      this request is the clean way: the supervisor starts a server that exits
+      with ``EXIT_RESTART`` (3, :mod:`waxx.util.dashboard.exit_codes`) again,
+      not as a crash.  The GUI launcher runs unsupervised: there, exit code 3
+      is just an exit (nothing starts it again).  A loop's Start is refused while
       the queue has a job in its slot or one eligible to launch now (jobs due
       later, held or paused leave the loop alone).
 
@@ -289,9 +292,9 @@ class MonitorUDPServer(UdpServer):
     #: the monitor experiment and leaves the Qt loop with this exit code.
     server_exit_signal = pyqtSignal(int, str)
 
-    #: The exit code of a requested restart: the dashboard's supervisor
-    #: restarts a server that exits non-zero.
-    EXIT_RESTART = 3
+    #: The exit code of a requested restart (waxx.util.dashboard.exit_codes):
+    #: the dashboard's supervisor starts the server again on it.
+    EXIT_RESTART = EXIT_RESTART
     #: How long a loop active between runs gets to stop before a restart.
     LOOP_STOP_WAIT_S = 5.0
 
