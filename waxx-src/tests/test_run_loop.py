@@ -678,7 +678,9 @@ def _stuck(reset, host=None, **extra):
     live = ClientLive(client_pid=4242, client_host=host or socket.gethostname(),
                       launcher="run_lock")
     live.run_in_progress, live.run_id, live.reset_requested = True, 85528, reset
-    live.extra = extra
+    # 85528 had no shot, no frame, no pushed array (a run with data is never
+    # waived with an Abort pending: test_run_gate)
+    live.extra = dict({"n_shots": 0, "images_received": 0, "aux_items_received": 0}, **extra)
     return live
 
 

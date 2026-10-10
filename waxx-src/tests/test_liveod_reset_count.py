@@ -151,3 +151,15 @@ def test_an_unusable_data_file_aborts_as_liveod_not_a_person(srv):
     poll = _poll(srv)
     assert poll["reset_counts"]["liveod"] == 1 and poll["reset_counts"]["person"] == 0
     assert poll["reset_requested"] is True
+
+
+def test_poll_counts_the_arrays_pushed_during_the_run(srv):
+    from types import SimpleNamespace
+    import numpy as np
+    assert _poll(srv)["aux_items_received"] == 0
+    _init(srv)
+    srv._note_aux_items([SimpleNamespace(key="img_mot", index=(0,), offset=None,
+                                         array=np.zeros(3))])
+    assert _poll(srv)["aux_items_received"] == 1
+    _init(srv)                                         # a new run starts at 0
+    assert _poll(srv)["aux_items_received"] == 0

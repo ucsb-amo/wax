@@ -973,6 +973,9 @@ class LiveODServer(QThread, NetServer):
         (2026-10-05). Nothing subscribed to them."""
         now = time.time()
         notes = []
+        # every array pushed counts as the run's data (POLL aux_items_received),
+        # the end-of-run slices included
+        self._aux_items_received = getattr(self, "_aux_items_received", 0) + len(items)
         for it in items:
             if it.index is None and it.offset is not None:
                 continue
@@ -1206,6 +1209,7 @@ class LiveODServer(QThread, NetServer):
         self._run_in_progress = True
         self._shot_timestamps = []       # reset per-run timestamp list
         self._aux_latest = {}            # the latest pushed array per key, this run
+        self._aux_items_received = 0     # arrays pushed during this run (POLL)
         self._init_run_time = time.time()
         self._shot_durations = []  # reset rolling average for new run
 
@@ -1970,6 +1974,9 @@ class LiveODServer(QThread, NetServer):
             "n_shots_expected": self._current_n_shots,
             "images_expected": self._images_expected,
             "images_received": self._images_received_now(),
+            # arrays the experiment pushed during this run (PUT_DATA): with
+            # n_shots and images_received, whether the run has data at all
+            "aux_items_received": getattr(self, "_aux_items_received", 0),
             "grab_failure": self._grab_failure,
             "last_outcome": dict(self._last_outcome),
             # the current (or last) run's client: client_pid, client_host,
