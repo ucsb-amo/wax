@@ -341,3 +341,42 @@ def test_the_helper_reports_the_servers_refusal(srv, monkeypatch):
                                                       "reason": why}))
     assert out["sent"] and out["ok"] is False and "liveOD refused" in out["why"]
     assert os.path.exists(run["filepath"]) and _poll(srv)["run_in_progress"]
+
+
+# -- INIT_RUN's finalize of an unanswered Abort (review F5) ---------------------------
+
+def _abort_then(srv, monkeypatch, shots, alive_at_init, **client):
+    run = _init(srv, **client)
+    srv._shot_timestamps = [1.0] * shots
+    _alive(monkeypatch, True)                              # alive when the Abort is set
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    assert _poll(srv)["reset_requested"] is True
+    _alive(monkeypatch, alive_at_init)
+    nxt = _init(srv)                                       # the next run starts
+    return run, nxt
+
+
+def test_a_dead_client_run_with_data_is_kept_at_the_next_init_run(srv, monkeypatch):
+    run, nxt = _abort_then(srv, monkeypatch, 3, False, client_pid=4242, client_host=HERE)
+    assert os.path.exists(run["filepath"])                 # kept, not discarded
+    poll = _poll(srv)
+    last = poll["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "exited"
+    assert last["detail"] == srv.DEAD_CLIENT_KEPT_AT_INIT_WHY
+    assert last["n_shots"] == 3                            # the kept run's own counts
+    assert poll["run_in_progress"] and poll["run_id"] == nxt["run_id"]
+    assert not poll["reset_requested"]                     # the new run is not aborted
+
+
+@pytest.mark.parametrize("shots, alive, client", [
+    (0, False, {"client_pid": 4242, "client_host": HERE}),        # dead, no data
+    (3, True, {"client_pid": 4242, "client_host": HERE}),         # live client
+    (3, False, {"client_pid": 4242, "client_host": "other-pc"}),  # unknown: another host
+    (3, False, {"client_host": HERE}),                            # unknown: no pid
+])
+def test_otherwise_the_next_init_run_discards_it_as_before(srv, monkeypatch, shots, alive,
+                                                           client):
+    run, _ = _abort_then(srv, monkeypatch, shots, alive, **client)
+    assert not os.path.exists(run["filepath"])
+    last = _poll(srv)["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"

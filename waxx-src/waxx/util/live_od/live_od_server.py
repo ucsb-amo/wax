@@ -1083,6 +1083,40 @@ class LiveODServer(QThread, NetServer):
         self._set_run_state("aborted")
         self.run_done_signal.emit()
 
+    #: The outcome's why when INIT_RUN finds an unanswered Abort on a run whose
+    #: process is gone and that has data (review F5): its file is kept.
+    DEAD_CLIENT_KEPT_AT_INIT_WHY = "dead client with data, kept at the next run's start"
+
+    def _keep_dead_reset_run(self) -> bool:
+        """At INIT_RUN, with an Abort pending on the run in progress: keep its
+        file instead of discarding it -- its client is known to be gone
+        (:meth:`client_known_dead`) and it has data (:meth:`run_data_counts`)."""
+        if not self.client_known_dead():
+            return False
+        from waxx.util.device_state.run_gate import run_has_data  # noqa: PLC0415
+        return run_has_data(self.run_data_counts())
+
+    def _keep_reset_run_at_init(self):
+        """Close the reset run as an exited run: the writer closes its file with
+        what it has, the path is forgotten (RunFile.leave: not saved, not
+        deleted); outcome "exited" with :data:`DEAD_CLIENT_KEPT_AT_INIT_WHY`.
+        As _finalize_reset_run, the GUI is not notified again."""
+        run_id, counts = self._current_run_id, self.run_data_counts()
+        logger.warning(f"INIT_RUN: run {run_id} had an unanswered Abort, its process is gone and "
+                       f"it has data (shots {counts['n_shots']}, frames "
+                       f"{counts['images_received']}, pushed arrays "
+                       f"{counts['aux_items_received']}): its file is KEPT (not saved as "
+                       f"complete, not deleted).")
+        self._run_file.leave()
+        self._reset_requested = False
+        self._abort_requested_at = None
+        self._abort_again = False
+        self._run_in_progress = False
+        self._record_outcome("exited", self.DEAD_CLIENT_KEPT_AT_INIT_WHY)
+        self._set_run_state("exited", f"run {run_id}: {self.DEAD_CLIENT_KEPT_AT_INIT_WHY}; its "
+                                      f"file is kept as it was")
+        self.run_done_signal.emit()
+
     def _record_outcome(self, outcome: str, detail: str = ""):
         """How the current run ended, for the log buffer's run index and POLL."""
         self._last_outcome = {
@@ -1177,7 +1211,14 @@ class LiveODServer(QThread, NetServer):
         # Abort was pressed between runs and is just cleared (below). Finalizing
         # then recorded the previous run as "discarded/reset" and deleted its
         # file if its save had failed (RunFile keeps the path for a retry).
-        if self._reset_requested and self._run_in_progress:
+        # A run whose process is known to be gone and that has data is KEPT, not
+        # discarded (user ruling 2026-10-09: a run's data is never deleted
+        # unattended): nobody answered its Abort, and a new run starting is not
+        # a person deciding to delete it.  A live / unknown client, or a run
+        # with no data, is discarded as before.
+        if self._reset_requested and self._run_in_progress and self._keep_dead_reset_run():
+            self._keep_reset_run_at_init()
+        elif self._reset_requested and self._run_in_progress:
             self._finalize_reset_run(notify_gui=False)
         elif self._reset_requested:
             logger.info(f"INIT_RUN: an Abort pressed with no run in progress is cleared "
@@ -1620,7 +1661,8 @@ class LiveODServer(QThread, NetServer):
         detail = (f"Abort requested {waited:.0f} s ago and no answer from the experiment "
                   f"(limit {limit:.0f} s, from the shot period): its process may be gone "
                   f"or hung. It is still told to stop; the next run start discards its "
-                  f"file, as for any abort.")
+                  f"file, as for any abort -- unless its process is known to be gone and "
+                  f"the run has data: then its file is kept.")
         logger.warning(f"Run {self._current_run_id}: {detail}")
         self._set_run_state("no_reply", detail)
 
