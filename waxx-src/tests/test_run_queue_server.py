@@ -501,6 +501,28 @@ def test_a_loop_that_does_not_stop_in_time_is_asked_to_start_the_monitor(server,
     loop._s["state"] = "idle"
 
 
+@pytest.mark.parametrize("second", ["not_running", "raises"])
+def test_a_loop_that_ends_just_before_the_second_stop_does_not_break_the_request(
+        server, monkeypatch, second):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"
+    calls = []
+
+    def stop(**kw):
+        calls.append(kw["start_monitor"])
+        if len(calls) == 2:                               # it ended in between
+            loop._s["state"] = "stopped"
+            if second == "raises":
+                raise RuntimeError("the loop is gone")
+            return {"status": "error", "msg": "Auto TOF is not running"}
+        return {"status": "ok"}
+    monkeypatch.setattr(loop, "stop", stop)
+    monkeypatch.setattr(type(server), "LOOP_STOP_WAIT_S", 0.1)
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert calls == [False, True]
+    assert reply["status"] == "ok" and reply["exit_code"] == 3   # stopped after all: go on
+
+
 def test_a_refusal_after_stopping_a_loop_leaves_the_monitor_owed(server, expts, monkeypatch):
     loop = server.loops["auto_tof"]
     loop._s["state"] = "running"
@@ -534,6 +556,29 @@ def test_nothing_new_starts_once_a_restart_is_accepted(server, expts, qapp):
     server.on_message_received("run complete")
     QApplication.processEvents()
     assert restarts == []
+
+
+def test_reads_are_answered_while_exiting(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "person"})
+    server._exiting = "server is restarting"             # as an accepted restart sets it
+    try:
+        refused = {"status": "error", "msg": "server is restarting"}
+        for req in ({"type": "run_queue", "action": "list"},
+                    {"type": "run_queue", "action": "describe", "path": str(expts / "rabi.py")},
+                    {"type": "get_journal", "n": 5},
+                    {"type": "get_version"},
+                    {"type": "poll"},
+                    {"type": "output", "kind": "run_loop", "key": "auto_tof"},
+                    {"type": "slm_reinit", "action": "status"}):
+            assert server.ask(req) != refused, req
+        # the job-log read: never refused for exiting (the panel branch serves it)
+        assert server._starts_work("run_queue", {"action": "tail", "id": 1}) is False
+        assert server.ask({"type": "run_queue", "action": "tail", "id": 1}) != refused
+        assert server._starts_work("slm_reinit", {"action": "now"}) is True
+        assert server.ask({"type": "slm_reinit", "action": "restart"}) == refused
+    finally:
+        server._exiting = ""
 
 
 def test_the_owners_and_the_queue_start_no_monitor_or_loop_while_exiting(tmp_path):

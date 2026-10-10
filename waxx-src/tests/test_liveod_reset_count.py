@@ -380,3 +380,52 @@ def test_otherwise_the_next_init_run_discards_it_as_before(srv, monkeypatch, sho
     assert not os.path.exists(run["filepath"])
     last = _poll(srv)["last_outcome"]
     assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"
+
+
+# -- the file a camera thread already deleted at the Abort (review G2) -----------------
+
+def test_a_file_already_gone_is_never_reported_kept(srv, monkeypatch):
+    # a person's Abort on a camera run while the client was alive: the grab
+    # loop's dishonorable_death deletes the file at once; then the client dies.
+    # The deletion is simulated: os.path.exists says the file is gone (no file
+    # is removed by this test).
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    srv._shot_timestamps = [1.0, 2.0]
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "person"})
+    real_exists = os.path.exists
+    monkeypatch.setattr(os.path, "exists",
+                        lambda p: False if p == run["filepath"] else real_exists(p))
+    _alive(monkeypatch, False)
+    _init(srv)                                             # the next run starts
+    last = _poll(srv)["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"
+    assert last["detail"].startswith(srv.ALREADY_DELETED_AT_ABORT_WHY)
+    assert "the Abort was at" in last["detail"]
+    assert "kept" not in last["detail"].lower()
+    monkeypatch.undo()
+    assert os.path.exists(run["filepath"])                 # this path never deleted it
+
+
+def test_a_run_without_a_file_is_finalized_as_before(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE, save_data=False)
+    srv._shot_timestamps = [1.0]
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET"})
+    _alive(monkeypatch, False)
+    _init(srv)
+    last = _poll(srv)["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"
+
+
+@pytest.mark.parametrize("token", ["", None, 0])
+def test_a_falsy_token_is_still_a_notice_on_behalf(srv, monkeypatch, token):
+    # review G3: _run_msg_ok takes a falsy token as none, so must the refusal
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    srv._shot_timestamps = [1.0]
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "run_token": token, "reason": "sent by a helper"})
+    assert reply["ok"] is False and reply["abort_pending_with_data"]
+    assert _poll(srv)["run_in_progress"] and os.path.exists(run["filepath"])
