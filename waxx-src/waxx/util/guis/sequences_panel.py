@@ -26,8 +26,10 @@ The reset's Run emits ``reset_requested``; the host GUI confirms and sends it
 Above the cards: the person hold (:mod:`~waxx.util.device_state.person_hold`).
 "Hold — a person has the machine" asks for a reason and puts it on at the
 server; while it is on the row says since when, by whom and why, and the same
-button releases it.  The server also puts it on by itself when liveOD's Reset
-is pressed for a run that is not an agent's.  Under it, one line on the run
+button releases it.  The server also puts it on by itself on every Reset a
+person presses in liveOD, whatever run it lands on (a Reset sent by the queue,
+by an agent's own reset_liveod.py or by liveOD itself never does).  Under it,
+one line on the run
 queue (:meth:`SequencesPanel.set_queue`, from ``status_json`` alone): its
 state and how many jobs are queued; the queue itself is shown and driven in
 the monitor server's own panel (Server Dashboard).

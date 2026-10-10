@@ -252,8 +252,13 @@ class MonitorUDPServer(UdpServer):
       a person's hold on the machine
       (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
       runs wait and the run loops do not run.  The server also sets the hold
-      itself when liveOD's Reset is pressed for a run that is not an agent's
-      queued run.  The queue's thread (the watch) follows its job and
+      itself on every Reset a person presses in liveOD (source "person" in
+      liveOD's reset counts -- the window's Abort button or a remote viewer,
+      whatever run it lands on); Resets from the queue, an agent's own
+      reset_liveod.py or liveOD itself never set one.  Against an older
+      liveOD without reset counts it falls back to the level of
+      reset_requested and exempts the queue's agent runs.  The queue's
+      thread (the watch) follows its job and
       launches the next when the machine is free.  ``status_json`` has
       ``run_queue`` and ``person_hold``; changes are broadcast as
       ``run_queue`` and ``person_hold``.
