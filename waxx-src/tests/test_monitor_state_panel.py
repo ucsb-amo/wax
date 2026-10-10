@@ -296,3 +296,25 @@ def test_queue_panel_against_the_real_queue(window, qapp, tmp_path):
     assert qp.cancel_selected()
     qp.refresh_list()
     assert qp.model.jobs[0]["id"] == ids[0] and qp.model.jobs[0]["state"] == "cancelled"
+
+
+def test_a_restarting_server_refusal_shows_in_the_panels(window, qapp, tmp_path):
+    """After a `server` restart is accepted the server refuses requests that
+    would start work ("server is restarting"); through direct_request the
+    panels show that message and keep going -- reads still answer."""
+    qp = window.queue_panel
+    qp.set_reachable(True)
+    qp.refresh_list()
+    window.udp_server._exiting = "server is restarting"
+    qp.ask_text = lambda *a, **k: "mine"
+    assert qp.toggle_hold()
+    assert "server is restarting" in qp.message.text()
+    assert not window.udp_server.person_hold.info()["active"]     # refused, not applied
+    qp.toggle_pause("agent")
+    assert "server is restarting" in qp.message.text()
+    qp.refresh_list()                                               # a read still answers
+    assert qp.has_queue and qp.reachable
+    sp = window.state_panel
+    sp.set_state({"state": 2, "state_name": "NOT_READY", "run_loops": {}})
+    sp.refresh_journal()
+    assert sp.journal_supported                                     # get_journal not refused
