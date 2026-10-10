@@ -395,9 +395,12 @@ class Scanner():
             what = "RTIOOverflow"
             cleaned = True
         except:
+            # the machine's safe state first, as the data shot's handler does:
+            # _subscan_end makes a liveOD push (up to its timeout) and must not
+            # stand between an error and the cleanup
             self.core.break_realtime()
-            self._subscan_end(False, "error")
             self.cleanup_abort_kernel()
+            self._subscan_end(False, "error")
             raise
         if not cleaned:
             self.cleanup_calibration_kernel()

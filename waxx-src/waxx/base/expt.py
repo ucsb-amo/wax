@@ -705,11 +705,18 @@ class Expt(Scanner, Dealer, Scribe):
             return False
 
     def _subscan_end(self, ok, what) -> TInt32:
+        # The abort check reads liveOD's reset flag as of the last SHOT_COMPLETE
+        # (points send none), so mid-run it sees an Abort pressed during a point
+        # only after the next data shot; before shot 0 it polls liveOD. On the
+        # "error" path the kernel re-raises the point's own exception right after
+        # this call: raising TerminationRequested here would replace it.
         reset = False
         try:
             self._subscan.end_point(bool(ok), str(what))
         except Exception as e:
             self._subscan_note("end_point", e)
+        if str(what) == "error":
+            return 0
         try:
             reset = bool(self._check_for_abort_signal(raise_error=False))
         except Exception as e:

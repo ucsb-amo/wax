@@ -125,6 +125,21 @@ class SubScan:
         if values.ndim != 2 or values.size == 0:
             raise SubScanRefused(f"sub-scan xvar {key!r}: values must be a non-empty 1-D sequence "
                                  f"(per event) or 2-D (n_cycle, n_points)")
+        # the kernel writer of an existing key is chosen by its value's type: a
+        # float param given integer points would hand fetch_float a numpy int
+        # (an RPC type error, outside the point's try), an integer param given
+        # fractional points would be rounded silently -- coerce or refuse
+        if key in vars(self.params):
+            cur = vars(self.params)[key]
+            if isinstance(cur, (bool, np.bool_)):
+                pass
+            elif isinstance(cur, (float, np.floating)):
+                values = values.astype(np.float64)
+            elif isinstance(cur, (int, np.integer)):
+                if not np.all(np.equal(np.mod(values, 1), 0)):
+                    raise SubScanRefused(f"sub-scan xvar {key!r}: the param is an integer but the "
+                                         f"point values are not whole numbers")
+                values = values.astype(np.int64)
         if key not in vars(self.params):
             vars(self.params)[key] = values[0, 0]
         self._point_values[key] = values
@@ -308,30 +323,34 @@ class SubScan:
         The counter advances whether the point succeeded or not."""
         self._restore()
         i = self.counter
-        entry = {"slot": i, "event": i // self.n_points_per_event if self.n_points_per_event else 0,
-                 "ok": bool(ok), "what": str(what), "t": time.time(),
-                 "values": {k: _jsonable(v) for k, v in self.point_values(i).items()}}
         try:
-            acq, final = getattr(self.expt, "_last_data_shot", (-1, -1))
-        except Exception:
-            acq, final = -1, -1
-        entry["main_acq_index"] = int(acq)
-        entry["main_final_slot"] = int(final)
-        if ok:
-            self.n_ok += 1
-            self.data.time.put_shot_data_host((i,), entry["t"])
-            self.data.main_index.put_shot_data_host((i,), np.array([acq, final], dtype=np.int64))
-            self.data.status.put_shot_data_host((i,), 1)
-            items = [(vars(self.data)[k], vars(self.data)[k]._run_data[i]) for k in self.data.keys]
-            pushed = self.expt.push_shot_data(items, idx=(i,), final=True)
-            entry["pushed"] = bool(pushed)
-        else:
-            self.n_failed += 1
-            self.data.status.put_shot_data_host((i,), 2)
-            items = [(self.data.status, self.data.status._run_data[i])]
-            self.expt.push_shot_data(items, idx=(i,), final=True)
-        self.log["points"].append(entry)
-        self.counter += 1
+            entry = {"slot": i, "event": i // self.n_points_per_event if self.n_points_per_event else 0,
+                     "ok": bool(ok), "what": str(what), "t": time.time(),
+                     "values": {k: _jsonable(v) for k, v in self.point_values(i).items()}}
+            try:
+                acq, final = getattr(self.expt, "_last_data_shot", (-1, -1))
+            except Exception:
+                acq, final = -1, -1
+            entry["main_acq_index"] = int(acq)
+            entry["main_final_slot"] = int(final)
+            if ok:
+                self.n_ok += 1
+                self.data.time.put_shot_data_host((i,), entry["t"])
+                self.data.main_index.put_shot_data_host((i,), np.array([acq, final], dtype=np.int64))
+                self.data.status.put_shot_data_host((i,), 1)
+                items = [(vars(self.data)[k], vars(self.data)[k]._run_data[i]) for k in self.data.keys]
+                pushed = self.expt.push_shot_data(items, idx=(i,), final=True)
+                entry["pushed"] = bool(pushed)
+            else:
+                self.n_failed += 1
+                self.data.status.put_shot_data_host((i,), 2)
+                items = [(self.data.status, self.data.status._run_data[i])]
+                self.expt.push_shot_data(items, idx=(i,), final=True)
+            self.log["points"].append(entry)
+        finally:
+            # whatever happened above, the point is done: a counter left behind
+            # would make the scan loop take the same point again, forever
+            self.counter += 1
         # the experiment's host hook (a calibration policy's entry point);
         # its errors are logged, never raised
         hook = getattr(self.expt, "on_sub_scan_point", None)
