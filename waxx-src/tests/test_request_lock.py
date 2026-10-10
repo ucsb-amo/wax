@@ -116,3 +116,19 @@ def test_reads_do_not_wait_for_the_lock(server):
         release.set()
         t.join(5)
 
+
+
+def test_the_uptime_is_the_process_s(monkeypatch):
+    """From the process's creation (psutil), else from the module's import."""
+    import builtins
+    from waxx.util.guis import monitor_server_gui as msg
+    assert msg._process_uptime_s() >= 0.0
+    real_import = builtins.__import__
+
+    def no_psutil(name, *a, **k):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", no_psutil)
+    monkeypatch.setattr(msg, "_IMPORTED_AT", time.time() - 30.0)
+    assert 29.0 < msg._process_uptime_s() < 40.0

@@ -1,6 +1,7 @@
 import socket
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
@@ -25,7 +26,7 @@ from waxx.util.device_state.state_reset import StateReset
 from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_queue import RunQueue, default_dir as default_queue_dir
-from waxx.util.dashboard.exit_codes import EXIT_RESTART
+from waxx.util.dashboard.exit_codes import EXIT_RESTART, RESTART_REQUEST_MIN_UPTIME_S
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -34,6 +35,24 @@ log = logging.getLogger(__name__)
 
 _STATE_NAMES = {STATES.READY: "READY", STATES.LOADING: "LOADING",
                 STATES.NOT_READY: "NOT_READY"}
+
+
+#: when this module was imported (wall clock) -- the fallback for the
+#: process's start, which the launcher reaches within moments of it
+_IMPORTED_AT = time.time()
+
+
+def _process_uptime_s() -> float:
+    """Seconds since this process started: its creation time (psutil), or,
+    without psutil, since this module was imported (a little later than the
+    process start, so an uptime floor checked against it errs on the safe
+    side)."""
+    try:
+        import psutil  # noqa: PLC0415
+        started = psutil.Process().create_time()
+    except Exception:                                 # noqa: BLE001
+        started = _IMPORTED_AT
+    return max(0.0, time.time() - started)
 
 
 def _state_name(state) -> str:
@@ -324,6 +343,12 @@ class MonitorUDPServer(UdpServer):
     EXIT_RESTART = EXIT_RESTART
     #: How long a loop active between runs gets to stop before a restart.
     LOOP_STOP_WAIT_S = 5.0
+    #: A restart request is refused while this server's uptime is below
+    #: exit_codes.RESTART_REQUEST_MIN_UPTIME_S plus this margin: the
+    #: supervisor takes an exit 3 sooner than that as a crash, and the monitor
+    #: server is not restarted on a crash (restart_on_crash=False) -- the
+    #: request would leave it down.
+    RESTART_UPTIME_MARGIN_S = 2.0
 
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
@@ -355,6 +380,11 @@ class MonitorUDPServer(UdpServer):
 
         self.config_file_path = config_file_path
         self._version = int(time.time())
+        #: when this server's process started, on the monotonic clock: a
+        #: restart request is refused until RESTART_REQUEST_MIN_UPTIME_S +
+        #: RESTART_UPTIME_MARGIN_S have passed since (the supervisor counts
+        #: its child's uptime from the same process start)
+        self._started_at = time.monotonic() - _process_uptime_s()
         self._broadcaster = _TappedBroadcaster(StateBroadcaster(), self.broadcast_sent.emit)
         self.ops = OpQueue()
         self.journal = OpJournal(journal_dir)
@@ -517,7 +547,7 @@ class MonitorUDPServer(UdpServer):
         if mtype in cls._READ_TYPES:
             return True
         if mtype == "run_queue":
-            return obj.get("action") in ("list", "describe", "tail")
+            return obj.get("action") in cls._QUEUE_READS     # the one list of queue reads
         if mtype == "run_loop":
             return obj.get("action") == "describe"
         if mtype == "slm_reinit":
@@ -908,6 +938,13 @@ class MonitorUDPServer(UdpServer):
     def _reply_server(self, obj: dict) -> dict:
         """``{"type": "server", "action": "restart" | "shutdown", "by", "owner"}``.
 
+        A restart is refused first of all -- before any other check, loop stop
+        or launch stop -- while this server's process has been up less than
+        exit_codes.RESTART_REQUEST_MIN_UPTIME_S + RESTART_UPTIME_MARGIN_S
+        (12 s): the supervisor would take that exit 3 as a crash and, with
+        restart_on_crash=False, leave the server down ("server started N s
+        ago; retry in M s", journaled as ``server_restart_refused``).
+
         Refused while the run queue has a job in its slot (launching, running,
         ending), while a run loop has a run in progress, or while the monitor
         experiment is starting (LOADING).  A loop that is active between runs
@@ -937,6 +974,12 @@ class MonitorUDPServer(UdpServer):
                                 msg=msg)
             return {"status": "error", "msg": msg}
 
+        if action == "restart":
+            uptime = time.monotonic() - self._started_at
+            floor = RESTART_REQUEST_MIN_UPTIME_S + self.RESTART_UPTIME_MARGIN_S
+            if uptime < floor:
+                return refuse(f"server started {uptime:.0f} s ago; retry in "
+                              f"{math.ceil(floor - uptime):.0f} s")
         if self.status.state == STATES.LOADING:
             return refuse("the monitor experiment is starting -- ask again once it is running")
         busy = self._queue_slot_text()

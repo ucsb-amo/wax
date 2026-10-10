@@ -51,6 +51,7 @@ def server(qapp, monkeypatch, tmp_path, expts):
                              run_loops=[LoopSpec("auto_tof", "BEC TOF loop",
                                                  str(expts / "auto_tof.py"))])
     s.status.expt_path = str(expts / "monitor.py")
+    s._started_at -= 60.0                   # up a minute: past the restart uptime floor
     s.live = Live()
     s._live_od = s.live                               # the queue calls it late
     s.spawner = Spawner()
@@ -605,3 +606,36 @@ def test_the_owners_and_the_queue_start_no_monitor_or_loop_while_exiting(tmp_pat
     q.stop_launching("the monitor server is restarting")
     q.tick()
     assert loop.starts == [] and q.monitor_starts == []
+
+
+def test_a_restart_is_refused_until_the_server_has_been_up_long_enough(server):
+    """An exit 3 within RESTART_REQUEST_MIN_UPTIME_S of the process start is a
+    crash to the supervisor, and the monitor server is not restarted on a
+    crash: until that floor plus a margin, the request is refused (it would
+    leave the server down) and nothing starts exiting."""
+    import time
+    from waxx.util.dashboard.exit_codes import RESTART_REQUEST_MIN_UPTIME_S
+    floor = RESTART_REQUEST_MIN_UPTIME_S + server.RESTART_UPTIME_MARGIN_S
+    assert floor == 12.0
+    server._started_at = time.monotonic() - 3.2
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert reply["status"] == "error"
+    assert reply["msg"] == "server started 3 s ago; retry in 9 s"
+    assert not server.exiting
+    assert any(e["kind"] == "server_restart_refused" for e in server.journal.tail(20))
+    server._started_at = time.monotonic() - floor - 0.5
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["exit_code"] == server.EXIT_RESTART
+
+
+def test_a_shutdown_is_not_held_by_the_uptime_floor(server):
+    import time
+    server._started_at = time.monotonic() - 1.0
+    reply = server.ask({"type": "server", "action": "shutdown", "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["exit_code"] == 0
+
+
+def test_the_supervisor_and_the_server_share_one_uptime_floor():
+    from waxx.util.dashboard import exit_codes
+    from waxx.util.dashboard.server_supervisor import ServerSupervisor
+    assert ServerSupervisor.RESTART_REQUEST_MIN_UPTIME_S == exit_codes.RESTART_REQUEST_MIN_UPTIME_S

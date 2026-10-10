@@ -318,3 +318,28 @@ def test_a_restarting_server_refusal_shows_in_the_panels(window, qapp, tmp_path)
     sp.set_state({"state": 2, "state_name": "NOT_READY", "run_loops": {}})
     sp.refresh_journal()
     assert sp.journal_supported                                     # get_journal not refused
+
+
+def test_a_log_window_keeps_following_while_the_server_exits(window, qapp, tmp_path):
+    """8c624fa: every read is answered while the server is exiting -- the
+    queue's tail included -- so a job's log window goes on following (it
+    used to stop on "server is restarting"); a change is still refused."""
+    (tmp_path / "logjob.py").write_text('"""logjob."""\n')
+    reply = window.direct_request({"type": "run_queue", "action": "submit",
+                                   "path": str(tmp_path / "logjob.py"), "by": "jp",
+                                   "owner": "person"})
+    assert reply["status"] == "ok", reply
+    job = reply["jobs"][0]
+    window.udp_server._exiting = "server is restarting"
+    qp = window.queue_panel
+    qp.set_reachable(True)
+    qp.refresh_list()
+    log_window = qp.show_log(job)
+    assert not log_window.stopped and "server is restarting" not in log_window.status.text()
+    log_window.fetch()
+    assert not log_window.stopped
+    qp.select_job(job["id"])
+    qp.confirm = lambda *a, **k: True
+    qp.cancel_selected()
+    assert "server is restarting" in qp.message.text()             # a change: refused
+    log_window.close()

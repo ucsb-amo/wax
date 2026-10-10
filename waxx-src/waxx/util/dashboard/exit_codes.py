@@ -19,3 +19,10 @@ restarted by anything: exit code 3 is then just an exit.
 
 #: The process asks its supervisor to start it again.
 EXIT_RESTART = 3
+
+#: An EXIT_RESTART sooner than this after the process started is taken as a
+#: crash (ServerSupervisor).  A server that offers a restart request refuses
+#: it until its own uptime is a margin above this (the monitor server:
+#: RESTART_REQUEST_MIN_UPTIME_S + 2 s), or the request would leave it down
+#: under restart_on_crash=False.
+RESTART_REQUEST_MIN_UPTIME_S = 10.0

@@ -59,6 +59,8 @@ _CREATE_NO_WINDOW = 0x08000000
 # (waxx.util.supervise), which runs servers on PCs without a dashboard; these
 # names stay importable from here.
 from waxx.util.dashboard.exit_codes import EXIT_RESTART  # noqa: E402
+from waxx.util.dashboard.exit_codes import (  # noqa: E402
+    RESTART_REQUEST_MIN_UPTIME_S as _RESTART_REQUEST_MIN_UPTIME_S)
 from waxx.util.supervise import (  # noqa: E402
     install_console_signal_guard,
     kill_pid_tree as _kill_pid_tree,
@@ -162,7 +164,9 @@ class ServerSupervisor(QObject):
     # started again only after it ran this long: exit code 3 is also what a
     # C runtime abort(), Qt's qFatal or a platform-plugin failure gives on
     # Windows, which happen at start-up.  Sooner, it is a crash (today's policy).
-    RESTART_REQUEST_MIN_UPTIME_S = 10.0
+    # (one value, in exit_codes: the monitor server refuses a restart request
+    # until its own uptime is past it)
+    RESTART_REQUEST_MIN_UPTIME_S = _RESTART_REQUEST_MIN_UPTIME_S
     # Requested restarts have their own storm guard: more than this many
     # within REQUESTED_RESTART_WINDOW_S -> FAILED.
     MAX_REQUESTED_RESTARTS = 3
@@ -613,9 +617,8 @@ class ServerSupervisor(QObject):
                 self._requested_server_restart(exit_code, uptime)
                 return
 
-        crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
-
-        crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
+        # (one assignment: a merge had left an identical duplicate line here)
+        crashed = exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
         if crashed and not self._stop_requested:
             self._set_state(SupervisorState.CRASHED)
             self.crashed.emit(exit_code)
