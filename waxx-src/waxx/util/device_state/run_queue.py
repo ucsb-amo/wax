@@ -2199,7 +2199,8 @@ class RunQueue:
         """No job eligible, none in the slot: start the loop the queue stopped
         (no hold, nothing paused), else ask for the monitor if the queue has
         run jobs since it last ran out."""
-        if active_loop is not None:
+        if active_loop is not None or self._stop_launching:
+            # (the server is restarting: no loop and no monitor started from here)
             return
         resume = self._resume_loop
         blocked = ""

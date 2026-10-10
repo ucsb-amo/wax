@@ -393,8 +393,11 @@ def test_server_restart_stops_a_loop_between_runs_releases_and_exits_3(server, e
     assert exits == [(3, "restart asked by kq@kong (agent)")]
     rec = [e for e in server.journal.tail(100) if e["kind"] == "server_restart_requested"][-1]
     assert rec["by"] == "kq@kong" and rec["owner"] == "agent" and rec["exit_code"] == 3
-    # nothing launches any more
-    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    # nothing launches any more (a request to submit is refused now -- F1 --
+    # and a job already queued waits)
+    assert server.ask({"type": "run_queue", "action": "submit",
+                       "path": str(expts / "rabi.py")})["msg"] == "server is restarting"
+    server.run_queue.submit({"path": str(expts / "rabi.py")})
     server.watch_tick()
     assert server.spawner.calls == []
     assert "restarting" in server.run_queue.info()["waiting"]
@@ -456,3 +459,50 @@ def test_the_gui_owner_cleans_up_once_then_exits_with_the_code(monkeypatch):
     gui.MonitorServerGUI._exit_now(owner, 3)
     assert calls == ["udp", "quit", "wait", "monitor"]       # once
     assert _FakeApp.codes == [3, 3]
+
+
+# --- nothing new starts in the exit window (review F1) ---------------------------------------------
+
+def test_nothing_new_starts_once_a_restart_is_accepted(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    restarts, starts = [], []
+    server.reset_signal.connect(lambda: restarts.append(True))
+    server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert server.exiting == "server is restarting"
+    for req in ({"type": "run_loop", "action": "start", "loop": "auto_tof"},
+                {"type": "reset_state", "operator": "jp"},
+                {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")},
+                {"type": "run_queue", "action": "resume", "scope": "all", "owner": "person"},
+                {"type": "server", "action": "restart", "owner": "person"}):
+        assert server.ask(req) == {"status": "error", "msg": "server is restarting"}, req
+    assert server.ask({"type": "run_queue", "action": "list"})["status"] == "ok"   # reads still
+    server.on_message_received("reset")                   # a monitor start: not now
+    server.on_message_received("run complete")
+    QApplication.processEvents()
+    assert restarts == []
+
+
+def test_the_owners_and_the_queue_start_no_monitor_or_loop_while_exiting(tmp_path):
+    from waxx.util.guis import monitor_server_headless as headless
+    started = []
+
+    class Owner:
+        udp_server = type("U", (), {"exiting": "server is restarting"})()
+        monitor_manager = type("M", (), {"isRunning": lambda self: False})()
+
+        def _restart_monitor(self):
+            started.append(True)
+    headless.HeadlessMonitorServer._start_monitor_unless_running(Owner(), "loop ended")
+    assert started == []
+    from test_run_queue import FakeLoop, make_queue
+    expts = tmp_path / "e"
+    expts.mkdir()
+    loop = FakeLoop()
+    loop.state = "stopped"
+    loop.text = "stopped by run queue@kong after 1 saved run"
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    q._resume_loop = {"key": "auto_tof", "path": None, "since": 0.0}
+    q._owe_monitor = True
+    q.stop_launching("the monitor server is restarting")
+    q.tick()
+    assert loop.starts == [] and q.monitor_starts == []

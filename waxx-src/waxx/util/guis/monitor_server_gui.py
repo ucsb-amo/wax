@@ -412,6 +412,10 @@ class MonitorUDPServer(UdpServer):
         if m in ('status', 'status_json'):
             # Polled continuously; never logged, never forwarded.
             return
+        if (m == 'reset' or "run complete" in m) and self.exiting:
+            log.warning("%r ignored: %s.", m, self.exiting)
+            self.journal.record("message", text=m, ignored=self.exiting)
+            return
         if m == 'reset' or "run complete" in m:
             # a monitor (re)start takes the core: while the run queue has a job
             # in its slot or one about to launch it is deferred -- the queue
@@ -476,6 +480,8 @@ class MonitorUDPServer(UdpServer):
         except Exception:
             return json.dumps({"status": "error", "msg": "invalid json"})
         mtype = obj.get("type")
+        if self.exiting and self._starts_work(mtype, obj):
+            return json.dumps({"status": "error", "msg": self.exiting})
         if mtype == "get_state":
             return self._reply_get_state()
         if mtype == "get_version":
@@ -885,6 +891,9 @@ class MonitorUDPServer(UdpServer):
         if busy:                                       # one slipped in meanwhile
             self.run_queue.stop_launching("")
             return refuse(f"{busy} -- the server is not restarted under it")
+        # from here no new work starts: requests that would are refused
+        self._exiting = ("server is restarting" if action == "restart"
+                         else "server is shutting down")
         code = self.EXIT_RESTART if action == "restart" else 0
         log.warning("Server %s asked by %s (%s): the loops end, connections are released, "
                     "then the process exits with code %d.", action, by, owner, code)
@@ -900,6 +909,30 @@ class MonitorUDPServer(UdpServer):
         # the owner acts on its own thread, after this reply has gone out
         self.server_exit_signal.emit(code, f"{action} asked by {by} ({owner})")
         return {"status": "ok", "restarting": action == "restart", "exit_code": code}
+
+    #: Set when a ``server`` restart / shutdown is accepted ("server is
+    #: restarting" / "server is shutting down"): from then on nothing new
+    #: starts -- see :meth:`_starts_work`, the 'reset' / 'run complete'
+    #: messages and the owners' monitor start.
+    _exiting = ""
+
+    @property
+    def exiting(self) -> str:
+        """Why this server is about to exit ("" normally)."""
+        return self._exiting
+
+    #: Requests refused while the server is exiting (they would start work).
+    _WORK_TYPES = frozenset({"reset_state", "regenerate_state", "op", "run_scene", "server",
+                             "connection"})
+
+    def _starts_work(self, mtype, obj: dict) -> bool:
+        if mtype in self._WORK_TYPES:
+            return True
+        if mtype == "run_loop":
+            return obj.get("action") in ("start", "configure")
+        if mtype == "run_queue":
+            return obj.get("action") not in ("list", "describe")
+        return False
 
     #: run_queue actions -> the RunQueue method that answers them
     _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
@@ -1702,6 +1735,9 @@ class MonitorServerGUI(QWidget):
     def _start_monitor_unless_running(self, why: str) -> None:
         """A run loop ended: bring the monitor back -- unless it already is
         (an aborted run's ``run complete`` has usually started it)."""
+        if getattr(self.udp_server, "exiting", ""):
+            log.info("%s -- not started: %s.", why, self.udp_server.exiting)
+            return
         if self.monitor_manager.isRunning():
             log.info("%s -- the monitor is already running.", why)
             return
