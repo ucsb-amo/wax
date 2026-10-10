@@ -163,3 +163,82 @@ def test_poll_counts_the_arrays_pushed_during_the_run(srv):
     assert _poll(srv)["aux_items_received"] == 1
     _init(srv)                                         # a new run starts at 0
     assert _poll(srv)["aux_items_received"] == 0
+
+
+# -- a Reset on a run whose process is gone keeps its file (user ruling 2026-10-09) --------------
+
+import socket as _socket
+
+HERE = _socket.gethostname()
+
+
+def _alive(monkeypatch, alive):
+    from waxx.util.device_state import run_gate
+    monkeypatch.setattr(run_gate, "pid_alive", lambda pid: alive)
+
+
+def test_a_reset_after_the_process_died_keeps_the_file(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    srv._shot_timestamps = [1.0, 2.0, 3.0]                # it took shots
+    _alive(monkeypatch, False)
+    reply = srv._handle_reset({"tag": "RESET"})
+    assert reply["ok"] and reply["kept"] and "file is KEPT" in reply["message"]
+    srv._check_exited_run()                               # the server loop's next pass
+    poll = _poll(srv)
+    assert not poll["run_in_progress"] and not poll["reset_requested"]
+    last = poll["last_outcome"]
+    assert last["outcome"] == "exited" and last["run_id"] == run["run_id"]
+    assert last["detail"] == srv.DEAD_CLIENT_RESET_WHY
+    assert os.path.exists(run["filepath"])                # not deleted
+    assert poll["reset_counts"]["person"] == 1            # the press is counted
+    from waxx.util.live_od.gui.remote_viewer_window import RemoteViewerWindow
+    assert "file is KEPT" in RemoteViewerWindow.reply_notice_text("Reset", reply)
+
+
+def test_an_abort_pressed_before_death_then_a_reset_after_keeps_the_file(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    srv._shot_timestamps = [1.0]
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET"})                   # alive: an Abort, as ever
+    assert _poll(srv)["reset_requested"] is True
+    _alive(monkeypatch, False)                            # it dies before answering
+    reply = srv._handle_reset({"tag": "RESET"})           # a person presses again
+    assert reply.get("kept") is True
+    assert _poll(srv)["reset_requested"] is False         # the pending Abort is spent
+    srv._check_exited_run()
+    _init(srv)                                            # the next run starts
+    assert os.path.exists(run["filepath"])
+
+
+def test_the_windows_button_on_a_dead_run_keeps_the_file(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, False)
+    win = _window(srv)
+    win.reset()
+    assert any("file is KEPT" in m for m in win.messages)
+    srv._check_exited_run()
+    assert _poll(srv)["last_outcome"]["detail"] == srv.DEAD_CLIENT_RESET_WHY
+    assert os.path.exists(run["filepath"])
+
+
+@pytest.mark.parametrize("client, alive", [
+    ({"client_pid": 4242, "client_host": HERE}, True),           # a live client
+    ({"client_pid": 4242, "client_host": "other-pc"}, False),    # another host
+    ({"client_host": HERE}, False),                              # no pid recorded
+])
+def test_otherwise_a_reset_is_the_abort_it_always_was(srv, monkeypatch, client, alive):
+    _init(srv, **client)
+    _alive(monkeypatch, alive)
+    reply = srv._handle_reset({"tag": "RESET"})
+    assert reply["ok"] and "kept" not in reply
+    assert _poll(srv)["reset_requested"] is True          # the experiment aborts; discard
+
+
+def test_an_empty_dead_run_with_an_abort_is_discarded_at_the_next_init_run(srv, monkeypatch):
+    # run 85528's case: Abort pending, process killed, no shot, no frame
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET"})
+    _alive(monkeypatch, False)
+    _init(srv)                                            # the gate waived it: next run
+    assert not os.path.exists(run["filepath"])            # discarded, as today
