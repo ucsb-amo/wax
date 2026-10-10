@@ -41,8 +41,14 @@ States (:class:`GateState`):
                    started yet.  Never waivable.
 ``reset_pending``  an Abort is pending in liveOD.  Waivable only when the
                    client's process is known to be dead (pid recorded, host is
-                   this machine, process gone): liveOD finalizes that run at
-                   the next INIT_RUN (its file is discarded, as for any abort).
+                   this machine, process gone) AND the run has no data
+                   (:func:`run_has_data`: POLL's n_shots, images_received and
+                   aux_items_received all 0; a missing field counts as data):
+                   liveOD finalizes that run at the next INIT_RUN and discards
+                   its file, as for any abort -- a run's data is never
+                   deleted unattended (user ruling 2026-10-09).  With data it
+                   is not waivable: a person must look; a Reset in liveOD on a
+                   run whose process is gone keeps the file.
 ``dead_client``    a run is in progress, no Abort, and its client's process is
                    known to be dead -- or liveOD itself heard it exit
                    (``run_state`` "exited", frames still due), pid or not.
@@ -220,6 +226,31 @@ def _saving(poll: dict) -> bool:
     return bool(poll.get("save_in_progress")) or poll.get("run_state") == "saving"
 
 
+#: POLL fields that say whether a run has data; a field a liveOD does not
+#: send counts as data.
+DATA_FIELDS = ("n_shots", "images_received", "aux_items_received")
+
+
+def run_has_data(poll: dict) -> bool:
+    """Whether liveOD's current run has any data: a shot, a camera frame or a
+    pushed array.  A field missing from POLL (an older liveOD) counts as data
+    -- the safe side: such a run is never discarded unattended."""
+    for key in DATA_FIELDS:
+        value = poll.get(key)
+        if value is None:
+            return True
+        try:
+            if float(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _data_text(poll: dict) -> str:
+    return ", ".join(f"{key} {poll.get(key, 'not reported')}" for key in DATA_FIELDS)
+
+
 def _num(value):
     try:
         return None if value is None else float(value)
@@ -309,11 +340,18 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
 
     if in_progress:
         if reset:
-            if client["alive"] is False:
+            if client["alive"] is False and run_has_data(poll):
                 st = GateState("reset_pending", rid,
                                f"run {rid}: an Abort is pending in liveOD and the run's process "
-                               f"({_who(client)}) is gone -- liveOD finalizes the run at the next "
-                               "INIT_RUN (its file is discarded, as for any abort)", True)
+                               f"({_who(client)}) is gone, but the run has data "
+                               f"({_data_text(poll)}) -- not waived: a person must look; a Reset "
+                               "in liveOD now keeps the file (dead client)")
+            elif client["alive"] is False:
+                st = GateState("reset_pending", rid,
+                               f"run {rid}: an Abort is pending in liveOD and the run's process "
+                               f"({_who(client)}) is gone, with no data -- liveOD finalizes the "
+                               "run at the next INIT_RUN (its empty file is discarded, as for "
+                               "any abort)", True)
             else:
                 st = GateState("reset_pending", rid,
                                f"run {rid}: an Abort is pending in liveOD, waiting for the run's "
@@ -623,6 +661,14 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False,
                 "why": f"the run's process is not known to be gone ({proc['why']})",
                 "reply": None}
+    if poll.get("reset_requested") and run_has_data(poll):
+        # liveOD takes RUN_EXITED during an abort as the abort's acknowledgement
+        # and discards the file: never on a run with data, unattended
+        return {"sent": False, "ok": False,
+                "why": f"an Abort is pending on run {run_id} and it has data "
+                       f"({_data_text(poll)}): RUN_EXITED would discard its file -- a person "
+                       "must look (a Reset in liveOD on a run whose process is gone keeps "
+                       "the file)", "reply": None}
     if send is not None:
         reply = send(int(run_id), str(reason))
     else:

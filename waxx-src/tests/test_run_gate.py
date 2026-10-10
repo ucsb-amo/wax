@@ -176,8 +176,10 @@ def test_a_failing_pid_check_counts_as_unknown():
 
 def test_reset_pending_with_a_dead_client_is_waivable():
     # run 85528, 2026-10-09: killed with its client, Abort pending, no shot
+    # (no shot, no frame, no pushed array: nothing a discard could lose)
     poll = _running(reset_requested=True, n_shots=0, last_shot_age_s=None,
-                    init_run_age_s=3600.0, run_state="no_reply")
+                    init_run_age_s=3600.0, run_state="no_reply", images_received=0,
+                    aux_items_received=0)
     st = classify(poll, None, now=NOW, pid_alive=_dead)
     assert st.state == "reset_pending" and st.waivable and st.run_id == 85528
     assert "next INIT_RUN" in st.reason and "discarded" in st.reason
@@ -430,7 +432,8 @@ def test_run_exited_is_never_sent_during_a_save(poll):
 
 def test_run_exited_for_an_abort_when_liveod_says_no_save_runs():
     client = FakeLiveOD(_running(save_in_progress=False, reset_requested=True,
-                                 run_state="aborting"))
+                                 run_state="aborting", n_shots=0, images_received=0,
+                                 aux_items_received=0))
     assert tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)["sent"]
 
 
@@ -513,3 +516,50 @@ def test_the_queues_job_in_its_slot_or_about_to_launch_is_busy():
     held = dict(base, person_hold={"active": True, "since": 1.0, "by": "jp", "reason": "x"},
                 run_queue={"current": None, "next": [13]})
     assert run_gate.loops_verdict(held).state == "held"
+
+
+# -- a run's data is never deleted unattended (user ruling 2026-10-09) ------------------------
+
+EMPTY = {"n_shots": 0, "images_received": 0, "aux_items_received": 0}
+
+
+@pytest.mark.parametrize("data", [
+    {"n_shots": 3, "images_received": 0, "aux_items_received": 0},
+    {"n_shots": 0, "images_received": 6, "aux_items_received": 0},
+    {"n_shots": 0, "images_received": 0, "aux_items_received": 2},
+])
+def test_a_dead_clients_aborted_run_with_data_is_never_waived(data):
+    poll = _running(reset_requested=True, init_run_age_s=3600.0, last_shot_age_s=3000.0,
+                    run_state="no_reply", **data)
+    st = classify(poll, None, now=NOW, pid_alive=_dead)
+    assert st.state == "reset_pending" and not st.waivable and st.blocks
+    assert "a person must look; a Reset in liveOD now keeps the file (dead client)" in st.reason
+
+
+@pytest.mark.parametrize("missing", ["n_shots", "images_received", "aux_items_received"])
+def test_a_missing_data_field_counts_as_data(missing):
+    poll = _running(reset_requested=True, **{k: v for k, v in EMPTY.items() if k != missing})
+    poll.pop(missing, None)
+    assert run_gate.run_has_data(poll)
+    assert not classify(poll, None, now=NOW, pid_alive=_dead).waivable
+
+
+def test_an_empty_dead_run_is_still_waived_and_a_dead_client_without_abort_unchanged():
+    assert classify(_running(reset_requested=True, **EMPTY), None, now=NOW,
+                    pid_alive=_dead).waivable
+    with_data = _running(n_shots=3, images_received=6, aux_items_received=0)
+    st = classify(with_data, None, now=NOW, pid_alive=_dead)
+    assert st.state == "dead_client" and st.waivable          # RUN_EXITED keeps its file
+
+
+def test_no_exit_notice_on_an_aborted_run_with_data():
+    client = FakeLiveOD(_running(save_in_progress=False, reset_requested=True,
+                                 run_state="aborting", n_shots=3, images_received=6,
+                                 aux_items_received=0))
+    out = tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)
+    assert not out["sent"] and client.sent == []
+    assert "would discard its file" in out["why"]
+    # no Abort pending: the notice goes (liveOD then keeps the file)
+    client = FakeLiveOD(_running(save_in_progress=False, n_shots=3, images_received=6,
+                                 aux_items_received=0))
+    assert tell_live_od_run_exited(client, 85528, "x", pid_alive=_dead)["sent"]

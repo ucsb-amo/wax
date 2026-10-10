@@ -973,6 +973,9 @@ class LiveODServer(QThread, NetServer):
         (2026-10-05). Nothing subscribed to them."""
         now = time.time()
         notes = []
+        # every array pushed counts as the run's data (POLL aux_items_received),
+        # the end-of-run slices included
+        self._aux_items_received = getattr(self, "_aux_items_received", 0) + len(items)
         for it in items:
             if it.index is None and it.offset is not None:
                 continue
@@ -1206,6 +1209,7 @@ class LiveODServer(QThread, NetServer):
         self._run_in_progress = True
         self._shot_timestamps = []       # reset per-run timestamp list
         self._aux_latest = {}            # the latest pushed array per key, this run
+        self._aux_items_received = 0     # arrays pushed during this run (POLL)
         self._init_run_time = time.time()
         self._shot_durations = []  # reset rolling average for new run
 
@@ -1803,15 +1807,69 @@ class LiveODServer(QThread, NetServer):
         if self._reset_requested:
             self.note_reset_requested()
             return False
+        self._count_reset(source)
+        self._reset_requested = True
+        self.note_reset_requested()
+        return True
+
+    def _count_reset(self, source: str) -> None:
+        """One Reset press, counted (POLL reset_count / reset_counts /
+        last_reset)."""
         source = source if source in self.RESET_SOURCES else "person"
         self._reset_count += 1
         self._reset_counts[source] += 1
         self._last_reset = {"at": time.time(), "count": self._reset_count,
                             "run_id": self._current_run_id if self._run_in_progress else None,
                             "source": source}
-        self._reset_requested = True
-        self.note_reset_requested()
-        return True
+
+    #: The outcome's why when a Reset closes a run whose process is gone.
+    DEAD_CLIENT_RESET_WHY = "Reset on a run whose process is gone: file kept"
+
+    def client_known_dead(self) -> bool:
+        """The run in progress's client process is known to be gone: its pid
+        was recorded at INIT_RUN, its host is this machine, and Windows says
+        the process has ended (run_gate.pid_alive: OpenProcess, never
+        os.kill).  A client on another host, or without a pid, is never known
+        dead."""
+        if not self._run_in_progress:
+            return False
+        client = self._current_client
+        pid = client.get("client_pid")
+        if not pid:
+            return False
+        import socket  # noqa: PLC0415
+        if str(client.get("client_host") or "").lower() != socket.gethostname().lower():
+            return False
+        try:
+            from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
+            return not pid_alive(pid)
+        except Exception:                             # noqa: BLE001
+            return False
+
+    def reset_dead_client(self, source: str = "person") -> str | None:
+        """A Reset on a run whose process is known to be gone (user ruling
+        2026-10-09: a run's data is never deleted by a Reset on a dead
+        client): the run is closed as an exited run is -- with what it has,
+        not saved as complete, NOT deleted; outcome "exited" with why
+        :data:`DEAD_CLIENT_RESET_WHY` -- whether or not an Abort was already
+        pending.  The press is counted.  Returns the text to show, or None
+        when it does not apply (no run, a live / remote / unrecorded client,
+        a save in progress).  Any thread: the server loop closes the run."""
+        if self._run_file.saving or not self.client_known_dead():
+            return None
+        self._count_reset(source)
+        # an Abort pending from before the process died is spent here: the next
+        # INIT_RUN must not finalize (discard) this run's file
+        self._reset_requested = False
+        self._abort_requested_at = None
+        self._abort_again = False
+        run_id = self._current_run_id
+        text = (f"Reset on run {run_id}: its process is gone -- the run is closed with what "
+                f"it has (not saved as complete); its file is KEPT")
+        logger.warning(text + ".")
+        self._exited_pending = {"why": self.DEAD_CLIENT_RESET_WHY, "t": time.monotonic()}
+        self.close_exited_run_now("Reset on a run whose process is gone")
+        return text
 
     def _reset_refusal(self, msg: dict) -> dict | None:
         """A RESET naming a run (``run_id``, or ``run_token``) that is not the
@@ -1857,6 +1915,11 @@ class LiveODServer(QThread, NetServer):
                            "exited; closing the run now (its file is kept).")
             self.close_exited_run_now("Reset pressed in a remote viewer")
             return {"ok": True, "closing_exited_run": True}
+        kept = self.reset_dead_client(source)
+        if kept is not None:
+            return {"ok": True, "kept": True, "closing_dead_client_run": True,
+                    "run_id": self._current_run_id, "message": kept,
+                    "reset_count": self._reset_count}
         if self.abort_again():
             logger.warning("RESET requested again by remote viewer on an unanswered abort.")
             return {"ok": True, "closing_aborted_run": True}
@@ -1970,6 +2033,9 @@ class LiveODServer(QThread, NetServer):
             "n_shots_expected": self._current_n_shots,
             "images_expected": self._images_expected,
             "images_received": self._images_received_now(),
+            # arrays the experiment pushed during this run (PUT_DATA): with
+            # n_shots and images_received, whether the run has data at all
+            "aux_items_received": getattr(self, "_aux_items_received", 0),
             "grab_failure": self._grab_failure,
             "last_outcome": dict(self._last_outcome),
             # the current (or last) run's client: client_pid, client_host,

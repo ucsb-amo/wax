@@ -1434,6 +1434,18 @@ class LiveODWindow(QWidget):
                 self.msg("Reset: the run's experiment has exited; closing the run "
                          "(its file is kept).", logging.WARNING)
                 return
+            # the run's process is gone (pid on this machine, ended): the run is
+            # closed with what it has and its file KEPT, never discarded
+            # (user ruling 2026-10-09). The server's own signal (source None)
+            # has already been through this in its RESET handler.
+            kept = (srv.reset_dead_client(source)
+                    if source is not None and hasattr(srv, 'reset_dead_client') else None)
+            if kept is not None:
+                strip = getattr(self, 'status_strip', None)
+                if strip is not None:
+                    strip.show_notice(kept)
+                self.msg(kept + ".", logging.WARNING)
+                return
             if srv.abort_again():
                 self.msg("Reset pressed again: the Abort has no answer from the experiment; "
                          "closing the aborted run now.", logging.WARNING)

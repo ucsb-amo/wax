@@ -293,6 +293,8 @@ class RunLoop:
         #: (run id, state) of the last dead run the gate waived (warned once)
         self._waived: tuple | None = None
         self._stop_by = ""
+        #: a run's process is up (in_run)
+        self._in_run = False
         #: Stop asked for the monitor at the end (False: the run queue's stop)
         self._stop_monitor = True
         self._external = ""
@@ -311,6 +313,12 @@ class RunLoop:
     def active(self) -> bool:
         with self._lock:
             return self._s["state"] in ACTIVE
+
+    @property
+    def in_run(self) -> bool:
+        """A run of the loop's experiment is in progress (from its launch to
+        its process's exit); False between runs."""
+        return self._in_run
 
     def info(self) -> dict:
         with self._lock:
@@ -559,6 +567,13 @@ class RunLoop:
 
     def _one_run(self) -> tuple[str, str, bool] | None:
         """Launch the experiment once and follow it; None when it saved."""
+        self._in_run = True
+        try:
+            return self._one_run_inner()
+        finally:
+            self._in_run = False
+
+    def _one_run_inner(self) -> tuple[str, str, bool] | None:
         path = self.path
         command = ar_command(f'"{path}"' if " " in path else path)
         n = self.info()["runs"] + 1
