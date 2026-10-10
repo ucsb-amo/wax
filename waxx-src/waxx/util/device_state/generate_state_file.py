@@ -23,7 +23,12 @@ from typing import Dict, Any, List
 # script_dir = Path(__file__).parent
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = Path(os.getenv('data'))
-sys.path.insert(0, str(kexp_root))
+# Only a script run needs this (the venv installs kexp). Imported as a library -- waxx.util.device_state's
+# __init__ and the monitor import this module -- it must not touch sys.path: putting the LIVE k-exp first
+# made a later top-level `kexp` import resolve to the live tree even in a process running a worktree's
+# code (2026-10-10, found while porting the interleaved calibration).
+if __name__ == "__main__" and str(kexp_root) not in sys.path:
+    sys.path.insert(0, str(kexp_root))
 
 # Fields holding *live* device state, as opposed to the wiring description that
 # comes from the _id files.  These are the ones carried across a reconcile.

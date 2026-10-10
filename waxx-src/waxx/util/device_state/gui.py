@@ -17,7 +17,10 @@ from waxx.util.device_state.generate_state_file import load_module_from_file
 
 kexp_root = Path(os.getenv('code')) / 'k-exp'
 config_file_path_dir = kexp_root / 'kexp' / 'config'
-sys.path.insert(0, str(kexp_root))
+# Only a script run needs this (the venv installs kexp); imported as a library it must not touch
+# sys.path (see generate_state_file.py).
+if __name__ == "__main__" and str(kexp_root) not in sys.path:
+    sys.path.insert(0, str(kexp_root))
 
 # Import the DDS frame for detuning calculations
 try:
