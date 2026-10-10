@@ -372,6 +372,18 @@ def test_submit_refusals(q, expts, obj, words):
     assert "run_queue_refused" in q.journal.kinds
 
 
+def test_the_submitters_copy_must_match_the_one_that_runs(q, expts):
+    path = str(expts / "rabi.py")
+    sha = rq.file_sha256(path)
+    assert q.submit({"path": path, "client_sha256": sha, "client_host": "pc2"})["status"] == "ok"
+    r = q.submit({"path": path, "client_sha256": "0" * 64, "client_host": "kong"})
+    assert r["status"] == "error" and "your copy differs from kong's" in r["msg"]
+    r = q.submit({"path": path, "client_host": "pc2"})              # could not hash it
+    assert r["status"] == "error" and "could not be read" in r["msg"]
+    assert q.submit({"path": path, "client_host": "KONG"})["status"] == "ok"   # same host
+    assert q.submit({"path": path})["status"] == "ok"               # an older client
+
+
 def test_a_spawn_failure_fails_the_job(q, expts):
     a = submit(q, expts)
     q.spawner.fail = "no shell"
@@ -1613,7 +1625,7 @@ def _order_ids(q):
 
 def test_insert_at_a_position(q, expts):
     a, b, c = (submit(q, expts, at_end=True) for _ in range(3))
-    d = q.insert({"path": str(expts / "rabi.py"), "at_index": 1, "owner": "agent"})["ids"][0]
+    d = q.insert({"path": str(expts / "rabi.py"), "at_index": 1})["ids"][0]
     e = q.insert({"path": str(expts / "rabi.py"), "before_id": a})["ids"][0]
     f = q.insert({"path": str(expts / "rabi.py"), "after_id": c})["ids"][0]
     assert _order_ids(q) == [e, a, d, b, c, f]
@@ -1634,8 +1646,8 @@ def test_move_by_index_and_next_to_a_job_and_who_may(q, expts):
     q.move({"id": c, "after_id": b, "owner": "person", "by": "jp"})
     assert _order_ids(q) == [a, b, c]
     assert "a person's job" in q.move({"id": a, "to_index": 2, "owner": "agent"})["msg"]
-    assert q.move({"id": b, "to_index": 0, "owner": "agent", "by": "a7"})["status"] == "ok"
-    assert _order_ids(q) == [b, a, c]
+    assert q.move({"id": b, "to_index": 0, "owner": "person", "by": "jp"})["status"] == "ok"
+    assert _order_ids(q) == [b, a, c]                     # a person may put it anywhere
     assert "owner is required" in q.move({"id": b, "to_index": 0})["msg"]
     assert "needs to_index" in q.move({"id": b, "owner": "person"})["msg"]
     assert "next to itself" in q.move({"id": b, "before_id": b, "owner": "person"})["msg"]
@@ -1823,3 +1835,147 @@ def test_a_paused_job_waits_keeps_its_place_and_others_go(q, expts):
     assert job(q, a)["paused_by"] == "" and job(q, a)["paused_since"] is None
     q.tick()
     assert job(q, a)["state"] == "running"
+
+
+# --- an agent never goes ahead of a person's queued job (review S-a) ------------------------------
+
+def test_an_agents_requested_position_is_clamped_behind_the_persons_jobs(q, expts):
+    p1 = submit(q, expts, at_end=True)
+    p2 = submit(q, expts, at_end=True)
+    a1 = submit(q, expts, owner="agent", at_end=True)
+    r = q.submit({"path": str(expts / "rabi.py"), "owner": "agent", "at_index": 0})
+    assert r["clamped"] is True
+    a2 = r["ids"][0]
+    r = q.insert({"path": str(expts / "rabi.py"), "owner": "agent", "before_id": p1})
+    assert r["clamped"] is True
+    a3 = r["ids"][0]
+    r = q.insert({"path": str(expts / "rabi.py"), "owner": "agent", "after_id": p1})
+    assert r["clamped"] is True
+    a4 = r["ids"][0]
+    order = _order_ids(q)
+    assert order[:2] == [p1, p2] and set(order[2:]) == {a1, a2, a3, a4}
+    r = q.insert({"path": str(expts / "rabi.py"), "owner": "agent", "after_id": a1})
+    assert r["clamped"] is False                          # among agent jobs: as asked
+    for where in ({"to_index": 0}, {"before_id": p2}, {"after_id": p1}):
+        r = q.move(dict({"id": a1, "owner": "agent", "by": "a7"}, **where))
+        assert r["status"] == "ok" and r["clamped"] is True and r["position"] == 2
+    p3 = q.submit({"path": str(expts / "rabi.py"), "at_index": 0})   # a person: anywhere
+    assert p3["clamped"] is False and _order_ids(q)[0] == p3["ids"][0]
+    r = q.move({"id": a2, "to_index": 0, "owner": "person", "by": "jp"})
+    assert r["clamped"] is False and _order_ids(q)[0] == a2
+
+
+# --- a change landing while the gate polls is honoured at launch (review S-b) ---------------------
+
+@pytest.mark.parametrize("change", [
+    lambda q, a: q.edit({"id": a, "owner": "person", "by": "jp", "fields": {"paused": True}}),
+    lambda q, a: q.edit({"id": a, "owner": "person", "fields": {"due": q.clock.t + 600}}),
+    lambda q, a: q.pause({"scope": "all", "by": "jp"}),
+])
+def test_a_pause_or_edit_between_the_gate_and_the_launch_keeps_the_job_queued(q, expts, change):
+    a = submit(q, expts)
+    real_gate = q._gate
+
+    def gate_then_change():
+        why = real_gate()                                # liveOD polled outside the lock...
+        change(q, a)                                     # ...and a request lands meanwhile
+        return why
+    q._gate = gate_then_change
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q.spawner.calls == []
+
+
+def test_a_hold_between_the_gate_and_the_launch_keeps_an_agents_job_queued(q, expts):
+    a = submit(q, expts, owner="agent")
+    real_gate = q._gate
+
+    def gate_then_hold():
+        why = real_gate()
+        q.hold_request({"reason": "mine", "by": "jp"})
+        return why
+    q._gate = gate_then_hold
+    q.tick()
+    assert job(q, a)["state"] == "queued" and q.spawner.calls == []
+
+
+# --- list stays cheap with a long queue (review S-c) -----------------------------------------------
+
+def test_a_thousand_queued_jobs_list_quickly_and_are_capped(q, expts):
+    ids = submit(q, expts, repeat=1000, at_end=True)
+    assert len(ids) == 1000
+    held = []
+    real_views = q._views
+
+    def timed_views(jobs, now):
+        t0 = time.perf_counter()
+        out = real_views(jobs, now)
+        held.append(time.perf_counter() - t0)
+        return out
+    q._views = timed_views
+    t0 = time.perf_counter()
+    reply = q.list()
+    total = time.perf_counter() - t0
+    assert reply["truncated"] is True and reply["queued_total"] == 1000
+    queued = [v for v in reply["jobs"] if v["state"] == "queued"]
+    assert [v["position"] for v in queued] == list(range(200))
+    assert len(reply["rows"]) == 200
+    assert held[0] < 1.0, f"the lock was held {held[0]:.2f} s building the views"
+    assert total < 3.0, f"list took {total:.2f} s"
+    big = q.list({"limit": 2000})
+    assert big["truncated"] is False and len(big["jobs"]) == 1000
+    t0 = time.perf_counter()
+    q.describe({"id": ids[-1]})
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_source_hashing_happens_outside_the_lock(q, expts, monkeypatch):
+    submit(q, expts)
+    seen = []
+    real = rq.file_sha256
+
+    def watched(path):
+        seen.append(q._lock._is_owned())
+        return real(path)
+    monkeypatch.setattr(rq, "file_sha256", watched)
+    (expts / "rabi.py").write_text("# touched\n")      # new mtime: hashed again
+    assert q.list()["jobs"][0]["source_changed"] is True
+    assert seen and not any(seen)
+
+
+def test_a_negative_index_is_refused(q, expts):
+    a = submit(q, expts, at_end=True)
+    reply = q.insert({"path": str(expts / "rabi.py"), "at_index": -1})
+    assert reply["status"] == "error" and "0 or more" in reply["msg"]
+    reply = q.move({"id": a, "to_index": -3, "owner": "person"})
+    assert reply["status"] == "error" and "0 or more" in reply["msg"]
+    assert q.insert({"path": str(expts / "rabi.py"), "at_index": 99})["status"] == "ok"
+
+
+def test_a_pathological_source_is_listed_without_class_or_calibrations(q, expts, monkeypatch,
+                                                                       caplog):
+    import ast
+
+    def deep(*a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+    monkeypatch.setattr(ast, "parse", deep)
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.run_queue"):
+        assert rq.describe_source(expts / "rabi.py") == ("", [])
+        a = submit(q, expts)
+    assert job(q, a)["expt_class"] == "" and job(q, a)["calibrates_declared"] == []
+    assert any("listed without them" in r.getMessage() for r in caplog.records)
+
+
+def test_queued_etas_skip_blocked_jobs_ahead_and_say_so(q, expts):
+    for i in range(2):                                     # two saved runs: 100 s each
+        submit(q, expts, at_end=True)
+        q.tick()
+        q.clock.t += 100.0
+        run_through(q, 101 + i)
+    blocked = submit(q, expts, "tof", at_end=True, due=q.clock.t + 3600)   # unknown duration
+    a = submit(q, expts, at_end=True)
+    b = submit(q, expts, at_end=True)
+    views = {v["id"]: v for v in q.list()["jobs"]}
+    assert views[a]["estimate"]["eta_start"] == pytest.approx(q.clock.t)
+    assert "ignores blocked jobs ahead" in views[a]["estimate"]["basis"]
+    assert views[b]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 100.0)
+    assert "ignores blocked" not in views[blocked]["estimate"]["basis"]

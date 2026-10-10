@@ -135,6 +135,8 @@ def test_experiment_arguments_after_the_file_as_in_artiq_run(server, expts):
     assert r.code == 0, r.err
     assert sent(server, "submit")[-1]["argv"] == ["n=3", "m=x", "-c", "Rabi"]
     assert kq(server, "submit", str(expts / "rabi.py"), "-c", "Rabi").code == 2
+    r = kq(server, "submit", str(expts / "rabi.py"), "-1", "x=-2")    # as the docstring says
+    assert r.code == 0 and sent(server, "submit")[-1]["argv"] == ["-1", "x=-2"]
     r = kq(server, "submit", str(expts / "rabi.py"), "a=1", "--label", "x", "b=2")
     assert r.code == 0 and sent(server, "submit")[-1]["argv"] == ["a=1", "b=2"]
     assert sent(server, "submit")[-1]["label"] == "x"
@@ -157,7 +159,11 @@ def test_parse_at():
     now = time.mktime((2026, 10, 9, 14, 0, 0, 0, 0, -1))
     assert kqmod.parse_at("15:30", now) == now + 5400
     assert kqmod.parse_at("13:00", now) == pytest.approx(now + 23 * 3600, abs=3600)
-    assert kqmod.parse_at("1800000000") == 1.8e9
+    assert kqmod.parse_at("1800000000", now) == 1.8e9
+    with pytest.raises(ValueError, match="more than a year ahead"):
+        kqmod.parse_at(str(now + 400 * 86400), now)
+    with pytest.raises(ValueError, match="more than a year ahead"):
+        kqmod.parse_at("inf", now)
     for bad in ("25:00", "noon", "1430", "86400"):
         with pytest.raises(ValueError):
             kqmod.parse_at(bad, now)
@@ -191,6 +197,19 @@ def test_a_repeat_is_followed_job_by_job(server, q, expts):
     assert r.out.count("Run ID: 10") == 2 and "[kq] job 2 (rabi) saved (run 102)" in r.out
 
 
+def test_a_copy_that_differs_from_the_servers_is_refused(server, q, expts, monkeypatch):
+    from waxx.util.device_state import run_queue_client as rqc
+    monkeypatch.setattr(rqc, "local_sha256", lambda path: "0" * 64)
+    r = kq(server, "submit", str(expts / "rabi.py"))
+    assert r.code == 6 and "your copy differs from kong's" in r.err
+    assert "the file that runs is kong's; it must match yours" in r.err
+    monkeypatch.setattr(rqc, "local_sha256", lambda path: None)     # unreadable here
+    monkeypatch.setattr(rqc.socket, "gethostname", lambda: "pc2")
+    r = kq(server, "submit", str(expts / "rabi.py"))
+    assert r.code == 6 and "could not be read" in r.err
+    assert q.list()["jobs"] == []
+
+
 def test_the_queue_refusing_exits_6(server, expts):
     r = kq(server, "run", str(expts / "nothing.py"))
     assert r.code == 6 and "no such file" in r.err and r.out == ""
@@ -222,9 +241,34 @@ def _interrupt_on(server, action):
 
 
 def test_ctrl_c_during_the_submit_says_the_job_may_be_queued(server, q, expts):
+    # a KeyboardInterrupt raised inside the request itself (no guard possible)
     _interrupt_on(server, "submit")
     r = kq(server, "run", str(expts / "rabi.py"))
     assert r.code == 130 and "the job may be queued -- check kq list" in r.err
+
+
+@pytest.mark.parametrize("cmd", ["run", "submit"])
+def test_a_ctrl_c_during_the_submit_round_trip_is_held_and_the_job_cancelled(server, q,
+                                                                            expts, cmd):
+    import signal
+    before = signal.getsignal(signal.SIGINT)
+
+    def on_request(obj):
+        if obj.get("action") == "submit":
+            signal.raise_signal(signal.SIGINT)    # Ctrl-C while the request is out
+    server.on_request = on_request
+    r = kq(server, cmd, str(expts / "rabi.py"), "--repeat", "2")
+    assert r.code == 130 and "cancelled jobs 1, 2 (not started)" in r.out
+    assert [q.describe({"id": i})["job"]["state"] for i in (1, 2)] == ["cancelled"] * 2
+    assert all(c.get("queued_only") for c in sent(server, "cancel"))
+    assert signal.getsignal(signal.SIGINT) is before          # the handler is put back
+
+
+def test_the_sigint_guard_is_put_back_after_a_refused_submit(server, expts):
+    import signal
+    before = signal.getsignal(signal.SIGINT)
+    assert kq(server, "run", str(expts / "nothing.py")).code == 6
+    assert signal.getsignal(signal.SIGINT) is before
 
 
 def test_ctrl_c_right_after_the_submit_cancels_the_job_and_names_it(server, q, expts):
@@ -255,6 +299,20 @@ def test_ctrl_c_between_two_jobs_of_a_repeat(server, q, expts):
     assert q.describe({"id": 1})["job"]["state"] == "saved"
     assert q.describe({"id": 2})["job"]["state"] == "cancelled"
     assert "cancelled queued job 2" in r.out
+
+
+def test_a_second_ctrl_c_says_the_cancel_may_have_landed(server, q, expts):
+    def on_request(obj):
+        if obj.get("action") == "cancel":
+            q.cancel(dict(obj))                    # the cancel reaches the queue ...
+            raise KeyboardInterrupt                # ... and Ctrl-C comes before the reply
+    Script(server, [], interrupt_at={1})
+    inner = server.on_request
+    server.on_request = lambda obj: (inner(obj), on_request(obj))
+    r = kq(server, "run", str(expts / "rabi.py"))
+    assert r.code == 130
+    assert "a cancel of job 1 may or may not have reached the queue -- check kq show 1" in r.out
+    assert q.describe({"id": 1})["job"]["state"] == "cancelled"
 
 
 def test_a_queue_error_inside_the_interrupt_still_exits_130(server, q, expts):
@@ -350,7 +408,7 @@ def test_list_show_and_status(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"), "--label", "r1", "--priority", "1",
        "--no-write-back")
     kq(server, "submit", str(expts / "tof.py"), "--priority", "3")
-    assert ("write-back veto requested (honoured once the calibration branch lands)"
+    assert ("write-back vetoed (WAXX_CAL_NO_WRITE_BACK=1)"
             in kq(server, "show", "1").out)
     assert "write-back" not in kq(server, "show", "2").out
     r = kq(server, "list")
@@ -505,7 +563,7 @@ def test_tail_follow_reports_an_abort_someone_else_asked_for(server, q, expts):
 
 @pytest.mark.parametrize("extra, words", [
     (["--", "folder" + "\\"], "ends in a backslash"),
-    (["--at", "inf"], "finite"),
+    (["--at", "nan"], "finite"),
 ])
 def test_new_submit_refusals_are_shown_as_the_server_words_them(server, expts, extra, words):
     r = kq(server, "submit", str(expts / "rabi.py"), *extra)
@@ -627,10 +685,45 @@ def test_dependencies_are_depends_on_and_after_is_only_a_position(server, q, exp
             assert "--after " not in out.getvalue()
 
 
+def test_a_greedy_depends_on_gets_a_hint(server, expts):
+    r = kq(server, "submit", str(expts / "rabi.py"), "--depends-on", "1", "a=1")
+    assert r.code == 2 and "put experiment arguments before it" in r.err
+    assert sent(server, "submit") == []
+
+
 def test_insert_follows_like_run(server, q, expts):
     Script(server, run_steps(q))
     r = kq(server, "insert", str(expts / "rabi.py"), "--at-index", "1")
     assert r.code == 0 and "Run ID: 101" in r.out and "saved (run 101)" in r.out
+
+
+def test_an_agents_position_clamped_behind_person_jobs_is_said(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))                    # a person's job
+    r = kq(server, "insert", str(expts / "tof.py"), "--at-index", "1", "--detach", "--agent")
+    assert r.code == 0 and kqmod.CLAMPED_TEXT in r.out and _next(q) == [1, 2]
+    kq(server, "submit", str(expts / "tof.py"), "--agent")
+    r = kq(server, "move", "3", "--to", "1", "--agent")
+    assert r.code == 0 and kqmod.CLAMPED_TEXT in r.out and _next(q)[0] == 1
+    r = kq(server, "move", "3", "--to", "2")                        # a person: not clamped
+    assert kqmod.CLAMPED_TEXT not in r.out
+
+
+def test_a_position_below_1_is_the_servers_refusal(server, q, expts):
+    kq(server, "submit", str(expts / "rabi.py"))
+    kq(server, "submit", str(expts / "tof.py"))
+    r = kq(server, "move", "2", "--to", "0")
+    assert r.code == 6 and "to_index" in r.err
+    r = kq(server, "insert", str(expts / "tof.py"), "--at-index", "0", "--detach")
+    assert r.code == 6 and "at_index" in r.err
+
+
+def test_a_truncated_list_says_how_many_more(server, q, expts):
+    for _ in range(4):
+        kq(server, "submit", str(expts / "rabi.py"))
+    r = kq(server, "list", "--limit", "1")
+    assert "... 3 more queued (use --limit)" in r.out
+    assert json.loads(kq(server, "list", "--limit", "1", "--json").out)["queued_total"] == 4
+    assert "more queued" not in kq(server, "list").out
 
 
 def test_move(server, q, expts):

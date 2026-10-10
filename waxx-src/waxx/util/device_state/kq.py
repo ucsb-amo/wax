@@ -31,7 +31,8 @@ Commands::
 Words after the file (``key=value``, as artiq_run takes them, before or after
 kq's options) and everything after ``--`` are passed to the experiment:
 ``kq run x.py n=3 --label scan m=2 -- -c MyExpt``.  Words starting with ``-``
-must go after ``--``.  The queue refuses an argument (or a path) holding any
+must go after ``--``, except negative numbers (``-1``), which are taken as
+experiment arguments where they stand.  The queue refuses an argument (or a path) holding any
 of ``& | < > ^ % " !`` -- e.g. ``x=50%``, which artiq_run itself accepts --
 and one ending in a backslash: such a run goes through artiq_run directly.
 
@@ -39,7 +40,9 @@ and one ending in a backslash: such a run goes through artiq_run directly.
 the job's output exactly as the experiment writes it ("Run ID: N" included),
 and exits with the experiment's result (see the exit codes).  Ctrl-C while
 the job is queued cancels it (and any later jobs of the same submission still
-queued).  Ctrl-C while it runs asks once on a terminal "abort the run? it
+queued); a Ctrl-C during the submit request itself is held until its reply
+(at most the request's timeout) and then does the same, so it never leaves a
+job queued that this terminal did not name.  Ctrl-C while it runs asks once on a terminal "abort the run? it
 discards its data file [y/N]": yes asks the queue to cancel it -- the queue
 then sends liveOD's Abort (the run stops at its next shot and liveOD discards
 its file) -- and kq prints "abort requested; waiting for the run to end" and
@@ -103,6 +106,7 @@ import argparse
 import datetime
 import json
 import re
+import signal
 import sys
 import time
 
@@ -309,12 +313,15 @@ _HHMM = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$")
 #: A bare number below this is not taken as epoch seconds (1e9 s is 2001-09-09):
 #: ``--at 1430`` is a typo for 14:30, not 1970.
 MIN_EPOCH = 1e9
+#: ``--at`` further ahead than this is refused (a typo, not a plan).
+MAX_AHEAD_S = 366 * 86400.0
 
 
 def parse_at(text: str, now: float | None = None) -> float:
     """``HH:MM[:SS]`` (local; the next such time, so a time already past
     today means tomorrow -- by the calendar, so a DST change is no hour off)
-    or epoch seconds (at least :data:`MIN_EPOCH`) -> epoch seconds."""
+    or epoch seconds (at least :data:`MIN_EPOCH`, at most a year ahead) ->
+    epoch seconds."""
     now = time.time() if now is None else float(now)
     m = _HHMM.match(text.strip())
     if m:
@@ -334,6 +341,8 @@ def parse_at(text: str, now: float | None = None) -> float:
     if value < MIN_EPOCH:
         raise ValueError(f"--at {text}: a bare number must be epoch seconds (at least "
                          f"{MIN_EPOCH:.0f}); for a time of day write HH:MM")
+    if value > now + MAX_AHEAD_S:
+        raise ValueError(f"--at {text}: more than a year ahead")
     return value
 
 
@@ -344,6 +353,13 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     (default: stdout / stderr), in ASCII."""
 
     class _Parser(argparse.ArgumentParser):
+        def error(self, message):
+            if "--depends-on" in message and "invalid int value" in message:
+                # it takes every word after it: kq run f.py --depends-on 3 a=1
+                message += (" (--depends-on takes job ids up to the next option: put "
+                            "experiment arguments before it, or another option after it)")
+            super().error(message)
+
         def _print_message(self, message, file=None):
             if message:
                 stream = ((err or sys.stderr) if file is sys.stderr
@@ -383,8 +399,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
         sp.add_argument("--no-stop-on-failure", action="store_true",
                         help="a failed job does not cancel the rest of its chain")
         sp.add_argument("--no-write-back", action="store_true",
-                        help="ask that the experiment's calibration write-back be vetoed "
-                             "(honoured once the calibration branch lands)")
+                        help="veto the experiment's calibration write-back (the job runs "
+                             "with WAXX_CAL_NO_WRITE_BACK=1)")
         sp.add_argument("--allow-drift", action="store_true",
                         help="run even if the file changed after submit")
         sp.add_argument("--cwd", help="working folder on the server's machine "
@@ -517,6 +533,10 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             ctx.warn(f"kq: {exc}")
             return EXIT_USAGE
     owner = _owner(args)
+    # Ctrl-C is held back from the submit request until its reply has been
+    # read (bounded by the request's timeout): a job the server queued is then
+    # known by id and is cancelled below, never left queued unseen
+    guard = _SigintGuard().start()
     try:
         reply = ctx.client.submit(
             args.file, argv=list(args.args) + expt_argv, cwd=args.cwd, label=args.label,
@@ -528,32 +548,48 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             at_index=(None if getattr(args, "at_index", None) is None
                       else args.at_index - 1),
             before_id=getattr(args, "before", None), after_id=getattr(args, "after_id", None))
+        jobs = reply.get("jobs") or []
+        ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
+        tokens = {int(j["id"]): j.get("token") for j in jobs}
     except KeyboardInterrupt:
+        # raised inside the request without the guard (it could not be set:
+        # not the main thread)
+        guard.stop()
         safe_write(ctx.out, "\n")
         ctx.warn("[kq] interrupted while submitting: the job may be queued -- check kq list")
         return EXIT_INTERRUPTED
-    jobs = reply.get("jobs") or []
-    ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
-    tokens = {int(j["id"]): j.get("token") for j in jobs}
+    except BaseException:
+        if guard.stop():
+            ctx.warn("[kq] interrupted while submitting")
+        raise
     if not ids:
+        if guard.stop():
+            safe_write(ctx.out, "\n")
         ctx.warn("kq: the queue accepted the request but returned no job")
         return EXIT_REFUSED
     first = jobs[0] if jobs else {"id": ids[0]}
     many = (f"jobs {ids[0]}-{ids[-1]} (chain {first.get('chain')})" if len(ids) > 1
             else f"job {ids[0]}")
     due_text = f", due {_when(due)}" if due else ""
-    if args.cmd == "submit" or getattr(args, "detach", False):
-        placed = _position(ctx, ids[0], tokens.get(ids[0]))
-        ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
-                f"({placed})")
-        ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
-        return EXIT_OK
-    # from here on a Ctrl-C anywhere goes to _interrupted: the job ids are
-    # known, a queued job is cancelled (queued_only) and its id printed
+    # from here on a Ctrl-C anywhere -- one held back during the submit
+    # included -- goes to _interrupted: the job ids are known, a queued job is
+    # cancelled (queued_only) and its id printed
     n, cursor = 0, {"offset": 0}
     try:
+        if guard.stop():
+            raise KeyboardInterrupt
+        if args.cmd == "submit" or getattr(args, "detach", False):
+            placed = _position(ctx, ids[0], tokens.get(ids[0]))
+            ctx.say(f"[kq] {many} queued: {first.get('label')}, owner {owner}{due_text} "
+                    f"({placed})")
+            if reply.get("clamped"):
+                ctx.say(CLAMPED_TEXT)
+            ctx.say(f"[kq] follow: kq tail {ids[0]} -f    cancel: kq cancel {ids[0]}")
+            return EXIT_OK
         ctx.say(f"[kq] {many} queued ({_position(ctx, ids[0], tokens.get(ids[0]))})"
                 f"{due_text}")
+        if reply.get("clamped"):
+            ctx.say(CLAMPED_TEXT)
         final = EXIT_OK
         for n, jid in enumerate(ids):
             cursor = {"offset": 0}
@@ -578,6 +614,34 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
         return final
     except KeyboardInterrupt:
         return _interrupted(ctx, ids[n:], tokens, owner, cursor)
+
+
+class _SigintGuard:
+    """Holds Ctrl-C back while it is on: SIGINT only sets ``fired``.
+    :meth:`stop` puts the previous handler back and returns ``fired``.  Off
+    the main thread (where Python cannot set a handler) it does nothing."""
+
+    def __init__(self):
+        self.fired = False
+        self._old = None
+        self._on = False
+
+    def _handler(self, signum, frame):
+        self.fired = True
+
+    def start(self) -> "_SigintGuard":
+        try:
+            self._old = signal.signal(signal.SIGINT, self._handler)
+            self._on = True
+        except (ValueError, OSError):
+            self._on = False
+        return self
+
+    def stop(self) -> bool:
+        if self._on:
+            self._on = False
+            signal.signal(signal.SIGINT, self._old)
+        return self.fired
 
 
 def _position(ctx: _Ctx, jid: int, token) -> str:
@@ -663,7 +727,9 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
                                               on_abort=lambda j: ctx.say(_abort_text(j)))
                 except KeyboardInterrupt:
                     safe_write(ctx.out, "\n")
-                    ctx.say(f"[kq] left {_job_word(job)} ending on its own. {_leave_text(jid)}")
+                    ctx.say(f"[kq] stopped following {_job_word(job)}: its abort was "
+                            f"requested and it ends on its own (kq show {jid}). "
+                            f"{_leave_text(jid)}")
                     return EXIT_INTERRUPTED
                 _report_end(ctx, final)
                 return exit_code_for(final)
@@ -672,14 +738,18 @@ def _interrupted(ctx: _Ctx, ids: list[int], tokens: dict, owner: str, cursor: di
                 + f". {_leave_text(jid)}")
         return EXIT_INTERRUPTED
     except KeyboardInterrupt:
+        # a second Ctrl-C while the interrupt was being handled: a cancel (or
+        # an abort) may already have reached the queue
         safe_write(ctx.out, "\n")
-        ctx.say(f"[kq] interrupted: job {jid} is left as it is. {_leave_text(jid)}")
+        ctx.say(f"[kq] interrupted again: a cancel of job {jid} may or may not have reached "
+                f"the queue -- check kq show {jid}. {_leave_text(jid)}")
         return EXIT_INTERRUPTED
     except RunQueueError as exc:
         # still an interrupt: the person asked to stop; what the queue said goes
         # with it, and the job is whatever the queue made of it
         ctx.warn(f"kq: {exc}")
-        ctx.say(f"[kq] interrupted: job {jid} may be left as it was. {_leave_text(jid)}")
+        ctx.say(f"[kq] interrupted: a cancel of job {jid} may or may not have reached the "
+                f"queue -- check kq show {jid}. {_leave_text(jid)}")
         return EXIT_INTERRUPTED
 
 
@@ -744,6 +814,8 @@ def _list_rows(jobs: list[dict], rows: dict) -> list[list[str]]:
     return table
 
 
+CLAMPED_TEXT = "[kq] position clamped behind person jobs"
+
 SOURCE_CHANGED_NOTE = ("* source changed since submit: the job is skipped at launch unless "
                        "drift is allowed (kq edit <id> --allow-drift)")
 
@@ -759,7 +831,9 @@ def _cmd_list(ctx: _Ctx, args) -> int:
         ids = {j["id"] for j in jobs}
         ctx.say(json.dumps({"jobs": jobs,
                             "rows": [r for r in reply.get("rows") or [] if r.get("id") in ids],
-                            "next": reply.get("next"), "run_queue": reply.get("run_queue")},
+                            "next": reply.get("next"), "run_queue": reply.get("run_queue"),
+                            "truncated": bool(reply.get("truncated")),
+                            "queued_total": reply.get("queued_total")},
                            indent=1, default=str))
         return EXIT_OK
     rows = {r.get("id"): r for r in reply.get("rows") or []}
@@ -770,6 +844,12 @@ def _cmd_list(ctx: _Ctx, args) -> int:
             ctx.say("  ".join(c.ljust(w) for c, w in zip(r[:-1], widths)) + "  " + r[-1])
     else:
         ctx.say("(no jobs)")
+    if reply.get("truncated"):
+        total = reply.get("queued_total")         # the server lists the first --limit
+        if isinstance(total, int):
+            ctx.say(f"... {total - min(int(args.limit), total)} more queued (use --limit)")
+        else:
+            ctx.say("... more queued (use --limit)")
     if any(j.get("source_changed") for j in jobs):
         ctx.say(SOURCE_CHANGED_NOTE)
     ctx.say(queue_line(reply.get("run_queue") or {}))
@@ -810,9 +890,7 @@ def _cmd_show(ctx: _Ctx, args) -> int:
     if est and j.get("state") not in ENDED:
         ctx.say(f"  {est_text(est, str(j.get('state')))} -- basis: {est.get('basis') or '?'}")
     if j.get("write_back") is False:
-        # the queue passes WAXX_CAL_NO_WRITE_BACK=1; nothing reads it until the
-        # calibration write-back branch lands
-        ctx.say("  write-back veto requested (honoured once the calibration branch lands)")
+        ctx.say("  write-back vetoed (WAXX_CAL_NO_WRITE_BACK=1)")
     if j.get("allow_drift"):
         ctx.say("  drift allowed")
     if j.get("outcome"):
@@ -840,6 +918,8 @@ def _cmd_move(ctx: _Ctx, args) -> int:
     pos = reply.get("position")
     ctx.say(f"[kq] {_job_word(job)} moved to position "
             + ("?" if pos is None else str(int(pos) + 1)))
+    if reply.get("clamped"):
+        ctx.say(CLAMPED_TEXT)
     return EXIT_OK
 
 
