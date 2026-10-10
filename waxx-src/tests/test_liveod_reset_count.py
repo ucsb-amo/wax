@@ -416,3 +416,16 @@ def test_a_run_without_a_file_is_finalized_as_before(srv, monkeypatch):
     _init(srv)
     last = _poll(srv)["last_outcome"]
     assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"
+
+
+@pytest.mark.parametrize("token", ["", None, 0])
+def test_a_falsy_token_is_still_a_notice_on_behalf(srv, monkeypatch, token):
+    # review G3: _run_msg_ok takes a falsy token as none, so must the refusal
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    srv._shot_timestamps = [1.0]
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "run_token": token, "reason": "sent by a helper"})
+    assert reply["ok"] is False and reply["abort_pending_with_data"]
+    assert _poll(srv)["run_in_progress"] and os.path.exists(run["filepath"])

@@ -1723,7 +1723,8 @@ class LiveODServer(QThread, NetServer):
             return {"ok": True, "ignored": True}
         why = str(msg.get("reason") or "") or "no exception reported"
         run_id = self._current_run_id
-        if self._reset_requested and msg.get("run_token") is None:
+        # (a falsy token counts as none, as in _run_msg_ok: "" is on-behalf too)
+        if self._reset_requested and not msg.get("run_token"):
             # sent on the process's behalf (run_id, no token) during an Abort:
             # taken as the abort's answer it would discard the file, so a run
             # with data is refused (user ruling 2026-10-09: data is never
