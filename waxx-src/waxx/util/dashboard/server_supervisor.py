@@ -158,6 +158,15 @@ class ServerSupervisor(QObject):
     RESTART_WINDOW_S = 60.0
     INITIAL_RESTART_DELAY_S = 0.5
     MAX_RESTART_DELAY_S = 30.0
+    # A server's exit with EXIT_RESTART is honoured as its request to be
+    # started again only after it ran this long: exit code 3 is also what a
+    # C runtime abort(), Qt's qFatal or a platform-plugin failure gives on
+    # Windows, which happen at start-up.  Sooner, it is a crash (today's policy).
+    RESTART_REQUEST_MIN_UPTIME_S = 10.0
+    # Requested restarts have their own storm guard: more than this many
+    # within REQUESTED_RESTART_WINDOW_S -> FAILED.
+    MAX_REQUESTED_RESTARTS = 3
+    REQUESTED_RESTART_WINDOW_S = 300.0
     # Longest stdout/stderr text held while waiting for its newline; beyond
     # this it is passed on as a line of its own.
     MAX_LINE_CHARS = 64 * 1024
@@ -202,6 +211,10 @@ class ServerSupervisor(QObject):
         self._state = SupervisorState.IDLE
         self._proc: Optional[QProcess] = None
         self._restart_history: list[float] = []
+        # restarts the server asked for (EXIT_RESTART), for their own guard
+        self._requested_restart_history: list[float] = []
+        # time.monotonic() when the current child started (None: not started)
+        self._child_started_at: Optional[float] = None
         self._stop_requested = False
         self._restart_pending = False
         self._precheck_in_flight = False
@@ -364,6 +377,7 @@ class ServerSupervisor(QObject):
     def reset_and_start(self) -> None:
         """Clear failure state and try again from scratch."""
         self._restart_history.clear()
+        self._requested_restart_history.clear()
         if self._state in (SupervisorState.FAILED, SupervisorState.CRASHED):
             self._set_state(SupervisorState.IDLE)
         self.start()
@@ -511,6 +525,7 @@ class ServerSupervisor(QObject):
 
         self._proc = proc
         self._graceful_sent_at = None
+        self._child_started_at = None
         now = time.monotonic()
         # Only starts inside the restart window matter (see _maybe_auto_restart);
         # trimming here keeps a days-long session of manual restarts bounded.
@@ -564,6 +579,7 @@ class ServerSupervisor(QObject):
 
     def _on_started(self) -> None:
         _LOG.info("%s: subprocess started pid=%s", self.server_id, self.pid())
+        self._child_started_at = time.monotonic()
         self._set_state(SupervisorState.RUNNING)
 
     def _on_error(self, err: QProcess.ProcessError) -> None:
@@ -581,23 +597,23 @@ class ServerSupervisor(QObject):
         self._graceful_sent_at = None
         self._child_exited_at = time.monotonic()
 
+        started = self._child_started_at
+        uptime = (self._child_exited_at - started) if started is not None else 0.0
         if (exit_status == QProcess.ExitStatus.NormalExit and exit_code == EXIT_RESTART
                 and not self._stop_requested):
-            # the server asked to be started again (it exited on purpose): not a
-            # crash -- no CRASHED state, no restart-storm accounting, and
-            # restart_on_crash does not apply
-            self._set_state(SupervisorState.IDLE)
-            if self._restart_suppressed:
-                _LOG.info("%s: exited asking for a restart (code %d); not restarted: shutdown "
-                          "in progress", self.server_id, exit_code)
+            if uptime < self.RESTART_REQUEST_MIN_UPTIME_S:
+                # too soon to be the server's own request: exit code 3 is also
+                # abort() / qFatal / a platform-plugin failure -- a crash
+                _LOG.error("%s: exited with code %d after %.1fs (under %.0fs): taken as a "
+                           "crash, not a restart request", self.server_id, exit_code, uptime,
+                           self.RESTART_REQUEST_MIN_UPTIME_S)
+                self.log_line.emit(f"[SUP] exit code {exit_code} after {uptime:.1f} s is too "
+                                   f"soon to be a restart request: treated as a crash")
+            else:
+                self._requested_server_restart(exit_code, uptime)
                 return
-            _LOG.warning("%s: exited asking for a restart (code %d); starting it again in "
-                         "%.1fs", self.server_id, exit_code, self.INITIAL_RESTART_DELAY_S)
-            self.log_line.emit(f"[SUP] restart requested by the server (exit code {exit_code}); "
-                               f"starting it again")
-            self._requested_restart = True
-            QTimer.singleShot(int(self.INITIAL_RESTART_DELAY_S * 1000), self.start)
-            return
+
+        crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
 
         crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
         if crashed and not self._stop_requested:
@@ -614,6 +630,40 @@ class ServerSupervisor(QObject):
             return
 
         self._set_state(SupervisorState.IDLE)
+
+    def _requested_server_restart(self, exit_code: int, uptime: float) -> None:
+        """The server exited with EXIT_RESTART after RESTART_REQUEST_MIN_UPTIME_S:
+        it asked to be started again.  Not a crash -- no CRASHED state, not in
+        the crash restart history, restart_on_crash does not apply -- but
+        guarded on its own: more than MAX_REQUESTED_RESTARTS within
+        REQUESTED_RESTART_WINDOW_S -> FAILED."""
+        self._set_state(SupervisorState.IDLE)
+        if self._restart_suppressed:
+            _LOG.info("%s: exited asking for a restart (code %d); not restarted: shutdown "
+                      "in progress", self.server_id, exit_code)
+            return
+        now = time.monotonic()
+        self._requested_restart_history = [
+            t for t in self._requested_restart_history
+            if t >= now - self.REQUESTED_RESTART_WINDOW_S]
+        if len(self._requested_restart_history) >= self.MAX_REQUESTED_RESTARTS:
+            _LOG.error("%s: asked for a restart (code %d) more than %d times within %.0fs - "
+                       "not started again, state -> FAILED", self.server_id, exit_code,
+                       self.MAX_REQUESTED_RESTARTS, self.REQUESTED_RESTART_WINDOW_S)
+            self.log_line.emit(f"[SUP] restart requested more than "
+                               f"{self.MAX_REQUESTED_RESTARTS} times within "
+                               f"{self.REQUESTED_RESTART_WINDOW_S / 60:.0f} min: not started "
+                               f"again (FAILED); start it by hand once the cause is known")
+            self._set_state(SupervisorState.FAILED)
+            return
+        self._requested_restart_history.append(now)
+        _LOG.warning("%s: exited asking for a restart (code %d, after %.0fs); starting it "
+                     "again in %.1fs", self.server_id, exit_code, uptime,
+                     self.INITIAL_RESTART_DELAY_S)
+        self.log_line.emit(f"[SUP] restart requested by the server (exit code {exit_code}); "
+                           f"starting it again")
+        self._requested_restart = True
+        QTimer.singleShot(int(self.INITIAL_RESTART_DELAY_S * 1000), self.start)
 
     def _maybe_auto_restart(self) -> None:
         if self._restart_suppressed:
