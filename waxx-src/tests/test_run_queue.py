@@ -856,6 +856,17 @@ def test_a_launching_job_is_never_launched_again_and_is_adopted_from_live_od(
     assert job(again, a)["state"] == "saved" and again.spawner.calls == []
 
 
+def test_adopting_from_live_od_passes_the_clients_creation_time(tmp_path, expts, q):
+    a, again = _restart_with_a_launching_job(tmp_path, expts, q)
+    asked = []
+    again._adopt = lambda pid, started: asked.append((pid, started))   # None: not adopted
+    again.live.start_run(101, launcher="kq", queue_job=qj(q, a), client_pid=7101,
+                         client_started=1234.5)
+    again.tick()
+    assert asked == [(7101, 1234.5)]                  # a reused pid is refused by adopt
+    assert job(again, a)["state"] == "launching"
+
+
 def test_a_launching_job_judged_from_its_outcome_or_failed_after_the_wait(
         tmp_path, expts, q):
     a, again = _restart_with_a_launching_job(tmp_path, expts, q)

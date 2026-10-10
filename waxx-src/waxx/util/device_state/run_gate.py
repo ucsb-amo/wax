@@ -48,7 +48,9 @@ States (:class:`GateState`):
                    its file, as for any abort -- a run's data is never
                    deleted unattended (user ruling 2026-10-09).  With data it
                    is not waivable: a person must look; a Reset in liveOD on a
-                   run whose process is gone keeps the file.
+                   run whose process is gone keeps the file, and so does
+                   liveOD's next INIT_RUN (outcome "exited", "dead client with
+                   data, kept at the next run's start").
 ``dead_client``    a run is in progress, no Abort, and its client's process is
                    known to be dead -- or liveOD itself heard it exit
                    (``run_state`` "exited", frames still due), pid or not.

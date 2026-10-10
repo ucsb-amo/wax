@@ -58,6 +58,7 @@ _CREATE_NO_WINDOW = 0x08000000
 # The process-table helpers are shared with the Qt-free supervisor
 # (waxx.util.supervise), which runs servers on PCs without a dashboard; these
 # names stay importable from here.
+from waxx.util.dashboard.exit_codes import EXIT_RESTART  # noqa: E402
 from waxx.util.supervise import (  # noqa: E402
     install_console_signal_guard,
     kill_pid_tree as _kill_pid_tree,
@@ -515,7 +516,11 @@ class ServerSupervisor(QObject):
         # trimming here keeps a days-long session of manual restarts bounded.
         self._restart_history = [t for t in self._restart_history
                                  if t >= now - self.RESTART_WINDOW_S]
-        self._restart_history.append(now)
+        if getattr(self, "_requested_restart", False):
+            # a start the server asked for (EXIT_RESTART) is not a crash restart
+            self._requested_restart = False
+        else:
+            self._restart_history.append(now)
 
         program = self.cmd[0]
         args = self.cmd[1:]
@@ -575,6 +580,24 @@ class ServerSupervisor(QObject):
         self._flush_partial_lines()
         self._graceful_sent_at = None
         self._child_exited_at = time.monotonic()
+
+        if (exit_status == QProcess.ExitStatus.NormalExit and exit_code == EXIT_RESTART
+                and not self._stop_requested):
+            # the server asked to be started again (it exited on purpose): not a
+            # crash -- no CRASHED state, no restart-storm accounting, and
+            # restart_on_crash does not apply
+            self._set_state(SupervisorState.IDLE)
+            if self._restart_suppressed:
+                _LOG.info("%s: exited asking for a restart (code %d); not restarted: shutdown "
+                          "in progress", self.server_id, exit_code)
+                return
+            _LOG.warning("%s: exited asking for a restart (code %d); starting it again in "
+                         "%.1fs", self.server_id, exit_code, self.INITIAL_RESTART_DELAY_S)
+            self.log_line.emit(f"[SUP] restart requested by the server (exit code {exit_code}); "
+                               f"starting it again")
+            self._requested_restart = True
+            QTimer.singleShot(int(self.INITIAL_RESTART_DELAY_S * 1000), self.start)
+            return
 
         crashed =exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0
         if crashed and not self._stop_requested:

@@ -186,6 +186,9 @@ class HeadlessMonitorServer(QObject):
     def _start_monitor_unless_running(self, why: str) -> None:
         """A run loop ended: bring the monitor back -- unless it already is
         (an aborted run's ``run complete`` has usually started it)."""
+        if getattr(self.udp_server, "exiting", ""):
+            log.info("%s -- not started: %s.", why, self.udp_server.exiting)
+            return
         if self.monitor_manager.isRunning():
             log.info("%s -- the monitor is already running.", why)
             return

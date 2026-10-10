@@ -242,3 +242,141 @@ def test_an_empty_dead_run_with_an_abort_is_discarded_at_the_next_init_run(srv, 
     _alive(monkeypatch, False)
     _init(srv)                                            # the gate waived it: next run
     assert not os.path.exists(run["filepath"])            # discarded, as today
+
+
+# -- a reused pid (review F3) ---------------------------------------------------------
+
+def _started_now(monkeypatch, value):
+    from waxx.util.device_state import detached
+    monkeypatch.setattr(detached, "process_started", lambda pid=None: value)
+
+
+@pytest.mark.parametrize("now, dead", [
+    (1000.0, False),             # the same process: alive, a normal Abort
+    (1000.004, False),           # within detached.SAME_PROCESS_S (rounding)
+    (2000.0, True),              # the pid was reused: the client is gone
+    (None, False),               # cannot be read: never taken for gone
+])
+def test_a_live_pid_is_the_client_only_when_its_creation_time_matches(srv, monkeypatch,
+                                                                       now, dead):
+    _init(srv, client_pid=4242, client_host=HERE, client_started=1000.0)
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, now)
+    assert srv.client_known_dead() is dead
+
+
+def test_without_a_recorded_creation_time_a_live_pid_is_the_client(srv, monkeypatch):
+    _init(srv, client_pid=4242, client_host=HERE)                 # an older client
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, 2000.0)
+    assert srv.client_known_dead() is False
+
+
+def test_a_reset_on_a_reused_pid_keeps_the_file(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE, client_started=1000.0)
+    srv._shot_timestamps = [1.0, 2.0]
+    _alive(monkeypatch, True)
+    _started_now(monkeypatch, 2000.0)                             # another process now
+    reply = srv._handle_reset({"tag": "RESET"})
+    assert reply["ok"] and reply["kept"]
+    srv._check_exited_run()
+    assert _poll(srv)["last_outcome"]["detail"] == srv.DEAD_CLIENT_RESET_WHY
+    assert os.path.exists(run["filepath"])
+
+
+# -- RUN_EXITED on a process's behalf during an Abort (review F4) --------------------
+
+@pytest.mark.parametrize("data", ["shots", "pushed"])
+def test_a_notice_on_behalf_during_an_abort_on_a_run_with_data_is_refused(srv, monkeypatch, data):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)                              # alive when the Abort is set
+    if data == "shots":
+        srv._shot_timestamps = [1.0]
+    else:
+        srv._aux_items_received = 2
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    before = _poll(srv)
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "reason": "sent by a helper"})
+    assert reply["ok"] is False and reply["refused"] and reply["abort_pending_with_data"]
+    assert "a person decides" in reply["error"]
+    after = _poll(srv)                                     # nothing changed
+    assert after["run_in_progress"] and after["reset_requested"]
+    assert after["last_outcome"] == before["last_outcome"]
+    assert os.path.exists(run["filepath"])
+
+
+def test_a_notice_on_behalf_during_an_abort_on_an_empty_run_is_the_abort(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": run["run_id"],
+                                    "reason": "sent by a helper"})
+    assert reply["ok"]
+    assert not _poll(srv)["run_in_progress"]
+    assert not os.path.exists(run["filepath"])             # nothing in it: discarded
+
+
+def test_the_processs_own_notice_during_an_abort_is_still_its_answer(srv, monkeypatch):
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._shot_timestamps = [1.0]
+    srv._handle_reset({"tag": "RESET"})                    # a person's Abort
+    reply = srv._handle_run_exited({"tag": "RUN_EXITED", "run_token": run["run_token"],
+                                    "reason": "uncaught KeyboardInterrupt"})
+    assert reply["ok"] and not _poll(srv)["run_in_progress"]
+    assert _poll(srv)["last_outcome"]["outcome"] == "discarded"
+
+
+def test_the_helper_reports_the_servers_refusal(srv, monkeypatch):
+    from waxx.util.device_state import run_gate
+    run = _init(srv, client_pid=4242, client_host=HERE)
+    _alive(monkeypatch, True)
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    stale = _poll(srv)                                     # taken before the shot came
+    srv._shot_timestamps = [1.0]
+    out = run_gate.tell_live_od_run_exited(
+        None, run["run_id"], "sent by a helper", poll=stale, pid_alive=lambda pid: False,
+        send=lambda rid, why: srv._handle_run_exited({"tag": "RUN_EXITED", "run_id": rid,
+                                                      "reason": why}))
+    assert out["sent"] and out["ok"] is False and "liveOD refused" in out["why"]
+    assert os.path.exists(run["filepath"]) and _poll(srv)["run_in_progress"]
+
+
+# -- INIT_RUN's finalize of an unanswered Abort (review F5) ---------------------------
+
+def _abort_then(srv, monkeypatch, shots, alive_at_init, **client):
+    run = _init(srv, **client)
+    srv._shot_timestamps = [1.0] * shots
+    _alive(monkeypatch, True)                              # alive when the Abort is set
+    srv._handle_reset({"tag": "RESET", "source": "queue"})
+    assert _poll(srv)["reset_requested"] is True
+    _alive(monkeypatch, alive_at_init)
+    nxt = _init(srv)                                       # the next run starts
+    return run, nxt
+
+
+def test_a_dead_client_run_with_data_is_kept_at_the_next_init_run(srv, monkeypatch):
+    run, nxt = _abort_then(srv, monkeypatch, 3, False, client_pid=4242, client_host=HERE)
+    assert os.path.exists(run["filepath"])                 # kept, not discarded
+    poll = _poll(srv)
+    last = poll["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "exited"
+    assert last["detail"] == srv.DEAD_CLIENT_KEPT_AT_INIT_WHY
+    assert last["n_shots"] == 3                            # the kept run's own counts
+    assert poll["run_in_progress"] and poll["run_id"] == nxt["run_id"]
+    assert not poll["reset_requested"]                     # the new run is not aborted
+
+
+@pytest.mark.parametrize("shots, alive, client", [
+    (0, False, {"client_pid": 4242, "client_host": HERE}),        # dead, no data
+    (3, True, {"client_pid": 4242, "client_host": HERE}),         # live client
+    (3, False, {"client_pid": 4242, "client_host": "other-pc"}),  # unknown: another host
+    (3, False, {"client_host": HERE}),                            # unknown: no pid
+])
+def test_otherwise_the_next_init_run_discards_it_as_before(srv, monkeypatch, shots, alive,
+                                                           client):
+    run, _ = _abort_then(srv, monkeypatch, shots, alive, **client)
+    assert not os.path.exists(run["filepath"])
+    last = _poll(srv)["last_outcome"]
+    assert last["run_id"] == run["run_id"] and last["outcome"] == "discarded"

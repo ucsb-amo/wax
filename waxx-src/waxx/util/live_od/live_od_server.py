@@ -67,14 +67,22 @@ def _safe_repr(value) -> str:
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
     ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job,
-    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent). A client that predates them sends none; a malformed
+    "<id>:<token>" as the experiment's WAXX_QUEUE_JOB has it; "" when absent)
+    and ``client_started`` (the client process's creation time, epoch s; None
+    when not sent). A client that predates them sends none; a malformed
     value is dropped, never raised on."""
     pid = msg.get("client_pid")
     try:
         pid = int(pid) if pid is not None else None
     except (TypeError, ValueError):
         pid = None
+    started = msg.get("client_started")
+    try:
+        started = float(started) if started is not None else None
+    except (TypeError, ValueError):
+        started = None
     return {"client_pid": pid, "client_host": str(msg.get("client_host") or ""),
+            "client_started": started,
             "launcher": str(msg.get("launcher") or ""),
             "queue_job": str(msg.get("queue_job") or "")}
 
@@ -174,8 +182,8 @@ class LiveODServer(QThread, NetServer):
         # person). None/"" from a client that predates them. A launcher's gate
         # (waxx.util.device_state.run_gate) uses them to tell a run whose
         # process is gone from a live one.
-        self._current_client = {"client_pid": None, "client_host": "", "launcher": "",
-                                "queue_job": ""}
+        self._current_client = {"client_pid": None, "client_host": "", "client_started": None,
+                                "launcher": "", "queue_job": ""}
         # every Abort set (request_reset), for POLL's reset_count / last_reset
         self._reset_count = 0
         self._reset_counts = {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
@@ -1075,6 +1083,40 @@ class LiveODServer(QThread, NetServer):
         self._set_run_state("aborted")
         self.run_done_signal.emit()
 
+    #: The outcome's why when INIT_RUN finds an unanswered Abort on a run whose
+    #: process is gone and that has data (review F5): its file is kept.
+    DEAD_CLIENT_KEPT_AT_INIT_WHY = "dead client with data, kept at the next run's start"
+
+    def _keep_dead_reset_run(self) -> bool:
+        """At INIT_RUN, with an Abort pending on the run in progress: keep its
+        file instead of discarding it -- its client is known to be gone
+        (:meth:`client_known_dead`) and it has data (:meth:`run_data_counts`)."""
+        if not self.client_known_dead():
+            return False
+        from waxx.util.device_state.run_gate import run_has_data  # noqa: PLC0415
+        return run_has_data(self.run_data_counts())
+
+    def _keep_reset_run_at_init(self):
+        """Close the reset run as an exited run: the writer closes its file with
+        what it has, the path is forgotten (RunFile.leave: not saved, not
+        deleted); outcome "exited" with :data:`DEAD_CLIENT_KEPT_AT_INIT_WHY`.
+        As _finalize_reset_run, the GUI is not notified again."""
+        run_id, counts = self._current_run_id, self.run_data_counts()
+        logger.warning(f"INIT_RUN: run {run_id} had an unanswered Abort, its process is gone and "
+                       f"it has data (shots {counts['n_shots']}, frames "
+                       f"{counts['images_received']}, pushed arrays "
+                       f"{counts['aux_items_received']}): its file is KEPT (not saved as "
+                       f"complete, not deleted).")
+        self._run_file.leave()
+        self._reset_requested = False
+        self._abort_requested_at = None
+        self._abort_again = False
+        self._run_in_progress = False
+        self._record_outcome("exited", self.DEAD_CLIENT_KEPT_AT_INIT_WHY)
+        self._set_run_state("exited", f"run {run_id}: {self.DEAD_CLIENT_KEPT_AT_INIT_WHY}; its "
+                                      f"file is kept as it was")
+        self.run_done_signal.emit()
+
     def _record_outcome(self, outcome: str, detail: str = ""):
         """How the current run ended, for the log buffer's run index and POLL."""
         self._last_outcome = {
@@ -1169,7 +1211,14 @@ class LiveODServer(QThread, NetServer):
         # Abort was pressed between runs and is just cleared (below). Finalizing
         # then recorded the previous run as "discarded/reset" and deleted its
         # file if its save had failed (RunFile keeps the path for a retry).
-        if self._reset_requested and self._run_in_progress:
+        # A run whose process is known to be gone and that has data is KEPT, not
+        # discarded (user ruling 2026-10-09: a run's data is never deleted
+        # unattended): nobody answered its Abort, and a new run starting is not
+        # a person deciding to delete it.  A live / unknown client, or a run
+        # with no data, is discarded as before.
+        if self._reset_requested and self._run_in_progress and self._keep_dead_reset_run():
+            self._keep_reset_run_at_init()
+        elif self._reset_requested and self._run_in_progress:
             self._finalize_reset_run(notify_gui=False)
         elif self._reset_requested:
             logger.info(f"INIT_RUN: an Abort pressed with no run in progress is cleared "
@@ -1612,7 +1661,8 @@ class LiveODServer(QThread, NetServer):
         detail = (f"Abort requested {waited:.0f} s ago and no answer from the experiment "
                   f"(limit {limit:.0f} s, from the shot period): its process may be gone "
                   f"or hung. It is still told to stop; the next run start discards its "
-                  f"file, as for any abort.")
+                  f"file, as for any abort -- unless its process is known to be gone and "
+                  f"the run has data: then its file is kept.")
         logger.warning(f"Run {self._current_run_id}: {detail}")
         self._set_run_state("no_reply", detail)
 
@@ -1621,7 +1671,9 @@ class LiveODServer(QThread, NetServer):
         and no ABORT_RUN that reached liveOD (LiveODClient.notify_exit, an atexit
         handler). ``reason``: the uncaught exception, "" when none was reported.
 
-        * During an abort: that is the abort's answer, taken exactly as ABORT_RUN.
+        * During an abort: that is the abort's answer, taken exactly as ABORT_RUN --
+          except a notice sent on the process's behalf (``run_id``, no run token)
+          for a run with data (:meth:`run_data_counts`): refused, nothing changes.
         * With camera frames still due: the camera thread still owns the run's
           file, so the run stays open (as after a crash until now); only the state
           says what happened.
@@ -1644,6 +1696,24 @@ class LiveODServer(QThread, NetServer):
             return {"ok": True, "ignored": True}
         why = str(msg.get("reason") or "") or "no exception reported"
         run_id = self._current_run_id
+        if self._reset_requested and msg.get("run_token") is None:
+            # sent on the process's behalf (run_id, no token) during an Abort:
+            # taken as the abort's answer it would discard the file, so a run
+            # with data is refused (user ruling 2026-10-09: data is never
+            # deleted unattended) -- the helper refuses too, but from a POLL
+            # that can be a moment old; these are this server's own counts
+            counts = self.run_data_counts()
+            from waxx.util.device_state.run_gate import run_has_data  # noqa: PLC0415
+            if run_has_data(counts):
+                text = (f"RUN_EXITED for run {run_id} refused: an Abort is pending and the run "
+                        f"has data (shots {counts['n_shots']}, frames "
+                        f"{counts['images_received']}, pushed arrays "
+                        f"{counts['aux_items_received']}); taken as the abort's answer it "
+                        f"would discard the file -- a person decides (Reset on a run whose "
+                        f"process is gone keeps the file)")
+                logger.warning(text + ".")
+                return {"ok": False, "refused": True, "abort_pending_with_data": True,
+                        "error": text, **counts}
         if self._reset_requested:
             logger.warning(f"RUN_EXITED: the experiment of run {run_id} exited during its "
                            f"abort ({why}); taken as the abort's acknowledgement.")
@@ -1675,6 +1745,13 @@ class LiveODServer(QThread, NetServer):
 
     # A run whose experiment is gone
     # ------------------------------------------------------------------
+
+    def run_data_counts(self) -> dict:
+        """The current run's data as POLL reports it (run_gate.DATA_FIELDS):
+        shots, camera frames and arrays pushed during the run."""
+        return {"n_shots": len(self._shot_timestamps),
+                "images_received": self._images_received_now(),
+                "aux_items_received": getattr(self, "_aux_items_received", 0)}
 
     def exited_run_pending(self) -> bool:
         """The current run's experiment exited with frames still due and the run is
@@ -1829,8 +1906,11 @@ class LiveODServer(QThread, NetServer):
         """The run in progress's client process is known to be gone: its pid
         was recorded at INIT_RUN, its host is this machine, and Windows says
         the process has ended (run_gate.pid_alive: OpenProcess, never
-        os.kill).  A client on another host, or without a pid, is never known
-        dead."""
+        os.kill) -- or the pid is alive but is provably another process: the
+        creation time the client sent (``client_started``) and the live pid's
+        differ by more than detached.SAME_PROCESS_S (the pid was reused).
+        A client on another host, or without a pid, is never known dead; nor
+        is a live pid whose creation time was not sent or cannot be read."""
         if not self._run_in_progress:
             return False
         client = self._current_client
@@ -1842,7 +1922,14 @@ class LiveODServer(QThread, NetServer):
             return False
         try:
             from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
-            return not pid_alive(pid)
+            if not pid_alive(pid):
+                return True
+            started = client.get("client_started")
+            if started is None:
+                return False
+            from waxx.util.device_state import detached  # noqa: PLC0415
+            now = detached.process_started(pid)
+            return now is not None and abs(now - float(started)) > detached.SAME_PROCESS_S
         except Exception:                             # noqa: BLE001
             return False
 

@@ -69,6 +69,16 @@ def _fmt_duration(seconds):
     return f"{h}h{m:02d}m"
 
 
+def _process_started():
+    """This process's creation time for INIT_RUN's ``client_started`` (None
+    when it cannot be read: liveOD then goes by the pid alone)."""
+    try:
+        from waxx.util.device_state.detached import process_started
+        return process_started()
+    except Exception:
+        return None
+
+
 #: ``WAXX_LAUNCHER`` of a run the monitor server's run queue launched
 #: (waxx.util.device_state.run_queue.LAUNCHER).
 QUEUE_LAUNCHER = "kq"
@@ -957,6 +967,10 @@ class Expt(Scanner, Dealer, Scribe):
             # ("run_lock", "run_loop", ...); "" for a person's `ar`.
             'client_pid': os.getpid(),
             'client_host': socket.gethostname(),
+            # this process's creation time (epoch s; None off Windows): with
+            # the pid it names this process, so a pid reused after it ends is
+            # never taken for it
+            'client_started': _process_started(),
             'launcher': str(os.environ.get('WAXX_LAUNCHER') or ''),
             # the run queue's job this run is (WAXX_QUEUE_JOB, set by the
             # queue): liveOD reports it in POLL and last_outcome, so the

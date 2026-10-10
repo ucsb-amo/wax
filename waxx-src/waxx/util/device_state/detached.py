@@ -156,6 +156,32 @@ class ProcessWatch:
             self._handle = None
 
 
+def process_started(pid: int | None = None) -> float | None:
+    """Process ``pid``'s creation time (this process when None), in epoch
+    seconds, read as :meth:`ProcessWatch.adopt` reads it (``GetProcessTimes``);
+    None off Windows, or when the process cannot be opened or read.  Two
+    readings of one process agree within :data:`SAME_PROCESS_S`; a live pid
+    whose creation time differs from a recorded one is another process (the
+    pid was reused).  Only opens a handle to query it: never touches the
+    process."""
+    if sys.platform != "win32":
+        return None
+    try:
+        pid = os.getpid() if pid is None else int(pid)
+        if pid <= 0:
+            return None
+        _, _, k32 = _k32()
+        handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            return _creation_time(handle)
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
 def _creation_time(handle) -> float | None:
     try:
         ctypes, wintypes, k32 = _k32()
