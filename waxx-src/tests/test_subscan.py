@@ -77,9 +77,18 @@ def _declare(e, every=2, at_start=True, alternate=True, n_reads=3, **kw):
 
 def _finish(e, sub):
     sub.finish(n_data_shots=int(np.prod(e.xvardims)), main_xvarnames=e.xvarnames,
-               setup_camera=e.setup_camera)
+               setup_camera=e.setup_camera, main_xvardims=list(e.xvardims))
     e._decide_subscan()
     return sub
+
+
+def test_refused_when_the_point_count_equals_an_xvar_length():
+    # 6 data shots, every 2 -> events before 0, 2, 4 -> 6 points = the xvar length
+    e = _expt(n_data=6)
+    with pytest.raises(SubScanRefused, match="point count 6 equals a main-scan xvar length 6"):
+        _finish(e, _declare(e, every=2))
+    e2 = _expt(n_data=6)
+    assert _finish(e2, _declare(e2, every=3)).N == 4            # a different cadence passes
 
 
 # ----------------------------------------------------------------- schedule
@@ -88,9 +97,9 @@ def test_events_before_shot_0_and_every_n_shots_and_none_after_the_last():
     e = _expt(n_data=5)
     sub = _finish(e, _declare(e, every=2))
     assert sub.event_starts == [0, 2, 4] and sub.n_events == 3 and sub.N == 6
-    e2 = _expt(n_data=4)
-    sub2 = _finish(e2, _declare(e2, every=2))
-    assert sub2.event_starts == [0, 2]          # N % every == 0: no event after the last shot
+    e2 = _expt(n_data=6)
+    sub2 = _finish(e2, _declare(e2, every=3))
+    assert sub2.event_starts == [0, 3]          # N % every == 0: no event after the last shot
     e3 = _expt(n_data=3)
     sub3 = _finish(e3, _declare(e3, every=20, at_start=False))
     assert not sub3.enabled and "no schedule event" in sub3.disabled_reason

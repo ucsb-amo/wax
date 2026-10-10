@@ -138,7 +138,7 @@ class SubScan:
     def add_host_data_container(self, per_shot_data_shape=(1,), dtype=np.float64, fill_value=0):
         return self.data.add_host_data_container(per_shot_data_shape, dtype, fill_value=fill_value)
 
-    def finish(self, n_data_shots, main_xvarnames=(), setup_camera=False):
+    def finish(self, n_data_shots, main_xvarnames=(), setup_camera=False, main_xvardims=()):
         """Called by Expt.finish_prepare_wax after the main vault's init():
         checks, the tiled point arrays, the containers (sized by this
         sub-scan) and their registration in the main vault under the prefix."""
@@ -191,6 +191,17 @@ class SubScan:
                          f"{n_data_shots} data shots (every {self.every_n_shots})")
             self._init_empty()
             return
+        # The containers are declared final_order and pushed point by point,
+        # so the saver never unshuffles them -- unless every push failed and
+        # they are carried whole at END_RUN, when an axis whose length equals
+        # an xvar's would be unshuffled by axis length. Refuse the one
+        # configuration where that could silently scramble them.
+        clash = [int(d) for d in main_xvardims if int(d) == self.N]
+        if clash:
+            raise SubScanRefused(
+                f"sub-scan '{self.name}': its point count {self.N} equals a main-scan xvar length "
+                f"{clash[0]}; change every_n_shots / at_start / the points per event so they differ "
+                f"(a container carried whole at END_RUN would otherwise be unshuffled by axis length)")
         # event e takes row e % n_cycle of each xvar; the point order is
         # reversed on every other cycle (not event), so a cycling value sees
         # both orders equally

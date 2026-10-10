@@ -276,7 +276,8 @@ class Expt(Scanner, Dealer, Scribe):
         if self._subscan is not None:
             self._subscan.finish(n_data_shots=int(np.prod(self.xvardims)) if self.xvardims else 1,
                                  main_xvarnames=list(self.xvarnames),
-                                 setup_camera=bool(self.setup_camera))
+                                 setup_camera=bool(self.setup_camera),
+                                 main_xvardims=[int(d) for d in self.xvardims])
 
         # Reset per-run shot counter
         self._shot_complete_count = 0
@@ -654,6 +655,14 @@ class Expt(Scanner, Dealer, Scribe):
         self._subscan_enabled = bool(sub.enabled)
         if sub.enabled:
             console.info("[sub-scan] " + sub.describe())
+            # which code takes the points -- a run from a worktree says so
+            try:
+                import waxa
+                import waxx
+                print(f"[sub-scan] code: experiment {self._expt_file_stem()!r}, "
+                      f"waxx {os.path.dirname(waxx.__file__)}, waxa {os.path.dirname(waxa.__file__)}")
+            except Exception:
+                pass
         elif getattr(sub, "quiet", False):
             console.info(f"[sub-scan] '{sub.name}' off this run ({sub.disabled_reason})")
         else:
