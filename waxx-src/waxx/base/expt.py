@@ -106,6 +106,34 @@ def _fmt_duration(seconds):
     return f"{h}h{m:02d}m"
 
 
+def _process_started():
+    """This process's creation time for INIT_RUN's ``client_started`` (None
+    when it cannot be read: liveOD then goes by the pid alone)."""
+    try:
+        from waxx.util.device_state.detached import process_started
+        return process_started()
+    except Exception:
+        return None
+
+
+#: ``WAXX_LAUNCHER`` of a run the monitor server's run queue launched
+#: (waxx.util.device_state.run_queue.LAUNCHER).
+QUEUE_LAUNCHER = "kq"
+
+
+def _queue_restart_monitor(restart_monitor):
+    """A run the run queue launched never restarts the monitor at its end: the
+    queue's next job follows at once, and the monitor server starts the
+    monitor itself when the queue runs out (or starts again the loop it
+    stopped).  Says so in one line; any other run keeps ``restart_monitor``."""
+    if os.environ.get("WAXX_LAUNCHER") != QUEUE_LAUNCHER or not restart_monitor:
+        return restart_monitor
+    print(f"[Monitor] launched by the run queue (job {os.environ.get('WAXX_QUEUE_JOB') or '?'}"
+          "): the monitor is not restarted at the end of this run -- the monitor server "
+          "starts it when the queue runs out.")
+    return False
+
+
 class Expt(Scanner, Dealer, Scribe):
     def __init__(self,
                  setup_camera=True,
@@ -252,7 +280,12 @@ class Expt(Scanner, Dealer, Scribe):
             self.run_info.filepath = response['filepath']
             self._ridstr = "Run ID: " + str(self.run_info.run_id)
             if response['run_id']:
-                console.info(f"Run ID: {self.run_info.run_id}")
+                if os.environ.get('WAXX_LAUNCHER'):
+                    # a launcher (the run queue, the run loop, run_lock) reads
+                    # this line from the output: never hidden by WAX_VERBOSITY
+                    print(f"Run ID: {self.run_info.run_id}", flush=True)
+                else:
+                    console.info(f"Run ID: {self.run_info.run_id}")
         else:
             if self.run_info.save_data and self.setup_camera:
                 raise RuntimeError(
@@ -556,6 +589,7 @@ class Expt(Scanner, Dealer, Scribe):
                 notify=True,
                 restart_monitor=True):
 
+        restart_monitor = _queue_restart_monitor(restart_monitor)
         _t0 = time.monotonic()
         try:
             self.scope_data.close()
@@ -1077,7 +1111,15 @@ class Expt(Scanner, Dealer, Scribe):
             # ("run_lock", "run_loop", ...); "" for a person's `ar`.
             'client_pid': os.getpid(),
             'client_host': socket.gethostname(),
+            # this process's creation time (epoch s; None off Windows): with
+            # the pid it names this process, so a pid reused after it ends is
+            # never taken for it
+            'client_started': _process_started(),
             'launcher': str(os.environ.get('WAXX_LAUNCHER') or ''),
+            # the run queue's job this run is (WAXX_QUEUE_JOB, set by the
+            # queue): liveOD reports it in POLL and last_outcome, so the
+            # queue knows its job's run without reading the output
+            'queue_job': str(os.environ.get('WAXX_QUEUE_JOB') or ''),
         }
 
     def _serialize_end_payload(self, expt_filepath: str) -> dict:

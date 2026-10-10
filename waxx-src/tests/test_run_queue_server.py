@@ -1,0 +1,641 @@
+"""The run queue in the monitor server: the ``run_queue`` requests (the
+contract the kq / ar client will use), status_json, broadcasts, the watch
+tick, and the queue's interplay with the server's loops, state reset and
+monitor.  The server is built offscreen with its broadcaster faked; liveOD,
+the job processes and the loops' runs are fakes; files live under
+tmp_path.  Nothing is launched and nothing goes on the network."""
+import json
+import os
+import threading
+
+import pytest
+
+from test_run_queue import Live, Spawner
+
+
+class Broadcasts:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def expts(tmp_path):
+    folder = tmp_path / "experiments"
+    folder.mkdir()
+    for name in ("rabi", "auto_tof", "monitor"):
+        (folder / f"{name}.py").write_text(f'"""{name}."""\nclass {name}: pass\n')
+    return folder
+
+
+@pytest.fixture
+def server(qapp, monkeypatch, tmp_path, expts):
+    from waxx.util.device_state.run_loop import LoopSpec
+    from waxx.util.guis import monitor_server_gui as msg
+    monkeypatch.setattr(msg, "StateBroadcaster", Broadcasts)
+    monkeypatch.setattr(msg, "monitor_server_id", lambda: "monitor-under-test")
+    s = msg.MonitorUDPServer(config_file_path=str(tmp_path / "state.json"),
+                             journal_dir=str(tmp_path / "logs" / "ops_journal"),
+                             run_loops=[LoopSpec("auto_tof", "BEC TOF loop",
+                                                 str(expts / "auto_tof.py"))])
+    s.status.expt_path = str(expts / "monitor.py")
+    s._started_at -= 60.0                   # up a minute: past the restart uptime floor
+    s.live = Live()
+    s._live_od = s.live                               # the queue calls it late
+    s.spawner = Spawner()
+    s.run_queue._spawn = s.spawner                    # never the real detached launcher
+    s.run_queue._adopt = lambda pid, started: None    # never a real process
+    s.run_queue.poll_every_s, s.run_queue._gap_s, s.run_queue._outcome_wait_s = 0., 0., 0.
+    loop = s.loops["auto_tof"]
+    loop._poll = s.live
+    loop._gap_s, loop._poll_s = 0., 0.01
+    s.monitor_starts = []
+    s.start_monitor_signal.connect(s.monitor_starts.append)
+    s.ask = lambda obj: json.loads(s.generate_reply(json.dumps(obj)))
+    yield s
+    loop.join(5)
+    s.sock.close()
+
+
+def _run(server, run_id, outcome="saved", code=0, lines=()):
+    proc = server.spawner.procs[-1]
+    proc.write(f"Run ID: {run_id}", *lines)
+    server.live.start_run(run_id)
+    server.watch_tick()
+    server.live.end_run(run_id, outcome)
+    proc.code = code
+    server.watch_tick()
+
+
+def test_the_request_contract(server, expts, tmp_path):
+    path = str(expts / "rabi.py")
+    reply = server.ask({"type": "run_queue", "action": "submit", "path": path, "by": "jp",
+                        "label": "rabi", "priority": 2, "owner": "agent"})
+    assert reply["status"] == "ok" and reply["ids"] == [1]
+    j = reply["jobs"][0]
+    assert {"id", "token", "path", "sha256", "label", "argv", "cwd", "owner", "priority",
+            "due", "after", "chain", "stop_on_failure", "write_back", "allow_drift",
+            "repeat_index", "repeat_of", "submitted_at", "submitted_by", "state", "reason",
+            "pid", "pid_started", "client_pid", "run_id", "log_path", "exit_code",
+            "outcome", "launched_at", "ended_at", "cancel", "adopted", "rank", "expt_class",
+            "calibrates_declared", "submitter", "paused", "paused_by", "paused_since"} == set(j)
+    # the edit, move and insert actions answer through the server
+    assert server.ask({"type": "run_queue", "action": "edit", "id": 1, "owner": "agent",
+                       "fields": {"label": "rabi2"}})["job"]["label"] == "rabi2"
+    assert server.ask({"type": "run_queue", "action": "move", "id": 1, "owner": "agent",
+                       "to_index": 0})["position"] == 0
+    assert j["state"] == "queued" and j["owner"] == "agent"
+    status = json.loads(server.generate_reply("status_json"))
+    rq = status["run_queue"]
+    assert rq["enabled"] and rq["counts"]["queued"] == 1 and rq["next"] == [1]
+    assert rq["directory"] == str(tmp_path / "run_queue_default")   # conftest's local default
+    assert status["person_hold"] == rq["person_hold"]
+    assert any(p.get("type") == "run_queue" for p in server._broadcaster.sent)
+    listed = server.ask({"type": "run_queue", "action": "list"})
+    assert [x["id"] for x in listed["jobs"]] == [1] and listed["next"] == [1]
+    described = server.ask({"type": "run_queue", "action": "describe", "id": 1})
+    assert described["job"]["id"] == 1 and described["waiting"] == "launching"
+    assert server.ask({"type": "run_queue", "action": "pause", "scope": "agent",
+                       "by": "jp"})["run_queue"]["paused"]["agent"]["by"] == "jp"
+    assert server.ask({"type": "run_queue", "action": "resume", "scope": "agent",
+                       "by": "jp", "owner": "person"})["status"] == "ok"
+    no_owner = server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp"})
+    assert no_owner["status"] == "error" and "owner is required" in no_owner["msg"]
+    assert server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp",
+                       "owner": "person"})["job"]["state"] == "cancelled"
+    held = server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
+    assert held["person_hold"]["active"] and held["person_hold"]["owner"] == "person"
+    assert server.ask({"type": "run_queue", "action": "release", "by": "jp",
+                       "owner": "person"})["status"] == "ok"
+    bad = server.ask({"type": "run_queue", "action": "explode"})
+    assert bad["status"] == "error" and "known: submit" in bad["msg"]
+    kinds = [e["kind"] for e in server.journal.tail(100)]
+    for kind in ("run_queue_submit", "run_queue_pause", "run_queue_resume", "run_queue_end",
+                 "run_queue_hold", "run_queue_release"):
+        assert kind in kinds
+    lines = (tmp_path / "run_queue_default" / "journal.jsonl").read_text().splitlines()
+    assert json.loads(lines[0])["kind"] == "run_queue_submit"
+
+
+def test_tail_and_a_queued_only_cancel_through_the_server(server, expts):
+    def ask(**kw):
+        return server.ask(dict({"type": "run_queue"}, **kw))
+
+    sub = ask(action="submit", path=str(expts / "rabi.py"), owner="person")
+    a, token = sub["ids"][0], sub["jobs"][0]["token"]
+    assert "token" in ask(action="tail", id=a, offset=0)["msg"]       # required
+    t = ask(action="tail", id=a, token=token, offset=0)
+    assert t["status"] == "ok" and t["state"] == "queued" and t["lines"] == []
+    server.watch_tick()
+    server.spawner.procs[-1].write("Run ID: 85600", "shot 1/2")
+    t = ask(action="tail", id=a, token=token, offset=0)
+    assert t["lines"][-2:] == ["Run ID: 85600", "shot 1/2"] and not t["done"]
+    refused = ask(action="cancel", id=a, by="jp", owner="person", queued_only=True)
+    assert refused["status"] == "error" and refused["state"] == "running"
+    assert server.live.resets == []
+    sent = len(server._broadcaster.sent)
+    records = len(server.journal.tail(1000))
+    ask(action="tail", id=a, token=token, offset=0)   # polled often: no broadcast, no journal
+    assert len(server._broadcaster.sent) == sent and len(server.journal.tail(1000)) == records
+    _run(server, 85600)
+    t2 = ask(action="tail", id=a, token=token, offset=t["offset"])
+    assert t2["done"] and t2["state"] == "saved" and t2["run_id"] == 85600
+
+
+def test_the_monitors_own_experiment_is_refused(server, expts):
+    reply = server.ask({"type": "run_queue", "action": "submit",
+                        "path": str(expts / "monitor.py")})
+    assert reply["status"] == "error" and "monitor's own experiment" in reply["msg"]
+
+
+def test_the_watch_runs_the_job_and_asks_for_the_monitor_when_out_of_jobs(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    j = server.ask({"type": "run_queue", "action": "describe", "id": 1})["job"]
+    assert j["state"] == "running" and server.spawner.calls[0]["env"]["WAXX_LAUNCHER"] == "kq"
+    _run(server, 85600)
+    server.watch_tick()
+    QApplication.processEvents()
+    j = server.ask({"type": "run_queue", "action": "describe", "id": 1})["job"]
+    assert j["state"] == "saved" and j["run_id"] == 85600
+    assert server.monitor_starts == ["the run queue has no job to run"]
+
+
+def test_the_queue_waits_for_a_state_reset_and_a_starting_monitor(server, expts):
+    from waxx.util.comms_server.comm_server import STATES
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.status.state = STATES.LOADING
+    server.watch_tick()
+    assert server.spawner.calls == []
+    assert server.run_queue.info()["waiting"] == "the monitor is starting"
+    server.status.state = STATES.READY
+    server.watch_tick()
+    assert len(server.spawner.calls) == 1
+
+
+def test_a_reset_on_a_persons_run_holds_but_not_on_an_agents_queued_run(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    server.spawner.procs[-1].write("Run ID: 85600")
+    server.live.start_run(85600)
+    server.watch_tick()
+    server.live.state["reset_requested"] = True       # the agent resets its own run
+    server.watch_tick()
+    assert not server.person_hold.active
+    server.live.end_run(85600, "discarded")
+    server.spawner.procs[-1].code = 1
+    server.watch_tick()
+    server.live.state.update(run_in_progress=True, run_id=85601, reset_requested=False)
+    server.watch_tick()
+    server.live.state["reset_requested"] = True       # a person's run
+    server.watch_tick()
+    assert server.person_hold.active and server.person_hold.info()["run_id"] == 85601
+    status = json.loads(server.generate_reply("status_json"))
+    assert status["person_hold"]["reason"].startswith("Reset in liveOD at ")
+
+
+# --- the queue and the server's real run loop ------------------------------------------------
+
+class LoopProc:
+    """One run of the loop's experiment: prints its run id, waits for
+    ``release``, then liveOD records it saved; exit code 0."""
+
+    def __init__(self, live, run_id, release: threading.Event):
+        self.pid, self._live, self._run_id, self._release = 4242, live, run_id, release
+        self.stdout = self._out()
+
+    def _out(self):
+        self._live.start_run(self._run_id)
+        yield f"Run ID: {self._run_id}\n"
+        self._release.wait(5)
+        self._live.end_run(self._run_id)
+
+    def wait(self):
+        return 0
+
+
+def _wait_for(predicate, timeout=5.0):
+    import time
+    t0 = time.monotonic()
+    while not predicate() and time.monotonic() - t0 < timeout:
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_job_stops_the_loop_gracefully_and_the_loop_comes_back(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    run_ids = iter([81001, 81002])
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, next(run_ids), release)
+    assert server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})["status"] == "ok"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"            # its run in progress finishes
+    assert server.spawner.calls == []
+    assert "BEC TOF loop is finishing its run" in server.run_queue.info()["waiting"]
+    assert server.run_queue.info()["resume_loop"]["key"] == "auto_tof"
+    release.set()
+    loop.join(5)
+    QApplication.processEvents()
+    assert loop.info()["state"] == "stopped" and loop.info()["runs"] == 1
+    assert server.monitor_starts == []                   # no monitor between loop and job
+    server.watch_tick()
+    assert len(server.spawner.calls) == 1
+    # a person's Start meanwhile is refused, naming the queue's work
+    refused = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
+    assert refused["status"] == "error"
+    assert "the run queue has a job to run now (the run queue's job 1" in refused["msg"]
+    release.clear()                                      # the loop's next run will wait
+    _run(server, 85600)                                  # its last tick starts the loop
+    assert loop.info()["state"] == "running", loop.info()["text"]   # started again by the queue
+    assert server.monitor_starts == []
+    kinds = [e["kind"] for e in server.journal.tail(200)]
+    assert "run_queue_loop_stop" in kinds and "run_queue_loop_resume" in kinds
+    loop.stop()
+    release.set()
+    loop.join(5)
+
+
+def test_jobs_due_later_held_or_paused_leave_a_loop_start_alone(server, expts):
+    import time as _time
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001,
+                                                           threading.Event())
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "due": _time.time() + 3600})
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.ask({"type": "run_queue", "action": "hold", "reason": "mine", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    server.ask({"type": "run_queue", "action": "release", "by": "jp", "owner": "person"})
+    server.ask({"type": "run_queue", "action": "pause", "scope": "agent", "by": "jp"})
+    assert server.run_queue.eligible_or_running() == ""
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof"})
+    assert reply["status"] == "ok", reply
+    loop.stop()
+    loop.join(6)
+
+
+def test_a_persons_stop_request_cancels_the_queues_restart_and_starters_are_kept(
+        server, expts, qapp):
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                        "owner": "agent"})
+    assert reply["status"] == "ok" and reply["loop"]["owner"] == "agent"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"            # an agent's loop: an agent's job stops it
+    assert server.run_queue.info()["resume_loop"]["key"] == "auto_tof"
+    server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof", "operator": "jp"})
+    assert server.run_queue.info()["resume_loop"] is None
+    assert "run_queue_loop_resume_cancelled" in [e["kind"] for e in server.journal.tail(50)]
+    release.set()
+    loop.join(5)
+
+
+def test_a_monitor_restart_waits_while_the_queue_has_work(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    restarts = []
+    server.reset_signal.connect(lambda: restarts.append("reset"))
+    forwarded = []
+    server.message_received.connect(forwarded.append)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.live.start_run(555, n_shots=1, last_shot_age_s=1.0, init_run_age_s=10.0)
+    server.watch_tick()                                 # waits for someone's live run
+    server.on_message_received("reset")                 # eligible, gate live: deferred
+    server.live.end_run(555)
+    server.watch_tick()
+    server.on_message_received("reset")                 # in the slot
+    server.on_message_received("run complete")
+    QApplication.processEvents()
+    assert restarts == [] and forwarded == []
+    kinds = [e["kind"] for e in server.journal.tail(100)]
+    assert kinds.count("run_queue_monitor_deferred") == 3
+    _run(server, 85600)
+    server.watch_tick()
+    QApplication.processEvents()
+    assert server.monitor_starts == ["the run queue has no job to run"]
+    server.on_message_received("reset")                 # the queue is idle: as before
+    QApplication.processEvents()
+    assert restarts == ["reset"]
+
+
+def test_a_state_reset_is_refused_while_a_queue_job_runs(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    reply = server.ask({"type": "reset_state", "operator": "jp"})
+    assert reply["status"] == "error" and "the run queue's job 1 (rabi) is running" in reply["msg"]
+    assert "run queue's job 1" in server._regenerate_blocker()
+    from waxx.util.comms_server.comm_server import STATES
+    server.status.state = STATES.READY                   # even with a monitor up
+    assert "run queue's job 1" in server._slm_reinit_blocker()
+
+
+# --- restart / shutdown by request ---------------------------------------------------------------
+
+def _exits(server):
+    exits = []
+    server.server_exit_signal.connect(lambda code, why: exits.append((code, why)))
+    return exits
+
+
+def test_server_restart_needs_an_action_and_an_owner(server):
+    assert "unknown server action" in server.ask({"type": "server", "action": "reboot",
+                                                  "owner": "person"})["msg"]
+    assert "owner is required" in server.ask({"type": "server", "action": "restart"})["msg"]
+
+
+def test_server_restart_is_refused_under_a_queue_job_a_loop_run_or_a_starting_monitor(
+        server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    from waxx.util.comms_server.comm_server import STATES
+    exits = _exits(server)
+    server.status.state = STATES.LOADING
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert reply["status"] == "error" and "monitor experiment is starting" in reply["msg"]
+    server.status.state = STATES.NOT_READY
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.watch_tick()
+    reply = server.ask({"type": "server", "action": "restart", "owner": "agent", "by": "a7"})
+    assert reply["status"] == "error" and "job 1 (rabi) is running" in reply["msg"]
+    _run(server, 85600)
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    server.run_queue.cancel({"id": 1, "owner": "person"})  # (nothing left queued)
+    assert loop.start(owner="person")["status"] == "ok"
+    assert _wait_for(lambda: loop.in_run and loop.info().get("run_id") == 81001)
+    reply = server.ask({"type": "server", "action": "shutdown", "owner": "person"})
+    assert reply["status"] == "error" and "has a run in progress (run 81001)" in reply["msg"]
+    release.set()
+    loop.stop()
+    loop.join(5)
+    QApplication.processEvents()
+    assert exits == []
+    kinds = [e["kind"] for e in server.journal.tail(100)]
+    assert kinds.count("server_restart_refused") == 3
+
+
+def test_server_restart_stops_a_loop_between_runs_releases_and_exits_3(server, expts, qapp,
+                                                                        monkeypatch):
+    from PyQt6.QtWidgets import QApplication
+    exits = _exits(server)
+    released = []
+    monkeypatch.setattr(server.connections, "stop", lambda: released.append(True))
+    loop = server.loops["auto_tof"]
+    loop._gap_s = 30.0                                   # it waits between runs
+    release = threading.Event()
+    release.set()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    assert loop.start(owner="agent")["status"] == "ok"
+    assert _wait_for(lambda: loop.info().get("runs") == 1 and not loop.in_run)
+    assert loop.active                                   # between runs
+    reply = server.ask({"type": "server", "action": "restart", "owner": "agent",
+                        "by": "kq@kong"})
+    assert reply == {"status": "ok", "restarting": True, "exit_code": 3}
+    assert not loop.active and loop.info()["state"] in ("stopped", "latched")
+    assert released == [True]
+    QApplication.processEvents()
+    assert exits == [(3, "restart asked by kq@kong (agent)")]
+    rec = [e for e in server.journal.tail(100) if e["kind"] == "server_restart_requested"][-1]
+    assert rec["by"] == "kq@kong" and rec["owner"] == "agent" and rec["exit_code"] == 3
+    # nothing launches any more (a request to submit is refused now -- F1 --
+    # and a job already queued waits)
+    assert server.ask({"type": "run_queue", "action": "submit",
+                       "path": str(expts / "rabi.py")})["msg"] == "server is restarting"
+    server.run_queue.submit({"path": str(expts / "rabi.py")})
+    server.watch_tick()
+    assert server.spawner.calls == []
+    assert "restarting" in server.run_queue.info()["waiting"]
+
+
+def test_server_shutdown_exits_0(server, qapp):
+    from PyQt6.QtWidgets import QApplication
+    exits = _exits(server)
+    reply = server.ask({"type": "server", "action": "shutdown", "owner": "person", "by": "jp"})
+    assert reply == {"status": "ok", "restarting": False, "exit_code": 0}
+    QApplication.processEvents()
+    assert [c for c, _ in exits] == [0]
+
+
+class _FakeApp:
+    codes = []
+
+    @classmethod
+    def instance(cls):
+        return cls
+
+    @classmethod
+    def exit(cls, code):
+        cls.codes.append(code)
+
+
+def test_the_headless_owner_stops_the_monitor_then_exits_with_the_code(monkeypatch):
+    from waxx.util.guis import monitor_server_headless as headless
+    _FakeApp.codes = []
+    monkeypatch.setattr(headless, "QCoreApplication", _FakeApp)
+    stopped = []
+
+    class Owner:
+        monitor_manager = type("M", (), {"stop": lambda self: stopped.append(True)})()
+    headless.HeadlessMonitorServer._exit_now(Owner(), 3)
+    assert stopped == [True] and _FakeApp.codes == [3]
+
+
+def test_the_gui_owner_cleans_up_once_then_exits_with_the_code(monkeypatch):
+    from waxx.util.guis import monitor_server_gui as gui
+    _FakeApp.codes = []
+    monkeypatch.setattr(gui, "QApplication", _FakeApp)
+    calls = []
+
+    class Thread:
+        def quit(self):
+            calls.append("quit")
+
+        def wait(self):
+            calls.append("wait")
+
+    class Owner:
+        _cleanup = gui.MonitorServerGUI._cleanup
+        udp_server = type("U", (), {"stop": lambda self: calls.append("udp")})()
+        server_thread = Thread()
+        monitor_manager = type("M", (), {"stop": lambda self: calls.append("monitor")})()
+    owner = Owner()
+    gui.MonitorServerGUI._exit_now(owner, 3)
+    gui.MonitorServerGUI._exit_now(owner, 3)
+    assert calls == ["udp", "quit", "wait", "monitor"]       # once
+    assert _FakeApp.codes == [3, 3]
+
+
+# --- a refused restart never leaves the machine without a monitor (review F2) -----------------------
+
+def test_a_loop_that_does_not_stop_in_time_is_asked_to_start_the_monitor(server, monkeypatch):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"                         # active between runs, slow to stop
+    asked = []
+    monkeypatch.setattr(loop, "stop", lambda **kw: asked.append(kw["start_monitor"]))
+    monkeypatch.setattr(type(server), "LOOP_STOP_WAIT_S", 0.1)
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert reply["status"] == "error" and "starts the monitor when it ends" in reply["msg"]
+    assert asked == [False, True]
+    assert server.exiting == ""
+    loop._s["state"] = "idle"
+
+
+@pytest.mark.parametrize("second", ["not_running", "raises"])
+def test_a_loop_that_ends_just_before_the_second_stop_does_not_break_the_request(
+        server, monkeypatch, second):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"
+    calls = []
+
+    def stop(**kw):
+        calls.append(kw["start_monitor"])
+        if len(calls) == 2:                               # it ended in between
+            loop._s["state"] = "stopped"
+            if second == "raises":
+                raise RuntimeError("the loop is gone")
+            return {"status": "error", "msg": "Auto TOF is not running"}
+        return {"status": "ok"}
+    monkeypatch.setattr(loop, "stop", stop)
+    monkeypatch.setattr(type(server), "LOOP_STOP_WAIT_S", 0.1)
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert calls == [False, True]
+    assert reply["status"] == "ok" and reply["exit_code"] == 3   # stopped after all: go on
+
+
+def test_a_refusal_after_stopping_a_loop_leaves_the_monitor_owed(server, expts, monkeypatch):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"
+    monkeypatch.setattr(loop, "stop", lambda **kw: loop._s.update(state="stopped"))
+    answers = iter(["", "the run queue's job 1 (rabi) is launching"])
+    monkeypatch.setattr(server, "_queue_slot_text", lambda: next(answers))
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert reply["status"] == "error" and "is launching" in reply["msg"]
+    assert server.run_queue._owe_monitor is True         # asked for once the queue runs out
+    assert server.run_queue._stop_launching == ""        # and it launches again
+    kinds = [e["kind"] for e in server.journal.tail(50)]
+    assert "run_queue_monitor_deferred" in kinds
+
+
+# --- nothing new starts in the exit window (review F1) ---------------------------------------------
+
+def test_nothing_new_starts_once_a_restart_is_accepted(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    restarts, starts = [], []
+    server.reset_signal.connect(lambda: restarts.append(True))
+    server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert server.exiting == "server is restarting"
+    for req in ({"type": "run_loop", "action": "start", "loop": "auto_tof"},
+                {"type": "reset_state", "operator": "jp"},
+                {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")},
+                {"type": "run_queue", "action": "resume", "scope": "all", "owner": "person"},
+                {"type": "server", "action": "restart", "owner": "person"}):
+        assert server.ask(req) == {"status": "error", "msg": "server is restarting"}, req
+    assert server.ask({"type": "run_queue", "action": "list"})["status"] == "ok"   # reads still
+    server.on_message_received("reset")                   # a monitor start: not now
+    server.on_message_received("run complete")
+    QApplication.processEvents()
+    assert restarts == []
+
+
+def test_reads_are_answered_while_exiting(server, expts):
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "person"})
+    server._exiting = "server is restarting"             # as an accepted restart sets it
+    try:
+        refused = {"status": "error", "msg": "server is restarting"}
+        for req in ({"type": "run_queue", "action": "list"},
+                    {"type": "run_queue", "action": "describe", "path": str(expts / "rabi.py")},
+                    {"type": "get_journal", "n": 5},
+                    {"type": "get_version"},
+                    {"type": "poll"},
+                    {"type": "output", "kind": "run_loop", "key": "auto_tof"},
+                    {"type": "slm_reinit", "action": "status"}):
+            assert server.ask(req) != refused, req
+        # the job-log read: never refused for exiting (the panel branch serves it)
+        assert server._starts_work("run_queue", {"action": "tail", "id": 1}) is False
+        assert server.ask({"type": "run_queue", "action": "tail", "id": 1}) != refused
+        assert server._starts_work("slm_reinit", {"action": "now"}) is True
+        assert server.ask({"type": "slm_reinit", "action": "restart"}) == refused
+    finally:
+        server._exiting = ""
+
+
+def test_the_owners_and_the_queue_start_no_monitor_or_loop_while_exiting(tmp_path):
+    from waxx.util.guis import monitor_server_headless as headless
+    started = []
+
+    class Owner:
+        udp_server = type("U", (), {"exiting": "server is restarting"})()
+        monitor_manager = type("M", (), {"isRunning": lambda self: False})()
+
+        def _restart_monitor(self):
+            started.append(True)
+    headless.HeadlessMonitorServer._start_monitor_unless_running(Owner(), "loop ended")
+    assert started == []
+    from test_run_queue import FakeLoop, make_queue
+    expts = tmp_path / "e"
+    expts.mkdir()
+    loop = FakeLoop()
+    loop.state = "stopped"
+    loop.text = "stopped by run queue@kong after 1 saved run"
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    q._resume_loop = {"key": "auto_tof", "path": None, "since": 0.0}
+    q._owe_monitor = True
+    q.stop_launching("the monitor server is restarting")
+    q.tick()
+    assert loop.starts == [] and q.monitor_starts == []
+
+
+def test_a_restart_is_refused_until_the_server_has_been_up_long_enough(server):
+    """An exit 3 within RESTART_REQUEST_MIN_UPTIME_S of the process start is a
+    crash to the supervisor, and the monitor server is not restarted on a
+    crash: until that floor plus a margin, the request is refused (it would
+    leave the server down) and nothing starts exiting."""
+    import time
+    from waxx.util.dashboard.exit_codes import RESTART_REQUEST_MIN_UPTIME_S
+    floor = RESTART_REQUEST_MIN_UPTIME_S + server.RESTART_UPTIME_MARGIN_S
+    assert floor == 12.0
+    server._started_at = time.monotonic() - 3.2
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert reply["status"] == "error"
+    assert reply["msg"] == "server started 3 s ago; retry in 9 s"
+    assert not server.exiting
+    assert any(e["kind"] == "server_restart_refused" for e in server.journal.tail(20))
+    server._started_at = time.monotonic() - floor - 0.5
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["exit_code"] == server.EXIT_RESTART
+
+
+def test_a_shutdown_is_not_held_by_the_uptime_floor(server):
+    import time
+    server._started_at = time.monotonic() - 1.0
+    reply = server.ask({"type": "server", "action": "shutdown", "owner": "person", "by": "jp"})
+    assert reply["status"] == "ok" and reply["exit_code"] == 0
+
+
+def test_the_supervisor_and_the_server_share_one_uptime_floor():
+    from waxx.util.dashboard import exit_codes
+    from waxx.util.dashboard.server_supervisor import ServerSupervisor
+    assert ServerSupervisor.RESTART_REQUEST_MIN_UPTIME_S == exit_codes.RESTART_REQUEST_MIN_UPTIME_S

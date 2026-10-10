@@ -3,8 +3,9 @@
 The lab's use: the BEC TOF loop (kexp: ``experiments/tools/auto_tof.py``),
 started and stopped from a card on the Device Control GUI's Composite tab.  It
 runs in the monitor server because that process outlives the GUIs and already
-launches experiments the lab's way (``%kpy% & ar <file>``, as
-:class:`~waxx.util.device_state.state_reset.StateReset` does).
+launches experiments directly (``%kpy% & artiq_run --device-db "%db%" <file>``,
+:func:`~waxx.util.device_state.monitor_manager.ar_command`), as
+:class:`~waxx.util.device_state.state_reset.StateReset` does.
 
 One run at a time:
 
@@ -86,10 +87,12 @@ _TAIL_SHOWN = 8
 #: the run in progress finishes first), ``stopped`` (ended by Stop),
 #: ``latched`` (ended by anything else; off until Start).
 ACTIVE = ("running", "stopping")
+#: Who may have started a loop (RunLoop.start's owner).
+LOOP_OWNERS = ("person", "agent", "queue")
 
 
 #: Characters refused in a picked file's path: the run is launched through the
-#: shell (``%kpy% & ar <file>``).
+#: shell (:func:`~waxx.util.device_state.monitor_manager.ar_command`).
 _SHELL_CHARS = set('&|<>^%"!')
 
 
@@ -191,28 +194,34 @@ class _LiveOD:
     restart the kept client still points at the old port, and without the
     retry the first Start after the restart was refused ("liveOD is not
     reachable") although liveOD was up.  POLL is read-only, so repeating it is
-    safe; the exit notice is not repeated."""
+    safe; the exit notice is not repeated.
+
+    One request at a time (a lock).  Each RunLoop makes its own (a loop polls
+    while its run starts, and between runs); the monitor server keeps one
+    more for its watch thread -- the run queue and the person hold."""
 
     def __init__(self):
         self._client = None
+        self._lock = threading.Lock()
 
     def _call(self, fn, retry: bool = False):
         from waxx.util.live_od.live_od_client import LiveODClient  # noqa: PLC0415
-        for attempt in range(2 if retry else 1):
-            if self._client is None:
-                self._client = LiveODClient(timeout_ms=3000, discovery_timeout=3.0)
-            try:
-                return fn(self._client)
-            except Exception:
-                client, self._client = self._client, None
+        with self._lock:
+            for attempt in range(2 if retry else 1):
+                if self._client is None:
+                    self._client = LiveODClient(timeout_ms=3000, discovery_timeout=3.0)
                 try:
-                    client.close()
+                    return fn(self._client)
                 except Exception:
-                    pass
-                if attempt == (1 if retry else 0):
-                    raise
-                log.info("liveOD POLL failed on the kept client; retrying on a fresh one "
-                         "(liveOD may have restarted)")
+                    client, self._client = self._client, None
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    if attempt == (1 if retry else 0):
+                        raise
+                    log.info("liveOD POLL failed on the kept client; retrying on a fresh one "
+                             "(liveOD may have restarted)")
 
     def __call__(self) -> dict:
         reply = self._call(lambda c: c.poll(), retry=True)
@@ -225,6 +234,19 @@ class _LiveOD:
         token: liveOD matches the run id instead)."""
         return self._call(lambda c: c._send_recv(
             {"tag": "RUN_EXITED", "run_id": int(run_id), "reason": reason}))
+
+    def reset(self, run_id=None, source: str = "queue") -> dict:
+        """liveOD's RESET -- what its Abort button sends: the run in progress
+        is aborted at its next shot and its file discarded (liveOD's own
+        rule).  ``run_id``: liveOD refuses it unless that run is the one in
+        progress (a liveOD from before 2026-10-09 ignores the field: the caller
+        also checks on a POLL just before); ``source`` ("queue" for the run
+        queue's cancel) tells liveOD's watchers it was not a person's press.
+        Not repeated."""
+        msg = {"tag": "RESET", "source": source}
+        if run_id is not None:
+            msg["run_id"] = int(run_id)
+        return self._call(lambda c: c._send_recv(msg))
 
 
 class RunLoop:
@@ -243,6 +265,7 @@ class RunLoop:
                  run_exited: Callable[[int, str], dict] | None = None,
                  fence: Callable[[], dict | None] | None = None,
                  busy: Callable[[], str] | None = None,
+                 held: Callable[[], str] | None = None,
                  start_monitor: Callable[[str], None] | None = None,
                  on_change: Callable[[dict], None] | None = None, journal=None,
                  spawn=None, clock: Callable[[], float] = time.time,
@@ -255,6 +278,7 @@ class RunLoop:
         self._run_exited = run_exited or getattr(self._poll, "run_exited", None)
         self._fence = fence
         self._busy = busy
+        self._held = held
         self._start_monitor = start_monitor
         self._on_change = on_change
         self._journal = journal
@@ -269,6 +293,10 @@ class RunLoop:
         #: (run id, state) of the last dead run the gate waived (warned once)
         self._waived: tuple | None = None
         self._stop_by = ""
+        #: a run's process is up (in_run)
+        self._in_run = False
+        #: Stop asked for the monitor at the end (False: the run queue's stop)
+        self._stop_monitor = True
         self._external = ""
         self._about, self._about_key = "", None
         self._s: dict = {"state": "idle", "text": "not started", "runs": 0,
@@ -285,6 +313,12 @@ class RunLoop:
     def active(self) -> bool:
         with self._lock:
             return self._s["state"] in ACTIVE
+
+    @property
+    def in_run(self) -> bool:
+        """A run of the loop's experiment is in progress (from its launch to
+        its process's exit); False between runs."""
+        return self._in_run
 
     def info(self) -> dict:
         with self._lock:
@@ -336,8 +370,13 @@ class RunLoop:
 
     # -- requests ---------------------------------------------------------------
 
-    def start(self, operator: str = "", client: str = "", path=None) -> dict:
-        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`)."""
+    def start(self, operator: str = "", client: str = "", path=None,
+              owner: str = "person") -> dict:
+        """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`).
+        ``owner``: who starts it -- "person" (the GUI), "agent" (an agent's
+        TOF-idle restart) or "queue" (the run queue starting again a loop it
+        stopped); kept in ``info()``: the run queue stops a person's loop only
+        for a person's job."""
         who = _who(operator, client)
         if self.spec.pick:
             full, why = resolve_pick(self.spec, path)
@@ -359,30 +398,37 @@ class RunLoop:
             if self.spec.pick:
                 self.path, self.expt = str(full), full.stem
             self._stop_by, self._external = "", ""
+            self._stop_monitor = True
             self._wake.clear()
             self._s = {"state": "running", "text": f"started by {who}", "runs": 0,
                        "run_id": None, "last": None, "started": self._clock(),
-                       "ended": None, "operator": operator, "client": client}
+                       "ended": None, "operator": operator, "client": client,
+                       "owner": owner if owner in LOOP_OWNERS else "person"}
         log.info("%s: started by %s (%s).", self.spec.title, who, self.path)
-        self._record("run_loop_start", operator=operator, client=client)
+        self._record("run_loop_start", operator=operator, client=client, owner=owner)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"run-loop-{self.spec.key}")
         self._thread.start()
         self._notify()
         return {"status": "ok", "loop": self.info()}
 
-    def stop(self, operator: str = "", client: str = "") -> dict:
-        """Finish the run in progress, then end the loop."""
+    def stop(self, operator: str = "", client: str = "", start_monitor: bool = True) -> dict:
+        """Finish the run in progress, then end the loop.  ``start_monitor``
+        False: do not start the monitor at the end (the run queue stops a loop
+        to run its own jobs straight after -- a monitor starting then could
+        take the core from the job)."""
         who = _who(operator, client)
         with self._lock:
             if self._s["state"] not in ACTIVE:
                 return {"status": "error", "msg": f"{self.spec.title} is not running"}
             self._stop_by = who
+            self._stop_monitor = bool(start_monitor)
             self._s["state"] = "stopping"
             self._s["text"] = (f"Stop pressed by {who}: run {self._s['run_id']} finishes first"
                                if self._s.get("run_id") else f"Stop pressed by {who}")
         log.info("%s: stop requested by %s.", self.spec.title, who)
-        self._record("run_loop_stop", operator=operator, client=client)
+        self._record("run_loop_stop", operator=operator, client=client,
+                     start_monitor=bool(start_monitor))
         self._wake.set()
         self._notify()
         return {"status": "ok", "loop": self.info()}
@@ -466,7 +512,7 @@ class RunLoop:
         if external:
             return "latched", external, False
         if stop_by:
-            return "stopped", f"stopped by {stop_by} after {_n_runs(runs)}", True
+            return "stopped", f"stopped by {stop_by} after {_n_runs(runs)}", self._stop_monitor
         blocked = self._gate()
         if blocked is not None:
             return "latched", blocked[0], blocked[1]
@@ -475,6 +521,11 @@ class RunLoop:
     def _gate(self) -> tuple[str, bool] | None:
         """(why the machine is not free, whether the monitor may be started
         then) -- or None when it is free."""
+        held = self._held() if self._held is not None else ""
+        if held:
+            # a person has the machine: the loop ends as on a Stop (the
+            # monitor is started), and the text says it is the hold
+            return f"{held} -- the loop does not run while it is on", True
         busy = self._busy() if self._busy is not None else ""
         if busy:
             return busy, False
@@ -516,6 +567,13 @@ class RunLoop:
 
     def _one_run(self) -> tuple[str, str, bool] | None:
         """Launch the experiment once and follow it; None when it saved."""
+        self._in_run = True
+        try:
+            return self._one_run_inner()
+        finally:
+            self._in_run = False
+
+    def _one_run_inner(self) -> tuple[str, str, bool] | None:
         path = self.path
         command = ar_command(f'"{path}"' if " " in path else path)
         n = self.info()["runs"] + 1
@@ -586,60 +644,23 @@ class RunLoop:
                 and poll.get("run_id") == waived[0])
 
     def _tell_live_od_it_exited(self, run_id, code, tail: list[str], n: int) -> None:
-        """The run's process has exited. If liveOD still has the run in progress
-        and has not heard that its process exited (``run_state`` "exited"), send
-        RUN_EXITED for it: the process's own notice (an atexit handler) never ran
-        -- it was killed or crashed hard -- or did not get through. Without it
-        the run stays "in progress" in liveOD until the next run starts."""
+        """The run's process has exited: :func:`tell_live_od_exited` (RUN_EXITED
+        on its behalf when liveOD still shows it in progress), with the loop's
+        own output line and journal record."""
         if self._run_exited is None:
             return
-        try:
-            poll = self._poll()
-        except Exception as exc:
-            log.warning("%s: could not ask liveOD whether it knows the run ended: %s",
-                        self.spec.title, exc)
+        told = tell_live_od_exited(self._poll, self._run_exited, run_id, code, tail,
+                                   expt=self.expt, started=self.info().get("run_started"),
+                                   now=self._clock(), who=self.spec.title,
+                                   sender="the monitor server's run loop")
+        if told is None or told["status"] == "not_sent":
             return
-        if not poll.get("run_in_progress") or poll.get("run_state") == "exited":
-            return
-        live_id = poll.get("run_id")
-        if run_id is None:
-            # killed before its "Run ID:" line came through: liveOD's run is this
-            # one only if it is our experiment and started after this launch
-            age = poll.get("init_run_age_s")
-            started = self.info().get("run_started")
-            if (Path(str(poll.get("expt_name") or "")).stem != self.expt or age is None
-                    or started is None or age > self._clock() - started):
-                return
-        elif live_id != run_id:
-            return
-        reason = f"its process ended with exit code {code} and sent no exit notice"
-        if tail:
-            reason += f"; last line: {tail[-1]}"
-        reason += " (sent by the monitor server's run loop)"
-        try:
-            # require_known_dead stays False here: the loop never kills its child,
-            # and proc.wait() returned because the shell ended after `ar` did, so
-            # an unknown pid (older client) still means the experiment has exited.
-            # A pid liveOD knows to be alive is never told (the helper's rule).
-            sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=poll,
-                                                    send=self._run_exited)
-        except Exception as exc:
-            log.error("%s: run %s is still in progress in liveOD after its process exited, "
-                      "and telling liveOD failed: %s", self.spec.title, live_id, exc)
+        live_id = told["run_id"]
+        if told["status"] == "error":
             self.output.mark(f"run {live_id}: liveOD still shows it in progress, and could "
-                             f"not be told its process exited ({exc})", self._clock)
+                             f"not be told its process exited ({told['why']})", self._clock)
             return
-        if not sent["sent"]:
-            # liveOD is saving it, or its experiment process still lives
-            log.warning("%s: run %s is still in progress in liveOD after the loop's process "
-                        "for it exited (exit code %s); no exit notice sent: %s",
-                        self.spec.title, live_id, code, sent["why"])
-            return
-        reply = sent["reply"] if isinstance(sent["reply"], dict) else {"ok": sent["ok"]}
-        ok = bool(reply.get("ok"))
-        log.warning("%s: run %s was still in progress in liveOD after its process exited "
-                    "(exit code %s); told liveOD: %s", self.spec.title, live_id, code,
-                    "done" if ok else reply)
+        ok, reply = told["ok"], told["reply"]
         self.output.mark(f"run {live_id}: its process exited without telling liveOD; "
                          + ("the loop told it" if ok else f"liveOD refused the notice: {reply}"),
                          self._clock)
@@ -647,17 +668,8 @@ class RunLoop:
                      ok=ok)
 
     def _judge(self, code, tail: list[str], run_id, abort_seen: bool):
-        name = f"run {run_id}" if run_id is not None else "the run (it never got a run id)"
-        text = "\n".join(tail)
-        if code == 0 and run_id is not None:
-            outcome = self._outcome(run_id)
-            if outcome is None:
-                return self._failed(f"{name} exited but liveOD reports no outcome for it",
-                                    tail, run_id, code)
-            if outcome.get("outcome") != "saved":
-                detail = outcome.get("detail") or ""
-                return self._failed(f"{name} ended {outcome.get('outcome')}"
-                                    + (f" ({detail})" if detail else ""), tail, run_id, code)
+        v = judge_run(code, tail, run_id, self.expt, self._outcome)
+        if v.saved:
             with self._lock:
                 self._s["runs"] += 1
                 self._s["last"] = {"run_id": run_id, "outcome": "saved", "ended": self._clock()}
@@ -665,28 +677,13 @@ class RunLoop:
                 self._s["text"] = f"run {run_id} saved"
             self._notify()
             if abort_seen:
+                name = f"run {run_id}"
                 return ("latched", f"an Abort was pressed in liveOD while {name} was starting; "
                         f"liveOD spent it on no run (it skipped a run id), so {name} ran to the "
                         "end and was saved", True)
             return None
-        m = ABORTED_RE.search(text)
-        if m:
-            return self._failed(f"run {m.group(1)} was aborted in liveOD (Abort): its file "
-                                "was discarded", tail, run_id, code, show_tail=False)
-        if _matches(text, _INTERRUPTED_SIGNATURES):
-            return self._failed(f"{name} lost the core device to another process (the monitor "
-                                "or another experiment was started)", tail, run_id, code,
-                                start_monitor=False)
-        if code == 0:
-            return self._failed(f"{self.expt} exited without a run id -- its prepare() did "
-                                "not register a run with liveOD", tail, run_id, code)
-        why = f"{name} failed (exit code {code})"
-        hints = _diagnose(text)
-        if hints:
-            why += f" -- likely cause: {hints[0]}"
-        elif tail:
-            why += f" -- last line: {tail[-1]}"
-        return self._failed(why, tail, run_id, code)
+        return self._failed(v.why, tail, run_id, code, show_tail=v.show_tail,
+                            start_monitor=v.start_monitor)
 
     def _failed(self, why, tail, run_id, code, show_tail=True, start_monitor=True):
         with self._lock:
@@ -702,15 +699,7 @@ class RunLoop:
 
     def _outcome(self, run_id) -> dict | None:
         """liveOD's record of how run ``run_id`` ended (POLL's last_outcome)."""
-        for _ in range(3):
-            try:
-                last = self._poll().get("last_outcome") or {}
-            except Exception:
-                last = {}
-            if last.get("run_id") == run_id:
-                return last
-            time.sleep(self._poll_s)
-        return None
+        return live_od_outcome(self._poll, run_id, wait_s=self._poll_s)
 
     def _end(self, state: str, why: str, start_monitor: bool) -> None:
         with self._lock:
@@ -747,6 +736,142 @@ class RunLoop:
             self._on_change(self.info())
         except Exception:
             log.exception("Run loop change notification failed")
+
+
+@dataclass(frozen=True)
+class RunVerdict:
+    """How one run of an experiment process ended (:func:`judge_run`):
+    ``saved`` (exit code 0 and liveOD's outcome "saved"), else ``why`` in
+    words; ``start_monitor`` False when the run lost the core to another
+    process (the monitor must not be started then); ``show_tail`` False when
+    the last lines say nothing more (an Abort); ``outcome`` liveOD's record;
+    ``aborted`` True for an Abort in liveOD."""
+
+    saved: bool
+    why: str = ""
+    start_monitor: bool = True
+    show_tail: bool = True
+    outcome: dict | None = None
+    aborted: bool = False
+
+
+def judge_run(code, tail, run_id, expt: str,
+              outcome: Callable[[int], dict | None]) -> RunVerdict:
+    """Judge a finished experiment process: its exit ``code`` (None: not known
+    -- a process followed by pid only, e.g. after a server restart; then
+    liveOD's outcome alone decides), the last lines of its output, the run id
+    it printed (None if it never did), its file's stem ``expt``, and
+    ``outcome(run_id)`` -> liveOD's last_outcome for that run, or None.
+    Shared by the run loop and the run queue."""
+    tail = list(tail or ())
+    name = f"run {run_id}" if run_id is not None else "the run (it never got a run id)"
+    text = "\n".join(tail)
+    if code in (0, None) and run_id is not None:
+        last = outcome(run_id)
+        if last is None:
+            return RunVerdict(False, f"{name} exited but liveOD reports no outcome for it")
+        if last.get("outcome") != "saved":
+            detail = last.get("detail") or ""
+            return RunVerdict(False, f"{name} ended {last.get('outcome')}"
+                              + (f" ({detail})" if detail else ""), outcome=last)
+        return RunVerdict(True, outcome=last)
+    m = ABORTED_RE.search(text)
+    if m:
+        return RunVerdict(False, f"run {m.group(1)} was aborted in liveOD (Abort): its file "
+                          "was discarded", show_tail=False, aborted=True)
+    if _matches(text, _INTERRUPTED_SIGNATURES):
+        return RunVerdict(False, f"{name} lost the core device to another process (the "
+                          "monitor or another experiment was started)", start_monitor=False)
+    if code == 0:
+        return RunVerdict(False, f"{expt} exited without a run id -- its prepare() did not "
+                          "register a run with liveOD")
+    why = (f"{name} failed (exit code {code})" if code is not None
+           else f"{name}: its process ended (exit code unknown)")
+    hints = _diagnose(text)
+    if hints:
+        why += f" -- likely cause: {hints[0]}"
+    elif tail:
+        why += f" -- last line: {tail[-1]}"
+    return RunVerdict(False, why)
+
+
+def live_od_outcome(poll: Callable[[], dict], run_id, tries: int = 3,
+                    wait_s: float = POLL_S) -> dict | None:
+    """liveOD's record of how run ``run_id`` ended (POLL's last_outcome), asked
+    up to ``tries`` times ``wait_s`` apart; None when it never names the run."""
+    for i in range(tries):
+        try:
+            last = poll().get("last_outcome") or {}
+        except Exception:
+            last = {}
+        if last.get("run_id") == run_id:
+            return last
+        if i < tries - 1:
+            time.sleep(wait_s)
+    return None
+
+
+def tell_live_od_exited(poll: Callable[[], dict], send: Callable[[int, str], dict], run_id,
+                        code, tail, *, expt: str, started: float | None, now: float,
+                        who: str, sender: str) -> dict | None:
+    """An experiment process has exited.  If liveOD still has its run in
+    progress and has not heard that its process exited (``run_state``
+    "exited"), send RUN_EXITED for it: the process's own notice (an atexit
+    handler) never ran -- it was killed or crashed hard -- or did not get
+    through.  Without it the run stays "in progress" in liveOD until the next
+    run starts.  ``run_id`` None (killed before its "Run ID:" line): liveOD's
+    run counts as this one only if it is ``expt`` and started after
+    ``started``.  ``who`` names the caller in log lines, ``sender`` in the
+    notice's reason.
+
+    Returns None when nothing was to be told (liveOD unreachable, no run, not
+    this one), else ``{"status": "sent" | "not_sent" | "error", "run_id",
+    "ok", "reply", "why"}``.  Shared by the run loop and the run queue."""
+    try:
+        snapshot = poll()
+    except Exception as exc:
+        log.warning("%s: could not ask liveOD whether it knows the run ended: %s", who, exc)
+        return None
+    if not snapshot.get("run_in_progress") or snapshot.get("run_state") == "exited":
+        return None
+    live_id = snapshot.get("run_id")
+    if run_id is None:
+        age = snapshot.get("init_run_age_s")
+        if (Path(str(snapshot.get("expt_name") or "")).stem != expt or age is None
+                or started is None or age > now - started):
+            return None
+    elif live_id != run_id:
+        return None
+    tail = list(tail or ())
+    reason = (f"its process ended with exit code {code} and sent no exit notice"
+              if code is not None else "its process ended and sent no exit notice")
+    if tail:
+        reason += f"; last line: {tail[-1]}"
+    reason += f" (sent by {sender})"
+    try:
+        # require_known_dead stays False: the launcher never kills its child, and
+        # the shell it followed ended after artiq_run did, so an unknown pid
+        # (older client) still means the experiment has exited. A pid liveOD
+        # knows to be alive is never told (the helper's rule).
+        sent = run_gate.tell_live_od_run_exited(None, live_id, reason, poll=snapshot, send=send)
+    except Exception as exc:
+        log.error("%s: run %s is still in progress in liveOD after its process exited, and "
+                  "telling liveOD failed: %s", who, live_id, exc)
+        return {"status": "error", "run_id": live_id, "ok": False, "reply": None,
+                "why": str(exc)}
+    if not sent["sent"]:
+        # liveOD is saving it, or its experiment process still lives
+        log.warning("%s: run %s is still in progress in liveOD after the process for it "
+                    "exited (exit code %s); no exit notice sent: %s", who, live_id, code,
+                    sent["why"])
+        return {"status": "not_sent", "run_id": live_id, "ok": False, "reply": None,
+                "why": sent["why"]}
+    reply = sent["reply"] if isinstance(sent["reply"], dict) else {"ok": sent["ok"]}
+    ok = bool(reply.get("ok"))
+    log.warning("%s: run %s was still in progress in liveOD after its process exited (exit "
+                "code %s); told liveOD: %s", who, live_id, code, "done" if ok else reply)
+    return {"status": "sent", "run_id": live_id, "ok": ok, "reply": reply,
+            "why": "sent" if ok else f"liveOD refused: {reply}"}
 
 
 def _pump(proc, lines: queue.Queue) -> None:

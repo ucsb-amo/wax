@@ -60,7 +60,7 @@ import socket
 import threading
 import time
 from collections import deque
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from PyQt6.QtCore import QEvent, QObject, QSettings, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
@@ -70,9 +70,14 @@ from PyQt6.QtWidgets import (
     QTableWidget, QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from waxx.util.comms_server.comm_client import MonitorClient
-from waxx.util.comms_server.comm_server import STATES
+# Not waxx.util.comms_server at module level: its package __init__ imports
+# beacon.discovery, which binds the discovery listener at import.  The
+# MonitorClient is imported where it is made (_OpSender._get_client).
+from waxx.util.device_state.ready_bit import STATES
 from waxx.util.dashboard import theme
+
+if TYPE_CHECKING:
+    from waxx.util.comms_server.comm_client import MonitorClient
 from waxx.util.device_state import composite as cmp
 from waxx.util.device_state import connections as conns
 from waxx.util.guis.card_layout import FlowLayout, MasonryLayout
@@ -302,6 +307,7 @@ class _OpSender(QThread):
     def _get_client(self) -> MonitorClient | None:
         if self._client is None:
             try:
+                from waxx.util.comms_server.comm_client import MonitorClient  # noqa: PLC0415
                 self._client = MonitorClient(discovery_timeout=0.5)
             except Exception:
                 return None

@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from waxx.util.comms_server.comm_server import STATES
+from waxx.util.device_state.ready_bit import STATES  # (comm_server's; no discovery import)
 from waxx.util.dashboard import theme
 from waxx.util.guis.card_layout import FlowLayout
 

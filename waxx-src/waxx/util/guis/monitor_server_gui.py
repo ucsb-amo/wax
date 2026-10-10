@@ -1,9 +1,11 @@
 import socket
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QMessageBox
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
+                             QMessageBox, QTabWidget)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 
@@ -21,7 +23,10 @@ from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
-from waxx.util.device_state.run_loop import RunLoop, active_loop
+from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
+from waxx.util.device_state.person_hold import PersonHold
+from waxx.util.device_state.run_queue import RunQueue, default_dir as default_queue_dir
+from waxx.util.dashboard.exit_codes import EXIT_RESTART, RESTART_REQUEST_MIN_UPTIME_S
 from waxx.util.device_state import connections as conns
 from waxx.util.device_state.connections import ConnectionService
 from waxx.util.device_state.slm_reinit import SlmReinitService
@@ -30,6 +35,24 @@ log = logging.getLogger(__name__)
 
 _STATE_NAMES = {STATES.READY: "READY", STATES.LOADING: "LOADING",
                 STATES.NOT_READY: "NOT_READY"}
+
+
+#: when this module was imported (wall clock) -- the fallback for the
+#: process's start, which the launcher reaches within moments of it
+_IMPORTED_AT = time.time()
+
+
+def _process_uptime_s() -> float:
+    """Seconds since this process started: its creation time (psutil), or,
+    without psutil, since this module was imported (a little later than the
+    process start, so an uptime floor checked against it errs on the safe
+    side)."""
+    try:
+        import psutil  # noqa: PLC0415
+        started = psutil.Process().create_time()
+    except Exception:                                 # noqa: BLE001
+        started = _IMPORTED_AT
+    return max(0.0, time.time() - started)
 
 
 def _state_name(state) -> str:
@@ -43,6 +66,26 @@ def _run_name(run_id, expt) -> str:
     if run_id:
         return f"run {run_id} ({expt or 'experiment'})"
     return expt or "an experiment"
+
+
+class _TappedBroadcaster:
+    """The server's broadcaster, with every payload also handed to ``tap``
+    (the server's own window shows its broadcasts without listening on the
+    network).  Anything else is the wrapped broadcaster's."""
+
+    def __init__(self, inner, tap):
+        self._inner = inner
+        self._tap = tap
+
+    def send(self, payload):
+        try:
+            self._tap(payload)
+        except Exception:                             # noqa: BLE001
+            log.debug("broadcast tap failed", exc_info=True)
+        return self._inner.send(payload)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 @dataclass
@@ -192,6 +235,44 @@ class MonitorUDPServer(UdpServer):
     * ``run_scene`` / ``cancel_scene``, ``arm_watchdog`` / ``extend_watchdog``
       / ``disarm_watchdog`` — see :mod:`waxx.util.device_state.op_runner`.
     * ``get_journal`` — recent journal records (``n``, or ``since``).
+    * ``run_queue`` (``action``) — the run queue
+      (:mod:`~waxx.util.device_state.run_queue`): ``submit`` (``path``,
+      ``argv``, ``cwd``, ``label``, ``owner``, ``priority``, ``due``,
+      ``after``, ``repeat``, ``chain``, ``stop_on_failure``, ``write_back``,
+      ``allow_drift``, ``by``, ``at_end``), ``insert`` (submit at
+      ``at_index`` / ``before_id`` / ``after_id``), ``move`` (``id``,
+      ``to_index`` / ``before_id`` / ``after_id``, ``owner``, ``by``),
+      ``edit`` (``id``, ``owner``, ``by``, ``fields``), ``cancel`` (``id``,
+      ``token``, ``by``, ``owner``, ``queued_only``), ``list`` (``states``,
+      ``limit``), ``describe`` (``id``), ``tail`` (``id``, ``token`` --
+      required when the job has one --, ``offset``: the job's log from that
+      byte, read here for a client on any PC; not logged or journaled),
+      ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
+      ``reason``), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
+      a person's hold on the machine
+      (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
+      runs wait and the run loops do not run.  The server also sets the hold
+      itself when liveOD's Reset is pressed for a run that is not an agent's
+      queued run.  The queue's thread (the watch) follows its job and
+      launches the next when the machine is free.  ``status_json`` has
+      ``run_queue`` and ``person_hold``; changes are broadcast as
+      ``run_queue`` and ``person_hold``.
+    * ``server`` (``action`` ``restart`` | ``shutdown``, ``by``, ``owner``)
+      — restart (or stop) this server process by request, see
+      :meth:`_reply_server`: refused while a queue job is in its slot, a loop
+      has a run in progress, or the monitor experiment is starting;
+      otherwise the loops end, connections are released, the reply goes out,
+      and the process exits with :data:`EXIT_RESTART` (3) for a restart, 0
+      for a shutdown.  Why it exists: the kexp server registry gives the
+      monitor server no ``shutdown_request``, so the Server Dashboard's
+      Restart / Stop on it is a pid-tree kill (whatever runs is cut off), and
+      it restarts a server by itself only on a crash with restart_on_crash --
+      this request is the clean way: the supervisor starts a server that exits
+      with ``EXIT_RESTART`` (3, :mod:`waxx.util.dashboard.exit_codes`) again,
+      not as a crash.  The GUI launcher runs unsupervised: there, exit code 3
+      is just an exit (nothing starts it again).  A loop's Start is refused while
+      the queue has a job in its slot or one eligible to launch now (jobs due
+      later, held or paused leave the loop alone).
 
     Host-side connections this server holds between runs (the tweezer AWG;
     :class:`~waxx.util.device_state.connections.ConnectionService`, each in
@@ -249,14 +330,46 @@ class MonitorUDPServer(UdpServer):
     #: A run loop ended: start the monitor unless it is running (the owner
     #: decides; the argument says why).
     start_monitor_signal = pyqtSignal(str)
+    #: Every payload this server broadcasts (from whichever thread sent it),
+    #: for the server's own window: its Queue and State tabs follow the
+    #: broadcasts without listening on the network.
+    broadcast_sent = pyqtSignal(object)
+    #: A ``server`` restart / shutdown request was accepted: the owner stops
+    #: the monitor experiment and leaves the Qt loop with this exit code.
+    server_exit_signal = pyqtSignal(int, str)
+
+    #: The exit code of a requested restart (waxx.util.dashboard.exit_codes):
+    #: the dashboard's supervisor starts the server again on it.
+    EXIT_RESTART = EXIT_RESTART
+    #: How long a loop active between runs gets to stop before a restart.
+    LOOP_STOP_WAIT_S = 5.0
+    #: A restart request is refused while this server's uptime is below
+    #: exit_codes.RESTART_REQUEST_MIN_UPTIME_S plus this margin: the
+    #: supervisor takes an exit 3 sooner than that as a crash, and the monitor
+    #: server is not restarted on a crash (restart_on_crash=False) -- the
+    #: request would leave it down.
+    RESTART_UPTIME_MARGIN_S = 2.0
 
     #: A run_pending that never became a run (its prepare succeeded, its
     #: run() never took the core) stops fencing ops after this long.
     RUN_PENDING_TTL_S = 120.0
+    #: The run queue's tick (it polls liveOD at most every
+    #: ``run_queue.POLL_EVERY_S`` for the person hold's Reset watch, and
+    #: afresh before a launch).
+    WATCH_S = 0.5
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
-                 run_loops=(), connections=(), slm_reinit=None, state_generator=None):
+                 run_loops=(), connections=(), slm_reinit=None, state_generator=None,
+                 run_queue_dir=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
+        # The run queue's folder (its queue, journal, job logs, the person
+        # hold) is on LOCAL disk: given, or run_queue.default_dir()
+        # (~/.waxx/run_queue, or $WAXX_RUN_QUEUE_DIR).  Never the data share:
+        # an experiment's output is written to its job log as it runs, and an
+        # SMB hiccup there would stall the experiment's prints.
+        if run_queue_dir is None:
+            run_queue_dir = default_queue_dir()
+        self.run_queue_dir = run_queue_dir
         # regenerate_state: a callable -> {"dds", "ttl", "dac"} with every
         # channel at the lab's defaults (from its device frames); None: not offered.
         self._state_generator = state_generator
@@ -267,13 +380,22 @@ class MonitorUDPServer(UdpServer):
 
         self.config_file_path = config_file_path
         self._version = int(time.time())
-        self._broadcaster = StateBroadcaster()
+        #: when this server's process started, on the monotonic clock: a
+        #: restart request is refused until RESTART_REQUEST_MIN_UPTIME_S +
+        #: RESTART_UPTIME_MARGIN_S have passed since (the supervisor counts
+        #: its child's uptime from the same process start)
+        self._started_at = time.monotonic() - _process_uptime_s()
+        self._broadcaster = _TappedBroadcaster(StateBroadcaster(), self.broadcast_sent.emit)
         self.ops = OpQueue()
         self.journal = OpJournal(journal_dir)
 
         # The state file's content, kept in memory; re-read only when its
         # mtime says someone else wrote it (see _state()).
         self._state_lock = threading.RLock()
+        #: serialises the structured requests that may change something (see
+        #: _handle_structured): the TCP responder and the window's panels
+        #: (direct_request) may both be asking
+        self._request_lock = threading.RLock()
         self._state_cache: dict | None = None
         self._state_mtime = None
 
@@ -296,12 +418,33 @@ class MonitorUDPServer(UdpServer):
         self.reset = StateReset(reset_expt_path, on_change=self._on_reset_change,
                                 journal=self.journal)
 
+        # A person's hold on the machine (agents' runs wait while it is on),
+        # and the one liveOD link the server's own watch uses.
+        self.person_hold = PersonHold(
+            os.path.join(run_queue_dir, "person_hold.json") if run_queue_dir else None,
+            journal=self.journal, on_change=self._on_person_hold_change)
+        self._live_od = _LiveOD()
+        self._watch_stop = threading.Event()
+        self._watch_thread = None
+
         # Experiments the GUIs may run back to back -- only these files.
         self.loops = {spec.key: RunLoop(spec, fence=self._current_run_pending,
                                         busy=self._loop_busy,
+                                        held=lambda: self.person_hold.text(),
                                         start_monitor=self.start_monitor_signal.emit,
                                         on_change=self._on_loop_change, journal=self.journal)
                       for spec in run_loops}
+
+        # The run queue: experiment jobs one at a time (run_queue.py), through
+        # the same liveOD link (called late, so it is always the current one),
+        # fence, monitor state and loops as the rest of the server.
+        self.run_queue = RunQueue(
+            run_queue_dir, poll=lambda: self._live_od(),
+            run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
+            live_od_reset=lambda **kw: self._live_od.reset(**kw), fence=self._current_run_pending,
+            monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
+            loops=self.loops, start_monitor=self.start_monitor_signal.emit,
+            hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change)
 
         # Host-side connections (the tweezer AWG), held here between runs.
         # Bad definitions cost the connections, never the server.
@@ -330,6 +473,21 @@ class MonitorUDPServer(UdpServer):
         if m in ('status', 'status_json'):
             # Polled continuously; never logged, never forwarded.
             return
+        if (m == 'reset' or "run complete" in m) and self.exiting:
+            log.warning("%r ignored: %s.", m, self.exiting)
+            self.journal.record("message", text=m, ignored=self.exiting)
+            return
+        if m == 'reset' or "run complete" in m:
+            # a monitor (re)start takes the core: while the run queue has a job
+            # in its slot or one about to launch it is deferred -- the queue
+            # asks for the monitor itself when it runs out
+            busy = self.run_queue.monitor_busy()
+            if busy:
+                self.run_queue.defer_monitor(
+                    f"a client's {'monitor (re)start' if m == 'reset' else 'run complete'}",
+                    busy)
+                self.journal.record("message", text=m, deferred=busy)
+                return
         if m == 'reset':
             loop = active_loop(self.loops.values())
             if loop is not None:
@@ -366,21 +524,65 @@ class MonitorUDPServer(UdpServer):
     def _extra_status(self) -> dict:
         with self._runner_lock:
             runner = self.runner.info()
+        # one read: another thread may clear the fence between two
+        pending = self._run_pending
         return {"composite_ops": self.ops.info(), "trust": dict(self._trust),
-                "run_pending": dict(self._run_pending) if self._run_pending else None,
+                "run_pending": dict(pending) if pending else None,
                 "runner": runner, "reset": self.reset.info(),
                 "connections": self.connections.snapshot(),
                 "slm_reinit": (self.slm_reinit.snapshot() if self.slm_reinit is not None
                                else None),
                 "state_generator": self._state_generator is not None,
-                "run_loops": {key: loop.info() for key, loop in self.loops.items()}}
+                "run_loops": {key: loop.info() for key, loop in self.loops.items()},
+                "person_hold": self.person_hold.info(),
+                "run_queue": self.run_queue.info()}
+
+    #: Structured requests that only read (no check-then-act): answered
+    #: without the request lock, so they are never held up behind one that
+    #: waits (a ``server`` request waits up to LOOP_STOP_WAIT_S for a loop).
+    _READ_TYPES = frozenset({"get_state", "get_version", "op_status", "get_journal", "output"})
+
+    @classmethod
+    def _reads_only(cls, mtype, obj: dict) -> bool:
+        if mtype in cls._READ_TYPES:
+            return True
+        if mtype == "run_queue":
+            return obj.get("action") in cls._QUEUE_READS     # the one list of queue reads
+        if mtype == "run_loop":
+            return obj.get("action") == "describe"
+        if mtype == "slm_reinit":
+            return obj.get("action") == "status"
+        return False
 
     def _handle_structured(self, raw):
+        """One structured request.  Since the server's own window answers its
+        panels' requests on a worker thread (MonitorServerGUI.direct_request)
+        while the TCP responder answers network clients, two requests can now
+        arrive at once; the handlers' check-then-act steps (one loop at a
+        time, a restart refused while ..., a reset refused while ...) assumed
+        one caller.  Every structured request that may change something
+        therefore runs under one server-level lock (``_request_lock``, an
+        RLock); pure reads (:meth:`_reads_only`) and the plain-text
+        ``status_json`` do not take it.
+
+        The lock is held across a ``server`` request's wait for a loop to
+        stop (up to LOOP_STOP_WAIT_S): releasing it there would let a loop be
+        started under the restart.  Network clients lose nothing by it (the
+        TCP accept loop is single-threaded and was already busy for that
+        wait); the window's panels keep their status_json and reads."""
         try:
             obj = json.loads(raw)
         except Exception:
             return json.dumps({"status": "error", "msg": "invalid json"})
         mtype = obj.get("type")
+        if self._reads_only(mtype, obj):
+            return self._dispatch_structured(obj, mtype)
+        with self._request_lock:
+            return self._dispatch_structured(obj, mtype)
+
+    def _dispatch_structured(self, obj: dict, mtype):
+        if self.exiting and self._starts_work(mtype, obj):
+            return json.dumps({"status": "error", "msg": self.exiting})
         if mtype == "get_state":
             return self._reply_get_state()
         if mtype == "get_version":
@@ -426,6 +628,10 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_reset_state(obj))
         if mtype == "run_loop":
             return json.dumps(self._reply_run_loop(obj))
+        if mtype == "run_queue":
+            return json.dumps(self._reply_run_queue(obj))
+        if mtype == "server":
+            return json.dumps(self._reply_server(obj))
         if mtype == "slm_reinit":
             return json.dumps(self._reply_slm_reinit(obj))
         if mtype == "regenerate_state":
@@ -542,6 +748,9 @@ class MonitorUDPServer(UdpServer):
         self._runner_thread = threading.Thread(target=self._runner_loop, daemon=True,
                                                name="monitor-op-runner")
         self._runner_thread.start()
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True,
+                                              name="monitor-run-queue-watch")
+        self._watch_thread.start()
         self.connections.start()
         if self.slm_reinit is not None:
             self.slm_reinit.start()
@@ -624,6 +833,14 @@ class MonitorUDPServer(UdpServer):
             self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
                                 client=client, msg=msg)
             return {"status": "error", "msg": msg}
+        queued = self._queue_slot_text()
+        if queued:
+            msg = (f"{queued} -- a reset would take the core from it. Wait for it to end "
+                   "(queued jobs wait while the reset runs)")
+            log.warning("State reset refused: %s", msg)
+            self.journal.record("state_reset_refused", expt=self.reset.expt, operator=operator,
+                                client=client, msg=msg)
+            return {"status": "error", "msg": msg}
         pending = self._current_run_pending()
         if pending is not None and not self.reset.running:
             msg = (f"a run is starting (run {pending.get('run_id')}, "
@@ -650,6 +867,10 @@ class MonitorUDPServer(UdpServer):
         client = str(obj.get("client") or "")
         action = obj.get("action")
         if action == "stop":
+            # someone stops it: the run queue must not start it again later
+            self.run_queue.loop_stopped_by_someone(loop.spec.key,
+                                                   "@".join(p for p in (operator, client) if p)
+                                                   or "?")
             return loop.stop(operator=operator, client=client)
         if action == "describe":
             return loop.describe(obj.get("path"))
@@ -661,7 +882,22 @@ class MonitorUDPServer(UdpServer):
         if other is not None and other is not loop:
             return {"status": "error", "msg": f"{other.spec.title} is running -- one loop at "
                                               "a time"}
-        return loop.start(operator=operator, client=client, path=obj.get("path"))
+        busy = self.run_queue.eligible_or_running()
+        if busy:
+            # the queue starts the loop it stopped again itself once it has run
+            # out; jobs due later, held or paused leave the loop alone
+            msg = (f"the run queue has a job to run now ({busy}) -- {loop.spec.title} can "
+                   "start when it has run out (a loop the queue stopped starts again by "
+                   "itself)")
+            log.warning("%s: start refused: %s", loop.spec.title, msg)
+            self.journal.record("run_loop_refused", loop=loop.spec.key, expt=loop.expt,
+                                who="@".join(p for p in (operator, client) if p) or "?",
+                                msg=msg)
+            return {"status": "error", "msg": msg}
+        owner = str(obj.get("owner") or "person")
+        if owner not in ("person", "agent"):
+            return {"status": "error", "msg": f"owner must be person or agent, not {owner!r}"}
+        return loop.start(operator=operator, client=client, path=obj.get("path"), owner=owner)
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line
@@ -687,11 +923,229 @@ class MonitorUDPServer(UdpServer):
         return dict(source.since(obj.get("after", 0)), status="ok")
 
     def _loop_busy(self) -> str:
-        """Why something of this server's own holds the core, for the loops."""
+        """Why something of this server's own holds the core, for the loops: a
+        state reset.  (A person's hold reaches them as ``held``: a loop ends
+        on it as on a Stop.)"""
         return "a state reset is running" if self.reset.running else ""
 
     def _on_loop_change(self, info) -> None:
         self._broadcaster.send({"type": "run_loop", "loop": info})
+
+    # --- the run queue and the person hold ---------------------------------------------
+
+    # --- restarting / shutting the server down by request ---------------------------
+
+    def _reply_server(self, obj: dict) -> dict:
+        """``{"type": "server", "action": "restart" | "shutdown", "by", "owner"}``.
+
+        A restart is refused first of all -- before any other check, loop stop
+        or launch stop -- while this server's process has been up less than
+        exit_codes.RESTART_REQUEST_MIN_UPTIME_S + RESTART_UPTIME_MARGIN_S
+        (12 s): the supervisor would take that exit 3 as a crash and, with
+        restart_on_crash=False, leave the server down ("server started N s
+        ago; retry in M s", journaled as ``server_restart_refused``).
+
+        Refused while the run queue has a job in its slot (launching, running,
+        ending), while a run loop has a run in progress, or while the monitor
+        experiment is starting (LOADING).  A loop that is active between runs
+        is stopped first (gracefully, without starting the monitor); if it has
+        not stopped within :data:`LOOP_STOP_WAIT_S` the request is refused.
+        Otherwise: no job launches any more, the journal records
+        ``server_restart_requested`` (by, owner, action), the loops end, the
+        connections this server holds (the AWG agent) are released, the run
+        queue's journal is flushed, and the reply ``{"status": "ok",
+        "restarting": true|false, "exit_code": 3|0}`` is sent BEFORE anything
+        exits: the owner (headless or GUI) then stops the monitor experiment
+        and leaves the Qt loop with :data:`EXIT_RESTART` (3; the dashboard's
+        supervisor restarts a server that exits non-zero) or 0 (shutdown)."""
+        action = obj.get("action")
+        if action not in ("restart", "shutdown"):
+            return {"status": "error", "msg": f"unknown server action {action!r} (known: "
+                                              "restart, shutdown)"}
+        owner = str(obj.get("owner") or "")
+        if owner not in ("person", "agent"):
+            return {"status": "error", "msg": "owner is required (person or agent: who is "
+                                              "asking)"}
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+
+        def refuse(msg: str) -> dict:
+            log.warning("Server %s asked by %s refused: %s", action, by, msg)
+            self.journal.record("server_restart_refused", action=action, by=by, owner=owner,
+                                msg=msg)
+            return {"status": "error", "msg": msg}
+
+        if action == "restart":
+            uptime = time.monotonic() - self._started_at
+            floor = RESTART_REQUEST_MIN_UPTIME_S + self.RESTART_UPTIME_MARGIN_S
+            if uptime < floor:
+                return refuse(f"server started {uptime:.0f} s ago; retry in "
+                              f"{math.ceil(floor - uptime):.0f} s")
+        if self.status.state == STATES.LOADING:
+            return refuse("the monitor experiment is starting -- ask again once it is running")
+        busy = self._queue_slot_text()
+        if busy:
+            return refuse(f"{busy} -- the server is not restarted under it")
+        for loop in self.loops.values():
+            if getattr(loop, "in_run", False):
+                info = loop.info()
+                return refuse(f"{loop.spec.title} has a run in progress"
+                              + (f" (run {info.get('run_id')})" if info.get("run_id") else "")
+                              + " -- stop it and let the run finish first")
+        stopped = []
+        for loop in self.loops.values():
+            if loop.active:
+                loop.stop(operator=by, client="server " + action, start_monitor=False)
+                stopped.append(loop)
+                deadline = time.monotonic() + self.LOOP_STOP_WAIT_S
+                while loop.active and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if loop.active:
+                    # refused: the loop is not left to end without a monitor --
+                    # asked again, it starts the monitor when it ends
+                    try:
+                        again = loop.stop(operator=by, client="server " + action,
+                                          start_monitor=True)
+                    except Exception:                 # noqa: BLE001
+                        log.exception("%s: asking it to start the monitor when it ends failed",
+                                      loop.spec.title)
+                        again = None
+                    if loop.active or (isinstance(again, dict) and again.get("status") == "ok"):
+                        return refuse(f"{loop.spec.title} did not stop within "
+                                      f"{self.LOOP_STOP_WAIT_S:.0f} s (it starts the monitor "
+                                      "when it ends)")
+                    # it ended between the check and the call: stopped, go on
+        self.run_queue.stop_launching(f"the monitor server is {action}ing")
+        busy = self._queue_slot_text()
+        if busy:                                       # one slipped in meanwhile
+            self.run_queue.stop_launching("")
+            if stopped:
+                # the loop we stopped is not started again: the queue's job has
+                # the machine and the queue asks for the monitor when it runs out
+                self.run_queue.defer_monitor(f"the {action} refused after stopping "
+                                             + ", ".join(lp.spec.title for lp in stopped),
+                                             busy)
+            return refuse(f"{busy} -- the server is not restarted under it")
+        # from here no new work starts: requests that would are refused
+        self._exiting = ("server is restarting" if action == "restart"
+                         else "server is shutting down")
+        code = self.EXIT_RESTART if action == "restart" else 0
+        log.warning("Server %s asked by %s (%s): the loops end, connections are released, "
+                    "then the process exits with code %d.", action, by, owner, code)
+        self.journal.record("server_restart_requested", action=action, by=by, owner=owner,
+                            exit_code=code)
+        for loop in self.loops.values():
+            loop.shutdown()
+        try:
+            self.connections.stop()
+        except Exception:                             # noqa: BLE001
+            log.exception("Releasing the connections failed; exiting anyway")
+        self.run_queue.flush_journal()
+        # the owner acts on its own thread, after this reply has gone out
+        self.server_exit_signal.emit(code, f"{action} asked by {by} ({owner})")
+        return {"status": "ok", "restarting": action == "restart", "exit_code": code}
+
+    #: Set when a ``server`` restart / shutdown is accepted ("server is
+    #: restarting" / "server is shutting down"): from then on nothing new
+    #: starts -- see :meth:`_starts_work`, the 'reset' / 'run complete'
+    #: messages and the owners' monitor start.
+    _exiting = ""
+
+    @property
+    def exiting(self) -> str:
+        """Why this server is about to exit ("" normally)."""
+        return self._exiting
+
+    #: Requests refused while the server is exiting (they would start work).
+    #: Every other type is answered: the reads (get_state, get_version, poll,
+    #: get_journal, output, op_status, a status read of slm_reinit) never are
+    #: refused, so an open log or job-log window keeps reading to the end.
+    _WORK_TYPES = frozenset({"reset_state", "regenerate_state", "op", "run_scene", "server",
+                             "connection"})
+    #: run_queue actions that only read (answered while exiting); "tail" is the
+    #: job-log read (the queue panel's), refused only as unknown where absent.
+    _QUEUE_READS = frozenset({"list", "describe", "tail"})
+
+    def _starts_work(self, mtype, obj: dict) -> bool:
+        if mtype in self._WORK_TYPES:
+            return True
+        action = obj.get("action")
+        if mtype == "run_loop":
+            return action in ("start", "configure")
+        if mtype == "run_queue":
+            return action not in self._QUEUE_READS
+        if mtype == "slm_reinit":
+            return action != "status"
+        return False
+
+    #: run_queue actions -> the RunQueue method that answers them
+    _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
+                      "cancel": "cancel", "list": "list",
+                      "describe": "describe", "tail": "tail", "pause": "pause",
+                      "resume": "resume", "hold": "hold_request", "release": "release_request"}
+
+    def _reply_run_queue(self, obj: dict) -> dict:
+        """``{"type": "run_queue", "action": ...}`` -- see
+        :mod:`waxx.util.device_state.run_queue` and the module docstring of
+        :class:`MonitorUDPServer` for each action's fields."""
+        action = obj.get("action")
+        method = self._QUEUE_ACTIONS.get(str(action))
+        if method is None:
+            return {"status": "error", "msg": f"unknown run_queue action {action!r} "
+                                              f"(known: {', '.join(self._QUEUE_ACTIONS)})"}
+        if action in ("submit", "insert"):
+            monitor = self.status.expt_path
+            try:
+                same = bool(monitor) and bool(obj.get("path")) and (
+                    os.path.normcase(os.path.realpath(str(obj.get("path"))))
+                    == os.path.normcase(os.path.realpath(monitor)))
+            except (OSError, ValueError):
+                same = False
+            if same:
+                return {"status": "error",
+                        "msg": "that file is the monitor's own experiment: the monitor server "
+                               "runs it itself"}
+        try:
+            return getattr(self.run_queue, method)(obj)
+        except Exception as exc:                      # noqa: BLE001
+            log.exception("Run queue request %s failed", action)
+            return {"status": "error", "msg": f"the run queue failed on {action}: {exc!r}"}
+
+    def _queue_slot_text(self) -> str:
+        """"the run queue's job 12 (rabi) is running" while a queue job is in
+        its slot, else ""."""
+        cur = self.run_queue.current_job()
+        if cur is None:
+            return ""
+        return f"the run queue's job {cur['id']} ({cur['label']}) is {cur['state']}"
+
+    def _queue_busy(self) -> str:
+        """Why something of this server's own holds the machine, for the run
+        queue's launches ("" when nothing): a state reset, or a monitor that
+        is starting (a job launched then would race it for the core)."""
+        if self.reset.running:
+            return "a state reset is running"
+        if self.status.state == STATES.LOADING:
+            return "the monitor is starting"
+        return ""
+
+    def _on_queue_change(self, info) -> None:
+        self._broadcaster.send({"type": "run_queue", "run_queue": info})
+
+    def _on_person_hold_change(self, info) -> None:
+        self._broadcaster.send({"type": "person_hold", "person_hold": info})
+
+    def watch_tick(self) -> None:
+        """One step of the run queue (:meth:`RunQueue.tick`): it follows its
+        job, launches the next when the machine is free, and feeds every
+        liveOD POLL to the person hold's Reset watch."""
+        self.run_queue.tick()
+
+    def _watch_loop(self) -> None:
+        while not self._watch_stop.wait(self.WATCH_S):
+            try:
+                self.watch_tick()
+            except Exception:
+                log.exception("Run queue / person hold watch tick failed")
 
     def _set_trust(self, trusted: bool, reason: str) -> None:
         self._trust = {"trusted": bool(trusted), "reason": reason, "since": time.time()}
@@ -757,7 +1211,7 @@ class MonitorUDPServer(UdpServer):
         loop = active_loop(self.loops.values())
         if loop is not None:
             return f"{loop.spec.title} is running"
-        return ""
+        return self._queue_slot_text()
 
     def _on_slm_reinit_change(self, snapshot: dict) -> None:
         self._broadcaster.send({"type": "slm_reinit", "slm_reinit": snapshot})
@@ -1088,7 +1542,7 @@ class MonitorUDPServer(UdpServer):
         loop = active_loop(self.loops.values())
         if loop is not None:
             return f"{loop.spec.title} is running"
-        return ""
+        return self._queue_slot_text()
 
     @classmethod
     def _changed_channels(cls, old: dict, fresh: dict) -> list[str]:
@@ -1227,6 +1681,7 @@ class MonitorUDPServer(UdpServer):
 
     def stop(self):
         self._runner_stop.set()
+        self._watch_stop.set()
         if self.slm_reinit is not None:
             self.slm_reinit.stop()
         # Close the connections (bounded) while this process is still here;
@@ -1242,6 +1697,29 @@ class MonitorUDPServer(UdpServer):
 
 
 class MonitorServerGUI(QWidget):
+    """The monitor server's own window, when the server is run as a GUI
+    (launched by hand).  The Server Dashboard does not embed it: it runs the
+    server headless (``monitor_server_headless``) and shows the same three
+    tabs over the network in
+    :class:`~waxx.util.guis.monitor_panel.MonitorServerPanel`.
+
+    Three tabs: **Queue** (:class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`),
+    **State** (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`)
+    and **Monitor** -- the monitor experiment's big status button (click: start
+    it, or restart it after a confirm).  Both panels act through a direct call
+    into this window's server (:meth:`direct_request`: ``generate_reply`` on a
+    worker thread, the way a TCP client's request is answered -- no
+    discovery, no socket), get ``status_json`` the same way every
+    :data:`STATUS_POLL_MS` while the window is visible, and the server's
+    broadcasts through ``MonitorUDPServer.broadcast_sent``.  Requests from
+    the panels are answered on their worker thread while the server's own
+    thread answers network clients; the queue, hold, loops, connections and
+    journal they reach lock for themselves (the queue's requests "may come
+    from any thread")."""
+
+    #: How often the window asks its server for status_json (while visible).
+    STATUS_POLL_MS = 1000
+
     def __init__(self,
                 monitor_expt_path,
                 config_file_path=None,
@@ -1284,7 +1762,7 @@ class MonitorServerGUI(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.setWindowIcon(eye_icon)
-        self.setGeometry(100, 100, 250, 80)
+        self.setGeometry(100, 100, 1100, 620)
 
         # Everything the monitor reports goes through logging (stderr, line
         # buffered) rather than print, so it shows up promptly in the terminal
@@ -1326,6 +1804,15 @@ class MonitorServerGUI(QWidget):
         self.monitor_check_timer.timeout.connect(self.check_monitor_status)
         self.monitor_check_timer.start()
 
+        # the Queue and State tabs: the server's broadcasts, and its
+        # status_json while the window is visible
+        self.udp_server.broadcast_sent.connect(self._on_broadcast)
+        self.status_poll_timer = QTimer(self)
+        self.status_poll_timer.setInterval(self.STATUS_POLL_MS)
+        self.status_poll_timer.timeout.connect(self.poll_status)
+        self.status_poll_timer.start()
+        QTimer.singleShot(0, self.poll_status)
+
     @staticmethod
     def _create_eye_icon(size=64):
         pixmap = QPixmap(size, size)
@@ -1341,15 +1828,62 @@ class MonitorServerGUI(QWidget):
         return QIcon(pixmap)
 
     def setup_ui(self):
+        from waxx.util.guis.monitor_state_panel import MonitorStatePanel  # noqa: PLC0415
+        from waxx.util.guis.request_runner import RequestRunner  # noqa: PLC0415
+        from waxx.util.guis.run_queue_panel import RunQueuePanel  # noqa: PLC0415
+
         layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
         self.status_indicator = QPushButton("NOT READY")
         self.status_indicator.clicked.connect(self.on_button_clicked)
         font = QFont()
         font.setPointSize(24)
         font.setBold(True)
         self.status_indicator.setFont(font)
-        layout.addWidget(self.status_indicator)
+
+        # one worker thread for the panels' requests and the status poll
+        self.request_runner = RequestRunner(self.direct_request, parent=self)
+        self.queue_panel = RunQueuePanel(runner=self.request_runner)
+        self.state_panel = MonitorStatePanel(runner=self.request_runner)
+        monitor_page = QWidget()
+        monitor_box = QVBoxLayout(monitor_page)
+        monitor_box.addWidget(self.status_indicator)
+        monitor_box.addStretch(1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.queue_panel, "Queue")
+        self.tabs.addTab(self.state_panel, "State")
+        self.tabs.addTab(monitor_page, "Monitor")
+        layout.addWidget(self.tabs)
         self.setLayout(layout)
+
+    # --- the Queue and State tabs ---------------------------------------------------
+
+    def direct_request(self, obj: dict) -> dict:
+        """A request to this window's own server, answered as a TCP client's
+        would be (``generate_reply``) -- the panels' requester."""
+        return json.loads(self.udp_server.generate_reply(json.dumps(obj)))
+
+    def _status_json(self) -> dict:
+        return json.loads(self.udp_server.generate_reply("status_json"))
+
+    def poll_status(self) -> None:
+        """status_json for the panels (skipped while the window is hidden)."""
+        if not self.isVisible() or getattr(self, "_status_polling", False):
+            return
+        self._status_polling = True
+        self.request_runner.call(self._status_json, self._on_status)
+
+    def _on_status(self, status) -> None:
+        self._status_polling = False
+        status = status if isinstance(status, dict) else None
+        self.queue_panel.set_state(status)
+        self.state_panel.set_state(status)
+
+    def _on_broadcast(self, payload) -> None:
+        if not isinstance(payload, dict):
+            return
+        self.queue_panel.on_broadcast(payload)
+        self.state_panel.on_broadcast(payload)
 
     def setup_udp_server(self):
         self.server_thread = QThread()
@@ -1366,6 +1900,7 @@ class MonitorServerGUI(QWidget):
         self.udp_server.reset_signal.connect(self.restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
         self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
+        self.udp_server.server_exit_signal.connect(self._server_exit)
         self.server_thread.started.connect(self.udp_server.run)
         self.udp_server.message_received.connect(self.handle_message)
 
@@ -1422,6 +1957,9 @@ class MonitorServerGUI(QWidget):
     def _start_monitor_unless_running(self, why: str) -> None:
         """A run loop ended: bring the monitor back -- unless it already is
         (an aborted run's ``run complete`` has usually started it)."""
+        if getattr(self.udp_server, "exiting", ""):
+            log.info("%s -- not started: %s.", why, self.udp_server.exiting)
+            return
         if self.monitor_manager.isRunning():
             log.info("%s -- the monitor is already running.", why)
             return
@@ -1492,11 +2030,43 @@ class MonitorServerGUI(QWidget):
             log.info("Monitor ready message received.")
             self.set_status(STATES.READY, "running", "")
         
-    def closeEvent(self, event):
+    #: A requested exit waits this long, so the request's reply is sent first.
+    EXIT_DELAY_MS = 300
+
+    def _server_exit(self, code: int, why: str) -> None:
+        """The server accepted a ``server`` restart / shutdown request (its
+        reply is on its way): stop everything and leave the Qt loop with
+        ``code`` once the reply has gone out."""
+        log.warning("Monitor server exiting with code %d (%s).", code, why)
+        QTimer.singleShot(self.EXIT_DELAY_MS, lambda: self._exit_now(code))
+
+    def _exit_now(self, code: int) -> None:
+        self._cleanup()
+        app = QApplication.instance()
+        if app is not None:
+            app.exit(code)
+
+    def _cleanup(self) -> None:
+        """Stop the TCP responder and its thread and the monitor experiment
+        (once)."""
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
         # Guarded with getattr: when __init__ aborted early (another monitor
         # server was already running) none of these exist, and an
         # AttributeError traceback here would bury the message saying why.
-        log.info("Closing monitor server GUI...")
+        # the Queue / State tabs first: their worker may be in generate_reply
+        for name in ("status_poll_timer",):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
+        for name in ("queue_panel", "state_panel"):
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel.shutdown()
+        runner = getattr(self, "request_runner", None)
+        if runner is not None:
+            runner.shutdown()
         udp_server = getattr(self, "udp_server", None)
         if udp_server is not None:
             udp_server.stop()
@@ -1507,4 +2077,8 @@ class MonitorServerGUI(QWidget):
         monitor_manager = getattr(self, "monitor_manager", None)
         if monitor_manager is not None:
             monitor_manager.stop()
+
+    def closeEvent(self, event):
+        log.info("Closing monitor server GUI...")
+        self._cleanup()
         event.accept()

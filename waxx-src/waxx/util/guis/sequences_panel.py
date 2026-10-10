@@ -22,6 +22,21 @@ run.  The card's status line shows the current scan.
 Everything shown is the server's: every GUI sees the same loop and reset.
 The reset's Run emits ``reset_requested``; the host GUI confirms and sends it
 (the same dialog as the untrusted banner's button).
+
+Above the cards: the person hold (:mod:`~waxx.util.device_state.person_hold`).
+"Hold — a person has the machine" asks for a reason and puts it on at the
+server; while it is on the row says since when, by whom and why, and the same
+button releases it.  The server also puts it on by itself when liveOD's Reset
+is pressed for a run that is not an agent's.  Under it, one line on the run
+queue (:meth:`SequencesPanel.set_queue`, from ``status_json`` alone): its
+state and how many jobs are queued; the queue itself is shown and driven in
+the monitor server's own panel (Server Dashboard).
+
+Requests go through the GUI's own sender (a MonitorClient found by
+discovery) -- or, when the host passes ``requester`` (the monitor server's
+own window: a direct call into the server), through that callable on a
+worker thread (:class:`~waxx.util.guis.request_runner.RequestRunner`), with
+no discovery and no socket.
 """
 
 from __future__ import annotations
@@ -32,19 +47,23 @@ from typing import Callable
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolButton, QVBoxLayout,
-    QWidget,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from waxx.util.dashboard import theme
 from waxx.util.device_state import loop_scan
+from waxx.util.device_state.person_hold import describe as describe_hold
 from waxx.util.guis.composite_panel import (
     CARD_GAP, ERR_TEXT, OK_TEXT, WARN_TEXT, _OpSender, _card_css, _clock, _label_pill_css,
     _pill_button_css, _small,
 )
 from waxx.util.guis.device_summary import reset_title
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
+from waxx.util.guis.request_runner import RequestRunner
+from waxx.util.device_state.run_queue_client import default_by
+from waxx.util.guis.run_queue_panel import QueueSummaryLine
 
 #: How often an open log asks the server for new lines.
 LOG_POLL_MS = 1000
@@ -310,6 +329,8 @@ class SequenceCard(QFrame):
             runs = int(info.get("runs") or 0)
             if state in ("running", "stopping"):
                 parts.append(f"{runs} saved since {_clock(info.get('started'))}")
+                if info.get("owner"):
+                    parts.append(f"owner {info['owner']}")
             elif state in ("stopped", "latched") and info.get("ended"):
                 parts.append(f"{runs} saved · ended {_clock(info.get('ended'))}")
             last = info.get("last") or {}
@@ -432,6 +453,79 @@ class SequenceCard(QFrame):
             bar.setValue(bar.maximum())
 
 
+HOLD_TEXT = "Hold — a person has the machine"
+RELEASE_TEXT = "Release hold"
+
+
+class HoldRow(QFrame):
+    """The person hold: one button that puts it on (asking for a reason) or,
+    while it is on, releases it; and a line saying since when, by whom and
+    why.  Hidden while the server reports no ``person_hold`` (older server)."""
+
+    def __init__(self, panel: "SequencesPanel"):
+        super().__init__()
+        self.panel = panel
+        self.info: dict = {}
+        self.setObjectName("composite_card")
+        self.setStyleSheet(_card_css(theme.ACCENT))
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 5, 6, 5)
+        row.setSpacing(8)
+        self.button = QPushButton(HOLD_TEXT)
+        self.button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
+        self.button.clicked.connect(lambda _=False: panel.toggle_hold())
+        row.addWidget(self.button)
+        self.pill = QLabel("")
+        row.addWidget(self.pill)
+        self.status = _small("")
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status.setWordWrap(True)
+        row.addWidget(self.status, 1)
+        self.hide()
+
+    @property
+    def held(self) -> bool:
+        return bool(self.info.get("active"))
+
+    def set_info(self, info: dict | None) -> None:
+        self.info = dict(info) if isinstance(info, dict) else {}
+        self.setVisible(isinstance(info, dict))
+        self._show()
+
+    def set_message(self, text: str) -> None:
+        self._show(text)
+
+    def _show(self, message: str = "") -> None:
+        if self.held:
+            text, level = "HELD", "warn"
+            line = describe_hold(self.info)
+            line = line[0].upper() + line[1:] + " — agents' runs and the run loops wait."
+            color = WARN_TEXT
+        else:
+            text, level = "free", "off"
+            line = "No hold: agents may use the machine when it is free."
+            color = theme.FG_MUTED
+        if message:
+            line = f"{message} · {line}"
+        self.pill.setText(text)
+        set_style_if_changed(self.pill, _label_pill_css(level))
+        self.status.setText(line)
+        set_style_if_changed(self.status, f"color: {color}; font-size: 11px;")
+        self.refresh_buttons()
+
+    def refresh_buttons(self) -> None:
+        reachable = self.panel.reachable
+        self.button.setText(RELEASE_TEXT if self.held else HOLD_TEXT)
+        self.button.setEnabled(reachable)
+        self.button.setToolTip(
+            "the monitor server is unreachable" if not reachable else
+            ("Release the hold: agents' queued runs and the run loops may run again."
+             if self.held else
+             "Put a hold on the machine: agents' runs wait and the run loops stop after "
+             "their run in progress, until someone releases it. It never expires by itself."))
+
+
 class SequencesPanel(QWidget):
     """The Sequences tab: one :class:`SequenceCard` per run loop the monitor
     server offers, then its reset experiment.
@@ -444,18 +538,33 @@ class SequencesPanel(QWidget):
     reset_requested = pyqtSignal()
 
     def __init__(self, log_line: Callable[[str], None] | None = None, parent=None,
-                 start_sender: bool = True):
+                 start_sender: bool = True, requester: Callable[[dict], dict] | None = None,
+                 synchronous_requests: bool = False, show_hold: bool = True,
+                 show_queue: bool = True, runner: RequestRunner | None = None,
+                 by: str | None = None):
         super().__init__(parent)
+        #: who is clicking (``user@host``): a loop's start / stop / configure
+        #: carry it as ``by`` and the user as ``operator`` (the server names
+        #: who started or stopped a loop from operator@client)
+        self.by = by or default_by()
+        self._operator = self.by.split("@", 1)[0]
         self._log_line = log_line
         self._reachable = False
         self._req = 0
         self._requests: dict[int, Callable[[dict], None]] = {}
+        self._show_hold = bool(show_hold)
+        self._show_queue = bool(show_queue)
         self.loop_cards: dict[str, SequenceCard] = {}
         #: The last file chosen for a pick loop (the dialog opens there).
         self._last_pick = ""
         box = QVBoxLayout(self)
         box.setContentsMargins(CARD_GAP, 10, CARD_GAP, CARD_GAP)
         box.setSpacing(8)
+        self.hold_row = HoldRow(self)
+        box.addWidget(self.hold_row)
+        #: "Queue: <state> (<n> queued) -- ..." (status_json only)
+        self.queue_line = QueueSummaryLine()
+        box.addWidget(self.queue_line)
         self.empty = _small("")
         box.addWidget(self.empty)
         self._cards = QVBoxLayout()
@@ -467,7 +576,13 @@ class SequencesPanel(QWidget):
 
         self._sender = _OpSender(self)
         self._sender.requested.connect(self._on_requested)
-        if start_sender:
+        #: with a requester (or a host's runner), requests go through it -- no
+        #: discovery, no socket
+        self._own_runner = runner is None and requester is not None
+        self._runner = runner if runner is not None else (
+            RequestRunner(requester, synchronous=synchronous_requests, parent=self)
+            if requester is not None else None)
+        if start_sender and self._runner is None:
             self._sender.start()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.poll_logs)
@@ -488,7 +603,63 @@ class SequencesPanel(QWidget):
             self._reachable = bool(reachable)
             for card in self.cards():
                 card.refresh_buttons()
+            self.hold_row.refresh_buttons()
             self._refresh_empty()
+
+    # -- the person hold ----------------------------------------------------------------
+
+    def set_hold(self, info: dict | None) -> None:
+        """The server's person hold (``status_json`` ``person_hold``, or its
+        ``person_hold`` broadcast); None: the server has none (older code)."""
+        before = self.hold_row.held
+        self.hold_row.set_info(info)
+        if not self._show_hold:
+            self.hold_row.hide()
+        if isinstance(info, dict) and bool(info.get("active")) != before \
+                and self._log_line is not None:
+            self._log_line("[hold] " + (describe_hold(info) if info.get("active")
+                                        else "person hold released"))
+
+    def toggle_hold(self) -> bool:
+        """The hold button: put the hold on (asking for a reason) or release it."""
+        if self.hold_row.held:
+            request = {"type": "run_queue", "action": "release", "owner": "person",
+                       "by": self._hold_by()}
+        else:
+            reason = self.ask_hold_reason()
+            if reason is None:
+                return False
+            request = {"type": "run_queue", "action": "hold", "reason": reason, "owner": "person",
+                       "by": self._hold_by()}
+
+        def done(reply):
+            if reply.get("status") == "ok":
+                self.set_hold(reply.get("person_hold"))
+            else:
+                self.hold_row.set_message(f"✕ {reply.get('msg')}")
+        self.send_request(request, done)
+        return True
+
+    def _hold_by(self) -> str:
+        host = self._sender.client_name
+        return f"Device Control GUI on {host}" if host else "Device Control GUI"
+
+    def ask_hold_reason(self) -> str | None:
+        """The reason dialog (tests replace it): the text, or None (cancelled)."""
+        text, ok = QInputDialog.getText(
+            self, HOLD_TEXT,
+            "Why (shown to everyone, and to agents waiting for the machine):",
+            QLineEdit.EchoMode.Normal, "a person has the machine")
+        if not ok:
+            return None
+        return text.strip() or "a person has the machine"
+
+    def set_queue(self, info: dict | None) -> None:
+        """The run queue's summary (``status_json`` ``run_queue``, or its
+        ``run_queue`` broadcast); None: the server has none (older code)."""
+        self.queue_line.set_info(info)
+        if not self._show_queue:
+            self.queue_line.hide()
 
     def set_loops(self, loops: dict | None) -> None:
         """The server's loops (``status_json`` ``run_loops``)."""
@@ -604,7 +775,9 @@ class SequencesPanel(QWidget):
                 self.on_run_loop(reply.get("loop"))
             elif card is not None:
                 card.set_message(f"✕ not started: {reply.get('msg')}")
-        request = {"type": "run_loop", "action": "start", "loop": key}
+        # a person is clicking: the loop is a person's (the run queue stops
+        # only agent / queue / idle-started loops for its jobs)
+        request = {"type": "run_loop", "action": "start", "loop": key, "owner": "person"}
         if path is not None:
             request["path"] = path
         self.send_request(request, done)
@@ -680,6 +853,12 @@ class SequencesPanel(QWidget):
         req = self._req
         obj = dict(obj)
         obj.setdefault("client", self._sender.client_name)
+        if obj.get("type") == "run_loop" and obj.get("action") in ("start", "stop", "configure"):
+            obj.setdefault("operator", self._operator)
+            obj.setdefault("by", self.by)
+        if self._runner is not None:
+            self._runner.send(obj, on_reply)
+            return req
         if on_reply is not None:
             self._requests[req] = on_reply
         self._sender.request(req, obj)
@@ -705,5 +884,7 @@ class SequencesPanel(QWidget):
 
     def shutdown(self) -> None:
         self._timer.stop()
+        if self._runner is not None and self._own_runner:
+            self._runner.shutdown()
         self._sender.stop()
         self._sender.wait(2000)

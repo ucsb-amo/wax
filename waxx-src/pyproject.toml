@@ -19,6 +19,10 @@ kcal = "waxx.calibration.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ucsb-amo/wax-ucsb/waxx"
+
+[project.scripts]
+kq = "waxx.util.device_state.kq:main"
+
 [tool.setuptools.packages.find]
 where = ["."] # Look for packages in the current directory
 [tool.pdm]

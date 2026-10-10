@@ -751,9 +751,14 @@ class RemoteViewerWindow(QWidget):
     @staticmethod
     def reply_notice_text(label: str, reply) -> str:
         """The text for a reply that says the request was ignored or refused
-        (a Reset while the run is being saved); "" for any other reply."""
-        if not (isinstance(reply, dict) and (reply.get('ignored') or reply.get('saving'))):
+        (a Reset while the run is being saved, or naming another run) or that
+        it closed a run whose process is gone, keeping its file; "" for any
+        other reply."""
+        if not (isinstance(reply, dict) and (reply.get('ignored') or reply.get('saving')
+                                             or reply.get('refused') or reply.get('kept'))):
             return ""
+        if reply.get('kept') and reply.get('message'):
+            return str(reply['message'])
         text = str(reply.get('message') or reply.get('error') or '')
         if not text:
             what = "ignored" if reply.get('ignored') else "refused"

@@ -41,8 +41,16 @@ States (:class:`GateState`):
                    started yet.  Never waivable.
 ``reset_pending``  an Abort is pending in liveOD.  Waivable only when the
                    client's process is known to be dead (pid recorded, host is
-                   this machine, process gone): liveOD finalizes that run at
-                   the next INIT_RUN (its file is discarded, as for any abort).
+                   this machine, process gone) AND the run has no data
+                   (:func:`run_has_data`: POLL's n_shots, images_received and
+                   aux_items_received all 0; a missing field counts as data):
+                   liveOD finalizes that run at the next INIT_RUN and discards
+                   its file, as for any abort -- a run's data is never
+                   deleted unattended (user ruling 2026-10-09).  With data it
+                   is not waivable: a person must look; a Reset in liveOD on a
+                   run whose process is gone keeps the file, and so does
+                   liveOD's next INIT_RUN (outcome "exited", "dead client with
+                   data, kept at the next run's start").
 ``dead_client``    a run is in progress, no Abort, and its client's process is
                    known to be dead -- or liveOD itself heard it exit
                    (``run_state`` "exited", frames still due), pid or not.
@@ -54,6 +62,12 @@ States (:class:`GateState`):
 ``unknown``        POLL failed, or its reply lacks ``run_in_progress``, or the
                    fence could not be read.  Not waivable: anything unknown
                    counts as busy.
+``held``           a person has put a hold on the machine at the monitor
+                   server (its ``status_json`` ``person_hold``; see
+                   :mod:`~waxx.util.device_state.person_hold`).  Not waivable:
+                   an agent waits until a person releases it.  Reported by
+                   :func:`loops_verdict` / :func:`assess`, never by
+                   :func:`classify` (liveOD knows nothing of it).
 
 A client's pid is only checked on this machine: ``client_host`` must equal
 :func:`socket.gethostname` (case-insensitive).  On another host, or without a
@@ -70,7 +84,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
-STATES = ("free", "live", "reset_pending", "dead_client", "wedged", "unknown")
+STATES = ("free", "live", "reset_pending", "dead_client", "wedged", "unknown", "held")
 
 #: A run with no shot yet counts as live for this long after its INIT_RUN
 #: (compile, MOT load, warm-ups and the first shot).
@@ -214,6 +228,31 @@ def _saving(poll: dict) -> bool:
     return bool(poll.get("save_in_progress")) or poll.get("run_state") == "saving"
 
 
+#: POLL fields that say whether a run has data; a field a liveOD does not
+#: send counts as data.
+DATA_FIELDS = ("n_shots", "images_received", "aux_items_received")
+
+
+def run_has_data(poll: dict) -> bool:
+    """Whether liveOD's current run has any data: a shot, a camera frame or a
+    pushed array.  A field missing from POLL (an older liveOD) counts as data
+    -- the safe side: such a run is never discarded unattended."""
+    for key in DATA_FIELDS:
+        value = poll.get(key)
+        if value is None:
+            return True
+        try:
+            if float(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _data_text(poll: dict) -> str:
+    return ", ".join(f"{key} {poll.get(key, 'not reported')}" for key in DATA_FIELDS)
+
+
 def _num(value):
     try:
         return None if value is None else float(value)
@@ -303,11 +342,18 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
 
     if in_progress:
         if reset:
-            if client["alive"] is False:
+            if client["alive"] is False and run_has_data(poll):
                 st = GateState("reset_pending", rid,
                                f"run {rid}: an Abort is pending in liveOD and the run's process "
-                               f"({_who(client)}) is gone -- liveOD finalizes the run at the next "
-                               "INIT_RUN (its file is discarded, as for any abort)", True)
+                               f"({_who(client)}) is gone, but the run has data "
+                               f"({_data_text(poll)}) -- not waived: a person must look; a Reset "
+                               "in liveOD now keeps the file (dead client)")
+            elif client["alive"] is False:
+                st = GateState("reset_pending", rid,
+                               f"run {rid}: an Abort is pending in liveOD and the run's process "
+                               f"({_who(client)}) is gone, with no data -- liveOD finalizes the "
+                               "run at the next INIT_RUN (its empty file is discarded, as for "
+                               "any abort)", True)
             else:
                 st = GateState("reset_pending", rid,
                                f"run {rid}: an Abort is pending in liveOD, waiting for the run's "
@@ -348,9 +394,14 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
         # an outcome recorded -- is left over: with the monitor off (the server
         # lapses a fence only while READY), a run killed hard keeps its fence up
         # until a person clears it.
+        # Only a real run id (a positive int) can be told ended: every
+        # save_data=False run is run id 0, so a fence of 0 says nothing about
+        # which run liveOD last had (one that never sent INIT_RUN, while POLL
+        # answers run id 0 for an earlier no-save run, would read as ended).
         last = poll.get("last_outcome") or {}
-        ended = fid is not None and ((not in_progress and rid == fid)
-                                     or last.get("run_id") == fid)
+        real_id = isinstance(fid, int) and not isinstance(fid, bool) and fid > 0
+        ended = real_id and ((not in_progress and rid == fid)
+                             or last.get("run_id") == fid)
         fence_info["ended"] = ended
         if ended:
             if st.state == "free":
@@ -464,9 +515,57 @@ def active_loops(status: dict | None) -> list[str]:
             if isinstance(info, dict) and info.get("state") in LOOP_ACTIVE_STATES]
 
 
+def hold_verdict(status: dict | None) -> GateState | None:
+    """``held`` (not waivable) while a person's hold is on at the monitor
+    server (``status_json`` ``person_hold``); None otherwise."""
+    hold = (status or {}).get("person_hold")
+    if not isinstance(hold, dict) or not hold.get("active"):
+        return None
+    from waxx.util.device_state.person_hold import describe  # noqa: PLC0415
+    return GateState("held", hold.get("run_id"), describe(hold),
+                     detail={"person_hold": dict(hold)})
+
+
+def queue_verdict(status: dict | None) -> GateState | None:
+    """``live`` (not waivable) while the monitor server's run queue has a job
+    in its slot (``status_json["run_queue"]["current"]``: launching, running
+    or ending) or one about to launch (``next`` non-empty: eligible now, the
+    queue launches it as soon as the machine is free) -- as an active run
+    loop is busy between its runs.  None otherwise (an older server reports
+    no ``run_queue``)."""
+    queue = (status or {}).get("run_queue")
+    if not isinstance(queue, dict):
+        return None
+    cur = queue.get("current")
+    if isinstance(cur, dict) and cur:
+        return GateState("live", cur.get("run_id"),
+                         f"the monitor server's run queue has job {cur.get('id')} "
+                         f"({cur.get('label') or 'experiment'}) {cur.get('state') or 'running'}"
+                         + (f" (run {cur.get('run_id')})" if cur.get("run_id") else ""),
+                         detail={"run_queue": {"current": cur.get("id"),
+                                               "next": list(queue.get("next") or [])}})
+    nxt = list(queue.get("next") or [])
+    if nxt:
+        return GateState("live", None,
+                         f"the monitor server's run queue has job {nxt[0]} ready to start"
+                         + (f" ({len(nxt)} eligible)" if len(nxt) > 1 else ""),
+                         detail={"run_queue": {"current": None, "next": nxt}})
+    return None
+
+
 def loops_verdict(status: dict | None) -> GateState | None:
-    """``live`` (not waivable) while a run loop of the monitor server is active;
-    None otherwise."""
+    """What the monitor server itself has the machine for, from its
+    ``status_json``: a person's hold (``held``, see :func:`hold_verdict`), the
+    run queue's job in its slot or about to launch (``live``, see
+    :func:`queue_verdict`), or an active run loop (``live``); not waivable.
+    None when none.  (The name is older than the hold and the queue;
+    :func:`assess` and the agents' occupancy check both ask it.)"""
+    held = hold_verdict(status)
+    if held is not None:
+        return held
+    queued = queue_verdict(status)
+    if queued is not None:
+        return queued
     active = active_loops(status)
     if not active:
         return None
@@ -478,9 +577,10 @@ def loops_verdict(status: dict | None) -> GateState | None:
 def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
            now: float | None = None, pid_alive: Callable[[int], bool] | None = None
            ) -> GateState:
-    """Fetch POLL and the monitor's status and :func:`classify` them; an active
-    run loop of the monitor server is busy too.  Either fetch failing gives
-    ``unknown`` (counted as busy)."""
+    """Fetch POLL and the monitor's status and :func:`classify` them; a
+    person's hold at the monitor server (``held``, reported first, whatever
+    liveOD says) and an active run loop are busy too.  Either fetch failing
+    gives ``unknown`` (counted as busy)."""
     try:
         poll = fetch_poll(live_od_client, timeout)
     except Exception as exc:                      # noqa: BLE001
@@ -492,6 +592,9 @@ def assess(live_od_client=None, monitor_client=None, timeout: float = 5.0, *,
         return GateState("unknown", poll.get("run_id"),
                          f"the monitor server did not answer ({exc}) -- cannot read its run "
                          "fence", detail={"error": str(exc), "poll_run_id": poll.get("run_id")})
+    held = hold_verdict(status)
+    if held is not None:
+        return held
     verdict = classify(poll, status.get("run_pending") or None, now=now, pid_alive=pid_alive,
                        monitor_state=status.get("state"))
     if verdict.state == "free" or verdict.waivable:
@@ -560,6 +663,14 @@ def tell_live_od_run_exited(client, run_id, reason: str, *, poll: dict | None = 
         return {"sent": False, "ok": False,
                 "why": f"the run's process is not known to be gone ({proc['why']})",
                 "reply": None}
+    if poll.get("reset_requested") and run_has_data(poll):
+        # liveOD takes RUN_EXITED during an abort as the abort's acknowledgement
+        # and discards the file: never on a run with data, unattended
+        return {"sent": False, "ok": False,
+                "why": f"an Abort is pending on run {run_id} and it has data "
+                       f"({_data_text(poll)}): RUN_EXITED would discard its file -- a person "
+                       "must look (a Reset in liveOD on a run whose process is gone keeps "
+                       "the file)", "reply": None}
     if send is not None:
         reply = send(int(run_id), str(reason))
     else:

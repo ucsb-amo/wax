@@ -678,7 +678,9 @@ def _stuck(reset, host=None, **extra):
     live = ClientLive(client_pid=4242, client_host=host or socket.gethostname(),
                       launcher="run_lock")
     live.run_in_progress, live.run_id, live.reset_requested = True, 85528, reset
-    live.extra = extra
+    # 85528 had no shot, no frame, no pushed array (a run with data is never
+    # waived with an Abort pending: test_run_gate)
+    live.extra = dict({"n_shots": 0, "images_received": 0, "aux_items_received": 0}, **extra)
     return live
 
 
@@ -777,6 +779,16 @@ def test_a_client_on_another_host_is_never_waived(expt, monkeypatch):
     monkeypatch.setattr(run_gate, "_default_pid_alive", never)
     loop = _loop(expt, _stuck(True, host="some-other-pc"), [])
     assert loop.start()["status"] == "error"
+
+
+def test_launches_from_the_server_go_straight_to_artiq_run():
+    """`ar` becomes the run queue's submit client (phase 1): the server's own
+    launches (monitor, loops, state reset, queue jobs) must not go through it."""
+    from waxx.util.device_state.monitor_manager import MonitorManager, ar_command
+    assert ar_command("x.py") == r'%kpy% & artiq_run --device-db "%db%" x.py'
+    assert ar_command('"C:/M testing/x.py"').endswith(' "C:/M testing/x.py"')
+    assert " ar " not in ar_command("x.py")
+    assert MonitorManager("C:/m/monitor.py").launch_command == ar_command("C:/m/monitor.py")
 
 
 def test_the_loop_tells_its_runs_who_launched_them(monkeypatch):

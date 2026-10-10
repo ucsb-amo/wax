@@ -42,8 +42,9 @@ _FAILURE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
       "is not recognized as the name of a cmdlet",
       "cannot find the path specified"),
      "the shell could not resolve the launch command -- the lab environment "
-     "variables (%kpy%) or the shortcuts folder holding 'ar' are missing from "
-     "this process's environment. See the environment block below."),
+     "variables (%kpy%, %db%) are missing from this process's environment, or "
+     "%kpy% did not put the venv's artiq_run on PATH. See the environment block "
+     "below."),
     (("CompileError", "artiq.compiler", "compilation failed"),
      "the monitor experiment failed to COMPILE -- fix the compiler error above "
      "in the monitor experiment file."),
@@ -82,8 +83,20 @@ def _diagnose(text: str) -> list[str]:
 
 
 def ar_command(expt_path) -> str:
-    """The shell command that runs one experiment file, as the lab does."""
-    return r"%kpy% & ar " + str(expt_path)
+    """The shell command that runs one experiment file directly:
+    ``%kpy% & artiq_run --device-db "%db%" <file>`` -- what the lab's ``ar``
+    shortcut has run until now (``artiq_run --device-db %db%``).
+
+    Direct on purpose, not through ``ar``: ``ar`` is becoming the run queue's
+    submit client (run_queue_plan, phase 1), and every launch made here -- the
+    monitor experiment (:class:`MonitorManager`), the run loops
+    (:mod:`~waxx.util.device_state.run_loop`), the state reset
+    (:mod:`~waxx.util.device_state.state_reset`) and the queue's own jobs
+    (:mod:`~waxx.util.device_state.run_queue`) -- would otherwise be
+    submitted to the queue the monitor server itself runs: the monitor would
+    queue behind itself and the manager would deadlock.  ``expt_path`` is
+    passed as given (callers quote a path with spaces); ``%db%`` is quoted."""
+    return r'%kpy% & artiq_run --device-db "%db%" ' + str(expt_path)
 
 
 def environment_report() -> list[str]:
@@ -92,8 +105,8 @@ def environment_report() -> list[str]:
     for var in _LAUNCH_ENV_VARS:
         value = os.environ.get(var)
         lines.append(f"%{var}% = {value if value else '<UNSET>'}")
-    found = shutil.which("ar") or shutil.which("artiq_run")
-    lines.append(f"'ar'/'artiq_run' on PATH = {found or '<NOT FOUND>'}")
+    found = shutil.which("artiq_run") or shutil.which("ar")
+    lines.append(f"'artiq_run'/'ar' on PATH = {found or '<NOT FOUND>'}")
     lines.append(f"working directory = {os.getcwd()}")
     return lines
 
@@ -348,7 +361,7 @@ class MonitorManager(QThread):
     def stop(self, timeout_ms=1500):
         """Gracefully stop the monitor experiment.
 
-        Kills the spawned child process tree (``ar`` + its descendants) so the
+        Kills the spawned child process tree (``artiq_run`` + its descendants) so the
         blocking read of the child's output returns and ``run()`` exits on its
         own.  This replaces ``QThread.terminate()``, which force-kills the
         thread while it holds the GIL and crashes the whole dashboard
