@@ -747,9 +747,11 @@ class Expt(Scanner, Dealer, Scribe):
         # the sub-scan's log and description into the file's attrs (and any
         # container whose slot push failed, pushed whole); a sub-scan turned
         # off by the experiment leaves nothing
-        if self._subscan is not None and not (not self._subscan.enabled and getattr(self._subscan, "quiet", False)):
+        # (getattr: an object that borrows end_wax without Expt.__init__ has none)
+        _sub = getattr(self, "_subscan", None)
+        if _sub is not None and not (not _sub.enabled and getattr(_sub, "quiet", False)):
             try:
-                self._subscan.finish_run()
+                _sub.finish_run()
             except Exception as e:
                 print(f"[sub-scan] !! WARNING: finishing the sub-scan failed ({e!r}); "
                       f"its description may be missing from the file")

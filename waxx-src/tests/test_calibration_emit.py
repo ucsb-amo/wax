@@ -357,6 +357,20 @@ def test_end_wax_emits_after_the_save(lab, capsys):
     assert "[cal] applied:" in capsys.readouterr().out
 
 
+def test_end_wax_with_a_sub_scan_finishes_it_before_the_save_and_emits_after(lab, capsys):
+    # merge of jep/inrun-calibration: the sub-scan's finish_run (attrs, whole
+    # re-push) must precede END_RUN; the declared calibration still follows the save
+    e = make_run(lab)
+    e.calibrates("t_pi", "fake_pi")
+    order = []
+    wire_end(e, order)
+    e._subscan = SimpleNamespace(enabled=True, quiet=False,
+                                 finish_run=lambda: order.append("subscan"))
+    e.end_wax("rabi_flop.py", notify=False)
+    assert order == ["scope", "subscan", "end_run", "emit"]
+    assert "[cal] applied:" in capsys.readouterr().out
+
+
 def test_end_wax_failed_save_raises_as_before_and_does_not_emit(lab):
     e = make_run(lab)
     e.calibrates("t_pi", "fake_pi")
