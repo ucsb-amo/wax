@@ -651,3 +651,21 @@ def test_every_status_poll_refreshes_the_slots_estimate(panel, server):
     assert len(server.of("list")) == n_list                             # no full list
     panel.set_state(_status(dict(INFO, current=None)))                  # nothing in the slot
     assert len(server.of("describe")) == 2
+
+
+def test_truncated_list_clamped_move_and_the_estimate_caveat(panel, server):
+    reply = _list_reply(_phase1b_jobs(), nxt=(4, 3))
+    reply.update(truncated=True, queued_total=7)                  # 3 queued listed
+    server.answers["list"] = reply
+    panel.refresh_list()
+    assert "4 more queued not listed" in panel.counts.text()
+    server.answers["list"] = _list_reply(_phase1b_jobs(), nxt=(4, 3))
+    panel.refresh_list()
+    assert "not listed" not in panel.counts.text()
+    server.answers["move"] = {"status": "ok", "clamped": True, "position": 2}
+    panel.select_job(3)
+    panel.move_selected("top")
+    assert "clamped behind person jobs" in panel.message.text()
+    job = _job(3, estimate=_est(60.0, NOW, NOW + 60,
+                                "median of 2 saved runs; est. (ignores blocked jobs ahead)"))
+    assert "ignores blocked jobs ahead" in panel.model.tooltip(job, "est")

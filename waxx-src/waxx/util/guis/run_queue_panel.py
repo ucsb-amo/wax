@@ -938,6 +938,8 @@ class RunQueuePanel(QWidget):
         self._listing = False
         self._list_again = False
         self._describing = False
+        #: queued jobs the last list left out (its `truncated`; -1: count unknown)
+        self.not_listed = 0
         self._summary_sig = None
         self._selected: tuple | None = None
         self._log_windows: dict = {}
@@ -1174,6 +1176,14 @@ class RunQueuePanel(QWidget):
                 self._summary_sig = self._signature(self.info)
             self.model.set_jobs(reply.get("jobs"), self.info, reply.get("next"))
             self._reselect()
+            # the server lists the first `limit` queued jobs; how many it left out
+            self.not_listed = 0
+            if reply.get("truncated"):
+                try:
+                    listed = len(self.model.queued_in_order())
+                    self.not_listed = max(0, int(reply.get("queued_total")) - listed)
+                except (TypeError, ValueError):
+                    self.not_listed = -1              # truncated, count unknown
         elif is_unknown_request(reply):
             self.has_queue = False
             self.model.set_jobs([], {})
@@ -1215,6 +1225,9 @@ class RunQueuePanel(QWidget):
         counts = self.info.get("counts") or {}
         shown = [f"{counts[s]} {s}" for s in ("queued", "launching", "running", "ending",
                                                "failed", "saved") if counts.get(s)]
+        if self.not_listed:
+            shown.append(f"{self.not_listed} more queued not listed" if self.not_listed > 0
+                         else "more queued not listed")
         self.counts.setText(" | ".join(shown) if self.reachable and self.has_queue else "")
 
         alarm = self.info.get("alarm") if self.reachable else None
@@ -1370,9 +1383,14 @@ class RunQueuePanel(QWidget):
 
     def _done(self, what: str, on_unknown: str | None = None) -> Callable[[dict], None]:
         def done(reply: dict) -> None:
-            if reply.get("status") == "ok":
+            if reply.get("status") == "ok" and reply.get("clamped"):
+                # the server placed it elsewhere than asked (behind person jobs)
+                self.say(f"{what}: done, but the position was clamped behind person jobs",
+                         WARN_TEXT)
+            elif reply.get("status") == "ok":
                 self.say(f"{what}: done" + (" (the run ends at its next shot)"
                                             if reply.get("pending") else ""), OK_TEXT)
+            if reply.get("status") == "ok":
                 info = reply.get("run_queue")
                 if isinstance(info, dict):
                     self.set_info(info, ask_list=False)
