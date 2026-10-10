@@ -545,7 +545,9 @@ class Expt(Scanner, Dealer, Scribe):
         """
         conditions = {}
         try:
-            skip = self._subscan.prefix if self._subscan is not None else None
+            # (getattr: an object that borrows this without Expt.__init__ has none)
+            sub = getattr(self, "_subscan", None)
+            skip = sub.prefix if sub is not None else None
             for key in list(self.data.keys):
                 if skip is not None and key.startswith(skip):
                     continue        # a sub-scan container: not this shot's
