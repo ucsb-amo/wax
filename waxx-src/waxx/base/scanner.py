@@ -113,6 +113,10 @@ class Scanner():
         self._abort_snap_dac_v = np.zeros(1)
         self._abort_snap_ttl_s = np.zeros(1, dtype=np.int32)
 
+        # An interleaved sub-scan (Expt.add_sub_scan) takes points between
+        # data shots when this is True; the host RPCs below decide when.
+        self._subscan_enabled = False
+
     def logspace(self,start,end,n):
         return np.logspace(np.log10(start),np.log10(end),int(n))
     
@@ -298,6 +302,110 @@ class Scanner():
         Usually overloaded in kexp.Base.
         """
 
+    # ---- the interleaved sub-scan (waxx.base.subscan) --------------------
+    #
+    # A point of the sub-scan runs between two data shots: the host sets the
+    # point's parameters, every parameter is written to the kernel (as before
+    # a data shot), then init_calibration_kernel -> calibration_kernel ->
+    # cleanup_calibration_kernel, with the data shot's exception handling.
+    # No scan counter moves and no main-vault write happens for a point.
+
+    @kernel
+    def init_calibration_kernel(self):
+        """Before a sub-scan point: the per-shot machine reset a data shot
+        gets, without the scope arming or any camera. Overloaded in kexp.Base."""
+        pass
+
+    @kernel
+    def calibration_kernel(self):
+        """One point of the interleaved sub-scan, written per experiment. It
+        reads the point's parameters as ``self.p.<key>`` (set on the host and
+        shipped like any parameter), fills the sub-scan's containers with
+        ``put_data`` and ends with ``self.<sub-scan>.put_shot_data()``.
+
+        It must trigger no camera (the run's, a diagnostic Basler, a camera
+        stream line) and no scope: frames are counted per shot by liveOD and
+        by the camera streams, so one extra trigger shifts every later slot."""
+        pass
+
+    @kernel
+    def cleanup_calibration_kernel(self):
+        """After a sub-scan point (also after one that raised an RTIO error):
+        the safety cleanup plus the TTL input drain. Overloaded in kexp.Base."""
+        pass
+
+    # Host RPCs, overridden in Expt (they never raise except to end the run
+    # on the liveOD Abort button).
+    def _subscan_due(self) -> TBool:
+        return False
+
+    def _subscan_begin(self) -> TBool:
+        return False
+
+    def _subscan_end(self, ok, what) -> TInt32:
+        return 0
+
+    @kernel
+    def _run_subscan_point(self) -> TTuple([TBool, TStr]):
+        """One sub-scan point, with the data shot's exception handling (see
+        _scan): an RTIO error ends the run as it would a data shot (saved
+        with the shots taken under save_on_underflow); anything else puts
+        the machine in its safe state and re-raises. Returns (aborted, what)."""
+        aborted = False
+        what = ""
+        if not self._subscan_begin():
+            self._subscan_end(False, "begin_failed")
+            return (aborted, what)
+        self.write_host_params_to_kernel()
+        self.core.break_realtime()
+        self.init_calibration_kernel()
+        self.core.break_realtime()
+        cleaned = False
+        try:
+            self.calibration_kernel()
+        except RTIOUnderflow:
+            self.core.break_realtime()
+            self.cleanup_calibration_kernel()
+            self._subscan_end(False, "RTIOUnderflow")
+            if not self._abort_shot("RTIOUnderflow"):
+                raise
+            aborted = True
+            what = "RTIOUnderflow"
+            cleaned = True
+        except TriggerTimeout:
+            aprint("[scan] sub-scan point aborted: a triggered wait saw no edge "
+                   "(TriggerTimeout). Cleaning up and ending the run.")
+            self.core.break_realtime()
+            self.cleanup_calibration_kernel()
+            self._subscan_end(False, "TriggerTimeout")
+            if not self._abort_shot("TriggerTimeout"):
+                raise
+            aborted = True
+            what = "TriggerTimeout"
+            cleaned = True
+        except RTIOOverflow:
+            aprint("[scan] sub-scan point aborted: an RTIO input FIFO overflowed "
+                   "(RTIOOverflow). Cleaning up and ending the run.")
+            self.core.break_realtime()
+            self.cleanup_calibration_kernel()
+            self._subscan_end(False, "RTIOOverflow")
+            if not self._abort_shot("RTIOOverflow"):
+                raise
+            aborted = True
+            what = "RTIOOverflow"
+            cleaned = True
+        except:
+            self.core.break_realtime()
+            self._subscan_end(False, "error")
+            self.cleanup_abort_kernel()
+            raise
+        if not cleaned:
+            self.cleanup_calibration_kernel()
+            self._subscan_end(True, "")
+        delay(self.params.t_recover)
+        self.core.break_realtime()
+        return (aborted, what)
+
     @kernel
     def scan(self, raise_underflow=False):
         """
@@ -417,7 +525,17 @@ class Scanner():
             # still honored: the next shot's events sit >= t_recover after the
             # previous shot's on the timeline.
             aborted_bool = self._check_for_abort_signal()
-            
+
+            # Interleaved sub-scan points due before this data shot (the
+            # first ones before shot 0). A point that ends the run leaves
+            # the loop as a data shot would.
+            if self._subscan_enabled:
+                while self._subscan_due() and not aborted_bool:
+                    aborted_bool, abort_what = self._run_subscan_point()
+                if aborted_bool:
+                    scanning = False
+                    continue
+
             self.update_params_from_xvars()
             
             self.write_host_params_to_kernel()

@@ -231,6 +231,14 @@ class Expt(Scanner, Dealer, Scribe):
         self._shot_abort = ""
         self._monitor_restart_sent = False
 
+        # The interleaved sub-scan (add_sub_scan), one per run; host-only.
+        # _subscan_enabled (Scanner) is the kernel's copy of "take points".
+        self._subscan = None
+        # (flat acquisition index, flat final slot) of the last data shot
+        # that completed, cached in _notify_shot_complete before the scan
+        # counters move: what a sub-scan point records as "the shot before".
+        self._last_data_shot = (-1, -1)
+
     def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
         """
         To be called at the end of prepare. 
@@ -260,6 +268,15 @@ class Expt(Scanner, Dealer, Scribe):
         self.init_xvars(shuffle,N_repeats)
 
         self.data.init()
+
+        # The sub-scan's point arrays and containers (sized by its own slot
+        # count), registered in the main vault under its prefix -- after the
+        # main vault's init(), so they are saved like any container but never
+        # enter the kernel's per-shot write.
+        if self._subscan is not None:
+            self._subscan.finish(n_data_shots=int(np.prod(self.xvardims)) if self.xvardims else 1,
+                                 main_xvarnames=list(self.xvarnames),
+                                 setup_camera=bool(self.setup_camera))
 
         # Reset per-run shot counter
         self._shot_complete_count = 0
@@ -297,6 +314,8 @@ class Expt(Scanner, Dealer, Scribe):
                     "[LiveOD] WARNING: No liveOD server connection -- "
                     "data will not be saved (setup_camera=False)."
                 )
+
+        self._decide_subscan()
 
         if self._adjust_specs and self.run_info.save_data:
             print(
@@ -426,6 +445,14 @@ class Expt(Scanner, Dealer, Scribe):
         n = self._shot_complete_count + 1
         N = self._N_shots_total
         now = time.monotonic()
+        # This shot's place, for a sub-scan point taken after it: the scan
+        # counters still point at it here (step_scan runs after this RPC).
+        try:
+            dims = [int(d) for d in self.xvardims]
+            flat = int(np.ravel_multi_index(self.final_shot_index(self.current_shot_index()), dims))
+            self._last_data_shot = (int(self._shot_complete_count), flat)
+        except Exception:
+            self._last_data_shot = (int(self._shot_complete_count), -1)
         if n == 1:
             self._t_first_shot_done = now
         try:
@@ -517,7 +544,10 @@ class Expt(Scanner, Dealer, Scribe):
         """
         conditions = {}
         try:
+            skip = self._subscan.prefix if self._subscan is not None else None
             for key in list(self.data.keys):
+                if skip is not None and key.startswith(skip):
+                    continue        # a sub-scan container: not this shot's
                 value = np.asarray(getattr(self.data, key).shot_data)
                 if value.size == 1 and np.issubdtype(value.dtype, np.number):
                     conditions[key] = float(value.ravel()[0])
@@ -585,6 +615,104 @@ class Expt(Scanner, Dealer, Scribe):
                 val = spec.coerce(val, like=getattr(self.params, key, None))
             setattr(self.params, key, val)
 
+    # ---- the interleaved sub-scan ---------------------------------------
+
+    def add_sub_scan(self, name="cal", every_n_shots=20, at_start=True, alternate=True,
+                     reads_params=(), require_push=True):
+        """Declare the run's interleaved sub-scan (waxx.base.subscan.SubScan):
+        points the scan loop takes before data shot 0 (``at_start``) and
+        before every ``every_n_shots``-th data shot, run by the experiment's
+        ``calibration_kernel``. Call in prepare(), then ``.xvar(...)`` and
+        ``.data.<key> = .add_data_container(...)`` on it, before finish_prepare.
+        ``reads_params`` names the parameters the calibration kernel reads;
+        the sub-scan is refused if the main scan scans one of them.
+        ``require_push``: without a liveOD that takes data during the run the
+        sub-scan is disabled (its containers would be carried whole at END_RUN
+        and, in a shuffled run, be unshuffled by axis length); False keeps it
+        for an unshuffled run without liveOD (a run-only test)."""
+        if self._subscan is not None:
+            raise ValueError("one sub-scan per run (add_sub_scan was already called)")
+        from waxx.base.subscan import SubScan
+        self._subscan = SubScan(self, name=name, every_n_shots=every_n_shots, at_start=at_start,
+                                alternate=alternate, reads_params=reads_params)
+        self._subscan.require_push = bool(require_push)
+        return self._subscan
+
+    def _decide_subscan(self):
+        """After INIT_RUN: whether the sub-scan's points are taken this run."""
+        sub = self._subscan
+        if sub is None:
+            self._subscan_enabled = False
+            return
+        if sub.enabled and getattr(sub, "require_push", True) and not self.push_data_enabled:
+            why = ("this run has no liveOD client" if getattr(self, "live_od_client", None) is None
+                   else "this liveOD takes no PUT_DATA (restart it from the current code)")
+            sub.disable(f"{why}: its containers could not be written point by point")
+        if sub.enabled and not getattr(sub, "require_push", True) and self.sort_idx:
+            sub.disable("require_push=False needs an unshuffled run (shuffle=False): carried "
+                        "containers would be unshuffled by axis length")
+        self._subscan_enabled = bool(sub.enabled)
+        if sub.enabled:
+            console.info("[sub-scan] " + sub.describe())
+        else:
+            print(f"[sub-scan] !! '{sub.name}' is DISABLED this run: {sub.disabled_reason}. "
+                  f"No interleaved points are taken; the data run proceeds.")
+            self._extra_file_texts[f"{sub.name}_scan_disabled"] = sub.disabled_reason
+
+    def _subscan_note(self, where, exc):
+        from waxx.base.subscan import error_text
+        text = error_text(exc)
+        sub = self._subscan
+        if sub is not None:
+            sub.log["notes"].append(f"{where}: {text}")
+        print(f"[sub-scan] !! host error in {where} (the run goes on): {exc!r}")
+
+    # The three RPCs the scan loop calls around a sub-scan point. They never
+    # raise into the kernel (a host error there would end the run through the
+    # scan loop's "anything else" handler) -- except to end the run on the
+    # liveOD Abort button, as _notify_shot_complete does.
+    def _subscan_due(self) -> TBool:
+        try:
+            sub = self._subscan
+            return bool(sub is not None and sub.enabled and sub.due(self._shot_complete_count))
+        except Exception as e:
+            self._subscan_note("due", e)
+            return False
+
+    def _subscan_begin(self) -> TBool:
+        try:
+            self._subscan.begin_point()
+            return True
+        except Exception as e:
+            self._subscan_note("begin_point", e)
+            try:
+                self._subscan._restore()
+            except Exception:
+                pass
+            return False
+
+    def _subscan_end(self, ok, what) -> TInt32:
+        reset = False
+        try:
+            self._subscan.end_point(bool(ok), str(what))
+        except Exception as e:
+            self._subscan_note("end_point", e)
+        try:
+            reset = bool(self._check_for_abort_signal(raise_error=False))
+        except Exception as e:
+            self._subscan_note("abort check", e)
+        if reset:
+            self._abort_cause = "the liveOD Abort button"
+            _client = getattr(self, 'live_od_client', None)
+            if _client is not None:
+                try:
+                    _client.abort_run()
+                except Exception:
+                    pass
+            _arm_exit_hang_dump()
+            raise TerminationRequested
+        return 0
+
     def end_wax(self, expt_filepath,
                 notify=True,
                 restart_monitor=True):
@@ -605,6 +733,14 @@ class Expt(Scanner, Dealer, Scribe):
         # what the streams queued and liveOD never took is counted here, and
         # recorded (aux_frames_dropped) before END_RUN is built
         self._close_shot_data_queue()
+        # the sub-scan's log and description into the file's attrs (and any
+        # container whose slot push failed, pushed whole)
+        if self._subscan is not None:
+            try:
+                self._subscan.finish_run()
+            except Exception as e:
+                print(f"[sub-scan] !! WARNING: finishing the sub-scan failed ({e!r}); "
+                      f"its description may be missing from the file")
         _t_streams = time.monotonic() - _t0
 
         self.cleanup_scanned()
@@ -785,18 +921,19 @@ class Expt(Scanner, Dealer, Scribe):
         client = getattr(self, "live_od_client", None)
         return bool(client is not None and client.supports("put_data"))
 
-    def push_shot_data(self, items, idx=None):
+    def push_shot_data(self, items, idx=None, final=False):
         """Push one shot's value of each container in ``items`` (``[(dc,
         value), ...]``) into the run's file at the shot's final slot. ``idx``
-        is the shot's scan-counter index (the shot in progress when None).
-        True when liveOD took them. On a refusal or a failure the container
-        falls back to END_RUN, which has the value anyway. Never raises; any
-        host thread may call it."""
+        is the shot's scan-counter index (the shot in progress when None);
+        with ``final`` it is the file slot itself (a sub-scan point: never
+        shuffled). True when liveOD took them. On a refusal or a failure the
+        container falls back to END_RUN, which has the value anyway. Never
+        raises; any host thread may call it."""
         if not self.push_data_enabled:
             return False
         if idx is None:
             idx = self.current_shot_index()
-        final = self.final_shot_index(idx)
+        final = tuple(int(i) for i in idx) if final else self.final_shot_index(idx)
         specs = [{"key": dc.key, "index": final, "array": value,
                   "full_shape": dc._run_data.shape,
                   "fill": getattr(dc, "_fill_value", None)}
