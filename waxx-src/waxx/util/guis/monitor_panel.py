@@ -323,13 +323,17 @@ class MonitorServerPanel(WidgetPanelBase):
 
     def _on_status(self, status) -> None:
         self._polling = False
+        if self._cleaned:
+            return
         status = status if isinstance(status, dict) else None
         self.queue_panel.set_state(status)
         self.state_panel.set_state(status)
         self.monitor_tab.set_state(status)
 
     def on_broadcast(self, payload) -> None:
-        if not isinstance(payload, dict):
+        """A broadcast to the tabs; a no-op once cleaned up (a listener's
+        queued datagram may still arrive)."""
+        if self._cleaned or not isinstance(payload, dict):
             return
         self.queue_panel.on_broadcast(payload)
         self.state_panel.on_broadcast(payload)

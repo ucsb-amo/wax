@@ -1072,8 +1072,13 @@ class RunQueuePanel(QWidget):
 
     # -- inputs from the host -----------------------------------------------------------
 
+    #: set by shutdown(): every input is then a no-op
+    _shut = False
+
     def set_state(self, state: dict | None) -> None:
         """The server's ``status_json`` (None: it did not answer)."""
+        if self._shut:
+            return
         if not isinstance(state, dict):
             self.set_reachable(False)
             return
@@ -1113,8 +1118,9 @@ class RunQueuePanel(QWidget):
 
     def on_broadcast(self, payload: dict) -> None:
         """A server broadcast: ``run_queue`` refreshes the summary and asks for
-        the list (debounced); ``person_hold`` the hold.  Others are ignored."""
-        if not isinstance(payload, dict):
+        the list (debounced); ``person_hold`` the hold.  Others are ignored
+        (all of them after shutdown)."""
+        if self._shut or not isinstance(payload, dict):
             return
         kind = payload.get("type")
         if kind == "run_queue" and isinstance(payload.get("run_queue"), dict):
@@ -1155,10 +1161,12 @@ class RunQueuePanel(QWidget):
 
     def schedule_list(self) -> None:
         """A ``list`` within :data:`LIST_DEBOUNCE_MS` (several calls, one list)."""
-        if not self._list_timer.isActive():
+        if not self._shut and not self._list_timer.isActive():
             self._list_timer.start(LIST_DEBOUNCE_MS)
 
     def refresh_list(self) -> None:
+        if self._shut:
+            return
         if self._listing:
             self._list_again = True
             return
@@ -1553,6 +1561,9 @@ class RunQueuePanel(QWidget):
     # -- shutdown ----------------------------------------------------------------------------
 
     def shutdown(self) -> None:
+        """Stop the timers and log windows; from now on state, broadcasts
+        and refreshes are ignored (nothing is sent)."""
+        self._shut = True
         self._list_timer.stop()
         for window in list(self._log_windows.values()):
             window.stopped = True

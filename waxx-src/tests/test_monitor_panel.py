@@ -294,3 +294,35 @@ def test_a_double_click_sends_one_reset(panel, factory):
     done(fn())                                                    # the reset's reply
     assert client.texts == [("reset", 1)]
     assert not tab.in_flight and tab.button.isEnabled()
+
+
+def test_a_shut_down_panel_ignores_broadcasts_and_state(panel, factory, qapp):
+    panel.show()
+    qapp.processEvents()
+    client = factory.made[0]
+    panel.cleanup()
+    n = len(client.requests)
+    panel.on_broadcast({"type": "run_queue", "run_queue": STATUS["run_queue"]})
+    panel.queue_panel.on_broadcast({"type": "run_queue", "run_queue": STATUS["run_queue"]})
+    panel.queue_panel.set_state(dict(STATUS))
+    panel.state_panel.on_broadcast({"type": "trust", "trust": {"trusted": False}})
+    panel.state_panel.set_state(dict(STATUS))
+    panel.state_panel.refresh_journal()
+    panel.queue_panel.refresh_list()
+    assert not panel.queue_panel._list_timer.isActive()
+    assert not panel.state_panel._journal_soon.isActive()
+    assert len(client.requests) == n                               # nothing sent
+    panel.hide()
+
+
+def test_a_worker_stuck_in_a_request_is_reported_at_shutdown(qapp, caplog):
+    import threading
+    import logging
+    from waxx.util.guis.request_runner import RequestRunner
+    release = threading.Event()
+    runner = RequestRunner(lambda obj: release.wait(5) and {"status": "ok"})
+    runner.send({"type": "get_version"})
+    with caplog.at_level(logging.WARNING, logger="waxx.util.guis.request_runner"):
+        runner.shutdown(timeout=0.2)
+    release.set()
+    assert any("still waiting on a request" in r.getMessage() for r in caplog.records)

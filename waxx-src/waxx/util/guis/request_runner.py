@@ -20,11 +20,14 @@ Machine-agnostic: nothing here knows the K machine.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
+
+log = logging.getLogger(__name__)
 
 #: Words in a refusal that mean "this server does not know that request"
 #: (an older server): the control that sent it is disabled, not retried.
@@ -100,6 +103,12 @@ class RequestRunner(QObject):
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+            if thread.is_alive():
+                # a request still in the requester (a server not answering):
+                # the daemon thread ends with it, its reply is dropped
+                log.warning("The monitor panel's request worker is still waiting on a "
+                            "request after %.1f s; it is left to finish (its reply is "
+                            "dropped).", timeout)
 
     # -- plumbing -------------------------------------------------------------------
 

@@ -232,8 +232,13 @@ class MonitorStatePanel(QWidget):
 
     # -- inputs ---------------------------------------------------------------------------
 
+    #: set by shutdown(): every input is then a no-op
+    _shut = False
+
     def set_state(self, state: dict | None) -> None:
         """The server's ``status_json`` (None: it did not answer)."""
+        if self._shut:
+            return
         if not isinstance(state, dict):
             self.reachable = False
             self.sequences.set_reachable(False)
@@ -249,8 +254,8 @@ class MonitorStatePanel(QWidget):
     def on_broadcast(self, payload: dict) -> None:
         """A server broadcast: trust, the run fence, connections, the SLM
         reinit and the loops update at once; any of them asks for the journal
-        again shortly."""
-        if not isinstance(payload, dict):
+        again shortly.  Ignored after shutdown."""
+        if self._shut or not isinstance(payload, dict):
             return
         kind = payload.get("type")
         if kind == "trust":
@@ -388,14 +393,14 @@ class MonitorStatePanel(QWidget):
             self.refresh_journal()
 
     def journal_soon(self) -> None:
-        if not self._journal_soon.isActive():
+        if not self._shut and not self._journal_soon.isActive():
             self._journal_soon.start(JOURNAL_DEBOUNCE_MS)
 
     def journal_request(self) -> dict:
         return {"type": "get_journal", "n": JOURNAL_LINES}
 
     def refresh_journal(self) -> None:
-        if self._journal_fetching or not self.journal_supported:
+        if self._shut or self._journal_fetching or not self.journal_supported:
             return
         self._journal_fetching = True
         self.runner.send(self.journal_request(), self._on_journal)
@@ -430,6 +435,9 @@ class MonitorStatePanel(QWidget):
     # -- shutdown -------------------------------------------------------------------------------
 
     def shutdown(self) -> None:
+        """Stop the timers; from now on state, broadcasts and the journal are
+        ignored (nothing is sent)."""
+        self._shut = True
         self._journal_timer.stop()
         self._journal_soon.stop()
         self._tick.stop()
