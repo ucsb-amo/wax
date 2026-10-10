@@ -159,6 +159,9 @@ class MonitorExperimentTab(QWidget):
         super().__init__()
         self.panel = panel
         self.state: dict = {}
+        #: a reset sent and not answered yet: the button stays disabled (one
+        #: click, one command -- as Device Control's _command_in_flight)
+        self.in_flight = False
         box = QVBoxLayout(self)
         self.button = QPushButton("?")
         font = QFont()
@@ -190,7 +193,7 @@ class MonitorExperimentTab(QWidget):
         text, bg = _LOOK.get(name, (name or "?", "#454545"))
         self.button.setText(text)
         self.button.setStyleSheet(f"background-color: {bg}; color: white;")
-        self.button.setEnabled(name in ("READY", "NOT_READY"))
+        self.button.setEnabled(name in ("READY", "NOT_READY") and not self.in_flight)
         sub = str(self.state.get("sub_state") or "").replace("_", " ")
         reason = str(self.state.get("reason") or "")
         self.detail.setText(" -- ".join(p for p in (sub, reason) if p))
@@ -221,6 +224,8 @@ class MonitorExperimentTab(QWidget):
         return signs
 
     def clicked(self) -> bool:
+        if self.in_flight:
+            return False
         name = self.state.get("state_name")
         signs = self.core_signs()
         why = ("\n\n" + "\n".join(f"- {s}" for s in signs)) if signs else ""
@@ -242,11 +247,15 @@ class MonitorExperimentTab(QWidget):
         else:
             return False
         self.message.setText("asked the monitor server to (re)start the monitor...")
+        self.in_flight = True
+        self.button.setEnabled(False)
 
         def done(reply) -> None:
+            self.in_flight = False
             self.message.setText("the monitor server did not answer" if reply is None else
                                  "asked; the monitor server starts it unless the run queue "
                                  "has a job to run first")
+            self.set_state(self.state or None)
             self.panel.poll_status(force=True)
         self.panel.runner.call(lambda: self.panel.link.send_text("reset"), done)
         return True

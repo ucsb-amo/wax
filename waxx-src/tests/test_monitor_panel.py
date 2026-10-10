@@ -272,3 +272,25 @@ def test_restart_names_what_holds_the_core(panel, factory):
     assert not panel.monitor_tab.clicked()
     assert asked[-1][0] == "Restart monitor"
     assert "this will interrupt it" in asked[-1][1] and "run 85703 (rabi)" in asked[-1][1]
+
+
+def test_a_double_click_sends_one_reset(panel, factory):
+    """S-1: while a reset is in flight the button is disabled and a second
+    click sends nothing; the reply re-enables it."""
+    panel.poll_status(force=True)
+    client = factory.made[0]
+    queued = []
+    real_call = panel.runner.call
+    panel.runner.call = lambda fn, callback=None: queued.append((fn, callback))  # held
+    tab = panel.monitor_tab
+    tab.button.click()
+    tab.button.click()
+    assert len(queued) == 1 and tab.in_flight and not tab.button.isEnabled()
+    panel._polling = False
+    panel.poll_status(force=True)                                 # a poll meanwhile
+    assert len(queued) == 2                                       # (the poll, held too)
+    panel.runner.call = real_call
+    fn, done = queued[0]
+    done(fn())                                                    # the reset's reply
+    assert client.texts == [("reset", 1)]
+    assert not tab.in_flight and tab.button.isEnabled()
