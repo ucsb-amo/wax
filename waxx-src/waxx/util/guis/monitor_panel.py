@@ -150,8 +150,8 @@ _LOOK = {"READY": ("READY", "green"), "LOADING": ("Loading...", "orange"),
 class MonitorExperimentTab(QWidget):
     """The monitor experiment's status button, as in the server's own window:
     READY (click: restart it, after a confirm), NOT READY (click: start it; a
-    confirm first when a run has taken the core from it), Loading... (no
-    click).  The click sends the server's ``reset`` command, which (re)starts
+    confirm first, as in Device Control, whenever the status shows the core
+    may be held -- :meth:`core_signs`), Loading... (no click).  The click sends the server's ``reset`` command, which (re)starts
     the monitor -- unless the run queue has a job in its slot or about to
     launch, in which case the server defers it until the queue runs out."""
 
@@ -195,16 +195,49 @@ class MonitorExperimentTab(QWidget):
         reason = str(self.state.get("reason") or "")
         self.detail.setText(" -- ".join(p for p in (sub, reason) if p))
 
+    def core_signs(self) -> list[str]:
+        """Every sign in ``status_json`` that an experiment may hold the core:
+        the monitor was interrupted by a run; a run has announced itself (the
+        run fence, ``run_pending``); a run queue job is in its slot
+        (``run_queue.current``); liveOD says a run is in progress (``live_od``
+        -- only if the server reports it; status_json does not today)."""
+        s = self.state
+        signs = []
+        if s.get("sub_state") == "interrupted_by_run":
+            signs.append("a run interrupted the monitor and has not reported its end")
+        pending = s.get("run_pending")
+        if isinstance(pending, dict):
+            signs.append(f"run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) "
+                         "has announced itself and holds the run fence")
+        current = (s.get("run_queue") or {}).get("current")
+        if isinstance(current, dict):
+            run = f", run {current['run_id']}" if current.get("run_id") else ""
+            signs.append(f"the run queue's job {current.get('id')} "
+                         f"({current.get('label') or '?'}) is {current.get('state')}{run}")
+        live_od = s.get("live_od")
+        if isinstance(live_od, dict) and live_od.get("run_in_progress"):
+            signs.append(f"liveOD says run {live_od.get('run_id')} "
+                         f"({live_od.get('expt_name') or 'experiment'}) is in progress")
+        return signs
+
     def clicked(self) -> bool:
         name = self.state.get("state_name")
+        signs = self.core_signs()
+        why = ("\n\n" + "\n".join(f"- {s}" for s in signs)) if signs else ""
         if name == "READY":
-            if not self.panel.confirm("Restart Monitor", "Are you sure you'd like to restart "
-                                      "the monitor experiment?"):
+            # Device Control's restart question, plus what the status shows
+            if not self.panel.confirm(
+                    "Restart monitor",
+                    "Restart the monitor experiment? If another experiment is currently "
+                    "using the core device this will interrupt it." + why):
                 return False
         elif name == "NOT_READY":
-            if self.state.get("sub_state") == "interrupted_by_run" and not self.panel.confirm(
-                    "Start Monitor", "A run has taken the core from the monitor and has not "
-                    "ended. Starting the monitor takes the core back from that run. Start it?"):
+            # Device Control's start question, whenever the core may be held
+            if signs and not self.panel.confirm(
+                    "Start monitor",
+                    "An experiment probably holds the core device." + why + "\n\n"
+                    "Starting the monitor takes the core and cuts that experiment off.\n\n"
+                    "Start the monitor anyway?"):
                 return False
         else:
             return False

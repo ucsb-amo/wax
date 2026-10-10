@@ -190,12 +190,6 @@ def test_the_monitor_button(panel, factory):
     panel.confirm = lambda title, text: False
     assert not panel.monitor_tab.clicked()                        # READY: asks; declined
     assert len(client.texts) == 1
-    client.status = dict(STATUS, sub_state="interrupted_by_run")
-    panel.poll_status(force=True)
-    asked = []
-    panel.confirm = lambda title, text: asked.append(text) or True
-    assert panel.monitor_tab.clicked()
-    assert "takes the core back" in asked[-1] and client.texts[-1] == ("reset", 1)
     client.status = dict(STATUS, state=1, state_name="LOADING", sub_state="starting")
     panel.poll_status(force=True)
     assert not panel.monitor_tab.button.isEnabled() and not panel.monitor_tab.clicked()
@@ -236,3 +230,45 @@ def test_constructing_the_panel_binds_nothing():
                          env=env, timeout=120)
     assert out.returncode == 0, out.stderr[-2000:]
     assert "LOADED []" in out.stdout, out.stdout
+
+
+@pytest.mark.parametrize("extra, word", [
+    ({"sub_state": "interrupted_by_run"}, "interrupted the monitor"),
+    ({"run_pending": {"run_id": 85700, "expt": "rabi", "client": "kong", "since": 0}},
+     "run 85700 (rabi) has announced itself"),
+    ({"run_queue": dict(STATUS["run_queue"], current={"id": 4, "label": "scan",
+                                                      "state": "running", "run_id": 85701})},
+     "job 4 (scan) is running, run 85701"),
+    ({"live_od": {"run_in_progress": True, "run_id": 85702, "expt_name": "tof"}},
+     "liveOD says run 85702 (tof) is in progress"),
+])
+def test_start_asks_whenever_the_core_may_be_held(panel, factory, extra, word):
+    """BL-1: NOT READY + any sign the core may be held -> Device Control's
+    question first; declined, nothing is sent."""
+    panel.poll_status(force=True)
+    client = factory.made[0]
+    client.status = dict(STATUS, **extra)
+    panel.poll_status(force=True)
+    asked = []
+    panel.confirm = lambda title, text: asked.append((title, text)) or False
+    assert not panel.monitor_tab.clicked()
+    title, text = asked[-1]
+    assert title == "Start monitor"
+    assert "An experiment probably holds the core device." in text
+    assert "takes the core and cuts that experiment off" in text and word in text
+    assert client.texts == []
+    panel.confirm = lambda title, text: True
+    assert panel.monitor_tab.clicked() and client.texts == [("reset", 1)]
+
+
+def test_restart_names_what_holds_the_core(panel, factory):
+    panel.poll_status(force=True)
+    client = factory.made[0]
+    client.status = dict(STATUS, state=0, state_name="READY", sub_state="running",
+                         run_pending={"run_id": 85703, "expt": "rabi"})
+    panel.poll_status(force=True)
+    asked = []
+    panel.confirm = lambda title, text: asked.append((title, text)) or False
+    assert not panel.monitor_tab.clicked()
+    assert asked[-1][0] == "Restart monitor"
+    assert "this will interrupt it" in asked[-1][1] and "run 85703 (rabi)" in asked[-1][1]
