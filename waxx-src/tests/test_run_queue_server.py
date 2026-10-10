@@ -461,6 +461,35 @@ def test_the_gui_owner_cleans_up_once_then_exits_with_the_code(monkeypatch):
     assert _FakeApp.codes == [3, 3]
 
 
+# --- a refused restart never leaves the machine without a monitor (review F2) -----------------------
+
+def test_a_loop_that_does_not_stop_in_time_is_asked_to_start_the_monitor(server, monkeypatch):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"                         # active between runs, slow to stop
+    asked = []
+    monkeypatch.setattr(loop, "stop", lambda **kw: asked.append(kw["start_monitor"]))
+    monkeypatch.setattr(type(server), "LOOP_STOP_WAIT_S", 0.1)
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert reply["status"] == "error" and "starts the monitor when it ends" in reply["msg"]
+    assert asked == [False, True]
+    assert server.exiting == ""
+    loop._s["state"] = "idle"
+
+
+def test_a_refusal_after_stopping_a_loop_leaves_the_monitor_owed(server, expts, monkeypatch):
+    loop = server.loops["auto_tof"]
+    loop._s["state"] = "running"
+    monkeypatch.setattr(loop, "stop", lambda **kw: loop._s.update(state="stopped"))
+    answers = iter(["", "the run queue's job 1 (rabi) is launching"])
+    monkeypatch.setattr(server, "_queue_slot_text", lambda: next(answers))
+    reply = server.ask({"type": "server", "action": "restart", "owner": "person"})
+    assert reply["status"] == "error" and "is launching" in reply["msg"]
+    assert server.run_queue._owe_monitor is True         # asked for once the queue runs out
+    assert server.run_queue._stop_launching == ""        # and it launches again
+    kinds = [e["kind"] for e in server.journal.tail(50)]
+    assert "run_queue_monitor_deferred" in kinds
+
+
 # --- nothing new starts in the exit window (review F1) ---------------------------------------------
 
 def test_nothing_new_starts_once_a_restart_is_accepted(server, expts, qapp):

@@ -877,19 +877,31 @@ class MonitorUDPServer(UdpServer):
                 return refuse(f"{loop.spec.title} has a run in progress"
                               + (f" (run {info.get('run_id')})" if info.get("run_id") else "")
                               + " -- stop it and let the run finish first")
+        stopped = []
         for loop in self.loops.values():
             if loop.active:
                 loop.stop(operator=by, client="server " + action, start_monitor=False)
+                stopped.append(loop)
                 deadline = time.monotonic() + self.LOOP_STOP_WAIT_S
                 while loop.active and time.monotonic() < deadline:
                     time.sleep(0.05)
                 if loop.active:
+                    # refused: the loop is not left to end without a monitor --
+                    # asked again, it starts the monitor when it ends
+                    loop.stop(operator=by, client="server " + action, start_monitor=True)
                     return refuse(f"{loop.spec.title} did not stop within "
-                                  f"{self.LOOP_STOP_WAIT_S:.0f} s")
+                                  f"{self.LOOP_STOP_WAIT_S:.0f} s (it starts the monitor when "
+                                  "it ends)")
         self.run_queue.stop_launching(f"the monitor server is {action}ing")
         busy = self._queue_slot_text()
         if busy:                                       # one slipped in meanwhile
             self.run_queue.stop_launching("")
+            if stopped:
+                # the loop we stopped is not started again: the queue's job has
+                # the machine and the queue asks for the monitor when it runs out
+                self.run_queue.defer_monitor(f"the {action} refused after stopping "
+                                             + ", ".join(lp.spec.title for lp in stopped),
+                                             busy)
             return refuse(f"{busy} -- the server is not restarted under it")
         # from here no new work starts: requests that would are refused
         self._exiting = ("server is restarting" if action == "restart"
