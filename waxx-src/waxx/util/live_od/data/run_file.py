@@ -217,6 +217,10 @@ class RunFile:
             incomplete=incomplete,
         )
         self._set_phase("write")
+        if reopens_json:
+            # before the save: the save ends by setting run_complete, and a reader
+            # may load the file from that moment (the writer has closed it by now)
+            self._record_reopens(filepath, reopens_json)
         try:
             self._data_saver.save_data_from_payload(
                 msg, filepath,
@@ -224,8 +228,6 @@ class RunFile:
                 incomplete=incomplete,
             )
             clear_end_run_payload(stash_path)
-            if reopens_json:
-                self._record_reopens(filepath, reopens_json)
             # Forget the file so a late RESET cannot delete an already-saved run.
             if self.filepath == filepath:
                 self.filepath = ""
@@ -250,7 +252,8 @@ class RunFile:
     def _record_reopens(filepath, reopens_json: str):
         """The writer's reopen records into the run file's root attribute
         ``writer_reopens`` (the writer wrote it too when its reopen worked;
-        this one is complete, and lands even when every reopen failed)."""
+        this one is complete, and lands even when every reopen failed).
+        Written before the END_RUN save, which sets run_complete last."""
         import h5py
         try:
             with h5py.File(filepath, "r+") as f:

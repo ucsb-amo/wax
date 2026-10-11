@@ -54,6 +54,8 @@ class World:
         self.flush_advance = 0.0     # seconds the fake clock moves during a flush
         self.clock = Clock()
         self.tamper = None           # called on the file between a death and the reopen
+        self.partial = False         # cached lookups survive the death (86182)
+        self.partial_exc = KeyError(ERR22)
 
     def open(self, **kw):
         self.opens += 1
@@ -84,14 +86,21 @@ class World:
             for a, v in real.attrs.items():
                 s.attrs[a] = v
 
-    def tick(self):
+    def tick(self, cached=False):
+        """One access. ``partial``: once dead, what HDF5 answers from its metadata
+        cache (``'x' in group``, the root's ``data`` group, attributes) still works,
+        and only real reads / writes fail -- 86182's signature."""
         if self.dead:
-            raise KeyError(ERR22)
+            if self.partial and cached:
+                return
+            raise self.partial_exc if self.partial else KeyError(ERR22)
         self.accesses += 1
         if self.die_after is not None and self.accesses > self.die_after:
             self.die_after = None
             self.dead = True
-            raise KeyError(ERR22)
+            if self.partial and cached:
+                return
+            raise self.partial_exc if self.partial else KeyError(ERR22)
 
     def flush(self, real):
         self.tick()
@@ -123,28 +132,33 @@ class Clock:
         return self.t
 
 
-def _wrap(obj, world):
+def _wrap(obj, world, cached=False):
     if isinstance(obj, (h5py.Group, h5py.Dataset, h5py.AttributeManager)):
-        return Proxy(obj, world)
+        return Proxy(obj, world, cached=cached)
     return obj
 
 
 class Proxy:
-    def __init__(self, obj, world, root=False):
+    """``cached``: an object whose accesses HDF5 can answer from its metadata
+    cache (the root group's ``data`` group, attributes)."""
+
+    def __init__(self, obj, world, root=False, cached=False):
         object.__setattr__(self, "_o", obj)
         object.__setattr__(self, "_w", world)
         object.__setattr__(self, "_root", root)
+        object.__setattr__(self, "_cached", cached)
 
     def __getitem__(self, k):
-        self._w.tick()
-        return _wrap(self._o[k], self._w)
+        cached = self._cached or (self._root and k == "data")
+        self._w.tick(cached=cached)
+        return _wrap(self._o[k], self._w, cached=False)
 
     def __setitem__(self, k, v):
-        self._w.tick()
+        self._w.tick()                                   # a write: never from the cache
         self._o[k] = v
 
     def __contains__(self, k):
-        self._w.tick()
+        self._w.tick(cached=True)
         return k in self._o
 
     def flush(self):
@@ -155,15 +169,15 @@ class Proxy:
 
     def __getattr__(self, name):
         if name == "attrs":
-            self._w.tick()
-            return Proxy(self._o.attrs, self._w)
+            self._w.tick(cached=True)
+            return Proxy(self._o.attrs, self._w, cached=True)
         attr = getattr(self._o, name)
         if callable(attr):
             def call(*a, **k):
-                self._w.tick()
+                self._w.tick(cached=self._cached)
                 return _wrap(attr(*a, **k), self._w)
             return call
-        self._w.tick()
+        self._w.tick(cached=self._cached)
         return attr
 
 
@@ -275,6 +289,129 @@ def test_unflushed_items_really_are_lost_without_the_rewrite(app, tmp_path, monk
     assert any(not images[i].any() for i in range(6))
 
 
+# -- a dead handle whose cached lookups still answer (86182) ---------------------------------
+
+@pytest.mark.parametrize("die_after", [30, 41, 57])
+def test_cached_probe_passing_on_a_dead_handle_still_reopens(app, tmp_path, die_after, monkeypatch):
+    """86182's signature: 'x' in group and attributes answer from HDF5's cache,
+    dataset lookups and writes fail with "file read failed ... errno = 22". The
+    probe passes; the error's I/O text still marks the handle dead."""
+    path = new_file(tmp_path)
+    world = World(path)
+    world.partial = True
+    world.die_after = die_after
+    probes = []
+    orig_alive = SaveWorker._alive
+
+    def alive(f):
+        ok = orig_alive(f)
+        probes.append(ok)
+        return ok
+    monkeypatch.setattr(SaveWorker, "_alive", staticmethod(alive))
+    w, faults, failed = run_worker(world, items())
+    assert len(w.reopens) == 1 and w.reopens[0]["outcome"] == "reopened"
+    assert "file read failed" in w.reopens[0]["error"]
+    assert True in probes                               # the probe passed on the dead handle
+    check_all_written(path)
+    written, lost, _ = w.report.snapshot()
+    pw, plost, _ = w.put_report.snapshot()
+    assert written == 6 and lost == [] and pw == {"img_2dmot": 6, "pre": 6} and plost == []
+    assert not faults and not failed
+
+
+def test_with_the_probe_alone_the_cached_case_loses_everything_after_it(app, tmp_path, monkeypatch):
+    """The 'before' of the fix above (6260011's rule: the probe alone): every item
+    after the death is lost as the item's own error until the next flush fails and
+    forces a reopen (here: the end of the queue; in a run: the next idle queue,
+    32 items or 5 s -- about one shot). Which is why the error's own text decides."""
+    monkeypatch.setattr(iw, "_io_error", lambda exc: False)
+    monkeypatch.setattr(iw, "MAX_ITEM_ERRORS_IN_A_ROW", 10 ** 6)
+    path = new_file(tmp_path)
+    world = World(path)
+    world.partial = True
+    world.die_after = 41
+    w, faults, failed = run_worker(world, items())
+    assert [r["item"] for r in w.reopens] == ["the flush"]    # only the flush noticed
+    lost = w.report.snapshot()[1] + w.put_report.snapshot()[1]
+    assert len(lost) >= 10
+
+
+def test_the_cached_probe_really_passes_on_the_partly_dead_handle(tmp_path):
+    """(so the test above is the cached-probe case, not the old one)"""
+    path = new_file(tmp_path)
+    world = World(path)
+    world.partial = True
+    f = world.open()
+    world.dead = True
+    assert SaveWorker._alive(f) is True
+    with pytest.raises(KeyError, match="file read failed"):
+        f["data"]["pre"]
+    world.dead = False
+    f.close()
+
+
+def test_errors_without_io_text_on_a_passing_probe_reopen_after_three(app, tmp_path):
+    """A dead handle whose errors carry no I/O text: the third item in a row that
+    fails while the probe answers forces a reopen, and the held items are written
+    again -- nothing lost."""
+    path = new_file(tmp_path)
+    world = World(path)
+    world.partial = True
+    world.partial_exc = RuntimeError("something odd happened")
+    world.die_after = 41
+    w, faults, failed = run_worker(world, items())
+    assert len(w.reopens) == 1 and w.reopens[0]["outcome"] == "reopened"
+    assert w.reopens[0]["retried"] == iw.MAX_ITEM_ERRORS_IN_A_ROW
+    check_all_written(path)
+    assert w.report.snapshot()[1] == [] and w.put_report.snapshot()[1] == []
+
+
+def test_an_item_error_on_a_healthy_handle_does_not_reopen(app, tmp_path):
+    path = new_file(tmp_path)
+    world = World(path)
+    bad = PutItem("nowhere", (0,), np.zeros(3))          # no such dataset, no full_shape
+    w, faults, failed = run_worker(world, items()[:3] + [bad] + items()[3:])
+    assert w.reopens == [] and not faults
+    pw, plost, _ = w.put_report.snapshot()
+    assert len(plost) == 1 and "PutItem(nowhere[0])" in plost[0] and "ValueError" in plost[0]
+    check_all_written(path)
+
+
+def test_a_lone_odd_error_on_a_healthy_handle_stays_the_items_own(app, tmp_path, monkeypatch):
+    """A non-ValueError error once, then writes go on: reported as the item's own
+    error (held until the next write showed the handle is fine), no reopen."""
+    path = new_file(tmp_path)
+    world = World(path)
+    orig = SaveWorker._write_put
+    n = {"k": 0}
+
+    def write_put(self, f, item):
+        if item.key == "pre" and item.index == (2,):
+            raise RuntimeError("one-off")
+        return orig(self, f, item)
+    monkeypatch.setattr(SaveWorker, "_write_put", write_put)
+    w, faults, failed = run_worker(world, items())
+    assert w.reopens == []
+    plost = w.put_report.snapshot()[1]
+    assert len(plost) == 1 and "pre[2]" in plost[0] and "one-off" in plost[0]
+
+
+def test_io_error_classification():
+    assert iw._io_error(OSError(22, "x"))
+    assert iw._io_error(KeyError(ERR22))
+    assert iw._io_error(RuntimeError("Can't write data (file write failed)"))
+    inner = OSError(9, "Bad file descriptor")
+    try:
+        try:
+            raise inner
+        except OSError as e:
+            raise KeyError("Unable to synchronously open object") from e
+    except KeyError as outer:
+        assert iw._io_error(outer)
+    assert not iw._io_error(ValueError("no such dataset and no full_shape to create it"))
+    assert not iw._io_error(KeyError("Unable to synchronously open object (object 'x' doesn't exist)"))
+
+
 # -- reopening fails ------------------------------------------------------------------------
 
 def test_reopen_failing_sets_the_fault_and_keeps_the_file(app, tmp_path, caplog):
@@ -299,7 +436,7 @@ def test_reopen_failing_sets_the_fault_and_keeps_the_file(app, tmp_path, caplog)
     assert any("KEPT" in r.message for r in caplog.records)
 
 
-def test_a_later_try_recovers_after_a_failed_reopen(app, tmp_path):
+def test_a_later_try_recovers_after_a_failed_reopen(app, tmp_path, monkeypatch):
     path = new_file(tmp_path)
     world = World(path)
     world.die_after = 30
@@ -315,11 +452,8 @@ def test_a_later_try_recovers_after_a_failed_reopen(app, tmp_path):
     def take(self, item):
         world.clock.t += 20.0
         return orig_take(self, item)
-    SaveWorker._take, saved = take, SaveWorker._take
-    try:
-        w, faults, failed = run_worker(world, q_items, sleeps)
-    finally:
-        SaveWorker._take = saved
+    monkeypatch.setattr(SaveWorker, "_take", take)
+    w, faults, failed = run_worker(world, q_items, sleeps)
     assert [r["outcome"].split(":")[0] for r in w.reopens] == ["failed", "reopened"]
     assert "reopened at" in w.fault and faults
     with h5py.File(path, "r") as f:

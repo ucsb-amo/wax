@@ -353,6 +353,33 @@ DEAD_RETRY_S = 60.0
 MAX_REOPEN_RECORDS = 20
 
 
+#: Item errors in a row (on different items) after which the handle is taken
+#: for dead whatever the probe says (a probe can be answered from HDF5's cache).
+MAX_ITEM_ERRORS_IN_A_ROW = 3
+
+#: Text of an I/O failure underneath an h5py error (HDF5 wraps the OS error in
+#: a KeyError / OSError / RuntimeError message).
+_IO_SIGNATURES = ("file read failed", "file write failed", "errno", "invalid argument",
+                  "bad file descriptor", "can't write data", "can't read data",
+                  "unable to flush", "unable to read", "unable to write")
+
+
+def _io_error(exc) -> bool:
+    """``exc`` (or anything in its cause / context chain) is an I/O failure of
+    the handle: an OSError, or a message carrying one of _IO_SIGNATURES. A
+    ValueError / TypeError without such text is the item's own error."""
+    seen = 0
+    while exc is not None and seen < 10:
+        if isinstance(exc, OSError):
+            return True
+        text = str(exc).lower()
+        if any(sig in text for sig in _IO_SIGNATURES):
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
 def _item_name(item) -> str:
     return repr(item) if isinstance(item, PutItem) else f"frame {item[1]}"
 
@@ -411,8 +438,10 @@ class SaveWorker(QThread):
                  report: WriteReport = None,
                  put_report: PutReport = None,
                  gauge: QueueGauge = None,
-                 reopen_fn=None, sleep=time.sleep, clock=time.monotonic, wall=time.time):
+                 reopen_fn=None, sleep=time.sleep, clock=time.monotonic, wall=time.time,
+                 filepath: str = ""):
         super().__init__()
+        self._filepath = str(filepath or "")
         self._save_queue = save_queue
         # what the queue holds, counted by the feeder (ImageWriter) and taken
         # off here as each item comes out
@@ -440,6 +469,7 @@ class SaveWorker(QThread):
         self._last_dead_try = None
         self._rec = None            # the reopen being made (its record)
         self._n_lost_logged = 0
+        self._suspects = []          # [(item, exc)] failed on a handle whose probe answers
         self._datasets_created = False
         self._declared_checked = False
         self._frame_shape, self._frame_dtype = None, None
@@ -496,6 +526,9 @@ class SaveWorker(QThread):
         except Exception as exc:
             logger.exception(f"SaveWorker: unexpected error: {exc}")
         finally:
+            # suspects left at the end: no later write cleared or condemned the
+            # handle -- reported as their own errors
+            self._settle_suspects()
             if self._f is not None:
                 if self._pending:
                     # an interrupted run's last items, or an unexpected error:
@@ -514,38 +547,80 @@ class SaveWorker(QThread):
     # -- one item ------------------------------------------------------------------
 
     def _take(self, item):
-        """Write one item; on a dead handle, reopen and write it again."""
+        """Write one item; on a dead handle, reopen and write it again.
+
+        How a dead handle is told from an item's own error: an OSError or
+        HDF5's I/O text ("file read failed ... errno") anywhere in the error's
+        chain, or a probe that fails, means dead. The probe alone is not enough:
+        its two lookups can be answered from HDF5's metadata cache on a handle
+        that fails every real read (86182's dataset lookups did). A ValueError /
+        TypeError without I/O text is the item's own error, as before. Any other
+        error on a handle that passes the probe makes the item a suspect: held,
+        not reported yet. The next item that writes shows the handle is fine,
+        and the suspects are then reported as their own errors; the
+        MAX_ITEM_ERRORS_IN_A_ROW-th suspect in a row is taken for a dead
+        handle -- the file is reopened and every suspect written again."""
         if self._f is None:
             if not self._revive(item):
                 self._not_written(item, f"not written: the file's handle failed and the file "
                                         f"could not be reopened ({self.fault})")
+                self._settle_suspects(dead=True)
                 return
         try:
             self._write(item)
+            self._settle_suspects()           # the handle writes: they were their own errors
             return
         except Exception as exc:
-            if self._alive(self._f):
-                # the handle is fine: this item's own error, as before
-                self._item_error(item, exc)
+            if _io_error(exc) or not self._alive(self._f):
+                first = exc
+            elif isinstance(exc, (ValueError, TypeError)):
+                self._item_error(item, exc)       # the item's own error, as before
                 return
-            first = exc
-        if not self._reopen(_item_name(item), first):
-            self._not_written(item, f"not written: the file's handle failed and the file could "
-                                    f"not be reopened ({self.fault})")
+            else:
+                self._suspects.append((item, exc))
+                if len(self._suspects) < MAX_ITEM_ERRORS_IN_A_ROW:
+                    return
+                logger.error(f"SaveWorker: {len(self._suspects)} items in a row failed to write "
+                             f"({type(exc).__name__}: {exc}) while the handle's probe answers; "
+                             f"taking the handle for dead and reopening the file")
+                first, item = exc, None           # the suspects hold this item too
+        what = _item_name(item) if item is not None else _item_name(self._suspects[-1][0])
+        if not self._reopen(what, first):
+            if item is not None:
+                self._not_written(item, f"not written: the file's handle failed and the file "
+                                        f"could not be reopened ({self.fault})")
+            self._settle_suspects(dead=True)
             return
-        # the item that met the dead handle, again; a dataset it has to make
+        # the items that met the dead handle, again; a dataset they have to make
         # again goes in the reopen's record
         rec = self.reopens[-1] if self.reopens else None
         n_made = len(rec["recreated"]) if rec else 0
+        again = [s for s, _ in self._suspects] + ([item] if item is not None else [])
+        self._suspects = []
         self._rec = rec
         try:
-            self._write(item)
-        except Exception as exc:
-            self._item_error(item, exc, after_reopen=True)
+            for it in again:
+                try:
+                    self._write(it)
+                except Exception as exc:
+                    self._item_error(it, exc, after_reopen=True)
         finally:
             self._rec = None
-        if rec and len(rec["recreated"]) != n_made:
-            self._write_records()
+        if rec is not None:
+            rec["retried"] = len(again)
+            if len(rec["recreated"]) != n_made or len(again) > 1:
+                self._write_records()
+
+    def _settle_suspects(self, dead=False):
+        """The held suspects: their own errors (the handle wrote since), or --
+        ``dead`` -- lost with the handle."""
+        suspects, self._suspects = self._suspects, []
+        for item, exc in suspects:
+            if dead:
+                self._not_written(item, f"not written: the file's handle failed and the file "
+                                        f"could not be reopened ({self.fault})")
+            else:
+                self._item_error(item, exc)
 
     def _item_error(self, item, exc, after_reopen=False):
         how = "write failed after the file was reopened" if after_reopen else "write failed"
@@ -749,6 +824,19 @@ class SaveWorker(QThread):
                 f.id.close()
             except Exception:
                 pass
+            # h5py can keep the dead file id registered, and the next open of
+            # the same path then fails on a lock this process holds itself: drop
+            # every id left for this file, as the END_RUN save's retry does
+            # (DataSaver._force_close_stale_handles). Only this writer holds the
+            # file during the run.
+            if self._filepath:
+                try:
+                    from waxa.data.data_saver import DataSaver
+                    DataSaver._force_close_stale_handles(self._filepath)
+                    if rec is not None:
+                        rec["stale_ids_dropped"] = True
+                except Exception as e:
+                    logger.warning(f"SaveWorker: dropping stale HDF5 ids failed: {e}")
 
     def _record(self, rec):
         if len(self.reopens) < MAX_REOPEN_RECORDS:
@@ -1020,6 +1108,7 @@ class ImageWriter(Scribe):
             report=self.report,
             put_report=self.put_report,
             gauge=self._gauge,
+            filepath=self.data_filepath,
         )
         self._worker.start()
 
