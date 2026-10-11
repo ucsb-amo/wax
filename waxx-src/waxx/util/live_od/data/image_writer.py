@@ -31,8 +31,10 @@ The queue stays unbounded. A frame handed over after the writer was finished,
 and anything still queued when the worker stops after an unexpected error, is
 reported as not written (it used to sit unseen in a queue nobody read).
 """
+import json
 import os
 import threading
+import time
 from queue import Empty, Queue
 
 import numpy as np
@@ -309,6 +311,61 @@ def _declared_frame(f):
         return None
 
 
+# --- a dead file handle (2026-10-10) -------------------------------------------------
+# Runs 86095 (10:42:49) and 86182 (21:46:38): the writer's one long-lived handle on
+# the run file on the B: share started failing every access ("file read failed ...
+# errno = 22, 'Invalid argument' ... offset = 800") and the worker carried on with it,
+# so every frame and pushed array after the fault was lost while a fresh open (the
+# END_RUN save) worked. Now a write that fails on a handle that no longer answers
+# closes it, reopens the file (the same open liveOD uses: Scribe.wait_for_data_available,
+# r+, HDF5's default locking) and writes again what may not have reached the disk.
+#
+# What a dead handle can lose: everything written since the handle's last flush may
+# still be only in HDF5's caches (chunk data, chunk-index entries, the headers of
+# datasets created since then). So the writer flushes after every dataset it
+# creates, whenever its queue runs empty (about once per shot) and at least every
+# FLUSH_EVERY_ITEMS items or FLUSH_EVERY_S seconds, and keeps what it wrote since
+# the last flush ("pending") in memory. The reports count an item as written only
+# once a flush has succeeded after it. After a reopen every pending item is written
+# again (slot writes: the same bytes to the same place), and what was committed
+# before is checked (every dataset there with its shape and dtype; each dataset's
+# last committed item read back against its sha256). Each reopen is recorded in the
+# run file's root attribute ``writer_reopens`` (JSON) and the log; anything the check
+# finds wrong makes the run incomplete (``problems``, read by RunFile.save).
+#
+# A reopen that keeps failing sets ``fault`` and emits ``writer_fault_signal`` -- NOT
+# save_failed_signal, whose slot resets the run and deletes its file, with every
+# frame written before the fault in it. The server reports ``fault`` at SHOT_COMPLETE
+# and in POLL (``writer_fault``). Items that come meanwhile are reported not written,
+# and one reopen is tried at most every DEAD_RETRY_S on the next item.
+
+#: Waits (s) before each reopen try; each try is one open bounded by REOPEN_TRY_S.
+REOPEN_WAITS_S = (0.0, 5.0, 15.0)
+REOPEN_TRY_S = 5.0
+#: Flush at least this often (also after each dataset made and when the queue is empty).
+FLUSH_EVERY_ITEMS = 32
+FLUSH_EVERY_S = 5.0
+#: A flush slower than this is reported once per run (WARNING).
+SLOW_FLUSH_S = 1.0
+#: Once reopening has failed: one more try at most this often.
+DEAD_RETRY_S = 60.0
+#: Reopen records kept in full (later ones are counted).
+MAX_REOPEN_RECORDS = 20
+
+
+def _item_name(item) -> str:
+    return repr(item) if isinstance(item, PutItem) else f"frame {item[1]}"
+
+
+def _item_key(item) -> str:
+    return item.key if isinstance(item, PutItem) else "images"
+
+
+def _sha(array) -> str:
+    import hashlib
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
 class SaveWorker(QThread):
     """Writes images to HDF5 on a dedicated thread, decoupled from image display.
 
@@ -341,14 +398,20 @@ class SaveWorker(QThread):
     """
 
     done_writing_signal = pyqtSignal()
-    save_failed_signal = pyqtSignal(str)   # reason — emitted when the HDF5 file is unusable
+    # reason -- the HDF5 file could not be opened at all (the run is reset: its
+    # slot deletes the file, which holds nothing yet)
+    save_failed_signal = pyqtSignal(str)
+    # reason -- the handle died mid-run and reopening failed; the file is KEPT
+    # (it holds everything written before the fault), the run is not reset
+    writer_fault_signal = pyqtSignal(str)
 
     def __init__(self, save_queue: Queue, wait_fn, n_img: int,
                  wait_timeout: float = 120.,
                  check_interrupt_method=None,
                  report: WriteReport = None,
                  put_report: PutReport = None,
-                 gauge: QueueGauge = None):
+                 gauge: QueueGauge = None,
+                 reopen_fn=None, sleep=time.sleep, clock=time.monotonic, wall=time.time):
         super().__init__()
         self._save_queue = save_queue
         # what the queue holds, counted by the feeder (ImageWriter) and taken
@@ -363,6 +426,31 @@ class SaveWorker(QThread):
         self.put_report = put_report if put_report is not None else PutReport()
         self.open_error = ""        # why the file could not be opened ("" = it could)
         self.file_open = threading.Event()   # the file is open (or the open failed)
+        # a reopen is the same open as the first one, each try bounded
+        self._reopen_fn = reopen_fn if reopen_fn is not None else (
+            lambda: wait_fn(timeout=REOPEN_TRY_S, check_interrupt_method=lambda: False))
+        self._sleep, self._clock, self._wall = sleep, clock, wall
+        self._f = None
+        self._pending = []          # [(item, key, where, dtype)] written since the last flush
+        self._committed = {}        # key -> (where, sha256, dtype) of its last committed item
+        self._layout = {}           # key -> (shape, dtype) of every dataset written into
+        self._last_flush = 0.0
+        self._slow_flush_warned = False
+        self._dead_since = None     # the handle died and reopening failed (clock)
+        self._last_dead_try = None
+        self._rec = None            # the reopen being made (its record)
+        self._n_lost_logged = 0
+        self._datasets_created = False
+        self._declared_checked = False
+        self._frame_shape, self._frame_dtype = None, None
+        self._n_refused = 0
+        #: "" or why the writer could not keep writing (a reopen failed)
+        self.fault = ""
+        #: one record per reopen (MAX_REOPEN_RECORDS kept; ``reopens_more`` counts the rest)
+        self.reopens = []
+        self.reopens_more = 0
+        #: what a reopen's check found wrong: the run is saved incomplete
+        self.problems = []
 
     def set_n_img(self, n_img: int):
         self._n_img = int(n_img)
@@ -386,9 +474,8 @@ class SaveWorker(QThread):
         finally:
             self.file_open.set()
 
-        _datasets_created = False
-        frame_shape, frame_dtype = None, None
-        n_refused = 0
+        self._f = f
+        self._last_flush = self._clock()
         try:
             while True:
                 item = self._save_queue.get()
@@ -399,79 +486,434 @@ class SaveWorker(QThread):
                     if isinstance(item, PutItem) and f is None:
                         self.put_report.not_written(f"{item!r}: the file could not be opened")
                     continue                # drain without writing
-                if isinstance(item, PutItem):
-                    self._write_put(f, item)
-                    continue
-                img, idx, img_t = item
-                try:
-                    # Lazy dataset creation on the first image received.
-                    # images/image_timestamps are deliberately not pre-allocated
-                    # at file creation (that heavy NAS write would block the
-                    # INIT_RUN reply).  We create them here from the actual
-                    # image shape.
-                    if not _datasets_created:
-                        dgrp = f['data']
-                        if 'images' not in dgrp:
-                            # one chunk per frame, gzip (waxa.data.h5_image)
-                            # unless COMPRESS_MAIN_IMAGES is off
-                            plain = {} if COMPRESS_MAIN_IMAGES else {
-                                "chunks": None, "compression": None, "shuffle": False}
-                            create_image_dataset(
-                                dgrp, 'images',
-                                shape=(self._n_img,) + img.shape,
-                                dtype=img.dtype, **plain,
-                            )
-                            dgrp.create_dataset(
-                                'image_timestamps',
-                                shape=(self._n_img,),
-                                dtype=np.float64,
-                            )
-                        frame_shape = tuple(dgrp['images'].shape[1:])
-                        frame_dtype = dgrp['images'].dtype
-                        _datasets_created = True
-                        # The frames are kept whatever they are; if they are not
-                        # what the run declared, the run is marked incomplete
-                        # with that as the reason (RunFile.save).
-                        declared = _declared_frame(f)
-                        if declared is None:
-                            logger.warning("the run's file declares no image shape/dtype; "
-                                           f"frames are {frame_shape} {frame_dtype}, not checked")
-                        elif (tuple(declared[0]) != frame_shape
-                              or np.dtype(declared[1]) != frame_dtype):
-                            line = (f"frames are {frame_shape} {frame_dtype} but the run "
-                                    f"declared {tuple(declared[0])} {np.dtype(declared[1])}")
-                            self.report.mismatch(line)
-                            logger.error(f"SaveWorker: {line}. Every frame is still written; "
-                                         f"the run will be saved incomplete.")
-                    if tuple(img.shape) != frame_shape or img.dtype != frame_dtype:
-                        # Cannot go in the run's dataset: the frame's shape or
-                        # dtype changed mid-run. Not written, and counted.
-                        n_refused += 1
-                        line = (f"frame {idx}: {tuple(img.shape)} {img.dtype} does not fit the "
-                                f"run's images {frame_shape} {frame_dtype}; not written")
-                        self.report.not_written(line)
-                        if n_refused == 1:
-                            logger.error(f"SaveWorker: {line}. The run will be saved incomplete.")
-                        else:
-                            logger.debug(f"SaveWorker: {line}")
-                        continue
-                    f['data']['images'][idx] = img
-                    f['data']['image_timestamps'][idx] = img_t
-                    self.report.wrote_one()
-                    logger.debug(f"saved {idx + 1}/{self._n_img}")
-                except Exception as exc:
-                    logger.exception(f"SaveWorker: write error at idx={idx}: {exc}")
-                    self.report.not_written(f"frame {idx}: write failed: {type(exc).__name__}: {exc}")
+                self._take(item)
+                # flush when the queue has run empty (about once per shot) or
+                # when enough has piled up since the last flush
+                if self._pending and (self._save_queue.empty() or self._flush_due()):
+                    self._flush_or_reopen()
+            if self._pending and not self.interrupted:
+                self._flush_or_reopen()
         except Exception as exc:
             logger.exception(f"SaveWorker: unexpected error: {exc}")
         finally:
-            if f is not None:
-                try:
-                    f.close()
-                except Exception:
-                    pass
+            if self._f is not None:
+                if self._pending:
+                    # an interrupted run's last items, or an unexpected error:
+                    # flushed with the close if the handle allows
+                    try:
+                        self._flush()
+                    except Exception as exc:
+                        self._lose_pending(f"the final flush failed ({type(exc).__name__}: {exc})")
+                self._close_quietly(self._f)
+                self._f = None
+            elif self._pending:
+                self._lose_pending("the file was not open at the end")
             self._drain_unwritten()
             self.done_writing_signal.emit()
+
+    # -- one item ------------------------------------------------------------------
+
+    def _take(self, item):
+        """Write one item; on a dead handle, reopen and write it again."""
+        if self._f is None:
+            if not self._revive(item):
+                self._not_written(item, f"not written: the file's handle failed and the file "
+                                        f"could not be reopened ({self.fault})")
+                return
+        try:
+            self._write(item)
+            return
+        except Exception as exc:
+            if self._alive(self._f):
+                # the handle is fine: this item's own error, as before
+                self._item_error(item, exc)
+                return
+            first = exc
+        if not self._reopen(_item_name(item), first):
+            self._not_written(item, f"not written: the file's handle failed and the file could "
+                                    f"not be reopened ({self.fault})")
+            return
+        # the item that met the dead handle, again; a dataset it has to make
+        # again goes in the reopen's record
+        rec = self.reopens[-1] if self.reopens else None
+        n_made = len(rec["recreated"]) if rec else 0
+        self._rec = rec
+        try:
+            self._write(item)
+        except Exception as exc:
+            self._item_error(item, exc, after_reopen=True)
+        finally:
+            self._rec = None
+        if rec and len(rec["recreated"]) != n_made:
+            self._write_records()
+
+    def _item_error(self, item, exc, after_reopen=False):
+        how = "write failed after the file was reopened" if after_reopen else "write failed"
+        if isinstance(item, PutItem):
+            line = f"{item!r}: {type(exc).__name__}: {exc}"
+            logger.error(f"SaveWorker: pushed array not written: {line}")
+            self.put_report.not_written(line if not after_reopen else f"{line} ({how})")
+        else:
+            logger.exception(f"SaveWorker: write error at idx={item[1]}: {exc}")
+            self.report.not_written(f"frame {item[1]}: {how}: {type(exc).__name__}: {exc}")
+
+    def _not_written(self, item, why):
+        """``item`` did not reach the file (or reached it unflushed and was lost)."""
+        self._n_lost_logged += 1
+        log = logger.error if self._n_lost_logged <= 3 else logger.debug
+        log(f"SaveWorker: {_item_name(item)} {why}")
+        if isinstance(item, PutItem):
+            self.put_report.not_written(f"{item!r}: {why}")
+        else:
+            self.report.not_written(f"frame {item[1]}: {why}")
+
+    def _write(self, item):
+        """One item into the file through the current handle; raises on an I/O
+        error. A frame that does not fit the run's images is refused (counted)."""
+        f = self._f
+        if isinstance(item, PutItem):
+            self._write_put(f, item)
+            return
+        img, idx, img_t = item
+        # Lazy dataset creation on the first image received.
+        # images/image_timestamps are deliberately not pre-allocated
+        # at file creation (that heavy NAS write would block the
+        # INIT_RUN reply).  We create them here from the actual
+        # image shape.
+        if not self._datasets_created:
+            dgrp = f['data']
+            if 'images' not in dgrp:
+                # one chunk per frame, gzip (waxa.data.h5_image)
+                # unless COMPRESS_MAIN_IMAGES is off
+                plain = {} if COMPRESS_MAIN_IMAGES else {
+                    "chunks": None, "compression": None, "shuffle": False}
+                shape = (self._n_img,) + img.shape
+                if self._frame_shape is not None:     # (re-made after a reopen)
+                    shape = (self._layout["images"][0][0],) + tuple(self._frame_shape)
+                create_image_dataset(dgrp, 'images', shape=shape,
+                                     dtype=img.dtype if self._frame_dtype is None
+                                     else self._frame_dtype, **plain)
+                dgrp.create_dataset('image_timestamps', shape=(shape[0],), dtype=np.float64)
+                if self._rec is not None:
+                    self._rec["recreated"].append("images")
+                self._flush()                 # a new dataset is on disk before it is used
+            self._frame_shape = tuple(dgrp['images'].shape[1:])
+            self._frame_dtype = dgrp['images'].dtype
+            self._layout["images"] = (tuple(dgrp['images'].shape), dgrp['images'].dtype)
+            self._datasets_created = True
+            if not self._declared_checked:
+                self._declared_checked = True
+                # The frames are kept whatever they are; if they are not
+                # what the run declared, the run is marked incomplete
+                # with that as the reason (RunFile.save).
+                declared = _declared_frame(f)
+                frame_shape, frame_dtype = self._frame_shape, self._frame_dtype
+                if declared is None:
+                    logger.warning("the run's file declares no image shape/dtype; "
+                                   f"frames are {frame_shape} {frame_dtype}, not checked")
+                elif (tuple(declared[0]) != frame_shape
+                      or np.dtype(declared[1]) != frame_dtype):
+                    line = (f"frames are {frame_shape} {frame_dtype} but the run "
+                            f"declared {tuple(declared[0])} {np.dtype(declared[1])}")
+                    self.report.mismatch(line)
+                    logger.error(f"SaveWorker: {line}. Every frame is still written; "
+                                 f"the run will be saved incomplete.")
+        if tuple(img.shape) != self._frame_shape or img.dtype != self._frame_dtype:
+            # Cannot go in the run's dataset: the frame's shape or
+            # dtype changed mid-run. Not written, and counted.
+            self._n_refused += 1
+            line = (f"frame {idx}: {tuple(img.shape)} {img.dtype} does not fit the "
+                    f"run's images {self._frame_shape} {self._frame_dtype}; not written")
+            self.report.not_written(line)
+            if self._n_refused == 1:
+                logger.error(f"SaveWorker: {line}. The run will be saved incomplete.")
+            else:
+                logger.debug(f"SaveWorker: {line}")
+            return
+        f['data']['images'][idx] = img
+        f['data']['image_timestamps'][idx] = img_t
+        self._pending.append((item, "images", ("index", (int(idx),)), self._frame_dtype))
+        logger.debug(f"saved {idx + 1}/{self._n_img}")
+
+    def _write_put(self, f, item: PutItem):
+        """One pushed array into its slot; the dataset is made on first use.
+        Raises on an error (the caller decides: the item's own, or a dead
+        handle)."""
+        grp = f['data']
+        parts = [p for p in item.key.split('/') if p]
+        if not parts:
+            raise ValueError("empty key")
+        for p in parts[:-1]:
+            grp = grp.require_group(p)
+        name = parts[-1]
+        if name not in grp:
+            if item.full_shape is None:
+                raise ValueError("no such dataset and no full_shape to create it")
+            kw = {}
+            if item.fill is not None:
+                kw["fillvalue"] = item.fill
+            kw.update(_float_storage(item.full_shape, item.dtype))
+            create_image_dataset(grp, name, shape=item.full_shape, dtype=item.dtype, **kw)
+            self.put_report.created(item.key)
+            if self._rec is not None:
+                self._rec["recreated"].append(item.key)
+            self._flush()                     # a new dataset is on disk before it is used
+        ds = grp[name]
+        if item.index is not None:
+            ds[item.index] = item.array
+            where = ("index", item.index)
+        elif item.offset is not None:
+            ds[item.offset:item.offset + len(item.array)] = item.array
+            where = ("slice", item.offset, len(item.array))
+        else:
+            ds[...] = item.array
+            where = ("all",)
+        self._layout.setdefault(item.key, (tuple(ds.shape), ds.dtype))
+        self._pending.append((item, item.key, where, ds.dtype))
+
+    # -- flushing ------------------------------------------------------------------
+
+    def _flush_due(self) -> bool:
+        return (len(self._pending) >= FLUSH_EVERY_ITEMS
+                or self._clock() - self._last_flush >= FLUSH_EVERY_S)
+
+    def _flush(self):
+        """Flush the handle; then what was written since the last flush counts
+        as written. Raises on an I/O error."""
+        t0 = self._clock()
+        self._f.flush()
+        dt = self._clock() - t0
+        logger.debug(f"SaveWorker: flush {dt * 1e3:.0f} ms ({len(self._pending)} item(s))")
+        if dt > SLOW_FLUSH_S and not self._slow_flush_warned:
+            self._slow_flush_warned = True
+            logger.warning(f"SaveWorker: a flush of the run file took {dt:.1f} s (> {SLOW_FLUSH_S:.0f} s; "
+                           f"said once per run). The data drive is slow; nothing is lost, the "
+                           f"backlog shows in POLL's writer_queue.")
+        self._commit()
+        self._last_flush = self._clock()
+
+    def _commit(self):
+        last = {}
+        for item, key, where, dtype in self._pending:
+            if isinstance(item, PutItem):
+                self.put_report.wrote(key)
+            else:
+                self.report.wrote_one()
+            last[key] = (item, where, dtype)
+        for key, (item, where, dtype) in last.items():
+            arr = item.array if isinstance(item, PutItem) else item[0]
+            self._committed[key] = (where, _sha(np.asarray(arr).astype(dtype)), dtype)
+        self._pending = []
+
+    def _flush_or_reopen(self):
+        if self._f is None or not self._pending:
+            return
+        try:
+            self._flush()
+            return
+        except Exception as exc:
+            first = exc
+        self._reopen("the flush", first)
+
+    def _lose_pending(self, why):
+        lost, self._pending = self._pending, []
+        for item, *_ in lost:
+            self._not_written(item, f"written but not flushed when {why}; lost")
+        return len(lost)
+
+    # -- the handle ----------------------------------------------------------------
+
+    @staticmethod
+    def _alive(f) -> bool:
+        """The handle still answers (two small reads)."""
+        if f is None:
+            return False
+        try:
+            _ = 'data' in f
+            f.attrs.get('images_shape', None)
+            return True
+        except Exception:
+            return False
+
+    def _close_quietly(self, f, rec=None):
+        if f is None:
+            return
+        try:
+            f.close()
+        except Exception as exc:
+            # (a dead handle's close fails on its flush; the OS handle may stay)
+            logger.warning(f"SaveWorker: closing the old handle failed: {type(exc).__name__}: {exc}")
+            if rec is not None:
+                rec["close_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            try:
+                f.id.close()
+            except Exception:
+                pass
+
+    def _record(self, rec):
+        if len(self.reopens) < MAX_REOPEN_RECORDS:
+            self.reopens.append(rec)
+        else:
+            self.reopens_more += 1
+
+    def records_json(self) -> str:
+        """``writer_reopens`` as stored in the run file."""
+        return json.dumps({"reopens": self.reopens, "more": self.reopens_more,
+                           "fault": self.fault, "problems": self.problems})
+
+    def _write_records(self):
+        try:
+            self._f.attrs['writer_reopens'] = self.records_json()
+            self._f.flush()
+        except Exception as exc:
+            logger.warning(f"SaveWorker: could not record the reopen in the file now "
+                           f"({type(exc).__name__}: {exc}); the END_RUN save records it")
+
+    def _revive(self, item) -> bool:
+        """After a failed reopen: one more try, at most every DEAD_RETRY_S."""
+        now = self._clock()
+        if self._last_dead_try is not None and now - self._last_dead_try < DEAD_RETRY_S:
+            return False
+        self._last_dead_try = now
+        return self._reopen(_item_name(item), None, waits=(0.0,))
+
+    def _reopen(self, what, exc, waits=REOPEN_WAITS_S) -> bool:
+        """Close the dead handle, open the file again, check what was committed,
+        write again what was pending. False when no handle could be had (then
+        ``fault`` says why and the pending items are reported lost)."""
+        t = self._wall()
+        when = time.strftime("%H:%M:%S", time.localtime(t))
+        err = "still unwritable after an earlier failed reopen" if exc is None else \
+            f"{type(exc).__name__}: {exc}"
+        rec = {"t": t, "time": when, "item": what, "error": err[:400], "attempts": 0,
+               "pending": len(self._pending), "rewritten": 0, "recreated": [], "verify": "",
+               "outcome": ""}
+        if exc is not None:
+            logger.error(f"SaveWorker: the run file's handle stopped answering at {what} ({err}); "
+                         f"closing it and opening the file again ({len(waits)} tries). "
+                         f"{len(self._pending)} item(s) written since the last flush will be "
+                         f"written again.")
+        self._close_quietly(self._f, rec)
+        self._f = None
+        last = ""
+        for wait in waits:
+            if wait:
+                self._sleep(wait)
+            rec["attempts"] += 1
+            try:
+                cand = self._reopen_fn()
+            except Exception as e:
+                last = f"{type(e).__name__}: {e}"
+                logger.warning(f"SaveWorker: reopen try {rec['attempts']} failed: {last}")
+                continue
+            if self._alive(cand):
+                self._f = cand
+                break
+            last = "the reopened handle does not answer either"
+            logger.warning(f"SaveWorker: reopen try {rec['attempts']}: {last}")
+            self._close_quietly(cand)
+        if self._f is None:
+            rec["outcome"] = f"failed: {last}"[:400]
+            self._record(rec)
+            n = self._lose_pending(f"the handle failed at {when}")
+            self._dead_since = self._dead_since or self._clock()
+            self._last_dead_try = self._clock()
+            if not self.fault:
+                self.fault = (f"the run file's handle failed at {when} ({err[:200]}) and reopening "
+                              f"it failed ({last[:200]}); data from then on is not written")
+                logger.error(f"SaveWorker: {self.fault}. {n} unflushed item(s) lost. The file is "
+                             f"KEPT with what was written before; the run will be saved "
+                             f"incomplete. One reopen is tried every {DEAD_RETRY_S:.0f} s.")
+                self.writer_fault_signal.emit(self.fault)
+            return False
+        # a handle again: check what was committed, then write the pending again
+        self._dead_since = None
+        self._datasets_created = False
+        self._rec = rec
+        try:
+            problems = self._verify()
+            pending, self._pending = self._pending, []
+            for item, *_ in pending:
+                try:
+                    self._write(item)
+                    rec["rewritten"] += 1
+                except Exception as e:
+                    self._item_error(item, e, after_reopen=True)
+            self._flush()
+        except Exception as e:
+            # the new handle failed at once: give up on it like a failed reopen
+            self._rec = None
+            self._close_quietly(self._f)
+            self._f = None
+            rec["outcome"] = f"reopened, then failed again: {type(e).__name__}: {e}"[:400]
+            self._record(rec)
+            self._lose_pending(f"the reopened handle failed at once")
+            self._dead_since = self._clock()
+            self._last_dead_try = self._clock()
+            if not self.fault:
+                self.fault = (f"the run file's handle failed at {when} ({err[:200]}); the reopened "
+                              f"handle failed at once ({type(e).__name__}: {e})")
+                logger.error(f"SaveWorker: {self.fault}. The file is KEPT; the run will be saved "
+                             f"incomplete.")
+                self.writer_fault_signal.emit(self.fault)
+            return False
+        self._rec = None
+        rec["verify"] = "ok" if not problems else "; ".join(problems)[:1000]
+        rec["outcome"] = "reopened"
+        if problems:
+            self.problems += [f"the writer reopened the file at {when}: {p}" for p in problems]
+        if self.fault:
+            self.fault += f"; reopened at {when}"
+        self._record(rec)
+        self._write_records()
+        log = logger.warning if not problems else logger.error
+        log(f"SaveWorker: run file reopened at {when} after {rec['attempts']} try(s); "
+            f"{rec['rewritten']} item(s) written again"
+            + (f", re-made {rec['recreated']}" if rec["recreated"] else "")
+            + f"; check of what was written before: {rec['verify']}")
+        return True
+
+    def _dataset(self, key):
+        """The dataset ``data/<key>``, or None when it is not there."""
+        grp = self._f['data']
+        for p in [p for p in key.split('/') if p]:
+            if p not in grp:
+                return None
+            grp = grp[p]
+        return grp
+
+    def _verify(self) -> list:
+        """After a reopen: every dataset written into is there with its shape
+        and dtype, and each one's last committed item reads back the same."""
+        problems = []
+        for key, (shape, dtype) in self._layout.items():
+            ds = self._dataset(key)
+            if ds is None:
+                if key in self._committed:
+                    problems.append(f"data/{key} is missing (it held flushed data)")
+                continue
+            if tuple(ds.shape) != tuple(shape) or ds.dtype != dtype:
+                problems.append(f"data/{key} is {tuple(ds.shape)} {ds.dtype}, was {tuple(shape)} {dtype}")
+                continue
+            c = self._committed.get(key)
+            if c is None:
+                continue
+            where, sha, cdtype = c
+            try:
+                if where[0] == "index":
+                    back = ds[where[1]]
+                elif where[0] == "slice":
+                    back = ds[where[1]:where[1] + where[2]]
+                else:
+                    back = ds[...]
+            except Exception as exc:
+                problems.append(f"data/{key}: its last flushed item cannot be read back "
+                                f"({type(exc).__name__}: {exc})")
+                continue
+            if _sha(np.asarray(back).astype(cdtype)) != sha:
+                problems.append(f"data/{key}{list(where[1:])}: its last flushed item reads back "
+                                f"different")
+        return problems
 
     def _drain_unwritten(self):
         """What is still queued once the loop is over (only after an unexpected
@@ -494,38 +936,6 @@ class SaveWorker(QThread):
         if n:
             logger.error(f"SaveWorker: {n} queued item(s) were never written: the writer "
                          f"stopped first. The run will be saved incomplete.")
-
-    def _write_put(self, f, item: PutItem):
-        """One pushed array into its slot; the dataset is made on first use."""
-        try:
-            grp = f['data']
-            parts = [p for p in item.key.split('/') if p]
-            if not parts:
-                raise ValueError("empty key")
-            for p in parts[:-1]:
-                grp = grp.require_group(p)
-            name = parts[-1]
-            if name not in grp:
-                if item.full_shape is None:
-                    raise ValueError("no such dataset and no full_shape to create it")
-                kw = {}
-                if item.fill is not None:
-                    kw["fillvalue"] = item.fill
-                kw.update(_float_storage(item.full_shape, item.dtype))
-                create_image_dataset(grp, name, shape=item.full_shape, dtype=item.dtype, **kw)
-                self.put_report.created(item.key)
-            ds = grp[name]
-            if item.index is not None:
-                ds[item.index] = item.array
-            elif item.offset is not None:
-                ds[item.offset:item.offset + len(item.array)] = item.array
-            else:
-                ds[...] = item.array
-            self.put_report.wrote(item.key)
-        except Exception as exc:
-            line = f"{item!r}: {type(exc).__name__}: {exc}"
-            logger.error(f"SaveWorker: pushed array not written: {line}")
-            self.put_report.not_written(line)
 
 
 class ImageWriter(Scribe):
@@ -569,6 +979,29 @@ class ImageWriter(Scribe):
     @property
     def finished(self) -> bool:
         return self._finished
+
+    @property
+    def fault(self) -> str:
+        """"" or why the writer could not keep writing (its handle died and
+        reopening failed; the file is kept). POLL / SHOT_COMPLETE ``writer_fault``."""
+        return self._worker.fault if self._worker is not None else ""
+
+    @property
+    def problems(self) -> list:
+        """What a reopen's check found wrong (the run is saved incomplete)."""
+        return list(self._worker.problems) if self._worker is not None else []
+
+    @property
+    def reopens(self) -> list:
+        """The reopen records (empty for a run whose handle never failed)."""
+        return list(self._worker.reopens) if self._worker is not None else []
+
+    def records_json(self) -> str:
+        """``writer_reopens`` as stored in the run file ("" when nothing happened)."""
+        w = self._worker
+        if w is None or not (w.reopens or w.fault):
+            return ""
+        return w.records_json()
 
     def _start_worker(self, n_img: int, check_interrupt_method):
         self._save_queue = Queue()

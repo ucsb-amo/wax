@@ -1507,7 +1507,24 @@ class LiveODServer(QThread, NetServer):
             # this run is recorded from here on. The experiment is told (its client
             # warns once); stopping the run is left to the person running it.
             reply["grab_failure"] = grab_failure
+        writer_fault = self._writer_fault()
+        if writer_fault:
+            # The run file's writer lost its handle and could not reopen the file
+            # (image_writer): what comes from here on is not written. The file is
+            # kept; the experiment is told (its client warns once), the run goes
+            # on unless someone stops it. An older client ignores the key.
+            reply["writer_fault"] = writer_fault
         return reply
+
+    def _writer_fault(self) -> str:
+        """The current (or last) run's writer fault; "" when its handle never
+        failed, or it reopened. (getattr: stand-ins in tests lack the run file.)"""
+        run_file = getattr(self, "_run_file", None)
+        writer = getattr(run_file, "writer", None)
+        try:
+            return str(getattr(writer, "fault", "") or "")
+        except Exception:
+            return ""
 
     def _check_frame_deficit(self, shot_idx: int, N_total: int):
         """Warn, during the run, when the camera has delivered fewer frames than
@@ -2173,6 +2190,9 @@ class LiveODServer(QThread, NetServer):
             # what the image writers hold that is not on disk yet:
             # {items, bytes, peak_bytes, warn_bytes} (image_writer.QueueGauge)
             "writer_queue": writer_queue_stats(),
+            # the run file's writer lost its handle and could not reopen the file
+            # ("" when not): data from then on is not written (image_writer)
+            "writer_fault": self._writer_fault(),
         }
 
     def _handle_get_log(self, msg: dict) -> dict:

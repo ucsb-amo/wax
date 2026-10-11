@@ -337,6 +337,21 @@ class LiveODClient(NetClient):
         print("\n" + bar + "\n" + "\n".join(lines) + "\n" + bar + "\n")
 
     @staticmethod
+    def _print_writer_fault(reason) -> None:
+        """liveOD's writer lost its handle on this run's file and could not
+        reopen it: what comes from here on (frames, pushed arrays) is not
+        written. Said once; ASCII only."""
+        reason = str(reason).encode("ascii", "replace").decode("ascii")
+        bar = "!" * 72
+        print(f"\n{bar}\n"
+              f"!! liveOD: THE RUN FILE CANNOT BE WRITTEN (data drive)\n"
+              f"!!   {reason}\n"
+              f"!! Frames and pushed arrays from here on are NOT written. The file is kept\n"
+              f"!! with what was written before; END_RUN saves it data_complete=False.\n"
+              f"!! The run is not stopped by this: abort it if the rest matters.\n"
+              f"{bar}\n")
+
+    @staticmethod
     def _print_grab_failure(reason) -> None:
         """liveOD's camera grab for this run has ended early (a lost frame, a
         camera timeout): nothing of the run is recorded from here on. Said once,
@@ -382,6 +397,7 @@ class LiveODClient(NetClient):
         self.last_reset_requested = False    # the server clears its flag on INIT_RUN
         self._run_token = ""
         self._grab_failure_warned = False
+        self._writer_fault_warned = False
         reply = self._send_recv(payload, rcvtimeo_ms=60_000)
         if not reply.get("ok"):
             raise RuntimeError(
@@ -491,6 +507,11 @@ class LiveODClient(NetClient):
             # the camera's grab ended early: said once per run; the run goes on
             self._grab_failure_warned = True
             self._print_grab_failure(reply["grab_failure"])
+        if reply.get("writer_fault") and not getattr(self, "_writer_fault_warned", False):
+            # liveOD can no longer write the run's file: said once per run; the
+            # run goes on (a server that predates the key never sends it)
+            self._writer_fault_warned = True
+            self._print_writer_fault(reply["writer_fault"])
         self.last_adjust_values = reply.get('adjust_values', {})
         if "reset_requested" in reply:
             # cached for Scribe._check_for_abort_signal (top of the scan loop)

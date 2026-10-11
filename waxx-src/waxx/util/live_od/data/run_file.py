@@ -186,11 +186,18 @@ class RunFile:
                     what += f" ({len(not_written)} not written; first: {not_written[0]})"
                 reasons.append(what)
         pushed_written = {}
+        reopens_json = ""
         if writer is not None:
             pushed_written, pushed_lost, _ = writer.put_report.snapshot()
             if pushed_lost:
                 reasons.append(f"{len(pushed_lost)} pushed array(s) not written to the file "
                                f"(first: {pushed_lost[0]})")
+            # the writer's handle died mid-run (image_writer, 2026-10-10): a
+            # reopen that failed, or what a reopen's check found wrong
+            if getattr(writer, "fault", ""):
+                reasons.append(f"image writer: {writer.fault}")
+            reasons += list(getattr(writer, "problems", []) or [])
+            reopens_json = writer.records_json() if hasattr(writer, "records_json") else ""
         if grab_failure:
             reasons.append(str(grab_failure))
         incomplete = None
@@ -217,6 +224,8 @@ class RunFile:
                 incomplete=incomplete,
             )
             clear_end_run_payload(stash_path)
+            if reopens_json:
+                self._record_reopens(filepath, reopens_json)
             # Forget the file so a late RESET cannot delete an already-saved run.
             if self.filepath == filepath:
                 self.filepath = ""
@@ -236,6 +245,21 @@ class RunFile:
                 )
                 error = f"{error}\n{hint}"
             raise RunFileSaveError(error, cause=str(exc)) from exc
+
+    @staticmethod
+    def _record_reopens(filepath, reopens_json: str):
+        """The writer's reopen records into the run file's root attribute
+        ``writer_reopens`` (the writer wrote it too when its reopen worked;
+        this one is complete, and lands even when every reopen failed)."""
+        import h5py
+        try:
+            with h5py.File(filepath, "r+") as f:
+                f.attrs["writer_reopens"] = reopens_json
+            logger.warning(f"END_RUN: the image writer's handle failed during this run; "
+                           f"recorded in writer_reopens: {reopens_json[:500]}")
+        except Exception as exc:
+            logger.error(f"END_RUN: could not record writer_reopens in {filepath}: "
+                         f"{type(exc).__name__}: {exc}. The record was: {reopens_json[:2000]}")
 
     def save_async(self, msg: dict, run_id: int, shot_timestamps: list, on_done,
                    **kw):
