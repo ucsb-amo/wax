@@ -136,6 +136,22 @@ def _cell(panel, job_id, key, role=Qt.ItemDataRole.DisplayRole):
     return panel.model.data(index, role)
 
 
+def _on(panel, kind):
+    """Whether the selected job's action ``kind`` is enabled."""
+    return panel.action_state(kind)[0]
+
+
+def _tip(panel, kind):
+    return panel.action_state(kind)[1]
+
+
+def _menu_action(panel, kind):
+    """The selected job's right-click menu action ``kind``."""
+    menu, acts = panel.job_menu()
+    panel._open_menus = getattr(panel, "_open_menus", []) + [menu]   # keep it alive
+    return acts[kind]
+
+
 # --- the table ----------------------------------------------------------------------------
 
 def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
@@ -156,7 +172,8 @@ def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
     assert _cell(panel, 5, "waiting") == "waiting for job 3"
     assert _cell(panel, 5, "after") == "after 3 | chain c1"
     assert _cell(panel, 3, "submitted").endswith("by jp@kong")
-    assert "argv: n=3 -c X y" == _cell(panel, 5, "label", Qt.ItemDataRole.ToolTipRole)
+    tip = _cell(panel, 5, "label", Qt.ItemDataRole.ToolTipRole)
+    assert "C:/code/kexp/experiments/JP/expt_5.py" in tip and "argv: n=3 -c X y" in tip
     assert panel.table.textElideMode() == Qt.TextElideMode.ElideMiddle
 
 
@@ -213,11 +230,37 @@ def test_phase1b_fields_order_and_render(panel, server):
     assert _cell(panel, 3, "priority") == "10"
 
 
-def test_ended_jobs_can_be_hidden(panel):
-    panel.ended_box.setChecked(False)
+def test_the_pending_filter_hides_ended_jobs(panel):
+    assert panel.filter == "all" and len(panel.model.jobs) == 5
+    assert panel.filter_buttons["all"].text() == "All 5"
+    assert panel.filter_buttons["pending"].text() == "Pending 4"
+    panel.select_job(3)
+    panel.set_filter("pending")
     assert [j["id"] for j in panel.model.jobs] == [2, 3, 4, 5]
-    panel.ended_box.setChecked(True)
+    assert panel.selected_job()["id"] == 3                         # the selection stays
+    panel.set_filter("all")
     assert len(panel.model.jobs) == 5
+    with pytest.raises(ValueError):
+        panel.set_filter("ended")
+
+
+def test_rows_are_tinted_by_state(panel):
+    bg = Qt.ItemDataRole.BackgroundRole
+    assert _cell(panel, 1, "label", bg).getRgb() == rqp.ROW_TINT["saved"]      # saved: green
+    assert _cell(panel, 2, "label", bg).getRgb() == rqp.ROW_TINT["running"]
+    assert _cell(panel, 2, "label", Qt.ItemDataRole.FontRole).bold()          # in the slot
+    assert _cell(panel, 3, "label", bg) is None                               # queued: none
+    panel.model.set_jobs(_phase1_jobs() + [_job(9, "failed", exit_code=1)], INFO)
+    assert _cell(panel, 9, "label", bg).getRgb() == rqp.ROW_TINT["failed"]
+
+
+def test_less_used_columns_start_hidden(panel):
+    for key in rqp.COLUMN_KEYS:
+        hidden = panel.table.isColumnHidden(rqp.COLUMN_KEYS.index(key))
+        assert hidden == (key in rqp.DEFAULT_HIDDEN), key
+    panel.table.setColumnHidden(rqp.COLUMN_KEYS.index("path"), False)
+    panel.default_columns()
+    assert panel.table.isColumnHidden(rqp.COLUMN_KEYS.index("path"))
 
 
 # --- the top strip --------------------------------------------------------------------------
@@ -252,7 +295,9 @@ def test_summary_alarm_hold_pause_and_loop_note(panel):
 
 def test_unreachable_and_no_queue(panel):
     panel.set_state(None)
-    assert not panel.reachable and not panel.cancel_button.isEnabled()
+    panel.select_job(3)
+    assert not panel.reachable and not _on(panel, "remove") and not _on(panel, "again")
+    assert "not answering" in _tip(panel, "remove")
     assert "not answering" in panel.summary.text()
     panel.set_state({"state": 0, "state_name": "READY"})           # an older server
     assert panel.reachable and not panel.has_queue
@@ -286,7 +331,7 @@ def test_hold_release_pause_resume_send_exact_requests(panel, server):
 
 def test_cancel_a_queued_job(panel, server):
     assert panel.select_job(3)
-    assert panel.cancel_button.isEnabled()
+    assert _on(panel, "remove") and not _on(panel, "abort")
     assert panel.cancel_selected()
     title, text, yes, no = panel.confirms[-1]
     assert "has not started" in text and "discard" not in text.lower()
@@ -325,13 +370,13 @@ def test_a_queued_cancel_that_meets_a_launch_is_not_turned_into_an_abort(panel, 
 
 def test_cancel_disabled_for_ended_jobs_and_after_a_cancel_was_asked(panel, server):
     panel.select_job(1)
-    assert not panel.cancel_button.isEnabled()
+    assert not _on(panel, "remove") and not _on(panel, "abort")
     jobs = _phase1_jobs()
     jobs[1]["cancel"] = {"by": "jp", "at": NOW, "abort_sent": True}
     server.answers["list"] = _list_reply(jobs)
     panel.refresh_list()
     panel.select_job(2)
-    assert not panel.cancel_button.isEnabled()
+    assert not _on(panel, "abort") and "cancel has been asked" in _tip(panel, "abort")
     assert _cell(panel, 2, "state") == "running (cancel asked)"
 
 
@@ -341,28 +386,29 @@ def test_move_names_neighbours_by_id_and_unknown_disables_it(panel, server):
     panel.select_job(4)                                          # queued: 3, 4, 5
     for where, extra in (("up", {"before_id": 3}), ("down", {"after_id": 5}),
                          ("top", {"to_index": 0}), ("bottom", {"to_index": 3})):
-        assert panel.move_buttons[where].isEnabled()
-        panel.move_buttons[where].click()
+        act = _menu_action(panel, where)                          # the right-click menu
+        assert act.isEnabled()
+        act.trigger()
         assert server.of("move")[-1] == dict(base, **extra)
     panel.select_job(3)                                          # first: no up / top
-    assert not panel.move_buttons["up"].isEnabled()
-    assert not panel.move_buttons["top"].isEnabled()
-    assert "already first" in panel.move_buttons["up"].toolTip()
-    assert panel.move_buttons["down"].isEnabled()
+    assert not _on(panel, "up")
+    assert not _on(panel, "top")
+    assert "already first" in _tip(panel, "up")
+    assert _on(panel, "down")
     panel.select_job(5)                                          # last: no down / bottom
-    assert not panel.move_buttons["down"].isEnabled()
-    assert not panel.move_buttons["bottom"].isEnabled()
+    assert not _on(panel, "down")
+    assert not _on(panel, "bottom")
     server.answers["move"] = {"status": "error",
                               "msg": "unknown run_queue action 'move' (known: submit, cancel)"}
-    panel.move_buttons["up"].click()
-    for b in panel.move_buttons.values():
-        assert not b.isEnabled()
-        assert "older code" in b.toolTip()
+    panel.move_selected("up")
+    for where in rqp.MOVE_WHERE:
+        assert not _on(panel, where)
+        assert "older code" in _tip(panel, where)
     n = len(server.requests)
     assert not panel.move_selected("up")
     assert len(server.requests) == n
     panel.select_job(2)                                          # a running job: never movable
-    assert not panel.move_buttons["up"].isEnabled()
+    assert not _on(panel, "up")
 
 
 def test_an_actions_list_in_the_info_gates_nothing(panel):
@@ -370,7 +416,7 @@ def test_an_actions_list_in_the_info_gates_nothing(panel):
     "unknown action" reply."""
     panel.set_state(_status(dict(INFO, actions=["list", "cancel"])))
     panel.select_job(3)
-    assert panel.move_buttons["down"].isEnabled() and panel.edit_button.isEnabled()
+    assert _on(panel, "down") and _on(panel, "edit")
 
 
 def test_edit_sends_only_the_changes_and_unknown_disables_it(panel, server):
@@ -383,7 +429,7 @@ def test_edit_sends_only_the_changes_and_unknown_disables_it(panel, server):
                                      "owner": "person", "by": "jp@test"}
     server.answers["edit"] = {"status": "error", "msg": "unknown run_queue action 'edit'"}
     panel.edit_selected()
-    assert not panel.edit_button.isEnabled()
+    assert not _on(panel, "edit")
     panel.edit_answer = None
     n = len(server.requests)
     assert not panel.edit_selected()
@@ -599,6 +645,40 @@ def test_first_show_lists_and_broadcasts_are_debounced(qapp, server):
         p.shutdown()
 
 
+def test_a_failed_first_list_is_asked_again_once_the_server_answers(qapp, server):
+    """The dashboard shows the panel while the monitor server it just started
+    is not beaconing yet: that first list fails.  An idle queue's summary never
+    changes, so only this retry lists it -- and the error line goes."""
+    server.answers["list"] = {"status": "error", "no_reply": True,
+                              "msg": "no monitor server found (not discovered within 1.0 s)"}
+    p = rqp.RunQueuePanel(server, by="jp@test", synchronous=True)
+    try:
+        p.set_state(None)
+        p.show()
+        qapp.processEvents()
+        assert len(server.of("list")) == 1
+        assert p.message.text().startswith("list: no monitor server found")
+        server.answers["list"] = _list_reply(_phase1_jobs())
+        p.set_state(_status())                                     # the server answers
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 2
+        assert [j["id"] for j in p.model.jobs] == [1, 2, 3, 4, 5]
+        assert p.message.text() == ""
+        p.set_state(_status())                                     # listed: no more lists
+        QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
+        assert len(server.of("list")) == 2
+        # a newer message is not wiped by a later good list
+        server.answers["list"] = {"status": "error", "no_reply": True, "msg": "gone"}
+        p.refresh_list()
+        p.say("hold: done")
+        server.answers["list"] = _list_reply(_phase1_jobs())
+        p.refresh_list()
+        assert p.message.text() == "hold: done"
+        p.hide()
+    finally:
+        p.shutdown()
+
+
 def test_selection_survives_a_refresh(panel, server):
     panel.select_job(4)
     panel.refresh_list()
@@ -669,3 +749,183 @@ def test_truncated_list_clamped_move_and_the_estimate_caveat(panel, server):
     job = _job(3, estimate=_est(60.0, NOW, NOW + 60,
                                 "median of 2 saved runs; est. (ignores blocked jobs ahead)"))
     assert "ignores blocked jobs ahead" in panel.model.tooltip(job, "est")
+
+
+# --- the right-click menu's actions -------------------------------------------------------
+
+def _select(panel, *ids):
+    from PyQt6.QtCore import QItemSelectionModel
+    panel.table.clearSelection()
+    flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    for i in ids:
+        panel.table.selectionModel().select(panel.model.index(_row(panel, i), 0), flags)
+
+
+def test_remove_takes_several_queued_jobs_out_and_leaves_the_running_one(panel, server):
+    _select(panel, 2, 3, 5)                                       # running, queued, queued
+    assert [j["id"] for j in panel.selected_jobs()] == [2, 3, 5]
+    assert panel.remove_selected()
+    title, text, yes, no = panel.confirms[-1]
+    assert title == "Remove 2 jobs from the queue?" and "job 3 (expt_3)" in text
+    assert "job 2" not in text and "never run" in text and yes == "Remove"
+    assert [(r["id"], r.get("queued_only")) for r in server.of("cancel")] == [(3, True),
+                                                                               (5, True)]
+    assert "removed 3, 5" in panel.message.text()
+
+
+def test_remove_reports_a_job_that_launched_meanwhile(panel, server):
+    server.answers["cancel"] = lambda obj: (
+        {"status": "error", "state": "running", "msg": "running, not queued"}
+        if obj["id"] == 3 else {"status": "ok"})
+    _select(panel, 3, 4)
+    assert panel.remove_selected()
+    assert "removed 4" in panel.message.text()
+    assert "launched before the remove arrived" in panel.message.text()
+    assert "job 3" in panel.message.text()
+
+
+def test_remove_declined_or_nothing_queued_sends_nothing(panel, server):
+    _select(panel, 3)
+    panel.confirm_answer = False
+    assert not panel.remove_selected()
+    _select(panel, 1, 2)                                          # saved + running
+    assert not panel.remove_selected()
+    assert server.of("cancel") == []
+    assert "Abort run" in panel.message.text()
+
+
+def test_run_again_resubmits_the_same_file_as_a_person(panel, server, tmp_path):
+    path = tmp_path / "expt_5.py"
+    path.write_text("x = 1\n")
+    from waxx.util.device_state.run_queue_client import local_sha256
+    jobs = _phase1_jobs()
+    jobs[4].update(path=str(path), sha256=local_sha256(str(path)), write_back=False,
+                   cwd=str(tmp_path))
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    panel.select_job(5)
+    server.answers["submit"] = {"status": "ok", "ids": [11], "clamped": False}
+    assert _menu_action(panel, "again").isEnabled()
+    assert panel.run_again()
+    title, text, yes, no = panel.confirms[-1]
+    assert yes == "Queue it" and "CHANGED" not in text
+    assert "dependencies (after 3)" in text and "chain (c1)" in text   # not carried over
+    req = server.of("submit")[-1]
+    host = socket.gethostname()
+    assert req == {"type": "run_queue", "action": "submit", "path": str(path),
+                   "argv": ["n=3", "-c", "X y"], "cwd": str(tmp_path), "label": "expt_5",
+                   "owner": "person", "by": "jp@test", "allow_drift": False,
+                   "client_sha256": local_sha256(str(path)), "client_host": host,
+                   "host": host, "write_back": False}
+    assert "queued as job 11" in panel.message.text()
+    # next: insert at 0; a changed file is said so
+    path.write_text("x = 2\n")
+    server.answers["insert"] = {"status": "ok", "ids": [12]}
+    assert panel.run_again(first=True)
+    assert "CHANGED since job 5" in panel.confirms[-1][1]
+    req = server.of("insert")[-1]
+    assert req["at_index"] == 0 and req["client_sha256"] == local_sha256(str(path))
+    n = len(server.requests)
+    panel.confirm_answer = False
+    assert not panel.run_again()
+    assert len(server.requests) == n
+
+
+def test_run_again_refused_shows_why(panel, server):
+    panel.select_job(3)
+    server.answers["submit"] = {"status": "error", "msg": "your copy differs from kong's"}
+    assert panel.run_again()
+    assert "cannot be compared" in panel.confirms[-1][1]       # this PC cannot read the file
+    assert "your copy differs" in panel.message.text()
+
+
+def test_open_source_uses_the_editor_never_the_os_default(panel, server, tmp_path,
+                                                          monkeypatch):
+    path = tmp_path / "expt_3.py"
+    path.write_text("print('hi')\n")
+    jobs = _phase1_jobs()
+    jobs[2].update(path=str(path), sha256="00" * 32)            # differs: the file changed
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    panel.select_job(3)
+    launched = []
+    panel.launch = launched.append
+    monkeypatch.setattr(rqp, "find_editor", lambda: ["C:/VS Code/Code.exe"])
+    monkeypatch.setattr(os, "startfile", lambda *a, **k: pytest.fail("os default action"),
+                        raising=False)
+    assert panel.open_source() == "editor"
+    assert launched == [["C:/VS Code/Code.exe", str(path)]]
+    assert "has changed since job 3" in panel.message.text()
+    monkeypatch.setattr(rqp, "find_editor", lambda: None)       # no editor: read-only view
+    assert panel.open_source() == "viewer"
+    window = panel._source_windows[-1]
+    assert window.text.toPlainText() == "print('hi')\n" and window.text.isReadOnly()
+    assert "has changed since job 3" in window.note.text()
+    panel.select_job(4)                                          # not readable from this PC
+    assert panel.open_source() == ""
+    assert "cannot be read from this PC" in panel.message.text()
+
+
+def test_the_menu_offers_what_the_state_allows(panel):
+    panel.select_job(3)                                          # queued
+    menu, acts = panel.job_menu()
+    assert {"log", "source", "view_source", "again", "again_next", "edit", "up", "down",
+            "top", "bottom", "remove", "copy_submit", "copy_path"} <= set(acts)
+    assert "abort" not in acts and acts["remove"].isEnabled()
+    panel.select_job(2)                                          # running
+    menu, acts = panel.job_menu()
+    assert "abort" in acts and acts["abort"].isEnabled() and "remove" not in acts
+    assert "edit" not in acts and "copy_run" in acts
+    panel.select_job(1)                                          # saved
+    menu, acts = panel.job_menu()
+    assert acts["again"].isEnabled() and "abort" not in acts and "remove" not in acts
+    acts["copy_run"].trigger()
+    assert "85599" in panel.message.text()
+
+
+def test_again_request_drops_the_old_jobs_place():
+    job = _job(5, after=[3], chain="c1", due=NOW + 60, paused=True, repeat_of=3,
+               argv=["a=1"])
+    req = rqp.again_request(job, "jp@test")
+    for key in ("after", "chain", "due", "paused", "repeat", "at_index", "write_back",
+                "client_sha256", "client_host"):
+        assert key not in req, key
+    assert rqp.again_request(job, "x", first=True)["action"] == "insert"
+    words = " ".join(rqp.not_carried_over(job))
+    assert "after 3" in words and "c1" in words and "one of 3" in words and "pause" in words
+
+
+# --- following new jobs ---------------------------------------------------------------------
+
+def _many_jobs(n):
+    return [_job(1, "saved", run_id=85599)] + [_job(i) for i in range(2, n + 1)]
+
+
+def test_a_newly_queued_job_scrolls_the_table_to_the_bottom(panel, server):
+    assert panel.follow_new and panel.follow_button.isChecked()       # on by default
+    panel.resize(700, 220)
+    server.answers["list"] = _list_reply(_many_jobs(40), nxt=(2,))
+    panel.show()
+    panel.refresh_list()
+    bar = panel.table.verticalScrollBar()
+    assert bar.maximum() > 0
+    bar.setValue(0)
+    panel.refresh_list()                                             # nothing new: stays
+    assert bar.value() == 0
+    server.answers["list"] = _list_reply(_many_jobs(41), nxt=(2,))
+    panel.refresh_list()                                             # job 41 is new
+    assert bar.value() == bar.maximum()
+
+
+def test_follow_off_leaves_the_scroll_where_it_is(panel, server):
+    panel.follow_button.setChecked(False)
+    assert not panel.follow_new
+    panel.resize(700, 220)
+    server.answers["list"] = _list_reply(_many_jobs(40), nxt=(2,))
+    panel.show()
+    panel.refresh_list()
+    bar = panel.table.verticalScrollBar()
+    bar.setValue(0)
+    server.answers["list"] = _list_reply(_many_jobs(41), nxt=(2,))
+    panel.refresh_list()
+    assert bar.value() == 0

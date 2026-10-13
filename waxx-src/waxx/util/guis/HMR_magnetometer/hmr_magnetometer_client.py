@@ -62,6 +62,9 @@ class HMRClient(NetClient):
         # Default socket timeout for get_snapshot()/request_shutdown(); the
         # older per-call ``timeout=`` arguments below are unchanged.
         self.timeout = float(timeout)
+        # True when the last get_field_magnitude() gave up and returned 0.
+        # (all attempts failed), so a caller can tell that from a reading.
+        self.last_read_failed = False
 
     def _request(self, command: str, timeout: float) -> dict:
         return _request(command, self.host, self.port, timeout)
@@ -155,11 +158,14 @@ class HMRClient(NetClient):
     def get_field_magnitude(self, timeout: float = 5.) -> float:
         """Return the latest total field magnitude in Gauss.
 
-        Raises ``RuntimeError`` if the server returns an error or has no data yet.
+        Raises ``RuntimeError`` if the server returns any other error. Returns
+        0. and sets ``last_read_failed`` when every attempt found no data yet
+        or failed on the network.
         """
         max_attempts = 5
         per_try_timeout = min(1.5, timeout / max_attempts)
-        
+        self.last_read_failed = False
+
         for attempt in range(max_attempts):
             try:
                 result = self._get_field(timeout=per_try_timeout)
@@ -171,12 +177,14 @@ class HMRClient(NetClient):
                             continue
                         else:
                             print(f"Reading magnetometer failed after {max_attempts} attempts: {error_msg}")
+                            self.last_read_failed = True
                             return float(0.)
                     raise RuntimeError(error_msg)
                 return float(result["Btot"])
             except (socket.timeout, socket.error) as e:
                 if attempt == max_attempts - 1:
                     print(f"Reading magnetometer failed after {max_attempts} attempts: {e}")
+                    self.last_read_failed = True
                     return float(0.)
                 # Attempt to find the server at a new IP/port before retrying.
                 self._rediscover(timeout=1.0)

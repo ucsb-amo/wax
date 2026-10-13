@@ -1429,7 +1429,10 @@ class DummyCameraStreamClient:
             expt.camera_streams = []
         expt.camera_streams.append(self)
         keys = ", ".join(f"'{k}'" for k in self.keys)
-        print(f"[{self.label}] note: no {keys} frames this run ({self.reason})")
+        # The reason is in the run file's provenance; a setup failure is
+        # announced loudly by the caller.
+        console.info(f"[{self.label}] note: no {keys} frames this run ({self.reason})",
+                     console.VERBOSE)
 
     @kernel
     def grab(self, t_offset=0.):

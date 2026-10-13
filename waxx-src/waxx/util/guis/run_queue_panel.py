@@ -35,19 +35,47 @@ What it shows:
   fields for a server that does not send it), and when / by whom it was
   submitted.  Fields a server does not send are blank.
 
-The controls act on the selected job: Cancel (asks first; for a job in the
-slot the question says that liveOD's Abort discards that run's data file --
-nothing else is offered until the queue can stop a run and keep its data; a
-queued job's cancel is sent ``queued_only``, so one that launched meanwhile
-is never aborted on a question about a queued job), Move up / down / to top
-/ to bottom (``move``: up / down name the neighbour by id -- ``before_id`` /
-``after_id`` -- top / bottom send ``to_index``), Edit (``edit`` with
-``fields``: argv, label, after, chain, stop_on_failure, the write-back veto,
-due, allow_drift, paused; only the fields changed), Show log (a window
-following the job's log through the ``tail``
-action: every 0.5 s while it runs, every 2 s while it is queued, until it has
-ended and its log is read to the end), and Copy kq command.  An action the
-server refuses as unknown (an older server) disables its control.
+Layout: one toolbar (the state pill and text, the counts, the filter --
+All / Pending, i.e. without the ended jobs --, Follow, Hold / Release, Pause /
+Resume agent and all jobs, Refresh); banners only while there is something
+to say (the alarm, the person hold, a pause, the loop the queue stopped); the
+table (rows tinted: saved green, failed red, the job in the slot blue and
+bold; less-used columns hidden until the header's right-click menu shows
+them; a column moves by dragging its header); a message line.  With Follow
+on (the default) the table scrolls to its bottom when a list brings a job
+the previous list did not have (a newly queued job).  Given a ``settings``
+(a QSettings), the panel remembers the columns' order, widths and shown set,
+the filter and Follow, on every change (:func:`panel_settings`).
+
+A job's actions are on its right-click menu (:meth:`RunQueuePanel.job_menu`;
+what each allows: :meth:`RunQueuePanel.action_state`):
+
+* Show log (also Enter / double-click): a window following the job's log
+  through the ``tail`` action -- every 0.5 s while it runs, every 2 s while
+  it is queued, until it has ended and its log is read to the end;
+* Open source (VS Code, when this PC can read the file) / View source (a
+  read-only window).  A ``.py`` is never handed to the OS's default action
+  (it can run it).  Both say when the file now differs from the one the job
+  was submitted with; what a run ran is in its run file (``expt_file``);
+* Run again / Run again next (asks first): the same file as a new person's
+  job (``submit``, or ``insert`` at 0) with its argv, working folder, label,
+  write-back veto and drift setting -- not its dependencies, chain, due time
+  or repeats; this PC's hash of the file goes with it, as kq sends it;
+* Edit (``edit`` with ``fields``: argv, label, after, chain, stop_on_failure,
+  the write-back veto, due, allow_drift, paused; only the fields changed) and
+  Move up / down / to top / to bottom (also Ctrl+Up / Ctrl+Down; ``move``: up
+  / down name the neighbour by id -- ``before_id`` / ``after_id`` -- top /
+  bottom send ``to_index``), for a queued job;
+* Remove from queue (also Del; several selected at once; asks first): each
+  queued job is cancelled ``queued_only``, so one that launched meanwhile is
+  never aborted on a question about a queued job.  The queue keeps the
+  records; the Pending filter hides them;
+* Abort run, for the job in the slot (asks first: liveOD's Abort discards
+  that run's data file -- nothing else is offered until the queue can stop a
+  run and keep its data);
+* Copy: a kq command line, the file's path, the run id.
+
+An action the server refuses as unknown (an older server) is disabled.
 
 Every request that changes something carries ``owner`` "person" (a person is
 clicking) and ``by`` = ``user@host``.
@@ -62,23 +90,29 @@ Machine-agnostic: nothing here knows the K machine.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import shutil
+import socket
+import subprocess
 import time
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from typing import Any, Callable
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QTimer, Qt
-from PyQt6.QtGui import QColor, QFont, QGuiApplication
+from PyQt6.QtCore import QAbstractTableModel, QByteArray, QModelIndex, QSettings, QTimer, Qt
+from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
-    QPushButton, QTableView, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
+    QPlainTextEdit, QPushButton, QSizePolicy, QStyle, QTableView, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from waxx.util.dashboard import theme
 from waxx.util.device_state.person_hold import describe as describe_hold
-from waxx.util.device_state.run_queue_client import ENDED, IN_SLOT, default_by
+from waxx.util.device_state.run_queue_client import (
+    ENDED, IN_SLOT, SUCCEEDED, default_by, local_sha256)
 from waxx.util.guis.request_runner import RequestRunner, is_unknown_request
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 
@@ -113,10 +147,17 @@ _PILL_BG = {"on": theme.OK, "off": "#4d4d4d", "partial": "#8a6a12", "warn": "#8a
 #: queue state -> pill level
 _QUEUE_LEVEL = {"idle": "off", "running": "on", "launching": "partial", "waiting": "partial",
                 "paused": "warn", "held": "warn"}
-#: job state -> text colour in the table
+#: job state -> text colour of its state cell
 _STATE_COLOR = {"queued": theme.FG, "launching": WARN_TEXT, "running": OK_TEXT,
-                "ending": WARN_TEXT, "saved": theme.FG_MUTED, "failed": ERR_TEXT,
-                "cancelled": theme.FG_MUTED, "skipped": theme.FG_MUTED}
+                "ending": WARN_TEXT, "saved": OK_TEXT, "done": OK_TEXT, "failed": ERR_TEXT,
+                "aborted": WARN_TEXT, "cancelled": theme.FG_MUTED, "skipped": theme.FG_MUTED}
+#: job state -> a subtle row tint (translucent, over the row's own base)
+ROW_TINT = {"saved": (95, 211, 141, 30), "done": (95, 211, 141, 30),
+            "failed": (255, 107, 107, 36), "aborted": (255, 179, 71, 34),
+            "launching": (90, 160, 255, 34), "running": (90, 160, 255, 34),
+            "ending": (90, 160, 255, 34)}
+#: states whose other cells are drawn muted
+_MUTED_STATES = ("cancelled", "skipped")
 
 
 # -- small helpers -------------------------------------------------------------------
@@ -154,6 +195,13 @@ def _pill_css(level: str) -> str:
     bg = _PILL_BG.get(level, "#454545")
     return (f"QLabel {{ background: {bg}; color: white; border-radius: 9px;"
             f" padding: 2px 10px; font-size: 12px; font-weight: 600; }}")
+
+
+def chip_css(level: str) -> str:
+    """A small pill for a one-line status bar."""
+    bg = _PILL_BG.get(level, "#454545")
+    return (f"QLabel {{ background: {bg}; color: white; border-radius: 8px;"
+            f" padding: 1px 8px; font-size: 11px; font-weight: 600; }}")
 
 
 def _banner_css(bg: str, fg: str = "white") -> str:
@@ -256,6 +304,62 @@ def hold_request(reason: str, by: str) -> dict:
 
 def release_request(by: str) -> dict:
     return {"type": "run_queue", "action": "release", "owner": OWNER, "by": by}
+
+
+def again_request(job: dict, by: str, *, first: bool = False,
+                  client_sha256: str | None = None, client_host: str | None = None) -> dict:
+    """The same file again as a new job of a person's: its argv, working
+    folder, label, write-back veto and drift setting.  Its dependencies,
+    chain, due time and repeats are NOT carried over (they named the old
+    job's place).  ``first``: ``insert`` at ``at_index`` 0 (the next job);
+    otherwise ``submit`` (the owner rule: ahead of agents' queued jobs).
+    ``client_sha256`` / ``client_host`` let the server refuse a file whose copy
+    on its machine differs from this PC's (as kq sends them)."""
+    obj = {"type": "run_queue", "action": "insert" if first else "submit",
+           "path": job.get("path"), "argv": [str(a) for a in (job.get("argv") or [])],
+           "cwd": job.get("cwd") or None, "label": job.get("label") or None,
+           "owner": OWNER, "by": by, "allow_drift": bool(job.get("allow_drift")),
+           "client_sha256": client_sha256, "client_host": client_host, "host": client_host}
+    if job.get("write_back") is False:
+        obj["write_back"] = False
+    if first:
+        obj["at_index"] = 0
+    return {k: v for k, v in obj.items() if v is not None}
+
+
+def not_carried_over(job: dict) -> list[str]:
+    """What :func:`again_request` leaves behind, in words."""
+    out = []
+    if job.get("after"):
+        out.append("its dependencies (after " + ", ".join(map(str, job["after"])) + ")")
+    if job.get("chain") and not str(job["chain"]).startswith("repeat-"):
+        out.append(f"its chain ({job['chain']})")
+    if int(job.get("repeat_of") or 1) > 1:
+        out.append(f"its repeats (one of {job['repeat_of']})")
+    if job.get("due"):
+        out.append(f"its due time ({_clock(job['due'])})")
+    if job.get("paused"):
+        out.append("its pause")
+    return out
+
+
+def find_editor() -> list[str] | None:
+    """The command that opens a file in VS Code on this PC (``Code.exe``
+    next to the ``code`` CLI's folder, else the CLI itself), or None.  A
+    ``.py`` file is never handed to the OS's default action: on Windows that
+    can run it."""
+    cli = shutil.which("code")
+    if not cli:
+        return None
+    exe = Path(cli).resolve().parent.parent / "Code.exe"
+    return [str(exe)] if exe.is_file() else [cli]
+
+
+def _launch_detached(cmd: list[str]) -> None:
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
 
 
 def _q(arg: str) -> str:
@@ -381,7 +485,7 @@ def derived_waiting(job: dict, info: dict, by_id: dict) -> str:
     # only dependencies in this listing are judged (one beyond it is the
     # server's to judge: it says so through the job's state)
     waits = [a for a in (job.get("after") or [])
-             if a in by_id and by_id[a].get("state") != "saved"]
+             if a in by_id and by_id[a].get("state") not in SUCCEEDED]
     if waits:
         return "waiting for job " + ", ".join(map(str, waits))
     paused = info.get("paused") or {}
@@ -409,6 +513,26 @@ COLUMNS = (
     ("source_changed", "source"), ("waiting", "waiting"), ("submitted", "submitted"),
 )
 COLUMN_KEYS = tuple(k for k, _ in COLUMNS)
+#: Columns hidden until someone shows them (right-click the header); the
+#: label's tooltip carries the file's path.
+DEFAULT_HIDDEN = ("expt_class", "path", "priority", "due", "after")
+#: Column widths (px) until someone resizes them; the last column stretches.
+DEFAULT_WIDTHS = {"position": 40, "id": 44, "state": 100, "owner": 120, "label": 160,
+                  "expt_class": 110, "path": 220, "run_id": 60, "priority": 50, "due": 60,
+                  "after": 100, "est": 150, "source_changed": 64, "waiting": 200}
+#: The table's filters: every listed job, or only those not ended.
+FILTERS = ("all", "pending")
+#: Where a host's panel remembers its columns and filter (:func:`panel_settings`).
+SETTINGS_ORG = "waxx"
+SETTINGS_APP = "run_queue_panel"
+#: How long after the last column change the layout is written.
+SAVE_DEBOUNCE_MS = 300
+
+
+def panel_settings() -> QSettings:
+    """The QSettings a host passes as ``RunQueuePanel(settings=...)`` so the
+    table's columns and filter outlive the window."""
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
 
 
 class JobTableModel(QAbstractTableModel):
@@ -492,12 +616,22 @@ class JobTableModel(QAbstractTableModel):
             return self.text(job, key)
         if role == Qt.ItemDataRole.ToolTipRole:
             return self.tooltip(job, key) or None
+        state = str(job.get("state"))
         if role == Qt.ItemDataRole.ForegroundRole:
             if key == "source_changed" and job.get("source_changed"):
                 return QColor(ERR_TEXT)
-            if key == "est" and self.text(job, key):
+            if key == "state":
+                return QColor(_STATE_COLOR.get(state, theme.FG))
+            if (key == "est" and self.text(job, key)) or state in _MUTED_STATES:
                 return QColor(theme.FG_MUTED)
-            return QColor(_STATE_COLOR.get(str(job.get("state")), theme.FG))
+            return QColor(theme.FG)
+        if role == Qt.ItemDataRole.BackgroundRole:
+            tint = ROW_TINT.get(state)
+            return QColor(*tint) if tint else None
+        if role == Qt.ItemDataRole.FontRole and state in IN_SLOT:
+            font = QFont()
+            font.setBold(True)
+            return font
         if role == Qt.ItemDataRole.UserRole:
             return job
         return None
@@ -507,6 +641,11 @@ class JobTableModel(QAbstractTableModel):
     def queued_in_order(self) -> list[dict]:
         """The queued jobs in the server's order (all of them, shown or not)."""
         return [j for j in self._all if j.get("state") == "queued"]
+
+    def filter_counts(self) -> dict[str, int]:
+        """Rows each filter would show: ``{"all": n, "pending": m}``."""
+        return {"all": len(self._all),
+                "pending": sum(1 for j in self._all if j.get("state") not in ENDED)}
 
     def position_text(self, job: dict) -> str:
         """1-based place in the queue ("slot" for the job in it): the server's
@@ -623,7 +762,12 @@ class JobTableModel(QAbstractTableModel):
             return "\n".join(lines)
         if key == "label":
             argv = job.get("argv") or []
-            return ("argv: " + " ".join(str(a) for a in argv)) if argv else ""
+            lines = [str(job.get("path") or "")]
+            if argv:
+                lines.append("argv: " + " ".join(str(a) for a in argv))
+            if job.get("expt_class"):
+                lines.append(f"class {job['expt_class']}")
+            return "\n".join(x for x in lines if x)
         if key == "expt_class":
             cal = job.get("calibrates_declared")
             lines = []
@@ -914,6 +1058,41 @@ class JobLogWindow(QDialog):
         super().closeEvent(event)
 
 
+class SourceWindow(QDialog):
+    """A job's experiment file, read-only, as this PC reads it now -- with a
+    warning line when it differs from the file the job was submitted with."""
+
+    def __init__(self, panel: "RunQueuePanel", job: dict, text: str, note: str = ""):
+        super().__init__(panel)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.panel = panel
+        self.job = dict(job)
+        self.setWindowTitle(f"{job.get('label') or 'source'} -- {job.get('path')} (read-only)")
+        self.resize(900, 640)
+        box = QVBoxLayout(self)
+        head = QHBoxLayout()
+        self.path_label = _small(str(job.get("path") or ""))
+        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        head.addWidget(self.path_label, 1)
+        self.editor_button = _button("Open in VS Code")
+        self.editor_button.setEnabled(find_editor() is not None)
+        self.editor_button.clicked.connect(lambda _=False: self.panel.open_source(self.job))
+        head.addWidget(self.editor_button)
+        box.addLayout(head)
+        self.note = _small(note, WARN_TEXT)
+        self.note.setVisible(bool(note))
+        box.addWidget(self.note)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(9)
+        self.text.setFont(mono)
+        self.text.setPlainText(text)
+        box.addWidget(self.text, 1)
+
+
 # -- the panel -----------------------------------------------------------------------------
 
 class RunQueuePanel(QWidget):
@@ -921,11 +1100,15 @@ class RunQueuePanel(QWidget):
 
     ``requester``: ``request_dict -> reply_dict``; ``by``: who is clicking
     (default ``user@host``); ``synchronous``: call the requester on the GUI
-    thread (tests).  ``runner``: an existing RequestRunner to share instead."""
+    thread (tests).  ``runner``: an existing RequestRunner to share instead.
+    ``settings``: a QSettings to remember the columns (order, widths, shown)
+    and the filter in, written on every change; None remembers nothing."""
 
     def __init__(self, requester: Callable[[dict], Any] | None = None, *, by: str | None = None,
-                 synchronous: bool = False, runner: RequestRunner | None = None, parent=None):
+                 synchronous: bool = False, runner: RequestRunner | None = None,
+                 settings: QSettings | None = None, parent=None):
         super().__init__(parent)
+        self.settings = settings
         self.by = by or default_by()
         self._own_runner = runner is None
         self.runner = runner or RequestRunner(requester, synchronous=synchronous, parent=self)
@@ -944,120 +1127,150 @@ class RunQueuePanel(QWidget):
         self._selected: tuple | None = None
         self._log_windows: dict = {}
 
-        box = QVBoxLayout(self)
-        box.setContentsMargins(8, 8, 8, 8)
-        box.setSpacing(6)
+        #: the table's filter (:data:`FILTERS`)
+        saved_filter = self._setting("filter")
+        self.filter = saved_filter if saved_filter in FILTERS else "all"
+        #: scroll to the bottom when a list brings a new job (default on)
+        saved_follow = self._setting("follow_new")
+        self.follow_new = (True if saved_follow in (None, "")
+                           else str(saved_follow).lower() in ("true", "1"))
+        #: (id, token) of every job in the last good list; None before the first
+        self._known_jobs: set | None = None
+        #: opens a file in an editor: ``cmd -> None`` (tests replace it)
+        self.launch = _launch_detached
+        self._source_windows: list = []
 
-        # top strip
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 4, 0, 0)
+        box.setSpacing(4)
+
+        # the toolbar: the queue's state, the filter, hold / pause, refresh
         top = QHBoxLayout()
+        top.setSpacing(6)
         self.pill = QLabel("?")
         top.addWidget(self.pill)
         self.summary = QLabel("")
         self.summary.setStyleSheet(f"color: {theme.FG}; font-size: 12px;")
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         top.addWidget(self.summary, 1)
         self.counts = _small("")
         self.counts.setWordWrap(False)
         top.addWidget(self.counts)
+        top.addSpacing(8)
+        self.filter_group = QButtonGroup(self)
+        self.filter_group.setExclusive(True)
+        self.filter_buttons: dict[str, QToolButton] = {}
+        for name in FILTERS:
+            b = QToolButton()
+            b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setChecked(name == self.filter)
+            b.clicked.connect(lambda _=False, n=name: self.set_filter(n))
+            self.filter_group.addButton(b)
+            self.filter_buttons[name] = b
+            top.addWidget(b)
+        self.follow_button = QToolButton()
+        self.follow_button.setText("Follow")
+        self.follow_button.setCheckable(True)
+        self.follow_button.setAutoRaise(True)
+        self.follow_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.follow_button.setChecked(self.follow_new)
+        self.follow_button.setToolTip("Scroll to the bottom of the table when a job is queued")
+        self.follow_button.toggled.connect(self.set_follow_new)
+        top.addWidget(self.follow_button)
+        top.addSpacing(8)
+        self.hold_button = _button("Hold...")
+        self.hold_button.clicked.connect(lambda _=False: self.toggle_hold())
+        top.addWidget(self.hold_button)
+        self.pause_buttons: dict[str, QPushButton] = {}
+        for scope in ("agent", "all"):
+            button = _button("")
+            button.clicked.connect(lambda _=False, s=scope: self.toggle_pause(s))
+            self.pause_buttons[scope] = button
+            top.addWidget(button)
+        self.refresh_button = QToolButton()
+        self.refresh_button.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_button.setToolTip("Ask the server for the list again")
+        self.refresh_button.setAutoRaise(True)
+        self.refresh_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.refresh_button.clicked.connect(lambda _=False: self.refresh_list())
+        top.addWidget(self.refresh_button)
         box.addLayout(top)
 
+        # banners: only while there is something to say
         self.alarm = QLabel("")
         self.alarm.setWordWrap(True)
         self.alarm.setStyleSheet(_banner_css("#c62828"))
         self.alarm.hide()
         box.addWidget(self.alarm)
-
-        hold_row = QHBoxLayout()
         self.hold_label = QLabel("")
         self.hold_label.setWordWrap(True)
         self.hold_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        hold_row.addWidget(self.hold_label, 1)
-        self.hold_button = _button("Hold...")
-        self.hold_button.clicked.connect(lambda _=False: self.toggle_hold())
-        hold_row.addWidget(self.hold_button)
-        box.addLayout(hold_row)
-
-        pause_row = QHBoxLayout()
+        self.hold_label.hide()
+        box.addWidget(self.hold_label)
         self.pause_labels: dict[str, QLabel] = {}
-        self.pause_buttons: dict[str, QPushButton] = {}
-        for scope, title in (("agent", "Agent jobs"), ("all", "All jobs")):
+        for scope in ("agent", "all"):
             label = _small("")
-            label.setWordWrap(False)
+            label.hide()
             self.pause_labels[scope] = label
-            button = _button("")
-            button.clicked.connect(lambda _=False, s=scope: self.toggle_pause(s))
-            self.pause_buttons[scope] = button
-            pause_row.addWidget(label)
-            pause_row.addWidget(button)
-            pause_row.addSpacing(12)
-        pause_row.addStretch(1)
-        box.addLayout(pause_row)
-
+            box.addWidget(label)
         self.loop_note = _small("")
         self.loop_note.hide()
         box.addWidget(self.loop_note)
 
         # the jobs
         self.model = JobTableModel(self)
+        self.model.set_show_ended(self.filter == "all")
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.table.setWordWrap(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        for key, width in (("position", 40), ("id", 44), ("state", 110), ("owner", 120),
-                           ("label", 120), ("expt_class", 110), ("path", 220), ("run_id", 60),
-                           ("priority", 50), ("due", 60), ("after", 100), ("est", 130),
-                           ("source_changed", 70), ("waiting", 200)):
+        header.setHighlightSections(False)
+        header.setSectionsMovable(True)
+        for key, width in DEFAULT_WIDTHS.items():
             header.resizeSection(COLUMN_KEYS.index(key), width)
+        for key in DEFAULT_HIDDEN:
+            self.table.setColumnHidden(COLUMN_KEYS.index(key), True)
+        self._restore_columns()
+        # written SAVE_DEBOUNCE_MS after the last change (a drag resizes many times)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self.save_columns)
+        header.sectionMoved.connect(lambda *_: self._columns_changed())
+        header.sectionResized.connect(self._on_section_resized)
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._header_menu)
+        header.setToolTip("Drag a header to move its column; right-click: show or hide columns")
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.selectionModel().selectionChanged.connect(self._on_selection)
         self.table.doubleClicked.connect(lambda _i: self.show_log())
+        self.table.setToolTip("Right-click a job for its actions (log, source, run again, "
+                              "edit, move, remove). Del: remove the selected queued jobs; "
+                              "Enter: log; Ctrl+Up / Ctrl+Down: move.")
+        for keys, slot in ((QKeySequence.StandardKey.Delete, self.remove_selected),
+                           (QKeySequence(Qt.Key.Key_Return), self.show_log),
+                           (QKeySequence(Qt.Key.Key_Enter), self.show_log),
+                           (QKeySequence("Ctrl+Up"), lambda: self.move_selected("up")),
+                           (QKeySequence("Ctrl+Down"), lambda: self.move_selected("down"))):
+            shortcut = QShortcut(keys, self.table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(lambda s=slot: s())
         box.addWidget(self.table, 1)
-
-        # actions on the selected job
-        actions = QHBoxLayout()
-        self.cancel_button = _button("Cancel...")
-        self.cancel_button.clicked.connect(lambda _=False: self.cancel_selected())
-        actions.addWidget(self.cancel_button)
-        self.move_buttons: dict[str, QPushButton] = {}
-        for where, text in (("up", "Up"), ("down", "Down"), ("top", "Top"),
-                            ("bottom", "Bottom")):
-            b = _button(text)
-            b.clicked.connect(lambda _=False, w=where: self.move_selected(w))
-            self.move_buttons[where] = b
-            actions.addWidget(b)
-        self.edit_button = _button("Edit...")
-        self.edit_button.clicked.connect(lambda _=False: self.edit_selected())
-        actions.addWidget(self.edit_button)
-        self.log_button = _button("Show log")
-        self.log_button.clicked.connect(lambda _=False: self.show_log())
-        actions.addWidget(self.log_button)
-        self.copy_button = QToolButton()
-        self.copy_button.setText("Copy kq command")
-        self.copy_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(self.copy_button)
-        for kind, text in (("submit", "kq submit ... (the same job again)"),
-                           ("tail", "kq tail <id> -f (follow its log)"),
-                           ("show", "kq show <id>"), ("cancel", "kq cancel <id>")):
-            menu.addAction(text, lambda k=kind: self.copy_kq(k))
-        self.copy_button.setMenu(menu)
-        actions.addWidget(self.copy_button)
-        actions.addStretch(1)
-        self.ended_box = QCheckBox("ended jobs")
-        self.ended_box.setChecked(True)
-        self.ended_box.toggled.connect(self._on_show_ended)
-        actions.addWidget(self.ended_box)
-        self.refresh_button = _button("Refresh")
-        self.refresh_button.clicked.connect(lambda _=False: self.refresh_list())
-        actions.addWidget(self.refresh_button)
-        box.addLayout(actions)
 
         self.message = _small("")
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1068,12 +1281,17 @@ class RunQueuePanel(QWidget):
         self._list_timer.timeout.connect(self.refresh_list)
 
         self._show_summary()
+        self._show_filter_counts()
         self.refresh_buttons()
 
     # -- inputs from the host -----------------------------------------------------------
 
     #: set by shutdown(): every input is then a no-op
     _shut = False
+    #: the message line shows a failed list (cleared by the next good one)
+    _list_error_shown = False
+    #: the last list failed: the next status that answers asks again
+    _list_failed = False
 
     def set_state(self, state: dict | None) -> None:
         """The server's ``status_json`` (None: it did not answer)."""
@@ -1083,6 +1301,11 @@ class RunQueuePanel(QWidget):
             self.set_reachable(False)
             return
         self.set_reachable(True)
+        if self._list_failed and not self._listing:
+            # the last list failed (e.g. the server was not up yet): ask again
+            # now that it answers -- an idle queue's summary never changes, so
+            # set_info would never ask
+            self.schedule_list()
         if "run_queue" not in state or not isinstance(state.get("run_queue"), dict):
             self.has_queue = False
             self._show_summary()
@@ -1175,7 +1398,12 @@ class RunQueuePanel(QWidget):
 
     def _on_list(self, reply: dict) -> None:
         self._listing = False
-        self._listed_once = True
+        self._list_failed = not (reply.get("status") == "ok" or is_unknown_request(reply))
+        if not self._list_failed:
+            self._listed_once = True
+            if self._list_error_shown:
+                self._list_error_shown = False
+                self.say("")
         if reply.get("status") == "ok":
             self.has_queue = True
             info = reply.get("run_queue")
@@ -1184,6 +1412,12 @@ class RunQueuePanel(QWidget):
                 self._summary_sig = self._signature(self.info)
             self.model.set_jobs(reply.get("jobs"), self.info, reply.get("next"))
             self._reselect()
+            listed = {(j.get("id"), j.get("token")) for j in self.model._all}
+            if (self.follow_new and self._known_jobs is not None
+                    and listed - self._known_jobs):
+                self.table.scrollToBottom()
+            self._known_jobs = listed
+            self._show_filter_counts()
             # the server lists the first `limit` queued jobs; how many it left out
             self.not_listed = 0
             if reply.get("truncated"):
@@ -1197,16 +1431,41 @@ class RunQueuePanel(QWidget):
             self.model.set_jobs([], {})
         else:
             self.say(f"list: {reply.get('msg')}", ERR_TEXT)
+            self._list_error_shown = True
         self._show_summary()
         self.refresh_buttons()
         if self._list_again:
             self._list_again = False
             self.schedule_list()
 
-    def _on_show_ended(self, show: bool) -> None:
-        self.model.set_show_ended(show)
+    def set_filter(self, name: str) -> None:
+        """``"all"``: every listed job; ``"pending"``: queued and in the slot
+        (the ended ones hidden)."""
+        if name not in FILTERS:
+            raise ValueError(f"filter must be one of {FILTERS}, not {name!r}")
+        self.filter = name
+        self.filter_buttons[name].setChecked(True)
+        self.model.set_show_ended(name == "all")
+        self._put_settings({"filter": name})
         self._reselect()
+        self._show_filter_counts()
         self.refresh_buttons()
+
+    def set_follow_new(self, on: bool) -> None:
+        """Scroll to the bottom when a list brings a new job (or not)."""
+        self.follow_new = bool(on)
+        if self.follow_button.isChecked() != self.follow_new:
+            self.follow_button.setChecked(self.follow_new)
+        self._put_settings({"follow_new": self.follow_new})
+
+    def _show_filter_counts(self) -> None:
+        counts = self.model.filter_counts()
+        for name, b in self.filter_buttons.items():
+            b.setText(f"{name.capitalize()} {counts[name]}")
+        self.filter_buttons["all"].setToolTip(
+            "Every job the server listed: ended ones too (saved green, failed red)")
+        self.filter_buttons["pending"].setToolTip("Only jobs that have not ended: queued, and "
+                                                  "the one in the slot")
 
     # -- the summary --------------------------------------------------------------------------
 
@@ -1230,9 +1489,11 @@ class RunQueuePanel(QWidget):
             self.pill.setText(state)
             set_style_if_changed(self.pill, _pill_css(_QUEUE_LEVEL.get(state, "unknown")))
             self.summary.setText(str(self.info.get("text") or ""))
+        self.summary.setToolTip(self.summary.text())
         counts = self.info.get("counts") or {}
         shown = [f"{counts[s]} {s}" for s in ("queued", "launching", "running", "ending",
-                                               "failed", "saved") if counts.get(s)]
+                                               "failed", "aborted", "saved", "done")
+                 if counts.get(s)]
         if self.not_listed:
             shown.append(f"{self.not_listed} more queued not listed" if self.not_listed > 0
                          else "more queued not listed")
@@ -1264,9 +1525,11 @@ class RunQueuePanel(QWidget):
             text = "HELD: " + " ".join(details) + " -- agents' jobs and the run loops wait."
             self.hold_label.setText(text[0].upper() + text[1:])
             set_style_if_changed(self.hold_label, _banner_css("#8a6a12"))
+            self.hold_label.setVisible(self.reachable)
         else:
             self.hold_label.setText("No person hold: agents may use the machine when it is free.")
             set_style_if_changed(self.hold_label, f"color: {theme.FG_MUTED}; font-size: 11px;")
+            self.hold_label.hide()
 
         paused = self.info.get("paused") or {}
         for scope, label in self.pause_labels.items():
@@ -1277,9 +1540,11 @@ class RunQueuePanel(QWidget):
                 label.setText(f"{title}: PAUSED by {p.get('by')} ({p.get('owner') or 'person'}) "
                               f"since {_clock(p.get('since'))}{why}")
                 set_style_if_changed(label, f"color: {WARN_TEXT}; font-size: 11px;")
+                label.setVisible(self.reachable)
             else:
                 label.setText(f"{title}: not paused")
                 set_style_if_changed(label, f"color: {theme.FG_MUTED}; font-size: 11px;")
+                label.hide()
 
         resume = self.info.get("resume_loop")
         if isinstance(resume, dict) and self.reachable:
@@ -1293,11 +1558,23 @@ class RunQueuePanel(QWidget):
     # -- selection and buttons ------------------------------------------------------------------
 
     def selected_job(self) -> dict | None:
+        """The job the actions act on: the current row when it is selected,
+        else the first selected row."""
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return None
-        job = self.model.data(rows[0], Qt.ItemDataRole.UserRole)
+        current = self.table.currentIndex()
+        index = rows[0]
+        if current.isValid() and any(r.row() == current.row() for r in rows):
+            index = self.model.index(current.row(), 0)
+        job = self.model.data(index, Qt.ItemDataRole.UserRole)
         return job if isinstance(job, dict) else None
+
+    def selected_jobs(self) -> list[dict]:
+        """Every selected job, in table order."""
+        rows = sorted(r.row() for r in self.table.selectionModel().selectedRows())
+        jobs = [self.model.data(self.model.index(r, 0), Qt.ItemDataRole.UserRole) for r in rows]
+        return [j for j in jobs if isinstance(j, dict)]
 
     def select_job(self, job_id) -> bool:
         row = self.model.row_of(job_id)
@@ -1330,41 +1607,59 @@ class RunQueuePanel(QWidget):
     def supported(self, action: str) -> bool:
         return action not in self.unsupported
 
+    def action_state(self, kind: str, job: dict | None = None) -> tuple[bool, str]:
+        """``(enabled, tooltip)`` of a job action for ``job`` (default: the
+        selected one).  Kinds: ``log``, ``source``, ``again``, ``again_next``,
+        ``edit``, ``up`` / ``down`` / ``top`` / ``bottom``, ``remove`` (the
+        selected queued jobs), ``abort`` (the job in the slot), ``copy``."""
+        job = job if job is not None else self.selected_job()
+        live = self.reachable and self.has_queue
+        if job is None:
+            return False, "select a job"
+        state = job.get("state")
+        if kind in ("log", "copy"):
+            return (live or kind == "copy"), ("Follow the job's log" if kind == "log" else
+                                               "Copy a command line or a field")
+        if kind == "source":
+            return bool(job.get("path")), "The experiment file as it is now (read-only view)"
+        why_not = ("the monitor server is not answering" if not self.reachable else
+                   "this monitor server has no run queue" if not self.has_queue else "")
+        if why_not:
+            return False, why_not
+        if kind in ("again", "again_next"):
+            return bool(job.get("path")), ("Queue the same file again as a new job" if
+                                           kind == "again" else
+                                           "Queue the same file again, ahead of every queued job")
+        if kind == "remove":
+            queued = [j for j in self.selected_jobs() or [job] if j.get("state") == "queued"]
+            return (bool(queued), "Take the selected queued jobs out of the queue (asks first)"
+                    if queued else "only a queued job can be removed (a running one: Abort)")
+        if kind == "abort":
+            if state not in ("launching", "running"):
+                return False, f"it is {state}: no run to abort"
+            if job.get("cancel"):
+                return False, "its cancel has been asked for; the run ends at its next shot"
+            return True, "Stop its run at the next shot: liveOD DISCARDS the run's data file"
+        if kind == "edit":
+            if not self.supported(EDIT_ACTION):
+                return False, "this monitor server cannot edit jobs (older code)"
+            return (state == "queued", "Edit the queued job" if state == "queued"
+                    else "only a queued job can be edited")
+        if kind in MOVE_WHERE:
+            if not self.supported(MOVE_ACTION):
+                return False, "this monitor server cannot reorder jobs (older code)"
+            if state != "queued":
+                return False, "only a queued job can be moved"
+            if move_request(job, kind, self.by, self.model.queued_in_order()) is None:
+                return False, "it is already first" if kind in ("up", "top") else \
+                    "it is already last"
+            return True, _MOVE_TIPS[kind]
+        raise ValueError(f"no such job action: {kind!r}")
+
     def refresh_buttons(self) -> None:
         live = self.reachable and self.has_queue
-        job = self.selected_job()
-        state = (job or {}).get("state")
         why_not = ("the monitor server is not answering" if not self.reachable else
-                   "this monitor server has no run queue" if not self.has_queue else
-                   "select a job" if job is None else "")
-
-        def setup(button, ok: bool, tip_ok: str, tip_no: str) -> None:
-            button.setEnabled(bool(live and job is not None and ok))
-            button.setToolTip(why_not or (tip_ok if ok else tip_no))
-
-        cancel_asked = bool((job or {}).get("cancel"))
-        setup(self.cancel_button, state == "queued" or (state in ("launching", "running")
-                                                         and not cancel_asked),
-              "Cancel the job (asks first)",
-              "its cancel has been asked for; the run ends at its next shot" if cancel_asked
-              else f"it is {state}: nothing to cancel")
-        queued = self.model.queued_in_order()
-        for where, b in self.move_buttons.items():
-            if not self.supported(MOVE_ACTION):
-                setup(b, False, "", "this monitor server cannot reorder jobs (older code)")
-            elif state != "queued":
-                setup(b, False, "", "only a queued job can be moved")
-            else:
-                can = move_request(job, where, self.by, queued) is not None
-                setup(b, can, _MOVE_TIPS[where],
-                      "it is already first" if where in ("up", "top") else "it is already last")
-        if not self.supported(EDIT_ACTION):
-            setup(self.edit_button, False, "", "this monitor server cannot edit jobs (older code)")
-        else:
-            setup(self.edit_button, state == "queued", "Edit the queued job",
-                  "only a queued job can be edited")
-        setup(self.log_button, True, "Follow the job's log", "")
-        setup(self.copy_button, True, "Copy a kq command line for this job", "")
+                   "this monitor server has no run queue" if not self.has_queue else "")
         self.hold_button.setEnabled(live)
         self.hold_button.setText("Release hold" if self.hold.get("active") else "Hold...")
         self.hold_button.setToolTip(
@@ -1384,6 +1679,7 @@ class RunQueuePanel(QWidget):
         self.refresh_button.setEnabled(self.reachable)
 
     def say(self, text: str, color: str = theme.FG_MUTED) -> None:
+        self._list_error_shown = False        # a newer message is not cleared by a list
         self.message.setText(text)
         set_style_if_changed(self.message, f"color: {color}; font-size: 11px;")
 
@@ -1509,6 +1805,327 @@ class RunQueuePanel(QWidget):
         self.say(f"copied: {text}")
         return text
 
+    def copy_text(self, text: str, what: str) -> str:
+        try:
+            QGuiApplication.clipboard().setText(text)
+        except Exception:                             # noqa: BLE001
+            pass
+        self.say(f"copied {what}: {text}")
+        return text
+
+    def remove_selected(self) -> bool:
+        """Take the selected queued jobs out of the queue (asks first): each
+        is cancelled ``queued_only``, so one that launched meanwhile is left
+        running and named.  The queue keeps their records (as cancelled).  A
+        selected job that is not queued is left alone."""
+        jobs = [j for j in self.selected_jobs() if j.get("state") == "queued"]
+        if not jobs or not (self.reachable and self.has_queue):
+            if any(j.get("state") in IN_SLOT for j in self.selected_jobs()):
+                self.say("A running job is not removed: right-click it for Abort run (that "
+                         "discards its run's data).", WARN_TEXT)
+            return False
+        names = "\n".join(f"- {job_name(j)}" for j in jobs[:12])
+        if len(jobs) > 12:
+            names += f"\n- ... and {len(jobs) - 12} more"
+        n = len(jobs)
+        if not self.confirm(f"Remove {n} job{'s' if n > 1 else ''} from the queue?",
+                            f"{names}\n\nNot started: taken out of the queue, never run. The "
+                            "queue keeps the record (as cancelled).",
+                            "Remove", "Keep"):
+            return False
+        results: dict = {"ok": [], "launched": [], "failed": []}
+
+        def done_for(job: dict) -> Callable[[dict], None]:
+            def done(reply: dict) -> None:
+                if reply.get("status") == "ok":
+                    results["ok"].append(job)
+                elif reply.get("state") in IN_SLOT:
+                    results["launched"].append(job)
+                else:
+                    results["failed"].append((job, reply.get("msg")))
+                if sum(len(v) for v in results.values()) == n:
+                    self._removed(results)
+            return done
+        for job in jobs:
+            self.runner.send(cancel_request(job, self.by), done_for(job))
+        return True
+
+    def _removed(self, results: dict) -> None:
+        parts, color = [], OK_TEXT
+        if results["ok"]:
+            parts.append("removed " + ", ".join(str(j.get("id")) for j in results["ok"]))
+        if results["launched"]:
+            color = WARN_TEXT
+            parts.append("launched before the remove arrived, still running: "
+                         + ", ".join(job_name(j) for j in results["launched"]))
+        if results["failed"]:
+            color = ERR_TEXT
+            parts.append("; ".join(f"{job_name(j)}: {msg}" for j, msg in results["failed"]))
+        self.say("; ".join(parts), color)
+        self.schedule_list()
+        self.refresh_buttons()
+
+    def run_again(self, job: dict | None = None, first: bool = False) -> bool:
+        """The same file as a new job (asks first): :func:`again_request`.
+        ``first``: as the next job.  The question says when this PC's copy of
+        the file differs from what the job ran, or cannot be read."""
+        job = job or self.selected_job()
+        ok, _ = self.action_state("again", job) if job else (False, "")
+        if not ok:
+            return False
+        path = str(job.get("path"))
+        sha = local_sha256(path)
+        lines = [path]
+        if job.get("argv"):
+            lines.append("argv: " + join_argv(job["argv"]))
+        lines.append("")
+        lines.append("It goes in as the next job, ahead of every queued job." if first else
+                     "It goes in as a person's job: ahead of agents' queued jobs, behind other "
+                     "people's.")
+        if sha is None:
+            lines.append("\nThis PC cannot read the file, so its copy cannot be compared with "
+                         "the queue machine's: the queue refuses it unless this PC is that "
+                         "machine.")
+        elif job.get("sha256") and sha != job.get("sha256"):
+            lines.append(f"\nThe file has CHANGED since {job_name(job)} was submitted: the "
+                         "current version runs.")
+        dropped = not_carried_over(job)
+        if dropped:
+            lines.append("\nNot carried over: " + "; ".join(dropped) + ".")
+        if not self.confirm(f"Run {job.get('label') or 'it'} again?", "\n".join(lines),
+                            "Queue it", "Cancel"):
+            return False
+        host = socket.gethostname()
+        what = f"run {job_name(job)} again" + (" next" if first else "")
+
+        def done(reply: dict) -> None:
+            if reply.get("status") == "ok" and reply.get("ids"):
+                ids = ", ".join(str(i) for i in reply["ids"])
+                self.say(f"{what}: queued as job {ids}"
+                         + (" (placed behind person jobs)" if reply.get("clamped") else ""),
+                         WARN_TEXT if reply.get("clamped") else OK_TEXT)
+                self.schedule_list()
+                self.refresh_buttons()
+                return
+            self._done(what)(reply)
+        self.runner.send(again_request(job, self.by, first=first, client_sha256=sha,
+                                       client_host=host), done)
+        return True
+
+    def _source_note(self, job: dict) -> str:
+        """"" or why the file shown may not be what the job ran."""
+        sha = local_sha256(str(job.get("path") or ""))
+        if sha is None or not job.get("sha256") or sha == job.get("sha256"):
+            return ""
+        if job.get("state") == "queued":
+            return (f"The file has changed since {job_name(job)} was submitted (the queue skips "
+                    "it at launch unless it allows drift).")
+        run = f" (run {job['run_id']})" if job.get("run_id") else ""
+        return (f"The file has changed since {job_name(job)} was submitted: what ran{run} is "
+                "the source text in its run file (attribute expt_file), not this.")
+
+    def open_source(self, job: dict | None = None) -> str:
+        """The job's file in VS Code when this PC has it and can read the file,
+        else in a read-only window (:meth:`view_source`).  Never the OS's
+        default action for a .py file (it can run it).  -> "editor",
+        "viewer" or "" (the file cannot be read from this PC)."""
+        job = job or self.selected_job()
+        if job is None or not job.get("path"):
+            return ""
+        path = str(job["path"])
+        if not os.path.isfile(path):
+            self.say(f"{path} cannot be read from this PC (the file that runs is the queue "
+                     "machine's copy).", WARN_TEXT)
+            return ""
+        editor = find_editor()
+        if editor is None:
+            return "viewer" if self.view_source(job) else ""
+        try:
+            self.launch(editor + [path])
+        except OSError as exc:
+            self.say(f"could not start the editor ({exc}); showing it read-only", WARN_TEXT)
+            return "viewer" if self.view_source(job) else ""
+        note = self._source_note(job)
+        self.say(f"opened {path} in VS Code" + (f" -- {note}" if note else ""),
+                 WARN_TEXT if note else theme.FG_MUTED)
+        return "editor"
+
+    def view_source(self, job: dict | None = None) -> "SourceWindow | None":
+        """The job's file, read-only, in a window of this panel's."""
+        job = job or self.selected_job()
+        if job is None or not job.get("path"):
+            return None
+        path = str(job["path"])
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(4_000_000)
+        except OSError as exc:
+            self.say(f"{path} cannot be read from this PC ({exc}).", WARN_TEXT)
+            return None
+        window = SourceWindow(self, job, text, self._source_note(job))
+        for old in [w for w in self._source_windows if not w.isVisible()]:
+            self._source_windows.remove(old)
+            old.deleteLater()                         # closed by hand earlier
+        self._source_windows.append(window)
+        window.show()
+        return window
+
+    # -- the menus -------------------------------------------------------------------------------
+
+    def job_menu(self, job: dict | None = None) -> tuple[QMenu, dict[str, QAction]]:
+        """The right-click menu for ``job`` (default: the selected one) and its
+        actions by kind (:meth:`action_state`; ``copy_<what>`` for the copy
+        submenu)."""
+        job = job if job is not None else self.selected_job()
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        acts: dict[str, QAction] = {}
+
+        def add(target: QMenu, kind: str, text: str, slot, shortcut: str = "") -> QAction:
+            act = QAction(text, target)
+            ok, tip = self.action_state(kind.split("_")[0] if kind.startswith("copy_") else kind,
+                                        job)
+            act.setEnabled(ok)
+            act.setToolTip(tip)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+            act.triggered.connect(lambda _=False: slot())
+            target.addAction(act)
+            acts[kind] = act
+            return act
+
+        if job is None:
+            return menu, acts
+        add(menu, "log", "Show log", lambda: self.show_log(job), "Return")
+        add(menu, "source", "Open source", lambda: self.open_source(job))
+        act = QAction("View source (read-only)", menu)
+        act.setEnabled(bool(job.get("path")))
+        act.triggered.connect(lambda _=False: self.view_source(job))
+        menu.addAction(act)
+        acts["view_source"] = act
+        menu.addSeparator()
+        add(menu, "again", "Run again...", lambda: self.run_again(job))
+        add(menu, "again_next", "Run again next...", lambda: self.run_again(job, first=True))
+        menu.addSeparator()
+        state = job.get("state")
+        if state == "queued":
+            add(menu, "edit", "Edit...", lambda: self.edit_selected())
+            move = menu.addMenu("Move")
+            move.setToolTipsVisible(True)
+            for where, text, keys in (("up", "Up", "Ctrl+Up"), ("down", "Down", "Ctrl+Down"),
+                                      ("top", "To the top (next)", ""),
+                                      ("bottom", "To the bottom", "")):
+                add(move, where, text, lambda w=where: self.move_selected(w), keys)
+            n = sum(1 for j in self.selected_jobs() if j.get("state") == "queued")
+            add(menu, "remove", f"Remove {n} jobs from the queue..." if n > 1 else
+                "Remove from queue...", self.remove_selected, "Del")
+        elif state in IN_SLOT:
+            add(menu, "abort", "Abort run (discards its data)...", self.cancel_selected)
+        menu.addSeparator()
+        copy = menu.addMenu("Copy")
+        commands = kq_commands(job)
+        for kind, text in (("submit", "kq submit ... (the same job again)"),
+                           ("tail", "kq tail <id> -f"), ("show", "kq show <id>"),
+                           ("cancel", "kq cancel <id>")):
+            add(copy, f"copy_{kind}", text,
+                lambda k=kind: self.copy_text(commands[k], f"kq {k}"))
+        add(copy, "copy_path", "File path",
+            lambda: self.copy_text(str(job.get("path") or ""), "the path"))
+        if job.get("run_id") not in (None, ""):
+            add(copy, "copy_run", f"Run id ({job['run_id']})",
+                lambda: self.copy_text(str(job["run_id"]), "the run id"))
+        return menu, acts
+
+    def _context_menu(self, pos) -> None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        if not self.table.selectionModel().isRowSelected(index.row(), QModelIndex()):
+            self.table.selectRow(index.row())
+        self.table.setCurrentIndex(index)
+        job = self.model.data(index, Qt.ItemDataRole.UserRole)
+        menu, _ = self.job_menu(job)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+        delete_later(menu)
+
+    def _header_menu(self, pos) -> None:
+        menu = QMenu(self)
+        for i, (key, title) in enumerate(COLUMNS):
+            act = QAction(title, menu)
+            act.setCheckable(True)
+            act.setChecked(not self.table.isColumnHidden(i))
+            act.toggled.connect(lambda on, c=i: self.set_column_shown(c, on))
+            menu.addAction(act)
+        menu.addSeparator()
+        menu.addAction("Default columns", self.default_columns)
+        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        delete_later(menu)
+
+    def set_column_shown(self, column: int, shown: bool) -> None:
+        self.table.setColumnHidden(column, not shown)
+        self._columns_changed()
+
+    def default_columns(self) -> None:
+        """The columns as built: their order, widths and shown set."""
+        header = self.table.horizontalHeader()
+        for logical in range(len(COLUMNS)):
+            header.moveSection(header.visualIndex(logical), logical)
+        for key, width in DEFAULT_WIDTHS.items():
+            header.resizeSection(COLUMN_KEYS.index(key), width)
+        for i, key in enumerate(COLUMN_KEYS):
+            self.table.setColumnHidden(i, key in DEFAULT_HIDDEN)
+        self._columns_changed()
+
+    # -- remembered columns and filter (only with ``settings``) -------------------------------
+
+    def _setting(self, key: str):
+        if self.settings is None:
+            return None
+        try:
+            return self.settings.value(key)
+        except Exception:                             # noqa: BLE001
+            return None
+
+    def _put_settings(self, values: dict) -> None:
+        if self.settings is None:
+            return
+        try:
+            for key, value in values.items():
+                self.settings.setValue(key, value)
+            self.settings.sync()
+        except Exception:                             # noqa: BLE001
+            pass
+
+    def _restore_columns(self) -> None:
+        """The saved order, widths and shown set -- only when they were saved
+        for this panel's columns (a version with other columns starts from
+        the defaults)."""
+        state = self._setting("columns/state")
+        if not state or self._setting("columns/keys") != ",".join(COLUMN_KEYS):
+            return
+        try:
+            self.table.horizontalHeader().restoreState(QByteArray(state))
+        except Exception:                             # noqa: BLE001
+            pass
+
+    def _on_section_resized(self, logical: int, _old: int, _new: int) -> None:
+        # the stretched last column follows the window's width: not a choice
+        header = self.table.horizontalHeader()
+        last = max((i for i in range(len(COLUMNS)) if not header.isSectionHidden(i)),
+                   key=header.visualIndex, default=-1)
+        if logical != last:
+            self._columns_changed()
+
+    def _columns_changed(self) -> None:
+        if self.settings is not None and not self._shut:
+            self._save_timer.start()
+
+    def save_columns(self) -> None:
+        """Write the columns' order, widths and shown set now."""
+        self._save_timer.stop()
+        self._put_settings({"columns/state": self.table.horizontalHeader().saveState(),
+                            "columns/keys": ",".join(COLUMN_KEYS)})
+
     def show_log(self, job: dict | None = None) -> "JobLogWindow | None":
         job = job or self.selected_job()
         if job is None:
@@ -1562,7 +2179,10 @@ class RunQueuePanel(QWidget):
 
     def shutdown(self) -> None:
         """Stop the timers and log windows; from now on state, broadcasts
-        and refreshes are ignored (nothing is sent)."""
+        and refreshes are ignored (nothing is sent).  A column change not yet
+        written is written now."""
+        if self._save_timer.isActive():
+            self.save_columns()
         self._shut = True
         self._list_timer.stop()
         for window in list(self._log_windows.values()):
@@ -1570,6 +2190,12 @@ class RunQueuePanel(QWidget):
             window.timer.stop()
             window.close()
         self._log_windows.clear()
+        for window in self._source_windows:
+            try:
+                window.close()
+            except RuntimeError:                      # already deleted (closed by hand)
+                pass
+        self._source_windows = []
         if self._own_runner:
             self.runner.shutdown()
 
@@ -1612,7 +2238,8 @@ class QueueSummaryLine(QFrame):
         self.show()
 
 
-__all__ = ["COLUMNS", "EditJobDialog", "JobLogWindow", "JobTableModel", "QueueSummaryLine",
-           "RunQueuePanel", "cancel_request", "derived_waiting", "edit_request", "hold_request",
-           "kq_commands", "list_request", "move_request", "order_jobs", "pause_request",
-           "release_request", "resume_request", "tail_request"]
+__all__ = ["COLUMNS", "DEFAULT_HIDDEN", "EditJobDialog", "FILTERS", "JobLogWindow",
+           "JobTableModel", "QueueSummaryLine", "RunQueuePanel", "SourceWindow", "again_request",
+           "cancel_request", "chip_css", "derived_waiting", "edit_request", "find_editor",
+           "hold_request", "kq_commands", "list_request", "move_request", "not_carried_over",
+           "order_jobs", "pause_request", "release_request", "resume_request", "tail_request"]

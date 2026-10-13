@@ -3942,7 +3942,7 @@ def launch(data_dir: str):
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("weldlab.kexp.gui.data_browser")
             from waxa.taskbar import group_console
-            group_console()  # console joins the shared terminals taskbar button
+            group_console(title="Data Browser")  # console joins the shared terminals taskbar button
         app = QApplication(sys.argv)
 
     window = DataBrowserWindow(data_dir)

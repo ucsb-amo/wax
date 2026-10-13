@@ -1,0 +1,3 @@
+[console_scripts]
+kcal = waxx.calibration.cli:main
+kq = waxx.util.device_state.kq:main

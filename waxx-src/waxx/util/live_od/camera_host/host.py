@@ -523,11 +523,6 @@ class CameraHost:
                                           name="CameraHost-snapshots")
         self._started = True
         self._notifier.start()
-        for cat, cons in self._constraints.items():
-            for c in cons:
-                conds = " and ".join(f"{k} {op} {v!r}" for k, op, v in c.when)
-                logger.debug(f"camera host: lab constraint on {cat} ({c.applies_to}): {conds} -> "
-                             f"{c.level}: {c.reason}")
         if self._serve:
             core.start_in_thread()
             logger.info(f"camera host: serving {self.server_id} on port {core.port} "
@@ -938,6 +933,8 @@ class CameraHost:
             raise HostRefused(str(exc)) from None
         bad = refusals(plan.violations)
         if bad:
+            logger.warning(f"camera host: INIT_RUN on {camera_key} refused by a constraint: "
+                           + "; ".join(str(v) for v in bad))
             raise HostRefused("; ".join(str(v) for v in bad))
         for key, why in plan.refused.items():
             logger.warning(f"camera host: persisted {camera_key} value not carried into the "
@@ -1035,6 +1032,8 @@ class CameraHost:
                                          extra=self._constraints_for(spec))
                 bad = refusals(plan.violations)
                 if bad:
+                    logger.warning(f"camera host: arm of {run.key} refused by a constraint: "
+                                   + "; ".join(str(v) for v in bad))
                     raise HostRefused("; ".join(str(v) for v in bad))
             except (RunProfileError, HostRefused) as exc:
                 run.arm_error = str(exc)
@@ -1339,6 +1338,8 @@ class CameraHost:
                                           and not (merged.get("em_gain_unlocked")
                                                    or set(v.keys) <= confirmed))]
         if bad:
+            logger.warning(f"camera host: live setting on {key} refused by a constraint: "
+                           + "; ".join(str(v) for v in bad))
             raise ApplyRefused(",".join(bad[0].keys), str(bad[0]))
         return w.call("apply", timeout_s, values=values, purpose="live")
 

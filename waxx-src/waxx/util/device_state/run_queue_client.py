@@ -36,7 +36,10 @@ from typing import Callable, Iterable
 
 #: States a job ends in (as run_queue.ENDED; repeated so a client does not
 #: import the server's module).
-ENDED = ("saved", "failed", "cancelled", "skipped")
+ENDED = ("saved", "done", "failed", "aborted", "cancelled", "skipped")
+#: The ended states of a job that ran to its end (as run_queue.SUCCEEDED):
+#: "done" is a run with save_data=False (no file).
+SUCCEEDED = ("saved", "done")
 #: States of the job in the queue's one slot ("launching": between the
 #: queue's record of the launch and the process starting).
 IN_SLOT = ("launching", "running", "ending")

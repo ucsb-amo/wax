@@ -1,5 +1,5 @@
 """The monitor state panel (waxx.util.guis.monitor_state_panel) and the
-monitor server's own window with its Queue | State | Monitor tabs.
+monitor server's own window: the state bar over the run queue.
 
 Offscreen Qt.  The panel's requester is a fake (no socket may be opened by
 the panel tests: socket.socket is replaced by one that fails the test).  The
@@ -92,7 +92,11 @@ def test_renders_monitor_trust_fence_connections_slm(panel):
     assert "run 85602 (rabi) from kong" in fence and "held 12 s" in fence
     assert "NOT_READY, so it does not lapse" in fence
     pill, line = panel.conn_rows["awg"]
-    assert pill.text() == "disconnected" and "released for run 85601" in line.text()
+    assert pill.text() == "Tweezer AWG: disconnected" and "released for run 85601" in line.text()
+    assert panel.trust_chip.text() == "state UNTRUSTED"
+    assert panel.fence_chip.text() == "fence: run 85602" and not panel.fence_chip.isHidden()
+    assert panel.slm_chip.text() == "SLM: due"
+    assert panel.loop_chips["auto_tof"].text() == "BEC TOF loop: running"
     assert "blocked by: run 85602" in panel.slm_line.text() and "reinit due" in \
         panel.slm_line.text()
     card = panel.sequences.loop_cards["auto_tof"]
@@ -140,10 +144,11 @@ def test_broadcasts_update_at_once(panel):
     assert panel.fence_line.text().startswith("No run fence")
     panel.on_broadcast({"type": "connections", "connections": {"awg": dict(
         STATUS["connections"]["awg"], state="connected", detail="")}})
-    assert panel.conn_rows["awg"][0].text() == "connected"
+    assert panel.conn_rows["awg"][0].text() == "Tweezer AWG: connected"
     panel.on_broadcast({"type": "run_loop", "loop": dict(LOOP, state="stopped", ended=NOW,
                                                          text="stopped")})
     assert panel.sequences.loop_cards["auto_tof"].pill.text() == "stopped"
+    assert panel.loop_chips["auto_tof"].text() == "BEC TOF loop: stopped"
     assert panel._journal_soon.isActive()                         # the journal, shortly
 
 
@@ -151,6 +156,11 @@ def test_journal(panel, qapp):
     panel.set_state(dict(STATUS))
     panel.show()
     qapp.processEvents()
+    assert not panel.expanded and not panel.details.isVisible()   # collapsed: a bar
+    assert [r for r in panel.server.requests if r.get("type") == "get_journal"] == []
+    panel.set_expanded(True)                                       # opening asks
+    qapp.processEvents()
+    assert panel.details.isVisible()
     asked = [r for r in panel.server.requests if r.get("type") == "get_journal"]
     assert asked and asked[-1] == {"type": "get_journal", "n": msp.JOURNAL_LINES}
     text = panel.journal.toPlainText()
@@ -228,10 +238,11 @@ def window(qapp, monkeypatch, tmp_path):
     assert w.spawner.calls == []
 
 
-def test_the_window_has_queue_state_and_monitor_tabs(window, qapp):
-    tabs = [window.tabs.tabText(i) for i in range(window.tabs.count())]
-    assert tabs == ["Queue", "State", "Monitor"]
-    assert window.tabs.widget(2).isAncestorOf(window.status_indicator)
+def test_the_window_is_one_page_with_the_monitor_pill_in_the_bar(window, qapp):
+    assert not hasattr(window, "tabs")
+    assert window.state_panel.bar.isAncestorOf(window.status_indicator)
+    assert window.state_panel.monitor_pill is window.status_indicator
+    assert window.isAncestorOf(window.queue_panel)
     # the existing content still works: NOT READY -> click starts the monitor
     assert window.status_indicator.text() == "NOT READY"
     window.status_indicator.click()
@@ -284,7 +295,7 @@ def test_queue_panel_against_the_real_queue(window, qapp, tmp_path):
     assert qp.move_selected("down")
     qp.refresh_list()
     assert [j["id"] for j in qp.model.queued_in_order()] == [ids[2], ids[1], ids[0]]
-    assert qp.move_buttons["up"].isEnabled() and not qp.move_buttons["down"].isEnabled()
+    assert qp.action_state("up")[0] and not qp.action_state("down")[0]
     qp.ask_edit = lambda job: {"label": "renamed", "paused": True}
     assert qp.edit_selected()
     assert "edit" in qp.message.text() and "done" in qp.message.text(), qp.message.text()

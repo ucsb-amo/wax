@@ -185,3 +185,40 @@ def test_discard_keeps_named_layouts(qapp, ini, monkeypatch):
         assert win._layouts.active == DEFAULT_NAME
     finally:
         _close(win)
+
+
+def test_layout_menu_keeps_per_layout_actions_in_manage(qapp, ini, monkeypatch):
+    """The Layout menu's top level: the layouts, then Save / Save as new /
+    Revert, then one "Manage layouts" submenu -- each saved layout's save-over,
+    rename and delete live in its own submenu there, never at the top."""
+    win = _make_window(qapp)
+    try:
+        for name in ("One", "Two"):
+            monkeypatch.setattr(QInputDialog, "getText",
+                                staticmethod(lambda *a, n=name, **k: (n, True)))
+            win._add_layout()
+        win._rebuild_layout_menu()
+        top = [a.text() for a in win._layout_menu.actions() if not a.isSeparator()]
+        assert top == [DEFAULT_NAME, "One", "Two", "Save 'Two'", "Save as new layout…",
+                       "Revert to 'Two'", "Manage layouts"]
+        assert not any("Rename" in t or "Delete" in t for t in top)
+        manage = [a for a in win._layout_menu.actions() if a.text() == "Manage layouts"][0].menu()
+        subs = {a.text(): a.menu() for a in manage.actions() if a.menu() is not None}
+        assert set(subs) == {"One", "Two"}
+        assert [a.text() for a in subs["One"].actions()] == ["Save current over it", "Rename…",
+                                                              "Delete…"]
+        assert {a.text() for a in manage.actions() if not a.isSeparator()} >= {
+            "Import from file…", "Export current to file…"}
+        # deleting from the submenu acts on THAT layout, not the active one
+        monkeypatch.setattr(QMessageBox, "question",
+                            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+        subs["One"].actions()[2].trigger()
+        assert win._layouts.names() == ["Two"] and win._layouts.active == "Two"
+        # Default selected: Save is off (it is built in)
+        win._select_layout(DEFAULT_NAME)
+        _pump(qapp, rounds=5)
+        win._rebuild_layout_menu()
+        save = [a for a in win._layout_menu.actions() if a.text() == "Save"][0]
+        assert not save.isEnabled()
+    finally:
+        _close(win)

@@ -745,7 +745,9 @@ class RunVerdict:
     words; ``start_monitor`` False when the run lost the core to another
     process (the monitor must not be started then); ``show_tail`` False when
     the last lines say nothing more (an Abort); ``outcome`` liveOD's record;
-    ``aborted`` True for an Abort in liveOD."""
+    ``aborted`` True for an Abort in liveOD; ``nothing_written`` True when
+    the run ran to its end with ``save_data=False`` (``saved`` is True then:
+    the run succeeded, and there is no file)."""
 
     saved: bool
     why: str = ""
@@ -753,16 +755,22 @@ class RunVerdict:
     show_tail: bool = True
     outcome: dict | None = None
     aborted: bool = False
+    nothing_written: bool = False
 
 
 def judge_run(code, tail, run_id, expt: str,
-              outcome: Callable[[int], dict | None]) -> RunVerdict:
+              outcome: Callable[[int], dict | None],
+              unsaved: dict | None = None) -> RunVerdict:
     """Judge a finished experiment process: its exit ``code`` (None: not known
     -- a process followed by pid only, e.g. after a server restart; then
     liveOD's outcome alone decides), the last lines of its output, the run id
     it printed (None if it never did), its file's stem ``expt``, and
     ``outcome(run_id)`` -> liveOD's last_outcome for that run, or None.
-    Shared by the run loop and the run queue."""
+    ``unsaved``: liveOD's last_outcome for this process's run when the run
+    had no file (``save_data=False``: liveOD gives it run id 0 and it prints
+    no "Run ID:" line), as the caller identified it; None otherwise.  Exit
+    code 0 (or unknown) and liveOD's outcome "nothing_written" is a run that
+    went to its end.  Shared by the run loop and the run queue."""
     tail = list(tail or ())
     name = f"run {run_id}" if run_id is not None else "the run (it never got a run id)"
     text = "\n".join(tail)
@@ -775,14 +783,27 @@ def judge_run(code, tail, run_id, expt: str,
             return RunVerdict(False, f"{name} ended {last.get('outcome')}"
                               + (f" ({detail})" if detail else ""), outcome=last)
         return RunVerdict(True, outcome=last)
+    if (code in (0, None) and run_id is None and isinstance(unsaved, dict)
+            and unsaved.get("outcome") == "nothing_written"):
+        return RunVerdict(True, "ran to the end with save_data=False: nothing was written",
+                          outcome=unsaved, nothing_written=True)
     m = ABORTED_RE.search(text)
     if m:
+        if m.group(1) == "0":
+            return RunVerdict(False, "the run (save_data=False, no file) was aborted in "
+                              "liveOD (Abort)", show_tail=False, aborted=True,
+                              outcome=unsaved)
         return RunVerdict(False, f"run {m.group(1)} was aborted in liveOD (Abort): its file "
                           "was discarded", show_tail=False, aborted=True)
     if _matches(text, _INTERRUPTED_SIGNATURES):
         return RunVerdict(False, f"{name} lost the core device to another process (the "
                           "monitor or another experiment was started)", start_monitor=False)
     if code == 0:
+        if isinstance(unsaved, dict) and unsaved.get("outcome"):
+            detail = unsaved.get("detail") or ""
+            return RunVerdict(False, f"the run (save_data=False, no file) ended "
+                              f"{unsaved.get('outcome')}" + (f" ({detail})" if detail else ""),
+                              outcome=unsaved)
         return RunVerdict(False, f"{expt} exited without a run id -- its prepare() did not "
                           "register a run with liveOD")
     why = (f"{name} failed (exit code {code})" if code is not None

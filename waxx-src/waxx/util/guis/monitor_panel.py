@@ -1,17 +1,20 @@
-"""The monitor server's panel for the Server Dashboard: its run queue, its
-state, and the monitor experiment's status button -- over the network.
+"""The monitor server's panel for the Server Dashboard: one panel, over the
+network -- the monitor server's state as a compact bar on top, its run queue
+below.
 
 The dashboard runs the monitor server headless (a subprocess with no window),
-so the Queue and State tabs of the server's own window
+so the server's own window
 (:class:`~waxx.util.guis.monitor_server_gui.MonitorServerGUI`) cannot be
-embedded from it.  :class:`MonitorServerPanel` shows the same three tabs from
-any PC:
+embedded from it.  :class:`MonitorServerPanel` shows the same from any PC:
 
-* **Queue** -- :class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`;
-* **State** -- :class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`;
-* **Monitor** -- :class:`MonitorExperimentTab`: the monitor experiment's big
-  READY / LOADING / NOT READY button as in the server's window (click:
-  start it, or restart it after a confirm -- the server's ``reset``).
+* the bar -- :class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`:
+  the monitor experiment's READY / LOADING / NOT READY pill (click: start it,
+  or restart it after a confirm -- the server's ``reset``, through
+  :class:`MonitorControl`), trust, the run fence, connections, the SLM lease
+  and the run loops as chips; its arrow opens the details, the loop cards and
+  the ops journal;
+* the queue -- :class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`: its
+  toolbar (filter, hold, pause), the jobs, each job's right-click menu.
 
 How it talks to the server:
 
@@ -29,7 +32,7 @@ How it talks to the server:
 * broadcasts -- a :class:`~waxx.util.comms_server.state_broadcast.StateListener`
   (UDP, receive only), started when the panel is first shown; ``run_queue``,
   ``person_hold``, trust, the run fence, connections, the SLM reinit and the
-  loops are fed to the tabs as they come.
+  loops are fed to the bar and the queue as they come.
 
 The dashboard calls :meth:`MonitorServerPanel.cleanup` when the panel goes:
 the poll stops, the listener and the worker thread end.
@@ -43,10 +46,8 @@ import threading
 from typing import Any, Callable
 
 from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QLabel, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QMessageBox, QVBoxLayout
 
-from waxx.util.dashboard import theme
 from waxx.util.dashboard.embed_helpers import WidgetPanelBase
 from waxx.util.guis.monitor_state_panel import MonitorStatePanel
 from waxx.util.guis.qt_upkeep import delete_later
@@ -142,61 +143,33 @@ class MonitorLink:
         return reply
 
 
-#: monitor state name -> (button text, background)
-_LOOK = {"READY": ("READY", "green"), "LOADING": ("Loading...", "orange"),
-         "NOT_READY": ("NOT READY", "#c46666")}
-
-
-class MonitorExperimentTab(QWidget):
-    """The monitor experiment's status button, as in the server's own window:
+class MonitorControl:
+    """The monitor experiment's start / restart, behind the state bar's
+    monitor pill (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`):
     READY (click: restart it, after a confirm), NOT READY (click: start it; a
     confirm first, as in Device Control, whenever the status shows the core
-    may be held -- :meth:`core_signs`), Loading... (no click).  The click sends the server's ``reset`` command, which (re)starts
-    the monitor -- unless the run queue has a job in its slot or about to
-    launch, in which case the server defers it until the queue runs out."""
+    may be held -- :meth:`core_signs`), LOADING (no click).  The click sends
+    the server's ``reset`` command, which (re)starts the monitor -- unless the
+    run queue has a job in its slot or about to launch, in which case the
+    server defers it until the queue runs out.  What happened goes to the
+    queue panel's message line."""
 
     def __init__(self, panel: "MonitorServerPanel"):
-        super().__init__()
         self.panel = panel
         self.state: dict = {}
-        #: a reset sent and not answered yet: the button stays disabled (one
-        #: click, one command -- as Device Control's _command_in_flight)
+        #: a reset sent and not answered yet: no click (one click, one
+        #: command -- as Device Control's _command_in_flight)
         self.in_flight = False
-        box = QVBoxLayout(self)
-        self.button = QPushButton("?")
-        font = QFont()
-        font.setPointSize(24)
-        font.setBold(True)
-        self.button.setFont(font)
-        self.button.clicked.connect(lambda _=False: self.clicked())
-        box.addWidget(self.button)
-        self.detail = QLabel("")
-        self.detail.setWordWrap(True)
-        self.detail.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 11px;")
-        box.addWidget(self.detail)
-        self.message = QLabel("")
-        self.message.setWordWrap(True)
-        self.message.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 11px;")
-        box.addWidget(self.message)
-        box.addStretch(1)
-        self.set_state(None)
+        panel.state_panel.set_monitor_clickable(True)
+        panel.state_panel.monitor_clicked.connect(self.clicked)
+
+    @property
+    def button(self):
+        """The pill that shows the monitor's state (the state bar's)."""
+        return self.panel.state_panel.monitor_pill
 
     def set_state(self, state: dict | None) -> None:
         self.state = dict(state) if isinstance(state, dict) else {}
-        if not self.state:
-            self.button.setText("monitor server not answering")
-            self.button.setStyleSheet("background-color: #454545; color: white;")
-            self.button.setEnabled(False)
-            self.detail.setText("")
-            return
-        name = str(self.state.get("state_name") or "")
-        text, bg = _LOOK.get(name, (name or "?", "#454545"))
-        self.button.setText(text)
-        self.button.setStyleSheet(f"background-color: {bg}; color: white;")
-        self.button.setEnabled(name in ("READY", "NOT_READY") and not self.in_flight)
-        sub = str(self.state.get("sub_state") or "").replace("_", " ")
-        reason = str(self.state.get("reason") or "")
-        self.detail.setText(" -- ".join(p for p in (sub, reason) if p))
 
     def core_signs(self) -> list[str]:
         """Every sign in ``status_json`` that an experiment may hold the core:
@@ -224,7 +197,7 @@ class MonitorExperimentTab(QWidget):
         return signs
 
     def clicked(self) -> bool:
-        if self.in_flight:
+        if self.in_flight or not self.state:
             return False
         name = self.state.get("state_name")
         signs = self.core_signs()
@@ -246,16 +219,17 @@ class MonitorExperimentTab(QWidget):
                 return False
         else:
             return False
-        self.message.setText("asked the monitor server to (re)start the monitor...")
+        self.panel.queue_panel.say("asked the monitor server to (re)start the monitor...")
         self.in_flight = True
-        self.button.setEnabled(False)
+        self.panel.state_panel.set_monitor_busy(True)
 
         def done(reply) -> None:
             self.in_flight = False
-            self.message.setText("the monitor server did not answer" if reply is None else
-                                 "asked; the monitor server starts it unless the run queue "
-                                 "has a job to run first")
-            self.set_state(self.state or None)
+            self.panel.state_panel.set_monitor_busy(False)
+            self.panel.queue_panel.say(
+                "monitor: the monitor server did not answer" if reply is None else
+                "monitor: asked; the monitor server starts it unless the run queue has a job "
+                "to run first")
             self.panel.poll_status(force=True)
         self.panel.runner.call(lambda: self.panel.link.send_text("reset"), done)
         return True
@@ -268,14 +242,16 @@ class MonitorServerPanel(WidgetPanelBase):
     ``listener_factory``: makes the broadcast listener (a QThread with
     ``state_received(dict)``, ``start``, ``stop``, ``wait``), None for none;
     ``synchronous``: requests on the GUI thread (tests); ``by``: who is
-    clicking (default ``user@host``)."""
+    clicking (default ``user@host``); ``settings``: a QSettings for the queue
+    table's columns and filter (``run_queue_panel.panel_settings()``), None
+    remembers nothing."""
 
     #: How often status_json is asked for while the panel is visible.
     STATUS_POLL_MS = 1000
 
     def __init__(self, parent=None, *, link: MonitorLink | None = None,
                  listener_factory: Callable[[], Any] | None | str = "default",
-                 synchronous: bool = False, by: str | None = None):
+                 synchronous: bool = False, by: str | None = None, settings=None):
         super().__init__(parent)
         self.link = link or MonitorLink()
         # "default": a StateListener, imported at first show (importing the
@@ -286,22 +262,20 @@ class MonitorServerPanel(WidgetPanelBase):
         self._polling = False
         self._cleaned = False
         self.runner = RequestRunner(self.link.request, synchronous=synchronous, parent=self)
-        self.queue_panel = RunQueuePanel(runner=self.runner, by=by)
         self.state_panel = MonitorStatePanel(runner=self.runner, by=by)
-        self.monitor_tab = MonitorExperimentTab(self)
+        self.queue_panel = RunQueuePanel(runner=self.runner, by=by, settings=settings)
+        self.monitor_control = MonitorControl(self)
         box = QVBoxLayout(self)
-        box.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.queue_panel, "Queue")
-        self.tabs.addTab(self.state_panel, "State")
-        self.tabs.addTab(self.monitor_tab, "Monitor")
-        box.addWidget(self.tabs)
+        box.setContentsMargins(4, 4, 4, 4)
+        box.setSpacing(2)
+        box.addWidget(self.state_panel)
+        box.addWidget(self.queue_panel, 1)
         self.timer = QTimer(self)
         self.timer.setInterval(self.STATUS_POLL_MS)
         self.timer.timeout.connect(self.poll_status)
         self.timer.start()
 
-    # -- feeding the tabs ------------------------------------------------------------------
+    # -- feeding the parts ------------------------------------------------------------------
 
     def showEvent(self, event):                                 # noqa: N802
         super().showEvent(event)
@@ -328,10 +302,10 @@ class MonitorServerPanel(WidgetPanelBase):
         status = status if isinstance(status, dict) else None
         self.queue_panel.set_state(status)
         self.state_panel.set_state(status)
-        self.monitor_tab.set_state(status)
+        self.monitor_control.set_state(status)
 
     def on_broadcast(self, payload) -> None:
-        """A broadcast to the tabs; a no-op once cleaned up (a listener's
+        """A broadcast to the bar and the queue; a no-op once cleaned up (a listener's
         queued datagram may still arrive)."""
         if self._cleaned or not isinstance(payload, dict):
             return
@@ -378,4 +352,4 @@ class MonitorServerPanel(WidgetPanelBase):
         super().closeEvent(event)
 
 
-__all__ = ["MonitorExperimentTab", "MonitorLink", "MonitorServerPanel"]
+__all__ = ["MonitorControl", "MonitorLink", "MonitorServerPanel"]

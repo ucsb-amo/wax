@@ -1105,40 +1105,59 @@ class DashboardMainWindow(QMainWindow):
             revert.setText(f"Revert to '{active}'" if active else "Revert to the layout loaded at startup")
 
     def _rebuild_layout_menu(self) -> None:
+        """The Layout menu: the layouts (click: load), then Save / Save as
+        new / Revert for the arrangement on screen, and one "Manage layouts"
+        submenu holding each saved layout's own actions (save over, rename,
+        delete) and import / export -- the top level never lists per-layout
+        edits."""
         menu = self._layout_menu
         menu.clear()
         active = self._layouts.active
         names = self._layouts.names()
+        modified = bool(self._layouts.modified)
         for name in [DEFAULT_NAME] + names:
-            act = QAction(name, menu)
+            mark = " •" if (name == active and modified) else ""
+            act = QAction(name + mark, menu)
             act.setCheckable(True)
             act.setChecked(name == active)
+            if mark:
+                act.setToolTip("changed since it was loaded or saved")
             act.triggered.connect(lambda _c=False, n=name: self._select_layout(n))
             menu.addAction(act)
         menu.addSeparator()
         self._refresh_layout_picker()
-        self._revert_act.setEnabled(bool(active) or self._last_loaded_layout is not None)
-        menu.addAction(self._revert_act)
-        add = QAction("Save current as new layout…", menu)
+        save = QAction(f"Save '{active}'" if active in names else "Save", menu)
+        save.setEnabled(active in names)
+        save.setToolTip("Save the arrangement on screen over the selected layout"
+                        if active in names else "Default is built in: use Save as new layout")
+        save.triggered.connect(lambda _c=False, n=active: self._overwrite_layout(n))
+        menu.addAction(save)
+        add = QAction("Save as new layout…", menu)
         add.triggered.connect(self._add_layout)
         menu.addAction(add)
-        if active in names:
-            over = QAction(f"Save current over '{active}'", menu)
-            over.triggered.connect(lambda _c=False, n=active: self._overwrite_layout(n))
-            menu.addAction(over)
-            ren = QAction(f"Rename '{active}'…", menu)
-            ren.triggered.connect(lambda _c=False, n=active: self._rename_layout(n))
-            menu.addAction(ren)
-            dele = QAction(f"Delete '{active}'…", menu)
-            dele.triggered.connect(lambda _c=False, n=active: self._delete_layout(n))
-            menu.addAction(dele)
+        self._revert_act.setEnabled(bool(active) or self._last_loaded_layout is not None)
+        menu.addAction(self._revert_act)
         menu.addSeparator()
-        imp = QAction("Import layout from file…", menu)
+        manage = menu.addMenu("Manage layouts")
+        for name in names:
+            sub = manage.addMenu(name)
+            over = QAction("Save current over it", sub)
+            over.triggered.connect(lambda _c=False, n=name: self._overwrite_layout(n))
+            sub.addAction(over)
+            ren = QAction("Rename…", sub)
+            ren.triggered.connect(lambda _c=False, n=name: self._rename_layout(n))
+            sub.addAction(ren)
+            dele = QAction("Delete…", sub)
+            dele.triggered.connect(lambda _c=False, n=name: self._delete_layout(n))
+            sub.addAction(dele)
+        if names:
+            manage.addSeparator()
+        imp = QAction("Import from file…", manage)
         imp.triggered.connect(self._load_layout_from_file)
-        menu.addAction(imp)
-        exp = QAction("Export current layout to file…", menu)
+        manage.addAction(imp)
+        exp = QAction("Export current to file…", manage)
         exp.triggered.connect(self._save_layout_to_file)
-        menu.addAction(exp)
+        manage.addAction(exp)
 
     def _revert_layout(self) -> None:
         active = self._layouts.active

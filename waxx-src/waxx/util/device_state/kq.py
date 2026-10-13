@@ -79,11 +79,12 @@ stderr.
 
 Exit codes:
 
-* 0 -- the job saved (run, tail -f); the request was done; status: queue free
+* 0 -- the job saved, or was done (ran to its end with save_data=False: no
+  file) (run, tail -f); the request was done; status: queue free
 * 1 -- the job failed without an exit code of its own (or with 0)
 * N -- the job failed: the experiment's own exit code N
 * 2 -- bad command line
-* 3 -- the job was cancelled or skipped
+* 3 -- the job was cancelled, aborted (an Abort pressed in liveOD) or skipped
 * 4 -- no run queue is beaconing (no monitor server, or one without a queue)
 * 5 -- status: queue busy -- a queue job is in the slot (launching, running,
   ending) or a person's hold is on.  Queue state only: kq status never asks
@@ -111,8 +112,8 @@ import sys
 import time
 
 from waxx.util.device_state.run_queue_client import (
-    ENDED, IN_SLOT, STATES, NoRunQueue, RunQueueClient, RunQueueError, owner_from_env,
-    safe_write)
+    ENDED, IN_SLOT, STATES, SUCCEEDED, NoRunQueue, RunQueueClient, RunQueueError,
+    owner_from_env, safe_write)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -133,10 +134,12 @@ RUN_COMMANDS = ("run", "submit", "insert")
 LIST_ENDED = 10
 
 EPILOG = """\
-job states: queued -> launching -> running -> ending -> saved | failed;
-  or cancelled / skipped.
+job states: queued -> launching -> running -> ending -> saved | done | failed |
+  aborted; or cancelled / skipped.  done = ran to its end with save_data=False
+  (no file); aborted = an Abort pressed in liveOD.
 exit codes: 0 saved / done / free, 1 failed (no exit code of its own),
-  N the experiment's own exit code, 2 bad command line, 3 cancelled or skipped,
+  N the experiment's own exit code, 2 bad command line, 3 cancelled, aborted
+  or skipped,
   4 no run queue beaconing, 5 status: queue busy (a job in the slot or a
   person's hold; queue state only, not machine occupancy: use occupancy.py
   (agents) or the dashboard), 6 refused or no answer,
@@ -282,9 +285,9 @@ def _job_word(job: dict) -> str:
 def exit_code_for(job: dict) -> int:
     """The exit code ``kq run`` / ``kq tail -f`` give for an ended job."""
     state = job.get("state")
-    if state == "saved":
+    if state in SUCCEEDED:
         return EXIT_OK
-    if state in ("cancelled", "skipped"):
+    if state in ("cancelled", "aborted", "skipped"):
         return EXIT_NOT_RUN
     code = job.get("exit_code")
     if isinstance(code, int) and code > 0:
@@ -295,8 +298,8 @@ def exit_code_for(job: dict) -> int:
 def _report_end(ctx: _Ctx, job: dict) -> None:
     state = job.get("state")
     run = f"run {job['run_id']}" if job.get("run_id") is not None else "no run id"
-    if state == "saved":
-        ctx.say(f"[kq] {_job_word(job)} saved ({run})"
+    if state in SUCCEEDED:
+        ctx.say(f"[kq] {_job_word(job)} {state} ({run})"
                 + (f": {job.get('reason')}" if job.get("reason") else ""))
         return
     code = job.get("exit_code")
@@ -382,7 +385,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
         sp.add_argument("--at", dest="at", metavar="HH:MM|EPOCH",
                         help="not before this time (local HH:MM: the next such time)")
         sp.add_argument("--depends-on", dest="after", type=int, nargs="+", action="extend",
-                        default=[], metavar="ID", help="only after these jobs have saved")
+                        default=[], metavar="ID",
+                        help="only after these jobs have saved (or are done)")
         if insert:
             where = sp.add_mutually_exclusive_group(required=True)
             where.add_argument("--at-index", type=int, metavar="N",
@@ -435,7 +439,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("--label")
     flag = sp.add_mutually_exclusive_group()
     flag.add_argument("--depends-on", dest="after", type=int, nargs="+", metavar="ID",
-                      help="only after these jobs have saved (replaces the list)")
+                      help="only after these jobs have saved or are done (replaces the "
+                           "list)")
     flag.add_argument("--depends-on-none", dest="after", action="store_const", const=[],
                       help="no dependencies")
     sp.add_argument("--chain", help="chain name ('' clears it)")

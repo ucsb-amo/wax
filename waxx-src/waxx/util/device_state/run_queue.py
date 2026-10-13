@@ -16,14 +16,15 @@ loops in, and calls :meth:`RunQueue.tick` from its watch thread.
 file's SHA-256 at submit, extra ``artiq_run`` arguments, working folder, a
 label, its owner (``"person"`` -- the default -- or ``"agent"``), a priority
 (higher first), an optional due time, jobs it must wait for (``after``: each
-must end *saved*), an optional chain name, and the submitter's write-back veto.
+must end *saved* or *done*), an optional chain name, and the submitter's write-back veto.
 ``repeat`` N submits N jobs in one chain.  States: ``queued`` -> ``running``
 -> ``ending`` (its process has exited; the outcome is being read) ->
-``saved`` | ``failed``; or ``cancelled`` / ``skipped`` (never launched, or
-launched and cancelled).
+``saved`` | ``done`` (ran to its end with ``save_data=False``: no file) |
+``failed`` | ``aborted`` (an Abort pressed in liveOD); or ``cancelled`` /
+``skipped`` (never launched, or launched and cancelled).
 
 **Scheduling.**  One slot.  A job is *eligible* when it is queued, its due time
-has passed, every job in ``after`` is saved, it is not paused (scope "all", or
+has passed, every job in ``after`` is saved (or done), it is not paused (scope "all", or
 "agent" for an agent's job) and -- for an agent's job -- no person's hold is on
 (:mod:`~waxx.util.device_state.person_hold`).  The queue has an explicit
 order: every job has a ``rank`` and the eligible job with the lowest rank goes
@@ -132,10 +133,14 @@ from waxx.util.device_state.run_loop import (
 
 log = logging.getLogger(__name__)
 
-STATES = ("queued", "launching", "running", "ending", "saved", "failed", "cancelled",
-          "skipped")
+STATES = ("queued", "launching", "running", "ending", "saved", "done", "failed", "aborted",
+          "cancelled", "skipped")
 #: States a job ends in.
-ENDED = ("saved", "failed", "cancelled", "skipped")
+ENDED = ("saved", "done", "failed", "aborted", "cancelled", "skipped")
+#: The ended states of a job that ran to its end: "saved", or "done" (a run
+#: with ``save_data=False``: it went to its end and liveOD wrote nothing).
+#: Dependencies, chains and exit codes treat both as success.
+SUCCEEDED = ("saved", "done")
 #: States of the one job in the slot ("launching": saved before its process is
 #: started, so a server that dies meanwhile never starts it twice).
 IN_SLOT = ("launching", "running", "ending")
@@ -818,7 +823,7 @@ class RunQueue:
         of each file (jobs the queue still keeps); one pass over the jobs."""
         by_path: dict = {}
         for j in self._jobs.values():
-            if j.state == "saved" and j.launched_at and j.ended_at:
+            if j.state in SUCCEEDED and j.launched_at and j.ended_at:
                 by_path.setdefault(j.path, []).append(j)
         out = {}
         for path, runs in by_path.items():
@@ -1482,7 +1487,7 @@ class RunQueue:
                     f"{_since_text(job.paused_since)}")
         if job.due is not None and job.due > now:
             return f"due {_since_text(job.due)}"
-        waits = [a for a in job.after if self._dep_state(a) != "saved"]
+        waits = [a for a in job.after if self._dep_state(a) not in SUCCEEDED]
         if waits:
             return "after " + ", ".join(f"#{a} ({self._dep_state(a)})" for a in waits)
         if self._paused.get("all"):
@@ -1625,7 +1630,7 @@ class RunQueue:
                         continue
                     for a in job.after:
                         state = self._dep_state(a)
-                        if state in ENDED and state != "saved":
+                        if state in ENDED and state not in SUCCEEDED:
                             dep = self._jobs.get(a)
                             why = (dep.reason if dep is not None else
                                    "no longer in queue.json; from the journal")
@@ -2046,6 +2051,17 @@ class RunQueue:
                 and str(record.get("queue_job") or "") == job.queue_job
                 and bool(record.get("run_id")))
 
+    @staticmethod
+    def _is_job_unsaved_run(job: Job, record) -> bool:
+        """A liveOD last_outcome record is ``job``'s run that had no file
+        (``save_data=False``: liveOD gives it run id 0, and it prints no
+        "Run ID:" line), matched as :meth:`_is_job_run` does by launcher, job
+        id and token."""
+        return (isinstance(record, dict) and record.get("launcher") == LAUNCHER
+                and bool(job.queue_job)
+                and str(record.get("queue_job") or "") == job.queue_job
+                and record.get("run_id") == 0)
+
     def _identify(self, job: Job, poll) -> None:
         """The job's run id and experiment pid from liveOD (``queue_job``) --
         the primary way; the "Run ID:" line in its output is the fallback (an
@@ -2095,11 +2111,14 @@ class RunQueue:
         self._save()
         self._notify()
         self._take_lines(job, self._read_log(job), final=True)
+        unsaved = None
         if job.run_id is None:
             fresh = self._poll_now()
             if isinstance(fresh, dict):
                 self._identify(job, fresh)
                 self._identify(job, fresh.get("last_outcome"))
+                if job.run_id is None and self._is_job_unsaved_run(job, fresh.get("last_outcome")):
+                    unsaved = dict(fresh["last_outcome"])
         known = proc is not None and getattr(proc, "exit_code_known", True) and code != -1
         exit_code = int(code) if known else None
         tail = list(self._tails.get(job.id, ()))
@@ -2116,9 +2135,10 @@ class RunQueue:
         if self._poll_fn is not None:
             v = judge_run(exit_code, tail, job.run_id, stem,
                           lambda rid: live_od_outcome(self._poll_fn, rid,
-                                                      wait_s=self._outcome_wait_s))
+                                                      wait_s=self._outcome_wait_s),
+                          unsaved=unsaved)
         else:
-            v = judge_run(exit_code, tail, job.run_id, stem, lambda rid: None)
+            v = judge_run(exit_code, tail, job.run_id, stem, lambda rid: None, unsaved=unsaved)
         outcome = {"outcome": (v.outcome or {}).get("outcome"),
                    "detail": (v.outcome or {}).get("detail") or "", "why": v.why,
                    "exit_code": exit_code, "aborted": v.aborted,
@@ -2128,14 +2148,18 @@ class RunQueue:
             job.exit_code = exit_code
             job.outcome = outcome
             if v.saved:
-                state, reason = "saved", ""
+                state = "done" if v.nothing_written else "saved"
+                reason = v.why
                 if job.cancel is not None:
-                    reason = (f"saved before the cancel by {job.cancel.get('by')} reached it"
+                    reason = (f"{'ran to its end' if v.nothing_written else 'saved'} before "
+                              f"the cancel by {job.cancel.get('by')} reached it"
                               + (f" ({job.cancel['abort_note']})"
                                  if job.cancel.get("abort_note") else ""))
             elif job.cancel is not None:
                 state = "cancelled"
                 reason = f"cancelled by {job.cancel.get('by')} while running: {v.why}"
+            elif v.aborted:
+                state, reason = "aborted", v.why
             else:
                 state, reason = "failed", v.why
             if proc is None and job.adopted is False and state == "failed":
@@ -2143,7 +2167,11 @@ class RunQueue:
             elif proc is None and state == "saved":
                 reason = (f"its process ended while the monitor server was down; liveOD "
                           f"recorded run {job.run_id} saved")
-            self._end(job, state, reason, stop_chain=state in ("failed", "cancelled"))
+            elif proc is None and state == "done":
+                reason = ("its process ended while the monitor server was down; liveOD "
+                          "recorded its run (save_data=False) as ended with nothing written")
+            self._end(job, state, reason,
+                      stop_chain=state in ("failed", "aborted", "cancelled"))
             self._current = None
             self._last_end_t = self._clock()
             self._last_ended_run_id = job.run_id
@@ -2153,11 +2181,12 @@ class RunQueue:
                 proc.close()
             except Exception:                         # noqa: BLE001
                 pass
-        (log.info if state == "saved" else log.warning)(
-            "Run queue: %s %s%s%s", job.name, state if state == "saved" else state.upper(),
+        ok = state in SUCCEEDED
+        (log.info if ok else log.warning)(
+            "Run queue: %s %s%s%s", job.name, state if ok else state.upper(),
             f" (run {job.run_id})" if job.run_id is not None else "",
             f": {reason}" if reason else "")
-        if state != "saved" and tail:
+        if not ok and tail:
             for line in tail[-8:]:
                 log.warning("    | %s", line)
         self._save()

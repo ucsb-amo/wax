@@ -24,6 +24,9 @@ from waxx.util.device_state.op_journal import describe_entry
 from waxx.util.guis.device_summary import (
     MakeSafeDialog, MonitorNotice, SummaryStrip, reset_title)
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
+from waxx.util.guis.slm_actions import (  # noqa: F401 (re-exported)
+    SLM_LOG_MAX_LINES, SLM_LOG_POLL_MS, SlmActions, SlmLogWindow,
+)
 from waxa.helper.name_search import (
     parse_name_search_terms,
     name_matches_all_terms,
@@ -66,8 +69,6 @@ RECONCILE_MS = 10000                 # periodic full-snapshot safety reconcile
 STALE_WIDGET_RETRY_MS = 500          # re-sync a widget skipped while it was busy
 TELEMETRY_PULL_MS = 1000             # measured values into the cards and the strip
 JOURNAL_LOAD_N = 1000                # server journal records the changes window loads
-SLM_LOG_POLL_MS = 1000               # an open SLM log window asks for new lines this often
-SLM_LOG_MAX_LINES = 5000             # lines an SLM log window keeps
 
 _SETTINGS_ORG = "waxx"
 _SETTINGS_APP = "device_control_gui"
@@ -1610,161 +1611,6 @@ class ChangesLogWindow(QWidget):
         super().closeEvent(event)
 
 
-class SlmLogWindow(QWidget):
-    """Pop-out window following the SLM server's log (the SLM pill's "View
-    SLM server log…"): every line the server and its supervisor write on the
-    SLM PC.
-
-    The monitor server fetches the log from the SLM PC while this window asks
-    for it (the host GUI, every ``SLM_LOG_POLL_MS``) and keeps its last lines,
-    numbered (``OutputLog``), so the window asks only for lines after
-    :attr:`after`. Parentless (own taskbar entry) like
-    :class:`ChangesLogWindow`; deleted on close -- opened again, it loads
-    what the monitor server kept.
-    """
-
-    closed = pyqtSignal()
-
-    _GEOMETRY_KEY = "ui/slm_log_geometry"
-
-    def __init__(self):
-        super().__init__(None, Qt.WindowType.Window)
-        self.setWindowTitle("SLM server log")
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setStyleSheet(f"background: {theme.BG};")
-        #: Number of the last line shown (the monitor server's numbering).
-        self.after = 0
-        #: A request is on its way (the host sends one at a time).
-        self.fetching = False
-        #: The monitor server cannot send the log (older code): stop asking.
-        self.unsupported = False
-
-        box = QVBoxLayout(self)
-        box.setContentsMargins(6, 6, 6, 6)
-        box.setSpacing(4)
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        self.status_label = QLabel("Asking the monitor server for the SLM server's log…")
-        self.status_label.setWordWrap(True)
-        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._set_status(self.status_label.text(), theme.FG_MUTED)
-        head.addWidget(self.status_label, 1)
-        self.copy_button = QPushButton("Copy")
-        self.copy_button.setToolTip("Copy every line shown to the clipboard.")
-        self.copy_button.clicked.connect(self._copy_all)
-        head.addWidget(self.copy_button)
-        self.save_button = QPushButton("Save…")
-        self.save_button.setToolTip("Save the lines shown to a text file.")
-        self.save_button.clicked.connect(self._save)
-        head.addWidget(self.save_button)
-        box.addLayout(head)
-
-        self.text = QPlainTextEdit()
-        self.text.setReadOnly(True)
-        self.text.setMaximumBlockCount(SLM_LOG_MAX_LINES)
-        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        mono.setPointSize(9)
-        self.text.setFont(mono)
-        self.text.setStyleSheet(
-            f"QPlainTextEdit {{ color: {theme.FG}; background: {theme.BG_SUNKEN}; "
-            f"border: 1px solid {theme.BORDER}; border-radius: 4px; }}")
-        self.text.setPlaceholderText("No lines yet.")
-        box.addWidget(self.text, 1)
-
-        self.resize(900, 420)
-        geom = _setting(self._GEOMETRY_KEY, None)
-        if isinstance(geom, QByteArray) and not geom.isEmpty():
-            try:
-                self.restoreGeometry(geom)
-            except Exception:
-                pass
-
-    def request(self) -> dict:
-        return {"type": "output", "kind": "slm", "after": self.after}
-
-    def add_output(self, reply: dict) -> bool:
-        """Show one ``output`` reply; True when the monitor server has more
-        lines waiting."""
-        if reply.get("status") != "ok":
-            msg = str(reply.get("msg") or "no reply")
-            if "unknown output kind" in msg or "unknown type" in msg:
-                self.unsupported = True
-                self._set_status("This monitor server cannot send the SLM server's log (it "
-                                 "is from before 2026-09-28): restart the monitor server, then "
-                                 "open this window again.", theme.WARN)
-            else:
-                self._set_status(f"No answer from the monitor server: {msg}", theme.WARN)
-            return False
-        try:
-            first, nxt = int(reply.get("first", 0)), int(reply.get("next", 0))
-        except (TypeError, ValueError):
-            return False
-        if nxt <= self.after:
-            # The monitor server restarted (its numbering started again).
-            self.text.clear()
-            self.after = 0
-            return True
-        lines = [str(x) for x in (reply.get("lines") or [])]
-        if lines and first > self.after + 1:
-            lines.insert(0, "(earlier lines: in the log files on the SLM PC)" if self.after == 0
-                         else f"({first - self.after - 1} lines were not kept here)")
-        if lines:
-            bar = self.text.verticalScrollBar()
-            at_end = bar.value() >= bar.maximum() - 2
-            self.text.appendPlainText("\n".join(lines))
-            if at_end:
-                bar.setValue(bar.maximum())
-        self.after = max(self.after, nxt - 1)
-        self._show_follow(reply.get("follow") or {})
-        return bool(reply.get("more"))
-
-    def _show_follow(self, follow: dict) -> None:
-        state = follow.get("state")
-        detail = str(follow.get("detail") or "")
-        if state == "following":
-            text = "Following the SLM server's log"
-            if follow.get("path"):
-                text += f" · {follow['path']} on the SLM PC"
-            if isinstance(follow.get("last_fetch"), (int, float)):
-                text += (" · fetched "
-                         + time.strftime("%H:%M:%S", time.localtime(follow["last_fetch"])))
-            self._set_status(text, theme.FG_MUTED)
-        elif state == "trouble":
-            self._set_status(f"⚠ {detail}", theme.WARN)
-        elif state == "waiting":
-            self._set_status(f"Waiting: {detail}", theme.FG_MUTED)
-        else:
-            self._set_status("Asking the SLM server for its log…", theme.FG_MUTED)
-
-    def _set_status(self, text: str, color: str) -> None:
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color};")
-
-    def _copy_all(self) -> None:
-        app = QApplication.instance()
-        if app is not None:
-            app.clipboard().setText(self.text.toPlainText())
-
-    def _save(self) -> None:
-        default = f"slm_server_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-        path, _ = QFileDialog.getSaveFileName(self, "Save the SLM server log", default,
-                                              "Text (*.txt)")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(self.text.toPlainText() + "\n")
-        except OSError as e:
-            QMessageBox.warning(self, "Save the SLM server log", f"Not saved:\n{e}")
-
-    def closeEvent(self, event):
-        _save_setting(self._GEOMETRY_KEY, self.saveGeometry())
-        self.closed.emit()
-        super().closeEvent(event)
-
-
 class DeviceStateGUI(QMainWindow):
     """Main GUI application for device state management.
 
@@ -1865,8 +1711,7 @@ class DeviceStateGUI(QMainWindow):
         self._changes: deque = deque(maxlen=CHANGES_LOG_MAX_ROWS)
         self._changes_window: ChangesLogWindow | None = None
         # The SLM pill's log window, and its poll (running only while it is open).
-        self._slm_log_window: SlmLogWindow | None = None
-        self._slm_log_timer: QTimer | None = None
+        self.slm_actions: SlmActions | None = None
 
         self.setup_ui()
         self._setup_update_sender()
@@ -2197,10 +2042,15 @@ class DeviceStateGUI(QMainWindow):
         # The SLM's reinit (and the spot finder launcher), beside them.
         from waxx.util.guis.slm_pill import SlmPill  # noqa: PLC0415
         self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
-        self.slm_pill.reinit_requested.connect(self._request_slm_reinit)
-        self.slm_pill.restart_requested.connect(self._request_slm_restart)
-        self.slm_pill.log_requested.connect(self._open_slm_log)
-        self.slm_pill.spot_finder_requested.connect(self._launch_spot_finder)
+        # What its menu does: shared with the monitor state bar.  Late-bound
+        # (the send path and the launcher are looked up at each use).
+        self.slm_actions = SlmActions(
+            self.slm_pill,
+            lambda obj, cb, **kw: self._send_request(obj, cb, **kw),
+            dialog_parent=self, record=self._record_line,
+            launcher=(lambda: self._spot_finder_launcher())
+            if self._spot_finder_launcher is not None else None,
+            settings=_gui_settings)
         row.addWidget(self.slm_pill)
 
         # The changes log lives in its own pop-out window (see
@@ -2797,142 +2647,36 @@ class DeviceStateGUI(QMainWindow):
             host = ""
         self._send_request({"type": "reset_state", "client": host}, self._on_reset_reply)
 
-    def _request_slm_reinit(self) -> None:
-        """The SLM pill's "Re-initialise SLM now": the monitor server sends it
-        only while the machine is idle, and says so if it is not."""
-        pill = self.slm_pill
-        if pill is None:
-            return
-        allowed, why = pill.reinit_allowed()
-        if not allowed:
-            QMessageBox.warning(self, "Re-initialise SLM", f"Not sent: {why}.")
-            return
-        from waxx.util.guis.slm_pill import describe_next  # noqa: PLC0415
-        nxt = describe_next(pill.snapshot)
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Re-initialise SLM")
-        box.setText("The SLM server re-initialises the SLM now (a few seconds) and puts the "
-                    "pattern it shows back. The monitor server sends it only while no run is "
-                    "starting or running."
-                    + (f"\n\n{nxt}; the hour restarts after this one." if nxt else ""))
-        yes = box.addButton("Re-initialise", QMessageBox.ButtonRole.AcceptRole)
-        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        delete_later(box)
-        if clicked is not yes:
-            return
-        try:
-            host = socket.gethostname()
-        except Exception:
-            host = ""
-        self._send_request({"type": "slm_reinit", "action": "reinit", "client": host},
-                           self._on_slm_reinit_reply)
+    # The SLM pill's menu is carried out by slm_actions.SlmActions (shared with
+    # the monitor state bar); these names stay for callers and tests.
 
-    def _on_slm_reinit_reply(self, reply: dict) -> None:
-        if reply.get("status") == "ok":
-            self._record_line("[slm] reinit asked for; the monitor server sends it now")
-        else:
-            self._record_line(f"[slm] reinit refused: {reply.get('msg')}")
-            QMessageBox.warning(self, "Re-initialise SLM",
-                                f"The monitor server did not send it: {reply.get('msg')}")
+    @property
+    def _slm_log_window(self) -> SlmLogWindow | None:
+        return self.slm_actions.log_window if self.slm_actions is not None else None
+
+    @property
+    def _slm_log_timer(self) -> QTimer | None:
+        return self.slm_actions.log_timer if self.slm_actions is not None else None
+
+    def _request_slm_reinit(self) -> None:
+        if self.slm_actions is not None:
+            self.slm_actions.request_reinit()
 
     def _request_slm_restart(self) -> None:
-        """The SLM pill's "Restart SLM server": the server process exits and its
-        supervisor on the SLM PC starts a new one; only while the machine is idle."""
-        pill = self.slm_pill
-        if pill is None:
-            return
-        allowed, why = pill.restart_allowed()
-        if not allowed:
-            QMessageBox.warning(self, "Restart SLM server", f"Not sent: {why}.")
-            return
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Restart SLM server")
-        box.setText("The SLM server process exits and its supervisor on the SLM PC starts a "
-                    "new one (a few seconds): it re-initialises the SLM and puts the saved "
-                    "pattern back. The monitor server sends it only while no run is starting "
-                    "or running; a run started in those seconds fails its mask write with an "
-                    "error rather than running without its mask.")
-        yes = box.addButton("Restart", QMessageBox.ButtonRole.AcceptRole)
-        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        delete_later(box)
-        if clicked is not yes:
-            return
-        try:
-            host = socket.gethostname()
-        except Exception:
-            host = ""
-        self._send_request({"type": "slm_reinit", "action": "restart", "client": host},
-                           self._on_slm_restart_reply)
-
-    def _on_slm_restart_reply(self, reply: dict) -> None:
-        if reply.get("status") == "ok":
-            self._record_line("[slm] server restart asked for; the monitor server sends it now")
-        else:
-            self._record_line(f"[slm] server restart refused: {reply.get('msg')}")
-            QMessageBox.warning(self, "Restart SLM server",
-                                f"The monitor server did not send it: {reply.get('msg')}")
+        if self.slm_actions is not None:
+            self.slm_actions.request_restart()
 
     def _open_slm_log(self) -> None:
-        """The SLM pill's "View SLM server log": the log window, following the
-        log (through the monitor server) while it is open."""
-        if self._slm_log_window is None:
-            win = SlmLogWindow()
-            win.setWindowIcon(self.windowIcon())
-            win.closed.connect(self._on_slm_log_window_closed)
-            self._slm_log_window = win
-            if self._slm_log_timer is None:
-                self._slm_log_timer = QTimer(self)
-                self._slm_log_timer.timeout.connect(self._poll_slm_log)
-            self._slm_log_timer.start(SLM_LOG_POLL_MS)
-            self._poll_slm_log()
-        self._slm_log_window.show()
-        self._slm_log_window.raise_()
-        self._slm_log_window.activateWindow()
+        if self.slm_actions is not None:
+            self.slm_actions.open_log()
 
     def _poll_slm_log(self) -> None:
-        win = self._slm_log_window
-        if win is None:
-            if self._slm_log_timer is not None:
-                self._slm_log_timer.stop()
-            return
-        if win.fetching or win.unsupported:
-            return
-        win.fetching = True
-        self._send_request(win.request(), lambda reply, w=win: self._on_slm_log_reply(w, reply),
-                           timeout=2.0, attempts=1)
-
-    def _on_slm_log_reply(self, win: SlmLogWindow, reply: dict) -> None:
-        if win is not self._slm_log_window:
-            return                  # closed (or replaced) meanwhile
-        win.fetching = False
-        if win.add_output(reply):
-            self._poll_slm_log()    # more lines waiting: ask again now
-
-    def _on_slm_log_window_closed(self) -> None:
-        self._slm_log_window = None
-        if self._slm_log_timer is not None:
-            self._slm_log_timer.stop()
+        if self.slm_actions is not None:
+            self.slm_actions.poll_log()
 
     def _launch_spot_finder(self) -> None:
-        """The SLM pill's "Launch spot finder": the lab's launcher, on this PC."""
-        if self._spot_finder_launcher is None:
-            return
-        try:
-            what = self._spot_finder_launcher()
-        except Exception as e:
-            self._record_line(f"[slm] spot finder did not start: {e}")
-            QMessageBox.warning(self, "Launch spot finder",
-                                f"The spot finder did not start:\n{e}")
-            return
-        self._record_line(f"[slm] spot finder started{f' ({what})' if what else ''}")
+        if self.slm_actions is not None:
+            self.slm_actions.launch_spot_finder()
 
     def _on_reset_reply(self, reply: dict) -> None:
         if reply.get("status") == "ok":
@@ -3558,12 +3302,8 @@ class DeviceStateGUI(QMainWindow):
         if win is not None:
             self._changes_window = None
             win.close()
-        slm_log = self._slm_log_window
-        if slm_log is not None:
-            self._slm_log_window = None
-            slm_log.close()
-        if self._slm_log_timer is not None:
-            self._slm_log_timer.stop()
+        if self.slm_actions is not None:
+            self.slm_actions.shutdown()
         if self.composite_panel is not None:
             self.composite_panel.shutdown()
         if self.sequences_panel is not None:

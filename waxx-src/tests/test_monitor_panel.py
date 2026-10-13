@@ -1,7 +1,7 @@
 """The Server Dashboard's monitor panel (waxx.util.guis.monitor_panel): its
 link to the server (lazy discovery, a dropped client rediscovered, writes
-sent once, reads retried), the status poll and broadcasts feeding the Queue,
-State and Monitor tabs, the monitor experiment's button, and cleanup.
+sent once, reads retried), the status poll and broadcasts feeding the state
+bar and the queue, the monitor experiment's pill, and cleanup.
 
 Offscreen Qt.  The MonitorClient is a fake answering from a table: no
 discovery, no socket (socket.socket is replaced by one that fails the test),
@@ -123,22 +123,25 @@ def test_no_discovery_until_the_first_request(qapp, factory):
     p = mp.MonitorServerPanel(link=mp.MonitorLink(factory), listener_factory=None,
                               synchronous=True)
     assert factory.made == []                                    # built, nothing discovered
-    assert [p.tabs.tabText(i) for i in range(p.tabs.count())] == ["Queue", "State", "Monitor"]
+    # one page: the state bar over the queue, no tabs
+    assert p.isAncestorOf(p.state_panel) and p.isAncestorOf(p.queue_panel)
+    assert not hasattr(p, "tabs")
+    assert p.monitor_control.button is p.state_panel.monitor_pill
     p.cleanup()
     p.cleanup()                                                  # twice is harmless
 
 
-def test_show_polls_lists_listens_and_feeds_the_tabs(panel, factory, qapp):
+def test_show_polls_lists_listens_and_feeds_the_parts(panel, factory, qapp):
     panel.show()
     qapp.processEvents()
     client = factory.made[0]
     assert panel.listeners and panel.listeners[0].started
     assert panel.queue_panel.reachable and panel.queue_panel.queue_state() == "idle"
     assert panel.state_panel.monitor_pill.text() == "NOT READY"
-    assert panel.monitor_tab.button.text() == "NOT READY"
+    assert panel.monitor_control.button.text() == "NOT READY"
     sent = [obj for obj, _ in client.requests]
     assert {"type": "run_queue", "action": "list", "limit": 200} in sent
-    # a broadcast from the listener reaches the tabs
+    # a broadcast from the listener reaches the bar and the queue
     panel.listeners[0].state_received.emit({"type": "person_hold",
                                             "person_hold": {"active": True, "by": "x"}})
     assert panel.queue_panel.hold_button.text() == "Release hold"
@@ -167,7 +170,8 @@ def test_a_silent_server_is_rediscovered(panel, factory):
     first.silent = True
     panel.poll_status(force=True)                                # no answer: client dropped
     assert not panel.queue_panel.reachable
-    assert panel.monitor_tab.button.text() == "monitor server not answering"
+    assert panel.monitor_control.button.text() == "?"
+    assert not panel.monitor_control.button.isEnabled()
     panel.poll_status(force=True)                                # a fresh discovery
     assert len(factory.made) == 2 and panel.queue_panel.reachable
 
@@ -182,17 +186,17 @@ def test_no_server_found_is_an_error_reply_not_a_crash(qapp):
 def test_the_monitor_button(panel, factory):
     panel.poll_status(force=True)
     client = factory.made[0]
-    assert panel.monitor_tab.clicked()                            # NOT READY: start, no ask
+    assert panel.monitor_control.clicked()                            # NOT READY: start, no ask
     assert client.texts == [("reset", 1)] and panel.confirms == []
     client.status = dict(STATUS, state=0, state_name="READY", sub_state="running")
     panel.poll_status(force=True)
-    assert panel.monitor_tab.button.text() == "READY"
+    assert panel.monitor_control.button.text() == "READY"
     panel.confirm = lambda title, text: False
-    assert not panel.monitor_tab.clicked()                        # READY: asks; declined
+    assert not panel.monitor_control.clicked()                        # READY: asks; declined
     assert len(client.texts) == 1
     client.status = dict(STATUS, state=1, state_name="LOADING", sub_state="starting")
     panel.poll_status(force=True)
-    assert not panel.monitor_tab.button.isEnabled() and not panel.monitor_tab.clicked()
+    assert not panel.monitor_control.button.isEnabled() and not panel.monitor_control.clicked()
 
 
 def test_cleanup_stops_the_poll_and_the_listener(panel, qapp):
@@ -251,14 +255,14 @@ def test_start_asks_whenever_the_core_may_be_held(panel, factory, extra, word):
     panel.poll_status(force=True)
     asked = []
     panel.confirm = lambda title, text: asked.append((title, text)) or False
-    assert not panel.monitor_tab.clicked()
+    assert not panel.monitor_control.clicked()
     title, text = asked[-1]
     assert title == "Start monitor"
     assert "An experiment probably holds the core device." in text
     assert "takes the core and cuts that experiment off" in text and word in text
     assert client.texts == []
     panel.confirm = lambda title, text: True
-    assert panel.monitor_tab.clicked() and client.texts == [("reset", 1)]
+    assert panel.monitor_control.clicked() and client.texts == [("reset", 1)]
 
 
 def test_restart_names_what_holds_the_core(panel, factory):
@@ -269,7 +273,7 @@ def test_restart_names_what_holds_the_core(panel, factory):
     panel.poll_status(force=True)
     asked = []
     panel.confirm = lambda title, text: asked.append((title, text)) or False
-    assert not panel.monitor_tab.clicked()
+    assert not panel.monitor_control.clicked()
     assert asked[-1][0] == "Restart monitor"
     assert "this will interrupt it" in asked[-1][1] and "run 85703 (rabi)" in asked[-1][1]
 
@@ -282,7 +286,7 @@ def test_a_double_click_sends_one_reset(panel, factory):
     queued = []
     real_call = panel.runner.call
     panel.runner.call = lambda fn, callback=None: queued.append((fn, callback))  # held
-    tab = panel.monitor_tab
+    tab = panel.monitor_control
     tab.button.click()
     tab.button.click()
     assert len(queued) == 1 and tab.in_flight and not tab.button.isEnabled()

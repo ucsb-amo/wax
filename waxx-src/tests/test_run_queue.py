@@ -462,11 +462,62 @@ def test_outcomes(q, expts):
     saved, aborted, incomplete = (job(q, i) for i in ids)
     assert saved["state"] == "saved" and saved["outcome"]["outcome"] == "saved"
     assert saved["exit_code"] == 0 and saved["reason"] == ""
-    assert aborted["state"] == "failed" and aborted["outcome"]["aborted"]
+    assert aborted["state"] == "aborted" and aborted["outcome"]["aborted"]
     assert "aborted in liveOD" in aborted["reason"]
     assert incomplete["state"] == "failed" and "saved_incomplete" in incomplete["reason"]
     ends = [e for e in q.journal.entries if e["kind"] == "run_queue_end"]
-    assert [e["state"] for e in ends] == ["saved", "failed", "failed"]
+    assert [e["state"] for e in ends] == ["saved", "aborted", "failed"]
+
+
+def no_file_run(q, a, outcome="nothing_written", code=0, lines=(), tag=True):
+    """The job in the slot runs with save_data=False: liveOD gives it run id 0
+    (no "Run ID:" line) and records ``outcome`` for it at its END_RUN."""
+    proc = q.spawner.procs[-1]
+    who = dict(launcher="kq", queue_job=qj(q, a)) if tag else {}
+    q.live.start_run(0, client_pid=7000, client_host="kong", **who)
+    proc.write("run id 0 complete at 2026-10-12 15:07:34  (mot_observe)", *lines)
+    q.tick()
+    q.live.end_run(0, outcome, "save_data=False" if outcome == "nothing_written" else "reset")
+    q.live.state["last_outcome"].update(who)
+    proc.code = code
+    q.tick()
+
+
+def test_a_run_without_a_file_that_runs_to_its_end_is_done(q, expts):
+    a, b = submit(q, expts), submit(q, expts, "tof", after=[1])
+    q.tick()
+    no_file_run(q, a)
+    j = job(q, a)
+    assert j["state"] == "done" and j["run_id"] is None and j["exit_code"] == 0
+    assert "save_data=False" in j["reason"] and j["outcome"]["outcome"] == "nothing_written"
+    q.tick()
+    assert job(q, b)["state"] == "running"                # a done job satisfies `after`
+
+
+def test_a_run_without_a_file_aborted_in_live_od_is_aborted_and_stops_its_chain(q, expts):
+    a, b = submit(q, expts, repeat=2, chain="c")
+    q.tick()
+    no_file_run(q, a, outcome="discarded", code=1,
+                lines=["RuntimeError: Acquisition for run 0 aborted."])
+    j = job(q, a)
+    assert j["state"] == "aborted" and j["outcome"]["aborted"]
+    assert "no file" in j["reason"] and "discarded" not in j["reason"]
+    assert job(q, b)["state"] == "cancelled" and "aborted" in job(q, b)["reason"]
+
+
+def test_a_run_without_a_file_is_done_only_on_its_own_record(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    no_file_run(q, a, tag=False)                          # liveOD's record names no job
+    j = job(q, a)
+    assert j["state"] == "failed" and "without a run id" in j["reason"]
+
+
+def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    no_file_run(q, a, code=1, lines=["Traceback (most recent call last):", "ValueError: x"])
+    assert job(q, a)["state"] == "failed"
 
 
 def test_a_job_killed_hard_is_reported_to_live_od(q, expts):

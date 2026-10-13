@@ -5,7 +5,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
-                             QMessageBox, QTabWidget)
+                             QMessageBox)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 
@@ -1704,14 +1704,15 @@ class MonitorUDPServer(UdpServer):
 class MonitorServerGUI(QWidget):
     """The monitor server's own window, when the server is run as a GUI
     (launched by hand).  The Server Dashboard does not embed it: it runs the
-    server headless (``monitor_server_headless``) and shows the same three
-    tabs over the network in
-    :class:`~waxx.util.guis.monitor_panel.MonitorServerPanel`.
+    server headless (``monitor_server_headless``) and shows the same over the
+    network in :class:`~waxx.util.guis.monitor_panel.MonitorServerPanel`.
 
-    Three tabs: **Queue** (:class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`),
-    **State** (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`)
-    and **Monitor** -- the monitor experiment's big status button (click: start
-    it, or restart it after a confirm).  Both panels act through a direct call
+    One page: the state bar
+    (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`), holding
+    this window's monitor pill (:attr:`status_indicator`, driven by
+    :meth:`set_status`; click: start it, or restart it after a confirm), over
+    the run queue (:class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`).
+    Both panels act through a direct call
     into this window's server (:meth:`direct_request`: ``generate_reply`` on a
     worker thread, the way a TCP client's request is answered -- no
     discovery, no socket), get ``status_json`` the same way every
@@ -1733,10 +1734,13 @@ class MonitorServerGUI(QWidget):
                 run_loops=(),
                 connections=(),
                 slm_reinit=None,
-                state_generator=None):
+                state_generator=None,
+                queue_settings=None):
         super().__init__()
 
         self.config_file_path = config_file_path
+        # a QSettings for the queue table's columns and filter; None: not remembered
+        self.queue_settings = queue_settings
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
         self.run_loops = tuple(run_loops or ())
@@ -1839,26 +1843,20 @@ class MonitorServerGUI(QWidget):
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+        # the monitor experiment's pill, in the state bar; this window drives
+        # it itself (set_status), from its own monitor manager
         self.status_indicator = QPushButton("NOT READY")
         self.status_indicator.clicked.connect(self.on_button_clicked)
-        font = QFont()
-        font.setPointSize(24)
-        font.setBold(True)
-        self.status_indicator.setFont(font)
 
         # one worker thread for the panels' requests and the status poll
         self.request_runner = RequestRunner(self.direct_request, parent=self)
-        self.queue_panel = RunQueuePanel(runner=self.request_runner)
-        self.state_panel = MonitorStatePanel(runner=self.request_runner)
-        monitor_page = QWidget()
-        monitor_box = QVBoxLayout(monitor_page)
-        monitor_box.addWidget(self.status_indicator)
-        monitor_box.addStretch(1)
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.queue_panel, "Queue")
-        self.tabs.addTab(self.state_panel, "State")
-        self.tabs.addTab(monitor_page, "Monitor")
-        layout.addWidget(self.tabs)
+        self.state_panel = MonitorStatePanel(runner=self.request_runner,
+                                             monitor_button=self.status_indicator)
+        self.queue_panel = RunQueuePanel(runner=self.request_runner,
+                                         settings=self.queue_settings)
+        layout.addWidget(self.state_panel)
+        layout.addWidget(self.queue_panel, 1)
         self.setLayout(layout)
 
     # --- the Queue and State tabs ---------------------------------------------------
@@ -2007,15 +2005,16 @@ class MonitorServerGUI(QWidget):
                 log.info("state: %s -> %s", previous, current)
             self._logged_state = current
 
+        from waxx.util.guis.monitor_state_panel import monitor_button_css  # noqa: PLC0415
         if status == STATES.READY:
             self.status_indicator.setText("READY")
-            self.status_indicator.setStyleSheet("background-color: green; color: white;")
+            self.status_indicator.setStyleSheet(monitor_button_css("on"))
         elif status == STATES.NOT_READY:
             self.status_indicator.setText("NOT READY")
-            self.status_indicator.setStyleSheet("background-color: #c46666; color: white;")
+            self.status_indicator.setStyleSheet(monitor_button_css("hazard"))
         else:
-            self.status_indicator.setText("Loading...")
-            self.status_indicator.setStyleSheet("background-color: orange; color: white;")
+            self.status_indicator.setText("LOADING")
+            self.status_indicator.setStyleSheet(monitor_button_css("partial"))
 
     def check_monitor_status(self):
         running = self.monitor_manager.isRunning()
