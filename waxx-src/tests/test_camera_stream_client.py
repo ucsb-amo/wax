@@ -428,6 +428,56 @@ def test_key_collision_and_late_registration_refused():
                            _server_defaults=DEFAULTS)
 
 
+def test_deferred_stream_registers_nothing_until_register():
+    fe = FakeExpt()
+    stream = FakeStream()
+    cs = CameraStreamClient(fe, "12345", "img_test", _stream=stream,
+                            _server_defaults=DEFAULTS, defer_register=True)
+    try:
+        assert cs._frame_shape == (6, 5)            # set up: probe frame taken
+        assert not hasattr(fe.data, "img_test")
+        assert fe.camera_streams == []
+        assert not hasattr(cs, "_worker")
+        cs.register()
+        cs.register()                               # once only
+        assert isinstance(fe.data.img_test, HostDataContainer)
+        assert fe.camera_streams == [cs]
+        assert cs._worker.is_alive()
+    finally:
+        cs.finish()
+
+
+def test_abandoned_deferred_stream_puts_the_camera_back():
+    from waxx.control.cameras.camera_stream_client import TriggeredCameraStreamClient
+    fe = FakeExpt()
+    stream = TrigFakeStream()
+    cs = TriggeredCameraStreamClient(
+        fe, "12345", "img_test", ttl=FakeTTL(), trigger_source="Line2",
+        _stream=stream, _server_defaults=DEFAULTS, defer_register=True)
+    assert stream._settings["trigger_mode"] == "On" and stream.live
+    cs.abandon()
+    assert stream._settings["trigger_mode"] == "Off"
+    assert stream._settings["trigger_source"] == "Line1"
+    assert not stream.live and stream.closed
+    assert fe.camera_streams == [] and not hasattr(fe.data, "img_test")
+
+
+def test_register_rechecks_keys_taken_since_setup():
+    fe = FakeExpt()
+    a = CameraStreamClient(fe, "12345", "img_test", _stream=FakeStream(),
+                           _server_defaults=DEFAULTS, defer_register=True)
+    b = CameraStreamClient(fe, "67890", "img_test", _stream=FakeStream(),
+                           _server_defaults=DEFAULTS, defer_register=True)
+    try:
+        a.register()
+        with pytest.raises(ValueError):
+            b.register()
+        assert fe.camera_streams == [a]
+    finally:
+        b.abandon()
+        a.finish()
+
+
 def test_dummy_registers_placeholder_containers():
     from waxx.control.cameras.camera_stream_client import (
         DummyCameraStreamClient)

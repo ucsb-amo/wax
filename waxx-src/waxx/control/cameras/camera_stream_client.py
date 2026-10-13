@@ -78,11 +78,13 @@ LIVEOD_SERVER_SUFFIX = ":liveod"      # liveOD's camera host: camera_server:<hos
 
 _shared_dir = None
 _shared_dir_lock = threading.Lock()
-_beacons_collected = False
+# The experiment's LiveODClient is one REQ socket with no lock of its own:
+# streams set up in parallel (kexp camera_streams) take turns on it.
+_live_od_lock = threading.Lock()
 
 
 def shared_camera_directory():
-    """One CameraDirectory per process (its camera listing costs 2 s)."""
+    """One CameraDirectory per process (its first listing waits for beacons)."""
     global _shared_dir
     with _shared_dir_lock:
         if _shared_dir is None:
@@ -196,8 +198,12 @@ class CameraStreamClient:
                  exposure_time=None, gain=None, roi=None, crop_to_saved_roi=True,
                  no_roi_downsample=1, frame_timeout_s=5.0, t_snap_lead=0.0,
                  t_late_tolerance=T_LATE_TOLERANCE_S, label=None,
-                 live_od_client=None, directory=None,
+                 live_od_client=None, directory=None, defer_register=False,
                  _stream=None, _server_defaults=None):
+        """``defer_register``: set the camera up but register nothing with
+        the experiment (no containers, no worker); the caller then calls
+        ``register()`` -- from the thread that owns the experiment, in a fixed
+        order -- or ``abandon()``. For setting several streams up in parallel."""
         from beacon.camera.directory import query_string
 
         self._expt = expt
@@ -267,8 +273,21 @@ class CameraStreamClient:
                   f"Save an ROI for it in the camera viewer.")
         self._frame_shape = tuple(frame0.shape)
         self._frame_dtype = frame0.dtype
+        self._registered = False
+        if not defer_register:
+            self.register()
 
-        self._register_containers()
+    def register(self):
+        """Containers, ``expt.camera_streams``, the worker thread and the
+        abort-path cleanup (done by ``__init__`` unless ``defer_register``)."""
+        if self._registered:
+            return
+        expt = self._expt
+        # again: a stream set up alongside this one may have taken a key since
+        for k in getattr(self, "keys", (self.key,)):
+            self._check_key_available(expt, k)
+        self._register_containers()      # a failure here leaves it to abandon()
+        self._registered = True
         if not hasattr(expt, "camera_streams"):
             expt.camera_streams = []
         expt.camera_streams.append(self)
@@ -283,6 +302,14 @@ class CameraStreamClient:
                      + (f", roi {self._roi}" if self._roi else "")
                      + f", settings {_values(self._applied) or 'as saved'}",
                      console.VERBOSE)
+
+    def abandon(self):
+        """A stream set up with ``defer_register`` that will not be used: the
+        camera back as it was found, the connection closed. Never raises."""
+        if self._registered:
+            return
+        self._finished = True
+        self._restore_and_close()
 
     # ---- kernel side -----------------------------------------------------
 
@@ -366,7 +393,8 @@ class CameraStreamClient:
         if self._liveod_key is not None:
             if state not in ("open", "grabbing"):
                 try:
-                    self._live_od_client.open_camera(self._liveod_key)
+                    with _live_od_lock:
+                        self._live_od_client.open_camera(self._liveod_key)
                 except Exception as e:
                     raise RuntimeError(
                         f"[{self.label}] {self.serial} is on liveOD's bar as "
@@ -399,7 +427,8 @@ class CameraStreamClient:
         if self._live_od_client is None:
             return None, None
         try:
-            cams = self._live_od_client.cameras()
+            with _live_od_lock:
+                cams = self._live_od_client.cameras()
         except Exception:
             return None, None
         for k, v in cams.items():
@@ -415,7 +444,6 @@ class CameraStreamClient:
         from beacon.camera.viewer.sources import defaults_to_si
         from beacon.discovery import client as dc
 
-        global _beacons_collected
         host = self._stream.entry.host
 
         def on_host(entries):
@@ -426,9 +454,7 @@ class CameraStreamClient:
                     return str(sid)
             return None
 
-        if not _beacons_collected:          # 2 s, once per process
-            dc.discover_prefix(LEGACY_PREFIX, collect_for=2.0)
-            _beacons_collected = True
+        dc.ensure_listened()        # waits only while the process is new to beacons
         try:
             server = on_host(dc.discover_entries(LEGACY_PREFIX, max_age=10.0))
         except Exception:
