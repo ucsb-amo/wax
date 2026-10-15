@@ -1,8 +1,8 @@
 """waxx Expt: the claim (queue phase 2) and the source-text snapshot (M0).
 
 Host-only, offline: a stand-in object with the real Expt methods bound, a
-recording fake liveOD client and monitor, the placeholder queue_gate. No
-network, no servers, no core device.
+recording fake liveOD client and monitor, queue_gate with a stand-in
+transport that gives GO at once. No network, no servers, no core device.
 """
 import json
 import os
@@ -15,10 +15,19 @@ from waxx.base.expt import Expt
 from waxx.util.device_state import queue_gate
 
 
+class _GoAtOnce:
+    """The run queue as queue_gate sees it: GO at the first ask (reset_count
+    unknown).  Never the real monitor server."""
+
+    def request(self, obj, timeout=None, attempts=None):
+        return {"status": "ok", "go": obj.get("stage") != "warming", "reset_count": None}
+
+
 @pytest.fixture(autouse=True)
 def _fresh_gate(monkeypatch):
     monkeypatch.delenv("WAXX_QUEUE_WARM", raising=False)
     queue_gate._reset_for_tests()
+    queue_gate.set_transport(_GoAtOnce())
     yield
     queue_gate._reset_for_tests()
 
