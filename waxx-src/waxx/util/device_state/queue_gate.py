@@ -16,11 +16,24 @@ and the run loop are unaffected.
 
 * :func:`warm_token` reads ``WAXX_QUEUE_WARM`` once and POPS it from
   ``os.environ``: a child process of the experiment never inherits it.
+* The freshness manifest records each file AS IT WAS LOADED: in a warm
+  process (``WAXX_QUEUE_WARM`` present -- checked, not popped) a
+  ``sys.addaudithook`` on ``open`` is installed when this module is imported
+  (``import waxx`` imports it first thing in a warm process), and stats
+  (never reads) every file under the queue roots at its first open for
+  reading -- a module's source when its ``.pyc`` is opened; the
+  ``sys.modules`` files already loaded when the hook goes in are stat-ed
+  then.  Residual window: a module imported before the hook (the experiment
+  file's own first imports, ``artiq``, ...) is recorded at the hook's
+  install, not at its load; one the hook never saw is stat-ed at "ready".
 * :func:`hello` (``Expt.__init__``) tells the queue "warming" (pid, creation
-  time, job, warm token) and starts recording the files the process opens for
-  reading (a ``sys.addaudithook`` on ``open``), for the freshness manifest.
-* :func:`ensure_go` (the Core hook, after compile) sends "ready" once with
-  the manifest (:func:`build_manifest`), then polls every :data:`POLL_S` s.
+  time, job, warm token) (and installs the hook if the import did not).
+* :func:`ensure_go` (the Core hook, after compile) re-stats every manifest
+  file at "ready": one that changed since it was loaded stands the process
+  down (``EXIT_WARM_ABORTED``; the queue warms it again) naming the file --
+  the process would otherwise run code older than what is on disk.  Else it
+  sends "ready" once with the load-time manifest (:func:`build_manifest`),
+  then polls every :data:`POLL_S` s.
   GO: the process raises its own priority back to NORMAL (the queue starts
   warm launches at BELOW_NORMAL), records :func:`go_info` and returns.
   Abort (the queue discarded this warm launch): it prints why and raises
@@ -87,10 +100,18 @@ _state: dict = {
     "claimed": False,
     "hook": False,       # the audit hook is installed (it cannot be removed)
     "recording": False,  # the hook records opened files
+    "filter": None,      # _ManifestFilter of the recording
     "transport": None,   # the MonitorClient (or a test's stand-in)
     "expt": "",
 }
-_opened: set = set()
+#: normalised path -> (path, mtime_ns, size) at its first open for reading
+#: (or at the hook's install, for a module loaded before it)
+_loaded: dict = {}
+#: normalised paths the filter left out (not stat-ed again)
+_skipped: set = set()
+#: drive letter -> DRIVE_REMOTE
+_remote_drives: dict = {}
+_in_hook = threading.local()
 
 
 # -- identity -----------------------------------------------------------------------------
@@ -208,11 +229,130 @@ def _norm(path) -> str:
     return os.path.normcase(os.path.abspath(os.fsdecode(path)))
 
 
-def _audit(event, args) -> None:
-    """``sys.addaudithook`` callback: remember files opened for reading while
-    recording.  Never raises (an audit hook that raises fails the open)."""
-    if event != "open" or not _state["recording"]:
+def _norm_forms(path) -> set:
+    """A folder's normalised path as written and as resolved (an 8.3 short
+    name such as the temp folder's and its long name are the same folder)."""
+    out = set()
+    try:
+        out.add(_norm(path))
+        out.add(os.path.normcase(os.path.realpath(os.fsdecode(path))))
+    except Exception:                                 # noqa: BLE001
+        pass
+    return {p.rstrip("\\/") for p in out if p}
+
+
+def is_network_path(path: str) -> bool:
+    """A UNC path (``\\\\server\\share``) or a mapped network drive
+    (``GetDriveTypeW == DRIVE_REMOTE``; one call per drive letter, cached).
+    Such paths are never stat-ed for a manifest: a hung share must not stall
+    the warm process's hook or the queue's tick."""
+    p = os.fsdecode(path)
+    if p[:2] in ("\\\\", "//"):
+        return True
+    if sys.platform != "win32" or len(p) < 2 or p[1] != ":" or not p[0].isalpha():
+        return False
+    d = p[0].upper()
+    remote = _remote_drives.get(d)
+    if remote is None:
+        try:
+            import ctypes  # noqa: PLC0415
+            remote = ctypes.windll.kernel32.GetDriveTypeW(f"{d}:\\") == 4   # DRIVE_REMOTE
+        except Exception:                             # noqa: BLE001
+            remote = False
+        _remote_drives[d] = remote
+    return remote
+
+
+class _ManifestFilter:
+    """Which files a manifest holds: under one of the queue roots, and NOT
+    under the interpreter's folders (sys.prefix, sys.base_prefix, ...), the
+    temp folder, a ``site-packages`` or a ``.venv`` folder -- unless a root
+    lies deeper than the excluding folder -- and never on a network path.
+    (``%code%`` holds ``.venv``: without this a manifest is mostly the venv,
+    re-stat-ed by the queue every few seconds, and a ``uv sync`` during a
+    wait would discard warm jobs.)"""
+
+    _DIR_NAMES = ("site-packages", ".venv")
+
+    def __init__(self, roots=None):
+        self.roots = set()
+        for r in (queue_roots() if roots is None else roots):
+            if r:
+                self.roots |= _norm_forms(r)
+        self.skip = set()
+        for p in {sys.prefix, sys.base_prefix, sys.exec_prefix,
+                  getattr(sys, "base_exec_prefix", "")}:
+            if p:
+                self.skip |= _norm_forms(p)
+        try:
+            import tempfile  # noqa: PLC0415
+            self.skip |= _norm_forms(tempfile.gettempdir())
+        except Exception:                             # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _deepest(n: str, prefixes) -> str | None:
+        best = None
+        for p in prefixes:
+            if (n == p or n.startswith(p + os.sep)) and (best is None or len(p) > len(best)):
+                best = p
+        return best
+
+    def keep(self, n: str) -> bool:
+        """``n``: a normalised path."""
+        root = self._deepest(n, self.roots)
+        if root is None:
+            return False
+        skip = self._deepest(n, self.skip)
+        if skip is not None and len(skip) >= len(root):
+            return False
+        below = n[len(root):].split(os.sep)
+        if any(part in self._DIR_NAMES for part in below):
+            return False
+        return not is_network_path(n)
+
+
+def _stat_pair(path: str):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return int(st.st_mtime_ns), int(st.st_size)
+
+
+def _record_loaded(path: str) -> None:
+    """Remember ``path``'s stat at its first open for reading (a ``.pyc``
+    in ``__pycache__``: its source's, the file that matters; a sourceless
+    ``.pyc``: its own).  Stat only, never a read."""
+    n = _norm(path)
+    if n in _loaded or n in _skipped:
         return
+    flt = _state["filter"]
+    if flt is None:
+        return
+    if n.endswith(".pyc"):
+        folder, name = os.path.split(os.path.abspath(path))
+        if os.path.basename(folder).lower() == "__pycache__":
+            src = os.path.join(os.path.dirname(folder), name.split(".", 1)[0] + ".py")
+            if os.path.isfile(src):
+                path, n = src, _norm(src)
+                if n in _loaded or n in _skipped:
+                    return
+    if not flt.keep(n):
+        _skipped.add(n)
+        return
+    pair = _stat_pair(path)
+    if pair is not None and os.path.isfile(path):
+        _loaded.setdefault(n, (os.path.abspath(path),) + pair)
+
+
+def _audit(event, args) -> None:
+    """``sys.addaudithook`` callback: stat each file under the queue roots at
+    its first open for reading, while recording.  Never raises (an audit
+    hook that raises fails the open), never re-enters itself."""
+    if event != "open" or not _state["recording"] or getattr(_in_hook, "on", False):
+        return
+    _in_hook.on = True
     try:
         path, mode, flags = args[0], args[1], args[2]
         if path is None or isinstance(path, int):
@@ -223,46 +363,57 @@ def _audit(event, args) -> None:
         elif isinstance(flags, int):
             if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT):
                 return
-        _opened.add(os.fsdecode(path))
+        _record_loaded(os.fsdecode(path))
     except Exception:                                 # noqa: BLE001
         pass
+    finally:
+        _in_hook.on = False
+
+
+def _snapshot_modules() -> None:
+    """The ``sys.modules`` files loaded before the hook went in: recorded
+    now (the residual window -- they may have changed between their load
+    and this moment)."""
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f or not isinstance(f, str):
+            continue
+        try:
+            _record_loaded(f)
+        except Exception:                             # noqa: BLE001
+            continue
 
 
 def _start_recording() -> None:
+    """Install the audit hook (once per process; it cannot be removed) and
+    record from now on; on the first start, the modules already loaded are
+    stat-ed."""
     with _lock:
+        first = not _state["recording"]
+        if first:
+            _state["filter"] = _ManifestFilter()
+            import ctypes  # noqa: F401,PLC0415  (loaded now, never from inside the hook)
         if not _state["hook"]:
             sys.addaudithook(_audit)
             _state["hook"] = True
         _state["recording"] = True
-
-
-def _excluded_prefixes() -> list[str]:
-    out = []
-    for p in {sys.prefix, sys.base_prefix, sys.exec_prefix, getattr(sys, "base_exec_prefix", "")}:
-        if p:
-            out.append(_norm(p))
-    try:
-        import tempfile  # noqa: PLC0415
-        out.append(_norm(tempfile.gettempdir()))
-    except Exception:                                 # noqa: BLE001
-        pass
-    return out
-
-
-def _under(path: str, prefixes) -> bool:
-    return any(path == p or path.startswith(p.rstrip("\\/") + os.sep) for p in prefixes)
+    if first:
+        _snapshot_modules()
 
 
 def build_manifest(roots=None) -> list[list]:
     """``[[path, mtime_ns, size], ...]``, sorted, de-duplicated (by normalised
-    path): every ``sys.modules`` file under ``roots`` (default
-    :func:`queue_roots`) plus every file opened for reading since
-    :func:`hello` (the interpreter's own folders and the temp folder left
-    out: a compile's temporary files are gone by now).  Files that cannot be
-    stat-ed (deleted since) are left out."""
-    roots = [_norm(r) for r in (queue_roots() if roots is None else roots) if r]
-    skip = _excluded_prefixes()
-    paths: dict[str, str] = {}
+    path): every ``sys.modules`` file and every file opened for reading that
+    :class:`_ManifestFilter` keeps for ``roots`` (default
+    :func:`queue_roots`), each with its stat AT LOAD (its first open while
+    recording, or the hook's install for a module loaded before it; a module
+    the hook never saw is stat-ed now).  Files that cannot be stat-ed are
+    left out."""
+    flt = _ManifestFilter(roots)
+    entries: dict[str, list] = {}
+    for n, (path, mtime, size) in list(_loaded.items()):
+        if flt.keep(n):
+            entries[n] = [path, mtime, size]
     for mod in list(sys.modules.values()):
         f = getattr(mod, "__file__", None)
         if not f or not isinstance(f, str):
@@ -271,34 +422,33 @@ def build_manifest(roots=None) -> list[list]:
             n = _norm(f)
         except Exception:                             # noqa: BLE001
             continue
-        if _under(n, roots):
-            paths.setdefault(n, f)
-    for f in list(_opened):
-        try:
-            n = _norm(f)
-        except Exception:                             # noqa: BLE001
+        if n in entries or not flt.keep(n):
             continue
-        if not _under(n, skip):
-            paths.setdefault(n, f)
-    out = []
-    for n in sorted(paths):
-        try:
-            st = os.stat(paths[n])
-        except OSError:
-            continue
-        if not os.path.isfile(paths[n]):
-            continue
-        out.append([os.path.abspath(paths[n]), int(st.st_mtime_ns), int(st.st_size)])
-        if len(out) >= MANIFEST_MAX:
-            break
-    return out
+        pair = _stat_pair(f)
+        if pair is not None and os.path.isfile(f):
+            entries[n] = [os.path.abspath(f), pair[0], pair[1]]
+    out = [entries[n] for n in sorted(entries)]
+    return out[:MANIFEST_MAX]
+
+
+def changed_since_load(manifest) -> str:
+    """The first manifest file whose stat now differs from its load-time
+    stat (or that is gone), as text; "" when none."""
+    for path, mtime, size in manifest:
+        pair = _stat_pair(path)
+        if pair is None:
+            return f"{path} (gone)"
+        if pair != (int(mtime), int(size)):
+            return path
+    return ""
 
 
 # -- the gate -----------------------------------------------------------------------------
 
 def hello(expt: str = "") -> None:
-    """Best effort (warm processes only; once): start recording the files
-    opened for reading (the manifest), and tell the queue "warming".  An
+    """Best effort (warm processes only; once): make sure the files opened
+    for reading are being recorded (the manifest; normally since this
+    module's import), and tell the queue "warming".  An
     abort in the reply -- the queue no longer wants this warm launch --
     stands the process down at once (``SystemExit(EXIT_WARM_ABORTED)``;
     nothing has been claimed this early)."""
@@ -366,6 +516,12 @@ def ensure_go() -> None:
                 manifest = build_manifest()
                 with _lock:
                     _state["recording"] = False       # prepare is over: the manifest is made
+                changed = changed_since_load(manifest)
+                if changed:
+                    # the code or data on disk is newer than what this
+                    # process loaded: it must not run; the queue warms anew
+                    _stand_down(f"a file changed on disk after this process loaded it: "
+                                f"{changed}")
             reply = _ask("ready", manifest)
         else:
             reply = _ask("poll")
@@ -405,6 +561,19 @@ def _reset_for_tests() -> None:
     stops recording)."""
     with _lock:
         _state.update(read=False, token=None, job="", go=None, hello=False, ready_sent=False,
-                      claim=None, claimed=False, recording=False, transport=None, expt="")
+                      claim=None, claimed=False, recording=False, transport=None, expt="",
+                      filter=None)
         _state.pop("started", None)
-        _opened.clear()
+        _loaded.clear()
+        _skipped.clear()
+        _remote_drives.clear()
+
+
+# A warm process records from its first import of this module (as early as
+# possible: see the module docstring).  Only the presence is checked here --
+# warm_token() pops the variable.
+if os.environ.get(WARM_ENV):
+    try:
+        _start_recording()
+    except Exception:                                 # noqa: BLE001
+        pass

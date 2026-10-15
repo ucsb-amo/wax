@@ -524,6 +524,33 @@ def test_a_manifest_change_at_go_discards_and_the_job_launches_cold(tmp_path, ex
     assert "WAXX_QUEUE_WARM" not in q.spawner.calls[-1]["env"]
 
 
+def test_network_paths_are_never_kept_or_stat_ed_by_the_tick(tmp_path, expts, lib, monkeypatch):
+    """S5: a manifest entry on a share (UNC or a mapped network drive) is
+    dropped when "ready" is stored, and never stat-ed by the tick's
+    freshness check (a hung share must not stall the queue's one thread)."""
+    from waxx.util.device_state import queue_gate
+    q = wq(tmp_path, expts)
+    slot_running(q, expts)
+    b = submit(q, expts, "tof")
+    q.tick()
+    wp = WarmProc(q, b)
+    wp.ask("warming")
+    unc = r"\\fileserver\share\roi.xlsx"
+    r = wp.ask("ready", manifest=manifest_of(lib) + [[unc, 1, 2]])
+    assert r["status"] == "ok"
+    kept = [m[0] for m in warm_rec(q, b)["manifest"]]
+    assert kept == [str(lib)]
+    # an older record that still holds one: skipped by the check, not stat-ed
+    warm_rec(q, b)["manifest"].append([unc, 1, 2])
+    stats = []
+    real_stat = os.stat
+    monkeypatch.setattr(rq.os, "stat", lambda p, *a, **k: (stats.append(str(p)),
+                                                             real_stat(p, *a, **k))[1])
+    assert q._warm_stale(q._jobs[b]) == ""
+    assert unc not in stats and str(lib) in stats
+    assert queue_gate.is_network_path(unc)
+
+
 def test_experiment_file_drift_discards_then_the_job_is_skipped_as_today(tmp_path, expts, lib):
     q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
     (expts / "tof.py").write_text('"""tof, edited."""\nclass tof: pass\n')

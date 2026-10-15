@@ -178,30 +178,199 @@ def test_the_claim_runs_once():
     assert calls == ["b"]
 
 
+def _probe_module(folder, name, text="X = 1\n"):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.py").write_text(text)
+    sys.path.insert(0, str(folder))
+    try:
+        __import__(name)
+    finally:
+        sys.path.remove(str(folder))
+    return folder / f"{name}.py"
+
+
+def _norm_paths(manifest):
+    return [os.path.normcase(m[0]) for m in manifest]
+
+
 def test_the_manifest_takes_modules_under_the_roots_and_skips_temp_files(tmp_path, monkeypatch):
     import tempfile
     mod_dir = tmp_path / "roots"
-    mod_dir.mkdir()
-    (mod_dir / "qg_probe_mod.py").write_text("X = 1\n")
-    sys.path.insert(0, str(mod_dir))
     try:
-        import qg_probe_mod  # noqa: F401
+        mod = _probe_module(mod_dir, "qg_probe_mod")
         tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".tmp")
         tmp.write("x")
         tmp.close()
-        qg._opened.add(tmp.name)
-        qg._opened.add(str(tmp_path / "gone.npy"))       # deleted since: left out
+        monkeypatch.setenv(qg.ROOTS_ENV, str(mod_dir))
+        qg._start_recording()
+        with open(tmp.name) as f:                         # temp, outside the roots
+            f.read()
+        gone = mod_dir / "gone.npy"
+        gone.write_text("x")
+        with open(gone) as f:
+            f.read()
+        gone.unlink()                                     # deleted since: kept at its load stat
         manifest = qg.build_manifest([str(mod_dir)])
-        paths = [os.path.normcase(m[0]) for m in manifest]
-        assert os.path.normcase(str(mod_dir / "qg_probe_mod.py")) in paths
+        paths = _norm_paths(manifest)
+        assert os.path.normcase(str(mod)) in paths
         assert os.path.normcase(tmp.name) not in paths
-        assert not any(p.endswith("gone.npy") for p in paths)
         assert manifest == sorted(manifest, key=lambda m: os.path.normcase(
             os.path.abspath(m[0])))
+        assert qg.changed_since_load(manifest).endswith("gone.npy (gone)")
         os.unlink(tmp.name)
     finally:
-        sys.path.remove(str(mod_dir))
         sys.modules.pop("qg_probe_mod", None)
+
+
+def test_the_manifest_leaves_out_the_venv_site_packages_and_the_interpreter(tmp_path,
+                                                                             monkeypatch):
+    """S5: %code% holds .venv -- a manifest of a real warm process was 625 of
+    879 files from it.  Only files under the roots and outside sys.prefix /
+    sys.base_prefix / any site-packages / any .venv folder are kept."""
+    code = tmp_path / "code"
+    names = {"mine": code / "kexp" / "base",
+             "venvmod": code / ".venv" / "Lib" / "site-packages" / "pkgx",
+             "sitemod": code / "vendor" / "site-packages",
+             "prefixmod": code / "pyprefix" / "Lib",
+             "outside": tmp_path / "elsewhere"}
+    monkeypatch.setattr(sys, "prefix", str(code / "pyprefix"))
+    try:
+        files = {k: _probe_module(folder, f"qg_s5_{k}") for k, folder in names.items()}
+        manifest = qg.build_manifest([str(code)])
+        paths = _norm_paths(manifest)
+        assert os.path.normcase(str(files["mine"])) in paths
+        for k in ("venvmod", "sitemod", "prefixmod", "outside"):
+            assert os.path.normcase(str(files[k])) not in paths, k
+        # opened files follow the same rule
+        monkeypatch.setenv(qg.ROOTS_ENV, str(code))
+        qg._start_recording()
+        data = names["venvmod"] / "data.json"
+        data.write_text("{}")
+        mine = names["mine"] / "trap.json"
+        mine.write_text("{}")
+        for p in (data, mine):
+            with open(p) as f:
+                f.read()
+        paths = _norm_paths(qg.build_manifest([str(code)]))
+        assert os.path.normcase(str(mine)) in paths
+        assert os.path.normcase(str(data)) not in paths
+    finally:
+        for k in names:
+            sys.modules.pop(f"qg_s5_{k}", None)
+
+
+def test_network_paths_are_never_in_a_manifest_and_never_stat_ed(tmp_path, monkeypatch):
+    assert qg.is_network_path(r"\\fileserver\share\x.py")
+    assert qg.is_network_path("//fileserver/share/x.py")
+    qg._remote_drives["Q"] = True
+    assert qg.is_network_path(r"Q:\data\roi.xlsx")
+    drive = os.path.splitdrive(str(tmp_path))[0]
+    if drive[1:] == ":":
+        qg._remote_drives[drive[0].upper()] = False
+        assert not qg.is_network_path(str(tmp_path))
+        try:
+            mod = _probe_module(tmp_path / "net", "qg_net_mod")
+            stats = []
+            real_stat = os.stat
+            monkeypatch.setattr(qg.os, "stat", lambda p, *a, **k: (stats.append(str(p)),
+                                                                     real_stat(p, *a, **k))[1])
+            qg._remote_drives[drive[0].upper()] = True    # as if the folder were a share
+            assert qg.build_manifest([str(tmp_path / "net")]) == []
+            assert not any(os.path.normcase(s) == os.path.normcase(str(mod)) for s in stats)
+        finally:
+            sys.modules.pop("qg_net_mod", None)
+
+
+def test_a_file_is_recorded_as_it_was_when_loaded(tmp_path, monkeypatch):
+    """S3: the manifest holds each file's stat at its load, not at "ready":
+    a file edited between its import and "ready" shows as changed."""
+    monkeypatch.setenv(qg.ROOTS_ENV, str(tmp_path))
+    qg._start_recording()                                 # (a warm process: at import)
+    try:
+        mod = _probe_module(tmp_path / "pkg", "qg_s3_mod", "X = 1\n")
+        at_load = os.stat(mod)
+        os.utime(mod, ns=(at_load.st_atime_ns, at_load.st_mtime_ns + 10**9))
+        mod.write_text("X = 2  # edited after the import\n")
+        manifest = qg.build_manifest()
+        entry = [m for m in manifest if os.path.normcase(m[0]) == os.path.normcase(str(mod))]
+        assert entry == [[os.path.abspath(str(mod)), at_load.st_mtime_ns, at_load.st_size]]
+        assert os.path.normcase(qg.changed_since_load(manifest)) == os.path.normcase(
+            os.path.abspath(str(mod)))
+    finally:
+        sys.modules.pop("qg_s3_mod", None)
+
+
+def test_a_pyc_open_records_its_source(tmp_path, monkeypatch):
+    """A module imported from its cached .pyc is opened as the .pyc only: the
+    hook records the source's stat (the file that matters), not the .pyc."""
+    monkeypatch.setenv(qg.ROOTS_ENV, str(tmp_path))
+    qg._start_recording()
+    src = tmp_path / "pkg" / "cached.py"
+    pyc = tmp_path / "pkg" / "__pycache__" / "cached.cpython-313.pyc"
+    pyc.parent.mkdir(parents=True)
+    src.write_text("X = 1\n")
+    pyc.write_bytes(b"\0" * 32)
+    qg._audit("open", (str(pyc), "rb", 0))
+    st = os.stat(src)
+    assert qg._loaded[os.path.normcase(os.path.abspath(str(src)))][1:] == (st.st_mtime_ns,
+                                                                           st.st_size)
+    assert os.path.normcase(os.path.abspath(str(pyc))) not in qg._loaded
+
+
+def test_ready_stands_down_when_a_loaded_file_changed(monkeypatch, tmp_path, capsys):
+    """S3: a file changed between its load and "ready" -> exit 78 before
+    "ready" is sent, naming the file (the queue warms the job again)."""
+    warm(monkeypatch)
+    monkeypatch.setenv(qg.ROOTS_ENV, str(tmp_path))
+    script = Script({"status": "ok", "go": True, "reset_count": 0})
+    qg.set_transport(script)
+    qg.hello("rabi")
+    data = tmp_path / "trap.json"
+    data.write_text("{}")
+    with open(data) as f:                                 # read during prepare
+        f.read()
+    data.write_text('{"edited": "after it was read"}')
+    with pytest.raises(SystemExit) as e:
+        qg.ensure_go()
+    assert e.value.code == qg.EXIT_WARM_ABORTED
+    assert [o["stage"] for o in script.sent] == ["warming"]     # never said "ready"
+    out = capsys.readouterr().out
+    assert "a file changed on disk after this process loaded it" in out
+    assert "trap.json" in out
+    assert not qg.go_passed()
+
+
+def test_the_hook_goes_in_at_import_in_a_warm_process_and_the_variable_stays(tmp_path):
+    """A fresh interpreter, warm: importing waxx installs the hook and stats
+    the modules already loaded (the residual window); the variable is still
+    there for warm_token() to pop.  Cold: no hook."""
+    import subprocess
+    import textwrap
+    pre = tmp_path / "pre"
+    pre.mkdir()
+    (pre / "qg_pre_mod.py").write_text("X = 1\n")
+    code = textwrap.dedent(f"""
+        import os, sys
+        sys.path.insert(0, {str(pre)!r})
+        import qg_pre_mod                      # loaded before waxx: the residual window
+        import waxx
+        qg = sys.modules.get("waxx.util.device_state.queue_gate")
+        if qg is None:
+            print("no-gate"); raise SystemExit
+        n = os.path.normcase(os.path.abspath(qg_pre_mod.__file__))
+        print(qg._state["hook"], qg._state["recording"], "WAXX_QUEUE_WARM" in os.environ,
+              n in qg._loaded)
+        print(qg.warm_token(), "WAXX_QUEUE_WARM" in os.environ)
+    """)
+    env = dict(os.environ, WAXX_RUN_QUEUE_ROOTS=str(tmp_path), PYTHONDONTWRITEBYTECODE="1")
+    env.pop("WAXX_QUEUE_WARM", None)
+    cold = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                          text=True, timeout=120)
+    assert cold.stdout.split() == ["no-gate"], cold.stderr
+    env["WAXX_QUEUE_WARM"] = "tok123"
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, timeout=120)
+    assert out.stdout.split() == ["True", "True", "True", "True", "tok123", "False"], out.stderr
 
 
 def test_queue_roots_are_the_queues(monkeypatch):

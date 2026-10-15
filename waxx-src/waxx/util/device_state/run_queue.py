@@ -2124,6 +2124,8 @@ class RunQueue:
                 p, mtime, size = str(entry[0]), int(entry[1]), int(entry[2])
             except (TypeError, ValueError, IndexError):
                 continue
+            if queue_gate.is_network_path(p):
+                continue                              # never stat a share from the tick
             try:
                 st = os.stat(p)
             except OSError:
@@ -2583,9 +2585,13 @@ class RunQueue:
                         manifest = []
                         for entry in list(obj.get("manifest") or ())[:WARM_MANIFEST_MAX]:
                             try:
-                                manifest.append([str(entry[0]), int(entry[1]), int(entry[2])])
+                                e = [str(entry[0]), int(entry[1]), int(entry[2])]
                             except (TypeError, ValueError, IndexError):
                                 continue
+                            # a network path is never kept: the tick re-stats
+                            # the manifest, and a hung share must not stall it
+                            if not queue_gate.is_network_path(e[0]):
+                                manifest.append(e)
                         w["state"], w["ready_at"], w["manifest"] = "ready", now, manifest
                         changed = True
                         records.append(("run_queue_warm_ready", {
