@@ -549,9 +549,11 @@ def test_a_refused_start_raises_and_leaves_the_run_closed(srv, monkeypatch):
 def test_the_new_client_against_an_old_server(srv):
     c = _client(_wire(srv, old=True))
     payload = _msg()
-    assert c.reserve_run(payload)["unknown_tag"] is True
-    assert c.start_run(payload, reservation="x")["unknown_tag"] is True
-    assert c.release_reservation("x")["unknown_tag"] is True
+    for reply in (c.reserve_run(payload), c.start_run(payload, reservation="x"),
+                  c.release_reservation("x")):
+        # the words Expt's fallback looks for ("unknown tag") stay in the error
+        assert reply["ok"] is False and reply["unknown_tag"] is True
+        assert "unknown tag" in reply["error"].lower()
     assert not c._run_open
     reply = c.init_run(dict(payload))                       # the fallback
     assert reply["ok"] and c._run_open

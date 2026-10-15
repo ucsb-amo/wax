@@ -485,10 +485,11 @@ class LiveODClient(NetClient):
             return {"ok": False, "error": _ascii(f"RESERVE_RUN: {type(exc).__name__}: {exc}")}
         if _unknown_tag(reply, "RESERVE_RUN"):
             return {"ok": False, "unknown_tag": True,
-                    "error": "this liveOD predates RESERVE_RUN (restart it with current code)"}
+                    "error": "Unknown tag: RESERVE_RUN (this liveOD predates it; restart it with "
+                             "current code)"}
         reply = dict(reply)
         if reply.get("ok"):
-            self._print_warnings(reply, "reservation")
+            # (its warnings are the caller's to print: Expt prints them)
             refused = list((reply.get("preview") or {}).get("refused") or [])
             if refused:
                 print(_ascii("!! liveOD, reservation: the run start would be REFUSED now:"))
@@ -523,7 +524,8 @@ class LiveODClient(NetClient):
         reply = self._send_recv(msg, rcvtimeo_ms=START_RUN_TIMEOUT_MS)
         if _unknown_tag(reply, "START_RUN"):
             return {"ok": False, "unknown_tag": True,
-                    "error": "this liveOD predates START_RUN (restart it with current code)"}
+                    "error": "Unknown tag: START_RUN (this liveOD predates it; restart it with "
+                             "current code)"}
         if not reply.get("ok"):
             raise LiveODStartRefused(f"[LiveODClient] START_RUN failed: {reply.get('error')}",
                                      reply)
@@ -546,7 +548,7 @@ class LiveODClient(NetClient):
                                                  f"{type(exc).__name__}: {exc}")}
         if _unknown_tag(reply, "RELEASE_RESERVATION"):
             return {"ok": False, "unknown_tag": True,
-                    "error": "this liveOD predates RELEASE_RESERVATION"}
+                    "error": "Unknown tag: RELEASE_RESERVATION (this liveOD predates it)"}
         return dict(reply)
 
     def wait_cam_ready(self, timeout: float = 60.0) -> bool:
