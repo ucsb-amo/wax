@@ -1541,8 +1541,11 @@ class LiveODServer(QThread, NetServer):
 
     def _live_run_refusal(self, tag: str):
         """None, or the refusal of a run start that would supersede a run in
-        progress whose client is not known to be gone (never for the queue)."""
-        if not self._run_in_progress or self.client_known_dead():
+        progress whose client is not known to be gone (never for the queue).
+        A run whose experiment told liveOD it is exiting (RUN_EXITED, frames
+        still due) counts as gone, pid or not -- as run_gate's dead_client
+        waiver has it (START_RUN first waits for its last frames)."""
+        if not self._run_in_progress or self.client_known_dead() or self.exited_run_pending():
             return None
         state = "an Abort is pending on it" if self._reset_requested else "it is running"
         return self._refuse_before_id(

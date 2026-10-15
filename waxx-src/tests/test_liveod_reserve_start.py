@@ -461,6 +461,17 @@ def test_the_queues_init_run_supersedes_a_dead_clients_run(srv, monkeypatch):
     assert reply["ok"] and reply["run_id"] != run["run_id"]
 
 
+def test_the_queues_init_run_takes_over_a_run_whose_experiment_said_it_exited(srv, monkeypatch):
+    """run_gate waives such a run (dead_client: liveOD heard it exit, pid or
+    not); the guard agrees, so a phase-1 queue job is not refused for it."""
+    from waxx.util.live_od import live_od_server
+    monkeypatch.setattr(live_od_server, "EXITED_FRAME_GRACE_S", 60.0)
+    run = _exited_camera_run(srv)                         # client on another host
+    reply = srv._handle_init_run(_msg(client_pid=5151, client_host=HERE, launcher="kq"))
+    assert reply["ok"] and reply["run_id"] != run["run_id"]
+    assert os.path.exists(run["filepath"])
+
+
 def test_init_run_replies_carry_the_fills_warnings(real):
     srv, _ = real
     reply = srv._handle_init_run(_msg(params={"N_img": 1, "nothing": None}))
