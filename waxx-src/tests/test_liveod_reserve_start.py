@@ -317,6 +317,23 @@ def test_a_start_leaves_another_processes_reservation_alone(srv):
     assert srv._handle_poll({"tag": "POLL"})["reservation"]["pid"] == 10
 
 
+def test_a_missing_creation_time_is_never_the_same_process(srv):
+    """N1: same pid and host but a creation time unknown on either side is
+    not "the same process" (Windows reuses pids): no renewal, and the
+    holder's INIT_RUN does not spend it (it lapses by release / dead pid /
+    ttl)."""
+    a = {"client_pid": 10, "client_host": "elsewhere", "client_started": 5.0}
+    for missing in ({"client_started": None},):
+        assert srv._same_process(a, dict(a, **missing)) is False
+        assert srv._same_process(dict(a, **missing), a) is False
+        assert srv._same_process(dict(a, **missing), dict(a, **missing)) is False
+    assert srv._same_process(a, dict(a)) is True
+    _reserve(srv, client_pid=10)                                     # no creation time
+    assert _reserve(srv, client_pid=10)["ok"] is False               # not renewed
+    srv._handle_init_run(_msg(client_pid=10, client_host="elsewhere"))
+    assert srv._handle_poll({"tag": "POLL"})["reservation"] is not None
+
+
 def test_the_holders_own_plain_init_run_spends_its_reservation(srv):
     _reserve(srv, client_pid=10, client_started=5.0)
     srv._handle_init_run(_msg(client_pid=10, client_host="elsewhere", client_started=5.0))

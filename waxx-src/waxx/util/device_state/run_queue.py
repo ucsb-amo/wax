@@ -2569,11 +2569,12 @@ class RunQueue:
                               "(discarded or replaced)")
             elif pid is None:
                 reply = abort("no pid given")
+            elif started is None:
+                # Windows reuses pids: a pid alone never names a process
+                reply = abort("no process creation time given (a pid alone is never trusted)")
             elif w.get("py_pid") is not None and (
-                    pid != w.get("py_pid")
-                    or (w.get("py_started") is not None
-                        and (started is None
-                             or abs(started - float(w["py_started"])) > SAME_PROCESS_S))):
+                    pid != w.get("py_pid") or w.get("py_started") is None
+                    or abs(started - float(w["py_started"])) > SAME_PROCESS_S):
                 reply = abort(f"{job.name}'s warm launch belongs to pid {w.get('py_pid')}, "
                               f"not {pid}")
             else:

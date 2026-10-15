@@ -194,9 +194,10 @@ def process_started(pid: int | None = None) -> float | None:
 
 def set_normal_priority(pid, started: float | None) -> bool:
     """Raise process ``pid`` to NORMAL_PRIORITY_CLASS -- only when it is the
-    process created at ``started`` (a reused pid is never touched; None:
-    not checked).  True when done.  Windows only; never raises."""
-    if sys.platform != "win32":
+    process created at ``started`` (a reused pid is never touched; without a
+    creation time nothing is done: Windows reuses pids, and a pid alone never
+    names a process).  True when done.  Windows only; never raises."""
+    if sys.platform != "win32" or started is None:
         return False
     try:
         pid = int(pid)
@@ -209,10 +210,9 @@ def set_normal_priority(pid, started: float | None) -> bool:
         if not handle:
             return False
         try:
-            if started is not None:
-                created = _creation_time(handle)
-                if created is None or abs(created - float(started)) > SAME_PROCESS_S:
-                    return False
+            created = _creation_time(handle)
+            if created is None or abs(created - float(started)) > SAME_PROCESS_S:
+                return False
             return bool(k32.SetPriorityClass(handle, NORMAL_PRIORITY_CLASS))
         finally:
             k32.CloseHandle(handle)

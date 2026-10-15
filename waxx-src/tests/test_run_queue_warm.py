@@ -329,10 +329,31 @@ def test_mismatched_tokens_pids_and_creation_times_are_told_to_abort(tmp_path, e
     assert "not a job" in wp.ask("poll", job="nonsense")["abort"]
     assert "belongs to pid 9001" in wp.ask("poll", pid=9002)["abort"]
     assert "belongs to pid 9001" in wp.ask("poll", started=4322.0)["abort"]
-    assert "belongs to pid 9001" in wp.ask("poll", started=None)["abort"]
+    assert "no process creation time" in wp.ask("poll", started=None)["abort"]
     assert q.warm_request({"stage": "go!"})["status"] == "error"
     assert wp.ask("poll")["go"] is True                   # the real process is unaffected
     assert "run_queue_warm_abort_sent" in q.journal.kinds
+
+
+def test_a_warm_process_without_a_creation_time_is_never_adopted(tmp_path, expts):
+    """N1: Windows reuses pids -- a hello with a pid and no creation time is
+    told to abort and nothing of it is recorded."""
+    q = wq(tmp_path, expts)
+    slot_running(q, expts)
+    b = submit(q, expts, "tof")
+    q.tick()
+    wp = WarmProc(q, b, started=None)
+    for stage in ("warming", "ready", "poll"):
+        r = wp.ask(stage, manifest=[] if stage == "ready" else None)
+        assert "no process creation time" in r["abort"], stage
+    w = warm_rec(q, b)
+    assert w["py_pid"] is None and w["py_started"] is None and w["state"] == "warming"
+
+
+def test_the_priority_is_never_raised_on_a_pid_alone():
+    """N1: set_normal_priority without a creation time does nothing (even
+    for a live process it could reach)."""
+    assert detached.set_normal_priority(os.getpid(), None) is False
 
 
 def test_no_go_while_the_server_stops_launching(tmp_path, expts, lib):

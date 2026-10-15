@@ -1513,14 +1513,17 @@ class LiveODServer(QThread, NetServer):
     @staticmethod
     def _same_process(a: dict, b: dict) -> bool:
         """Two client records name one process: same pid and host, and
-        creation times that agree (or one of them unknown)."""
+        creation times that agree.  A missing creation time is "unknown",
+        never a match (Windows reuses pids): a reservation is then neither
+        spent by nor renewed for that client -- the safe direction for both
+        callers (it lapses by release, dead pid or ttl)."""
         if not a or not b or not a.get("client_pid") or a.get("client_pid") != b.get("client_pid"):
             return False
         if str(a.get("client_host") or "").lower() != str(b.get("client_host") or "").lower():
             return False
         sa, sb = a.get("client_started"), b.get("client_started")
         if sa is None or sb is None:
-            return True
+            return False
         try:
             from waxx.util.device_state import detached  # noqa: PLC0415
             tol = float(detached.SAME_PROCESS_S)
