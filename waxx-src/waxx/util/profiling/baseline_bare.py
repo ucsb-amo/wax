@@ -1,4 +1,5 @@
-"""Bare-ARTIQ baseline for startup_timer.py: no lab package, no waxx.
+"""Bare-ARTIQ baseline for startup_timer.py: no lab package, no waxx (except the
+device_db's ``core``, waxx.util.artiq.core.Core, which unarmed is upstream's Core).
 
 Gives the floor for import / compile / upload on this machine and core device.
 The kernel only resets the RTIO core and returns -- no outputs are driven.
