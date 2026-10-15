@@ -22,6 +22,12 @@ A process that exits with its run still open (no END_RUN, and no ABORT_RUN that
 reached liveOD) tells liveOD so from an atexit handler (``notify_exit`` ->
 RUN_EXITED); without it the run sat "in progress", or an abort on "Aborting",
 until the next run started (run 83110, 2026-09-26).
+
+A run the queue warm-starts (queue phase 2) checks in early with
+``reserve_run`` (liveOD makes nothing) and takes the machine with ``start_run``
+instead of ``init_run``; ``release_reservation`` gives the slot back if it never
+starts. Against a liveOD older than these, each returns ``{"ok": False,
+"unknown_tag": True}`` and the run uses init_run as before.
 """
 
 import atexit
@@ -145,6 +151,28 @@ EXIT_NOTICE_TIMEOUT_MS = 2000
 def _ascii(text) -> str:
     """ExptBuilder pipes stdout through cp1252: print ASCII only."""
     return str(text).encode("ascii", "replace").decode("ascii")
+
+
+# START_RUN may wait for the previous run's save (45 s) and for the last frames
+# of a run whose experiment exited (~7 s) before it makes the file
+START_RUN_TIMEOUT_MS = 90_000
+RESERVE_RUN_TIMEOUT_MS = 30_000
+
+
+class LiveODStartRefused(RuntimeError):
+    """liveOD refused START_RUN (or INIT_RUN): no run id was used, nothing was
+    made. ``reply`` is the server's reply (``refused_reason``: ``feature``,
+    ``reset_since_go``, ``run_in_progress``, ``save_in_progress``,
+    ``exited_frames_due``, ...; absent for the older refusals)."""
+
+    def __init__(self, message: str, reply: dict):
+        super().__init__(message)
+        self.reply = dict(reply or {})
+
+
+def _unknown_tag(reply: dict, tag: str) -> bool:
+    """The reply of a liveOD older than ``tag``."""
+    return (not reply.get("ok")) and str(reply.get("error", "")).startswith(f"Unknown tag: {tag}")
 
 
 class LiveODClient(NetClient):
@@ -394,15 +422,29 @@ class LiveODClient(NetClient):
         the raised receive timeout rather than the 5 s default.
         """
         payload["tag"] = "INIT_RUN"
+        self._before_run_start()
+        reply = self._send_recv(payload, rcvtimeo_ms=60_000)
+        if not reply.get("ok"):
+            if reply.get("refused"):
+                # the queue's INIT_RUN refused before any run id (a live run)
+                raise LiveODStartRefused(
+                    f"[LiveODClient] INIT_RUN failed: {reply.get('error')}", reply)
+            raise RuntimeError(
+                f"[LiveODClient] INIT_RUN failed: {reply.get('error')}"
+            )
+        self._adopt_run_reply(reply)
+        return reply
+
+    def _before_run_start(self) -> None:
         self.last_reset_requested = False    # the server clears its flag on INIT_RUN
         self._run_token = ""
         self._grab_failure_warned = False
         self._writer_fault_warned = False
-        reply = self._send_recv(payload, rcvtimeo_ms=60_000)
-        if not reply.get("ok"):
-            raise RuntimeError(
-                f"[LiveODClient] INIT_RUN failed: {reply.get('error')}"
-            )
+
+    def _adopt_run_reply(self, reply: dict) -> None:
+        """An accepted INIT_RUN / START_RUN: the run's token, the server's
+        features, the run is open (the exit notice is armed), and what the
+        experiment's terminal should show."""
         self._run_token = str(reply.get("run_token") or "")
         self.server_features = dict(reply.get("features") or {})
         self._run_open = True
@@ -410,8 +452,104 @@ class LiveODClient(NetClient):
         if not getattr(self, "_exit_hook_registered", False):
             atexit.register(self.notify_exit)
             self._exit_hook_registered = True
+        self._print_warnings(reply, f"run {reply.get('run_id')}")
         self._print_camera_overrides(reply)
+
+    @staticmethod
+    def _print_warnings(reply: dict, what: str) -> None:
+        """liveOD's ``warnings`` (values the run file does not hold as sent,
+        persisted camera values not carried), a few lines; ASCII only."""
+        lines = list(reply.get("warnings") or [])
+        if not lines:
+            return
+        print(_ascii(f"!! liveOD, {what}: {len(lines)} warning(s):"))
+        for line in lines:
+            print(_ascii(f"!!   {line}"))
+
+    def reserve_run(self, payload: dict, ttl_s: float = 900.0) -> dict:
+        """RESERVE_RUN (queue phase 2): the next run checks in while the current
+        one runs. liveOD creates nothing (no run id, file or camera lock) and
+        dry-runs the start: the reply has ``reservation`` (the token for
+        start_run / release_reservation), ``features``, ``ttl_s``, ``warnings``
+        and ``preview`` (``camera_overrides``, ``refused``). Never raises: an
+        older liveOD ("Unknown tag") gives ``{"ok": False, "unknown_tag":
+        True}``, a network error or a refusal (another process holds the slot)
+        ``{"ok": False, "error"}`` -- either way the run starts with a plain
+        INIT_RUN later. ``payload`` is not modified."""
+        msg = dict(payload)
+        msg["tag"] = "RESERVE_RUN"
+        msg["ttl_s"] = float(ttl_s)
+        try:
+            reply = self._send_recv(msg, rcvtimeo_ms=RESERVE_RUN_TIMEOUT_MS)
+        except Exception as exc:                      # noqa: BLE001
+            return {"ok": False, "error": _ascii(f"RESERVE_RUN: {type(exc).__name__}: {exc}")}
+        if _unknown_tag(reply, "RESERVE_RUN"):
+            return {"ok": False, "unknown_tag": True,
+                    "error": "Unknown tag: RESERVE_RUN (this liveOD predates it; restart it with "
+                             "current code)"}
+        reply = dict(reply)
+        if reply.get("ok"):
+            # (its warnings are the caller's to print: Expt prints them)
+            refused = list((reply.get("preview") or {}).get("refused") or [])
+            if refused:
+                print(_ascii("!! liveOD, reservation: the run start would be REFUSED now:"))
+                for line in refused:
+                    print(_ascii(f"!!   {line}"))
         return reply
+
+    def start_run(self, payload: dict, *, reservation, require_features=(),
+                  go_reset_count=None) -> dict:
+        """START_RUN (queue phase 2): INIT_RUN for a warm-started run, behind
+        refusals that come before any run id. The reply is INIT_RUN's plus
+        ``run_date_str`` / ``run_datetime_str`` (the server's start time, which
+        names the file: adopt them) and ``run_started_at``; it is handled as
+        init_run's (run token, run open, exit notice, features).
+
+        ``reservation``: RESERVE_RUN's token (unknown or None: a plain start).
+        ``require_features``: what the compiled code assumes the server has.
+        ``go_reset_count``: liveOD's reset_count when the queue gave GO; a Reset
+        counted since refuses the start.
+
+        A refusal raises :class:`LiveODStartRefused` (``.reply``) -- never fall
+        back to init_run then. An older liveOD ("Unknown tag") gives
+        ``{"ok": False, "unknown_tag": True}`` instead of raising: that one may
+        be followed by a plain init_run. A network error raises as init_run's.
+        ``payload`` is not modified."""
+        msg = dict(payload)
+        msg["tag"] = "START_RUN"
+        msg["reservation"] = str(reservation or "")
+        msg["require_features"] = [str(f) for f in (require_features or ())]
+        msg["go_reset_count"] = None if go_reset_count is None else int(go_reset_count)
+        self._before_run_start()
+        reply = self._send_recv(msg, rcvtimeo_ms=START_RUN_TIMEOUT_MS)
+        if _unknown_tag(reply, "START_RUN"):
+            return {"ok": False, "unknown_tag": True,
+                    "error": "Unknown tag: START_RUN (this liveOD predates it; restart it with "
+                             "current code)"}
+        if not reply.get("ok"):
+            raise LiveODStartRefused(f"[LiveODClient] START_RUN failed: {reply.get('error')}",
+                                     reply)
+        self._adopt_run_reply(reply)
+        return reply
+
+    def release_reservation(self, reservation) -> dict:
+        """RELEASE_RESERVATION: give the reservation back (the warm process
+        stands down or exits; safe from an atexit handler: one request on a
+        fresh socket, 2 s). Idempotent; never raises: ``{"ok", "released"}``,
+        ``{"ok": False, "unknown_tag": True}`` from an older liveOD, or
+        ``{"ok": False, "error"}``."""
+        if not reservation:
+            return {"ok": True, "released": False}
+        msg = {"tag": "RELEASE_RESERVATION", "reservation": str(reservation)}
+        try:
+            reply = self._send_once(msg, EXIT_NOTICE_TIMEOUT_MS)
+        except Exception as exc:                      # noqa: BLE001
+            return {"ok": False, "error": _ascii(f"RELEASE_RESERVATION: "
+                                                 f"{type(exc).__name__}: {exc}")}
+        if _unknown_tag(reply, "RELEASE_RESERVATION"):
+            return {"ok": False, "unknown_tag": True,
+                    "error": "Unknown tag: RELEASE_RESERVATION (this liveOD predates it)"}
+        return dict(reply)
 
     def wait_cam_ready(self, timeout: float = 60.0) -> bool:
         """Block until liveOD confirms the camera is ready.

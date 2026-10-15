@@ -87,6 +87,15 @@ def write_scope_time_axes(group, t):
         group.create_dataset('t', data=t_unique, compression='gzip', compression_opts=4)
         group.create_dataset('t_map', data=t_map)
 
+def _note_slash(problems: list, group: str, key) -> None:
+    """A ``/`` in a dataset name makes h5py create nested groups (``params/a/b``
+    for the key ``a/b``): the value is stored, but not under the name it had.
+    Said in the run file's PROBLEMS list (see DataSaver._populate_data_file)."""
+    if "/" in str(key):
+        problems.append(f"{group}/{key}: '/' in the name -- stored as nested groups "
+                        f"({group}/{str(key).strip('/')}), not as one dataset named {key!r}")
+
+
 class DataSaver():
     def __init__(self,
                  data_dir="",
@@ -107,6 +116,8 @@ class DataSaver():
         else:
             server_talk = server_talk
         self.server_talk = server_talk
+        # the PROBLEMS of the last reserve_run_id_and_path's fill
+        self.last_fill_problems = []
 
     def save_data(self,expt:DummyExpt,expt_filepath="",data_object=None):
 
@@ -399,6 +410,9 @@ class DataSaver():
         thread.
         """
         st = self.server_talk
+        # the fill's PROBLEMS for this run (see _populate_data_file); liveOD
+        # hands them back in the INIT_RUN / START_RUN reply
+        self.last_fill_problems = []
         st.check_for_mapped_data_dir()
 
         try:
@@ -433,7 +447,7 @@ class DataSaver():
             # left claimed by an unusable corpse, and let the caller refuse to
             # start the run.
             try:
-                self._populate_data_file(f, payload, candidate)
+                self.last_fill_problems = self._populate_data_file(f, payload, candidate)
             except Exception:
                 try:
                     f.close()
@@ -487,7 +501,8 @@ class DataSaver():
             f.close()
         return fpath
 
-    def _populate_data_file(self, f: "h5py.File", payload: dict, run_id: int) -> None:
+    def _populate_data_file(self, f: "h5py.File", payload: dict, run_id: int,
+                            quiet: bool = False) -> list:
         """Write the full run structure into an already-open HDF5 handle.
 
         Creates the ``data``, ``run_info``, ``params`` and ``camera_params``
@@ -497,7 +512,21 @@ class DataSaver():
         When ``capture_images=False`` the ``images`` / ``image_timestamps``
         datasets are omitted and ``f.attrs['has_images']`` is set to
         ``False`` so that ``atomdata`` can skip image analysis on load.
+
+        Returns the PROBLEMS met (2026-10-14): one line per value that is not
+        in the file as the payload had it -- a params / camera_params value
+        h5py cannot store, a DataVault container that could not be
+        pre-allocated, a run_info value dropped (that one used to be silent),
+        a ``/`` in a key (h5py makes nested groups of it: ``params/a/b``). The
+        file is written exactly as before and the old prints stay; the list is
+        for whoever started the run (INIT_RUN's reply, RESERVE_RUN's dry run).
+        Still raised, as before: an unknown DataVault dtype, a DataVault entry
+        without a shape, a non-integer imaging_type, xvarnames h5py cannot
+        store. ``quiet``: no prints (the dry run: its lines would read as the
+        run in progress's).
         """
+        problems = []
+        say = (lambda text: None) if quiet else print
         # ------ minimal run_info proxy --------------------------------
         class _RunInfoProxy:
             pass
@@ -546,10 +575,13 @@ class DataSaver():
                 kw = {}
                 if info.get("fill") is not None:
                     kw["fillvalue"] = info["fill"]
+                _note_slash(problems, "data", key)
                 try:
                     create_image_dataset(data_grp, key, shape=shape, dtype=dtype, **kw)
                 except Exception as exc:
-                    print(f"[DataSaver] Could not pre-allocate DataVault '{key}': {exc}")
+                    say(f"[DataSaver] Could not pre-allocate DataVault '{key}': {exc}")
+                    problems.append(f"data/{key}: DataVault container not pre-allocated "
+                                    f"(shape {list(shape)}, dtype {dtype.str}): {exc}")
 
         # Sort index / sort N
         sort_idx_raw = payload.get("sort_idx", [])
@@ -564,27 +596,65 @@ class DataSaver():
             data_grp.create_dataset("sort_N", data=np.array(sort_N_raw))
 
         # run_info group + attrs
-        self._run_info_proxy_to_h5(f, ri)
+        problems.extend(self._run_info_proxy_to_h5(f, ri))
 
         # params initial snapshot
         # A value h5py cannot store (None, a dict, a mixed list) is left out of
         # the group, so it is missing when the run is loaded: say which one.
         params_grp = f.create_group("params")
         for key, val in payload.get("params", {}).items():
+            _note_slash(problems, "params", key)
             try:
                 params_grp.create_dataset(key, data=val)
             except Exception as exc:
-                print(f"[DataSaver] WARNING: params/{key} not stored "
+                say(f"[DataSaver] WARNING: params/{key} not stored "
                       f"({type(val).__name__} value): {exc}")
+                problems.append(f"params/{key} not stored ({type(val).__name__} value): {exc}")
 
         # camera_params group
         cam_grp = f.create_group("camera_params")
         for key, val in payload.get("camera_params", {}).items():
+            _note_slash(problems, "camera_params", key)
             try:
                 cam_grp.create_dataset(key, data=val)
             except Exception as exc:
-                print(f"[DataSaver] WARNING: camera_params/{key} not stored "
+                say(f"[DataSaver] WARNING: camera_params/{key} not stored "
                       f"({type(val).__name__} value): {exc}")
+                problems.append(f"camera_params/{key} not stored ({type(val).__name__} "
+                                f"value): {exc}")
+        return problems
+
+    def dry_run_fill(self, payload: dict) -> dict:
+        """The run file's fill (``_populate_data_file``) into an HDF5 file that
+        lives in memory only (``driver='core'``, nothing on any disk), for
+        liveOD's RESERVE_RUN: what INIT_RUN / START_RUN would meet, before any
+        run id is used. ``{"problems": [...], "error": str | None}`` --
+        ``error`` is what would make the real fill raise (and the run start be
+        refused). The data drive itself is not checked here (space,
+        permissions): see ``data_dir_reachable``. Prints nothing (the real
+        fill's prints would read as the run in progress's). Never raises."""
+        import uuid  # noqa: PLC0415
+        problems, error = [], None
+        # the name is only the in-memory file's label: with backing_store=False
+        # the core driver never creates, reads or writes it on disk
+        name = f"liveod_dry_run_{uuid.uuid4().hex}.h5"
+        try:
+            with h5py.File(name, "w", driver="core", backing_store=False) as f:
+                problems = self._populate_data_file(f, payload, 0, quiet=True)
+        except Exception as exc:                      # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        return {"problems": list(problems or []), "error": error}
+
+    def data_dir_reachable(self):
+        """``(ok, text)``: is the data directory there? Read-only (unlike
+        server_talk.check_for_mapped_data_dir, nothing is re-mapped)."""
+        path = self._data_dir
+        try:
+            if path and os.path.isdir(path):
+                return True, ""
+        except Exception as exc:                      # noqa: BLE001
+            return False, f"data directory {path!r} cannot be checked: {exc}"
+        return False, f"data directory {path!r} not found"
 
     # Params that must never be unshuffled — they describe the scan itself
     # rather than per-shot results.
@@ -952,19 +1022,24 @@ class DataSaver():
     # Private helpers shared by server-side methods
     # ------------------------------------------------------------------
 
-    def _run_info_proxy_to_h5(self, f: "h5py.File", ri) -> None:
-        """Write run_info fields to HDF5 attrs and run_info group."""
+    def _run_info_proxy_to_h5(self, f: "h5py.File", ri) -> list:
+        """Write run_info fields to HDF5 attrs and run_info group. Returns the
+        values that could not be written (left out, as they always were)."""
+        problems = []
         for key in vars(ri):
             try:
                 f.attrs[key] = getattr(ri, key)
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(f"run_info attribute {key} not stored "
+                                f"({type(getattr(ri, key)).__name__} value): {exc}")
         runinfo_grp = f.create_group("run_info")
         for key in vars(ri):
             try:
                 runinfo_grp.create_dataset(key, data=getattr(ri, key))
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(f"run_info/{key} not stored "
+                                f"({type(getattr(ri, key)).__name__} value): {exc}")
+        return problems
 
     @staticmethod
     def _unshuffle_single_array(

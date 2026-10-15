@@ -38,6 +38,35 @@ class FakeSaver:
         self.incomplete = incomplete        # what the last save was told is missing
 
 
+class TmpTalk:
+    """The server_talk calls the real DataSaver's reserve makes, kept inside a
+    folder (pytest's tmp_path): a run id counter and nothing else."""
+
+    def __init__(self, folder):
+        self.data_dir = str(folder)
+        self.next_id = 1
+        self.set_calls = 0
+
+    def check_for_mapped_data_dir(self):
+        return True
+
+    def get_run_id(self):
+        return self.next_id
+
+    def get_latest_run_id_any(self):
+        return None
+
+    def set_run_id(self, value):
+        self.set_calls += 1
+        self.next_id = int(value)
+
+
+def tmp_data_saver(folder):
+    """The real waxa DataSaver, rooted in ``folder``, with a TmpTalk."""
+    from waxa.data.data_saver import DataSaver
+    return DataSaver(str(folder), server_talk=TmpTalk(folder))
+
+
 def new_data_file(folder):
     """(run_id, filepath) of a fresh file with a 'data' group, as INIT_RUN leaves it."""
     return FakeSaver(folder).reserve_run_id_and_path({})
