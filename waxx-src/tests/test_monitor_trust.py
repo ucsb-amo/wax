@@ -102,6 +102,35 @@ def test_the_never_took_the_core_ttl_restores_the_trust(server):
     assert "never took the core" in server._trust["reason"]
 
 
+def _lapse(server):
+    server._run_pending["t0"] = time.monotonic() - server.RUN_PENDING_TTL_S - 1
+    assert server._current_run_pending() is None
+
+
+def test_the_ttl_keeps_it_untrusted_when_the_monitor_was_not_ready_throughout(server):
+    """A queue run announced while no monitor ran (or one restarted in
+    between) may have taken the core and been hard-killed: its fence lapsing
+    with the monitor READY again does not give the old trust back."""
+    server.status.state = STATES.NOT_READY                         # between queue jobs
+    ask(server, {"type": "run_pending", "run_id": 6, "expt": "x", "token": "tok"})
+    server.status.state = STATES.READY                             # the queue restarted it
+    _lapse(server)
+    t = server._trust
+    assert t["trusted"] is False
+    assert "fence lapsed; the monitor was not continuously ready" in t["reason"]
+    assert "whether it took the core is unknown" in t["reason"]
+
+
+def test_the_ttl_keeps_it_untrusted_after_a_monitor_restart_in_between(server):
+    server.status.state = STATES.READY
+    ask(server, {"type": "run_pending", "run_id": 6, "expt": "x", "token": "tok"})
+    server.on_monitor_state(STATES.LOADING, "")                    # restarted meanwhile
+    server.on_monitor_state(STATES.READY, "")
+    _lapse(server)
+    assert server._trust["trusted"] is False
+    assert "not continuously ready" in server._trust["reason"]
+
+
 def test_taking_the_core_keeps_it_untrusted_and_forgets_the_old_trust(server):
     ask(server, {"type": "run_pending", "run_id": 7, "expt": "x", "token": "tok"})
     server.on_monitor_state(STATES.NOT_READY, "interrupted_by_run")

@@ -796,7 +796,10 @@ class MonitorUDPServer(UdpServer):
         token = str(obj.get("token") or "")
         self._run_pending = {"run_id": obj.get("run_id"), "expt": str(obj.get("expt", "")),
                              "client": str(obj.get("client", "")), "since": time.time(),
-                             "token": token, "t0": time.monotonic()}
+                             "token": token, "t0": time.monotonic(),
+                             # the monitor has been READY at every look since the
+                             # announcement (the TTL restores trust only then)
+                             "ready_throughout": self.status.state == STATES.READY}
         log.info("Run %s (%s) is starting: composite ops are fenced until it ends.",
                  obj.get("run_id"), obj.get("expt", ""))
         self.journal.record("run_pending", run_id=obj.get("run_id"), expt=obj.get("expt"),
@@ -866,11 +869,24 @@ class MonitorUDPServer(UdpServer):
 
     def _current_run_pending(self) -> dict | None:
         p = self._run_pending
+        if p is not None and self.status.state != STATES.READY:
+            p["ready_throughout"] = False
         if p is not None and time.monotonic() - p["t0"] > self.RUN_PENDING_TTL_S \
                 and self.status.state == STATES.READY:
-            why = (f"run {p.get('run_id')} never took the core "
-                   f"within {self.RUN_PENDING_TTL_S:.0f} s")
-            self._restore_trust(p.get("token") or "", why)
+            if p.get("ready_throughout"):
+                # a monitor running the whole time proves the run never took
+                # the core: the trust from before its announcement comes back
+                why = (f"run {p.get('run_id')} never took the core "
+                       f"within {self.RUN_PENDING_TTL_S:.0f} s")
+                self._restore_trust(p.get("token") or "", why)
+            else:
+                # the monitor was not running (or was restarted) at some point
+                # since the announcement: the run may have taken the core and
+                # died without reporting -- keep it untrusted
+                why = (f"run {p.get('run_id')}'s fence lapsed; the monitor was not "
+                       "continuously ready since its announcement, so whether it took "
+                       "the core is unknown")
+                self._set_trust(False, why)
             self._clear_run_pending(why)
             self.connections.run_over(why, reopen=True)
             return None
@@ -1251,6 +1267,8 @@ class MonitorUDPServer(UdpServer):
         interrupted by a run makes the state untrusted until that run's end
         state arrives."""
         previous, self._last_monitor_state = self._last_monitor_state, (state, reason)
+        if state != STATES.READY and self._run_pending is not None:
+            self._run_pending["ready_throughout"] = False
         if state == STATES.NOT_READY:
             self.retire_ops(reason or _state_name(state))
             if reason == "interrupted_by_run" and previous != (state, reason):
