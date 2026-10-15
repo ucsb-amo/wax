@@ -67,8 +67,9 @@ def slot_running(q, expts, name="rabi", run_id=101, n_shots=1, **kw):
     a = ids[0] if isinstance(ids, list) else ids
     q.tick()
     assert job(q, a)["state"] == "running"
+    # init 1 s ago, last shot just now: an ETA from liveOD's shot timing
     q.live.start_run(run_id, launcher="kq", queue_job=qj(q, a), n_shots=n_shots,
-                     n_shots_expected=20, client_pid=7001)
+                     n_shots_expected=20, client_pid=7001, last_shot_age_s=0.0)
     q.tick()
     return ids
 
@@ -197,6 +198,22 @@ def test_not_while_the_slot_job_is_far_from_its_end(tmp_path, expts):
     q.tick()
     assert len(q.spawner.calls) == 1
     q.live.state.update(n_shots=990)                      # (10-0)/990 s a shot: soon
+    q.tick()
+    assert len(q.spawner.calls) == 2
+
+
+def test_an_unknown_eta_does_not_warm_until_it_is_known(tmp_path, expts):
+    """N3: with no ETA (liveOD's shot timing incomplete, no duration
+    history) a warm launch waits: warming right after the first shot of a
+    long run would go stale and re-warm."""
+    q = wq(tmp_path, expts)
+    slot_running(q, expts)
+    q.live.state.pop("last_shot_age_s")                   # shot timing not known
+    submit(q, expts, "tof")
+    q.tick()
+    q.tick()
+    assert len(q.spawner.calls) == 1
+    q.live.state.update(last_shot_age_s=0.0)              # now it is: ~19 s to go
     q.tick()
     assert len(q.spawner.calls) == 2
 
@@ -583,7 +600,10 @@ def test_a_discarded_process_that_does_not_exit_raises_the_alarm_and_is_never_ki
 
 # --- deaths ---------------------------------------------------------------------------------
 
-def test_death_while_warming_fails_the_job(tmp_path, expts):
+def test_death_while_warming_makes_the_job_cold_and_keeps_it_queued(tmp_path, expts):
+    """S4: a warm process that dies before GO does not fail the job (the
+    failure may exist only because the launch was warm): the job is made
+    cold, stays queued, and launches cold when the slot frees."""
     q = wq(tmp_path, expts)
     slot_running(q, expts)
     b = submit(q, expts, "tof")
@@ -591,15 +611,65 @@ def test_death_while_warming_fails_the_job(tmp_path, expts):
     WarmProc(q, b).proc.code = 1
     q.tick()
     jb = job(q, b)
-    assert jb["state"] == "failed" and jb["warm"] is None
-    assert "while warming, before it took the machine" in jb["reason"]
+    assert jb["state"] == "queued" and jb["warm"] is None
+    assert jb["cold_why"].startswith("warm attempt failed (exit 1): ")
+    assert "while warming, before it took the machine" in jb["cold_why"]
+    assert q.journal.kinds.count("run_queue_warm_made_cold") == 1
+    rec = [e for e in q.journal.entries if e["kind"] == "run_queue_warm_exited"][-1]
+    assert rec["failed"] is False and rec["made_cold"] is True
+    q.tick()
+    assert len(q.spawner.calls) == 2                      # never warmed again
+    end_slot(q)
+    q.tick()
+    assert job(q, b)["state"] == "running"
+    last = q.spawner.calls[-1]
+    assert "WAXX_QUEUE_WARM" not in last["env"] and "below_normal" not in last
 
 
-def test_death_while_ready_fails_the_job(tmp_path, expts, lib):
+def test_death_while_ready_makes_the_job_cold(tmp_path, expts, lib):
     q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
     wp.proc.code = 1
     q.tick()
-    assert job(q, b)["state"] == "failed" and "while ready" in job(q, b)["reason"]
+    jb = job(q, b)
+    assert jb["state"] == "queued" and "while ready" in jb["cold_why"]
+    assert jb["cold_why"].startswith("warm attempt failed (exit 1)")
+
+
+def test_a_cold_launch_after_a_failed_warm_one_fails_as_before(tmp_path, expts):
+    """A genuine bug: the warm attempt dies, then the cold launch dies too --
+    that one fails the job (and its chain) as a cold run always did."""
+    q = wq(tmp_path, expts)
+    slot_running(q, expts)
+    b = submit(q, expts, "tof")
+    q.tick()
+    WarmProc(q, b).proc.code = 1
+    q.tick()
+    end_slot(q)
+    q.tick()
+    assert job(q, b)["state"] == "running"
+    q.spawner.procs[-1].code = 1
+    q.tick()
+    assert job(q, b)["state"] == "failed"
+
+
+def test_a_stale_discard_does_not_count_towards_the_cold_cap(tmp_path, expts, lib):
+    """N3: a warm launch discarded only for being stale (the slot job ran
+    long) gives its attempt back; any number of stale re-warms never make
+    the job cold."""
+    q, a, b, wp = ready_behind_slot(tmp_path, expts, lib)
+    for n in range(rq.WARM_MAX_ATTEMPTS + 1):
+        q.clock.t += rq.WARM_READY_MAX_S + 1
+        q.tick()
+        w = warm_rec(q, b)
+        assert w["state"] == "aborting" and w["why"].endswith(rq.WARM_STALE_MARK)
+        q.spawner.procs[-1].code = rq.EXIT_WARM_ABORTED
+        q.tick()                                          # exits; re-warms at once
+        assert job(q, b)["warm_attempts"] == 1, n
+        assert job(q, b)["cold_why"] == ""
+        wp = WarmProc(q, b, pid=9100 + n)
+        wp.ready(lib)
+    rec = [e for e in q.journal.entries if e["kind"] == "run_queue_warm_exited"][-1]
+    assert rec["attempt_refunded"] is True
 
 
 def test_a_process_that_stood_down_by_itself_leaves_the_job_queued(tmp_path, expts, lib):
@@ -764,7 +834,8 @@ def test_the_loop_the_queue_stopped_comes_back_after_a_warm_chain(tmp_path, expt
     loop.finish_stop()
     q.tick()
     assert job(q, a)["state"] == "running"
-    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), n_shots=1, client_pid=7001)
+    q.live.start_run(101, launcher="kq", queue_job=qj(q, a), n_shots=1, client_pid=7001,
+                     n_shots_expected=20, last_shot_age_s=0.0)     # (an ETA is known)
     b = submit(q, expts, "tof")
     q.tick()
     wp = WarmProc(q, b)

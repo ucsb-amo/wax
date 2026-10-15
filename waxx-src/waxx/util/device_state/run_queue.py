@@ -231,8 +231,11 @@ WARM_PREP_MAX_S = 600.0
 WARM_EXIT_ALARM_S = 120.0
 #: A ready warm process's manifest is re-stat-ed this often while it waits.
 WARM_MANIFEST_CHECK_S = 5.0
-#: Warm launches per job at most (after that it goes cold).
+#: Warm launches per job at most (after that it goes cold).  A launch
+#: discarded only because it went stale (ready too long) is not counted.
 WARM_MAX_ATTEMPTS = 3
+#: The end of the discard reason of a warm process ready too long.
+WARM_STALE_MARK = "(stale)"
 #: A warm launch whose launcher gave no answer is waited for (its hello)
 #: this long before it is forgotten.
 WARM_HELLO_WAIT_S = 120.0
@@ -2034,6 +2037,10 @@ class RunQueue:
     def _discard_warm(self, job: Job, why: str) -> None:
         with self._lock:
             done = self._mark_aborting(job, why)
+            if done and why.endswith(WARM_STALE_MARK):
+                # only stale (the slot job ran long): its attempt is given
+                # back at its exit, so waiting never makes the job cold
+                job.warm["refund_attempt"] = True
         if done:
             self._save()
             self._notify()
@@ -2103,7 +2110,7 @@ class RunQueue:
                 return "no longer next" + (f" (#{cand.id} is)" if cand is not None else "")
             if (w.get("state") == "ready"
                     and now - float(w.get("ready_at") or now) > WARM_READY_MAX_S):
-                return f"ready for more than {WARM_READY_MAX_S / 60.0:.0f} min (stale)"
+                return f"ready for more than {WARM_READY_MAX_S / 60.0:.0f} min {WARM_STALE_MARK}"
             if (w.get("state") == "warming"
                     and now - float(w.get("spawned_at") or now) > WARM_PREP_MAX_S):
                 return f"not ready {WARM_PREP_MAX_S / 60.0:.0f} min after its launch"
@@ -2182,9 +2189,13 @@ class RunQueue:
     def _warm_exited(self, job: Job, code) -> None:
         """A warm process (no GO given) has exited: its record goes.  Told to
         stand down, or it stood down itself (exit 78), or gone with no exit
-        code known: the job stays as it is.  Any other exit -- it died while
-        warming or ready, before it took the machine -- fails the job (the
-        same code would have failed cold)."""
+        code known: the job stays as it is (a launch discarded only for
+        being stale gives its attempt back).  Any other exit -- it died
+        while warming or ready, before it took the machine -- makes the job
+        COLD and leaves it queued: some failures happen only because the
+        launch was warm (a host kernel call in prepare refused before GO, a
+        lazy device touched before GO, a person ending a stuck warm
+        process); a genuine bug then fails the cold launch as before."""
         proc = self._warm_procs.pop(job.id, None)
         _close(proc)
         self._warm_checked.pop(job.id, None)
@@ -2194,21 +2205,29 @@ class RunQueue:
                 return
             state = w.get("state")
             job.warm = None
-            fail = (state != "aborting" and code not in (-1, EXIT_WARM_ABORTED)
+            refund = bool(w.get("refund_attempt")) and job.warm_attempts > 0
+            if refund:
+                job.warm_attempts -= 1
+            cold = (state != "aborting" and code not in (-1, EXIT_WARM_ABORTED)
                     and job.state == "queued")
-            if fail:
-                self._end(job, "failed", f"its warm process exited (code {code}) while "
-                                         f"{state}, before it took the machine")
+            if cold:
+                job.cold_why = (f"warm attempt failed (exit {code}): its warm process exited "
+                                f"while {state}, before it took the machine; it launches cold")
             if self._warm_alarm is not None and self._warm_alarm.get("job") == job.id:
                 self._warm_alarm = None
-        if fail:
-            log.warning("Run queue: %s FAILED: its warm process exited (code %s) while %s.",
+        if cold:
+            log.warning("Run queue: %s: its warm process exited (code %s) while %s, before "
+                        "it took the machine; the job stays queued and launches cold.",
                         job.name, code, state)
         else:
             log.info("Run queue: %s's warm process exited (code %s; it was %s%s).", job.name,
                      code, state, f": {w.get('why')}" if w.get("why") else "")
         self._record("run_queue_warm_exited", job=job.id, attempt=w.get("attempt"), code=code,
-                     state=state, why=w.get("why") or "", failed=fail)
+                     state=state, why=w.get("why") or "", failed=False, made_cold=cold,
+                     attempt_refunded=refund)
+        if cold:
+            self._record("run_queue_warm_made_cold", job=job.id, attempt=w.get("attempt"),
+                         code=code, cold_why=job.cold_why)
         self._save()
         self._notify()
 
@@ -2229,7 +2248,10 @@ class RunQueue:
                     and int(poll.get("n_shots") or 0) >= 1):
                 return                                # the two compiles never overlap
             end, _ = self._running_end(cur, now)
-            if end is not None and end - now > WARM_LEAD_S:
+            if end is None or end - now > WARM_LEAD_S:
+                # an unknown ETA waits until liveOD's shot timing (or a
+                # duration estimate) gives one: warming at once would go stale
+                # on a long run
                 return
             cand = self._warm_candidate(now)
             if (cand is None or cand.cold or cand.cold_why
