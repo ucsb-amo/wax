@@ -23,30 +23,61 @@ def _fresh_gate(monkeypatch):
     queue_gate._reset_for_tests()
 
 
+class LiveODStartRefused(RuntimeError):
+    """Stands in for D's client exception (a RuntimeError)."""
+
+
+RESERVED = {"ok": True, "reservation": "r9", "features": {"reserve": True, "put_data": True},
+            "warnings": ["w"]}
+REFUSED = {"ok": False, "refused": True, "error": "another process holds the slot",
+           "holder": {"pid": 1}, "features": {"reserve": True, "put_data": True}}
+UNKNOWN = {"ok": False, "unknown_tag": True, "error": "Unknown tag: RESERVE_RUN (old liveOD)"}
+
+
 class FakeLiveOD:
-    def __init__(self, events, has_phase2=True, start_reply=None, reserve_reply=None):
+    """LiveODClient as Expt uses it (D's API: reserve/release never raise,
+    start_run raises LiveODStartRefused on a refusal, an old server answers
+    unknown_tag)."""
+
+    def __init__(self, events, has_phase2=True, start_reply=None, reserve_reply=None,
+                 poll_reply=None, start_raises=None):
         self.events = events
         self.server_features = {}
         self._start_reply = start_reply
         self._reserve_reply = reserve_reply
+        self._poll_reply = poll_reply
+        self._start_raises = start_raises
         if not has_phase2:
             self.reserve_run = self.start_run = None
         self.released = []
+        self.init_payload_times = []
 
     def supports(self, f):
         return bool(self.server_features.get(f))
 
+    def poll(self):
+        self.events.append("poll")
+        if isinstance(self._poll_reply, Exception):
+            raise self._poll_reply
+        return self._poll_reply or {"ok": True, "features": {}}
+
     def init_run(self, payload):
         self.events.append("init_run")
+        self.init_payload_times.append(payload.get("run_datetime_str"))
         self.server_features = {"put_data": True}
         return {"ok": True, "run_id": 7, "filepath": "x.hdf5"}
 
     def reserve_run(self, payload, ttl_s=900.0):
         self.events.append("reserve_run")
-        return self._reserve_reply or {"ok": True, "reservation": "r9", "warnings": ["w"]}
+        r = self._reserve_reply if self._reserve_reply is not None else RESERVED
+        if isinstance(r, Exception):            # (D's never raises; an older client might)
+            raise r
+        return r
 
     def start_run(self, payload, *, reservation, require_features=(), go_reset_count=None):
         self.events.append(("start_run", reservation, tuple(require_features), go_reset_count))
+        if self._start_raises is not None:
+            raise self._start_raises
         if self._start_reply is not None:
             return self._start_reply
         return {"ok": True, "run_id": 8, "filepath": "y.hdf5",
@@ -63,7 +94,8 @@ class Stand(SimpleNamespace):
 
 _METHODS = ("claim", "claim_hardware", "claim_after_start", "pre_init_run",
             "_start_liveod_run", "_adopt_start_time", "_reserve_warm_run",
-            "_release_reservation", "_decide_subscan", "_compile_subscan_switch",
+            "_release_reservation", "_liveod_has_reserve", "_restamp_run_time_now",
+            "_decide_subscan", "_compile_subscan_switch",
             "_expt_file_stem", "_serialize_init_payload", "_xvar_ranges",
             "_source_texts_for_end", "_source_files", "_read_source",
             "_snapshot_source_texts", "_expt_file_path")
@@ -78,17 +110,35 @@ def _stand(events, client):
     e._claimed = False
     e._run_started = False
     e._reservation = None
+    e._liveod_features = None
     e._subscan = None
     e._extra_file_texts = {}
     e.live_od_client = client
     e.run_info = RunInfo(None, save_data=False)
     e.claim_hardware = lambda: events.append("hardware")
     e.claim_after_start = lambda: events.append("after_start")
-    e._serialize_init_payload = lambda: {"payload": True}
+    e._serialize_init_payload = lambda: {"payload": True,
+                                         "run_datetime_str": e.run_info.run_datetime_str}
     e._expt_file_stem = lambda: "stand"
     e.monitor = SimpleNamespace(announce_run=lambda **kw: events.append(("announce",
                                                                          kw["run_id"])))
     return e
+
+
+@pytest.fixture
+def warm(monkeypatch):
+    monkeypatch.setenv("WAXX_QUEUE_WARM", "tok")
+    assert queue_gate.is_warm()
+
+
+def _stale(e):
+    """The warm process's start time, long before the claim."""
+    e.run_info.run_date_str = "2026-01-01"
+    e.run_info.run_datetime_str = "2026-01-01_00-00-00"
+
+
+def _starts(ev):
+    return [x for x in ev if isinstance(x, tuple) and x[0] == "start_run"]
 
 
 def test_cold_claim_order_and_once():
@@ -100,12 +150,21 @@ def test_cold_claim_order_and_once():
     assert e.run_info.run_id == 7 and e._run_started
 
 
-def test_warm_reserve_then_start_with_the_reservation_and_server_time():
+def test_cold_never_uses_start_run_even_with_a_reservation():
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev))
+    e._reservation = "r1"
+    e.claim()
+    assert "init_run" in ev and _starts(ev) == []
+
+
+def test_warm_reserve_then_start_with_the_reservation_and_server_time(warm, capsys):
     ev = []
     client = FakeLiveOD(ev)
     e = _stand(ev, client)
     e._reserve_warm_run()
     assert ev == ["reserve_run"] and e._reservation == "r9"
+    assert "reservation warning: w" in capsys.readouterr().out      # printed once, by Expt
     e.claim()
     assert ev[1:] == ["hardware", ("start_run", "r9", ("reserve",), None), ("announce", 8),
                       "after_start"]
@@ -117,36 +176,92 @@ def test_warm_reserve_then_start_with_the_reservation_and_server_time():
     assert client.released == []
 
 
-def test_a_start_refusal_stops_the_claim_before_the_announce():
+def test_warm_reserve_refused_still_starts_with_start_run_and_no_reservation(warm):
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev, reserve_reply=REFUSED))
+    e._reserve_warm_run()
+    assert e._reservation is None
+    e.claim()
+    assert _starts(ev) == [("start_run", None, ("reserve",), None)]
+    assert "init_run" not in ev and "poll" not in ev
+    assert e.run_info.run_datetime_str == "2026-10-14_09-08-07"      # liveOD's start time
+
+
+def test_warm_reserve_failed_asks_poll_for_the_feature(warm):
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev, reserve_reply=ConnectionError("no reply"),
+                              poll_reply={"ok": True, "features": {"reserve": True}}))
+    e._reserve_warm_run()
+    e.claim()
+    assert "poll" in ev and _starts(ev) == [("start_run", None, ("reserve",), None)]
+    assert "init_run" not in ev
+
+
+def test_warm_without_the_reserve_feature_restamps_then_init_run(warm):
+    ev = []
+    client = FakeLiveOD(ev, reserve_reply=ConnectionError("no reply"),
+                        poll_reply={"ok": True, "features": {"put_data": True}})
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    _stale(e)
+    e.claim()
+    assert _starts(ev) == [] and "init_run" in ev
+    assert client.init_payload_times[0] != "2026-01-01_00-00-00"     # re-stamped before it
+    assert e.run_info.run_date_str != "2026-01-01"
+    assert e.run_info.run_datetime_str == client.init_payload_times[0]
+
+
+def test_warm_against_an_old_liveod_restamps_then_init_run(warm):
+    ev = []
+    client = FakeLiveOD(ev, reserve_reply=UNKNOWN)
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    assert e._reservation is None and e._liveod_features == {}
+    _stale(e)
+    e.claim()
+    assert _starts(ev) == [] and "poll" not in ev and "init_run" in ev
+    assert client.init_payload_times[0] != "2026-01-01_00-00-00"
+
+
+def test_warm_with_an_old_client_without_the_methods_gets_init_run(warm):
+    ev = []
+    client = FakeLiveOD(ev, has_phase2=False)
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    _stale(e)
+    e.claim()
+    assert "init_run" in ev and e.run_info.run_id == 7
+    assert e.run_info.run_date_str != "2026-01-01"
+
+
+def test_warm_start_unknown_tag_falls_back_to_a_restamped_init_run(warm):
+    ev = []
+    client = FakeLiveOD(ev, start_reply=dict(UNKNOWN, error="Unknown tag: START_RUN"))
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    _stale(e)
+    e.claim()
+    assert len(_starts(ev)) == 1 and "init_run" in ev
+    assert client.init_payload_times[0] != "2026-01-01_00-00-00"
+
+
+def test_a_start_refusal_propagates_before_the_announce(warm):
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev, start_raises=LiveODStartRefused("reset since GO")))
+    e._reserve_warm_run()
+    with pytest.raises(LiveODStartRefused, match="reset since GO"):
+        e.claim()
+    assert not any(isinstance(x, tuple) and x[0] == "announce" for x in ev)
+    assert "init_run" not in ev and e.run_info.run_id == 0
+
+
+def test_a_non_raising_refusal_reply_is_a_refusal_too(warm):
     ev = []
     e = _stand(ev, FakeLiveOD(ev, start_reply={"ok": False, "error": "a run is in progress"}))
     e._reserve_warm_run()
     with pytest.raises(RuntimeError, match="START_RUN refused: a run is in progress"):
         e.claim()
-    assert not any(isinstance(x, tuple) and x[0] == "announce" for x in ev)
     assert "init_run" not in ev
-
-
-def test_an_old_liveod_gets_init_run():
-    ev = []
-    e = _stand(ev, FakeLiveOD(ev, has_phase2=False))
-    e._reserve_warm_run()
-    assert e._reservation is None
-    e.claim()
-    assert "init_run" in ev and e.run_info.run_id == 7
-
-
-def test_unknown_tag_replies_fall_back_to_init_run():
-    ev = []
-    unknown = {"ok": False, "error": "Unknown tag: RESERVE_RUN"}
-    e = _stand(ev, FakeLiveOD(ev, reserve_reply=unknown))
-    e._reserve_warm_run()
-    assert e._reservation is None
-    ev2 = []
-    e2 = _stand(ev2, FakeLiveOD(ev2, start_reply={"ok": False, "error": "Unknown tag"}))
-    e2._reservation = "r1"
-    e2.claim()
-    assert "init_run" in ev2
 
 
 def test_an_unused_reservation_is_released():

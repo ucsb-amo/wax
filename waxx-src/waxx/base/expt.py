@@ -118,9 +118,10 @@ def _process_started():
 
 def _unknown_tag(reply) -> bool:
     """A liveOD reply that says it does not know the request (an older
-    liveOD): ``ok`` false with an "Unknown tag" error."""
+    liveOD): ``unknown_tag`` set, or ``ok`` false with an "Unknown tag" error."""
     return (isinstance(reply, dict) and not reply.get("ok", True)
-            and "unknown tag" in str(reply.get("error", "")).lower())
+            and (bool(reply.get("unknown_tag"))
+                 or "unknown tag" in str(reply.get("error", "")).lower()))
 
 
 #: ``WAXX_LAUNCHER`` of a run the monitor server's run queue launched
@@ -256,6 +257,7 @@ class Expt(Scanner, Dealer, Scribe):
         self._claimed = False
         self._run_started = False      # liveOD start done: shapes are final
         self._reservation = None       # liveOD RESERVE_RUN token (warm only)
+        self._liveod_features = None   # liveOD's features as RESERVE told (warm only)
 
         # The source texts this run is made of, read now (close to import
         # time) and saved at END: a file edited during the run (a write-back,
@@ -408,8 +410,15 @@ class Expt(Scanner, Dealer, Scribe):
         pass
 
     def _start_liveod_run(self):
-        """liveOD's start of this run: START_RUN for a warm-launched run that
-        holds a reservation (against a liveOD that has it), else INIT_RUN.
+        """liveOD's start of this run. Cold: INIT_RUN, as always. Warm-launched:
+        START_RUN whenever liveOD has the ``reserve`` feature -- with the
+        reservation, or with none when RESERVE was refused or failed (a plain
+        START still refuses before any run id on a Reset since GO or a live run
+        in progress, and stamps liveOD's start time); its refusal
+        (LiveODStartRefused) propagates, the run does not start. INIT_RUN only
+        when liveOD does not know START_RUN ("Unknown tag") or has no
+        ``reserve`` feature, and then run_info is re-stamped with the current
+        time first, so the file is not named by the warm process's start.
         Adopts the run id, file path and -- when the reply has them -- the
         server's start time into run_info."""
         _client = getattr(self, 'live_od_client', None)
@@ -420,26 +429,31 @@ class Expt(Scanner, Dealer, Scribe):
                     "data will not be saved (setup_camera=False)."
                 )
             return
-        # rebuilt here: claim_hardware may have changed container shapes
-        payload = self._serialize_init_payload()
-        response = None
-        start = getattr(_client, 'start_run', None)
+        from waxx.util.device_state import queue_gate
         reservation, self._reservation = self._reservation, None
-        if reservation and start is not None:
-            from waxx.util.device_state import queue_gate
-            response = start(payload, reservation=reservation,
-                             require_features=["reserve"],
-                             go_reset_count=queue_gate.go_info().get("reset_count"))
-            if not isinstance(response, dict) or (
-                    not response.get("ok", True) and _unknown_tag(response)):
-                print("[LiveOD] note: this liveOD has no START_RUN; starting with "
-                      "INIT_RUN instead.")
-                response = None
-            elif not response.get("ok", True) or "run_id" not in response:
-                raise RuntimeError(f"[LiveOD] START_RUN refused: "
-                                   f"{response.get('error', response)}")
+        response = None
+        if queue_gate.is_warm():
+            start = getattr(_client, 'start_run', None)
+            if start is not None and self._liveod_has_reserve(_client):
+                # rebuilt here: claim_hardware may have changed container shapes
+                response = start(self._serialize_init_payload(),
+                                 reservation=reservation or None,
+                                 require_features=["reserve"],
+                                 go_reset_count=queue_gate.go_info().get("reset_count"))
+                if not isinstance(response, dict) or _unknown_tag(response):
+                    print("[LiveOD] note: this liveOD does not know START_RUN; starting "
+                          "with INIT_RUN instead.")
+                    response = None
+                elif not response.get("ok", True) or "run_id" not in response:
+                    raise RuntimeError(f"[LiveOD] START_RUN refused: "
+                                       f"{response.get('error', response)}")
+            if response is None:
+                # INIT_RUN names the file by run_info's time: now, not the
+                # moment this process was launched to wait
+                self._restamp_run_time_now()
         if response is None:
-            response = _client.init_run(payload)
+            # rebuilt here: claim_hardware may have changed container shapes
+            response = _client.init_run(self._serialize_init_payload())
         self.run_info.run_id = response['run_id']
         self.run_info.filepath = response['filepath']
         self._adopt_start_time(response)
@@ -450,6 +464,30 @@ class Expt(Scanner, Dealer, Scribe):
                 print(f"Run ID: {self.run_info.run_id}", flush=True)
             else:
                 console.info(f"Run ID: {self.run_info.run_id}")
+
+    def _liveod_has_reserve(self, client) -> bool:
+        """Whether liveOD has the ``reserve`` feature (START_RUN): from the
+        RESERVE reply (kept by _reserve_warm_run, refused replies included);
+        when that told nothing (RESERVE not sent, or failed on the network),
+        from a POLL. False after an "Unknown tag"."""
+        feats = getattr(self, "_liveod_features", None)
+        if feats is None:
+            try:
+                reply = client.poll()
+                feats = dict(reply.get("features") or {}) if isinstance(reply, dict) else {}
+            except Exception as e:
+                print(f"[LiveOD] note: could not ask liveOD for its features ({e!r}); "
+                      f"starting with INIT_RUN.")
+                feats = {}
+            self._liveod_features = feats
+        return bool(feats.get("reserve"))
+
+    def _restamp_run_time_now(self):
+        """run_info's start time (date strings, run_datetime) set to now."""
+        now = time.localtime(time.time())
+        self.run_info.run_datetime = now
+        self.run_info.run_date_str = time.strftime("%Y-%m-%d", now)
+        self.run_info.run_datetime_str = time.strftime("%Y-%m-%d_%H-%M-%S", now)
 
     def _adopt_start_time(self, response):
         """The liveOD reply's start time (START_RUN stamps the server's clock),
@@ -470,9 +508,12 @@ class Expt(Scanner, Dealer, Scribe):
     def _reserve_warm_run(self):
         """Warm launch, end of finish_prepare_wax: ask liveOD whether this run
         could start (RESERVE_RUN: creates nothing -- no run id, no file, no
-        camera lock). Best effort: no client, an older liveOD ("Unknown tag")
-        or an error leaves no reservation, and the claim then sends a plain
-        INIT_RUN. A reservation given is released at exit if never used."""
+        camera lock). Best effort: no reservation is fine (refused, failed,
+        older liveOD); the claim then starts with START_RUN without one when
+        liveOD has the ``reserve`` feature, else with INIT_RUN. The reply's
+        ``features`` (also on a refusal) are kept for that choice. A
+        reservation given is released at exit if never used."""
+        self._liveod_features = None
         _client = getattr(self, 'live_od_client', None)
         reserve = getattr(_client, 'reserve_run', None) if _client is not None else None
         if reserve is None:
@@ -480,17 +521,22 @@ class Expt(Scanner, Dealer, Scribe):
         try:
             reply = reserve(self._serialize_init_payload(), ttl_s=900.)
         except Exception as e:
-            print(f"[LiveOD] note: RESERVE_RUN failed ({e!r}); the run will start "
-                  f"with INIT_RUN.")
+            print(f"[LiveOD] note: RESERVE_RUN failed ({e!r}); no reservation.")
             return
-        if not isinstance(reply, dict) or not reply.get("reservation"):
-            if isinstance(reply, dict) and not _unknown_tag(reply) and reply.get("error"):
-                print(f"[LiveOD] note: no reservation ({reply.get('error')}); the run "
-                      f"will start with INIT_RUN.")
+        if not isinstance(reply, dict):
             return
-        self._reservation = str(reply["reservation"])
+        if _unknown_tag(reply):
+            self._liveod_features = {}           # an older liveOD: INIT_RUN
+            return
+        if isinstance(reply.get("features"), dict):
+            self._liveod_features = dict(reply["features"])
         for w in reply.get("warnings") or ():
             print(f"[LiveOD] reservation warning: {w}")
+        if not reply.get("reservation"):
+            if reply.get("error"):
+                print(f"[LiveOD] note: no reservation ({reply.get('error')}).")
+            return
+        self._reservation = str(reply["reservation"])
         import atexit
         atexit.register(self._release_reservation)
 
