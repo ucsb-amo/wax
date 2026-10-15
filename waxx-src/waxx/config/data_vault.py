@@ -333,6 +333,7 @@ class HostDataContainer(DataContainer):
         return np.broadcast_to(np.array(self._fill_value, dtype=self._dtype), shape)
 
     def set_container_size(self):
+        self._sized = True
         if self._keep_run_data:
             return super().set_container_size()
         # the shape set_container_size + squeeze_axes give, without building it
@@ -342,6 +343,24 @@ class HostDataContainer(DataContainer):
             shape.pop()
         self._run_data = self._fill_array(tuple(shape))
         self._cell_shape = tuple(shape[len(xvd):])
+
+    def _reshape_per_shot(self, per_shot_data_shape, dtype, fill_value=None,
+                          keep_run_data=None):
+        """Give the container a new per-shot shape / dtype (and optionally
+        fill value and storage), and the run's array to match. Use
+        DataVault.resize_host_container, which refuses once the run started."""
+        self._per_shot_data_shape = tuple(int(n) for n in np.atleast_1d(per_shot_data_shape))
+        self._dtype = dtype
+        if fill_value is not None:
+            self._fill_value = fill_value
+        if keep_run_data is not None:
+            self._keep_run_data = bool(keep_run_data)
+        self.shot_data = np.zeros(self._per_shot_data_shape, dtype=dtype)
+        self._reference_data = copy.deepcopy(self.shot_data)
+        self._cell_shape = self._per_shot_data_shape
+        self._run_data = self._fill_array(self._per_shot_data_shape)
+        if getattr(self, "_sized", False):
+            self.set_container_size()
 
     def put_shot_data_host(self, idx, value):
         """Write one shot's value at xvar-counter index ``idx`` (tuple).
@@ -463,6 +482,25 @@ class DataVault():
                                  external_data_bool, self._expt,
                                  fill_value=fill_value,
                                  keep_run_data=keep_run_data)
+
+    def resize_host_container(self, dc, per_shot_data_shape, dtype, fill_value=None,
+                              keep_run_data=None):
+        """Change a HOST container's per-shot shape / dtype after it was
+        registered -- also after init() -- until the run has started (the
+        liveOD start pre-allocates the file from these shapes). A camera
+        stream registers its containers before the kernel is compiled with a
+        provisional shape and sets the real one from its probe frame in the
+        claim. Host containers are never in a kernel list, so the compiled
+        kernel is unaffected. Raises for a kernel container or after the
+        start."""
+        if not isinstance(dc, HostDataContainer):
+            raise TypeError(f"data container '{getattr(dc, 'key', '?')}' is not a host "
+                            f"container: a kernel container's shape is compiled in")
+        if getattr(self._expt, "_run_started", False):
+            raise RuntimeError(f"data container '{getattr(dc, 'key', '?')}': the run has "
+                               f"started (liveOD has allocated it); its shape is fixed")
+        dc._reshape_per_shot(per_shot_data_shape, dtype, fill_value=fill_value,
+                             keep_run_data=keep_run_data)
 
     def init(self):
         self.write_keys()

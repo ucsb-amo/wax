@@ -437,7 +437,7 @@ def test_deferred_stream_registers_nothing_until_register():
         assert cs._frame_shape == (6, 5)            # set up: probe frame taken
         assert not hasattr(fe.data, "img_test")
         assert fe.camera_streams == []
-        assert not hasattr(cs, "_worker")
+        assert cs._worker is None
         cs.register()
         cs.register()                               # once only
         assert isinstance(fe.data.img_test, HostDataContainer)

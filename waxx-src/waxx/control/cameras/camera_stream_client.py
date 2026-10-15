@@ -74,6 +74,10 @@ T_QUEUE_DRAIN_S = 30.0
 MAX_EVENTS = 100
 MAX_EVENTS_PER_KIND = 5
 
+# a stream registered before its connect (the claim) has containers of this
+# shape until activate() / mark_dead() sets the real one
+PROVISIONAL_FRAME_SHAPE = (1,)
+
 LIVEOD_SERVER_SUFFIX = ":liveod"      # liveOD's camera host: camera_server:<host>:liveod
 
 _shared_dir = None
@@ -150,6 +154,68 @@ def _values(readback):
             for k, r in (readback or {}).items()}
 
 
+def connect_streams(streams):
+    """The claim's connect of every stream in ``streams`` built with
+    ``connect=False`` (others are skipped): all at once, in parallel -- one
+    camera's round trips and probe frames do not wait for another's. Then,
+    in ``streams`` order, from the calling (experiment) thread: a connected
+    stream is activated (container shapes, worker); a failed one follows its
+    ``on_error``: ``'dummy'`` -> a loud line and ``mark_dead`` (no frames
+    this run, the kernel unchanged); ``'raise'`` -> it and every stream after
+    it that connected are put back (marked dead) and the error is raised.
+    Returns ``[(stream, error or None)]`` for the streams it connected."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    todo = [s for s in streams
+            if isinstance(s, CameraStreamClient) and not s._connected
+            and s._dead_reason is None and not s._finished]
+    errors = {}
+
+    def one(s):
+        try:
+            s.connect()
+        except Exception as e:
+            errors[id(s)] = e
+
+    if len(todo) == 1:
+        one(todo[0])
+    elif todo:
+        pool = ThreadPoolExecutor(max_workers=len(todo),
+                                  thread_name_prefix="camera_stream_connect")
+        try:
+            for f in [pool.submit(one, s) for s in todo]:
+                f.result()
+        except BaseException:
+            # interrupted: let the connects in flight finish, then put every
+            # camera back
+            pool.shutdown(wait=True)
+            for s in todo:
+                s.mark_dead("the claim was interrupted")
+            raise
+        pool.shutdown(wait=True)
+
+    out = []
+    for i, s in enumerate(todo):
+        error = errors.get(id(s))
+        if error is None:
+            try:
+                s.activate()
+            except Exception as e:
+                error = e
+        out.append((s, error))
+        if error is None:
+            continue
+        if s.on_error == "raise":
+            for q in todo[i + 1:]:
+                q.mark_dead("the claim stopped: an earlier stream failed")
+            s.mark_dead(f"setup failed: {error!r}")
+            raise error
+        print(f"[camera_stream:{s.key}] !! {s.serial} could not be set up ({error!r}); "
+              f"no such frames this run")
+        s.mark_dead(f"setup failed: {error!r}")
+    return out
+
+
 def link_trigger_line(*streams):
     """Make triggered streams on one TTL siblings (module docstring)."""
     for s in streams:
@@ -199,11 +265,21 @@ class CameraStreamClient:
                  no_roi_downsample=1, frame_timeout_s=5.0, t_snap_lead=0.0,
                  t_late_tolerance=T_LATE_TOLERANCE_S, label=None,
                  live_od_client=None, directory=None, defer_register=False,
+                 connect=True, on_error="raise",
                  _stream=None, _server_defaults=None):
         """``defer_register``: set the camera up but register nothing with
         the experiment (no containers, no worker); the caller then calls
         ``register()`` -- from the thread that owns the experiment, in a fixed
-        order -- or ``abandon()``. For setting several streams up in parallel."""
+        order -- or ``abandon()``. For setting several streams up in parallel.
+
+        ``connect=False``: no network at all now. The stream object -- what
+        the kernel sees -- is complete, and ``register()`` gives it
+        containers with a provisional shape; the experiment's claim then
+        calls ``connect()`` (camera, settings, probe frame; any thread) and
+        ``activate()`` (real container shapes, worker; the experiment's
+        thread), or ``mark_dead(reason)`` when the connect failed: the kernel
+        code still runs, its edges / snaps are counted and nothing is stored
+        (``on_error`` is the caller's policy for that, kept here)."""
         from beacon.camera.directory import query_string
 
         self._expt = expt
@@ -242,21 +318,53 @@ class CameraStreamClient:
         self._liveod_key = None
         self._roi = None
         self._downsample = 1
+        self._sensor_shape = ()
+
+        # connect-later state (see __init__'s docstring)
+        self._directory = directory
+        self._stream_hook = _stream                 # test hooks, used at connect
+        self._defaults_hook = _server_defaults
+        self._stream = None
+        self._defaults = {}
+        self._connected = False
+        self._dead_reason = None
+        self._worker = None
+        self.on_error = str(on_error)
+        # what register() gives the containers before the probe frame is known
+        self._frame_shape = PROVISIONAL_FRAME_SHAPE
+        self._frame_dtype = np.dtype(np.uint8)
+        self._registered = False
 
         self._check_key_available(expt, self.key)
 
         # Network: resolve the camera, read its defaults, apply ours, take a
-        # probe frame. This is prepare(): a failure here is loud and costs
-        # no run id.
-        if _stream is not None:                  # test hook
-            self._stream = _stream
-            self._defaults = dict(_server_defaults or {})
+        # probe frame. Here (connect=True) this is prepare(): a failure is
+        # loud and costs no run id.
+        if connect:
+            self._connect_network()
+        if not defer_register:
+            self.register()
+
+    @property
+    def live(self) -> bool:
+        """Connected, registered and not dead: frames are taken."""
+        return self._connected and self._registered and self._dead_reason is None
+
+    def _connect_network(self):
+        """Resolve and open the camera, read its defaults, apply ours, take
+        the probe frame (the stored shape and dtype). Raises on a failure,
+        with the camera put back as it was found."""
+        if self._stream_hook is not None:              # test hook
+            self._stream = self._stream_hook
+            self._defaults = dict(self._defaults_hook or {})
         else:
-            self._stream = self._resolve_and_connect(directory)
-            fully_given = (exposure_time is not None and gain is not None
-                           and (self._roi_override or not self._crop_to_saved_roi))
-            self._defaults = {} if fully_given else self._read_server_defaults()
+            self._stream = self._resolve_and_connect(self._directory)
         try:
+            if self._stream_hook is None:
+                fully_given = (self._exposure_override is not None
+                               and self._gain_override is not None
+                               and (self._roi_override or not self._crop_to_saved_roi))
+                self._defaults = {} if fully_given else self._read_server_defaults()
             frame0 = self._setup_settings_and_probe()
         except BaseException:
             try:
@@ -273,13 +381,58 @@ class CameraStreamClient:
                   f"Save an ROI for it in the camera viewer.")
         self._frame_shape = tuple(frame0.shape)
         self._frame_dtype = frame0.dtype
-        self._registered = False
-        if not defer_register:
-            self.register()
+        self._connected = True
+
+    def connect(self):
+        """The claim's connect of a stream built with ``connect=False``:
+        camera, settings, probe frame (and, triggered, waiting for edges).
+        Thread-safe with other streams' connects; touches nothing of the
+        experiment. Raises on a failure (camera put back as found); the
+        caller then calls ``mark_dead`` or stops the run."""
+        if self._connected or self._dead_reason is not None or self._finished:
+            return
+        self._connect_network()
+
+    def activate(self):
+        """After a successful ``connect()``, from the experiment's thread:
+        the containers get the probe frame's shape and dtype (before the
+        liveOD start payload is built), the worker starts. Raises when the
+        run has already started (the shapes are then fixed)."""
+        if not self._connected or self._dead_reason is not None:
+            raise RuntimeError(f"[{self.label}] activate() without a connect")
+        if self._registered and self._worker is None:
+            self._resize_containers(self._frame_shape, self._frame_dtype,
+                                    keep_run_data=False)
+            self._start_worker()
+            self._say_connected()
+
+    def mark_dead(self, reason):
+        """The connect failed (or the run stood it down): this run takes no
+        frames with it. The kernel code is unchanged -- its edges / snaps are
+        counted, nothing is stored -- and the containers become the
+        placeholder's (one byte per shot, NaN records), as a camera that
+        could not be set up has always had. Never raises."""
+        self._dead_reason = str(reason)
+        try:
+            if self._connected:
+                self._connected = False
+                self._restore_and_close()
+            if self._registered and not getattr(self._expt, "_run_started", False):
+                self._resize_containers((1,), np.uint8, keep_run_data=True)
+        except Exception as e:
+            print(f"[{self.label}] WARNING: marking the stream dead: {e!r}")
+
+    def _resize_containers(self, shape, dtype, keep_run_data):
+        d = self._expt.data
+        d.resize_host_container(self.dc, shape, dtype, keep_run_data=keep_run_data)
+        d.resize_host_container(self.dc_meta, (N_META,), np.float64,
+                                keep_run_data=keep_run_data)
 
     def register(self):
         """Containers, ``expt.camera_streams``, the worker thread and the
-        abort-path cleanup (done by ``__init__`` unless ``defer_register``)."""
+        abort-path cleanup (done by ``__init__`` unless ``defer_register``).
+        A stream not connected yet gets provisional containers and no
+        worker (``activate()`` does that)."""
         if self._registered:
             return
         expt = self._expt
@@ -291,12 +444,17 @@ class CameraStreamClient:
         if not hasattr(expt, "camera_streams"):
             expt.camera_streams = []
         expt.camera_streams.append(self)
+        if self._connected:
+            self._start_worker()
+            self._say_connected()
 
+    def _start_worker(self):
         self._worker = threading.Thread(target=self._work, daemon=True,
                                         name=f"CameraStreamClient:{self.key}")
         self._worker.start()
         atexit.register(self._atexit_cleanup)
 
+    def _say_connected(self):
         console.info(f"[{self.label}] {self.serial} via {self._stream.server_id}: "
                      f"frame {self._frame_shape} {self._frame_dtype}"
                      + (f", roi {self._roi}" if self._roi else "")
@@ -311,6 +469,15 @@ class CameraStreamClient:
         self._finished = True
         self._restore_and_close()
 
+    def _dead_or_unconnected(self):
+        """True when a kernel call must not be served (dead, or the claim
+        never connected it); counts the call as ``edges_not_served``."""
+        if self.live:
+            return False
+        with self._lock:
+            self.counts["edges_not_served"] = self.counts.get("edges_not_served", 0) + 1
+        return True
+
     # ---- kernel side -----------------------------------------------------
 
     @kernel
@@ -324,6 +491,8 @@ class CameraStreamClient:
     def request_snap_mu(self, slack_mu, t_offset):
         """Async RPC target; must never raise (it would kill the run)."""
         try:
+            if self._dead_or_unconnected():
+                return
             idx = self._shot_index()
             target = time.monotonic() + self._slack_s(slack_mu) + float(t_offset)
             with self._lock:
@@ -692,6 +861,9 @@ class CameraStreamClient:
         camera's settings back, close. Never raises."""
         if self._finished:
             return
+        if not self._connected:
+            self._finish_unconnected()
+            return
         try:
             deadline = time.monotonic() + (timeout_s if timeout_s is not None
                                            else self._frame_timeout_s + 10.0)
@@ -724,6 +896,32 @@ class CameraStreamClient:
 
     def close(self):
         self.finish()
+
+    def _finish_unconnected(self):
+        """finish() of a stream that never took frames (dead, or the claim
+        never connected it): the placeholder's record per key, with why and
+        how many kernel calls went unserved."""
+        with self._lock:
+            self._finished = True
+        reason = self._dead_reason or "not connected (the run's claim never connected it)"
+        for k in getattr(self, "keys", (self.key,)):
+            try:
+                self._expt._extra_file_texts[f"camera_stream_{k}"] = json.dumps(
+                    {"key": k, "keys": list(getattr(self, "keys", (self.key,))),
+                     "dummy": True, "dead": True, "serial": self.serial,
+                     "triggered": isinstance(self, TriggeredCameraStreamClient),
+                     "reason": reason,
+                     "edges_not_served": int(self.counts.get("edges_not_served", 0)),
+                     "note": f"'{k}' is a placeholder (one byte per shot), not a frame"})
+            except Exception:
+                pass
+        n = int(self.counts.get("edges_not_served", 0))
+        console.info(f"[{self.label}] no frames this run ({reason}); {n} kernel "
+                     f"call(s) not served", console.VERBOSE)
+        try:
+            atexit.unregister(self._atexit_cleanup)
+        except Exception:
+            pass
 
     def _drain_shot_queue(self):
         """Wait (bounded) for the experiment's shot queue to be empty. The
@@ -778,7 +976,7 @@ class CameraStreamClient:
         """The stream must not be closed under a request in flight (run
         84562 hung in zmq term() on exactly that)."""
         w = self._worker
-        if w is threading.current_thread() or not w.is_alive():
+        if w is None or w is threading.current_thread() or not w.is_alive():
             return
         w.join(WORKER_JOIN_S)
         if w.is_alive():
@@ -880,6 +1078,8 @@ class CameraStreamClient:
         """Trigger mode off whatever it was before; the trigger line and --
         only if nobody else changed the camera during the run -- exposure
         and gain back to what we found. Then close the stream."""
+        if self._stream is None:
+            return
         try:
             try:
                 self._before_restore()
@@ -1009,6 +1209,11 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         try:
             idx = self._shot_index()
             t_expected = time.monotonic() + self._slack_s(slack_mu)
+            if self._dead_or_unconnected():
+                # the TTL still pulsed: a live sibling on the line must know
+                for sib in self._siblings:
+                    sib.announce_sibling_edge(idx, t_expected)
+                return
             j = int(j)
             if not 0 <= j < len(self.keys):
                 self._note("bad_frame_index", idx=list(idx), j=j)
@@ -1022,6 +1227,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     def announce_sibling_edge(self, idx, t_expected):
         """A sibling fired our line: the frame is expected, not kept."""
         try:
+            if not self.live:
+                return
             self._note("sibling_edges")
             self._queue.put_nowait((float(t_expected), tuple(idx), -1, 0))
         except Exception:
@@ -1067,6 +1274,13 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             setattr(d, k + "_meta", slot.dc_meta)
             self._slots.append(slot)
         self.dc, self.dc_meta = self._slots[0].dc, self._slots[0].dc_meta
+
+    def _resize_containers(self, shape, dtype, keep_run_data):
+        d = self._expt.data
+        for slot in self._slots:
+            d.resize_host_container(slot.dc, shape, dtype, keep_run_data=keep_run_data)
+            d.resize_host_container(slot.dc_meta, (N_META,), np.float64,
+                                    keep_run_data=keep_run_data)
 
     def _setup_settings_and_probe(self):
         frame0 = super()._setup_settings_and_probe()

@@ -367,7 +367,15 @@ class Monitor:
         self._build_op_kernels()
         self._build_snapshot_kernel()
 
-        self.reconcile_state_file()
+        # The reconcile may WRITE the state file. A warm-launched run waits
+        # here while another run holds the machine, and its write would race
+        # that run's end state (the monitor server is the writer): skipped.
+        from waxx.util.device_state import queue_gate
+        if queue_gate.is_warm():
+            print("[Monitor] warm launch: the device state file's reconcile is "
+                  "skipped (the monitor server and the next cold run do it).")
+        else:
+            self.reconcile_state_file()
 
     def reconcile_state_file(self):
         """Match the state file's key set to the device frames before looping.
