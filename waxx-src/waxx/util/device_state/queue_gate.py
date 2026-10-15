@@ -141,8 +141,10 @@ def go_passed() -> bool:
 
 def go_info() -> dict:
     """``{}`` when not warm or before GO; after GO ``{"job": "<id>:<token>",
-    "reset_count": int | None, "given_at": time.time()}`` (``reset_count``:
-    liveOD's Abort count the queue last saw, for the run start's check)."""
+    "reset_count": int | None, "liveod_instance": str | None, "given_at":
+    time.time()}`` (``reset_count``: liveOD's Abort count the queue last saw,
+    for the run start's check; ``liveod_instance``: the liveOD process that
+    count is from -- None from an older queue or liveOD)."""
     go = _state["go"]
     return dict(go) if go else {}
 
@@ -543,6 +545,7 @@ def ensure_go() -> None:
             raised = _raise_own_priority()
             with _lock:
                 _state["go"] = {"job": _state["job"], "reset_count": reply.get("reset_count"),
+                                "liveod_instance": reply.get("liveod_instance"),
                                 "given_at": time.time()}
             _say("GO from the run queue" + ("" if raised or sys.platform != "win32"
                                             else " (its priority could not be raised)"))

@@ -498,7 +498,7 @@ class LiveODClient(NetClient):
         return reply
 
     def start_run(self, payload: dict, *, reservation, require_features=(),
-                  go_reset_count=None) -> dict:
+                  go_reset_count=None, go_instance=None) -> dict:
         """START_RUN (queue phase 2): INIT_RUN for a warm-started run, behind
         refusals that come before any run id. The reply is INIT_RUN's plus
         ``run_date_str`` / ``run_datetime_str`` (the server's start time, which
@@ -508,7 +508,9 @@ class LiveODClient(NetClient):
         ``reservation``: RESERVE_RUN's token (unknown or None: a plain start).
         ``require_features``: what the compiled code assumes the server has.
         ``go_reset_count``: liveOD's reset_count when the queue gave GO; a Reset
-        counted since refuses the start.
+        counted since refuses the start. ``go_instance``: liveOD's POLL
+        ``instance`` the count came from; another instance (liveOD restarted
+        since GO) refuses the start. None: not checked (older queue).
 
         A refusal raises :class:`LiveODStartRefused` (``.reply``) -- never fall
         back to init_run then. An older liveOD ("Unknown tag") gives
@@ -520,6 +522,7 @@ class LiveODClient(NetClient):
         msg["reservation"] = str(reservation or "")
         msg["require_features"] = [str(f) for f in (require_features or ())]
         msg["go_reset_count"] = None if go_reset_count is None else int(go_reset_count)
+        msg["go_instance"] = None if not go_instance else str(go_instance)
         self._before_run_start()
         reply = self._send_recv(msg, rcvtimeo_ms=START_RUN_TIMEOUT_MS)
         if _unknown_tag(reply, "START_RUN"):

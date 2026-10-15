@@ -364,6 +364,30 @@ def test_start_refuses_after_a_reset_since_go(srv, tmp_path):
     assert srv._handle_poll({"tag": "POLL"})["reset_requested"] is True   # left for a person
 
 
+def test_start_refuses_when_liveod_restarted_since_go(srv, tmp_path):
+    """N2: reset_count is counted per liveOD process. A START whose GO named
+    another instance (liveOD restarted between GO and START) is refused
+    before any id: a Reset pressed in the new instance before START would
+    otherwise be missed."""
+    poll = srv._handle_poll({"tag": "POLL"})
+    assert isinstance(poll["instance"], str) and len(poll["instance"]) >= 8
+    files, state = _files(tmp_path), _state(srv)
+    reply = _start(srv, go_reset_count=poll["reset_count"], go_instance="0123abcd-old")
+    _assert_refused_before_an_id(srv, reply, files, state, tmp_path, "liveod_restarted")
+    assert "liveOD restarted since the queue gave GO" in reply["error"]
+    assert reply["instance"] == poll["instance"]
+
+
+def test_start_with_this_instance_or_none_goes_as_before(srv):
+    poll = srv._handle_poll({"tag": "POLL"})
+    assert _start(srv, go_reset_count=poll["reset_count"], go_instance=poll["instance"])["ok"]
+
+
+def test_start_without_an_instance_is_todays_behaviour(srv):
+    go = srv._handle_poll({"tag": "POLL"})["reset_count"]
+    assert _start(srv, go_reset_count=go, go_instance=None)["ok"]
+
+
 def test_start_with_no_reset_since_go_goes(srv):
     go = srv._handle_poll({"tag": "POLL"})["reset_count"]
     assert _start(srv, go_reset_count=go)["ok"]
@@ -544,9 +568,13 @@ def test_the_client_round_trip(srv):
     payload.pop("tag")
     res = c.reserve_run(payload, ttl_s=60)
     assert res["ok"] and res["ttl_s"] == 60 and "tag" not in payload
+    sent = []
+    wired = c._send_recv
+    c._send_recv = lambda p, rcvtimeo_ms=None: (sent.append(dict(p)), wired(p, rcvtimeo_ms))[1]
     reply = c.start_run(payload, reservation=res["reservation"], require_features=["reserve"],
-                        go_reset_count=0)
+                        go_reset_count=0, go_instance=srv._instance)
     assert reply["ok"] and reply["reservation_known"]
+    assert sent[-1]["go_instance"] == srv._instance
     assert c._run_token == reply["run_token"] and c._run_open and c.supports("reserve")
     assert c.release_reservation(res["reservation"]) == {"ok": True, "released": False}
 

@@ -444,10 +444,16 @@ class Expt(Scanner, Dealer, Scribe):
             start = getattr(_client, 'start_run', None)
             if start is not None and self._liveod_has_reserve(_client):
                 # rebuilt here: claim_hardware may have changed container shapes
+                go = queue_gate.go_info()
+                extra = {}
+                if go.get("liveod_instance"):
+                    # liveOD restarted since GO -> START refuses (its count
+                    # would miss a Reset); absent (older queue): not checked
+                    extra["go_instance"] = go["liveod_instance"]
                 response = start(self._serialize_init_payload(),
                                  reservation=reservation or None,
                                  require_features=["reserve"],
-                                 go_reset_count=queue_gate.go_info().get("reset_count"))
+                                 go_reset_count=go.get("reset_count"), **extra)
                 if not isinstance(response, dict) or _unknown_tag(response):
                     print("[LiveOD] note: this liveOD does not know START_RUN; starting "
                           "with INIT_RUN instead.")

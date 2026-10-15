@@ -2436,6 +2436,8 @@ class RunQueue:
         process.  The server raises the process's priority too (backstop)."""
         poll = self._last_poll
         reset_count = poll.get("reset_count") if isinstance(poll, dict) else None
+        # the liveOD process that count belongs to (absent: an older liveOD)
+        instance = poll.get("instance") if isinstance(poll, dict) else None
         proc = self._warm_procs.get(job.id)
         if proc is None:
             with self._lock:
@@ -2456,7 +2458,8 @@ class RunQueue:
             job.launched_at = now
             job.reason = ""
             self._current = job.id
-            w["go"] = {"at": now, "reset_count": reset_count, "delivered": None}
+            w["go"] = {"at": now, "reset_count": reset_count, "liveod_instance": instance,
+                       "delivered": None}
             self._procs[job.id] = None
             self._log_pos[job.id] = int(w.get("log_offset") or 0)
             self._log_partial[job.id] = ""
@@ -2597,7 +2600,8 @@ class RunQueue:
                         if not go.get("delivered"):
                             go["delivered"] = now
                             delivered = True
-                        reply = {"status": "ok", "go": True, "reset_count": go.get("reset_count")}
+                        reply = {"status": "ok", "go": True, "reset_count": go.get("reset_count"),
+                                 "liveod_instance": go.get("liveod_instance")}
                 elif go:
                     reply = {"status": "ok", "go": False, "why": "GO is being saved"}
                 elif job.state != "queued":

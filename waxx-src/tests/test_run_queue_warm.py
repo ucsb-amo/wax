@@ -286,7 +286,7 @@ def test_go_is_saved_before_it_is_handed_out_and_repeats_are_the_same(tmp_path, 
     assert on_disk["warm"]["go"]["delivered"] is None     # decided and on disk, not handed out
     assert job(q, b)["state"] == "running" and job(q, b)["pid"] == wp.proc.pid
     r = wp.ask("poll")
-    assert r == {"status": "ok", "go": True, "reset_count": 0}
+    assert r == {"status": "ok", "go": True, "reset_count": 0, "liveod_instance": None}
     delivered = queue_json(q)[b]["warm"]["go"]["delivered"]
     assert delivered is not None
     q.clock.t += 5
@@ -319,6 +319,21 @@ def test_the_go_reply_carries_the_reset_count_last_seen(tmp_path, expts, lib):
     q.live.press("person")
     end_slot(q)
     assert wp.ask("poll")["reset_count"] == 2
+
+
+def test_the_go_reply_carries_the_liveod_instance_of_its_reset_count(tmp_path, expts, lib):
+    """N2: the count is per liveOD process; the GO names the process it came
+    from (None from a liveOD that predates the field)."""
+    q, a, b, wp = ready_behind_slot(tmp_path, expts, lib)
+    q.live.state["instance"] = "inst-A"
+    end_slot(q)
+    r = wp.ask("poll")
+    assert r["go"] is True and r["liveod_instance"] == "inst-A"
+    assert warm_rec(q, b)["go"]["liveod_instance"] == "inst-A"
+    q2, a2, b2, wp2 = ready_behind_slot(tmp_path / "old", expts, lib)
+    end_slot(q2)
+    r2 = wp2.ask("poll")
+    assert r2["go"] is True and r2["liveod_instance"] is None
 
 
 def test_mismatched_tokens_pids_and_creation_times_are_told_to_abort(tmp_path, expts, lib):

@@ -83,8 +83,10 @@ class FakeLiveOD:
             raise r
         return r
 
-    def start_run(self, payload, *, reservation, require_features=(), go_reset_count=None):
+    def start_run(self, payload, *, reservation, require_features=(), go_reset_count=None,
+                  **kw):
         self.events.append(("start_run", reservation, tuple(require_features), go_reset_count))
+        self.start_kw = kw
         if self._start_raises is not None:
             raise self._start_raises
         if self._start_reply is not None:
@@ -204,6 +206,32 @@ def test_warm_reserve_then_start_with_the_reservation_and_server_time(warm, caps
     assert e.run_info.run_datetime.tm_hour == 9
     e._release_reservation()                     # consumed: nothing to release
     assert client.released == []
+
+
+def test_warm_start_passes_the_go_instance_to_liveod(warm):
+    """N2: the GO's liveOD instance goes to START (which refuses when liveOD
+    restarted since GO); a GO without one sends nothing new."""
+    class _GoWithInstance:
+        def request(self, obj, timeout=None, attempts=None):
+            return {"status": "ok", "go": obj.get("stage") != "warming", "reset_count": 5,
+                    "liveod_instance": "inst-C"}
+    queue_gate.set_transport(_GoWithInstance())
+    ev = []
+    client = FakeLiveOD(ev)
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    e.claim()
+    assert _starts(ev) == [("start_run", "r9", ("reserve",), 5)]
+    assert client.start_kw == {"go_instance": "inst-C"}
+
+
+def test_warm_start_without_a_go_instance_sends_none(warm):
+    ev = []
+    client = FakeLiveOD(ev)
+    e = _stand(ev, client)
+    e._reserve_warm_run()
+    e.claim()
+    assert client.start_kw == {}
 
 
 def test_warm_reserve_refused_still_starts_with_start_run_and_no_reservation(warm):

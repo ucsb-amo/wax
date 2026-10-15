@@ -100,6 +100,7 @@ def test_hello_ready_poll_go(monkeypatch, fresh, tmp_path, capsys):
     assert qg.go_passed()
     info = qg.go_info()
     assert info["job"] == "7:abc123" and info["reset_count"] == 4 and info["given_at"] > 0
+    assert info["liveod_instance"] is None                # an older queue: absent
     stages = [o["stage"] for o in script.sent]
     assert stages == ["warming", "ready", "poll", "poll", "poll", "poll"]
     first = script.sent[0]
@@ -116,6 +117,14 @@ def test_hello_ready_poll_go(monkeypatch, fresh, tmp_path, capsys):
     n = len(script.sent)
     qg.ensure_go()                                        # idempotent
     assert len(script.sent) == n
+
+
+def test_go_info_carries_the_liveod_instance(monkeypatch):
+    warm(monkeypatch)
+    qg.set_transport(Script({"status": "ok", "go": True, "reset_count": 3,
+                             "liveod_instance": "inst-B"}))
+    qg.ensure_go()
+    assert qg.go_info()["liveod_instance"] == "inst-B" and qg.go_info()["reset_count"] == 3
 
 
 def test_an_abort_stands_down_with_exit_78(monkeypatch, capsys):

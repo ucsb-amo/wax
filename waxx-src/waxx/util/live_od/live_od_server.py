@@ -235,6 +235,10 @@ class LiveODServer(QThread, NetServer):
                                 "launcher": "", "queue_job": ""}
         # every Abort set (request_reset), for POLL's reset_count / last_reset
         self._reset_count = 0
+        # this server process (POLL "instance"): reset_count is counted per
+        # process, so a START whose GO named another instance (liveOD restarted
+        # since GO) cannot tell whether a Reset was pressed in between
+        self._instance = uuid.uuid4().hex[:16]
         self._reset_counts = {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
         self._last_reset = None
         # the run a Reset during its save was last warned about (one WARNING each)
@@ -1693,7 +1697,9 @@ class LiveODServer(QThread, NetServer):
         """START_RUN: the reserved (or any queued, warm) run takes the machine.
         Refused BEFORE any run id when a feature the experiment's compiled code
         needs is missing (``require_features``), when a Reset was counted since
-        the queue gave GO (``go_reset_count``: POLL's reset_count then), or when
+        the queue gave GO (``go_reset_count``: POLL's reset_count then; a
+        ``go_instance`` that is not this liveOD process -- restarted since GO
+        -- refuses too, as its count says nothing), or when
         a run is in progress whose client is not known to be gone (a live run
         is never superseded); it waits first, bounded, for the previous run's
         save and for the last frames of a run whose experiment exited. Then the
@@ -1716,6 +1722,15 @@ class LiveODServer(QThread, NetServer):
                 go = int(go)
             except (TypeError, ValueError):
                 return self._refuse_before_id(tag, "bad_request", f"bad go_reset_count {go!r}")
+        go_instance = msg.get("go_instance")
+        if go_instance and str(go_instance) != self._instance:
+            # the GO's reset_count was counted by another liveOD process: a
+            # Reset pressed in this one before now would be missed
+            return self._refuse_before_id(
+                tag, "liveod_restarted",
+                f"liveOD restarted since the queue gave GO (instance {go_instance} then, "
+                f"{self._instance} now): a Reset in between cannot be ruled out",
+                instance=self._instance)
         for wait in (self._wait_previous_save, self._wait_exited_run):
             refused = wait(tag)
             if refused is not None:
@@ -2538,6 +2553,9 @@ class LiveODServer(QThread, NetServer):
             # the next INIT_RUN between two polls); last_reset: {at, count,
             # run_id, source "person" | "queue" | "agent"} or None
             "reset_count": self._reset_count,
+            # this liveOD process (random at start): reset_count is counted
+            # per instance, so the queue hands it to START with the count
+            "instance": self._instance,
             "reset_counts": dict(self._reset_counts),      # by source
             "last_reset": dict(self._last_reset) if self._last_reset else None,
             "run_in_progress": self._run_in_progress,
