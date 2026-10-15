@@ -501,7 +501,8 @@ class DataSaver():
             f.close()
         return fpath
 
-    def _populate_data_file(self, f: "h5py.File", payload: dict, run_id: int) -> list:
+    def _populate_data_file(self, f: "h5py.File", payload: dict, run_id: int,
+                            quiet: bool = False) -> list:
         """Write the full run structure into an already-open HDF5 handle.
 
         Creates the ``data``, ``run_info``, ``params`` and ``camera_params``
@@ -521,9 +522,11 @@ class DataSaver():
         for whoever started the run (INIT_RUN's reply, RESERVE_RUN's dry run).
         Still raised, as before: an unknown DataVault dtype, a DataVault entry
         without a shape, a non-integer imaging_type, xvarnames h5py cannot
-        store.
+        store. ``quiet``: no prints (the dry run: its lines would read as the
+        run in progress's).
         """
         problems = []
+        say = (lambda text: None) if quiet else print
         # ------ minimal run_info proxy --------------------------------
         class _RunInfoProxy:
             pass
@@ -576,7 +579,7 @@ class DataSaver():
                 try:
                     create_image_dataset(data_grp, key, shape=shape, dtype=dtype, **kw)
                 except Exception as exc:
-                    print(f"[DataSaver] Could not pre-allocate DataVault '{key}': {exc}")
+                    say(f"[DataSaver] Could not pre-allocate DataVault '{key}': {exc}")
                     problems.append(f"data/{key}: DataVault container not pre-allocated "
                                     f"(shape {list(shape)}, dtype {dtype.str}): {exc}")
 
@@ -604,7 +607,7 @@ class DataSaver():
             try:
                 params_grp.create_dataset(key, data=val)
             except Exception as exc:
-                print(f"[DataSaver] WARNING: params/{key} not stored "
+                say(f"[DataSaver] WARNING: params/{key} not stored "
                       f"({type(val).__name__} value): {exc}")
                 problems.append(f"params/{key} not stored ({type(val).__name__} value): {exc}")
 
@@ -615,7 +618,7 @@ class DataSaver():
             try:
                 cam_grp.create_dataset(key, data=val)
             except Exception as exc:
-                print(f"[DataSaver] WARNING: camera_params/{key} not stored "
+                say(f"[DataSaver] WARNING: camera_params/{key} not stored "
                       f"({type(val).__name__} value): {exc}")
                 problems.append(f"camera_params/{key} not stored ({type(val).__name__} "
                                 f"value): {exc}")
@@ -628,8 +631,8 @@ class DataSaver():
         run id is used. ``{"problems": [...], "error": str | None}`` --
         ``error`` is what would make the real fill raise (and the run start be
         refused). The data drive itself is not checked here (space,
-        permissions): see ``data_dir_reachable``. Prints what the real fill
-        prints. Never raises."""
+        permissions): see ``data_dir_reachable``. Prints nothing (the real
+        fill's prints would read as the run in progress's). Never raises."""
         import uuid  # noqa: PLC0415
         problems, error = [], None
         # the name is only the in-memory file's label: with backing_store=False
@@ -637,7 +640,7 @@ class DataSaver():
         name = f"liveod_dry_run_{uuid.uuid4().hex}.h5"
         try:
             with h5py.File(name, "w", driver="core", backing_store=False) as f:
-                problems = self._populate_data_file(f, payload, 0)
+                problems = self._populate_data_file(f, payload, 0, quiet=True)
         except Exception as exc:                      # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
         return {"problems": list(problems or []), "error": error}

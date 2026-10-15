@@ -68,10 +68,12 @@ def test_a_dropped_run_info_value_is_named_no_longer_silent(tmp_path):
     assert any("run_info/odd not stored" in p for p in problems)
 
 
-def test_the_dry_run_finds_what_the_disk_fill_finds_and_writes_nothing(tmp_path, monkeypatch):
+def test_the_dry_run_finds_what_the_disk_fill_finds_and_writes_nothing(tmp_path, monkeypatch,
+                                                                       capsys):
     monkeypatch.chdir(tmp_path)
     before = sorted(os.listdir(tmp_path))
     dry = _saver(tmp_path / "nowhere").dry_run_fill(BAD)
+    assert capsys.readouterr().out == ""                      # silent: not the running run's
     assert sorted(os.listdir(tmp_path)) == before            # no file, anywhere here
     assert not (tmp_path / "nowhere").exists()
     disk_dir = tmp_path / "disk"
