@@ -369,9 +369,9 @@ class Expt(Scanner, Dealer, Scribe):
         the kernel at compile time and writes them back at its end."""
         if self._claimed:
             return
-        self._claimed = True
         from waxx.util.device_state import queue_gate
-        queue_gate.ensure_go()
+        queue_gate.ensure_go()          # may exit (stand down before GO): nothing claimed
+        self._claimed = True
 
         self.claim_hardware()
         # overloaded per machine; the last moment before the run id
@@ -1064,6 +1064,15 @@ class Expt(Scanner, Dealer, Scribe):
                 restart_monitor=True):
 
         restart_monitor = _queue_restart_monitor(restart_monitor)
+        # A warm-launched run claims at its first kernel (the ARTIQ Core
+        # hook). One whose run() never reached a kernel never claimed: no
+        # liveOD run, no fence -- nothing to end, and nothing must pretend.
+        if not getattr(self, "_claimed", True):
+            from waxx.util.device_state import queue_gate
+            if queue_gate.is_warm():
+                raise RuntimeError("[end] this warm-launched run never claimed the machine "
+                                   "(its run() reached no kernel): nothing was run, nothing "
+                                   "is saved")
         _t0 = time.monotonic()
         try:
             self.scope_data.close()

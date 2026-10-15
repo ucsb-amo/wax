@@ -242,3 +242,13 @@ def test_the_snapshot_is_taken_once_per_file(tmp_path):
     expt.write_text("expt v2\n")
     e._snapshot_source_texts()                              # a second call reads nothing again
     assert e._source_snapshot["expt_file"]["text"] == "expt v1\n"
+
+
+def test_a_warm_run_that_never_claimed_cannot_end_as_if_it_ran(monkeypatch):
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev))
+    e.end_wax = Expt.end_wax.__get__(e)
+    monkeypatch.setenv("WAXX_QUEUE_WARM", "tok")
+    with pytest.raises(RuntimeError, match="never claimed"):
+        e.end_wax("x.py")
+    assert ev == []
