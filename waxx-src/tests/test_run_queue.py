@@ -97,10 +97,11 @@ class Spawner:
         self.procs, self.calls = [], []
         self.fail = None
 
-    def __call__(self, command, cwd, env, log_path):
+    def __call__(self, command, cwd, env, log_path, **kw):
         if self.fail:
             raise OSError(self.fail)
-        self.calls.append({"command": command, "cwd": cwd, "env": env, "log_path": log_path})
+        self.calls.append(dict({"command": command, "cwd": cwd, "env": env, "log_path": log_path},
+                               **kw))
         proc = Proc(log_path, 5000 + len(self.procs))
         self.procs.append(proc)
         return proc

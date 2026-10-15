@@ -1125,8 +1125,6 @@ class RunQueue:
         for job in jobs:
             dur, basis = self._duration_estimate(job, medians)
             estimate = {"duration_s": dur, "eta_start": None, "eta_end": None, "basis": basis}
-            if job.warm is not None or job.warm_started_at is not None:
-                estimate["basis"] += "; GO to end, warm time excluded"
             view = dict(self._public(job, now), position=positions.get(job.id),
                         waiting=self._why_waiting(job, now, order), source_changed=None,
                         estimate=estimate)
@@ -1139,6 +1137,10 @@ class RunQueue:
                     estimate["basis"] += "; est. (ignores blocked jobs ahead)"
             elif job.state in IN_SLOT:
                 estimate["eta_end"], estimate["basis"] = self._running_end(job, now, medians)
+            if job.warm is not None or job.warm_started_at is not None:
+                # a warm job's launch time is its GO: the time it spent warming
+                # before (behind the previous job) is not in its duration
+                estimate["basis"] += "; GO to end, warm time excluded"
             out.append(view)
         return out, pending
 
@@ -1969,10 +1971,15 @@ class RunQueue:
     def _warm_candidate(self, now: float) -> Job | None:
         """The job a warm launch is for: the first queued job in rank order
         not blocked at ``now + WARM_DUE_LEAD_S`` (so a job due within that
-        may warm; its GO waits until it is due)."""
+        may warm; its GO waits until it is due).  None when a job ahead of it
+        waits for the job in the slot (``after``): that one may well go first
+        once the slot job is saved, so nobody warms (never an ``after`` on the
+        running job)."""
         for j in self._queued_in_order():
             if not self._blocked_by(j, now + WARM_DUE_LEAD_S):
                 return j
+            if self._current is not None and self._current in j.after:
+                return None
         return None
 
     @staticmethod
