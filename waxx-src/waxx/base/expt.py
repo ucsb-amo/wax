@@ -116,6 +116,14 @@ def _process_started():
         return None
 
 
+def _unknown_tag(reply) -> bool:
+    """A liveOD reply that says it does not know the request (an older
+    liveOD): ``unknown_tag`` set, or ``ok`` false with an "Unknown tag" error."""
+    return (isinstance(reply, dict) and not reply.get("ok", True)
+            and (bool(reply.get("unknown_tag"))
+                 or "unknown tag" in str(reply.get("error", "")).lower()))
+
+
 #: ``WAXX_LAUNCHER`` of a run the monitor server's run queue launched
 #: (waxx.util.device_state.run_queue.LAUNCHER).
 QUEUE_LAUNCHER = "kq"
@@ -181,6 +189,7 @@ class Expt(Scanner, Dealer, Scribe):
         # .camera_stream_client); each registers itself here and is drained /
         # closed in end_wax. Host-only: never touched by kernel code.
         self.camera_streams = []
+        # (kept for old code; init_kernel prints the run id via _print_run_id)
         self._ridstr = "Run ID: " + str(self.run_info.run_id)
         self._counter = counter()
 
@@ -239,6 +248,31 @@ class Expt(Scanner, Dealer, Scribe):
         # counters move: what a sub-scan point records as "the shot before".
         self._last_data_shot = (-1, -1)
 
+        # The claim (see claim()): every step that touches hardware, an
+        # exclusive device or shared lab state, done once. A cold run claims
+        # at the end of finish_prepare_wax (where INIT_RUN always was); a
+        # warm-launched one (the run queue's WAXX_QUEUE_WARM) from the ARTIQ
+        # Core hook, after its kernel is compiled and the queue gave GO.
+        # Host-only, never read by a kernel.
+        self._claimed = False
+        self._run_started = False      # liveOD start done: shapes are final
+        self._reservation = None       # liveOD RESERVE_RUN token (warm only)
+        self._liveod_features = None   # liveOD's features as RESERVE told (warm only)
+
+        # The source texts this run is made of, read now (close to import
+        # time) and saved at END: a file edited during the run (a write-back,
+        # the next scan being prepared) must not land in this run's file as
+        # if it had run. Kexp's Base adds the params file and base classes
+        # once its DataSaver knows where they are.
+        self._source_snapshot = {}
+        self._snapshot_source_texts()
+
+        try:
+            from waxx.util.device_state import queue_gate
+            queue_gate.hello(self._expt_file_stem())
+        except Exception as e:
+            print(f"[queue] note: could not say hello to the run queue ({e!r})")
+
     def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
         """
         To be called at the end of prepare. 
@@ -287,36 +321,18 @@ class Expt(Scanner, Dealer, Scribe):
         except Exception:
             self._N_shots_total = 1
 
-        # overloaded per machine (kexp.Base: a due SLM reinit, between runs)
-        self.pre_init_run()
+        # Host-only: a run that must save frames needs a liveOD client. Before
+        # the claim, so nothing is claimed for a run that cannot start.
+        if (getattr(self, 'live_od_client', None) is None
+                and self.run_info.save_data and self.setup_camera):
+            raise RuntimeError(
+                "No liveOD server connection found. "
+                "Start the liveOD GUI before running experiments."
+            )
 
-        _client = getattr(self, 'live_od_client', None)
-        if _client is not None:
-            payload = self._serialize_init_payload()
-            response = _client.init_run(payload)
-            self.run_info.run_id = response['run_id']
-            self.run_info.filepath = response['filepath']
-            self._ridstr = "Run ID: " + str(self.run_info.run_id)
-            if response['run_id']:
-                if os.environ.get('WAXX_LAUNCHER'):
-                    # a launcher (the run queue, the run loop, run_lock) reads
-                    # this line from the output: never hidden by WAX_VERBOSITY
-                    print(f"Run ID: {self.run_info.run_id}", flush=True)
-                else:
-                    console.info(f"Run ID: {self.run_info.run_id}")
-        else:
-            if self.run_info.save_data and self.setup_camera:
-                raise RuntimeError(
-                    "No liveOD server connection found. "
-                    "Start the liveOD GUI before running experiments."
-                )
-            elif self.run_info.save_data:
-                print(
-                    "[LiveOD] WARNING: No liveOD server connection -- "
-                    "data will not be saved (setup_camera=False)."
-                )
-
-        self._decide_subscan()
+        # The kernel's copy of "take sub-scan points", decided before the
+        # kernel is compiled (a later disable is honoured by _subscan_due).
+        self._compile_subscan_switch()
 
         if self._adjust_specs and self.run_info.save_data:
             print(
@@ -324,6 +340,48 @@ class Expt(Scanner, Dealer, Scribe):
                 "Values changed in the Adjust panel between shots will NOT be reflected "
                 "in saved data."
             )
+
+        from waxx.util.device_state import queue_gate
+        if not queue_gate.is_warm():
+            # cold: the same moment INIT_RUN always had
+            self.claim()
+        else:
+            # warm: nothing that touches the machine; liveOD only checks the
+            # run could start (RESERVE_RUN creates nothing). The ARTIQ Core
+            # hook runs claim() after the compile and the queue's GO.
+            self._reserve_warm_run()
+            queue_gate.register_claim(self.claim)
+
+    # ---- the claim -----------------------------------------------------------
+
+    def claim(self):
+        """Take the machine for this run, once (later calls do nothing).
+
+        Every step of a run's start that touches hardware, an exclusive device
+        or shared lab state is here, in this order: the queue's GO (no-op for
+        a cold run), ``claim_hardware()`` (machine hook), ``pre_init_run()``
+        (legacy machine hook), the liveOD start (INIT_RUN, or START_RUN for a
+        warm-launched run; the run id), the run id line, the monitor
+        announcement (composite-op fence), ``claim_after_start()`` (machine
+        hook). Raising before the liveOD start stops the run before it has a
+        run id.
+
+        It must never set an attribute a kernel reads: a warm-launched run
+        claims after its kernel was compiled, and ARTIQ bakes host values into
+        the kernel at compile time and writes them back at its end."""
+        if self._claimed:
+            return
+        from waxx.util.device_state import queue_gate
+        queue_gate.ensure_go()          # may exit (stand down before GO): nothing claimed
+        self._claimed = True
+
+        self.claim_hardware()
+        # overloaded per machine; the last moment before the run id
+        self.pre_init_run()
+
+        self._start_liveod_run()
+        self._run_started = True
+        self._decide_subscan()
 
         # Fence composite ops from here until this run's end state arrives
         # (the monitor experiment is the one run that must not fence itself).
@@ -334,6 +392,299 @@ class Expt(Scanner, Dealer, Scribe):
             except Exception as e:
                 print(f"[Monitor] note: could not announce this run to the monitor "
                       f"server ({e!r}); composite ops are not fenced for it.")
+
+        self.claim_after_start()
+
+    def claim_hardware(self):
+        """Machine hook, first step of claim(): hardware and exclusive devices
+        (kexp.Base: the APD stage, a due SLM reinit, the wavemeter, the
+        camera streams' connections and their containers' shapes). Runs
+        before the liveOD start payload is built; raising stops the run
+        before it has a run id. Must not set an attribute a kernel reads."""
+        pass
+
+    def claim_after_start(self):
+        """Machine hook, last step of claim(), after the liveOD start and the
+        monitor announcement (kexp.Base: the device-state stamp). Must not set
+        an attribute a kernel reads."""
+        pass
+
+    def _start_liveod_run(self):
+        """liveOD's start of this run. Cold: INIT_RUN, as always. Warm-launched:
+        START_RUN whenever liveOD has the ``reserve`` feature -- with the
+        reservation, or with none when RESERVE was refused or failed (a plain
+        START still refuses before any run id on a Reset since GO or a live run
+        in progress, and stamps liveOD's start time); its refusal
+        (LiveODStartRefused) propagates, the run does not start. INIT_RUN only
+        when liveOD does not know START_RUN ("Unknown tag") or has no
+        ``reserve`` feature, and then run_info is re-stamped with the current
+        time first, so the file is not named by the warm process's start.
+        Adopts the run id, file path and -- when the reply has them -- the
+        server's start time into run_info."""
+        _client = getattr(self, 'live_od_client', None)
+        if _client is None:
+            if self.run_info.save_data:
+                print(
+                    "[LiveOD] WARNING: No liveOD server connection -- "
+                    "data will not be saved (setup_camera=False)."
+                )
+            return
+        from waxx.util.device_state import queue_gate
+        reservation, self._reservation = self._reservation, None
+        response = None
+        if queue_gate.is_warm():
+            start = getattr(_client, 'start_run', None)
+            if start is not None and self._liveod_has_reserve(_client):
+                # rebuilt here: claim_hardware may have changed container shapes
+                response = start(self._serialize_init_payload(),
+                                 reservation=reservation or None,
+                                 require_features=["reserve"],
+                                 go_reset_count=queue_gate.go_info().get("reset_count"))
+                if not isinstance(response, dict) or _unknown_tag(response):
+                    print("[LiveOD] note: this liveOD does not know START_RUN; starting "
+                          "with INIT_RUN instead.")
+                    response = None
+                elif not response.get("ok", True) or "run_id" not in response:
+                    raise RuntimeError(f"[LiveOD] START_RUN refused: "
+                                       f"{response.get('error', response)}")
+            if response is None:
+                # INIT_RUN names the file by run_info's time: now, not the
+                # moment this process was launched to wait
+                self._restamp_run_time_now()
+        if response is None:
+            # rebuilt here: claim_hardware may have changed container shapes
+            response = _client.init_run(self._serialize_init_payload())
+        self.run_info.run_id = response['run_id']
+        self.run_info.filepath = response['filepath']
+        self._adopt_start_time(response)
+        if response['run_id']:
+            if os.environ.get('WAXX_LAUNCHER'):
+                # a launcher (the run queue, the run loop, run_lock) reads
+                # this line from the output: never hidden by WAX_VERBOSITY
+                print(f"Run ID: {self.run_info.run_id}", flush=True)
+            else:
+                console.info(f"Run ID: {self.run_info.run_id}")
+
+    def _liveod_has_reserve(self, client) -> bool:
+        """Whether liveOD has the ``reserve`` feature (START_RUN): from the
+        RESERVE reply (kept by _reserve_warm_run, refused replies included);
+        when that told nothing (RESERVE not sent, or failed on the network),
+        from a POLL. False after an "Unknown tag"."""
+        feats = getattr(self, "_liveod_features", None)
+        if feats is None:
+            try:
+                reply = client.poll()
+                feats = dict(reply.get("features") or {}) if isinstance(reply, dict) else {}
+            except Exception as e:
+                print(f"[LiveOD] note: could not ask liveOD for its features ({e!r}); "
+                      f"starting with INIT_RUN.")
+                feats = {}
+            self._liveod_features = feats
+        return bool(feats.get("reserve"))
+
+    def _restamp_run_time_now(self):
+        """run_info's start time (date strings, run_datetime) set to now."""
+        now = time.localtime(time.time())
+        self.run_info.run_datetime = now
+        self.run_info.run_date_str = time.strftime("%Y-%m-%d", now)
+        self.run_info.run_datetime_str = time.strftime("%Y-%m-%d_%H-%M-%S", now)
+
+    def _adopt_start_time(self, response):
+        """The liveOD reply's start time (START_RUN stamps the server's clock),
+        when it has one: run_info's date strings and run_datetime follow it,
+        so they agree with the file's name and day folder."""
+        date_str = response.get('run_date_str')
+        dt_str = response.get('run_datetime_str')
+        if not dt_str:
+            return
+        try:
+            self.run_info.run_datetime = time.strptime(str(dt_str), "%Y-%m-%d_%H-%M-%S")
+            self.run_info.run_datetime_str = str(dt_str)
+            self.run_info.run_date_str = str(date_str or str(dt_str)[:10])
+        except Exception as e:
+            print(f"[LiveOD] note: could not read the start time {dt_str!r} from "
+                  f"liveOD's reply ({e!r}); keeping this process's.")
+
+    def _reserve_warm_run(self):
+        """Warm launch, end of finish_prepare_wax: ask liveOD whether this run
+        could start (RESERVE_RUN: creates nothing -- no run id, no file, no
+        camera lock). Best effort: no reservation is fine (refused, failed,
+        older liveOD); the claim then starts with START_RUN without one when
+        liveOD has the ``reserve`` feature, else with INIT_RUN. The reply's
+        ``features`` (also on a refusal) are kept for that choice. A
+        reservation given is released at exit if never used."""
+        self._liveod_features = None
+        _client = getattr(self, 'live_od_client', None)
+        reserve = getattr(_client, 'reserve_run', None) if _client is not None else None
+        if reserve is None:
+            return
+        try:
+            reply = reserve(self._serialize_init_payload(), ttl_s=900.)
+        except Exception as e:
+            print(f"[LiveOD] note: RESERVE_RUN failed ({e!r}); no reservation.")
+            return
+        if not isinstance(reply, dict):
+            return
+        if _unknown_tag(reply):
+            self._liveod_features = {}           # an older liveOD: INIT_RUN
+            return
+        if isinstance(reply.get("features"), dict):
+            self._liveod_features = dict(reply["features"])
+        for w in reply.get("warnings") or ():
+            print(f"[LiveOD] reservation warning: {w}")
+        if not reply.get("reservation"):
+            if reply.get("error"):
+                print(f"[LiveOD] note: no reservation ({reply.get('error')}).")
+            return
+        self._reservation = str(reply["reservation"])
+        import atexit
+        atexit.register(self._release_reservation)
+
+    def _release_reservation(self):
+        """atexit: a reservation the claim never used goes back. Never raises."""
+        reservation, self._reservation = self._reservation, None
+        if not reservation:
+            return
+        try:
+            release = getattr(getattr(self, 'live_od_client', None),
+                              'release_reservation', None)
+            if release is not None:
+                release(reservation)
+        except Exception:
+            pass
+
+    # ---- source texts (what this run is made of) ---------------------------
+
+    def _expt_file_path(self) -> str:
+        """Full path of the file that defines this experiment's class, or ''."""
+        import inspect
+        cls = type(self)
+        try:
+            p = inspect.getsourcefile(cls)
+            if p:
+                return os.path.abspath(p)
+        except Exception:
+            pass
+        for attr in vars(cls).values():
+            try:
+                code = inspect.unwrap(attr).__code__
+            except Exception:
+                continue
+            if code.co_filename.endswith('.py') and os.path.isfile(code.co_filename):
+                return os.path.abspath(code.co_filename)
+        return ""
+
+    def _source_files(self):
+        """(label, path) of every source text a run's file keeps: the
+        experiment, the params file, the base classes (as DataSaver names
+        them). A path not known yet is left out."""
+        out = []
+        p = self._expt_file_path()
+        if p:
+            out.append(("expt_file", p))
+        ds = getattr(self, "ds", None)
+        params = getattr(ds, "_expt_params_path", "") if ds is not None else ""
+        if params:
+            out.append(("params_file", params))
+        base_dir = getattr(ds, "_base_class_dir", "") if ds is not None else ""
+        if base_dir and os.path.isdir(base_dir):
+            try:
+                names = sorted(os.listdir(base_dir))
+            except Exception:
+                names = []
+            for name in names:
+                fp = os.path.join(base_dir, name)
+                if name.endswith('.py') and not name.startswith('__') and os.path.isfile(fp):
+                    out.append((f"base_class_{name[:-3]}", fp))
+        return out
+
+    def _read_source(self, path):
+        """A source file's text as the run's file stores it ('' when missing)."""
+        try:
+            return self.ds._read_text_file_safe(path, os.path.basename(path))
+        except Exception:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+    def _snapshot_source_texts(self):
+        """Read every source text not read yet (see __init__). Idempotent per
+        file; never raises."""
+        import hashlib
+        snap = self.__dict__.setdefault("_source_snapshot", {})
+        try:
+            files = self._source_files()
+        except Exception:
+            files = []
+        for label, path in files:
+            if label in snap:
+                continue
+            text = self._read_source(path)
+            snap[label] = {"path": os.path.abspath(path), "text": text,
+                           "sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()}
+
+    def _source_texts_for_end(self, expt_filepath):
+        """(expt_text, params_text, base_class_texts) for END_RUN: the texts
+        read at the start of the run, re-read now to compare. Any file that
+        differs (or appeared / disappeared) is listed in the root attribute
+        ``source_changed_during_run`` with its hashes, and said once in the
+        terminal. A base class added during the run is read now and listed
+        with ``sha256_start`` None; a file the start could not name (the
+        experiment file given to end() is not the class's file) is read now,
+        with a note."""
+        import hashlib
+
+        def sha(text):
+            return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+        snap = getattr(self, "_source_snapshot", {}) or {}
+        changed = []
+
+        def start_text(label, path):
+            entry = snap.get(label)
+            now = self._read_source(path) if path else ""
+            if entry is not None and path and os.path.normcase(os.path.abspath(path)) \
+                    == os.path.normcase(entry["path"]):
+                if not os.path.isfile(path):
+                    changed.append({"file": entry["path"], "sha256_start": entry["sha256"],
+                                    "sha256_end": None})
+                elif sha(now) != entry["sha256"]:
+                    changed.append({"file": entry["path"], "sha256_start": entry["sha256"],
+                                    "sha256_end": sha(now)})
+                return entry["text"]
+            if label.startswith("base_class_"):
+                # a base class that appeared during the run
+                changed.append({"file": os.path.abspath(path), "sha256_start": None,
+                                "sha256_end": sha(now) if os.path.isfile(path) else None})
+            elif path:
+                print(f"[end] note: {os.path.basename(path)} was not read at the start of "
+                      f"the run; its text is the one on disk now.")
+            return now
+
+        expt_text = start_text("expt_file", expt_filepath) if expt_filepath else ""
+        params_path = getattr(getattr(self, "ds", None), "_expt_params_path", "")
+        params_text = start_text("params_file", params_path) if params_path else ""
+
+        base_class_texts = {}
+        now_files = {label: path for label, path in self._source_files()
+                     if label.startswith("base_class_")}
+        for label in sorted(set(now_files) | {k for k in snap if k.startswith("base_class_")}):
+            if label in now_files:
+                base_class_texts[label] = start_text(label, now_files[label])
+            else:                       # deleted during the run: the start text
+                entry = snap[label]
+                changed.append({"file": entry["path"], "sha256_start": entry["sha256"],
+                                "sha256_end": None})
+                base_class_texts[label] = entry["text"]
+
+        if changed:
+            self._extra_file_texts["source_changed_during_run"] = json.dumps(changed)
+            names = ", ".join(os.path.basename(c["file"]) for c in changed)
+            print(f"[end] !! source files changed during the run: {names} -- the run's file "
+                  f"keeps the texts read at its start (see source_changed_during_run).")
+        return expt_text, params_text, base_class_texts
 
     # ---- param overrides and calibrations (waxx.calibration) -----------------
 
@@ -423,12 +774,19 @@ class Expt(Scanner, Dealer, Scribe):
                   f"the run's data is saved and unaffected.")
 
     def pre_init_run(self):
-        """Host, in finish_prepare_wax just before INIT_RUN: the last moment
-        before the run starts -- liveOD arms the camera and hands out the run
-        id at INIT_RUN, so a wait here costs neither the first frame's timeout
-        nor a run id. Raising here stops the run before it has one. Overload
-        per machine (kexp.Base)."""
+        """Host, in claim() right after claim_hardware and just before the
+        liveOD start: the last moment before the run starts -- liveOD arms the
+        camera and hands out the run id there, so a wait here costs neither
+        the first frame's timeout nor a run id. Raising here stops the run
+        before it has one. Overload per machine (kexp.Base uses
+        claim_hardware); must not set an attribute a kernel reads."""
         pass
+
+    def _print_run_id(self):
+        """RPC: the run id line init_kernel prints at VERBOSE. An RPC, not a
+        kernel string: the run id is set by the claim, which for a
+        warm-launched run comes after the compile."""
+        print(f"Run ID: {self.run_info.run_id}")
 
     @kernel
     def cleanup_scan_kernel_wax(self):
@@ -641,20 +999,34 @@ class Expt(Scanner, Dealer, Scribe):
         self._subscan.require_push = bool(require_push)
         return self._subscan
 
-    def _decide_subscan(self):
-        """After INIT_RUN: whether the sub-scan's points are taken this run."""
+    def _compile_subscan_switch(self):
+        """Before the claim (and so before any compile): the kernel's copy of
+        "take sub-scan points" (``_subscan_enabled``, read by Scanner.scan).
+        True for a sub-scan the experiment left enabled and that can run in
+        this run's shape; the liveOD-dependent check comes after the start
+        (_decide_subscan) and, if it disables the sub-scan, ``_subscan_due``
+        (an RPC that checks ``enabled``) keeps the loop from taking points.
+        The claim never sets this: a warm run's kernel is compiled before."""
         sub = self._subscan
         if sub is None:
             self._subscan_enabled = False
+            return
+        if sub.enabled and not getattr(sub, "require_push", True) and self.sort_idx:
+            sub.disable("require_push=False needs an unshuffled run (shuffle=False): carried "
+                        "containers would be unshuffled by axis length")
+        self._subscan_enabled = bool(sub.enabled)
+
+    def _decide_subscan(self):
+        """After the liveOD start (in claim): whether the sub-scan's points
+        are taken this run. Host-only: it may disable the sub-scan, never
+        touches ``_subscan_enabled`` (see _compile_subscan_switch)."""
+        sub = self._subscan
+        if sub is None:
             return
         if sub.enabled and getattr(sub, "require_push", True) and not self.push_data_enabled:
             why = ("this run has no liveOD client" if getattr(self, "live_od_client", None) is None
                    else "this liveOD takes no PUT_DATA (restart it from the current code)")
             sub.disable(f"{why}: its containers could not be written point by point")
-        if sub.enabled and not getattr(sub, "require_push", True) and self.sort_idx:
-            sub.disable("require_push=False needs an unshuffled run (shuffle=False): carried "
-                        "containers would be unshuffled by axis length")
-        self._subscan_enabled = bool(sub.enabled)
         if sub.enabled:
             console.info("[sub-scan] " + sub.describe())
             # which code takes the points -- a run from a worktree says so
@@ -738,6 +1110,15 @@ class Expt(Scanner, Dealer, Scribe):
                 restart_monitor=True):
 
         restart_monitor = _queue_restart_monitor(restart_monitor)
+        # A warm-launched run claims at its first kernel (the ARTIQ Core
+        # hook). One whose run() never reached a kernel never claimed: no
+        # liveOD run, no fence -- nothing to end, and nothing must pretend.
+        if not getattr(self, "_claimed", True):
+            from waxx.util.device_state import queue_gate
+            if queue_gate.is_warm():
+                raise RuntimeError("[end] this warm-launched run never claimed the machine "
+                                   "(its run() reached no kernel): nothing was run, nothing "
+                                   "is saved")
         _t0 = time.monotonic()
         try:
             self.scope_data.close()
@@ -1333,22 +1714,9 @@ class Expt(Scanner, Dealer, Scribe):
                 'external': bool(dc._external_data_bool),
             }
 
-        # Source file texts (read from client filesystem via ds)
-        expt_text = self.ds._read_text_file_safe(expt_filepath, "experiment") if expt_filepath else ""
-        params_text = self.ds._read_text_file_safe(self.ds._expt_params_path, "params")
-
-        base_class_texts = {}
-        if self.ds._base_class_dir and os.path.isdir(self.ds._base_class_dir):
-            try:
-                filenames = sorted(os.listdir(self.ds._base_class_dir))
-            except Exception:
-                filenames = []
-            for filename in filenames:
-                if filename.endswith('.py') and not filename.startswith('__'):
-                    fp = os.path.join(self.ds._base_class_dir, filename)
-                    if os.path.isfile(fp):
-                        key = f"base_class_{filename[:-3]}"
-                        base_class_texts[key] = self.ds._read_text_file_safe(fp, filename)
+        # Source file texts: as read at the start of the run (a change since
+        # is recorded in source_changed_during_run, see _source_texts_for_end)
+        expt_text, params_text, base_class_texts = self._source_texts_for_end(expt_filepath)
 
         return {
             'params': {
