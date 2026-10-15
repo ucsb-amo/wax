@@ -210,7 +210,11 @@ class MonitorUDPServer(UdpServer):
     * ``busy`` — the monitor is playing out a long op for N s.
     * ``run_pending`` — an experiment finished ``prepare()`` and is about to
       take the core: ops are refused from now until it ends (or 2 min pass
-      without it taking the core).
+      without it taking the core), and the state is untrusted (see Trust).
+    * ``run_withdrawn`` / ``clear_run_pending`` (``token``) — the announced
+      run exits without taking the core (its trust from before the
+      announcement comes back), or an operator clears a dead run's fence
+      (the state stays untrusted).
     * ``trust_ack`` — an operator says the hardware matches the state file.
     * ``reset_state`` — run the reset experiment (``reset_expt_path``, see
       :class:`~waxx.util.device_state.state_reset.StateReset`): it takes the
@@ -248,7 +252,10 @@ class MonitorUDPServer(UdpServer):
       required when the job has one --, ``offset``: the job's log from that
       byte, read here for a client on any PC; not logged or journaled),
       ``pause`` / ``resume`` (``scope`` "agent" | "all", ``by``,
-      ``reason``), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
+      ``reason``), ``warm`` (a warm-launched job's process: ``stage``,
+      ``job``, ``warm``, ``pid``, ``started``, ``manifest`` -- see
+      :meth:`RunQueue.warm_request`; short, memory and queue.json only,
+      answered while the server is exiting), and ``hold`` (``reason``, ``by``) / ``release`` (``by``):
       a person's hold on the machine
       (:mod:`~waxx.util.device_state.person_hold`); while it is on, agents'
       runs wait and the run loops do not run.  The server also sets the hold
@@ -315,12 +322,15 @@ class MonitorUDPServer(UdpServer):
       starting or holds the core, or a reset or run loop is running.  Replies
       with the backup path and the channels whose values changed.
 
-    Trust: when an experiment takes the core (the monitor is interrupted by a
-    run) the state file stops describing the hardware until that run's
-    ``end()`` sends its end state (or, aborted inside its scan, sends
-    ``abort_state``).  A run that dies elsewhere never does, so from the
-    interruption until ``replace_state`` (or ``trust_ack``) the state is
-    *untrusted*: GUIs say so, and coil ops want a measured current.  It is
+    Trust: when an experiment takes the core the state file stops describing
+    the hardware until that run's ``end()`` sends its end state (or, aborted
+    inside its scan, sends ``abort_state``).  A run that dies elsewhere never
+    does, so from the run's announcement (``run_pending``; also when it
+    interrupts a running monitor) until ``replace_state`` (or ``trust_ack``)
+    the state is *untrusted*: GUIs say so, and coil ops want a measured
+    current.  A run that withdraws (it exited without taking the core) or
+    whose fence lapses unused gets the trust from before its announcement
+    back -- unless something else changed the trust meanwhile.  It is
     kept in the file's metadata so a server restart does not forget it.
     ``reset_state`` ends it the way a normal run does -- through the reset
     experiment's own end state, never by itself.
@@ -365,7 +375,7 @@ class MonitorUDPServer(UdpServer):
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
                  run_loops=(), connections=(), slm_reinit=None, state_generator=None,
-                 run_queue_dir=None):
+                 run_queue_dir=None, warm_ahead=False):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
         # The run queue's folder (its queue, journal, job logs, the person
         # hold) is on LOCAL disk: given, or run_queue.default_dir()
@@ -407,6 +417,11 @@ class MonitorUDPServer(UdpServer):
         self._run_pending: dict | None = None
         self._last_monitor_state = None
         self._trust = {"trusted": True, "reason": "", "since": time.time()}
+        #: the trust before the announced run made it untrusted: {"token",
+        #: "run", "trust"}; restored when that run withdraws (it never took
+        #: the core) or its fence lapses unused; dropped by any other trust
+        #: change (an end / abort state, a trust_ack, the run taking the core)
+        self._trust_before_run: dict | None = None
         try:
             meta = self._state().get("metadata") or {}
             if isinstance(meta.get("state_trust"), dict):
@@ -442,14 +457,17 @@ class MonitorUDPServer(UdpServer):
 
         # The run queue: experiment jobs one at a time (run_queue.py), through
         # the same liveOD link (called late, so it is always the current one),
-        # fence, monitor state and loops as the rest of the server.
+        # fence, monitor state and loops as the rest of the server.  Warm start
+        # (queue phase 2) stays off unless warm_ahead is given (until the
+        # hardware checks of the plan's M5 have passed).
         self.run_queue = RunQueue(
             run_queue_dir, poll=lambda: self._live_od(),
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
             live_od_reset=lambda **kw: self._live_od.reset(**kw), fence=self._current_run_pending,
             monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
             loops=self.loops, start_monitor=self.start_monitor_signal.emit,
-            hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change)
+            hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change,
+            warm_ahead=warm_ahead)
 
         # Host-side connections (the tweezer AWG), held here between runs.
         # Bad definitions cost the connections, never the server.
@@ -764,13 +782,27 @@ class MonitorUDPServer(UdpServer):
     # --- run fence and trust ------------------------------------------------------
 
     def _reply_run_pending(self, obj: dict) -> str:
+        """A run announces itself (finish_prepare / claim): composite ops are
+        fenced, and the device state is UNTRUSTED from now until the run's end
+        (or abort) state arrives -- whoever launched it.  (Before, trust went
+        false only when the run interrupted a running monitor; back-to-back
+        queue runs, which never restart the monitor, ran labelled trusted with
+        the previous run's end state.)  The trust before the announcement is
+        remembered and restored if the run withdraws -- it exited without
+        taking the core -- or its fence lapses unused (RUN_PENDING_TTL_S)."""
+        token = str(obj.get("token") or "")
         self._run_pending = {"run_id": obj.get("run_id"), "expt": str(obj.get("expt", "")),
                              "client": str(obj.get("client", "")), "since": time.time(),
-                             "token": str(obj.get("token") or ""), "t0": time.monotonic()}
+                             "token": token, "t0": time.monotonic()}
         log.info("Run %s (%s) is starting: composite ops are fenced until it ends.",
                  obj.get("run_id"), obj.get("expt", ""))
         self.journal.record("run_pending", run_id=obj.get("run_id"), expt=obj.get("expt"),
                             client=obj.get("client"))
+        name = _run_name(obj.get("run_id"), obj.get("expt"))
+        before = dict(self._trust)
+        self._set_trust(False, f"{name} announced at {time.strftime('%H:%M')}; untrusted until "
+                               "its end state")
+        self._trust_before_run = {"token": token, "run": name, "trust": before}
         self._broadcaster.send({"type": "run_pending", "run_pending": self._public_pending()})
         # No SLM reinit starts from now on; one being asked for is on its way
         # to the SLM server before the run's first mask (slm_reinit.SEND_WAIT_S).
@@ -798,6 +830,11 @@ class MonitorUDPServer(UdpServer):
         else:
             why = "the run exited without taking the core"
         log.info("Run %s: fence lifted -- %s.", p.get("run_id"), why)
+        if not by_operator:
+            # it never took the core: the state is what it was before it
+            # announced (an operator's clear asserts it is dead, not that it
+            # never ran: the state stays untrusted)
+            self._restore_trust(token, why)
         self._clear_run_pending(why)
         self.connections.run_over(why, reopen=True)
         return json.dumps({"status": "ok"})
@@ -812,10 +849,24 @@ class MonitorUDPServer(UdpServer):
                 and self.status.state == STATES.READY:
             why = (f"run {p.get('run_id')} never took the core "
                    f"within {self.RUN_PENDING_TTL_S:.0f} s")
+            self._restore_trust(p.get("token") or "", why)
             self._clear_run_pending(why)
             self.connections.run_over(why, reopen=True)
             return None
         return p
+
+    def _restore_trust(self, token: str, why: str) -> None:
+        """The announced run (``token``) never took the core: put back the
+        trust it had before its announcement -- only if nothing else changed
+        the trust since (then there is nothing remembered to restore)."""
+        memo = self._trust_before_run
+        if memo is None or memo.get("token") != token:
+            return
+        before = memo.get("trust") or {}
+        reason = str(before.get("reason") or "")
+        self._set_trust(bool(before.get("trusted")),
+                        f"{memo.get('run')}: {why}; trust as before it was announced"
+                        + (f" ({reason})" if reason else ""))
 
     def _clear_run_pending(self, why: str) -> None:
         if self._run_pending is None:
@@ -1077,7 +1128,10 @@ class MonitorUDPServer(UdpServer):
         if mtype == "run_loop":
             return action in ("start", "configure")
         if mtype == "run_queue":
-            return action not in self._QUEUE_READS
+            # "warm": a warm process's poll -- answered while exiting (the
+            # queue gives no GO then: stop_launching), so it keeps waiting
+            # for the restarted server instead of counting refusals
+            return action not in self._QUEUE_READS and action != "warm"
         if mtype == "slm_reinit":
             return action != "status"
         return False
@@ -1086,7 +1140,8 @@ class MonitorUDPServer(UdpServer):
     _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
                       "cancel": "cancel", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
-                      "resume": "resume", "hold": "hold_request", "release": "release_request"}
+                      "resume": "resume", "hold": "hold_request", "release": "release_request",
+                      "warm": "warm_request"}
 
     def _reply_run_queue(self, obj: dict) -> dict:
         """``{"type": "run_queue", "action": ...}`` -- see
@@ -1153,6 +1208,7 @@ class MonitorUDPServer(UdpServer):
                 log.exception("Run queue / person hold watch tick failed")
 
     def _set_trust(self, trusted: bool, reason: str) -> None:
+        self._trust_before_run = None     # any trust change ends what an announcement remembered
         self._trust = {"trusted": bool(trusted), "reason": reason, "since": time.time()}
         log.info("Device state %s: %s", "trusted" if trusted else "UNTRUSTED", reason)
         self.journal.record("trust", trusted=bool(trusted), reason=reason)
@@ -1465,6 +1521,7 @@ class MonitorUDPServer(UdpServer):
             self._version += 1
             version = self._version
         self._trust = trust
+        self._trust_before_run = None
         self._clear_run_pending(f"{_run_name(run_id, expt)} ended")
         # The run let go of the AWG in its post_scan; the connections open
         # again when the monitor is running (a run loop's next run would
@@ -1516,6 +1573,7 @@ class MonitorUDPServer(UdpServer):
             self._version += 1
             version = self._version
         self._trust = trust
+        self._trust_before_run = None
         self._clear_run_pending(f"{_run_name(run_id, expt)} aborted")
         self.connections.run_over(f"{_run_name(run_id, expt)} aborted", reopen=False)
         (log.info if trusted else log.warning)(

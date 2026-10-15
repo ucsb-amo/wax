@@ -97,10 +97,11 @@ class Spawner:
         self.procs, self.calls = [], []
         self.fail = None
 
-    def __call__(self, command, cwd, env, log_path):
+    def __call__(self, command, cwd, env, log_path, **kw):
         if self.fail:
             raise OSError(self.fail)
-        self.calls.append({"command": command, "cwd": cwd, "env": env, "log_path": log_path})
+        self.calls.append(dict({"command": command, "cwd": cwd, "env": env, "log_path": log_path},
+                               **kw))
         proc = Proc(log_path, 5000 + len(self.procs))
         self.procs.append(proc)
         return proc
@@ -1819,7 +1820,7 @@ def test_estimates_from_saved_runs_and_live_od_shots(q, expts):
     assert views[tof]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 350.0)
     rows = q.list()["rows"]
     assert set(rows[0]) == {"position", "id", "state", "owner", "submitter", "label",
-                            "expt_class", "run_id", "est", "waiting"}
+                            "expt_class", "run_id", "est", "waiting", "warm"}
 
 
 def test_source_changed_and_precise_waiting(q, expts):

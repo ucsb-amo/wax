@@ -826,3 +826,28 @@ def test_est_text():
     assert kqmod.est_text({"eta_end": time.time()}, "running").startswith("est. end ")
     assert kqmod.est_text({"duration_s": None, "basis": "x"}, "queued") == "-"
     assert kqmod.est_text({"duration_s": 5}, "saved") == "-"
+
+
+# --- warm start (queue phase 2) ---------------------------------------------------------------
+
+def test_cold_submit_edit_and_the_warm_jobs_list_show_and_cancel(server, q, expts):
+    r = kq(server, "submit", str(expts / "rabi.py"), "--cold")
+    assert r.code == 0, r.err
+    assert sent(server, "submit")[0]["cold"] is True and q._jobs[1].cold is True
+    r = kq(server, "edit", "1", "--no-cold")
+    assert r.code == 0 and "changed cold" in r.out and q._jobs[1].cold is False
+    kq(server, "submit", str(expts / "tof.py"))
+    assert "cold" not in sent(server, "submit")[1]          # not sent unless asked (old servers)
+    q._jobs[1].warm = {"token": "x" * 16, "state": "ready", "attempt": 1,
+                       "spawned_at": q.clock.t - 9, "ready_at": q.clock.t - 2, "py_pid": 9001,
+                       "cmd_pid": 5001, "manifest": [["a.py", 1, 2]], "go": None}
+    r = kq(server, "list")
+    line = next(ln for ln in r.out.splitlines() if ln.split()[1:2] == ["1"])
+    assert "ready" in line
+    assert "next #1 ready" in r.out
+    r = kq(server, "show", "1")
+    assert "  warm: ready (attempt 1)" in r.out and "py_pid 9001" in r.out
+    assert "manifest: 1 files" in r.out and "x" * 16 not in r.out    # never the warm token
+    r = kq(server, "cancel", "1")
+    assert r.code == 0
+    assert "[kq] job 1 (rabi) cancelled (not started (warm process told to exit))" in r.out
