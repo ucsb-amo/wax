@@ -296,6 +296,25 @@ def _install_hooks():
                                    first_only_mark="run() returned / analyze start")
     ok["close_devices"] = TL.wrap(DeviceManager, "close_devices", "close_devices",
                                   first_only_mark="analyze() done")
+
+    # --- run queue warm start (waxx's Core subclass; device_db "core") -----
+    # Imported here so the hooks exist before the device_db builds the core: two small
+    # modules (artiq.coredevice.core is already loaded above), not the lab package.
+    try:
+        from waxx.util.artiq import core as waxx_core
+        from waxx.util.device_state import queue_gate
+    except ImportError:                 # a tree without the warm-start gate
+        ok["Core._wait_for_go"] = ok["queue_gate.ensure_go"] = False
+        return ok, artiq_run
+
+    def mark_go(args, kwargs, result):
+        if queue_gate.is_warm():        # cold runs call ensure_go too (a no-op): no mark
+            TL.mark("GO received")
+
+    ok["Core._wait_for_go"] = TL.wrap(waxx_core.Core, "_wait_for_go", "wait for GO + claim")
+    # waxx_core calls it as queue_gate.ensure_go(), so the module attribute is the hook
+    ok["queue_gate.ensure_go"] = TL.wrap(queue_gate, "ensure_go", "wait for GO",
+                                         after=mark_go, min_s=0.001)
     return ok, artiq_run
 
 
@@ -333,6 +352,10 @@ def _report(json_path, argv):
         if build_end is not None:
             summary["prepare()"] = m["prepare() done / compile start"] - build_end
     summary["compile (all kernels)"] = span_total("Core.compile (total)")
+    # warm-launched runs only (0 otherwise, and then not printed)
+    summary["wait for GO (queue)"] = span_total("wait for GO")
+    summary["claim (after GO)"] = (span_total("wait for GO + claim")
+                                   - summary["wait for GO (queue)"])
     summary["upload kernel"] = span_total("upload kernel")
     if "kernel started" in m and "first RPC from kernel" in m:
         summary["kernel start -> first RPC"] = m["first RPC from kernel"] - m["kernel started"]
@@ -347,6 +370,9 @@ def _report(json_path, argv):
             print(f"  {key:<36s} {val:9.3f} s", file=out)
     if "kernel started" in m:
         print(f"  {'>> submission -> kernel running':<36s} {m['kernel started']:9.3f} s", file=out)
+        if "GO received" in m:
+            print(f"  {'>> GO -> kernel running':<36s} "
+                  f"{m['kernel started'] - m['GO received']:9.3f} s", file=out)
     print(f"\n  kernels compiled: {TL.n_compiles}    "
           f"RPCs served: {TL.n_rpcs} "
           f"({rpc_host_s:.3f} s host time inside RPC handlers)", file=out)
