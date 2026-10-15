@@ -388,3 +388,39 @@ def test_persist_on_with_nothing_different_is_only_info(served, records):
     records.clear()
     srv._handle_init_run(init_msg())
     assert not [r for r in records if "Persist" in r.getMessage() or "PERSIST" in r.getMessage()]
+
+
+# ----------------------------------------------------------------------
+# RESERVE_RUN's camera dry run (queue phase 2): no claim, no lock
+# ----------------------------------------------------------------------
+
+def _reserve_msg(**kw):
+    msg = init_msg(tag="RESERVE_RUN", client_pid=7001, client_host="elsewhere")
+    msg.update(kw)
+    return msg
+
+
+def test_reserve_previews_a_refused_profile_without_a_lock_or_an_id(served):
+    srv, host, fakes, saver, _ = served
+    next_id = saver._next_run_id
+    reply = srv._handle_reserve_run(_reserve_msg(
+        save_data=True, camera_key="cam_a", camera_params=andor_params(vs_speed=0, vs_amp=0)))
+    assert reply["ok"] and any("no charge" in r for r in reply["preview"]["refused"])
+    assert host.worker("cam_a").locked_by is None and saver._next_run_id == next_id
+    assert srv._run_in_progress is False and srv._host_pending is None
+
+
+def test_reserve_previews_persist_while_a_run_holds_the_camera(served):
+    srv, host, fakes, saver, _ = served
+    host.start_stream("cam_a").result(5)
+    host.set_live("cam_a", {"gain": 30})
+    host.set_persist("cam_a", True)
+    run = srv._handle_init_run(init_msg(camera_key="cam_a", camera_params=andor_params(gain=30)))
+    reply = srv._handle_reserve_run(_reserve_msg(camera_key="cam_a",
+                                                 camera_params=andor_params(gain=300)))
+    assert reply["ok"] and reply["preview"]["refused"] == []
+    assert reply["preview"]["camera_overrides"]["fields"] == {
+        "gain": {"requested": 300, "applied": 30, "origin": "persist"}}
+    assert host.worker("cam_a").locked_by == run["run_token"]          # still the run's
+    assert srv._run_token == run["run_token"]
+    srv._handle_abort_run({"run_token": run["run_token"]})

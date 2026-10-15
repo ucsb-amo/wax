@@ -967,6 +967,40 @@ class CameraHost:
                         persist_since=ps.since_iso if ps.on else None,
                         labels=self._labels(camera_key))
 
+    def preview_run(self, camera_key: str, capture_images: bool, camera_params=None) -> dict:
+        """RESERVE_RUN's camera dry run (queue phase 2): the run profile
+        ``begin_run`` would build and check for these camera_params -- and
+        nothing else: no claim, no lock, no run record, no log line, the
+        camera's thread is not asked anything (its last-known choices are
+        read). ``{"overrides": {field: {requested, applied, origin}},
+        "not_carried": {field: why}, "refusals": [text], "camera_key"}``;
+        ``refusals`` non-empty means begin_run would refuse the run now.
+        Persist can change before the run starts: START is what counts."""
+        out = {"camera_key": str(camera_key), "overrides": {}, "not_carried": {},
+               "refusals": []}
+        spec = self._by_key.get(camera_key)
+        if not capture_images or spec is None or not spec.has_camera:
+            return out
+        core = self._core
+        if not self._started or core is None:
+            out["refusals"].append(f"liveOD's camera host is not running ({camera_key})")
+            return out
+        w = core.worker(spec.camera_id)
+        ps = self._persist.get(camera_key, PersistState())
+        persisted = dict(ps.values) if ps.on else {}
+        choices = {k: {"choices": d["choices"]} for k, d in dict(w.dynamic).items()
+                   if isinstance(d, dict) and d.get("choices")}
+        try:
+            plan = build_run_profile(spec.category, camera_params or {}, persisted,
+                                     extra=self._constraints_for(spec), dynamic=choices)
+        except RunProfileError as exc:
+            out["refusals"].append(str(exc))
+            return out
+        out["refusals"].extend(str(v) for v in refusals(plan.violations))
+        out["overrides"] = {k: dict(v) for k, v in plan.overrides.items()}
+        out["not_carried"] = {k: str(v) for k, v in plan.refused.items()}
+        return out
+
     def _claim_if_needed(self, spec: CameraSpec, w) -> None:
         """A camera that liveOD does not hold yet: borrow it from every other
         v2 camera server that lists it (bounded) -- a Basler from the beacon
