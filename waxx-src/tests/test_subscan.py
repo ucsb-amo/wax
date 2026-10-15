@@ -59,7 +59,8 @@ def _expt(n_data=5, xvardims=None, sort_idx=(), push=True, client=True, setup_ca
     e.param_police = lambda xv: None
     e._check_for_abort_signal = lambda raise_error=True: False
     for name in ("current_shot_index", "final_shot_index", "push_shot_data", "_push",
-                 "_note_push_failure", "add_sub_scan", "_decide_subscan", "_subscan_note",
+                 "_note_push_failure", "add_sub_scan", "_decide_subscan", "_compile_subscan_switch",
+                 "_subscan_note",
                  "_subscan_due", "_subscan_begin", "_subscan_end", "_shot_conditions"):
         setattr(e, name, getattr(Expt, name).__get__(e))
     e.push_data_enabled = Expt.push_data_enabled.fget(e)
@@ -78,6 +79,8 @@ def _declare(e, every=2, at_start=True, alternate=True, n_reads=3, **kw):
 def _finish(e, sub):
     sub.finish(n_data_shots=int(np.prod(e.xvardims)), main_xvarnames=e.xvarnames,
                setup_camera=e.setup_camera, main_xvardims=list(e.xvardims))
+    # as Expt does: the kernel's switch before the claim, the liveOD check after it
+    e._compile_subscan_switch()
     e._decide_subscan()
     return sub
 
@@ -294,7 +297,9 @@ def test_refused_when_a_key_or_a_read_parameter_is_a_main_xvar():
 def test_disabled_loudly_without_a_liveod_that_takes_data(capsys):
     e = _expt(n_data=5, push=False)
     sub = _finish(e, _declare(e))
-    assert not sub.enabled and not e._subscan_enabled
+    # the kernel's switch was fixed before the claim; the disable after the liveOD
+    # start is honoured by the _subscan_due RPC (queue phase 2)
+    assert not sub.enabled and e._subscan_enabled and e._subscan_due() is False
     assert "DISABLED" in capsys.readouterr().out
     assert "PUT_DATA" in e._extra_file_texts["cal_scan_disabled"]
     e2 = _expt(n_data=5, client=None)
@@ -303,6 +308,7 @@ def test_disabled_loudly_without_a_liveod_that_takes_data(capsys):
     e3 = _expt(n_data=5, client=None, sort_idx=([1, 0, 2, 3, 4],))
     sub3 = _finish(e3, _declare(e3, require_push=False))
     assert not sub3.enabled and "unshuffled" in sub3.disabled_reason
+    assert not e3._subscan_enabled                       # known before the compile
 
 
 # -------------------------------------------------------------------- RPCs

@@ -122,6 +122,7 @@ def _expt_methods():
              "drain_shot_data", "_stream_only_keys", "_close_shot_data_queue",
              "push_shot_data", "push_raw", "_push", "_note_push_failure",
              "_push_whole_container", "_serialize_end_payload",
+             "_source_texts_for_end", "_source_files", "_read_source", "_expt_file_path",
              "PUSH_QUEUE_MAX_BYTES", "PUSH_QUEUE_RETRIES", "T_PUSH_QUEUE_CLOSE_S",
              "BULK_PUSH_BYTES", "PUT_DATA_SLICE_BYTES")
     return {n: vars(Expt)[n] for n in names}

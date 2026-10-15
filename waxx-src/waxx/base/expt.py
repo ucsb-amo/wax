@@ -618,7 +618,7 @@ class Expt(Scanner, Dealer, Scribe):
             return now
 
         expt_text = start_text("expt_file", expt_filepath) if expt_filepath else ""
-        params_path = getattr(self.ds, "_expt_params_path", "")
+        params_path = getattr(getattr(self, "ds", None), "_expt_params_path", "")
         params_text = start_text("params_file", params_path) if params_path else ""
 
         base_class_texts = {}
