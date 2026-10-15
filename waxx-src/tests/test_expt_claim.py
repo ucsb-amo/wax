@@ -155,8 +155,29 @@ def test_cold_claim_order_and_once():
     e = _stand(ev, FakeLiveOD(ev))
     e.claim()
     e.claim()
-    assert ev == ["hardware", "init_run", ("announce", 7), "after_start"]
+    assert ev == ["hardware", "init_run", "after_start", ("announce", 7)]
     assert e.run_info.run_id == 7 and e._run_started
+
+
+def test_the_stamp_records_the_trust_from_before_the_runs_own_announcement():
+    """The monitor server marks the device state untrusted on a run's
+    announcement (run_pending, M0): the stamp (claim_after_start) is taken
+    before the announcement, so it records the state the run starts from,
+    not the run's own "untrusted"."""
+    server = {"trusted": True, "reason": "end state of the previous run"}
+    ev = []
+    e = _stand(ev, FakeLiveOD(ev))
+
+    def announce_run(**kw):
+        ev.append(("announce", kw["run_id"]))
+        server.update(trusted=False, reason=f"run {kw['run_id']} announced")
+
+    e.monitor = SimpleNamespace(announce_run=announce_run)
+    stamped = []
+    e.claim_after_start = lambda: stamped.append(dict(server))
+    e.claim()
+    assert stamped == [{"trusted": True, "reason": "end state of the previous run"}]
+    assert server["trusted"] is False                   # the announcement did go out
 
 
 def test_cold_never_uses_start_run_even_with_a_reservation():
@@ -175,8 +196,8 @@ def test_warm_reserve_then_start_with_the_reservation_and_server_time(warm, caps
     assert ev == ["reserve_run"] and e._reservation == "r9"
     assert "reservation warning: w" in capsys.readouterr().out      # printed once, by Expt
     e.claim()
-    assert ev[1:] == ["hardware", ("start_run", "r9", ("reserve",), None), ("announce", 8),
-                      "after_start"]
+    assert ev[1:] == ["hardware", ("start_run", "r9", ("reserve",), None), "after_start",
+                      ("announce", 8)]
     assert e.run_info.run_id == 8 and e._reservation is None
     assert e.run_info.run_datetime_str == "2026-10-14_09-08-07"
     assert e.run_info.run_date_str == "2026-10-14"

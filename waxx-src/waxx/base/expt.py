@@ -361,10 +361,11 @@ class Expt(Scanner, Dealer, Scribe):
         or shared lab state is here, in this order: the queue's GO (no-op for
         a cold run), ``claim_hardware()`` (machine hook), ``pre_init_run()``
         (legacy machine hook), the liveOD start (INIT_RUN, or START_RUN for a
-        warm-launched run; the run id), the run id line, the monitor
-        announcement (composite-op fence), ``claim_after_start()`` (machine
-        hook). Raising before the liveOD start stops the run before it has a
-        run id.
+        warm-launched run; the run id), the run id line,
+        ``claim_after_start()`` (machine hook: the device-state stamp, taken
+        before the announcement, which makes the state untrusted), the
+        monitor announcement (composite-op fence). Raising before the liveOD
+        start stops the run before it has a run id.
 
         It must never set an attribute a kernel reads: a warm-launched run
         claims after its kernel was compiled, and ARTIQ bakes host values into
@@ -383,6 +384,13 @@ class Expt(Scanner, Dealer, Scribe):
         self._run_started = True
         self._decide_subscan()
 
+        # Before the announcement: the monitor server marks the device state
+        # untrusted on this run's announcement, so a stamp taken after it
+        # would record this run's own "untrusted" instead of the state the
+        # run starts from (and hazards judged on that). Here it is already
+        # after GO and after the previous run's process exited.
+        self.claim_after_start()
+
         # Fence composite ops from here until this run's end state arrives
         # (the monitor experiment is the one run that must not fence itself).
         if hasattr(self, 'monitor') and not getattr(self, '_is_monitor', False):
@@ -393,8 +401,6 @@ class Expt(Scanner, Dealer, Scribe):
                 print(f"[Monitor] note: could not announce this run to the monitor "
                       f"server ({e!r}); composite ops are not fenced for it.")
 
-        self.claim_after_start()
-
     def claim_hardware(self):
         """Machine hook, first step of claim(): hardware and exclusive devices
         (kexp.Base: the APD stage, a due SLM reinit, the wavemeter, the
@@ -404,9 +410,11 @@ class Expt(Scanner, Dealer, Scribe):
         pass
 
     def claim_after_start(self):
-        """Machine hook, last step of claim(), after the liveOD start and the
-        monitor announcement (kexp.Base: the device-state stamp). Must not set
-        an attribute a kernel reads."""
+        """Machine hook in claim(), after the liveOD start and BEFORE the
+        monitor announcement (kexp.Base: the device-state stamp -- the
+        announcement makes the monitor server's state untrusted, so a stamp
+        after it would describe this run, not what it starts from). Must not
+        set an attribute a kernel reads."""
         pass
 
     def _start_liveod_run(self):
