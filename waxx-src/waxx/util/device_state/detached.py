@@ -18,6 +18,12 @@ is outside the server's tree.  The server then follows the command by pid:
   its pid and its creation time (recorded at launch), refusing a pid now used
   by another process.
 
+A warm launch of the queue (queue phase 2) asks for
+``BELOW_NORMAL_PRIORITY_CLASS`` (``launch(..., below_normal=True)``: a flag in
+the launcher's JSON; the default is unchanged); its children inherit it, and
+:func:`set_normal_priority` raises it back at GO (the experiment raises itself
+too).
+
 Nothing here ever terminates a process.  Windows only for the detached part;
 elsewhere :func:`launch` starts the command in a new session and follows it
 through its Popen object.
@@ -38,6 +44,10 @@ _log = logging.getLogger(__name__)
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+#: Windows priority classes (creationflags / SetPriorityClass)
+BELOW_NORMAL_PRIORITY_CLASS = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+NORMAL_PRIORITY_CLASS = getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0x00000020)
+_PROCESS_SET_INFORMATION = 0x0200
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SYNCHRONIZE = 0x00100000
@@ -182,6 +192,34 @@ def process_started(pid: int | None = None) -> float | None:
         return None
 
 
+def set_normal_priority(pid, started: float | None) -> bool:
+    """Raise process ``pid`` to NORMAL_PRIORITY_CLASS -- only when it is the
+    process created at ``started`` (a reused pid is never touched; None:
+    not checked).  True when done.  Windows only; never raises."""
+    if sys.platform != "win32":
+        return False
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        ctypes, wintypes, k32 = _k32()
+        k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_SET_INFORMATION,
+                                 False, pid)
+        if not handle:
+            return False
+        try:
+            if started is not None:
+                created = _creation_time(handle)
+                if created is None or abs(created - float(started)) > SAME_PROCESS_S:
+                    return False
+            return bool(k32.SetPriorityClass(handle, NORMAL_PRIORITY_CLASS))
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
 def _creation_time(handle) -> float | None:
     try:
         ctypes, wintypes, k32 = _k32()
@@ -212,7 +250,7 @@ def _read_line(stream, timeout: float) -> str | None:
 
 
 def launch(command: str, *, cwd: str, env: dict, log_path: str,
-           timeout: float = LAUNCH_TIMEOUT_S) -> ProcessWatch:
+           timeout: float = LAUNCH_TIMEOUT_S, below_normal: bool = False) -> ProcessWatch:
     """Start ``command`` (a shell command line) detached, its output appended
     to ``log_path``; return a :class:`ProcessWatch` on it.
 
@@ -222,11 +260,13 @@ def launch(command: str, *, cwd: str, env: dict, log_path: str,
     Once the launcher has reported a pid, a watch is always returned: an error
     after that (the "ok" write, the launcher's exit) is logged, never raised.
     The launcher's pipes are closed on every path; the launcher itself is
-    never killed."""
+    never killed.  ``below_normal``: the command starts at
+    BELOW_NORMAL_PRIORITY_CLASS (a warm launch; Windows only)."""
     if sys.platform != "win32":
         with open(log_path, "ab") as out:
             popen = Popen(command, shell=True, cwd=cwd, env=env, stdin=DEVNULL, stdout=out,
-                          stderr=STDOUT, start_new_session=True)
+                          stderr=STDOUT, start_new_session=True,
+                          preexec_fn=(lambda: os.nice(5)) if below_normal else None)
         return ProcessWatch(popen.pid, popen=popen)
     launcher = Popen([sys.executable, "-m", "waxx.util.device_state.detached"],
                      stdin=PIPE, stdout=PIPE, stderr=PIPE, cwd=cwd, env=env,
@@ -297,17 +337,22 @@ def _start_job(job: dict, now: float | None = None):
     """The launcher's work: start ``job["command"]`` -- unless its
     ``not_after`` (epoch seconds) has passed, when the server has stopped
     waiting for this launcher and may already be looking for the job
-    elsewhere: then nothing is started.  Returns the child's Popen, or raises
-    (the reason goes back to the server)."""
+    elsewhere: then nothing is started.  ``job["priority"] ==
+    "below_normal"`` (a warm launch) adds BELOW_NORMAL_PRIORITY_CLASS to the
+    creation flags.  Returns the child's Popen, or raises (the reason goes
+    back to the server)."""
     now = time.time() if now is None else now
     not_after = job.get("not_after")
     if not_after is not None and now > float(not_after):
         raise TimeoutError(f"too late: the server stopped waiting {now - float(not_after):.1f} s "
                            "ago; the command was not started")
+    flags = _NO_WINDOW | _NEW_GROUP
+    if job.get("priority") == "below_normal":
+        flags |= BELOW_NORMAL_PRIORITY_CLASS          # a warm launch; children inherit it
     with open(job["log_path"], "ab") as out:
         return Popen(job["command"], shell=True, cwd=job.get("cwd") or None,
                      stdin=DEVNULL, stdout=out, stderr=STDOUT,
-                     creationflags=_NO_WINDOW | _NEW_GROUP, close_fds=True)
+                     creationflags=flags, close_fds=True)
 
 
 def _launcher_main() -> None:

@@ -1819,7 +1819,7 @@ def test_estimates_from_saved_runs_and_live_od_shots(q, expts):
     assert views[tof]["estimate"]["eta_start"] == pytest.approx(q.clock.t + 350.0)
     rows = q.list()["rows"]
     assert set(rows[0]) == {"position", "id", "state", "owner", "submitter", "label",
-                            "expt_class", "run_id", "est", "waiting"}
+                            "expt_class", "run_id", "est", "waiting", "warm"}
 
 
 def test_source_changed_and_precise_waiting(q, expts):
