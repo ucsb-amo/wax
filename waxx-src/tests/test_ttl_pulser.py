@@ -85,6 +85,7 @@ class FakeMonitor:
             "dac": {"z": {"voltage": 0.1}}, "metadata": {}}
         self.announced = []
         self.withdrawn = []
+        self.withdrawn_took = []
         self.replaced = []
         self.ends = 0
         self.closed = 0
@@ -98,8 +99,9 @@ class FakeMonitor:
             return {"status": "error", "msg": "no"}
         return {"status": "ok"}
 
-    def withdraw_run(self, token, run_id=None, timeout=2.0):
+    def withdraw_run(self, token, run_id=None, timeout=2.0, took_core=None):
         self.withdrawn.append(token)
+        self.withdrawn_took.append(took_core)
         return {"status": "ok"}
 
     def get_state(self):
@@ -302,7 +304,22 @@ def test_a_failed_connect_withdraws_the_announcement_and_holds_nothing():
         p.acquire()
     assert not p.held
     assert len(mon.announced) == 1 and mon.withdrawn == [mon.announced[0]["token"]]
+    assert mon.withdrawn_took == [False]          # never connected: trust may come back
     assert core.runs == 0 and mon.ends == 0
+
+
+def test_a_failure_after_the_connection_opened_withdraws_saying_it_took_the_core():
+    """The connection was opened (the running kernel's session ended) and the
+    first request failed: the withdraw says took_core=True, so the monitor
+    server keeps the state untrusted."""
+    mon = FakeMonitor(trusted=True)
+    p, core, _ = make(mon)
+    core.lost = True                              # check_system_info fails after open()
+    with pytest.raises(ConnectionResetError):
+        p.acquire()
+    assert not p.held and core.comm.info_calls == 1
+    assert mon.withdrawn == [mon.announced[0]["token"]] and mon.withdrawn_took == [True]
+    assert any("stays untrusted" in n for n in p.last_notes)
 
 
 def test_release_without_a_hold_is_a_no_op_and_close_releases():

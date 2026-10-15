@@ -212,8 +212,9 @@ class MonitorUDPServer(UdpServer):
       take the core: ops are refused from now until it ends (or 2 min pass
       without it taking the core), and the state is untrusted (see Trust).
     * ``run_withdrawn`` / ``clear_run_pending`` (``token``) — the announced
-      run exits without taking the core (its trust from before the
-      announcement comes back), or an operator clears a dead run's fence
+      run exits without an accepted end state (``took_core``: False -> its
+      trust from before the announcement comes back; True or absent -> the
+      state stays untrusted), or an operator clears a dead run's fence
       (the state stays untrusted).
     * ``trust_ack`` — an operator says the hardware matches the state file.
     * ``reset_state`` — run the reset experiment (``reset_expt_path``, see
@@ -328,9 +329,11 @@ class MonitorUDPServer(UdpServer):
     does, so from the run's announcement (``run_pending``; also when it
     interrupts a running monitor) until ``replace_state`` (or ``trust_ack``)
     the state is *untrusted*: GUIs say so, and coil ops want a measured
-    current.  A run that withdraws (it exited without taking the core) or
-    whose fence lapses unused gets the trust from before its announcement
-    back -- unless something else changed the trust meanwhile.  It is
+    current.  A run that withdraws saying it never took the core
+    (``took_core: false``) or whose fence lapses unused gets the trust from
+    before its announcement back -- unless something else changed the trust
+    meanwhile.  A withdraw that says it took the core, or does not say
+    (an older client, a core class that cannot tell), leaves it untrusted.  It is
     kept in the file's metadata so a server restart does not forget it.
     ``reset_state`` ends it the way a normal run does -- through the reset
     experiment's own end state, never by itself.
@@ -816,25 +819,43 @@ class MonitorUDPServer(UdpServer):
 
     def _reply_clear_run_pending(self, obj: dict, by_operator: bool) -> str:
         """Lift the fence of one announced run, named by its token: the run
-        withdrawing itself at exit (it never took the core), or an operator
+        withdrawing itself at exit (no accepted end state), or an operator
         asserting from the GUI that it is dead.  A token that is not the
-        current fence's -- a late message, a newer run -- changes nothing."""
+        current fence's -- a late message, a newer run -- changes nothing.
+
+        Trust: only a withdraw with ``took_core`` exactly False (the run's
+        process says it never talked to the core device) gets the trust from
+        before the announcement back.  ``took_core`` True -- the run took the
+        core and died, or its end() failed, before reporting an end state --
+        or absent/None (an older client; a core class that cannot tell)
+        leaves the state untrusted, with the reason.  An operator's clear
+        asserts the run is dead, not that it never ran: untrusted too."""
         p = self._run_pending
         token = str(obj.get("token") or "")
         if p is None or not token or token != p.get("token"):
             return json.dumps({"status": "error",
                                "msg": "that run is no longer fencing composite ops"})
+        took = obj.get("took_core")
+        name = _run_name(p.get("run_id"), p.get("expt"))
         if by_operator:
             who = str(obj.get("operator") or obj.get("client") or "?")
             why = f"cleared on the Device Control GUI by {who}"
-        else:
+        elif took is False:
             why = "the run exited without taking the core"
+        elif took is True:
+            why = f"{name} exited without reporting its end state after taking the core"
+        else:
+            why = (f"{name} exited without reporting its end state (whether it took the "
+                   "core is unknown)")
         log.info("Run %s: fence lifted -- %s.", p.get("run_id"), why)
         if not by_operator:
-            # it never took the core: the state is what it was before it
-            # announced (an operator's clear asserts it is dead, not that it
-            # never ran: the state stays untrusted)
-            self._restore_trust(token, why)
+            if took is False:
+                # it never took the core: the state is what it was before it
+                # announced
+                self._restore_trust(token, why)
+            else:
+                self._set_trust(False, f"{why}; the state file is not necessarily the "
+                                       "hardware")
         self._clear_run_pending(why)
         self.connections.run_over(why, reopen=True)
         return json.dumps({"status": "ok"})

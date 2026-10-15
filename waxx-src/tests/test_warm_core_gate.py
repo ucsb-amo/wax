@@ -142,6 +142,70 @@ def test_unarmed_core_is_upstream(monkeypatch):
     assert gate.claimed is False
 
 
+# ---- did this process take the core? (S2) -------------------------------------------
+
+@pytest.fixture
+def fresh_contact(monkeypatch):
+    monkeypatch.setattr(waxx_core, "_contact", {"taken": False})
+
+
+def test_core_taken_is_recorded_before_the_first_exchange_unarmed(monkeypatch, fresh_contact):
+    log = []
+    _gate(monkeypatch, log, warm=False)
+    core = Core(None, TEST_HOST, 1e-9)
+    comm = _wire(core, log)
+    seen = []
+    real = comm.check_system_info
+    comm.check_system_info = lambda: (seen.append(waxx_core.core_taken()), real())
+    assert waxx_core.core_taken() is False
+    core.compile(_kernel, (), {})                       # a compile alone talks to nothing
+    assert waxx_core.core_taken() is False
+    core.run(_kernel, (), {})
+    assert seen == [True] and waxx_core.core_taken() is True
+
+
+def test_core_taken_is_recorded_for_a_precompiled_kernel_too(monkeypatch, fresh_contact):
+    log = []
+    _gate(monkeypatch, log, warm=False)
+    core = Core(None, TEST_HOST, 1e-9)
+    _wire(core, log)
+    core._run_compiled("elf9", NoSubkernels(), None, None)
+    assert waxx_core.core_taken() is True
+
+
+def test_core_taken_is_not_recorded_while_the_gate_refuses(monkeypatch, fresh_contact,
+                                                           no_connection):
+    log = []
+    gate = _gate(monkeypatch, log)
+    core = Core(None, TEST_HOST, 1e-9)
+    with pytest.raises(GateNotPassed):
+        core._run_compiled(b"x", None, None, None)
+    assert waxx_core.core_taken() is False and no_connection == []
+    gate.ensure_go()
+    _wire(core, log)
+    core.run(_kernel, (), {})
+    assert waxx_core.core_taken() is True
+
+
+def test_a_subkernel_upload_counts_as_taking_the_core(monkeypatch, fresh_contact):
+    log = []
+    _gate(monkeypatch, log, warm=False)
+    core = Core(None, TEST_HOST, 1e-9)
+    _wire(core, log)
+
+    class OneSubkernel(NoSubkernels):
+        def subkernels(self):
+            return {1: _kernel}
+
+    seen = []
+    monkeypatch.setattr(ArtiqCore, "compile_and_upload_subkernels",
+                        lambda self, *a: seen.append(waxx_core.core_taken()))
+    core.compile_and_upload_subkernels(NoSubkernels(), (), {})
+    assert seen == [False] and waxx_core.core_taken() is False
+    core.compile_and_upload_subkernels(OneSubkernel(), (), {})
+    assert seen == [False, True]
+
+
 # ---- armed ---------------------------------------------------------------------------
 
 def test_armed_order_compile_gate_claim_then_core_device(monkeypatch):

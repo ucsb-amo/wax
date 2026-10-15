@@ -44,16 +44,44 @@ def test_a_withdrawn_run_gets_the_previous_trust_back(server):
     assert server._trust["trusted"] is False
     ask(server, {"type": "run_withdrawn", "token": "wrong"})        # not its token: nothing
     assert server._trust["trusted"] is False
-    assert ask(server, {"type": "run_withdrawn", "token": "tok"})["status"] == "ok"
+    assert ask(server, {"type": "run_withdrawn", "token": "tok",
+                        "took_core": False})["status"] == "ok"
     t = server._trust
     assert t["trusted"] is True
     assert "run 5 (x): the run exited without taking the core; trust as before" in t["reason"]
 
 
+def test_a_withdraw_after_taking_the_core_keeps_it_untrusted(server):
+    """A run that took the core and exited without an accepted end state (a
+    kernel that raised outside scan()'s handler, end() failing before
+    replace_state) withdraws with took_core=True: never trusted again."""
+    ask(server, {"type": "run_pending", "run_id": 5, "expt": "x", "token": "tok"})
+    assert ask(server, {"type": "run_withdrawn", "token": "tok",
+                        "took_core": True})["status"] == "ok"
+    t = server._trust
+    assert t["trusted"] is False
+    assert t["reason"].startswith("run 5 (x) exited without reporting its end state after "
+                                  "taking the core")
+    assert server._run_pending is None and server._trust_before_run is None
+    cleared = [e for e in server.journal.tail(50) if e["kind"] == "run_pending_cleared"]
+    assert "after taking the core" in cleared[-1]["why"]
+    assert not any("without taking the core" in e.get("why", "") for e in cleared)
+
+
+def test_a_withdraw_that_does_not_say_keeps_it_untrusted(server):
+    """No took_core (an older client, a core class that cannot tell): the
+    server cannot know the core was not taken -- untrusted."""
+    for took in ({}, {"took_core": None}):
+        ask(server, {"type": "run_pending", "run_id": 5, "expt": "x", "token": "tok"})
+        ask(server, dict({"type": "run_withdrawn", "token": "tok"}, **took))
+        assert server._trust["trusted"] is False
+        assert "whether it took the core is unknown" in server._trust["reason"]
+
+
 def test_a_withdrawn_run_restores_an_untrusted_state_as_untrusted(server):
     server._set_trust(False, "run 4 took the core and never reported")
     ask(server, {"type": "run_pending", "run_id": 5, "expt": "x", "token": "tok"})
-    ask(server, {"type": "run_withdrawn", "token": "tok"})
+    ask(server, {"type": "run_withdrawn", "token": "tok", "took_core": False})
     assert server._trust["trusted"] is False
     assert "run 4 took the core and never reported" in server._trust["reason"]
 
@@ -91,7 +119,7 @@ def test_an_abort_state_and_a_trust_ack_end_the_memory(server):
     ask(server, {"type": "run_pending", "run_id": 9, "expt": "x", "token": "t9"})
     ask(server, {"type": "trust_ack", "operator": "ada"})
     assert server._trust["trusted"] is True and server._trust_before_run is None
-    ask(server, {"type": "run_withdrawn", "token": "t9"})
+    ask(server, {"type": "run_withdrawn", "token": "t9", "took_core": False})
     assert "acknowledged" in server._trust["reason"]               # not overwritten
 
 

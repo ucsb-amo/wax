@@ -40,12 +40,39 @@ when that test fails):
   ``CommKernel.__init__(host, port=1381)`` keeps ``host`` and ``port``.
 * ``compile`` is not overridden here, so the startup profiler's wrapper on the base
   ``Core.compile`` (``waxx.util.profiling.startup_timer``) still times it.
+
+**Did this process take the core?** :func:`core_taken` is True once any Core of this
+class in the process has gone on to talk to the core device -- set just before
+``_run_compiled`` (every kernel run, precompiled ones included) and before a subkernel
+upload, armed or not (never for an armed Core before GO: its connection is refused).
+``Monitor.withdraw_run_at_exit`` sends it with ``run_withdrawn`` (``took_core``), so the
+monitor server gives back the trust from before a run's announcement only to a run that
+says it never took the core. True means "tried to": a refused connection counts, which
+errs towards "untrusted".
 """
+import threading
+
 from artiq.coredevice.comm_kernel import CommKernel
 from artiq.coredevice.core import Core as _ArtiqCore
 from artiq.language.core import rpc
 
 from waxx.util.device_state import queue_gate
+
+
+_contact_lock = threading.Lock()
+_contact = {"taken": False}
+
+
+def core_taken() -> bool:
+    """A Core of this class in this process has started to talk to the core
+    device (a kernel run or a subkernel upload was begun; see the module
+    docstring). Process-wide; never reset."""
+    return _contact["taken"]
+
+
+def _mark_core_taken() -> None:
+    with _contact_lock:
+        _contact["taken"] = True
 
 
 class GateNotPassed(RuntimeError):
@@ -102,6 +129,20 @@ class Core(_ArtiqCore):
         self.compile_and_upload_subkernels(embedding_map, args, subkernel_arg_types)
         self._run_compiled(kernel_library, embedding_map, symbolizer, demangler)
         return result
+
+    def compile_and_upload_subkernels(self, embedding_map, args, subkernel_arg_types):
+        # a subkernel upload talks to the core device (none: nothing is sent)
+        if embedding_map.subkernels() and queue_gate.go_passed():
+            _mark_core_taken()
+        return super().compile_and_upload_subkernels(embedding_map, args, subkernel_arg_types)
+
+    def _run_compiled(self, kernel_library, embedding_map, symbolizer, demangler):
+        # recorded BEFORE the connection: a process that dies inside it may
+        # have ended the previous session or started its kernel (armed before
+        # GO the connection is refused, so nothing is recorded)
+        if queue_gate.go_passed():
+            _mark_core_taken()
+        return super()._run_compiled(kernel_library, embedding_map, symbolizer, demangler)
 
     def _wait_for_go(self):
         """Block until the queue's GO, then run the experiment's claim (liveOD start,

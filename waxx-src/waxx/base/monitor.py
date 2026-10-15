@@ -291,15 +291,33 @@ class Monitor:
             self._withdraw_registered = True
 
     def withdraw_run_at_exit(self):
-        """Exit handler (see :meth:`announce_run`).  Never raises."""
+        """Exit handler (see :meth:`announce_run`).  Never raises.  Says
+        whether this process took the core (``took_core``: True / False, None
+        when unknown): the server gives back the trust from before the
+        announcement only on an explicit False."""
         announced, self._announced = self._announced, None
         if announced is None:
             return
         token, run_id = announced
         try:
-            self._monitor_client.withdraw_run(token, run_id)
+            took = self._took_core()
+        except Exception:
+            took = None
+        try:
+            self._monitor_client.withdraw_run(token, run_id, took_core=took)
         except Exception:
             pass
+
+    def _took_core(self):
+        """Whether this process talked to the core device: from the waxx
+        Core (``waxx.util.artiq.core.core_taken``, process-wide), or None
+        when the experiment's core is not that class (unknown)."""
+        import sys  # noqa: PLC0415
+        mod = sys.modules.get("waxx.util.artiq.core")
+        core = getattr(self.expt, "core", None)
+        if mod is None or core is None or not isinstance(core, mod.Core):
+            return None
+        return bool(mod.core_taken())
 
     def server_state(self):
         """The monitor server's ``get_state`` reply, or None."""
