@@ -242,6 +242,7 @@ class CameraStreamClient:
         self._liveod_key = None
         self._roi = None
         self._downsample = 1
+        self._tagging = True        # off once the server turns out to keep no tags
 
         self._check_key_available(expt, self.key)
 
@@ -571,6 +572,22 @@ class CameraStreamClient:
             self._note("superseded_frames", idx=list(idx), **more)
         return error is None
 
+    def _tag(self, frame, key):
+        """Name the frame ``key`` on its camera server, so a viewer can show
+        this key's frames alone (Camera Viewer: Options -> Frames). For
+        display only, nothing is saved by it; never raises."""
+        if not self._tagging:
+            return
+        from beacon.camera.stream import Unsupported
+        try:
+            if not self._stream.tag_frame(frame.seq, key):
+                self._note("tags_gone", seq=int(frame.seq))
+        except Unsupported as e:
+            self._tagging = False
+            self._note("tags_unsupported", error=str(e))
+        except Exception as e:
+            self._note("tag_errors", error=repr(e))
+
     def _on_pushed(self, slot, gen, idx, ok, reason, more):
         """The shot queue's outcome for one frame (any thread)."""
         with self._lock:
@@ -660,6 +677,7 @@ class CameraStreamClient:
         if self._check_shape(idx, img):
             self._store(self.dc, self.dc_meta, idx, img, frame, target,
                         slot=idx, gen=gen)
+            self._tag(frame, self.key)
 
     def _snap_once(self):
         """One snap at our settings revision; if someone changed the settings
@@ -1320,6 +1338,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         # _slot_ok[(idx, j)] turns True when liveOD has the frame (_on_pushed)
         self._store(slot.dc, slot.dc_meta, idx, img, frame, t_expected,
                     slot=(idx, j), gen=gen, frame_index=j)
+        self._tag(frame, slot.key)
 
     def _clear_slot_locked(self, idx, j=None):
         """Start frame ``j`` (every frame when None) of a scan point over as

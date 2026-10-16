@@ -48,6 +48,12 @@ class FakeStream:
         self.set_calls = []
         self.closed = False
         self.snap_hook = None     # optional callable -> raise / frame
+        self.tags = []            # (seq, tag) of every tag_frame
+        self.tag_hook = None      # optional callable(seq, tag) -> raise / bool
+
+    def tag_frame(self, seq, tag):
+        self.tags.append((int(seq), tag))
+        return True if self.tag_hook is None else self.tag_hook(seq, tag)
 
     def snap(self, timeout=5.0, policy="restart", require_rev=None):
         if self.snap_hook is not None:
@@ -799,6 +805,51 @@ def test_triggered_frames_land_at_their_shot():
         assert M(fe, "img_test", "gain")[0] == 0.0
         assert np.isnan(M(fe, "img_test", "exposure")[1])
         assert cs.counts["ok"] == 2 and cs._n_missing() == 0
+    finally:
+        cs.finish()
+
+
+def test_triggered_frames_are_tagged_with_their_key():
+    """Each frame kept is named on the camera server after its key (a viewer
+    can show one key's frames); a stray frame is not.  A server without tags
+    turns tagging off, once, and the frames are kept all the same."""
+    fe, stream, cs = make_triggered_keys(["img_a", "img_b"])
+    fe.data.init()
+    try:
+        for j in (0, 1):
+            cs.announce_trigger_mu(0, j)
+            stream.edge()
+            wait_settled(cs)
+        stream.edge()                           # nobody announced it: stray
+        time.sleep(0.5)
+        assert cs.counts["stray_frames"] == 1
+        assert stream.tags == [(int(M(fe, "img_a", "seq")[0]), "img_a"),
+                               (int(M(fe, "img_b", "seq")[0]), "img_b")]
+
+        from beacon.camera.stream import Unsupported
+
+        def old_server(seq, tag):
+            raise Unsupported("no TAG_FRAME here")
+        stream.tag_hook = old_server
+        fe.scan_xvars[0].counter = 1
+        for j in (0, 1):
+            cs.announce_trigger_mu(0, j)
+            stream.edge()
+            wait_settled(cs)
+        assert len(stream.tags) == 3            # asked once, then never again
+        assert cs.counts["tags_unsupported"] == 1 and "tag_errors" not in cs.counts
+        assert cs.counts["ok"] == 4 and cs._n_missing() == 0
+    finally:
+        cs.finish()
+
+
+def test_snaps_are_tagged_with_the_key():
+    fe, stream, cs = make_client()
+    fe.data.init()
+    try:
+        cs.request_snap_mu(0, 0.0)
+        wait_drained(cs)
+        assert stream.tags == [(int(M(fe, "img_test", "seq")[0]), "img_test")]
     finally:
         cs.finish()
 
