@@ -73,6 +73,11 @@ what each allows: :meth:`RunQueuePanel.action_state`):
 * Abort run, for the job in the slot (asks first: liveOD's Abort discards
   that run's data file -- nothing else is offered until the queue can stop a
   run and keep its data);
+* Force kill, for a launching or running job, when the Abort cannot work
+  (liveOD closed, the experiment's terminal or process hung, the queue out of
+  step): asks first, then ``kill`` -- the server kills the job's processes;
+  no cleanup runs, and liveOD leaves the run's file as it was (not saved, not
+  deleted).  Offered while a cancel is pending too;
 * Copy: a kq command line, the file's path, the run id.
 
 An action the server refuses as unknown (an older server) is disabled.
@@ -132,6 +137,7 @@ OWNER = "person"
 #: The 1b actions a server may not have yet (disabled when refused as unknown).
 MOVE_ACTION = "move"
 EDIT_ACTION = "edit"
+KILL_ACTION = "kill"
 #: The panel's four moves (:func:`move_request` turns each into the server's
 #: ``before_id`` / ``after_id`` / ``to_index``).
 MOVE_WHERE = ("up", "down", "top", "bottom")
@@ -242,6 +248,13 @@ def cancel_request(job: dict, by: str) -> dict:
     if job.get("state") == "queued":
         obj["queued_only"] = True
     return obj
+
+
+def kill_request(job: dict, by: str) -> dict:
+    """Force-kill ``job``'s processes (a person's request; see
+    :meth:`~waxx.util.device_state.run_queue.RunQueue.kill`)."""
+    return {"type": "run_queue", "action": KILL_ACTION, "id": job.get("id"),
+            "token": job.get("token"), "owner": OWNER, "by": by}
 
 
 def move_request(job: dict, where: str, by: str, queued: list[dict]) -> dict | None:
@@ -425,7 +438,7 @@ def kq_commands(job: dict, now: float | None = None) -> dict[str, str]:
     if argv:
         parts += ["--"] + [_q(a) for a in argv]
     return {"submit": " ".join(parts), "tail": f"kq tail {jid} -f", "show": f"kq show {jid}",
-            "cancel": f"kq cancel {jid}"}
+            "cancel": f"kq cancel {jid}", "kill": f"kq kill {jid}"}
 
 
 # -- ordering and the table --------------------------------------------------------------
@@ -670,7 +683,9 @@ class JobTableModel(QAbstractTableModel):
             return str(job.get("id", ""))
         if key == "state":
             s = str(job.get("state") or "")
-            if job.get("cancel") and s in IN_SLOT:
+            if job.get("kill") and s in IN_SLOT:
+                s += " (killed)"
+            elif job.get("cancel") and s in IN_SLOT:
                 s += " (cancel asked)"
             elif job.get("paused") and s == "queued":
                 s += " (paused)"
@@ -745,6 +760,10 @@ class JobTableModel(QAbstractTableModel):
             if isinstance(cancel, dict):
                 lines.append(f"cancel asked by {cancel.get('by')} at {_clock(cancel.get('at'), True)}"
                              + (" (Abort sent)" if cancel.get("abort_sent") else ""))
+            kill = job.get("kill")
+            if isinstance(kill, dict):
+                lines.append(f"force-killed by {kill.get('by')} at {_clock(kill.get('at'), True)}: "
+                             f"{kill.get('note')}")
             if job.get("paused"):
                 lines.append(f"paused by {job.get('paused_by') or '?'}"
                              + (f" since {_clock(job['paused_since'])}"
@@ -1611,7 +1630,8 @@ class RunQueuePanel(QWidget):
         """``(enabled, tooltip)`` of a job action for ``job`` (default: the
         selected one).  Kinds: ``log``, ``source``, ``again``, ``again_next``,
         ``edit``, ``up`` / ``down`` / ``top`` / ``bottom``, ``remove`` (the
-        selected queued jobs), ``abort`` (the job in the slot), ``copy``."""
+        selected queued jobs), ``abort`` (the job in the slot), ``kill`` (a
+        launching or running job's processes), ``copy``."""
         job = job if job is not None else self.selected_job()
         live = self.reachable and self.has_queue
         if job is None:
@@ -1640,6 +1660,14 @@ class RunQueuePanel(QWidget):
             if job.get("cancel"):
                 return False, "its cancel has been asked for; the run ends at its next shot"
             return True, "Stop its run at the next shot: liveOD DISCARDS the run's data file"
+        if kind == "kill":
+            if not self.supported(KILL_ACTION):
+                return False, "this monitor server cannot force-kill jobs (older code)"
+            if state not in ("launching", "running"):
+                return False, f"it is {state}: no process to kill"
+            return True, ("Kill its processes now, when the Abort cannot work (liveOD closed, "
+                          "its terminal or process hung, the queue out of step): NO cleanup "
+                          "runs; liveOD keeps the run's file as it was")
         if kind == "edit":
             if not self.supported(EDIT_ACTION):
                 return False, "this monitor server cannot edit jobs (older code)"
@@ -1743,6 +1771,39 @@ class RunQueuePanel(QWidget):
                 return
             self._done(f"cancel {job_name(job)}")(reply)
         self.runner.send(cancel_request(job, self.by), done)
+        return True
+
+    def kill_selected(self, job: dict | None = None) -> bool:
+        """Force-kill the job's processes (asks first): :func:`kill_request`."""
+        job = job or self.selected_job()
+        ok, _ = self.action_state("kill", job) if job else (False, "")
+        if not ok:
+            return False
+        run = job.get("run_id")
+        text = (f"{job_name(job)} is {job.get('state')}"
+                + (f" (run {run})" if run else " (no run id yet)") + ".\n\n"
+                "Use this only when Abort run cannot work: liveOD closed, the experiment's "
+                "terminal or process hung, or the queue out of step with what runs.\n\n"
+                "The monitor server kills the experiment's process and everything under it. "
+                "NOTHING of the experiment's cleanup runs: coils, AOMs and shutters stay as the "
+                "run left them until the next run or the monitor sets them.\n\n"
+                "liveOD is told the run's process exited and leaves its file as it was: not "
+                "saved, not deleted.\n\n"
+                "Queued jobs go on launching afterwards; pause them first if they should wait.")
+        if not self.confirm(f"Force kill {job_name(job)}?", text,
+                            "Kill it (no cleanup)", "Don't kill"):
+            return False
+        what = f"force kill {job_name(job)}"
+
+        def done(reply: dict) -> None:
+            if reply.get("status") == "ok":
+                self.say(f"{what}: {reply.get('note') or 'done'}; the job ends at the queue's "
+                         "next check", WARN_TEXT)
+                self.schedule_list()
+                self.refresh_buttons()
+                return
+            self._done(what, on_unknown=KILL_ACTION)(reply)
+        self.runner.send(kill_request(job, self.by), done)
         return True
 
     def move_selected(self, where: str) -> bool:
@@ -2021,12 +2082,14 @@ class RunQueuePanel(QWidget):
                 "Remove from queue...", self.remove_selected, "Del")
         elif state in IN_SLOT:
             add(menu, "abort", "Abort run (discards its data)...", self.cancel_selected)
+            if state != "ending":
+                add(menu, "kill", "Force kill (no cleanup)...", lambda: self.kill_selected(job))
         menu.addSeparator()
         copy = menu.addMenu("Copy")
         commands = kq_commands(job)
         for kind, text in (("submit", "kq submit ... (the same job again)"),
                            ("tail", "kq tail <id> -f"), ("show", "kq show <id>"),
-                           ("cancel", "kq cancel <id>")):
+                           ("cancel", "kq cancel <id>"), ("kill", "kq kill <id>")):
             add(copy, f"copy_{kind}", text,
                 lambda k=kind: self.copy_text(commands[k], f"kq {k}"))
         add(copy, "copy_path", "File path",

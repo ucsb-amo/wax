@@ -67,6 +67,20 @@ stays ``running`` until its process ends; it then ends ``cancelled`` (or
 own button does: the run stops at its next shot and liveOD discards its file.
 An agent may not cancel a person's running job.
 
+**Kill.**  For when the Abort cannot work -- liveOD closed, the experiment's
+terminal or process hung, the queue out of step with what runs -- a person
+(never an agent) may force-kill a launching or running job (``kill``): the
+experiment's process (``client_pid``, only when its creation time matches
+the one recorded from liveOD) and the shell the queue followed, each with
+everything under it (:func:`~waxx.util.device_state.detached.kill_tree`).
+Nothing of the experiment's cleanup runs: the hardware stays as the run left
+it until the next run or the monitor sets it.  The job then ends as any run
+whose process died: liveOD is told RUN_EXITED on its behalf, which leaves
+its file as it was (not saved, not deleted), and the job ends ``cancelled``
+("force-killed by ...", or ``saved`` if it had saved).  A pending Abort is
+never sent after a kill.  A job with no process left to kill (gone, or never
+known) is ended the same way at once, which frees the slot.
+
 **Owners.**  A job's ``owner`` (submit) and the asker's ``owner`` on cancel,
 release and resume ("person" | "agent"; required on those three, refused
 without) decide what an agent may undo: an agent may not cancel a person's
@@ -327,8 +341,10 @@ class Job:
     #: the launched shell's pid and creation time (epoch s)
     pid: int | None = None
     pid_started: float | None = None
-    #: the experiment process's pid, from liveOD's POLL (client_pid)
+    #: the experiment process's pid and creation time, from liveOD's POLL
+    #: (client_pid, client_started)
     client_pid: int | None = None
+    client_started: float | None = None
     run_id: int | None = None
     log_path: str | None = None
     exit_code: int | None = None
@@ -340,6 +356,9 @@ class Job:
     #: {"by", "at", "abort_sent": bool, "abort_note": str} once a cancel of a
     #: running job was asked for
     cancel: dict | None = None
+    #: {"by", "at", "results": [kill_tree replies, each with its "role"],
+    #:  "note"} after a person's force kill (the last one)
+    kill: dict | None = None
     adopted: bool = False
     #: the job's place in the queue: the scheduler takes the eligible job with
     #: the lowest rank (ties: lowest id); set at submit, changed by `move`
@@ -454,7 +473,9 @@ class RunQueue:
     run loops by key; ``start_monitor(why)``; ``spawn(command, cwd=, env=,
     log_path=)`` -> a process with ``pid``, ``started`` and ``poll()``
     (default: :func:`~waxx.util.device_state.detached.launch`);
-    ``adopt(pid, started)`` -> such a process or None; ``journal`` (the ops
+    ``adopt(pid, started)`` -> such a process or None; ``kill(pid, started)``
+    -> a :func:`~waxx.util.device_state.detached.kill_tree` reply (a person's
+    force kill); ``journal`` (the ops
     journal); ``on_change(info)``; ``exclude``: files the queue refuses (the
     monitor experiment)."""
 
@@ -468,7 +489,7 @@ class RunQueue:
                  start_monitor: Callable[[str], None] | None = None,
                  hold: PersonHold | None = None, journal=None,
                  on_change: Callable[[dict], None] | None = None,
-                 spawn=None, adopt=None, exclude=(), roots=None,
+                 spawn=None, adopt=None, kill=None, exclude=(), roots=None,
                  clock: Callable[[], float] = time.time,
                  poll_every_s: float = POLL_EVERY_S, gap_s: float = GAP_S,
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
@@ -493,8 +514,12 @@ class RunQueue:
         if adopt is None:
             from waxx.util.device_state.detached import ProcessWatch  # noqa: PLC0415
             adopt = ProcessWatch.adopt
+        if kill is None:
+            from waxx.util.device_state.detached import kill_tree  # noqa: PLC0415
+            kill = kill_tree
         self._spawn = spawn
         self._adopt = adopt
+        self._kill = kill
         self._exclude = {self._norm(p) for p in exclude if p}
         #: the folders a job's file must be inside (default_roots())
         self.roots = list(roots) if roots is not None else default_roots()
@@ -1174,6 +1199,103 @@ class RunQueue:
                 return {"status": "error", "msg": f"{job.name} is already {job.state}"}
         self._save()
         self._notify()
+        return reply
+
+    def kill(self, obj: Mapping) -> dict:
+        """``{"id", "token"?, "by", "owner"}``: force-kill a launching or
+        running job (see **Kill** in the module docstring).  Only a person may
+        (``owner`` "person").  Kills, in order, the experiment's process
+        (``client_pid``, only with a recorded creation time that still
+        matches) and the process the queue follows (the shell; the queue's
+        handle on it keeps its pid from being reused), each with its tree.
+        Never touches liveOD: the job ends on the queue's next tick, which
+        tells liveOD the run exited.  -> ``{"status", "job", "results",
+        "pending", "note"}``; ``status`` "error" (with ``results``) when a
+        process of it may still be alive."""
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        if as_owner != "person":
+            return {"status": "error",
+                    "msg": "only a person may force-kill a job (no cleanup runs: the hardware "
+                           "stays as the run left it)"}
+        with self._lock:
+            try:
+                job = self._find(obj)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+            if job.state not in ("launching", "running"):
+                return {"status": "error", "state": job.state,
+                        "msg": (f"{job.name} is queued: remove it instead" if job.state == "queued"
+                                else f"{job.name} is {job.state}: its process has exited"
+                                if job.state == "ending" else
+                                f"{job.name} is already {job.state}")}
+            proc = self._procs.get(job.id)
+            targets, unverified, refused = [], [], []
+            if job.client_pid and job.client_started is not None and (
+                    proc is None or int(job.client_pid) != int(proc.pid)):
+                targets.append(("experiment", job.client_pid, job.client_started))
+            if proc is not None and proc.poll() is None:
+                # the queue holds the handle (or, without one, checks the time)
+                vouch = getattr(proc, "_handle", None) is not None
+                role = ("experiment" if job.client_pid and int(job.client_pid) == int(proc.pid)
+                        else "shell")
+                started = None if vouch else (
+                    getattr(proc, "started", None)
+                    or (job.client_started if role == "experiment" else job.pid_started))
+                if vouch or started is not None:
+                    targets.append((role, proc.pid, started))
+                else:
+                    refused.append({"pid": proc.pid, "role": role, "ok": False, "gone": False,
+                                    "note": "not killed: no handle on it and no creation time "
+                                            "to check it by (its pid may have been reused)"})
+            if job.client_pid is not None and job.client_started is None:
+                unverified.append(f"experiment pid {job.client_pid} not killed on its own: its "
+                                  "creation time was never recorded (it goes with the shell's "
+                                  "tree)")
+            skipped = "; ".join(unverified)
+        log.warning("Run queue: FORCE KILL of %s (run %s) asked by %s: %s.", job.name,
+                    job.run_id if job.run_id is not None else "none",
+                    by, ", ".join(f"{role} pid {pid}" for role, pid, _ in targets)
+                    or "no live process known")
+        results = []
+        for role, pid, started in targets:
+            try:
+                r = dict(self._kill(pid, started))
+            except Exception as exc:                  # noqa: BLE001
+                r = {"pid": pid, "ok": False, "gone": False, "note": f"kill failed: {exc!r}"}
+            r["role"] = role
+            results.append(r)
+            (log.warning if r.get("ok") or r.get("gone") else log.error)(
+                "Run queue: kill %s pid %s of %s: %s", role, pid, job.name, r.get("note"))
+        results += refused
+        alive_left = any(not (r.get("ok") or r.get("gone")) for r in results)
+        killed = any(r.get("ok") for r in results)
+        note = ("killed" if killed and not alive_left else
+                "NOT all killed: " + "; ".join(f"{r['role']} pid {r['pid']}: {r.get('note')}"
+                                               for r in results
+                                               if not (r.get("ok") or r.get("gone")))
+                if alive_left else "no live process of it was found")
+        if skipped:
+            note += f" ({skipped})"
+        with self._lock:
+            job.kill = {"by": by, "at": self._clock(), "results": results, "note": note}
+            if job.state == "launching" and not alive_left:
+                # nothing to wait for: no launch answer is needed any more, and
+                # the tick ends it as a run whose process is gone
+                if self._spawning is not None and self._spawning.get("job") == job.id:
+                    self._abandon_spawn()
+                job.state = "running"
+                self._procs[job.id] = None
+        self._record("run_queue_kill", job=job.id, by=by, run_id=job.run_id,
+                     results=results, note=note)
+        self._save()
+        self._notify()
+        reply = {"status": "ok" if not alive_left else "error", "job": job.to_dict(),
+                 "results": results, "pending": True, "note": note}
+        if alive_left:
+            reply["msg"] = f"{job.name}: {note}"
         return reply
 
     def list(self, obj: Mapping | None = None) -> dict:
@@ -1961,6 +2083,7 @@ class RunQueue:
                 with self._lock:
                     job.run_id = int(poll["run_id"])
                     job.client_pid = poll.get("client_pid")
+                    job.client_started = poll.get("client_started")
                     job.adopted = True
                 if keep_waiting:
                     self._abandon_spawn()          # the launch thread's answer is not needed
@@ -2076,6 +2199,10 @@ class RunQueue:
             if job.client_pid is None and poll.get("client_pid"):
                 job.client_pid = poll.get("client_pid")
                 changed = True
+            if (job.client_started is None and poll.get("client_started") is not None
+                    and poll.get("client_pid") == job.client_pid):
+                job.client_started = poll.get("client_started")
+                changed = True
         if changed:
             if job.run_id == poll.get("run_id"):
                 self._record("run_queue_run_id", job=job.id, run_id=job.run_id, via="liveOD",
@@ -2096,8 +2223,11 @@ class RunQueue:
                 and poll.get("run_id") == job.run_id and poll.get("client_pid")):
             with self._lock:
                 job.client_pid = poll.get("client_pid")
+                if poll.get("client_started") is not None:
+                    job.client_started = poll.get("client_started")
             self._save()
-        if job.cancel is not None and not job.cancel.get("abort_sent"):
+        if job.cancel is not None and not job.cancel.get("abort_sent") and job.kill is None:
+            # (never after a kill: an Abort would discard the file liveOD keeps)
             self._send_abort(job)
         proc = self._procs.get(job.id)
         code = proc.poll() if proc is not None else -1
@@ -2147,14 +2277,22 @@ class RunQueue:
         with self._lock:
             job.exit_code = exit_code
             job.outcome = outcome
+            killed_by = (job.kill or {}).get("by")
             if v.saved:
                 state = "done" if v.nothing_written else "saved"
                 reason = v.why
-                if job.cancel is not None:
+                if job.kill is not None:
+                    reason = (f"{'ran to its end' if v.nothing_written else 'saved'} before "
+                              f"the force kill by {killed_by}")
+                elif job.cancel is not None:
                     reason = (f"{'ran to its end' if v.nothing_written else 'saved'} before "
                               f"the cancel by {job.cancel.get('by')} reached it"
                               + (f" ({job.cancel['abort_note']})"
                                  if job.cancel.get("abort_note") else ""))
+            elif job.kill is not None:
+                state = "cancelled"
+                reason = (f"force-killed by {killed_by} ({job.kill.get('note')}); no cleanup "
+                          f"ran: {v.why}")
             elif job.cancel is not None:
                 state = "cancelled"
                 reason = f"cancelled by {job.cancel.get('by')} while running: {v.why}"
@@ -2162,7 +2300,9 @@ class RunQueue:
                 state, reason = "aborted", v.why
             else:
                 state, reason = "failed", v.why
-            if proc is None and job.adopted is False and state == "failed":
+            if job.kill is not None:
+                pass                                  # the kill's reason stands
+            elif proc is None and job.adopted is False and state == "failed":
                 reason = f"server restarted; process gone ({v.why})"
             elif proc is None and state == "saved":
                 reason = (f"its process ended while the monitor server was down; liveOD "

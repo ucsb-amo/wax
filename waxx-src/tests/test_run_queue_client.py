@@ -16,13 +16,13 @@ from waxx.util.device_state.run_queue_client import (
     NO_QUEUE_MSG, NoRunQueue, RunQueueClient, RunQueueError, local_sha256, safe_write)
 
 ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
-           "cancel": "cancel", "list": "list", "describe": "describe",
+           "cancel": "cancel", "kill": "kill", "list": "list", "describe": "describe",
            "tail": "tail", "pause": "pause", "resume": "resume", "hold": "hold_request",
            "release": "release_request"}
 #: The fake is stricter than the server (which requires owner on cancel,
 #: release, resume, move and edit): the client must send it on every change.
-OWNER_REQUIRED = ("submit", "insert", "move", "edit", "cancel", "pause", "resume", "hold",
-                  "release")
+OWNER_REQUIRED = ("submit", "insert", "move", "edit", "cancel", "kill", "pause", "resume",
+                  "hold", "release")
 
 
 class FakeServer:

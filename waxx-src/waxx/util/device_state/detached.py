@@ -18,9 +18,11 @@ is outside the server's tree.  The server then follows the command by pid:
   its pid and its creation time (recorded at launch), refusing a pid now used
   by another process.
 
-Nothing here ever terminates a process.  Windows only for the detached part;
-elsewhere :func:`launch` starts the command in a new session and follows it
-through its Popen object.
+Nothing here terminates a process except :func:`kill_tree`, which only a
+person's force kill of a queue job calls (:meth:`RunQueue.kill
+<waxx.util.device_state.run_queue.RunQueue.kill>`).  Windows only for the
+detached part; elsewhere :func:`launch` starts the command in a new session
+and follows it through its Popen object.
 """
 
 from __future__ import annotations
@@ -192,6 +194,68 @@ def _creation_time(handle) -> float | None:
         return (ft - _EPOCH_AS_FILETIME) / 1e7
     except Exception:                                 # noqa: BLE001
         return None
+
+
+#: How long ``taskkill`` may take.
+KILL_TIMEOUT_S = 15.0
+
+
+def kill_tree(pid, started: float | None = None) -> dict:
+    """Terminate process ``pid`` and every process under it (``taskkill /PID
+    <pid> /T /F``; off Windows SIGKILL to its process group, as :func:`launch`
+    starts the command in a session of its own).  ``started``: its recorded
+    creation time -- when given, a live pid created at another time is
+    another process (the pid was reused) and is left alone, as is one whose
+    creation time cannot be read.  Without it the caller vouches for the pid
+    (it holds a handle on the process, so the pid cannot have been reused).
+
+    -> ``{"pid", "ok": killed, "gone": there was no such process,
+    "note"}``; never raises."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return {"pid": pid, "ok": False, "gone": False, "note": f"not a pid: {pid!r}"}
+    if pid <= 0:
+        return {"pid": pid, "ok": False, "gone": False, "note": f"not a pid: {pid}"}
+    if sys.platform == "win32":
+        watch = ProcessWatch.open(pid)
+        if watch is None:
+            return {"pid": pid, "ok": False, "gone": True, "note": "no such process"}
+        try:
+            if watch.poll() is not None:
+                return {"pid": pid, "ok": False, "gone": True, "note": "it had already exited"}
+            if started is not None:
+                now_started = watch.started if watch.started is not None else process_started(pid)
+                if now_started is None:
+                    return {"pid": pid, "ok": False, "gone": False,
+                            "note": "its creation time cannot be read: not killed (it may be "
+                                    "another process with a reused pid)"}
+                if abs(now_started - float(started)) > SAME_PROCESS_S:
+                    return {"pid": pid, "ok": False, "gone": True,
+                            "note": "that pid is now another process: not killed"}
+        finally:
+            watch.close()
+        try:
+            done = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=KILL_TIMEOUT_S, creationflags=_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"pid": pid, "ok": False, "gone": False, "note": f"taskkill failed: {exc!r}"}
+        text = " ".join((done.stdout + " " + done.stderr).split())
+        return {"pid": pid, "ok": done.returncode == 0, "gone": False,
+                "note": text or f"taskkill exit code {done.returncode}"}
+    import signal  # noqa: PLC0415
+    from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
+    if not pid_alive(pid):
+        return {"pid": pid, "ok": False, "gone": True, "note": "no such process"}
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (OSError, AttributeError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError as exc:
+            return {"pid": pid, "ok": False, "gone": False, "note": f"kill failed: {exc!r}"}
+    return {"pid": pid, "ok": True, "gone": False, "note": "SIGKILL sent"}
 
 
 class LaunchUnknown(OSError):

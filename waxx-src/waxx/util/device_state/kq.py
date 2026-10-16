@@ -22,6 +22,8 @@ Commands::
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
     kq cancel <id> [--yes]                    cancel (a running job: liveOD's Abort)
+    kq kill <id> [--yes]                      force-kill a running job (a person only;
+                                              no cleanup; liveOD keeps its file)
     kq pause [--all] [--reason R]             stop launching agent (or all) jobs
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
@@ -492,6 +494,12 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
                     help="abort a running job without asking (its data file is discarded)")
     sp.add_argument("--token")
     sp.add_argument("--agent", action="store_true", help="cancel as an agent")
+
+    sp = sub.add_parser("kill", help="force-kill a running job's processes (a person only; "
+                                     "no cleanup runs)")
+    sp.add_argument("id", type=int)
+    sp.add_argument("--yes", action="store_true", help="kill without asking")
+    sp.add_argument("--token")
 
     sp = sub.add_parser("pause", help="stop launching agent jobs (--all: every job)")
     sp.add_argument("--all", action="store_true")
@@ -1026,6 +1034,33 @@ def _cmd_cancel(ctx: _Ctx, args) -> int:
     return EXIT_OK
 
 
+def _cmd_kill(ctx: _Ctx, args) -> int:
+    owner = _owner(args)
+    if owner != "person":
+        ctx.warn("kq: only a person may force-kill a job (no cleanup runs); an agent asks a "
+                 "person")
+        return EXIT_REFUSED
+    job = ctx.client.describe(args.id, args.token)["job"]
+    if job["state"] not in ("launching", "running"):
+        ctx.warn(f"kq: {_job_word(job)} is {job['state']}: no process to kill")
+        return EXIT_REFUSED
+    run = f"run {job['run_id']}" if job.get("run_id") is not None else "no run id yet"
+    if not args.yes:
+        if not ctx.tty():
+            ctx.warn(f"kq: force-killing {_job_word(job)} ({run}) skips all of its cleanup "
+                     "(the hardware stays as the run left it). Pass --yes to do that.")
+            return EXIT_REFUSED
+        if not ctx.ask(f"[kq] force-kill {_job_word(job)} ({run})? no cleanup runs: coils, "
+                       "AOMs and shutters stay as the run left them; liveOD keeps its file "
+                       "as it was [y/N] "):
+            ctx.say("[kq] nothing killed")
+            return EXIT_OK
+    reply = ctx.client.kill(args.id, token=args.token, owner=owner)
+    ctx.say(f"[kq] {_job_word(reply.get('job') or job)}: {reply.get('note')}; it ends at the "
+            f"queue's next check (kq show {args.id})")
+    return EXIT_OK
+
+
 def _cmd_pause(ctx: _Ctx, args) -> int:
     scope = "all" if args.all else "agent"
     reply = ctx.client.pause(scope, args.reason, owner=_owner(args))
@@ -1090,6 +1125,7 @@ def _cmd_status(ctx: _Ctx, args) -> int:
 
 
 _COMMANDS = {"list": _cmd_list, "show": _cmd_show, "tail": _cmd_tail, "cancel": _cmd_cancel,
+             "kill": _cmd_kill,
              "move": _cmd_move, "edit": _cmd_edit,
              "pause": _cmd_pause, "resume": _cmd_resume, "hold": _cmd_hold,
              "release": _cmd_release, "status": _cmd_status}

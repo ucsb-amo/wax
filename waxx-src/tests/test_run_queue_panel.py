@@ -380,6 +380,46 @@ def test_cancel_disabled_for_ended_jobs_and_after_a_cancel_was_asked(panel, serv
     assert _cell(panel, 2, "state") == "running (cancel asked)"
 
 
+def test_force_kill_asks_first_says_no_cleanup_and_stays_offered_after_a_cancel(panel, server):
+    panel.select_job(3)                                          # queued: nothing to kill
+    assert not _on(panel, "kill")
+    panel.select_job(2)                                          # running
+    assert _on(panel, "kill") and "NO cleanup" in _tip(panel, "kill")
+    panel.confirm_answer = False
+    assert not panel.kill_selected()
+    assert server.of("kill") == []                               # declined: nothing sent
+    title, text, yes, no = panel.confirms[-1]
+    assert title.startswith("Force kill job 2")
+    assert "NOTHING of the experiment's cleanup runs" in text and "run 85600" in text
+    assert "not saved, not deleted" in text
+    assert yes == "Kill it (no cleanup)" and no == "Don't kill"
+    panel.confirm_answer = True
+    server.answers["kill"] = {"status": "ok", "pending": True, "note": "killed",
+                              "job": _job(2, "running")}
+    assert panel.kill_selected()
+    assert server.of("kill")[-1] == {"type": "run_queue", "action": "kill", "id": 2,
+                                     "token": "t2", "owner": "person", "by": "jp@test"}
+    assert "killed" in panel.message.text()
+    jobs = _phase1_jobs()                                        # a cancel pending: still offered
+    jobs[1]["cancel"] = {"by": "jp", "at": NOW, "abort_sent": False}
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    panel.select_job(2)
+    assert _on(panel, "kill") and not _on(panel, "abort")
+    jobs[1]["kill"] = {"by": "jp", "at": NOW, "results": [], "note": "killed"}
+    panel.refresh_list()
+    assert _cell(panel, 2, "state") == "running (killed)"
+    menu, acts = panel.job_menu()
+    assert "kill" in acts and "copy_kill" in acts
+
+
+def test_force_kill_against_an_older_server_is_disabled(panel, server):
+    server.answers["kill"] = {"status": "error", "msg": "unknown run_queue action 'kill'"}
+    panel.select_job(2)
+    assert panel.kill_selected()
+    assert not _on(panel, "kill") and "older code" in _tip(panel, "kill")
+
+
 def test_move_names_neighbours_by_id_and_unknown_disables_it(panel, server):
     base = {"type": "run_queue", "action": "move", "id": 4, "token": "t4", "owner": "person",
             "by": "jp@test"}
@@ -875,10 +915,12 @@ def test_the_menu_offers_what_the_state_allows(panel):
     panel.select_job(2)                                          # running
     menu, acts = panel.job_menu()
     assert "abort" in acts and acts["abort"].isEnabled() and "remove" not in acts
+    assert "kill" in acts and acts["kill"].isEnabled()
     assert "edit" not in acts and "copy_run" in acts
     panel.select_job(1)                                          # saved
     menu, acts = panel.job_menu()
     assert acts["again"].isEnabled() and "abort" not in acts and "remove" not in acts
+    assert "kill" not in acts
     acts["copy_run"].trigger()
     assert "85599" in panel.message.text()
 

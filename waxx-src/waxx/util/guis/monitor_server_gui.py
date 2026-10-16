@@ -243,7 +243,10 @@ class MonitorUDPServer(UdpServer):
       ``at_index`` / ``before_id`` / ``after_id``), ``move`` (``id``,
       ``to_index`` / ``before_id`` / ``after_id``, ``owner``, ``by``),
       ``edit`` (``id``, ``owner``, ``by``, ``fields``), ``cancel`` (``id``,
-      ``token``, ``by``, ``owner``, ``queued_only``), ``list`` (``states``,
+      ``token``, ``by``, ``owner``, ``queued_only``), ``kill`` (``id``,
+      ``token``, ``by``, ``owner`` -- "person" only: a force kill of a
+      launching or running job's processes, for when liveOD's Abort cannot
+      reach it; no cleanup runs), ``list`` (``states``,
       ``limit``), ``describe`` (``id``), ``tail`` (``id``, ``token`` --
       required when the job has one --, ``offset``: the job's log from that
       byte, read here for a client on any PC; not logged or journaled),
@@ -1084,7 +1087,7 @@ class MonitorUDPServer(UdpServer):
 
     #: run_queue actions -> the RunQueue method that answers them
     _QUEUE_ACTIONS = {"submit": "submit", "insert": "insert", "move": "move", "edit": "edit",
-                      "cancel": "cancel", "list": "list",
+                      "cancel": "cancel", "kill": "kill", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
                       "resume": "resume", "hold": "hold_request", "release": "release_request"}
 

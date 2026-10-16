@@ -522,6 +522,25 @@ def test_cancel(server, q, expts):
     assert "abort requested by jp@kong" in r.out
 
 
+def test_kill(server, q, expts, monkeypatch):
+    kq(server, "submit", str(expts / "rabi.py"), "--repeat", "2")
+    assert kq(server, "kill", "2").code == 6                   # queued: nothing to kill
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.live.start_run(101)
+    q.tick()
+    r = kq(server, "kill", "1", tty=False)
+    assert r.code == 6 and "Pass --yes" in r.err and q.killer.calls == []
+    r = kq(server, "kill", "1", answer="n")
+    assert r.code == 0 and "nothing killed" in r.out and "no cleanup" in r.asked[-1]
+    r = kq(server, "kill", "1", "--yes", tty=False)
+    assert r.code == 0 and "killed" in r.out and q.killer.calls == [(5000, 1234.5)], r.err
+    assert sent(server, "kill")[-1]["owner"] == "person"
+    monkeypatch.setenv("WAXX_OWNER", "agent")
+    r = kq(server, "kill", "1", "--yes", tty=False)
+    assert r.code == 6 and "only a person" in r.err and len(sent(server, "kill")) == 1
+
+
 def test_an_agent_cannot_abort_a_persons_job(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"))
     q.tick()

@@ -88,8 +88,9 @@ def test_the_request_contract(server, expts, tmp_path):
     assert {"id", "token", "path", "sha256", "label", "argv", "cwd", "owner", "priority",
             "due", "after", "chain", "stop_on_failure", "write_back", "allow_drift",
             "repeat_index", "repeat_of", "submitted_at", "submitted_by", "state", "reason",
-            "pid", "pid_started", "client_pid", "run_id", "log_path", "exit_code",
-            "outcome", "launched_at", "ended_at", "cancel", "adopted", "rank", "expt_class",
+            "pid", "pid_started", "client_pid", "client_started", "run_id", "log_path",
+            "exit_code", "outcome", "launched_at", "ended_at", "cancel", "kill", "adopted",
+            "rank", "expt_class",
             "calibrates_declared", "submitter", "paused", "paused_by", "paused_since"} == set(j)
     # the edit, move and insert actions answer through the server
     assert server.ask({"type": "run_queue", "action": "edit", "id": 1, "owner": "agent",
@@ -111,6 +112,10 @@ def test_the_request_contract(server, expts, tmp_path):
                        "by": "jp"})["run_queue"]["paused"]["agent"]["by"] == "jp"
     assert server.ask({"type": "run_queue", "action": "resume", "scope": "agent",
                        "by": "jp", "owner": "person"})["status"] == "ok"
+    # kill answers through the server (an agent's is refused before anything is killed)
+    agent_kill = server.ask({"type": "run_queue", "action": "kill", "id": 1, "by": "a",
+                             "owner": "agent"})
+    assert agent_kill["status"] == "error" and "only a person" in agent_kill["msg"]
     no_owner = server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp"})
     assert no_owner["status"] == "error" and "owner is required" in no_owner["msg"]
     assert server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp",
