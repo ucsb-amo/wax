@@ -200,7 +200,7 @@ def test_layout_menu_keeps_per_layout_actions_in_manage(qapp, ini, monkeypatch):
         win._rebuild_layout_menu()
         top = [a.text() for a in win._layout_menu.actions() if not a.isSeparator()]
         assert top == [DEFAULT_NAME, "One", "Two", "Save 'Two'", "Save as new layout…",
-                       "Revert to 'Two'", "Manage layouts"]
+                       "Revert to 'Two'", "Auto-arrange", "Manage layouts"]
         assert not any("Rename" in t or "Delete" in t for t in top)
         manage = [a for a in win._layout_menu.actions() if a.text() == "Manage layouts"][0].menu()
         subs = {a.text(): a.menu() for a in manage.actions() if a.menu() is not None}
