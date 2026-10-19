@@ -9,20 +9,20 @@ frames::
         def __init__(self):
             self.setup()
             self.mot = self.camera(cameras.mot_basler, exposure_time=300e-6, gain=3., roi=[...])
-            self.img_mot = self.image(self.mot, t=-150e-3, t_stage='t_mot_load', show='image')
+            self.img_mot = self.image(self.mot, t_offset=-150e-3, t_stage='t_mot_load', show='image')
             self.cleanup()
 
 An image is one frame its camera takes every shot. Its key -- the DataVault
 key it is saved under -- is the attribute name. Its frame index is its place
 among its camera's images in the order they are assigned: assign them in the
 order the sequence takes them. The sequence takes it where it belongs with
-``self.diag.img_mot.trigger()``: ``t`` (s) from the timeline cursor
+``self.diag.img_mot.trigger()``: ``t_offset`` (s) from the timeline cursor
 (negative: before it); the cursor stays where it was. Nothing is taken with
 diagnostics off, during warm-up shots (``active`` cleared), or for a camera
 that could not be used this run (a placeholder stream).
 
 ``t_stage`` (optional) is the length of the stage the frame sits in, in s or
-as the name of an ExptParams attribute: a frame with ``|t| > t_stage`` would
+as the name of an ExptParams attribute: a frame with ``|t_offset| > t_stage`` would
 fall outside its stage -- before it starts, possibly in the past -- and is
 skipped every shot, which is said at prepare. It is resolved from the run's
 params when the run is bound and again at finish_prepare (``resolve_stages``);
@@ -125,13 +125,13 @@ class DiagnosticCamera:
 
 
 class DiagnosticImage:
-    """One frame a camera takes every shot (module docstring): ``t`` (s)
+    """One frame a camera takes every shot (module docstring): ``t_offset`` (s)
     from where ``trigger()`` is called, ``t_stage`` (s or an ExptParams name;
     None: no limit), its own ``exposure_time`` (s) / ``gain`` (dB) (None:
     the camera's), and for the diagnostic viewer a ``label`` and ``show``
     ('image', 'counts' or None: not shown)."""
 
-    def __init__(self, camera, t=0., t_stage=None, exposure_time=None, gain=None,
+    def __init__(self, camera, t_offset=0., t_stage=None, exposure_time=None, gain=None,
                  label=None, show='counts'):
         if not isinstance(camera, DiagnosticCamera):
             raise TypeError(f"DiagnosticImage: camera must be a DiagnosticCamera, not {camera!r}")
@@ -140,7 +140,7 @@ class DiagnosticImage:
         if not (t_stage is None or isinstance(t_stage, str)):
             t_stage = float(t_stage)
         self.camera = camera
-        self.t = float(t)
+        self.t_offset = float(t_offset)
         self.t_stage = t_stage
         self.exposure_time = None if exposure_time is None else float(exposure_time)
         self.gain = None if gain is None else float(gain)
@@ -154,7 +154,7 @@ class DiagnosticImage:
         self.ttl = None             # the camera's trigger TTL
         self.j = -1                 # frame index on the camera
         self.live = False           # the camera's stream takes frames this run
-        self.in_stage = True        # |t| <= t_stage (resolve_stages)
+        self.in_stage = True        # |t_offset| <= t_stage (resolve_stages)
         self.exposure_delay = 0.
         self.t_trigger = 2.e-6
         self._stream = None
@@ -171,7 +171,7 @@ class DiagnosticImage:
 
     def assignment(self):
         """This image's line in a frame's ``__init__``."""
-        args = [f"self.{self.camera.key}", f"t={self.t!r}"]
+        args = [f"self.{self.camera.key}", f"t_offset={self.t_offset!r}"]
         if self.t_stage is not None:
             args.append(f"t_stage={self.t_stage!r}")
         args += [f"{k}={v!r}" for k, v in self.settings().items()]
@@ -183,13 +183,13 @@ class DiagnosticImage:
 
     @kernel
     def trigger(self):
-        """Take this frame ``t`` from the cursor; the cursor stays."""
+        """Take this frame ``t_offset`` from the cursor; the cursor stays."""
         if self.frame.active and self.live and self.in_stage:
-            delay(self.t)
+            delay(self.t_offset)
             self.announce_edge(now_mu() - self.core.get_rtio_counter_mu())
             delay(-self.exposure_delay)
             self.ttl.pulse(self.t_trigger)
-            delay(self.exposure_delay - self.t_trigger - self.t)
+            delay(self.exposure_delay - self.t_trigger - self.t_offset)
 
     @rpc(flags={"async"})
     def announce_edge(self, slack_mu):
@@ -236,11 +236,11 @@ class diagnostic_frame:
         return DiagnosticCamera(camera, exposure_time=exposure_time, gain=gain, roi=roi,
                                 label=label)
 
-    def image(self, camera, t=0., t_stage=None, exposure_time=None, gain=None, label=None,
+    def image(self, camera, t_offset=0., t_stage=None, exposure_time=None, gain=None, label=None,
               show='counts'):
         """An image ``camera`` takes every shot (assign it to an attribute:
         its key). Assign a camera's images in the order they are taken."""
-        return DiagnosticImage(camera, t=t, t_stage=t_stage, exposure_time=exposure_time,
+        return DiagnosticImage(camera, t_offset=t_offset, t_stage=t_stage, exposure_time=exposure_time,
                                gain=gain, label=label, show=show)
 
     def entries(self):
@@ -319,7 +319,7 @@ class diagnostic_frame:
 
     def resolve_stages(self, params, xvars=(), quiet=False):
         """Each image's ``t_stage`` in s from ``params`` (a scanned key -- in
-        ``xvars`` -- by its shortest value) and whether ``|t|`` fits in it.
+        ``xvars`` -- by its shortest value) and whether ``|t_offset|`` fits in it.
         A frame that does not is skipped every shot; says so unless quiet."""
         scanned = {x.key: np.asarray(x.values, dtype=float) for x in xvars}
         for key, img in self.images().items():
@@ -337,9 +337,9 @@ class diagnostic_frame:
             else:
                 v, what = float(s), "t_stage"
             img.t_stage_s = v
-            img.in_stage = abs(img.t) <= v
+            img.in_stage = abs(img.t_offset) <= v
             if not img.in_stage and not quiet and self.enabled:
-                print(f"[diag cams] {key}: not taken this run -- |t| = {abs(img.t) * 1e3:g} ms "
+                print(f"[diag cams] {key}: not taken this run -- |t_offset| = {abs(img.t_offset) * 1e3:g} ms "
                       f"is longer than {what} = {v * 1e3:g} ms")
 
     def record(self):
@@ -347,7 +347,7 @@ class diagnostic_frame:
         return {"enabled": self.enabled,
                 "images": {k: {"camera": img.camera.key,
                                "camera_id": str(getattr(img.camera.camera, 'key', '')),
-                               "frame": img.j, "t": img.t,
+                               "frame": img.j, "t_offset": img.t_offset,
                                "t_stage": img.t_stage, "t_stage_s": img.t_stage_s,
                                "taken": bool(img.live and img.in_stage),
                                **img.settings()}
