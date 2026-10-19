@@ -209,6 +209,32 @@ def test_center_grows_only_with_side_docks(qapp, ini):
     win.deleteLater()
 
 
+def test_toolbar_dropdown_offers_auto_arrange(qapp, ini, monkeypatch):
+    from PyQt6.QtWidgets import QLabel
+    from waxx.util.dashboard import dashboard_window as dw
+    from waxx.util.dashboard.panel_container import ClientPanel
+
+    calls = []
+    monkeypatch.setattr(dw.DashboardMainWindow, "_auto_arrange",
+                        lambda self, fill_screen=False: calls.append(fill_screen))
+    panels = [dw.PanelPlacement(ClientPanel("a", "A", lambda: QLabel("a")), area="right")]
+    win = dw.DashboardMainWindow("client", "Test dashboard", panels, host_ip="test")
+    win.show()
+    _pump(qapp, lambda: win._layout_ready)
+    acts = {a.text(): a for a in win._layout_picker.menu.actions() if a.text().startswith("Auto-arrange")}
+    assert set(acts) == {"Auto-arrange: fit this window", "Auto-arrange: fit this screen (maximize)"}
+    acts["Auto-arrange: fit this window"].trigger()
+    acts["Auto-arrange: fit this screen (maximize)"].trigger()
+    _pump(qapp, lambda: len(calls) == 2, rounds=50)
+    assert calls == [False, True]
+    # still there after the dropdown is rebuilt
+    win._refresh_layout_picker()
+    assert sum(a.text().startswith("Auto-arrange") for a in win._layout_picker.menu.actions()) == 2
+    win._layout_ready = False
+    win.hide()
+    win.deleteLater()
+
+
 def test_window_auto_arrange_applies_solution(qapp, ini, monkeypatch):
     from PyQt6.QtWidgets import QLabel
     from waxx.util.dashboard import dashboard_window as dw

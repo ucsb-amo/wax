@@ -873,6 +873,7 @@ class DashboardMainWindow(QMainWindow):
         picker.delete_requested.connect(self._delete_layout)
         picker.import_requested.connect(self._load_layout_from_file)
         picker.export_requested.connect(self._save_layout_to_file)
+        picker.auto_arrange_requested.connect(lambda fill: self._auto_arrange(fill_screen=fill))
         tb.addWidget(picker)
         self._layout_picker = picker
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)

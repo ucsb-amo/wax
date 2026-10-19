@@ -5,6 +5,8 @@
 * The dropdown lists the built-in *Default* placement, then every saved
   layout.  Clicking a name applies it.  Each saved row carries its own
   buttons: rename, save the current arrangement over it, delete.
+* Below them, *Auto-arrange* (fit this window / fit this screen) asks the
+  window to solve a layout for its size (:mod:`layout_solver`).
 * ``+`` saves the current arrangement as a new layout; ``-`` deletes the
   layout currently selected.
 * A ``•`` after the name means the arrangement was changed since that layout
@@ -159,6 +161,7 @@ class LayoutPicker(QWidget):
     delete_requested = pyqtSignal(str)
     import_requested = pyqtSignal()
     export_requested = pyqtSignal()
+    auto_arrange_requested = pyqtSignal(bool)   # True: maximize first (fit the screen)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -225,6 +228,16 @@ class LayoutPicker(QWidget):
             for name in names:
                 when = saved_at.get(name)
                 add_row(name, False, f"Apply '{name}'" + (f"  (saved {when})" if when else ""))
+        self.menu.addSeparator()
+        self.menu.setToolTipsVisible(True)
+        for text, fill_screen in (("Auto-arrange: fit this window", False),
+                                  ("Auto-arrange: fit this screen (maximize)", True)):
+            a = QAction(text, self.menu)
+            a.setToolTip("Re-dock the shown panels for this size: main panels first, status panels "
+                         "stacked behind tabs when space runs out")
+            a.triggered.connect(lambda _c=False, f=fill_screen: QTimer.singleShot(
+                0, lambda: self.auto_arrange_requested.emit(f)))
+            self.menu.addAction(a)
         self.menu.addSeparator()
         for text, sig in (
             ("Save current as new layout…", self.add_requested),
