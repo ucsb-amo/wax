@@ -71,6 +71,7 @@ def test_a_reset_without_a_source_is_a_persons_and_the_count_outlives_the_level(
     ({"run_token": "not-this-runs"}, "token"),
     ({"source": "robot"}, "unknown RESET source"),
     ({"run_id": "x"}, "bad run_id"),
+    ({"queue_job": "7:other"}, "names queue job 7:other"),
 ])
 def test_a_reset_for_another_run_is_refused_and_changes_nothing(srv, msg, words):
     _init(srv)
@@ -91,6 +92,20 @@ def test_the_right_run_id_and_token_are_accepted(srv):
                              "run_token": reply["run_token"]})
     assert out["ok"] and out["reset_count"] == 1
     assert _poll(srv)["reset_counts"]["agent"] == 1
+
+
+def test_a_save_data_false_run_is_named_by_its_queue_job(srv):
+    """Every save_data=False run is run id 0: the queue names its job's run by
+    queue_job too, and liveOD refuses the RESET for any other run 0."""
+    _init(srv, save_data=False, launcher="kq", queue_job="3:abc")
+    assert srv._current_run_id == 0
+    other = srv._handle_reset({"tag": "RESET", "source": "queue", "run_id": 0,
+                               "queue_job": "4:def"})
+    assert other["refused"] and "queue job 3:abc" in other["error"]
+    assert _poll(srv)["reset_count"] == 0
+    out = srv._handle_reset({"tag": "RESET", "source": "queue", "run_id": 0,
+                             "queue_job": "3:abc"})
+    assert out["ok"] and _poll(srv)["reset_counts"]["queue"] == 1
 
 
 # -- the window's reset(): only its own button counts a person's Reset (review NEW-1) --------

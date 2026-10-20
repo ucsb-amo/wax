@@ -44,10 +44,13 @@ class Live:
         self.state.update(run_in_progress=False, run_state="exited")
         return {"ok": True}
 
-    def reset(self, run_id=None, source="person"):
+    def reset(self, run_id=None, source="person", queue_job=None):
         if run_id is not None and (not self.state["run_in_progress"]
                                    or self.state["run_id"] != run_id):
             return {"ok": False, "refused": True, "error": "not the run in progress"}
+        if queue_job and self.state.get("queue_job") != queue_job:
+            return {"ok": False, "refused": True, "error": "not that queue job's run"}
+        self.queue_jobs = getattr(self, "queue_jobs", []) + [queue_job]
         self.resets.append(self.state["run_id"])
         self.sources = getattr(self, "sources", []) + [source]
         self.state["reset_requested"] = True
@@ -171,17 +174,38 @@ def q(tmp_path, expts):
     return make_queue(tmp_path, expts)
 
 
+class Killer:
+    """The queue's kill(pid, started): records each call; a spawned Proc with
+    that pid exits (code 1, as after taskkill /F)."""
+
+    def __init__(self, spawner):
+        self.spawner, self.calls = spawner, []
+        self.fail: set = set()
+
+    def __call__(self, pid, started):
+        self.calls.append((pid, started))
+        if pid in self.fail:
+            return {"pid": pid, "ok": False, "gone": False, "note": "Access is denied."}
+        for proc in self.spawner.procs:
+            if proc.pid == pid:
+                proc.code = 1
+        return {"pid": pid, "ok": True, "gone": False, "note": "SUCCESS"}
+
+
 def make_queue(tmp_path, expts, **kw):
     live, spawner, clock, journal, starts = Live(), Spawner(), Clock(), Journal(), []
+    killer = Killer(spawner)
     args = dict(poll=live, run_exited=live.run_exited, live_od_reset=live.reset,
                 fence=lambda: None, monitor_state=lambda: 2, server_busy=lambda: "",
                 loops={}, start_monitor=starts.append, journal=journal, spawn=spawner,
-                adopt=lambda pid, started: None, clock=clock, poll_every_s=0.0, gap_s=0.0,
+                adopt=lambda pid, started: None, kill=killer, clock=clock, poll_every_s=0.0,
+                gap_s=0.0,
                 outcome_wait_s=0.0, exclude=(str(expts / "monitor.py"),), client_name="kong")
     args.update(kw)
     queue = RunQueue(str(tmp_path / "logs" / "run_queue"), **args)
     queue.live, queue.spawner, queue.clock = live, spawner, clock
     queue.journal, queue.monitor_starts = journal, starts
+    queue.killer = killer
     return queue
 
 
@@ -468,6 +492,7 @@ def test_outcomes(q, expts):
     assert incomplete["state"] == "failed" and "saved_incomplete" in incomplete["reason"]
     ends = [e for e in q.journal.entries if e["kind"] == "run_queue_end"]
     assert [e["state"] for e in ends] == ["saved", "aborted", "failed"]
+    assert not any(job(q, i)["no_file"] for i in ids)        # each had a file
 
 
 def no_file_run(q, a, outcome="nothing_written", code=0, lines=(), tag=True):
@@ -491,6 +516,7 @@ def test_a_run_without_a_file_that_runs_to_its_end_is_done(q, expts):
     j = job(q, a)
     assert j["state"] == "done" and j["run_id"] is None and j["exit_code"] == 0
     assert "save_data=False" in j["reason"] and j["outcome"]["outcome"] == "nothing_written"
+    assert j["no_file"]
     q.tick()
     assert job(q, b)["state"] == "running"                # a done job satisfies `after`
 
@@ -501,7 +527,7 @@ def test_a_run_without_a_file_aborted_in_live_od_is_aborted_and_stops_its_chain(
     no_file_run(q, a, outcome="discarded", code=1,
                 lines=["RuntimeError: Acquisition for run 0 aborted."])
     j = job(q, a)
-    assert j["state"] == "aborted" and j["outcome"]["aborted"]
+    assert j["state"] == "aborted" and j["outcome"]["aborted"] and j["no_file"]
     assert "no file" in j["reason"] and "discarded" not in j["reason"]
     assert job(q, b)["state"] == "cancelled" and "aborted" in job(q, b)["reason"]
 
@@ -512,6 +538,7 @@ def test_a_run_without_a_file_is_done_only_on_its_own_record(q, expts):
     no_file_run(q, a, tag=False)                          # liveOD's record names no job
     j = job(q, a)
     assert j["state"] == "failed" and "without a run id" in j["reason"]
+    assert not j["no_file"]                               # nothing said it was this job's
 
 
 def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
@@ -519,6 +546,16 @@ def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
     q.tick()
     no_file_run(q, a, code=1, lines=["Traceback (most recent call last):", "ValueError: x"])
     assert job(q, a)["state"] == "failed"
+    assert job(q, a)["no_file"]                           # seen in liveOD's POLL while running
+
+
+def test_a_run_without_a_file_is_marked_while_it_runs(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.live.start_run(0, client_pid=7000, client_host="kong", launcher="kq", queue_job=qj(q, a))
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "running" and j["no_file"] and j["run_id"] is None
 
 
 def test_a_job_killed_hard_is_reported_to_live_od(q, expts):
@@ -580,6 +617,34 @@ def test_cancel_a_running_job_sends_live_ods_abort_for_its_run_only(q, expts):
     assert "run_queue_abort_sent" in q.journal.kinds
 
 
+def test_cancel_a_running_job_with_no_file_aborts_run_0_named_by_its_queue_job(q, expts):
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
+    q.tick()
+    assert q.live.resets == [] and "no run id yet" in job(q, a)["cancel"]["abort_note"]
+    # another save_data=False run is liveOD's (run id 0 too): never aborted
+    q.live.start_run(0, launcher="kq", queue_job=qj(q, b))
+    q.tick()
+    assert q.live.resets == [] and not job(q, a)["no_file"]
+    q.live.start_run(0, launcher="kq", queue_job=qj(q, a))   # a's own run, no file
+    q.tick()
+    j = job(q, a)
+    assert j["no_file"] and j["cancel"]["abort_sent"] and j["cancel"]["abort_note"] == "Abort sent"
+    assert q.live.resets == [0] and q.live.queue_jobs == [qj(q, a)]
+    assert 0 not in q.own_abort_ids()                 # never whitelists every run-0 Reset
+    q.tick()
+    assert q.live.resets == [0]                       # once
+    proc.write("RuntimeError: Acquisition for run 0 aborted.")
+    q.live.end_run(0, "discarded")
+    proc.code = 1
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "cancelled" and j["no_file"]
+    assert j["reason"].startswith("cancelled by jp while running")
+
+
 def test_no_abort_while_live_od_saves_and_a_late_cancel_still_saves(q, expts):
     a = submit(q, expts)
     q.tick()
@@ -602,6 +667,95 @@ def test_an_agent_may_not_abort_a_persons_running_job(q, expts):
     reply = q.cancel({"id": a, "by": "agent-7", "owner": "agent"})
     assert reply["status"] == "error" and "person's job" in reply["msg"]
     assert job(q, a)["cancel"] is None
+
+
+# --- force kill ---------------------------------------------------------------------------
+
+def test_a_force_kill_kills_the_experiment_then_the_shell_and_never_sends_the_abort(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("Run ID: 101")
+    q.live.start_run(101, client_pid=7101, client_started=1500.25, launcher="kq",
+                     queue_job=qj(q, a))
+    q.tick()
+    assert job(q, a)["client_pid"] == 7101 and job(q, a)["client_started"] == 1500.25
+    q.live.down = True                                # liveOD closed: the Abort cannot go
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
+    q.tick()
+    assert q.live.resets == [] and "not reachable" in job(q, a)["cancel"]["abort_note"]
+    reply = q.kill({"id": a, "by": "jp@kong", "owner": "person"})
+    assert reply["status"] == "ok" and reply["note"] == "killed", reply
+    # the experiment by its recorded creation time, then the shell the queue follows
+    assert q.killer.calls == [(7101, 1500.25), (5000, 1234.5)]
+    assert [r["role"] for r in reply["results"]] == ["experiment", "shell"]
+    assert job(q, a)["kill"]["by"] == "jp@kong"
+    q.live.down = False                               # liveOD back, the run still open there
+    q.tick()
+    assert q.live.resets == []                        # a pending Abort is never sent after a kill
+    assert [rid for rid, _ in q.live.exited] == [101]  # told RUN_EXITED: the file is left as is
+    j = job(q, a)
+    assert j["state"] == "cancelled" and j["reason"].startswith("force-killed by jp@kong")
+    assert "no cleanup ran" in j["reason"]
+    assert "run_queue_kill" in q.journal.kinds
+
+
+def test_a_force_kill_is_a_persons_and_only_for_a_job_with_a_process(q, expts):
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    assert q.kill({"id": a, "by": "x"})["status"] == "error"          # no owner
+    refused = q.kill({"id": a, "by": "agent-7", "owner": "agent"})
+    assert refused["status"] == "error" and "only a person" in refused["msg"]
+    queued = q.kill({"id": b, "by": "jp", "owner": "person"})
+    assert queued["status"] == "error" and "remove it" in queued["msg"]
+    assert q.killer.calls == [] and job(q, a)["kill"] is None
+    run_through(q, 101)
+    assert q.kill({"id": a, "by": "jp", "owner": "person"})["status"] == "error"   # saved
+
+
+def test_a_kill_that_fails_says_so_and_the_job_stays(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.killer.fail = {5000}
+    reply = q.kill({"id": a, "by": "jp", "owner": "person"})
+    assert reply["status"] == "error" and "NOT all killed" in reply["msg"]
+    assert "Access is denied" in reply["msg"]
+    q.tick()
+    assert job(q, a)["state"] == "running"
+    q.killer.fail = set()
+    assert q.kill({"id": a, "by": "jp", "owner": "person"})["status"] == "ok"   # again
+    q.tick()
+    assert job(q, a)["state"] == "cancelled"
+
+
+def test_an_experiment_pid_without_its_creation_time_is_not_killed_alone(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.live.start_run(101, client_pid=7101, launcher="kq", queue_job=qj(q, a))   # no time
+    q.tick()
+    reply = q.kill({"id": a, "by": "jp", "owner": "person"})
+    assert q.killer.calls == [(5000, 1234.5)]         # only the shell's tree
+    assert "never recorded" in reply["note"]
+
+
+def test_a_kill_with_no_process_left_frees_the_slot_at_once(tmp_path, expts):
+    from waxx.util.device_state.detached import LaunchUnknown
+
+    def unknown(command, cwd, env, log_path):
+        raise LaunchUnknown("the launcher reported nothing")
+    q = make_queue(tmp_path, expts, spawn=unknown)
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    q.tick()
+    assert job(q, a)["state"] == "launching"          # an orphan: waits ORPHAN_WAIT_S
+    reply = q.kill({"id": a, "by": "jp", "owner": "person"})
+    assert reply["status"] == "ok" and reply["note"] == "no live process of it was found"
+    assert q.killer.calls == []
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "cancelled" and j["reason"].startswith("force-killed by jp")
+    assert job(q, b)["state"] in ("queued", "launching")   # the slot is free again
 
 
 def test_a_queued_only_cancel_never_aborts_a_job_that_has_launched(q, expts):
@@ -1215,6 +1369,40 @@ def test_the_detached_launcher_runs_a_command_outside_and_reads_its_exit_code(tm
     assert ProcessWatch.adopt(os.getpid(), me.started) is not None
     watch.close()
     me.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="taskkill is Windows-only")
+def test_kill_tree_kills_a_shell_and_its_children_but_never_a_reused_pid(tmp_path):
+    """Its own sleeper only: cmd -> python (-> python, a venv launcher) writing
+    its pid, then sleeping."""
+    from waxx.util.device_state.detached import ProcessWatch, kill_tree, launch
+    sleeper, pid_file = tmp_path / "sleeper.py", tmp_path / "pid.txt"
+    sleeper.write_text("import os, sys, time\n"
+                       "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                       "time.sleep(60)\n")
+    watch = launch(f'"{sys.executable}" "{sleeper}" "{pid_file}"', cwd=str(tmp_path),
+                   env=dict(os.environ), log_path=str(tmp_path / "out.log"))
+    try:
+        t0 = time.monotonic()
+        while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() - t0 < 30:
+            time.sleep(0.05)
+        child = ProcessWatch.open(int(pid_file.read_text()))
+        assert child is not None and child.poll() is None
+        wrong = kill_tree(watch.pid, watch.started - 100.0)        # another creation time
+        assert not wrong["ok"] and "another process" in wrong["note"]
+        assert watch.poll() is None
+        done = kill_tree(watch.pid, watch.started)
+        assert done["ok"], done
+        t0 = time.monotonic()
+        while (watch.poll() is None or child.poll() is None) and time.monotonic() - t0 < 20:
+            time.sleep(0.05)
+        assert watch.poll() is not None and child.poll() is not None   # the tree went too
+        assert kill_tree(watch.pid, watch.started)["gone"]
+        child.close()
+    finally:
+        if watch.poll() is None:
+            kill_tree(watch.pid)
+        watch.close()
 
 
 # --- the queue's own Abort through liveOD's counts (review B2) ----------------------------------

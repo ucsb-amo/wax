@@ -252,6 +252,15 @@ class RunQueueClient:
                                     "queued_only": True if queued_only else None,
                                     "by": self.by}, retry=False)
 
+    def kill(self, job_id: int, *, token: str | None = None, owner: str | None = None) -> dict:
+        """Force-kill a launching or running job's processes: for when
+        liveOD's Abort cannot reach the run.  Only a person may (``owner``,
+        default this client's; the server refuses an agent).  No cleanup
+        runs; liveOD keeps the run's file as it was.  -> ``{"job",
+        "results", "note"}``; RunQueueError when something is still alive."""
+        return self._ask("kill", {"id": int(job_id), "token": token,
+                                  "owner": self._owner(owner), "by": self.by}, retry=False)
+
     def list(self, states: Iterable[str] | None = None, limit: int | None = None) -> dict:
         """-> ``{"jobs": [...] in the server's order (ended by id, the slot,
         then the queued in rank order), "next": [ids], "run_queue": info}``."""

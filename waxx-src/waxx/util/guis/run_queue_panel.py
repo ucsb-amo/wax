@@ -35,20 +35,26 @@ What it shows:
   fields for a server that does not send it), and when / by whom it was
   submitted.  Fields a server does not send are blank.
 
-Layout: one toolbar (the state pill and text, the counts, the filter --
-All / Pending, i.e. without the ended jobs --, Follow, Hold / Release, Pause /
-Resume agent and all jobs, Refresh); banners only while there is something
-to say (the alarm, the person hold, a pause, the loop the queue stopped); the
-table (rows tinted: saved green, failed red, the job in the slot blue and
-bold; less-used columns hidden until the header's right-click menu shows
-them; a column moves by dragging its header); a message line.  With Follow
-on (the default) the table scrolls to its bottom when a list brings a job
-the previous list did not have (a newly queued job).  Given a ``settings``
-(a QSettings), the panel remembers the columns' order, widths and shown set,
-the filter and Follow, on every change (:func:`panel_settings`).
+Layout: one toolbar (the state pill and text, the counts, the filter -- a
+dropdown: All; Last N, the default: the last N ended jobs (N from the spin
+box beside it, default :data:`DEFAULT_LAST_N`) and every job not ended;
+Pending, without the ended jobs --, Follow, Hold / Release, Pause / Resume
+agent and all jobs, Refresh); banners only while there is something to say
+(the alarm, the person hold, a pause, the loop the queue stopped); the table
+(rows tinted: saved green, failed red, the job in the slot blue and bold, an
+ended run that had no file -- ``save_data=False``, done / aborted /
+cancelled; a failed one stays red -- gray; less-used columns hidden until the
+header's right-click menu shows them; a column moves by dragging its
+header); a message line.  With Follow on (the default) the table scrolls to
+its bottom when a list brings a job the previous list did not have (a newly
+queued job).  Given a ``settings`` (a QSettings), the panel remembers the
+columns' order, widths and shown set, the filter, N and Follow, on every
+change (:func:`panel_settings`).
 
 A job's actions are on its right-click menu (:meth:`RunQueuePanel.job_menu`;
-what each allows: :meth:`RunQueuePanel.action_state`):
+what each allows: :meth:`RunQueuePanel.action_state`).  With several rows
+selected, Run again / Run again next, Move to the top / bottom, Remove and
+Copy (paths, run ids) act on all of them; the others on the row clicked:
 
 * Show log (also Enter / double-click): a window following the job's log
   through the ``tail`` action -- every 0.5 s while it runs, every 2 s while
@@ -57,15 +63,19 @@ what each allows: :meth:`RunQueuePanel.action_state`):
   read-only window).  A ``.py`` is never handed to the OS's default action
   (it can run it).  Both say when the file now differs from the one the job
   was submitted with; what a run ran is in its run file (``expt_file``);
-* Run again / Run again next (asks first): the same file as a new person's
-  job (``submit``, or ``insert`` at 0) with its argv, working folder, label,
-  write-back veto and drift setting -- not its dependencies, chain, due time
-  or repeats; this PC's hash of the file goes with it, as kq sends it;
+* Run again / Run again next (no question; what to know -- a changed or
+  unreadable file, what is not carried over -- goes to the message line):
+  the same file as a new person's job (``submit``, or ``insert`` at 0) with
+  its argv, working folder, label, write-back veto and drift setting -- not
+  its dependencies, chain, due time or repeats; this PC's hash of the file
+  goes with it, as kq sends it.  Several jobs go in in table order (next:
+  inserted last first, so they run in table order ahead of the queue);
 * Edit (``edit`` with ``fields``: argv, label, after, chain, stop_on_failure,
   the write-back veto, due, allow_drift, paused; only the fields changed) and
   Move up / down / to top / to bottom (also Ctrl+Up / Ctrl+Down; ``move``: up
   / down name the neighbour by id -- ``before_id`` / ``after_id`` -- top /
-  bottom send ``to_index``), for a queued job;
+  bottom send ``to_index``; several selected queued jobs move to the top or
+  bottom together, keeping their order), for a queued job;
 * Remove from queue (also Del; several selected at once; asks first): each
   queued job is cancelled ``queued_only``, so one that launched meanwhile is
   never aborted on a question about a queued job.  The queue keeps the
@@ -73,6 +83,11 @@ what each allows: :meth:`RunQueuePanel.action_state`):
 * Abort run, for the job in the slot (asks first: liveOD's Abort discards
   that run's data file -- nothing else is offered until the queue can stop a
   run and keep its data);
+* Force kill, for a launching or running job, when the Abort cannot work
+  (liveOD closed, the experiment's terminal or process hung, the queue out of
+  step): asks first, then ``kill`` -- the server kills the job's processes;
+  no cleanup runs, and liveOD leaves the run's file as it was (not saved, not
+  deleted).  Offered while a cancel is pending too;
 * Copy: a kq command line, the file's path, the run id.
 
 An action the server refuses as unknown (an older server) is disabled.
@@ -103,10 +118,10 @@ from typing import Any, Callable
 from PyQt6.QtCore import QAbstractTableModel, QByteArray, QModelIndex, QSettings, QTimer, Qt
 from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QStyle, QTableView, QToolButton, QVBoxLayout,
-    QWidget,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QStyle, QTableView, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from waxx.util.dashboard import theme
@@ -132,6 +147,7 @@ OWNER = "person"
 #: The 1b actions a server may not have yet (disabled when refused as unknown).
 MOVE_ACTION = "move"
 EDIT_ACTION = "edit"
+KILL_ACTION = "kill"
 #: The panel's four moves (:func:`move_request` turns each into the server's
 #: ``before_id`` / ``after_id`` / ``to_index``).
 MOVE_WHERE = ("up", "down", "top", "bottom")
@@ -155,11 +171,15 @@ _STATE_COLOR = {"queued": theme.FG, "launching": WARN_TEXT, "running": OK_TEXT,
 ROW_TINT = {"saved": (95, 211, 141, 30), "done": (95, 211, 141, 30),
             "failed": (255, 107, 107, 36), "aborted": (255, 179, 71, 34),
             "launching": (90, 160, 255, 34), "running": (90, 160, 255, 34),
-            "ending": (90, 160, 255, 34)}
+            "ending": (90, 160, 255, 34),
+            # an ended run that had no file (save_data=False): repeats, diagnostics
+            "no_file": (150, 150, 150, 40)}
 #: a queued job with a warm process (queue phase 2): warming / ready
 WARM_TINT = {"warming": (90, 160, 255, 14), "ready": (90, 160, 255, 24)}
 #: states whose other cells are drawn muted
 _MUTED_STATES = ("cancelled", "skipped")
+#: ended states drawn gray when the run had no file (a failed one stays red)
+_NO_FILE_GRAY = ("done", "aborted", "cancelled")
 
 
 # -- small helpers -------------------------------------------------------------------
@@ -228,6 +248,20 @@ def job_name(job: dict) -> str:
     return f"job {job.get('id')} ({job.get('label') or '?'})"
 
 
+def ran_without_file(job: dict) -> bool:
+    """The job's run had no file (``save_data=False``): the server's
+    ``no_file``, or the state ``done``.  For a record from before the server
+    set ``no_file``: its reason, which the queue words "save_data=False" for
+    such a run (:func:`~waxx.util.device_state.run_loop.judge_run`)."""
+    return (bool(job.get("no_file")) or job.get("state") == "done"
+            or "save_data=False" in str(job.get("reason") or ""))
+
+
+def gray_no_file(job: dict) -> bool:
+    """Drawn gray: an ended run with no file that did not fail."""
+    return job.get("state") in _NO_FILE_GRAY and ran_without_file(job)
+
+
 # -- requests (pure: the tests check them) ---------------------------------------------
 
 def list_request(limit: int = LIST_LIMIT) -> dict:
@@ -244,6 +278,13 @@ def cancel_request(job: dict, by: str) -> dict:
     if job.get("state") == "queued":
         obj["queued_only"] = True
     return obj
+
+
+def kill_request(job: dict, by: str) -> dict:
+    """Force-kill ``job``'s processes (a person's request; see
+    :meth:`~waxx.util.device_state.run_queue.RunQueue.kill`)."""
+    return {"type": "run_queue", "action": KILL_ACTION, "id": job.get("id"),
+            "token": job.get("token"), "owner": OWNER, "by": by}
 
 
 def move_request(job: dict, where: str, by: str, queued: list[dict]) -> dict | None:
@@ -427,7 +468,7 @@ def kq_commands(job: dict, now: float | None = None) -> dict[str, str]:
     if argv:
         parts += ["--"] + [_q(a) for a in argv]
     return {"submit": " ".join(parts), "tail": f"kq tail {jid} -f", "show": f"kq show {jid}",
-            "cancel": f"kq cancel {jid}"}
+            "cancel": f"kq cancel {jid}", "kill": f"kq kill {jid}"}
 
 
 # -- ordering and the table --------------------------------------------------------------
@@ -557,8 +598,13 @@ DEFAULT_HIDDEN = ("expt_class", "path", "priority", "due", "after")
 DEFAULT_WIDTHS = {"position": 40, "id": 44, "state": 100, "owner": 120, "label": 160,
                   "expt_class": 110, "path": 220, "run_id": 60, "priority": 50, "due": 60,
                   "after": 100, "est": 150, "source_changed": 64, "waiting": 200}
-#: The table's filters: every listed job, or only those not ended.
-FILTERS = ("all", "pending")
+#: The table's filters: every listed job; the last N ended ones and every one
+#: not ended; only those not ended.
+FILTERS = ("all", "last", "pending")
+DEFAULT_FILTER = "last"
+#: Ended jobs the "last" filter shows until someone changes it.
+DEFAULT_LAST_N = 15
+_FILTER_TITLES = {"all": "All", "last": "Last", "pending": "Pending"}
 #: Where a host's panel remembers its columns and filter (:func:`panel_settings`).
 SETTINGS_ORG = "waxx"
 SETTINGS_APP = "run_queue_panel"
@@ -583,7 +629,9 @@ class JobTableModel(QAbstractTableModel):
         self.info: dict = {}
         self._by_id: dict = {}
         self._all: list[dict] = []
-        self.show_ended = True
+        #: the filter (:data:`FILTERS`) and the "last" filter's N
+        self.mode = "all"
+        self.last_n = DEFAULT_LAST_N
 
     # -- feeding ---------------------------------------------------------------------
 
@@ -599,14 +647,42 @@ class JobTableModel(QAbstractTableModel):
         self._filter()
         self.endResetModel()
 
-    def set_show_ended(self, show: bool) -> None:
+    def set_mode(self, mode: str, last_n: int | None = None) -> None:
+        """The filter (:data:`FILTERS`) and, for "last", how many ended jobs."""
+        if mode not in FILTERS:
+            raise ValueError(f"filter must be one of {FILTERS}, not {mode!r}")
         self.beginResetModel()
-        self.show_ended = bool(show)
+        self.mode = mode
+        if last_n is not None:
+            self.last_n = max(0, int(last_n))
         self._filter()
         self.endResetModel()
 
+    def set_show_ended(self, show: bool) -> None:
+        self.set_mode("all" if show else "pending")
+
+    def _last_ended(self, n: int) -> set:
+        """ids of the ``n`` ended jobs that ended last (by ``ended_at``; a job
+        without one by its place in the list)."""
+        ended = [(i, j) for i, j in enumerate(self._all) if j.get("state") in ENDED]
+
+        def key(item):
+            i, j = item
+            try:
+                t = float(j.get("ended_at"))
+            except (TypeError, ValueError):
+                t = float("-inf")
+            return (t, i)
+        return {id(j) for _, j in sorted(ended, key=key)[-n:]} if n > 0 else set()
+
+    def _shown(self, mode: str) -> list[dict]:
+        if mode == "all":
+            return list(self._all)
+        keep = self._last_ended(self.last_n) if mode == "last" else set()
+        return [j for j in self._all if j.get("state") not in ENDED or id(j) in keep]
+
     def _filter(self) -> None:
-        self.jobs = [j for j in self._all if self.show_ended or j.get("state") not in ENDED]
+        self.jobs = self._shown(self.mode)
 
     def update_job(self, job: dict) -> bool:
         """One job's fresh record (a ``describe`` reply) in place: its row
@@ -658,12 +734,13 @@ class JobTableModel(QAbstractTableModel):
             if key == "source_changed" and job.get("source_changed"):
                 return QColor(ERR_TEXT)
             if key == "state":
-                return QColor(_STATE_COLOR.get(state, theme.FG))
+                return QColor(theme.FG_MUTED if gray_no_file(job)
+                              else _STATE_COLOR.get(state, theme.FG))
             if (key == "est" and self.text(job, key)) or state in _MUTED_STATES:
                 return QColor(theme.FG_MUTED)
             return QColor(theme.FG)
         if role == Qt.ItemDataRole.BackgroundRole:
-            tint = ROW_TINT.get(state)
+            tint = ROW_TINT["no_file"] if gray_no_file(job) else ROW_TINT.get(state)
             if tint is None and state == "queued":
                 tint = WARM_TINT.get(str((job.get("warm") or {}).get("state") or ""))
             return QColor(*tint) if tint else None
@@ -682,9 +759,8 @@ class JobTableModel(QAbstractTableModel):
         return [j for j in self._all if j.get("state") == "queued"]
 
     def filter_counts(self) -> dict[str, int]:
-        """Rows each filter would show: ``{"all": n, "pending": m}``."""
-        return {"all": len(self._all),
-                "pending": sum(1 for j in self._all if j.get("state") not in ENDED)}
+        """Rows each filter would show: ``{"all": n, "last": k, "pending": m}``."""
+        return {mode: len(self._shown(mode)) for mode in FILTERS}
 
     def position_text(self, job: dict) -> str:
         """1-based place in the queue ("slot" for the job in it): the server's
@@ -709,12 +785,16 @@ class JobTableModel(QAbstractTableModel):
             return str(job.get("id", ""))
         if key == "state":
             s = str(job.get("state") or "")
-            if job.get("cancel") and s in IN_SLOT:
+            if job.get("kill") and s in IN_SLOT:
+                s += " (killed)"
+            elif job.get("cancel") and s in IN_SLOT:
                 s += " (cancel asked)"
             elif job.get("paused") and s == "queued":
                 s += " (paused)"
             elif s == "queued" and warm_text(job):
                 s += f" ({warm_text(job)})"
+            elif s in ENDED and s != "done" and ran_without_file(job):
+                s += " (no file)"
             return s
         if key == "owner":
             who = job.get("submitter")
@@ -774,6 +854,8 @@ class JobTableModel(QAbstractTableModel):
             return "\n".join(lines)
         if key == "state":
             lines = []
+            if ran_without_file(job):
+                lines.append("save_data=False: liveOD wrote no file for this run")
             if job.get("reason"):
                 lines.append(str(job["reason"]))
             outcome = job.get("outcome") or {}
@@ -786,6 +868,10 @@ class JobTableModel(QAbstractTableModel):
             if isinstance(cancel, dict):
                 lines.append(f"cancel asked by {cancel.get('by')} at {_clock(cancel.get('at'), True)}"
                              + (" (Abort sent)" if cancel.get("abort_sent") else ""))
+            kill = job.get("kill")
+            if isinstance(kill, dict):
+                lines.append(f"force-killed by {kill.get('by')} at {_clock(kill.get('at'), True)}: "
+                             f"{kill.get('note')}")
             if job.get("paused"):
                 lines.append(f"paused by {job.get('paused_by') or '?'}"
                              + (f" since {_clock(job['paused_since'])}"
@@ -1171,7 +1257,12 @@ class RunQueuePanel(QWidget):
 
         #: the table's filter (:data:`FILTERS`)
         saved_filter = self._setting("filter")
-        self.filter = saved_filter if saved_filter in FILTERS else "all"
+        self.filter = saved_filter if saved_filter in FILTERS else DEFAULT_FILTER
+        #: ended jobs the "last" filter shows
+        try:
+            self.last_n = max(1, int(self._setting("last_n") or DEFAULT_LAST_N))
+        except (TypeError, ValueError):
+            self.last_n = DEFAULT_LAST_N
         #: scroll to the bottom when a list brings a new job (default on)
         saved_follow = self._setting("follow_new")
         self.follow_new = (True if saved_follow in (None, "")
@@ -1200,19 +1291,22 @@ class RunQueuePanel(QWidget):
         self.counts.setWordWrap(False)
         top.addWidget(self.counts)
         top.addSpacing(8)
-        self.filter_group = QButtonGroup(self)
-        self.filter_group.setExclusive(True)
-        self.filter_buttons: dict[str, QToolButton] = {}
+        self.filter_combo = QComboBox()
+        self.filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         for name in FILTERS:
-            b = QToolButton()
-            b.setCheckable(True)
-            b.setAutoRaise(True)
-            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            b.setChecked(name == self.filter)
-            b.clicked.connect(lambda _=False, n=name: self.set_filter(n))
-            self.filter_group.addButton(b)
-            self.filter_buttons[name] = b
-            top.addWidget(b)
+            self.filter_combo.addItem(_FILTER_TITLES[name], name)
+        self.filter_combo.setCurrentIndex(FILTERS.index(self.filter))
+        self.filter_combo.activated.connect(
+            lambda i: self.set_filter(self.filter_combo.itemData(i)))
+        top.addWidget(self.filter_combo)
+        self.last_spin = QSpinBox()
+        self.last_spin.setRange(1, 999)
+        self.last_spin.setValue(self.last_n)
+        self.last_spin.setToolTip("How many ended jobs the Last filter shows (with every job "
+                                  "not ended)")
+        self.last_spin.valueChanged.connect(self.set_last_n)
+        top.addWidget(self.last_spin)
         self.follow_button = QToolButton()
         self.follow_button.setText("Follow")
         self.follow_button.setCheckable(True)
@@ -1265,7 +1359,7 @@ class RunQueuePanel(QWidget):
 
         # the jobs
         self.model = JobTableModel(self)
-        self.model.set_show_ended(self.filter == "all")
+        self.model.set_mode(self.filter, self.last_n)
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1302,8 +1396,10 @@ class RunQueuePanel(QWidget):
         self.table.selectionModel().selectionChanged.connect(self._on_selection)
         self.table.doubleClicked.connect(lambda _i: self.show_log())
         self.table.setToolTip("Right-click a job for its actions (log, source, run again, "
-                              "edit, move, remove). Del: remove the selected queued jobs; "
-                              "Enter: log; Ctrl+Up / Ctrl+Down: move.")
+                              "edit, move, remove). Ctrl / Shift-click selects several: run "
+                              "again, move to top / bottom, remove and copy act on all. Del: "
+                              "remove the selected queued jobs; Enter: log; Ctrl+Up / "
+                              "Ctrl+Down: move.")
         for keys, slot in ((QKeySequence.StandardKey.Delete, self.remove_selected),
                            (QKeySequence(Qt.Key.Key_Return), self.show_log),
                            (QKeySequence(Qt.Key.Key_Enter), self.show_log),
@@ -1481,14 +1577,28 @@ class RunQueuePanel(QWidget):
             self.schedule_list()
 
     def set_filter(self, name: str) -> None:
-        """``"all"``: every listed job; ``"pending"``: queued and in the slot
-        (the ended ones hidden)."""
+        """``"all"``: every listed job; ``"last"``: the last N ended jobs
+        (:attr:`last_n`) and every job not ended; ``"pending"``: queued and
+        in the slot (the ended ones hidden)."""
         if name not in FILTERS:
             raise ValueError(f"filter must be one of {FILTERS}, not {name!r}")
         self.filter = name
-        self.filter_buttons[name].setChecked(True)
-        self.model.set_show_ended(name == "all")
+        if self.filter_combo.currentIndex() != FILTERS.index(name):
+            self.filter_combo.setCurrentIndex(FILTERS.index(name))
+        self.model.set_mode(name, self.last_n)
         self._put_settings({"filter": name})
+        self._after_filter()
+
+    def set_last_n(self, n: int) -> None:
+        """How many ended jobs the "last" filter shows."""
+        self.last_n = max(1, int(n))
+        if self.last_spin.value() != self.last_n:
+            self.last_spin.setValue(self.last_n)
+        self.model.set_mode(self.filter, self.last_n)
+        self._put_settings({"last_n": self.last_n})
+        self._after_filter()
+
+    def _after_filter(self) -> None:
         self._reselect()
         self._show_filter_counts()
         self.refresh_buttons()
@@ -1502,12 +1612,18 @@ class RunQueuePanel(QWidget):
 
     def _show_filter_counts(self) -> None:
         counts = self.model.filter_counts()
-        for name, b in self.filter_buttons.items():
-            b.setText(f"{name.capitalize()} {counts[name]}")
-        self.filter_buttons["all"].setToolTip(
-            "Every job the server listed: ended ones too (saved green, failed red)")
-        self.filter_buttons["pending"].setToolTip("Only jobs that have not ended: queued, and "
-                                                  "the one in the slot")
+        tips = {"all": "Every job the server listed: ended ones too (saved green, failed red, "
+                       "no file gray)",
+                "last": "The last N ended jobs (N: the box beside) and every job not ended",
+                "pending": "Only jobs that have not ended: queued, and the one in the slot"}
+        for i, name in enumerate(FILTERS):
+            text = (_FILTER_TITLES[name] if name == "last"
+                    else f"{_FILTER_TITLES[name]} {counts[name]}")
+            if self.filter_combo.itemText(i) != text:
+                self.filter_combo.setItemText(i, text)
+            self.filter_combo.setItemData(i, tips[name], Qt.ItemDataRole.ToolTipRole)
+        self.filter_combo.setToolTip(f"{tips[self.filter]} -- {counts[self.filter]} shown")
+        self.last_spin.setVisible(self.filter == "last")
 
     # -- the summary --------------------------------------------------------------------------
 
@@ -1626,6 +1742,18 @@ class RunQueuePanel(QWidget):
         jobs = [self.model.data(self.model.index(r, 0), Qt.ItemDataRole.UserRole) for r in rows]
         return [j for j in jobs if isinstance(j, dict)]
 
+    def batch_jobs(self, job: dict | None = None) -> list[dict]:
+        """The jobs a batch action acts on: the selection, when ``job`` (the
+        row clicked; default the selected one) is in it; else ``job`` alone."""
+        job = job if job is not None else self.selected_job()
+        selected = self.selected_jobs()
+        if job is None:
+            return selected
+        key = (job.get("id"), job.get("token"))
+        if any((j.get("id"), j.get("token")) == key for j in selected):
+            return selected
+        return [job]
+
     def select_job(self, job_id) -> bool:
         row = self.model.row_of(job_id)
         if row < 0:
@@ -1661,7 +1789,8 @@ class RunQueuePanel(QWidget):
         """``(enabled, tooltip)`` of a job action for ``job`` (default: the
         selected one).  Kinds: ``log``, ``source``, ``again``, ``again_next``,
         ``edit``, ``up`` / ``down`` / ``top`` / ``bottom``, ``remove`` (the
-        selected queued jobs), ``abort`` (the job in the slot), ``copy``."""
+        selected queued jobs), ``abort`` (the job in the slot), ``kill`` (a
+        launching or running job's processes), ``copy``."""
         job = job if job is not None else self.selected_job()
         live = self.reachable and self.has_queue
         if job is None:
@@ -1677,9 +1806,12 @@ class RunQueuePanel(QWidget):
         if why_not:
             return False, why_not
         if kind in ("again", "again_next"):
-            return bool(job.get("path")), ("Queue the same file again as a new job" if
-                                           kind == "again" else
-                                           "Queue the same file again, ahead of every queued job")
+            jobs = [j for j in self.batch_jobs(job) if j.get("path")]
+            n = len(jobs)
+            what = "the same file again as a new job" if n <= 1 else \
+                f"the {n} selected jobs' files again as new jobs, in table order"
+            return bool(jobs), ("Queue " + what if kind == "again" else
+                                "Queue " + what + ", ahead of every queued job")
         if kind == "remove":
             queued = [j for j in self.selected_jobs() or [job] if j.get("state") == "queued"]
             return (bool(queued), "Take the selected queued jobs out of the queue (asks first)"
@@ -1689,7 +1821,17 @@ class RunQueuePanel(QWidget):
                 return False, f"it is {state}: no run to abort"
             if job.get("cancel"):
                 return False, "its cancel has been asked for; the run ends at its next shot"
+            if ran_without_file(job):
+                return True, "Stop its run at the next shot (save_data=False: it has no file)"
             return True, "Stop its run at the next shot: liveOD DISCARDS the run's data file"
+        if kind == "kill":
+            if not self.supported(KILL_ACTION):
+                return False, "this monitor server cannot force-kill jobs (older code)"
+            if state not in ("launching", "running"):
+                return False, f"it is {state}: no process to kill"
+            return True, ("Kill its processes now, when the Abort cannot work (liveOD closed, "
+                          "its terminal or process hung, the queue out of step): NO cleanup "
+                          "runs; liveOD keeps the run's file as it was")
         if kind == "edit":
             if not self.supported(EDIT_ACTION):
                 return False, "this monitor server cannot edit jobs (older code)"
@@ -1698,6 +1840,10 @@ class RunQueuePanel(QWidget):
         if kind in MOVE_WHERE:
             if not self.supported(MOVE_ACTION):
                 return False, "this monitor server cannot reorder jobs (older code)"
+            queued = [j for j in self.batch_jobs(job) if j.get("state") == "queued"]
+            if kind in ("top", "bottom") and len(queued) > 1:
+                return True, (f"Move the {len(queued)} selected queued jobs to the "
+                              f"{kind}, in their order")
             if state != "queued":
                 return False, "only a queued job can be moved"
             if move_request(job, kind, self.by, self.model.queued_in_order()) is None:
@@ -1773,6 +1919,12 @@ class RunQueuePanel(QWidget):
                 text += ("\n\nIts process was started ahead (warm: it prepares and compiles, "
                          "and takes nothing until the queue's GO); it is told to exit.")
             yes, no = "Cancel the job", "Keep it"
+        elif state in ("launching", "running") and ran_without_file(job):
+            title = f"Abort {job_name(job)}?"
+            text = (f"{job_name(job)} is {state} with save_data=False: liveOD writes no file "
+                    "for it.\n\nCancelling it sends liveOD's Abort (Reset) for its run: the run "
+                    "stops at its next shot.")
+            yes, no = "Abort the run", "Keep it running"
         elif state in ("launching", "running"):
             run = job.get("run_id")
             title = f"Abort {job_name(job)}?"
@@ -1802,9 +1954,61 @@ class RunQueuePanel(QWidget):
         self.runner.send(cancel_request(job, self.by), done)
         return True
 
+    def kill_selected(self, job: dict | None = None) -> bool:
+        """Force-kill the job's processes (asks first): :func:`kill_request`."""
+        job = job or self.selected_job()
+        ok, _ = self.action_state("kill", job) if job else (False, "")
+        if not ok:
+            return False
+        run = job.get("run_id")
+        text = (f"{job_name(job)} is {job.get('state')}"
+                + (f" (run {run})" if run else " (no run id yet)") + ".\n\n"
+                "Use this only when Abort run cannot work: liveOD closed, the experiment's "
+                "terminal or process hung, or the queue out of step with what runs.\n\n"
+                "The monitor server kills the experiment's process and everything under it. "
+                "NOTHING of the experiment's cleanup runs: coils, AOMs and shutters stay as the "
+                "run left them until the next run or the monitor sets them.\n\n"
+                "liveOD is told the run's process exited and leaves its file as it was: not "
+                "saved, not deleted.\n\n"
+                "Queued jobs go on launching afterwards; pause them first if they should wait.")
+        if not self.confirm(f"Force kill {job_name(job)}?", text,
+                            "Kill it (no cleanup)", "Don't kill"):
+            return False
+        what = f"force kill {job_name(job)}"
+
+        def done(reply: dict) -> None:
+            if reply.get("status") == "ok":
+                self.say(f"{what}: {reply.get('note') or 'done'}; the job ends at the queue's "
+                         "next check", WARN_TEXT)
+                self.schedule_list()
+                self.refresh_buttons()
+                return
+            self._done(what, on_unknown=KILL_ACTION)(reply)
+        self.runner.send(kill_request(job, self.by), done)
+        return True
+
     def move_selected(self, where: str) -> bool:
+        """Move the selected job ``where``; to the top / bottom, every selected
+        queued job, keeping their order (top: the last sent first)."""
+        if not self.supported(MOVE_ACTION):
+            return False
+        order = self.model.queued_in_order()
+        if where in ("top", "bottom"):
+            picked = {(j.get("id"), j.get("token")) for j in self.selected_jobs()
+                      if j.get("state") == "queued"}
+            jobs = [j for j in order if (j.get("id"), j.get("token")) in picked]
+            if len(jobs) > 1:
+                if where == "top":
+                    jobs.reverse()
+                requests = [(j, {"type": "run_queue", "action": MOVE_ACTION, "id": j.get("id"),
+                                 "token": j.get("token"), "owner": OWNER, "by": self.by,
+                                 "to_index": 0 if where == "top" else len(order)})
+                            for j in jobs]
+                self._send_batch(requests, f"move {len(jobs)} jobs to the {where}",
+                                 on_unknown=MOVE_ACTION)
+                return True
         job = self.selected_job()
-        if job is None or job.get("state") != "queued" or not self.supported(MOVE_ACTION):
+        if job is None or job.get("state") != "queued":
             return False
         request = move_request(job, where, self.by, self.model.queued_in_order())
         if request is None:
@@ -1867,7 +2071,7 @@ class RunQueuePanel(QWidget):
             QGuiApplication.clipboard().setText(text)
         except Exception:                             # noqa: BLE001
             pass
-        self.say(f"copied {what}: {text}")
+        self.say(f"copied {what}: " + text.replace("\n", "; "))
         return text
 
     def remove_selected(self) -> bool:
@@ -1922,52 +2126,88 @@ class RunQueuePanel(QWidget):
         self.schedule_list()
         self.refresh_buttons()
 
-    def run_again(self, job: dict | None = None, first: bool = False) -> bool:
-        """The same file as a new job (asks first): :func:`again_request`.
-        ``first``: as the next job.  The question says when this PC's copy of
-        the file differs from what the job ran, or cannot be read."""
-        job = job or self.selected_job()
-        ok, _ = self.action_state("again", job) if job else (False, "")
-        if not ok:
-            return False
-        path = str(job.get("path"))
-        sha = local_sha256(path)
-        lines = [path]
-        if job.get("argv"):
-            lines.append("argv: " + join_argv(job["argv"]))
-        lines.append("")
-        lines.append("It goes in as the next job, ahead of every queued job." if first else
-                     "It goes in as a person's job: ahead of agents' queued jobs, behind other "
-                     "people's.")
-        if sha is None:
-            lines.append("\nThis PC cannot read the file, so its copy cannot be compared with "
-                         "the queue machine's: the queue refuses it unless this PC is that "
-                         "machine.")
-        elif job.get("sha256") and sha != job.get("sha256"):
-            lines.append(f"\nThe file has CHANGED since {job_name(job)} was submitted: the "
-                         "current version runs.")
-        dropped = not_carried_over(job)
-        if dropped:
-            lines.append("\nNot carried over: " + "; ".join(dropped) + ".")
-        if not self.confirm(f"Run {job.get('label') or 'it'} again?", "\n".join(lines),
-                            "Queue it", "Cancel"):
+    def run_again(self, job: dict | list | None = None, first: bool = False) -> bool:
+        """The same file as a new job, at once (no question):
+        :func:`again_request`.  ``job``: one job, a list of them, or None for
+        the selected ones (:meth:`batch_jobs`).  Several go in in table
+        order; ``first``: as the next jobs (inserted last first, so they run
+        in table order).  The message line says when this PC's copy of a file
+        differs from what the job ran or cannot be read, and what is not
+        carried over."""
+        if isinstance(job, list):
+            jobs = job
+        else:
+            jobs = self.batch_jobs(job) if job is None else [job]
+        jobs = [j for j in jobs if isinstance(j, dict) and j.get("path")]
+        if not jobs or not self.action_state("again", jobs[0])[0]:
             return False
         host = socket.gethostname()
-        what = f"run {job_name(job)} again" + (" next" if first else "")
+        notes, requests = [], []
+        for j in jobs:
+            sha = local_sha256(str(j.get("path")))
+            if sha is None:
+                notes.append(f"{job_name(j)}: this PC cannot read its file (the queue refuses "
+                             "it unless this PC is the queue machine)")
+            elif j.get("sha256") and sha != j.get("sha256"):
+                notes.append(f"{job_name(j)}: its file has CHANGED since it was submitted "
+                             "(the current version runs)")
+            dropped = not_carried_over(j)
+            if dropped:
+                notes.append(f"{job_name(j)}: not carried over: " + "; ".join(dropped))
+            requests.append((j, again_request(j, self.by, first=first, client_sha256=sha,
+                                              client_host=host)))
+        if first:
+            requests.reverse()
+        n = len(jobs)
+        what = ((f"run {job_name(jobs[0])} again" if n == 1 else f"run {n} jobs again")
+                + (" next" if first else ""))
 
-        def done(reply: dict) -> None:
-            if reply.get("status") == "ok" and reply.get("ids"):
-                ids = ", ".join(str(i) for i in reply["ids"])
-                self.say(f"{what}: queued as job {ids}"
-                         + (" (placed behind person jobs)" if reply.get("clamped") else ""),
-                         WARN_TEXT if reply.get("clamped") else OK_TEXT)
-                self.schedule_list()
-                self.refresh_buttons()
-                return
-            self._done(what)(reply)
-        self.runner.send(again_request(job, self.by, first=first, client_sha256=sha,
-                                       client_host=host), done)
+        def report(results: list) -> str:
+            ids = [i for _, reply in results if reply.get("status") == "ok"
+                   for i in (reply.get("ids") or [])]
+            if first:
+                ids.reverse()                         # sent last first
+            text = (f"queued as job{'s' if len(ids) > 1 else ''} "
+                    + ", ".join(map(str, ids))) if ids else ""
+            if any(reply.get("clamped") for _, reply in results):
+                text += " (placed behind person jobs)"
+            return text
+        self._send_batch(requests, what, notes=notes, report=report)
         return True
+
+    def _send_batch(self, requests: list, what: str, *, on_unknown: str | None = None,
+                    notes: list | None = None, report=None) -> None:
+        """Send ``requests`` (``[(job, request), ...]``) in order; when every
+        reply is in, one message: ``report(results)`` (or "done"), then the
+        refusals by job, then ``notes``."""
+        results: list = []
+        n = len(requests)
+
+        def done_for(job: dict) -> Callable[[dict], None]:
+            def done(reply: dict) -> None:
+                results.append((job, reply))
+                if len(results) < n:
+                    return
+                ok = [r for r in results if r[1].get("status") == "ok"]
+                bad = [r for r in results if r[1].get("status") != "ok"]
+                if on_unknown is not None and any(is_unknown_request(r) for _, r in bad):
+                    self.unsupported.add(on_unknown)
+                parts = []
+                if ok:
+                    parts.append((report(results) if report else "") or "done")
+                parts += [f"{job_name(j)}: {r.get('msg')}" for j, r in bad]
+                color = (ERR_TEXT if bad else
+                         WARN_TEXT if notes or any(r.get("clamped") for _, r in ok) else OK_TEXT)
+                self.say(f"{what}: " + "; ".join(parts + list(notes or [])), color)
+                if ok:
+                    for _, reply in ok[-1:]:
+                        if isinstance(reply.get("run_queue"), dict):
+                            self.set_info(reply["run_queue"], ask_list=False)
+                    self.schedule_list()
+                self.refresh_buttons()
+            return done
+        for job, request in requests:
+            self.runner.send(request, done_for(job))
 
     def _source_note(self, job: dict) -> str:
         """"" or why the file shown may not be what the job ran."""
@@ -2061,29 +2301,39 @@ class RunQueuePanel(QWidget):
         menu.addAction(act)
         acts["view_source"] = act
         menu.addSeparator()
-        add(menu, "again", "Run again...", lambda: self.run_again(job))
-        add(menu, "again_next", "Run again next...", lambda: self.run_again(job, first=True))
+        batch = self.batch_jobs(job)
+        n_again = sum(1 for j in batch if j.get("path"))
+        many = f" {n_again} jobs" if n_again > 1 else ""
+        add(menu, "again", f"Run{many} again", lambda: self.run_again(batch))
+        add(menu, "again_next", f"Run{many} again next",
+            lambda: self.run_again(batch, first=True))
         menu.addSeparator()
         state = job.get("state")
-        if state == "queued":
-            add(menu, "edit", "Edit...", lambda: self.edit_selected())
-            move = menu.addMenu("Move")
-            move.setToolTipsVisible(True)
-            for where, text, keys in (("up", "Up", "Ctrl+Up"), ("down", "Down", "Ctrl+Down"),
-                                      ("top", "To the top (next)", ""),
-                                      ("bottom", "To the bottom", "")):
-                add(move, where, text, lambda w=where: self.move_selected(w), keys)
-            n = sum(1 for j in self.selected_jobs() if j.get("state") == "queued")
-            add(menu, "remove", f"Remove {n} jobs from the queue..." if n > 1 else
-                "Remove from queue...", self.remove_selected, "Del")
-        elif state in IN_SLOT:
-            add(menu, "abort", "Abort run (discards its data)...", self.cancel_selected)
+        n_queued = sum(1 for j in batch if j.get("state") == "queued")
+        if state == "queued" or n_queued:
+            if state == "queued":
+                add(menu, "edit", "Edit...", lambda: self.edit_selected())
+            if state == "queued" or n_queued > 1:
+                move = menu.addMenu(f"Move {n_queued} jobs" if n_queued > 1 else "Move")
+                move.setToolTipsVisible(True)
+                moves = (("top", "To the top (next)", ""), ("bottom", "To the bottom", ""))
+                if n_queued == 1:
+                    moves = (("up", "Up", "Ctrl+Up"), ("down", "Down", "Ctrl+Down")) + moves
+                for where, text, keys in moves:
+                    add(move, where, text, lambda w=where: self.move_selected(w), keys)
+            add(menu, "remove", f"Remove {n_queued} jobs from the queue..." if n_queued > 1
+                else "Remove from queue...", self.remove_selected, "Del")
+        if state in IN_SLOT:
+            add(menu, "abort", "Abort run (no file)..." if ran_without_file(job) else
+                "Abort run (discards its data)...", self.cancel_selected)
+            if state != "ending":
+                add(menu, "kill", "Force kill (no cleanup)...", lambda: self.kill_selected(job))
         menu.addSeparator()
         copy = menu.addMenu("Copy")
         commands = kq_commands(job)
         for kind, text in (("submit", "kq submit ... (the same job again)"),
                            ("tail", "kq tail <id> -f"), ("show", "kq show <id>"),
-                           ("cancel", "kq cancel <id>")):
+                           ("cancel", "kq cancel <id>"), ("kill", "kq kill <id>")):
             add(copy, f"copy_{kind}", text,
                 lambda k=kind: self.copy_text(commands[k], f"kq {k}"))
         add(copy, "copy_path", "File path",
@@ -2091,6 +2341,15 @@ class RunQueuePanel(QWidget):
         if job.get("run_id") not in (None, ""):
             add(copy, "copy_run", f"Run id ({job['run_id']})",
                 lambda: self.copy_text(str(job["run_id"]), "the run id"))
+        if len(batch) > 1:
+            copy.addSeparator()
+            paths = "\n".join(str(j.get("path") or "") for j in batch)
+            add(copy, "copy_paths", f"File paths ({len(batch)} jobs)",
+                lambda: self.copy_text(paths, f"{len(batch)} paths"))
+            runs = [str(j["run_id"]) for j in batch if j.get("run_id") not in (None, "")]
+            if runs:
+                add(copy, "copy_runs", f"Run ids ({len(runs)})",
+                    lambda: self.copy_text(" ".join(runs), f"{len(runs)} run ids"))
         return menu, acts
 
     def _context_menu(self, pos) -> None:
@@ -2299,4 +2558,5 @@ __all__ = ["COLUMNS", "DEFAULT_HIDDEN", "EditJobDialog", "FILTERS", "JobLogWindo
            "JobTableModel", "QueueSummaryLine", "RunQueuePanel", "SourceWindow", "again_request",
            "cancel_request", "chip_css", "derived_waiting", "edit_request", "find_editor",
            "hold_request", "kq_commands", "list_request", "move_request", "not_carried_over",
-           "order_jobs", "pause_request", "release_request", "resume_request", "tail_request"]
+           "order_jobs", "pause_request", "ran_without_file", "release_request",
+           "resume_request", "tail_request"]

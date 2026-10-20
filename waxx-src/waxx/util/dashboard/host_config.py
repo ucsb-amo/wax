@@ -143,10 +143,24 @@ def load_layout_overrides(host_ip: Optional[str], kind: Optional[str] = None) ->
     return merged
 
 
+def load_auto_layout_hints() -> dict:
+    """Return the layout module's ``AUTO_LAYOUT_HINTS`` (``{panel_id: {tier,
+    family, min, pref, areas}}``, see :mod:`layout_solver`); ``{}`` if none."""
+    if not _LAYOUT_MODULE:
+        return {}
+    try:
+        mod = importlib.import_module(_LAYOUT_MODULE)
+    except Exception as exc:
+        _LOG.debug("layout module %s not importable: %r", _LAYOUT_MODULE, exc)
+        return {}
+    return dict(getattr(mod, "AUTO_LAYOUT_HINTS", {}) or {})
+
+
 __all__ = [
     "configure",
     "resolve_host_ip",
     "hostname",
     "load_autostart_set",
     "load_layout_overrides",
+    "load_auto_layout_hints",
 ]

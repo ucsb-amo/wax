@@ -43,16 +43,17 @@ import logging
 import platform
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional
 
-from PyQt6.QtCore import QByteArray, QEvent, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
     QColor,
     QDesktopServices,
+    QFont,
     QIcon,
     QKeySequence,
     QPainter,
@@ -62,19 +63,23 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QStatusBar,
     QToolBar,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
-from waxx.util.dashboard import theme
+from waxx.util.dashboard import layout_solver, theme
 from waxx.util.dashboard.layout_picker import LayoutPicker
 from waxx.util.dashboard.layout_store import DEFAULT_NAME, LayoutSnapshot, LayoutStore
 from waxx.util.dashboard.logging_setup import active_log_dir, pop_boot_warnings
@@ -93,6 +98,8 @@ _AREA_MAP = {
     "top": Qt.DockWidgetArea.TopDockWidgetArea,
     "bottom": Qt.DockWidgetArea.BottomDockWidgetArea,
 }
+
+_QWIDGETSIZE_MAX = 16777215
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +355,12 @@ class DashboardMainWindow(QMainWindow):
 
         # Pop-out bookkeeping.
         self._popped: dict[str, PanelWindow] = {}
+        # Panels being dragged by their header: once the button is released
+        # with the panel still floating (dropped outside a dock spot), it pops out.
+        self._dragged: set[_PanelDockBase] = set()
+        self._drag_out_timer = QTimer(self)
+        self._drag_out_timer.setInterval(30)
+        self._drag_out_timer.timeout.connect(self._check_drag_out)
 
         # Layout bookkeeping.
         self._settings = QSettings(settings_org, "dashboard")
@@ -363,6 +376,14 @@ class DashboardMainWindow(QMainWindow):
         self._applying_until = 0.0
         self._reapply_state: Optional[QByteArray] = None
         self._press_state: Optional[bytes] = None
+        self._auto_hints: dict = {}
+        self._auto_report = ""
+        # Docks shown / hidden / moved: re-decide the central widget's height
+        # policy once the burst of signals is over.
+        self._center_policy_timer = QTimer(self)
+        self._center_policy_timer.setSingleShot(True)
+        self._center_policy_timer.setInterval(0)
+        self._center_policy_timer.timeout.connect(self._update_center_policy)
 
         # Realization bookkeeping.
         self._realize_queue: deque[_PanelDockBase] = deque()
@@ -463,16 +484,19 @@ class DashboardMainWindow(QMainWindow):
     # Default layout
     # ------------------------------------------------------------------
 
-    def _place_default_layout(self) -> None:
+    def _place_default_layout(self, placements: Optional[list[PanelPlacement]] = None) -> None:
         """Add every dock according to its placement spec.
 
         Per area, in declaration order: each "dock" panel and each distinct
         "tab" group becomes its own dock, split from the previous one in that
         area; members of a tab group are stacked onto the group's first
-        panel.
+        panel.  *placements* (default: the declared ones) may name a subset
+        of the panels; it then leaves visibility to the caller.
         """
+        subset = placements is not None
+        placements = self._placements if placements is None else placements
         for area_name in ("left", "right", "top", "bottom"):
-            items = [pl for pl in self._placements if (pl.area if pl.area in _AREA_MAP else "right") == area_name]
+            items = [pl for pl in placements if (pl.area if pl.area in _AREA_MAP else "right") == area_name]
             if not items:
                 continue
             qarea = _AREA_MAP[area_name]
@@ -493,8 +517,33 @@ class DashboardMainWindow(QMainWindow):
             # Raise the first member of every tab stack.
             for first in group_first.values():
                 first.raise_()
+        if subset:
+            return
         for pl in self._placements:
             pl.panel.setVisible(pl.default_visible)
+        self._update_center_policy()
+
+    def _update_center_policy(self) -> None:
+        """Let the empty central widget grow in height only while a left or
+        right dock is on screen.
+
+        The center row of a QMainWindow is the left area, the central widget
+        and the right area.  With the central widget held at 0 x 0, Qt keeps
+        that row at its minimum height and gives every spare pixel to the top
+        and bottom areas, so side docks never get taller than their minimum
+        (resizeDocks cannot change that).  Free in height, the row can take
+        the height it is given -- but with no side dock shown it would be an
+        empty gap, so then it stays 0 x 0.  Width stays 0 either way.
+        """
+        center = self.centralWidget()
+        if center is None:
+            return
+        side_areas = (_AREA_MAP["left"], _AREA_MAP["right"])
+        side = any(not p.isHidden() and not p.is_popped_out() and self.dockWidgetArea(p) in side_areas
+                   for p in self._panels)
+        want = _QWIDGETSIZE_MAX if side else 0
+        if center.maximumHeight() != want:
+            center.setMaximumSize(0, want)
 
     def _reset_to_default_layout(self) -> None:
         """Live re-application of the placement spec (no restart needed)."""
@@ -519,6 +568,210 @@ class DashboardMainWindow(QMainWindow):
         self.statusBar().showMessage("Layout reset to defaults", 3000)
 
     # ------------------------------------------------------------------
+    # Auto-arrange (layout_solver)
+    # ------------------------------------------------------------------
+
+    #: Search budget of one auto-arrange (layouts tried, seconds).
+    AUTO_ARRANGE_EVALS = 20000
+    AUTO_ARRANGE_MAX_S = 3.0
+
+    def set_auto_layout_hints(self, hints: Optional[dict]) -> None:
+        """Per-panel ``{tier, family, min, pref, areas}`` for Layout -> Auto-arrange
+        (see :mod:`layout_solver`).  Panels without an entry count as "status"."""
+        self._auto_hints = dict(hints or {})
+
+    def _dock_region_size(self) -> tuple[int, int]:
+        """The width x height the dock areas share: the window less its menu
+        bar, top / bottom toolbars and status bar."""
+        w, h = self.width(), self.height()
+        mb = self.menuBar()
+        if mb is not None and mb.isVisible():
+            h -= mb.height()
+        for tb in self.findChildren(QToolBar):
+            if tb.parent() is self and tb.isVisible():
+                if self.toolBarArea(tb) in (Qt.ToolBarArea.TopToolBarArea, Qt.ToolBarArea.BottomToolBarArea):
+                    h -= tb.height()
+                else:
+                    w -= tb.width()
+        sb = self.statusBar()
+        if sb is not None and sb.isVisible():
+            h -= sb.height()
+        return max(1, w), max(1, h)
+
+    def _auto_panels(self) -> list[layout_solver.PanelInfo]:
+        """The panels docked and shown (popped-out and closed ones are left
+        alone), with sizes from the hints raised to what Qt reports for every
+        built panel."""
+        out = []
+        for pl in self._placements:
+            p = pl.panel
+            if p.isHidden() or p.is_popped_out():
+                continue
+            hint = self._auto_hints.get(p.panel_id, {})
+            mw, mh = (int(v) for v in hint.get("min", (0, 0)))
+            pw, ph = (int(v) for v in hint.get("pref", (0, 0)))
+            if p.is_realized():
+                ms, mn, sh = p.minimumSizeHint(), p.minimumSize(), p.sizeHint()
+                mw, mh = max(mw, ms.width(), mn.width()), max(mh, ms.height(), mn.height())
+                if not hint.get("pref"):
+                    pw, ph = sh.width(), sh.height()
+            if mw <= 0 or mh <= 0:
+                mw, mh = max(mw, 320), max(mh, 200)
+            if not pw or not ph:
+                pw, ph = int(mw * 1.3), int(mh * 1.3)
+            out.append(layout_solver.PanelInfo(
+                id=p.panel_id, label=p.label, min_size=(mw, mh), pref_size=(pw, ph),
+                tier=hint.get("tier", "status"), family=hint.get("family", ""),
+                areas=tuple(hint.get("areas", layout_solver.AREAS)),
+            ))
+        return out
+
+    def _declared_slots(self, ids: set[str]) -> list[tuple[str, list[str]]]:
+        """The declared placement as solver slots (a starting point for the search)."""
+        slots: dict[tuple, tuple[str, list[str]]] = {}
+        for pl in self._placements:
+            pid = pl.panel.panel_id
+            if pid not in ids:
+                continue
+            area = pl.area if pl.area in _AREA_MAP else "right"
+            key = (area, "tab", pl.tab_group) if pl.placement == "tab" else (area, "dock", pid)
+            slots.setdefault(key, (area, []))[1].append(pid)
+        return list(slots.values())
+
+    def _solve_layout(self, width: int, height: int) -> Optional[layout_solver.LayoutSolution]:
+        panels = self._auto_panels()
+        if not panels:
+            self.statusBar().showMessage("Auto-arrange: no docked panel is shown", 4000)
+            return None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return layout_solver.solve(
+                panels, width, height, initial=self._declared_slots({p.id for p in panels}),
+                max_evals=self.AUTO_ARRANGE_EVALS, time_budget_s=self.AUTO_ARRANGE_MAX_S,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _auto_arrange(self, fill_screen: bool = False) -> None:
+        """Layout -> Auto-arrange: re-dock the shown panels to suit the window
+        (maximized first when *fill_screen*)."""
+        if fill_screen and not self.isMaximized():
+            self.showMaximized()
+            QTimer.singleShot(300, self._auto_arrange_now)   # let the maximize land first
+            return
+        self._auto_arrange_now()
+
+    def _auto_arrange_now(self) -> None:
+        w, h = self._dock_region_size()
+        sol = self._solve_layout(w, h)
+        if sol is None:
+            return
+        self._auto_report = sol.render_ascii(100) + "\n\n" + sol.report()
+        _LOG.info("auto-arrange for %dx%d:\n%s", w, h, self._auto_report)
+        self._apply_solution(sol)
+        if sol.fits:
+            self.statusBar().showMessage(
+                f"Auto-arranged — {sol.summary()}.  Layout ▸ Save as new layout… keeps it.", 15000)
+        else:
+            QMessageBox.warning(
+                self, "Auto-arrange",
+                "The shown panels do not fit this window even with every stack used:\n\n"
+                f"{sol.summary()}\n\nClose a panel or pop one out, or use a larger window, "
+                "then auto-arrange again.  (Layout ▸ Auto-arrange ▸ Last report shows the details.)")
+
+    def _apply_solution(self, sol: layout_solver.LayoutSolution) -> None:
+        """Put a solver layout on screen: re-dock the panels it names, then size the docks."""
+        plan = sol.placements()
+        placements = [
+            replace(self._placement_of[pid], area=cfg["dock_area"], placement=cfg["placement"],
+                    tab_group=cfg["tab_group"])
+            for pid, cfg in plan.items() if pid in self._placement_of
+        ]
+        self._applying_until = time.monotonic() + 1.5
+        for pl in placements:
+            try:
+                pl.panel.setFloating(False)
+                self.removeDockWidget(pl.panel)
+            except Exception:
+                pass
+        self._place_default_layout(placements)
+        for pl in placements:
+            pl.panel.show()
+        self._update_center_policy()
+        for slot in sol.slots:
+            self._by_id[slot.raised].raise_()
+        for pl in placements:
+            if not pl.panel.visibleRegion().isEmpty() or pl.panel.panel_id in {s.raised for s in sol.slots}:
+                self._ensure_realized(pl.panel)
+        # Qt lays the docks out on the next pass; size them after it.
+        QTimer.singleShot(0, lambda s=sol: self._resize_to_solution(s))
+        self._last_loaded_layout = None
+        self._layouts.active = ""
+        self._layouts.modified = False
+        self._refresh_layout_picker()
+        self._mark_layout_dirty()
+
+    def _resize_to_solution(self, sol: layout_solver.LayoutSolution) -> None:
+        """Every slot's size in one resizeDocks call per orientation (separate
+        calls per area undo each other; checked offscreen, worst slot ~16 px off)."""
+        self._applying_until = time.monotonic() + 1.0
+        self._update_center_policy()
+        docks = [self._by_id[s.raised] for s in sol.slots]
+        try:
+            self.resizeDocks(docks, [max(1, s.content_h) for s in sol.slots], Qt.Orientation.Vertical)
+            self.resizeDocks(docks, [max(1, s.w) for s in sol.slots], Qt.Orientation.Horizontal)
+        except Exception:
+            _LOG.exception("auto-arrange: resizing the docks failed")
+        # Bodies still being built resize their docks; put this back once they exist.
+        if self._realize_queue:
+            self._reapply_state = self.saveState()
+        self._mark_layout_dirty()
+
+    def _preview_auto_layout(self) -> None:
+        """Layout -> Auto-arrange -> Preview for a display size: solve, show, apply nothing."""
+        screen = self.screen() or QApplication.primaryScreen()
+        size = screen.size() if screen is not None else None
+        default = f"{size.width()}x{size.height()}" if size is not None else "1920x1080"
+        text, ok = QInputDialog.getText(
+            self, "Auto-arrange preview",
+            "Display resolution, W x H (window chrome is subtracted; the panels\n"
+            "are the ones docked and shown here):", text=default)
+        if not ok:
+            return
+        try:
+            dw_, dh_ = (int(v) for v in text.lower().replace(" ", "").replace("×", "x").split("x"))
+        except ValueError:
+            QMessageBox.warning(self, "Auto-arrange preview", f"'{text}' is not W x H, e.g. 2560x1440.")
+            return
+        rw, rh = layout_solver.region_for_display(dw_, dh_)
+        sol = self._solve_layout(rw, rh)
+        if sol is not None:
+            self._show_text_dialog(f"Auto-arrange preview — {dw_}x{dh_} display",
+                                   sol.render_ascii(110) + "\n\n" + sol.report())
+
+    def _show_auto_report(self) -> None:
+        self._show_text_dialog("Auto-arrange — last report",
+                               self._auto_report or "No auto-arrange has run in this window yet.")
+
+    def _show_text_dialog(self, title: str, text: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        lay = QVBoxLayout(dlg)
+        view = QPlainTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        view.setFont(font)
+        view.setPlainText(text)
+        lay.addWidget(view)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dlg)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        dlg.resize(1000, 700)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
     # Per-panel wiring
     # ------------------------------------------------------------------
 
@@ -527,7 +780,9 @@ class DashboardMainWindow(QMainWindow):
         hdr.popout_clicked.connect(lambda _c=False, p=panel: self.toggle_popout(p))
         panel.visibilityChanged.connect(lambda vis, p=panel: self._on_panel_visibility(p, vis))
         panel.dockLocationChanged.connect(lambda _a: self._note_user_layout_change())
-        panel.topLevelChanged.connect(lambda _f: self._mark_layout_dirty())
+        panel.visibilityChanged.connect(lambda _v: self._center_policy_timer.start())
+        panel.dockLocationChanged.connect(lambda _a: self._center_policy_timer.start())
+        panel.topLevelChanged.connect(lambda f, p=panel: self._on_panel_top_level(p, f))
         # Dock sizes change without any signal (splitter drags, a neighbour
         # shown or hidden): watch the resize events so they are saved too.
         panel.installEventFilter(self)
@@ -624,6 +879,7 @@ class DashboardMainWindow(QMainWindow):
         picker.delete_requested.connect(self._delete_layout)
         picker.import_requested.connect(self._load_layout_from_file)
         picker.export_requested.connect(self._save_layout_to_file)
+        picker.auto_arrange_requested.connect(lambda fill: self._auto_arrange(fill_screen=fill))
         tb.addWidget(picker)
         self._layout_picker = picker
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
@@ -899,11 +1155,12 @@ class DashboardMainWindow(QMainWindow):
             if state is not None and not self.restoreState(state):
                 _LOG.warning("restoreState rejected the saved dock state")
                 return False
-            # Panels are no longer floatable; a layout saved with a floating
-            # panel would otherwise leave it with no way back into the dock.
+            # Panels never stay floating (a drag out pops them out); a layout
+            # saved with a floating panel would otherwise strand it there.
             for panel in self._panels:
                 if panel.isFloating():
                     panel.setFloating(False)
+            self._update_center_policy()
             return True
         finally:
             self._settings.remove(pending)
@@ -1137,6 +1394,24 @@ class DashboardMainWindow(QMainWindow):
         menu.addAction(add)
         self._revert_act.setEnabled(bool(active) or self._last_loaded_layout is not None)
         menu.addAction(self._revert_act)
+        auto = menu.addMenu("Auto-arrange")
+        auto.setToolTipsVisible(True)
+        fit = QAction("Fit this window", auto)
+        fit.setToolTip("Re-dock the shown panels for the window's present size: main panels "
+                       "first, status panels stacked behind tabs when space runs out")
+        fit.triggered.connect(lambda _c=False: self._auto_arrange(fill_screen=False))
+        auto.addAction(fit)
+        fill = QAction("Fit this screen (maximize)", auto)
+        fill.triggered.connect(lambda _c=False: self._auto_arrange(fill_screen=True))
+        auto.addAction(fill)
+        auto.addSeparator()
+        prev = QAction("Preview for a display size…", auto)
+        prev.triggered.connect(self._preview_auto_layout)
+        auto.addAction(prev)
+        rep = QAction("Last report", auto)
+        rep.setEnabled(bool(self._auto_report))
+        rep.triggered.connect(self._show_auto_report)
+        auto.addAction(rep)
         menu.addSeparator()
         manage = menu.addMenu("Manage layouts")
         for name in names:
@@ -1351,11 +1626,32 @@ class DashboardMainWindow(QMainWindow):
         else:
             self.pop_out(panel)
 
-    def pop_out(self, panel: _PanelDockBase, geometry: Optional[QByteArray] = None) -> None:
+    def _on_panel_top_level(self, panel: _PanelDockBase, floating: bool) -> None:
+        self._mark_layout_dirty()
+        # Qt floats a dock the moment its header is dragged; a programmatic
+        # float (restoreState) has no button held and is re-docked there.
+        if floating and QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._dragged.add(panel)
+            self._drag_out_timer.start()
+
+    def _check_drag_out(self) -> None:
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            return
+        # Released: Qt has already docked the panel if it was dropped on a
+        # dock spot (AnimatedDocks is off, so plugging is immediate).
+        self._drag_out_timer.stop()
+        dragged, self._dragged = self._dragged, set()
+        for panel in dragged:
+            if panel.isFloating() and not panel.is_popped_out():
+                self.pop_out(panel, rect=panel.frameGeometry())
+
+    def pop_out(self, panel: _PanelDockBase, geometry: Optional[QByteArray] = None,
+                rect: Optional[QRect] = None) -> None:
         """Move *panel* into its own top-level window (own taskbar button).
 
-        *geometry* places the window (a named layout's); by default it goes
-        where this panel's window was last.
+        *geometry* places the window (a named layout's), *rect* puts it where
+        a dragged-out panel was dropped (screen coordinates, kept on screen);
+        by default it goes where this panel's window was last.
         """
         if panel.is_popped_out():
             return
@@ -1372,7 +1668,14 @@ class DashboardMainWindow(QMainWindow):
         win = PanelWindow(panel, app_id=f"{self._app_id}.{panel.panel_id}",
                           title_prefix=f"{self.windowTitle().split(' - ')[0]} — ")
         geo = geometry if geometry is not None else             self._settings.value(self._layout_key(f"popped_geometry/{panel.panel_id}"))
-        if geo is not None:
+        if rect is not None:
+            screen = QApplication.screenAt(rect.center()) or self.screen() or QApplication.primaryScreen()
+            avail = screen.availableGeometry()
+            w, h = min(rect.width(), avail.width()), min(rect.height(), avail.height())
+            win.resize(w, h)
+            win.move(max(avail.left(), min(rect.left(), avail.right() - w)),
+                     max(avail.top(), min(rect.top(), avail.bottom() - h)))
+        elif geo is not None:
             try:
                 win.restoreGeometry(geo)
             except Exception:
@@ -1454,6 +1757,8 @@ class DashboardMainWindow(QMainWindow):
 
     def eventFilter(self, obj, ev):  # noqa: N802 - Qt API
         etype = ev.type()
+        if etype == QEvent.Type.MouseButtonDblClick and isinstance(obj, _PanelDockBase):
+            return True   # Qt would float a floatable dock on a header double-click
         if etype in (QEvent.Type.Resize, QEvent.Type.Move):
             if isinstance(obj, PanelWindow):
                 if not obj.isMinimized():
