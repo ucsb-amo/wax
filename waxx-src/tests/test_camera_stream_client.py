@@ -677,6 +677,7 @@ class TrigFakeStream(FakeStream):
         self._frames = []
         self._flock = threading.Lock()
         self._hw_idx = 0
+        self.exposure_start_delay_s = None      # what the server reports; None = not
 
     def start_live(self):
         self.live = True
@@ -691,7 +692,8 @@ class TrigFakeStream(FakeStream):
     def status(self, refresh=True):
         return SimpleNamespace(state="streaming" if self.live else "idle",
                                instance=self.instance,
-                               raw={"seq": self._seq})
+                               raw={"seq": self._seq,
+                                    "exposure_start_delay_s": self.exposure_start_delay_s})
 
     def edge(self, skip=0, **kw):
         """One triggered frame; ``skip`` frames before it were produced and
@@ -767,6 +769,38 @@ def test_triggered_construction_leaves_camera_waiting_for_trigger():
         for key in ("img_test", "img_test_meta"):
             assert isinstance(getattr(fe.data, key), HostDataContainer)
         assert cs._frame_shape == (6, 5)
+    finally:
+        cs.finish()
+
+
+def test_triggered_takes_the_cameras_own_exposure_delay():
+    stream = TrigFakeStream()
+    stream.exposure_start_delay_s = 23.5e-6
+    fe, stream, cs = make_triggered(stream=stream)
+    try:
+        assert cs.exposure_delay == 23.5e-6 and cs.exposure_delay_source == "camera"
+        assert cs.exposure_delay_configured == 17e-6
+        extra = cs._provenance_extra()
+        assert extra["exposure_delay"] == 23.5e-6 and extra["exposure_delay_source"] == "camera"
+    finally:
+        cs.finish()
+
+
+def test_triggered_keeps_the_configured_delay_when_the_camera_reports_none(capsys):
+    fe, stream, cs = make_triggered()                   # the fake reports None
+    try:
+        assert cs.exposure_delay == 17e-6 and cs.exposure_delay_source == "configured"
+        assert "exposure delay not read from the camera" in capsys.readouterr().out
+    finally:
+        cs.finish()
+
+
+def test_triggered_exposure_delay_from_camera_off():
+    stream = TrigFakeStream()
+    stream.exposure_start_delay_s = 23.5e-6
+    fe, stream, cs = make_triggered(stream=stream, exposure_delay_from_camera=False)
+    try:
+        assert cs.exposure_delay == 17e-6 and cs.exposure_delay_source == "configured"
     finally:
         cs.finish()
 
@@ -1245,6 +1279,35 @@ def test_per_frame_settings_refuse_bad_frame_or_key():
     with pytest.raises(ValueError, match="cannot change between frames"):
         make_triggered_keys(["img_a"],
                             frame_settings={0: {"trigger_mode": "Off"}})
+
+
+def test_per_frame_rois_crop_each_frame_to_its_own_shape(capsys):
+    """frame_rois: frame a cropped, frame b the full frame (downsampled like a
+    camera with no ROI), frame c the stream's roi; each stored at its shape."""
+    fe, stream, cs = make_triggered_keys(
+        ["img_a", "img_b", "img_c"], crop_to_saved_roi=False, roi=[0, 0, 6, 4],
+        frame_rois={"img_a": [1, 2, 4, 7], 1: None}, no_roi_downsample=2)
+    fe.data.init()
+    try:
+        assert [g[2] for g in cs._geometry] == [(5, 3), (5, 6), (4, 6)]
+        for k, shape in (("img_a", (5, 3)), ("img_b", (5, 6)), ("img_c", (4, 6))):
+            assert fe.data.__dict__[k]._run_data.shape == (4, *shape)
+        assert "img_b has no ROI" in capsys.readouterr().out
+        for j, v in enumerate((1, 2, 3)):
+            cs.announce_trigger_mu(0, j)
+            stream.edge(value=v)
+            wait_settled(cs)
+        assert F(fe, "img_a")[0].shape == (5, 3) and np.all(F(fe, "img_a")[0] == 1)
+        assert F(fe, "img_b")[0].shape == (5, 6) and np.all(F(fe, "img_b")[0] == 2)
+        assert F(fe, "img_c")[0].shape == (4, 6) and np.all(F(fe, "img_c")[0] == 3)
+        assert cs._n_missing() == 0 and not cs.counts.get("frame_shape_mismatch")
+    finally:
+        cs.finish()
+    rec = {k: json.loads(fe._extra_file_texts[f"camera_stream_{k}"]) for k in ("img_a", "img_b", "img_c")}
+    assert [(r["roi"], r["downsample"], r["frame_shape"]) for r in rec.values()] == [
+        ([1, 2, 4, 7], 1, [5, 3]), (None, 2, [5, 6]), ([0, 0, 6, 4], 1, [4, 6])]
+    with pytest.raises(ValueError, match="no such frame"):
+        make_triggered_keys(["img_a"], frame_rois={"img_z": [0, 0, 1, 1]})
 
 
 def test_dummy_for_triggered_keys_has_one_record_per_key():

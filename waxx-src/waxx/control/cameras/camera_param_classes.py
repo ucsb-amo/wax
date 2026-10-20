@@ -152,6 +152,9 @@ class BaslerParams(CameraParams):
                 t_light_only_image_delay=25.e-3, t_dark_image_delay=20.e-3,
                 resolution = (1200,1920,),
                 magnification = 0.75,
+                pixel_size_m = 3.45e-6,
+                exposure_delay = 17.e-6,
+                exposure_delay_from_camera = True,
                 trigger_ttl = "",
                 key = ""):
         super().__init__()
@@ -165,9 +168,18 @@ class BaslerParams(CameraParams):
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
         self.resolution = resolution
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
-        self.pixel_size_m = 3.45 * 1.e-6
+        self.pixel_size_m = pixel_size_m
         self.magnification = magnification
-        self.exposure_delay = 17 * 1.e-6
+        # The trigger-to-exposure delay the kernel triggers ahead by
+        # (Image.trigger_camera).  prepare_for_run() replaces it with the one
+        # the camera reports (BslExposureStartDelay, via its camera server);
+        # the configured value is used only when the camera does not report
+        # one, and exposure_delay_source says which it was ("camera" or
+        # "configured") in camera_params/ of every run.
+        self.exposure_delay_configured = float(exposure_delay)
+        self.exposure_delay_from_camera = bool(exposure_delay_from_camera)
+        self.exposure_delay = float(exposure_delay)
+        self.exposure_delay_source = "configured"
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
         self.__gain_fluor = gain_fluor
         self.__gain_abs = gain_abs
@@ -197,9 +209,49 @@ class BaslerParams(CameraParams):
             self.exposure_time = self.__exposure_time_dispersive__
             self.gain = self.__gain_dispersive
 
-    def prepare_for_run(self):
-        """Nothing to check for a Basler (see AndorParams.prepare_for_run)."""
-        pass
+    def read_exposure_delay(self, directory=None):
+        """``(seconds or None, why)``: the exposure start delay this camera's
+        server reports (``CameraEntry.exposure_start_delay_s``), as read at
+        the camera's last open / apply.  ``directory`` is a
+        beacon CameraDirectory (default: the process's shared one, which the
+        camera streams use too).  None, with the reason, when the camera
+        cannot be found or does not report one -- never raises."""
+        try:
+            if directory is None:
+                from waxx.control.cameras.camera_stream_client import shared_camera_directory
+                directory = shared_camera_directory()
+            entry = directory.find(str(self.serial_no))
+        except Exception as e:
+            return None, f"camera not found ({type(e).__name__}: {e})"
+        value = getattr(entry, "exposure_start_delay_s", None)
+        server = getattr(entry, "server_id", "?")
+        if value is None:
+            return None, (f"{server} does not report it (camera not opened yet, a model "
+                          f"without the node, or a server older than 2026-10-20)")
+        return float(value), f"reported by {server}"
+
+    def prepare_for_run(self, directory=None):
+        """Take the camera's own exposure start delay for this run (see
+        read_exposure_delay), else the configured one with a printed warning.
+        Called first in Scanner.prepare_image_array, inside finish_prepare,
+        so the kernel is compiled with the value used and camera_params/
+        records it with its source."""
+        self.exposure_delay = self.exposure_delay_configured
+        self.exposure_delay_source = "configured"
+        if not self.exposure_delay_from_camera:
+            return
+        value, why = self.read_exposure_delay(directory)
+        name = self.key or self.serial_no
+        if value is None:
+            print(f"[camera] !! {name}: exposure delay not read from the camera ({why}); "
+                  f"using the configured {self.exposure_delay_configured * 1e6:.2f} us")
+            return
+        self.exposure_delay = value
+        self.exposure_delay_source = "camera"
+        if value != self.exposure_delay_configured:
+            from waxx.util import console
+            console.info(f"[camera] {name}: exposure delay {value * 1e6:.2f} us, {why} "
+                         f"(configured {self.exposure_delay_configured * 1e6:.2f} us)")
 
 class AndorParams(CameraParams):
     # Class constants, not instance attributes: the INIT_RUN payload (and so
