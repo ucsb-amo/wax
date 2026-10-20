@@ -975,14 +975,21 @@ class Scanner():
         if callable(prepare_for_run):
             prepare_for_run()
         if self.run_info.save_data:
-            # print(self.camera_params.camera_type)
-            if self.camera_params.camera_type == 'andor':
+            # The frames' dtype, declared to liveOD at INIT_RUN (images_dtype):
+            # a camera that knows it says so (BaslerParams: uint8 for Mono8,
+            # uint16 for Mono12 / Mono12p); otherwise by camera type.
+            image_dtype = getattr(self.camera_params, "image_dtype", None)
+            if callable(image_dtype):
+                dtype = image_dtype()
+            elif self.camera_params.camera_type == 'andor':
                 dtype = np.uint16
-            elif self.camera_params.camera_type == 'basler':
-                dtype = np.uint8
             else:
                 dtype = np.uint8
-            self.images = np.zeros((self.params.N_img,)+self.camera_params.resolution,dtype=dtype)
+            # Only the shape and dtype are used (the INIT_RUN declaration);
+            # liveOD writes the frames.  A zero-memory, read-only view of one
+            # zero, not N_img full frames held for the whole run.
+            shape = (self.params.N_img,) + tuple(self.camera_params.resolution)
+            self.images = np.broadcast_to(np.zeros((), dtype=dtype), shape)
             self.image_timestamps = np.zeros((self.params.N_img,))
         else:
             self.images = np.array([0])

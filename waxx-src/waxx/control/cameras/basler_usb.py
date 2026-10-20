@@ -47,6 +47,14 @@ _GRAB_LOCKS_GUARD = threading.Lock()
 # most recent set_exposure / set_gain.
 _DEVICE_LOCKS = {}
 _LAST_CLAMPS = {}
+# Per serial: the dtype frames must have in the pixel format set by
+# set_pixel_format (Mono8 -> uint8, Mono12 / Mono12p -> uint16, unpacked by
+# pypylon).  A frame of another dtype is lost, never stored.
+_FRAME_DTYPES = {}
+
+def _pixel_format_dtype(pixel_format):
+    from beacon.camera.schema import pixel_format_dtype
+    return np.dtype(pixel_format_dtype(pixel_format))
 
 def _grab_lock_for(serial):
     with _GRAB_LOCKS_GUARD:
@@ -96,8 +104,10 @@ class BaslerUSB(pylon.InstantCamera):
         TriggerSource (str): picks the line that the camera triggers on. (default: 'Line1')
         TriggerMode (str): picks whether or not the camera waits for a trigger to capture frames. (default: 'On')
         BaslerSerialNumber (str): identifies which camera should be used via the serial number. (default: ExptParams.basler_serial_no_absorption)
+        PixelFormat (str): 'Mono8' (uint8 frames) or 'Mono12' / 'Mono12p' (uint16 frames, 0..4095). (default: 'Mono8')
     '''
-    def __init__(self,ExposureTime=0.,Gain=0.,TriggerSource='Line1',TriggerMode='On',BaslerSerialNumber='40316451'):
+    def __init__(self,ExposureTime=0.,Gain=0.,TriggerSource='Line1',TriggerMode='On',BaslerSerialNumber='40316451',
+                 PixelFormat='Mono8'):
 
         super().__init__()
 
@@ -126,6 +136,7 @@ class BaslerUSB(pylon.InstantCamera):
             self.UserSetLoad.Execute()
 
             self.configure_trigger(TriggerSource, TriggerMode)
+            self.set_pixel_format(PixelFormat)
 
             self.set_exposure(ExposureTime)
             self.set_gain(Gain)
@@ -176,6 +187,21 @@ class BaslerUSB(pylon.InstantCamera):
         self.TriggerSelector.SetValue("FrameStart")
         self.TriggerMode.SetValue(trigger_mode)
         self.TriggerSource.SetValue(trigger_source)
+
+    def set_pixel_format(self, pixel_format='Mono8'):
+        """Set PixelFormat ('Mono8', 'Mono12', 'Mono12p'; ValueError for any
+        other, before anything is written) and note the frame dtype it gives.
+        Called at open and by liveOD before every run."""
+        if isinstance(pixel_format, bytes):
+            pixel_format = pixel_format.decode()
+        dtype = _pixel_format_dtype(pixel_format)
+        self.PixelFormat.SetValue(str(pixel_format))
+        _FRAME_DTYPES[self._serial()] = dtype
+
+    def frame_dtype(self):
+        """The dtype frames have in the pixel format last set (None: not set
+        through set_pixel_format)."""
+        return _FRAME_DTYPES.get(self._serial())
 
     def last_clamps(self):
         """{key: (requested, applied)} for the most recent set_exposure /
@@ -286,6 +312,7 @@ class BaslerUSB(pylon.InstantCamera):
         self.StartGrabbingMax(Nimg, pylon.GrabStrategy_OneByOne)
         count = 0
         counters = {}       # FRAME_COUNTERS name -> value on this grab's previous frame
+        want_dtype = self.frame_dtype()
         try:
             if not self.IsGrabbing():
                 raise RuntimeError(f"Basler {self._serial()}: StartGrabbingMax({Nimg}) returned "
@@ -315,7 +342,14 @@ class BaslerUSB(pylon.InstantCamera):
                             f"Basler frame {count} of {Nimg} lost: {grab.GetErrorDescription()} "
                             f"(got {count}); later frames would have moved into its slot.",
                             lost=(count,))
-                    img = np.uint8(grab.GetArray())
+                    # The frame as the pixel format gives it (uint8 for Mono8,
+                    # uint16 for Mono12 / Mono12p), copied before Release().
+                    # Never cast: np.uint8 of a 12-bit frame wraps modulo 256.
+                    img = np.array(grab.GetArray(), copy=True)
+                    if want_dtype is not None and img.dtype != want_dtype:
+                        raise FrameLostError(
+                            f"Basler {self._serial()}: frame {count} of {Nimg} is {img.dtype}, but "
+                            f"the pixel format set gives {want_dtype}; not stored.", lost=(count,))
                     img_t = grab.TimeStamp
                     gap, jump = self._frames_skipped(grab, counters)
                 finally:

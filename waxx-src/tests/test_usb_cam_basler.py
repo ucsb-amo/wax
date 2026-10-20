@@ -389,3 +389,39 @@ def test_first_device_mode_locks_by_the_attached_serial(usb):
     with pytest.raises(DeviceBusy, match="40316451"):
         DeviceLock("basler:40316451").acquire()
     c.Close()
+
+
+# -- pixel format ----------------------------------------------------------------------
+def test_open_sets_mono8_by_default(cam):
+    assert ("PixelFormat", "Mono8") in cam._fake["writes"]
+    assert cam.frame_dtype() == np.uint8
+
+
+def test_mono12p_frames_are_kept_as_uint16_not_wrapped(usb):
+    c = usb.BaslerUSB(ExposureTime=100e-6, Gain=6.0, TriggerSource="Line2",
+                      BaslerSerialNumber="40316451", PixelFormat="Mono12p")
+    try:
+        assert c.PixelFormat.GetValue() == "Mono12p" and c.frame_dtype() == np.uint16
+        c._fake["results"].append(("ok", np.full((4, 6), 4000, dtype=np.uint16), 1000))
+        q = Queue()
+        c.start_grab(1, q)
+        img, _, idx = q.get_nowait()
+        assert idx == 0 and img.dtype == np.uint16 and int(img.max()) == 4000
+    finally:
+        c.Close()
+
+
+def test_a_frame_of_another_dtype_is_lost_not_stored(cam):
+    cam.set_pixel_format("Mono12p")
+    cam._fake["results"].extend(_frames(1))          # uint8, as if the format had not taken
+    q = Queue()
+    with pytest.raises(FrameLostError) as ei:
+        cam.start_grab(1, q)
+    assert ei.value.lost == (0,) and q.qsize() == 0
+
+
+def test_unsupported_pixel_format_is_refused_before_writing(cam):
+    n = len(cam._fake["writes"])
+    with pytest.raises(ValueError, match="Mono10p"):
+        cam.set_pixel_format("Mono10p")
+    assert len(cam._fake["writes"]) == n and cam.frame_dtype() == np.uint8

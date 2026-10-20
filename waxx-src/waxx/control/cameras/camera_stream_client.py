@@ -302,7 +302,10 @@ class CameraStreamClient:
     ``camera`` is a serial, camera id, name or a params object with
     ``.serial_no``. ``exposure_time`` (s), ``gain`` (dB) and ``roi``
     (``[x1, y1, x2, y2]``) override the camera's saved defaults; with all
-    three given the server's store is not read at all. ``t_snap_lead`` fires
+    three given the server's store is not read at all. ``pixel_format``
+    ("Mono8": uint8 frames; "Mono12" / "Mono12p": uint16, 0..4095) is always
+    set, never taken as the camera stands: it decides the stored dtype and
+    the scale of the counts. ``t_snap_lead`` fires
     the snap early so the exposure, not the published frame, lands near the
     target (a snap takes ~0.15-0.4 s). A camera with no ROI stores its
     frames block-averaged ``no_roi_downsample`` x ``no_roi_downsample``
@@ -311,6 +314,7 @@ class CameraStreamClient:
 
     def __init__(self, expt, camera, key, *,
                  exposure_time=None, gain=None, roi=None, crop_to_saved_roi=True,
+                 pixel_format="Mono8",
                  no_roi_downsample=1, frame_timeout_s=5.0, t_snap_lead=0.0,
                  t_late_tolerance=T_LATE_TOLERANCE_S, label=None,
                  live_od_client=None, directory=None, defer_register=False,
@@ -330,7 +334,13 @@ class CameraStreamClient:
         code still runs, its edges / snaps are counted and nothing is stored
         (``on_error`` is the caller's policy for that, kept here)."""
         from beacon.camera.directory import query_string
+        from beacon.camera.schema import pixel_format_dtype
 
+        # before anything touches the camera: a format with no declared dtype
+        # is refused here (ValueError naming the supported ones)
+        self._pixel_format = str(pixel_format)
+        self._pixel_dtype = np.dtype(pixel_format_dtype(self._pixel_format))
+        self._pixel_readback = {}
         self._expt = expt
         self.core = expt.core
         self.key = str(key)
@@ -732,7 +742,7 @@ class CameraStreamClient:
         self._stream.snap(timeout=self._frame_timeout_s)      # settles the profile
 
         current, rev = self._stream.get_settings()
-        wanted = {}
+        wanted = {"pixel_format": self._pixel_format}
         exposure = (self._exposure_override if self._exposure_override is not None
                     else self._defaults.get("exposure_time"))
         gain = (self._gain_override if self._gain_override is not None
@@ -763,6 +773,13 @@ class CameraStreamClient:
             self._roi = self._defaults.get("roi")
 
         frame0 = self._stream.snap(timeout=self._frame_timeout_s, require_rev=self._rev)
+        if frame0.image.dtype != self._pixel_dtype:
+            raise RuntimeError(f"[{self.label}] {self.serial}: asked for {self._pixel_format} "
+                               f"({self._pixel_dtype} frames) but the probe frame is "
+                               f"{frame0.image.dtype}; not streaming")
+        fs = getattr(frame0, "settings", None) or {}
+        self._pixel_readback = {k: _values({k: fs[k]})[k] for k in ("pixel_format",
+                                                                    "max_pixel_value") if k in fs}
         self._sensor_shape = tuple(frame0.image.shape)
         self._probe_full = frame0.image         # for _set_geometry, dropped after it
         return crop_to_roi(frame0.image, self._roi)
@@ -1140,6 +1157,10 @@ class CameraStreamClient:
                                             ("gain", self._gain_override),
                                             ("roi", self._roi_override))
                           if v is not None},
+            # always set by the stream (default Mono8); max_pixel_value is the
+            # camera's full-scale count as read back with the probe frame
+            "pixel_format": self._pixel_format,
+            "pixel_readback": dict(self._pixel_readback),
             "roi": self._roi,
             "downsample": self._downsample,
             "sensor_frame_shape": list(getattr(self, "_sensor_shape", ())),

@@ -183,6 +183,7 @@ class InstantCamera:
             "TriggerSelector": _Node(self, "TriggerSelector", "FrameStart"),
             "TriggerMode": _Node(self, "TriggerMode", "Off"),
             "TriggerSource": _Node(self, "TriggerSource", "Line1"),
+            "PixelFormat": _Node(self, "PixelFormat", "Mono8"),
             "UserSetSelector": _Node(self, "UserSetSelector", "Default"),
             "UserSetLoad": _Command(self, "UserSetLoad"),
         }

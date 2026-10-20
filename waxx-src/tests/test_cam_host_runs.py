@@ -485,3 +485,32 @@ def test_live_em_gain_is_capped_unless_unlocked(make):
     assert fakes["cam_a"].settings["gain"] == 150
     with pytest.raises(ApplyRefused, match="frame_transfer"):
         host.set_live("cam_a", {"frame_transfer": 1})
+
+
+# ----------------------------------------------------------------------
+# pixel format
+# ----------------------------------------------------------------------
+
+def test_a_run_applies_the_requested_pixel_format(make):
+    host, fakes = make()
+    arm(host, fakes, params=basler_params(pixel_format="Mono12p"))
+    profile, purpose = fakes["cam_b"].applied[-1]
+    assert purpose == "run" and profile["pixel_format"] == "Mono12p"
+    host.end_run("tok")
+
+
+def test_an_older_client_without_pixel_format_runs_mono8(make):
+    host, fakes = make()
+    params = basler_params()
+    params.pop("pixel_format", None)
+    arm(host, fakes, params=params)
+    assert fakes["cam_b"].applied[-1][0]["pixel_format"] == "Mono8"
+    host.end_run("tok")
+
+
+def test_an_unsupported_pixel_format_refuses_the_run_before_anything_is_locked(make):
+    from waxx.util.live_od.camera_host import HostRefused
+    host, fakes = make()
+    with pytest.raises(HostRefused, match="pixel_format"):
+        host.begin_run("tok", "cam_b", True, camera_params=basler_params(pixel_format="Mono10p"))
+    assert host.worker("cam_b").locked_by is None and not host.has_run("tok")

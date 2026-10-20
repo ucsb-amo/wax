@@ -1240,15 +1240,40 @@ class AtomdataVault(atomdata_base):
             except Exception:
                 return True         # not comparable: not reported
 
+        # A run from before a field existed ran at this value (not "same as
+        # whatever the first run has"): a Basler without pixel_format was Mono8.
+        legacy = {'pixel_format': 'Mono8'}
+
+        def _get(c, key, default):
+            return vars(c.camera_params).get(key, legacy.get(key, default))
+
         disagreements = {}
-        for key, first_val in first_cam.items():
+        keys = list(first_cam) + [k for k in legacy if k not in first_cam
+                                  and any(k in vars(c.camera_params) for c in chunks)]
+        for key in keys:
             if key.startswith('_'):
                 continue
-            if any(not _same(first_val, vars(c.camera_params).get(key, first_val))
-                   for c in chunks[1:]):
-                disagreements[key] = {int(c.run_info.run_id): vars(c.camera_params).get(key, None)
+            first_val = _get(first, key, None)
+            if any(not _same(first_val, _get(c, key, first_val)) for c in chunks[1:]):
+                disagreements[key] = {int(c.run_info.run_id): _get(c, key, None)
                                       for c in chunks}
         self.camera_param_disagreements = disagreements
+
+        # The dtype of each run's camera frames (uint8 Mono8, uint16 Mono12 or
+        # Andor): runs that differ were stacked into one dtype, but their raw
+        # counts are not on one scale.
+        self.image_dtype_by_run = {
+            int(c.run_info.run_id): str(np.asarray(c.images).dtype)
+            for c in chunks
+            if getattr(c, '_has_images', True) and getattr(c, 'images', None) is not None
+            and np.asarray(c.images).ndim > 1}
+        if len(set(self.image_dtype_by_run.values())) > 1:
+            warnings.warn(
+                "AtomdataVault: the runs' camera frames have different dtypes "
+                f"({sorted(set(self.image_dtype_by_run.values()))}; see "
+                "vault.image_dtype_by_run): OD is a ratio and comparable, raw counts are not.",
+                stacklevel=3,
+            )
         if disagreements:
             warnings.warn(
                 "AtomdataVault: the runs' camera_params differ (the vault uses the "
@@ -1398,14 +1423,23 @@ class AtomdataVault(atomdata_base):
                 continue
 
             trailing_shape = template.shape[1:] if template.ndim >= 1 else ()
+            # One dtype that holds every chunk's values: never the first
+            # chunk's when a later one is wider (a Mono12p frame cast to a
+            # Mono8 run's uint8 would wrap modulo 256).
+            dtypes = [p[1].dtype for p in pieces if p[0] == 'arr']
+            dtype = np.result_type(*dtypes)
+            int_dtypes = sorted({str(d) for d in dtypes if np.issubdtype(d, np.integer)})
+            if len(int_dtypes) > 1:
+                warnings.warn(
+                    f"AtomdataVault: data key '{k}' is {' / '.join(int_dtypes)} in different "
+                    f"runs (e.g. Mono8 and Mono12 camera frames): stacked as {np.dtype(dtype)}, "
+                    f"but the counts are not on one scale.",
+                    stacklevel=2,
+                )
             # NaN padding requires a float dtype.
             if pieces and any(p[0] == 'pad' for p in pieces):
-                if np.issubdtype(template.dtype, np.floating):
-                    dtype = template.dtype
-                else:
+                if not np.issubdtype(dtype, np.floating):
                     dtype = np.float64
-            else:
-                dtype = template.dtype
 
             built = []
             for tag, payload in pieces:

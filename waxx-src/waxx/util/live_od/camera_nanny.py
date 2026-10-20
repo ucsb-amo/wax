@@ -203,6 +203,19 @@ class CameraNanny():
                     configure_trigger(trigger_source)
                 else:
                     self._warn_missing(camera_key, "configure_trigger", "the trigger (mode, source, line)")
+                # a payload from before pixel_format existed ran at Mono8 and
+                # declared uint8 frames
+                pixel_format = getattr(camera_params, "pixel_format", "Mono8")
+                if isinstance(pixel_format, bytes):
+                    pixel_format = pixel_format.decode()
+                set_pixel_format = _driver_attr(camera, "set_pixel_format")
+                if callable(set_pixel_format):
+                    set_pixel_format(pixel_format)
+                elif pixel_format != "Mono8":
+                    raise RuntimeError(f"the camera driver cannot set pixel_format "
+                                       f"{pixel_format!r} (no set_pixel_format)")
+                else:
+                    self._warn_missing(camera_key, "set_pixel_format", "the pixel format")
                 logger.info(f"{camera_params.key}: gain set to {camera_params.gain}")
             elif camera_type == "andor":
                 camera.set_EMCCD_gain(camera_params.gain)
@@ -272,7 +285,8 @@ class CameraNanny():
                 camera = BaslerUSB(BaslerSerialNumber=camera_params.serial_no,
                                     ExposureTime=camera_params.exposure_time,
                                     TriggerSource=camera_params.trigger_source,
-                                    Gain=camera_params.gain)
+                                    Gain=camera_params.gain,
+                                    PixelFormat=getattr(camera_params, "pixel_format", "Mono8"))
             elif camera_type == "andor":
                 camera = AndorEMCCD(ExposureTime=camera_params.exposure_time,
                                     gain = camera_params.gain,

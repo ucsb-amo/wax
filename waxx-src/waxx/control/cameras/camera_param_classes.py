@@ -155,11 +155,17 @@ class BaslerParams(CameraParams):
                 pixel_size_m = 3.45e-6,
                 exposure_delay = 17.e-6,
                 exposure_delay_from_camera = True,
+                pixel_format = "Mono8",
                 trigger_ttl = "",
                 key = ""):
         super().__init__()
         self.key = key
         self.camera_type = "basler"
+        # "Mono8" (uint8 frames, 0..255) or "Mono12" / "Mono12p" (uint16, 0..4095:
+        # about 16x the counts for the same light).  The run applies it (the
+        # camera server's run profile) and the run's images are declared with
+        # its dtype (image_dtype()).  Saved in camera_params/ of every run.
+        self.pixel_format = pixel_format
         self.serial_no = serial_number
         self.trigger_source = trigger_source
         # The TTL line wired to this camera's trigger input: a ttl_frame
@@ -209,6 +215,26 @@ class BaslerParams(CameraParams):
             self.exposure_time = self.__exposure_time_dispersive__
             self.gain = self.__gain_dispersive
 
+    def image_dtype(self):
+        """The numpy dtype of this camera's frames in its pixel format
+        (uint8 for Mono8, uint16 for Mono12 / Mono12p).  RunFieldRefused for a
+        format no frame dtype is declared for."""
+        from beacon.camera.schema import pixel_format_dtype
+        try:
+            return np.dtype(pixel_format_dtype(self.pixel_format))
+        except ValueError as e:
+            raise RunFieldRefused("pixel_format", self.pixel_format, str(e)) from None
+
+    def check_pixel_format(self):
+        """Check the pixel format (see AndorParams.prepare_for_run): called
+        from prepare_for_run in finish_prepare before INIT_RUN, so a format
+        that is refused costs no run id."""
+        pf = getattr(self, "pixel_format", "Mono8")
+        if isinstance(pf, (bytes, np.ndarray)):
+            pf = _as_str("pixel_format", pf)
+        self.pixel_format = pf
+        self.image_dtype()
+
     def read_exposure_delay(self, directory=None):
         """``(seconds or None, why)``: the exposure start delay this camera's
         server reports (``CameraEntry.exposure_start_delay_s``), as read at
@@ -231,11 +257,13 @@ class BaslerParams(CameraParams):
         return float(value), f"reported by {server}"
 
     def prepare_for_run(self, directory=None):
-        """Take the camera's own exposure start delay for this run (see
+        """Check the pixel format (check_pixel_format), then take the
+        camera's own exposure start delay for this run (see
         read_exposure_delay), else the configured one with a printed warning.
         Called first in Scanner.prepare_image_array, inside finish_prepare,
         so the kernel is compiled with the value used and camera_params/
         records it with its source."""
+        self.check_pixel_format()
         self.exposure_delay = self.exposure_delay_configured
         self.exposure_delay_source = "configured"
         if not self.exposure_delay_from_camera:

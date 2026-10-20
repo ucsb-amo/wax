@@ -20,14 +20,18 @@ from waxx.control.cameras.camera_stream_client import (CameraStreamClient,
                                                        crop_to_roi)
 
 
+_FMT = {"Mono8": (np.uint8, 255), "Mono12": (np.uint16, 4095), "Mono12p": (np.uint16, 4095)}
+
+
 class FakeFrame:
-    def __init__(self, seq, shape=(10, 12), value=7, settings_rev=1):
-        self.image = np.full(shape, value, dtype=np.uint8)
+    def __init__(self, seq, shape=(10, 12), value=7, settings_rev=1, pixel_format="Mono8"):
+        dtype, top = _FMT[pixel_format]
+        self.image = np.full(shape, value, dtype=dtype)
         self.seq = seq
         self.t_mono = time.monotonic()
         self.settings_rev = settings_rev
         self.settings = {"trigger_mode": "Off", "exposure_time": 19e-6,
-                         "gain": 0.0}
+                         "gain": 0.0, "pixel_format": pixel_format, "max_pixel_value": top}
         self.hw_idx = seq
         self.hw_ts = 1000 * seq
 
@@ -43,6 +47,8 @@ class FakeStream:
         self._settings = dict(settings or {"exposure_time": 300e-6,
                                            "gain": 12.0,
                                            "trigger_mode": "Off"})
+        self._settings.setdefault("pixel_format", "Mono8")   # as a camera reports it
+        self.frames_ignore_format = False   # True: frames stay uint8 whatever is set
         self.rev = 1
         self._seq = 0
         self.set_calls = []
@@ -68,7 +74,8 @@ class FakeStream:
             from beacon.camera.stream import SettingsChanged
             raise SettingsChanged(require_rev, self.rev)
         self._seq += 1
-        return FakeFrame(self._seq, shape=self.shape, settings_rev=self.rev)
+        pf = "Mono8" if self.frames_ignore_format else self._settings["pixel_format"]
+        return FakeFrame(self._seq, shape=self.shape, settings_rev=self.rev, pixel_format=pf)
 
     def get_settings(self):
         return dict(self._settings), self.rev
@@ -1565,3 +1572,49 @@ def test_dead_stream_record_carries_the_resolve_notes():
     cs._finish_unconnected()
     rec = json.loads(cs._expt._extra_file_texts["camera_stream_img_2dmot"])
     assert rec["resolve"]["relisted"]["now"]["port"] == RL_NEW
+
+
+# ---------------------------------------------------------------------------
+# pixel format
+# ---------------------------------------------------------------------------
+
+def test_mono12p_stream_stores_uint16_and_records_it():
+    stream = FakeStream()
+    fe, stream, cs = make_client(stream=stream, pixel_format="Mono12p")
+    try:
+        assert stream.set_calls[0]["pixel_format"] == "Mono12p"
+        assert cs._frame_dtype == np.uint16
+        assert getattr(fe.data, "img_test")._run_data.dtype == np.uint16
+        rec = cs._provenance_record()
+        assert rec["pixel_format"] == "Mono12p" and rec["frame_dtype"] == "uint16"
+        assert rec["pixel_readback"] == {"pixel_format": "Mono12p", "max_pixel_value": 4095}
+    finally:
+        cs.finish()
+    # put back as it was found
+    assert stream._settings["pixel_format"] == "Mono8"
+
+
+def test_default_is_mono8_whatever_the_camera_was_left_at():
+    stream = FakeStream(settings={"exposure_time": 19e-6, "gain": 0.0, "trigger_mode": "Off",
+                                  "pixel_format": "Mono12"})
+    fe, stream, cs = make_client(stream=stream)
+    try:
+        assert stream.set_calls[0]["pixel_format"] == "Mono8"
+        assert cs._frame_dtype == np.uint8
+    finally:
+        cs.finish()
+    assert stream._settings["pixel_format"] == "Mono12"
+
+
+def test_unsupported_pixel_format_refused_before_the_camera_is_touched():
+    stream = FakeStream()
+    with pytest.raises(ValueError, match="Mono10p"):
+        make_client(stream=stream, pixel_format="Mono10p")
+    assert stream.set_calls == []
+
+
+def test_probe_frame_of_the_wrong_dtype_is_refused():
+    stream = FakeStream()
+    stream.frames_ignore_format = True
+    with pytest.raises(RuntimeError, match="probe frame"):
+        make_client(stream=stream, pixel_format="Mono12p")

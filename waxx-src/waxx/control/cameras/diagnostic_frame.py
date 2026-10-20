@@ -505,6 +505,8 @@ class diagnostic_frame:
                                "t_stage": img.t_stage, "t_stage_s": img.t_stage_s,
                                "taken": bool(img.live and img.in_stage
                                              and _connected(img._stream)),
+                               # what the stream set (None: no stream this run)
+                               "pixel_format": getattr(img._stream, "_pixel_format", None),
                                **img.settings(),
                                "from_camera_entry": [s for s in SETTING_KEYS
                                                      if s not in img.given],
