@@ -983,6 +983,7 @@ class ALSControlGUI(QMainWindow):
         power_col.setSpacing(5)
 
         power_box = QGroupBox("Power")
+        self.power_box = power_box
         power_layout = QVBoxLayout(power_box)
         power_layout.setContentsMargins(6, 2, 6, 3)
         power_layout.setSpacing(3)
@@ -1043,6 +1044,7 @@ class ALSControlGUI(QMainWindow):
         power_col.addWidget(power_box, 1)
 
         optical_box = QGroupBox("Optical Output")
+        self.optical_box = optical_box
         optical_layout = QVBoxLayout(optical_box)
         optical_layout.setContentsMargins(6, 2, 6, 3)
         optical_layout.setSpacing(3)

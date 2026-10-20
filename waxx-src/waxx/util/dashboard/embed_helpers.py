@@ -33,8 +33,8 @@ import logging
 from typing import Optional
 
 from PyQt6 import QtCore
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtWidgets import QLabel, QWidget
+from PyQt6.QtCore import QSize, QTimer, Qt
+from PyQt6.QtWidgets import QBoxLayout, QLabel, QLayout, QWidget
 
 from waxx.util.dashboard import theme
 
@@ -57,6 +57,158 @@ class WidgetPanelBase(QWidget):
     def cleanup(self) -> None:
         """Tear down timers / threads / sockets owned by this panel."""
         auto_cleanup_timers(self)
+
+
+class StagedCollapsePanel(WidgetPanelBase):
+    """Embedded panel that hides optional sections as the dock gets shorter.
+
+    Subclasses set ``self._gui`` (the embedded GUI) and ``_COLLAPSE_STAGES``:
+    ``((threshold_px, (attr, ...)), ...)``, first to hide first, naming
+    attributes of ``self._gui``.  A stage is hidden below its threshold, and
+    further stages are hidden, in order, while what is left does not fit.
+    Whatever no stage names is never hidden: it sets the panel's minimum
+    height, so the dock cannot be dragged shorter than it.
+
+    ``_readout_modes()`` names widgets that swap children (a readout label
+    vs. an edit field): the minimum covers the taller of its modes, so the
+    dock need not grow when the mode changes.
+    """
+
+    _COLLAPSE_STAGES: tuple = ()
+
+    def _readout_modes(self) -> dict:
+        """``{box: [(shown, hidden), ...]}``; each pair is lists of children."""
+        return {}
+
+    def _start_staged_collapse(self) -> None:
+        """Call at the end of ``__init__``, after the GUI is embedded."""
+        self._readout_heights: dict = {}
+        QTimer.singleShot(150, self._measure_readouts)
+
+    def _measure_readouts(self) -> None:
+        try:
+            self._readout_heights = {
+                box: min_height_over_modes(box, modes)
+                for box, modes in self._readout_modes().items()
+            }
+        except Exception:
+            _LOG.debug("readout measurement failed", exc_info=True)
+        self.updateGeometry()
+        self._apply_collapse_stages()
+
+    def _stage_widgets(self, attrs) -> list:
+        gui = getattr(self, "_gui", None)
+        return [w for w in (getattr(gui, a, None) for a in attrs) if w is not None]
+
+    def _needed_height(self, hidden) -> int:
+        visibility = {w: False for w in hidden}
+        for _, attrs in self._COLLAPSE_STAGES:
+            for w in self._stage_widgets(attrs):
+                visibility.setdefault(w, True)
+        layout = self.layout()
+        if layout is None:
+            return 0
+        return layout_min_height(layout, visibility, getattr(self, "_readout_heights", {}))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt API)
+        # With every stage hidden: what is left is the floor.
+        hidden = [w for _, attrs in self._COLLAPSE_STAGES for w in self._stage_widgets(attrs)]
+        return QSize(0, self._needed_height(hidden))
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        self._apply_collapse_stages()
+
+    def _apply_collapse_stages(self) -> None:
+        h = self.height()
+        stages = [self._stage_widgets(attrs) for _, attrs in self._COLLAPSE_STAGES]
+        n_hidden = sum(1 for t, _ in self._COLLAPSE_STAGES if h < t)
+        hidden = [w for ws in stages[:n_hidden] for w in ws]
+        while n_hidden < len(stages) and self._needed_height(hidden) > h:
+            hidden += stages[n_hidden]
+            n_hidden += 1
+        for i, ws in enumerate(stages):
+            for w in ws:
+                w.setVisible(i >= n_hidden)
+
+
+def min_height_over_modes(box: QWidget, modes) -> int:
+    """Tallest minimum height *box* needs over its display *modes*.
+
+    Each mode is a ``(shown, hidden)`` pair of child-widget lists; the
+    children's own shown/hidden flags are put back afterwards.
+    """
+    children = {w for shown, hidden in modes for w in (*shown, *hidden)}
+    was_hidden = {w: w.isHidden() for w in children}
+    best = 0
+    try:
+        for shown, hidden in modes:
+            for w in hidden:
+                w.setVisible(False)
+            for w in shown:
+                w.setVisible(True)
+            box.ensurePolished()
+            if box.layout() is not None:
+                box.layout().invalidate()
+            best = max(best, box.minimumSizeHint().height())
+    finally:
+        for w, h in was_hidden.items():
+            w.setHidden(h)
+        if box.layout() is not None:
+            box.layout().invalidate()
+    return best
+
+
+def layout_min_height(layout: QLayout, visibility=None, heights=None) -> int:
+    """Minimum height *layout* needs, counting widgets as *visibility* says.
+
+    *visibility* maps a widget to shown (True) / hidden (False); any other
+    widget counts as shown unless it is hidden now.  *heights* overrides a
+    widget's own minimum height.  Plain ``QWidget`` containers are measured
+    through their layout, so a section nested in one is counted correctly.
+    """
+    visibility = visibility or {}
+    heights = heights or {}
+
+    def shown(w):
+        return visibility.get(w, not w.isHidden())
+
+    def widget_h(w):
+        if w in heights:
+            return heights[w]
+        if type(w) is QWidget and w.layout() is not None:
+            return measure(w.layout())[0]
+        w.ensurePolished()
+        return max(w.minimumSizeHint().height(), w.minimumHeight())
+
+    def measure(lay):
+        """(height, anything shown)"""
+        if not isinstance(lay, QBoxLayout):
+            return lay.minimumSize().height(), True
+        parts = []
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                if shown(w):
+                    parts.append(widget_h(w))
+            elif item.layout() is not None:
+                h, nonempty = measure(item.layout())
+                if nonempty:
+                    parts.append(h)
+            # spacer items (addStretch) have no minimum height
+        m = lay.contentsMargins()
+        vertical = lay.direction() in (QBoxLayout.Direction.TopToBottom,
+                                       QBoxLayout.Direction.BottomToTop)
+        if not parts:
+            inner = 0
+        elif vertical:
+            inner = sum(parts) + max(lay.spacing(), 0) * (len(parts) - 1)
+        else:
+            inner = max(parts)
+        return inner + m.top() + m.bottom(), bool(parts)
+
+    return measure(layout)[0]
 
 
 def replace_status_bar(initial_text: str = "") -> QLabel:
@@ -222,4 +374,5 @@ def _strip_minimum_sizes(root: QWidget) -> None:
             pass
 
 
-__all__ = ["WidgetPanelBase", "replace_status_bar", "auto_cleanup_timers", "lint_panel", "embed_main_window"]
+__all__ = ["WidgetPanelBase", "StagedCollapsePanel", "replace_status_bar", "auto_cleanup_timers",
+           "lint_panel", "embed_main_window", "layout_min_height", "min_height_over_modes"]
