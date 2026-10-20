@@ -57,7 +57,18 @@ def test_order_widths_shown_and_filter_come_back(qapp, ini):
     assert not q.table.isColumnHidden(_col("path"))
     assert q.table.isColumnHidden(_col("est"))
     assert q.filter == "pending"
-    assert q.filter_buttons["pending"].isChecked()
+    assert q.filter_combo.currentIndex() == rqp.FILTERS.index("pending")
+    q.shutdown()
+
+
+def test_the_last_filters_n_comes_back(qapp, ini):
+    p = _panel(ini)
+    assert p.filter == "last" and p.last_n == 15                 # the defaults
+    p.last_spin.setValue(40)
+    p.shutdown()
+    q = _panel(ini)
+    assert q.filter == "last" and q.last_n == 40 and q.last_spin.value() == 40
+    assert q.model.last_n == 40
     q.shutdown()
 
 
@@ -100,10 +111,10 @@ def test_a_layout_saved_for_other_columns_is_not_applied(qapp, ini):
     q.shutdown()
 
 
-def test_an_unknown_saved_filter_falls_back_to_all(qapp, ini):
+def test_an_unknown_saved_filter_falls_back_to_last(qapp, ini):
     QSettings(ini, QSettings.Format.IniFormat).setValue("filter", "bogus")
     p = _panel(ini)
-    assert p.filter == "all"
+    assert p.filter == "last"
     p.shutdown()
 
 
@@ -115,7 +126,7 @@ def test_without_settings_nothing_is_remembered(qapp):
     assert not p._save_timer.isActive()
     p.shutdown()
     q = _panel()
-    assert q.filter == "all"
+    assert q.filter == "last"
     assert q.table.horizontalHeader().visualIndex(_col("run_id")) == _col("run_id")
     q.shutdown()
 

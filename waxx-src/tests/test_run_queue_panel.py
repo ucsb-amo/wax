@@ -230,18 +230,68 @@ def test_phase1b_fields_order_and_render(panel, server):
     assert _cell(panel, 3, "priority") == "10"
 
 
+def _combo_texts(panel):
+    return [panel.filter_combo.itemText(i) for i in range(panel.filter_combo.count())]
+
+
 def test_the_pending_filter_hides_ended_jobs(panel):
-    assert panel.filter == "all" and len(panel.model.jobs) == 5
-    assert panel.filter_buttons["all"].text() == "All 5"
-    assert panel.filter_buttons["pending"].text() == "Pending 4"
+    assert panel.filter == "last" and panel.last_n == rqp.DEFAULT_LAST_N == 15
+    assert len(panel.model.jobs) == 5                              # 1 ended (< 15) + 4
+    assert _combo_texts(panel) == ["All 5", "Last", "Pending 4"]
+    assert panel.filter_combo.currentText() == "Last" and not panel.last_spin.isHidden()
     panel.select_job(3)
     panel.set_filter("pending")
     assert [j["id"] for j in panel.model.jobs] == [2, 3, 4, 5]
     assert panel.selected_job()["id"] == 3                         # the selection stays
+    assert panel.filter_combo.currentText() == "Pending 4" and panel.last_spin.isHidden()
     panel.set_filter("all")
     assert len(panel.model.jobs) == 5
     with pytest.raises(ValueError):
         panel.set_filter("ended")
+
+
+def test_the_last_filter_shows_the_last_n_ended_and_every_pending_job(panel, server):
+    ended = [_job(i, "saved", run_id=85000 + i, ended_at=NOW - 1000 + i) for i in range(10, 30)]
+    ended[3]["ended_at"] = NOW                                    # ended last, listed early
+    server.answers["list"] = _list_reply(ended + _phase1_jobs()[1:])
+    panel.refresh_list()
+    shown = [j["id"] for j in panel.model.jobs]
+    assert len(shown) == 15 + 4 and shown[-4:] == [2, 3, 4, 5]
+    assert 13 in shown and 10 not in shown and 29 in shown        # by ended_at, list order kept
+    panel.last_spin.setValue(3)                                   # the spin box sets N
+    assert panel.last_n == 3
+    assert [j["id"] for j in panel.model.jobs] == [13, 28, 29, 2, 3, 4, 5]
+    assert _combo_texts(panel) == ["All 24", "Last", "Pending 4"]
+    panel.set_filter("all")
+    assert len(panel.model.jobs) == 24
+
+
+def test_ended_runs_without_a_file_are_gray(panel, server):
+    bg = Qt.ItemDataRole.BackgroundRole
+    fg = Qt.ItemDataRole.ForegroundRole
+    jobs = [_job(1, "done", reason="ran to the end with save_data=False: nothing was written"),
+            _job(6, "aborted", no_file=True, reason="the run (save_data=False, no file) was "
+                                                    "aborted in liveOD (Abort)"),
+            _job(7, "cancelled", no_file=True),
+            # a record from before the server's no_file flag: its reason says so
+            _job(8, "aborted", reason="the run (save_data=False, no file) was aborted in "
+                                      "liveOD (Abort)"),
+            _job(9, "failed", no_file=True, reason="failed (exit code 1)"),   # stays red
+            _job(10, "aborted", run_id=85601, reason="run 85601 was aborted in liveOD"),
+            _job(2, "running", run_id=85600, no_file=False)]
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    for i in (1, 6, 7, 8):
+        assert _cell(panel, i, "label", bg).getRgb() == rqp.ROW_TINT["no_file"], i
+        assert _cell(panel, i, "state", fg).name() == rqp.QColor(rqp.theme.FG_MUTED).name()
+    assert _cell(panel, 1, "state") == "done"
+    assert _cell(panel, 6, "state") == "aborted (no file)"
+    assert "save_data=False" in _cell(panel, 6, "state", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 9, "label", bg).getRgb() == rqp.ROW_TINT["failed"]
+    assert _cell(panel, 9, "state") == "failed (no file)"
+    assert _cell(panel, 10, "label", bg).getRgb() == rqp.ROW_TINT["aborted"]
+    assert _cell(panel, 10, "state") == "aborted"
+    assert _cell(panel, 2, "label", bg).getRgb() == rqp.ROW_TINT["running"]
 
 
 def test_rows_are_tinted_by_state(panel):
@@ -801,6 +851,13 @@ def _select(panel, *ids):
         panel.table.selectionModel().select(panel.model.index(_row(panel, i), 0), flags)
 
 
+def _current(panel, job_id):
+    """The row clicked (the current index), the selection left as it is."""
+    from PyQt6.QtCore import QItemSelectionModel
+    panel.table.selectionModel().setCurrentIndex(
+        panel.model.index(_row(panel, job_id), 0), QItemSelectionModel.SelectionFlag.NoUpdate)
+
+
 def test_remove_takes_several_queued_jobs_out_and_leaves_the_running_one(panel, server):
     _select(panel, 2, 3, 5)                                       # running, queued, queued
     assert [j["id"] for j in panel.selected_jobs()] == [2, 3, 5]
@@ -846,9 +903,11 @@ def test_run_again_resubmits_the_same_file_as_a_person(panel, server, tmp_path):
     panel.select_job(5)
     server.answers["submit"] = {"status": "ok", "ids": [11], "clamped": False}
     assert _menu_action(panel, "again").isEnabled()
+    assert _menu_action(panel, "again").text() == "Run again"     # no "...": no question
     assert panel.run_again()
-    title, text, yes, no = panel.confirms[-1]
-    assert yes == "Queue it" and "CHANGED" not in text
+    assert panel.confirms == []                                   # queued at once
+    text = panel.message.text()
+    assert "CHANGED" not in text
     assert "dependencies (after 3)" in text and "chain (c1)" in text   # not carried over
     req = server.of("submit")[-1]
     host = socket.gethostname()
@@ -862,21 +921,65 @@ def test_run_again_resubmits_the_same_file_as_a_person(panel, server, tmp_path):
     path.write_text("x = 2\n")
     server.answers["insert"] = {"status": "ok", "ids": [12]}
     assert panel.run_again(first=True)
-    assert "CHANGED since job 5" in panel.confirms[-1][1]
+    assert "job 5 (expt_5): its file has CHANGED" in panel.message.text()
+    assert "queued as job 12" in panel.message.text()
     req = server.of("insert")[-1]
     assert req["at_index"] == 0 and req["client_sha256"] == local_sha256(str(path))
-    n = len(server.requests)
-    panel.confirm_answer = False
-    assert not panel.run_again()
-    assert len(server.requests) == n
+    assert panel.confirms == []
 
 
 def test_run_again_refused_shows_why(panel, server):
     panel.select_job(3)
     server.answers["submit"] = {"status": "error", "msg": "your copy differs from kong's"}
     assert panel.run_again()
-    assert "cannot be compared" in panel.confirms[-1][1]       # this PC cannot read the file
+    assert "cannot read its file" in panel.message.text()      # this PC cannot read the file
     assert "your copy differs" in panel.message.text()
+
+
+def test_several_jobs_run_again_in_table_order(panel, server):
+    ids = iter(range(20, 30))
+    server.answers["submit"] = lambda obj: {"status": "ok", "ids": [next(ids)]}
+    server.answers["insert"] = lambda obj: {"status": "ok", "ids": [next(ids)]}
+    _select(panel, 1, 3, 5)                                       # saved, queued, queued
+    _current(panel, 3)
+    assert _menu_action(panel, "again").text() == "Run 3 jobs again"
+    assert _menu_action(panel, "again_next").text() == "Run 3 jobs again next"
+    assert panel.run_again()
+    assert [r["label"] for r in server.of("submit")] == ["expt_1", "expt_3", "expt_5"]
+    assert "queued as jobs 20, 21, 22" in panel.message.text()
+    # next: inserted at 0 last first, so they run in table order
+    assert panel.run_again(first=True)
+    inserts = server.of("insert")
+    assert [r["label"] for r in inserts] == ["expt_5", "expt_3", "expt_1"]
+    assert all(r["at_index"] == 0 for r in inserts)
+    assert "queued as jobs 25, 24, 23" in panel.message.text()    # in table order
+    assert panel.confirms == []
+
+
+def test_several_queued_jobs_move_to_the_top_or_bottom_together(panel, server):
+    _select(panel, 3, 5)                                          # queued 3, 4, 5 in order
+    _current(panel, 5)
+    menu, acts = panel.job_menu()
+    panel._open_menus = [menu]
+    assert acts["top"].isEnabled() and acts["bottom"].isEnabled()
+    assert "up" not in acts and "edit" in acts
+    assert acts["remove"].text() == "Remove 2 jobs from the queue..."
+    assert panel.move_selected("top")
+    assert [(r["id"], r["to_index"]) for r in server.of("move")] == [(5, 0), (3, 0)]
+    assert panel.move_selected("bottom")
+    assert [(r["id"], r["to_index"]) for r in server.of("move")[2:]] == [(3, 3), (5, 3)]
+    assert "move 2 jobs to the bottom: done" in panel.message.text()
+
+
+def test_copy_paths_and_run_ids_of_several_jobs(panel):
+    _select(panel, 1, 2, 3)
+    _current(panel, 1)
+    menu, acts = panel.job_menu()
+    panel._open_menus = [menu]
+    acts["copy_runs"].trigger()
+    assert "85599 85600" in panel.message.text()
+    acts["copy_paths"].trigger()
+    assert "3 paths" in panel.message.text() and "expt_3.py" in panel.message.text()
 
 
 def test_open_source_uses_the_editor_never_the_os_default(panel, server, tmp_path,
