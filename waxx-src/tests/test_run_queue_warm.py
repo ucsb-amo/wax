@@ -1058,3 +1058,15 @@ def test_kq_shows_warm_jobs_and_the_cancel_note(tmp_path, expts, lib):
     lines = kq._warm_lines(q.describe({"id": b})["job"])
     assert lines[0].startswith("  warm: ready (attempt 1)") and "py_pid 9001" in lines[1]
     assert "next #%d ready" % b in kq.queue_line(q.info())
+
+
+def test_switching_warm_start_off_discards_the_live_warm_launch(tmp_path, expts, lib):
+    q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
+    r = q.set_warm_ahead({"on": False, "by": "jp", "owner": "person"})
+    assert r == {"status": "ok", "warm_ahead": False, "was": True}
+    assert q.journal.kinds.count("run_queue_warm_ahead") == 1
+    _discarded(q, b, wp, "warm start was switched off")
+    assert q.set_warm_ahead({"owner": "person"})["warm_ahead"] is False      # report only
+    assert q.set_warm_ahead({"on": "yes", "owner": "person"})["status"] == "error"
+    assert q.set_warm_ahead({"on": False, "by": "jp", "owner": "person"})["was"] is False
+    assert q.journal.kinds.count("run_queue_warm_ahead") == 1               # no change, no record

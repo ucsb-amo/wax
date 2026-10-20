@@ -1692,6 +1692,31 @@ class RunQueue:
         self._notify()
         return reply
 
+    def set_warm_ahead(self, obj: Mapping) -> dict:
+        """``{"on": bool | None, "by", "owner"}``: switch warm start on or
+        off while the server runs (``on`` absent: report only).  Not kept
+        across a server restart (the server's start value comes back: off
+        unless ``WAXX_QUEUE_WARM_AHEAD=1``).  Switched off, a live warm launch
+        is told to exit at the next tick ("warm start was switched off").
+        Either owner may switch it; the journal records who."""
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        on = obj.get("on")
+        if on is None:
+            return {"status": "ok", "warm_ahead": self.warm_ahead}
+        if not isinstance(on, bool):
+            return {"status": "error", "msg": f"on must be true or false, not {on!r}"}
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        with self._lock:
+            was, self.warm_ahead = self.warm_ahead, on
+        if was != on:
+            log.warning("Run queue: warm start switched %s by %s (%s).", "ON" if on else "OFF",
+                        by, as_owner)
+            self._record("run_queue_warm_ahead", on=on, by=by, owner=as_owner)
+            self._notify()
+        return {"status": "ok", "warm_ahead": on, "was": was}
+
     def release_request(self, obj: Mapping) -> dict:
         """``{"by", "owner"}``; ``owner`` -- who asks -- is required."""
         as_owner, refusal = requester_owner(obj)

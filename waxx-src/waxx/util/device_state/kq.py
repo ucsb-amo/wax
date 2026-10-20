@@ -29,6 +29,7 @@ Commands::
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
     kq release                                lift the person's hold
+    kq warm [on|off]                          warm start (queue phase 2): show / switch
     kq status [--json]                        the queue's state (not occupancy)
 
 Warm start (queue phase 2, when the server has it on): the next job's process
@@ -535,6 +536,11 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("reason", nargs="*")
     sp.add_argument("--agent", action="store_true", help="as an agent")
     sp = sub.add_parser("release", help="lift the person's hold")
+    sp.add_argument("--agent", action="store_true", help="as an agent")
+
+    sp = sub.add_parser("warm", help="warm start (queue phase 2): show, or switch on / off "
+                                     "until the server restarts")
+    sp.add_argument("state", nargs="?", choices=("on", "off"))
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
     sp = sub.add_parser("status", help="the queue's state, not machine occupancy (exit 0 "
@@ -1163,6 +1169,19 @@ def _cmd_release(ctx: _Ctx, args) -> int:
     return EXIT_OK
 
 
+def _cmd_warm(ctx: _Ctx, args) -> int:
+    on = None if args.state is None else args.state == "on"
+    reply = ctx.client.warm_ahead(on, owner=_owner(args))
+    now = "on" if reply.get("warm_ahead") else "off"
+    if on is None:
+        ctx.say(f"[kq] warm start is {now}")
+    elif reply.get("was") == reply.get("warm_ahead"):
+        ctx.say(f"[kq] warm start was already {now}")
+    else:
+        ctx.say(f"[kq] warm start switched {now} (until the monitor server restarts)")
+    return EXIT_OK
+
+
 #: ``kq status`` reports the queue's state only, never the machine's.
 OCCUPANCY_NOTE = ("queue state only, not machine occupancy (liveOD, direct artiq_run "
                   "runs, the run loops): for occupancy use occupancy.py (agents) or the "
@@ -1198,7 +1217,7 @@ _COMMANDS = {"list": _cmd_list, "show": _cmd_show, "tail": _cmd_tail, "cancel": 
              "kill": _cmd_kill,
              "move": _cmd_move, "edit": _cmd_edit,
              "pause": _cmd_pause, "resume": _cmd_resume, "hold": _cmd_hold,
-             "release": _cmd_release, "status": _cmd_status}
+             "release": _cmd_release, "warm": _cmd_warm, "status": _cmd_status}
 
 
 def main(argv=None, *, client_factory=None, out=None, err=None, ask=None,

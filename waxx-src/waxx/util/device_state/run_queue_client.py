@@ -296,6 +296,11 @@ class RunQueueClient:
         return self._ask("hold", {"reason": reason, "owner": self._owner(owner),
                                   "by": self.by}, retry=False)
 
+    def warm_ahead(self, on: bool | None = None, *, owner: str | None = None) -> dict:
+        """Switch warm start on / off (None: report) -> ``{"warm_ahead", "was"}``."""
+        return self._ask("warm_ahead", {"on": on, "owner": self._owner(owner), "by": self.by},
+                         retry=on is None)
+
     def release(self, *, owner: str | None = None) -> dict:
         return self._ask("release", {"owner": self._owner(owner), "by": self.by},
                          retry=False)

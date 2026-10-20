@@ -381,7 +381,7 @@ class MonitorUDPServer(UdpServer):
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
                  run_loops=(), connections=(), slm_reinit=None, state_generator=None,
-                 run_queue_dir=None, warm_ahead=False):
+                 run_queue_dir=None, warm_ahead=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
         # The run queue's folder (its queue, journal, job logs, the person
         # hold) is on LOCAL disk: given, or run_queue.default_dir()
@@ -464,8 +464,11 @@ class MonitorUDPServer(UdpServer):
         # The run queue: experiment jobs one at a time (run_queue.py), through
         # the same liveOD link (called late, so it is always the current one),
         # fence, monitor state and loops as the rest of the server.  Warm start
-        # (queue phase 2) stays off unless warm_ahead is given (until the
-        # hardware checks of the plan's M5 have passed).
+        # (queue phase 2) stays off unless warm_ahead is given or
+        # WAXX_QUEUE_WARM_AHEAD=1 (until the hardware checks of the plan's M5
+        # have passed); `kq warm on|off` switches it while the server runs.
+        if warm_ahead is None:
+            warm_ahead = os.environ.get("WAXX_QUEUE_WARM_AHEAD", "").strip() == "1"
         self.run_queue = RunQueue(
             run_queue_dir, poll=lambda: self._live_od(),
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
@@ -1181,7 +1184,7 @@ class MonitorUDPServer(UdpServer):
                       "cancel": "cancel", "kill": "kill", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
                       "resume": "resume", "hold": "hold_request", "release": "release_request",
-                      "warm": "warm_request"}
+                      "warm": "warm_request", "warm_ahead": "set_warm_ahead"}
 
     def _reply_run_queue(self, obj: dict) -> dict:
         """``{"type": "run_queue", "action": ...}`` -- see

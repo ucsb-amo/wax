@@ -870,3 +870,17 @@ def test_cold_submit_edit_and_the_warm_jobs_list_show_and_cancel(server, q, expt
     r = kq(server, "cancel", "1")
     assert r.code == 0
     assert "[kq] job 1 (rabi) cancelled (not started (warm process told to exit))" in r.out
+
+
+def test_warm_shows_and_switches_warm_start(server, q):
+    r = kq(server, "warm")
+    assert r.code == 0 and "warm start is off" in r.out and q.warm_ahead is False
+    r = kq(server, "warm", "on")
+    assert r.code == 0 and "switched on (until the monitor server restarts)" in r.out
+    assert q.warm_ahead is True and sent(server, "warm_ahead")[-1]["on"] is True
+    assert sent(server, "warm_ahead")[-1]["owner"] == "person"
+    assert "already on" in kq(server, "warm", "on").out
+    r = kq(server, "warm", "off", "--agent")
+    assert r.code == 0 and "switched off" in r.out and q.warm_ahead is False
+    assert sent(server, "warm_ahead")[-1]["owner"] == "agent"
+    assert q.journal.kinds.count("run_queue_warm_ahead") == 2
