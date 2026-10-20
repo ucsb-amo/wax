@@ -26,6 +26,7 @@ from waxx.util.live_od.gui.tool_windows import ToolLauncher
 from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
 from waxx.util.live_od.gui.status_strip import StatusStrip
+from waxx.util.live_od.gui.hold_badge import HoldBadge
 from waxx.util.live_od.log import get_logger, setup_logging, install_excepthooks, DEFAULT_LOG_DIR
 from waxx.util.live_od import console_guard
 from waxx.control.cameras import DummyCamera
@@ -209,7 +210,9 @@ class LiveODWindow(QWidget):
         # ZMQ PUB broadcaster — forwards OD images and run events to remote viewers.
         self.broadcaster = LiveODBroadcaster()
         self.broadcaster.start()
-        self.live_od_server.run_started_signal.connect(self.broadcaster.broadcast_run_started)
+        # RUN_STARTED goes out from spawn_baby, with what the viewers need to show the run
+        # (experiment, camera, shots, save_data, units, params) -- not from run_started_signal
+        self.live_od_server.shot_timing_signal.connect(self.broadcaster.broadcast_shot_timing)
         self.live_od_server.shot_progress_signal.connect(self.broadcaster.broadcast_shot_progress)
         self.live_od_server.run_done_signal.connect(self.broadcaster.broadcast_run_done)
         self.live_od_server.run_state_signal.connect(self.broadcaster.broadcast_run_state)
@@ -574,6 +577,9 @@ class LiveODWindow(QWidget):
 
     def _on_run_id_polled(self, rid):
         self.status_strip.set_next_run_id(rid)
+        broadcaster = getattr(self, 'broadcaster', None)
+        if broadcaster is not None:         # every 2 s: a late viewer has it soon
+            broadcaster.broadcast_next_run_id(rid)
 
     def setup_widgets(self):
         self.server_talk.check_for_mapped_data_dir()
@@ -637,6 +643,8 @@ class LiveODWindow(QWidget):
         # happens when a run starts may change the window's width
         self.abort_button.setFixedWidth(56)
         self.fix_button = self.abort_button     # the name it had as 'Reset'
+        # the person hold (monitor server), shown only while it is on; Abort puts it on
+        self.hold_badge = HoldBadge(log=self.msg)
         self._update_run_buttons()
 
     def _run_is_active(self) -> bool:
@@ -675,6 +683,7 @@ class LiveODWindow(QWidget):
         status_row = QHBoxLayout()
         status_row.setSpacing(4)
         status_row.addWidget(self.status_strip, 1)
+        status_row.addWidget(self.hold_badge)
         status_row.addWidget(self.abort_button)
         layout.addLayout(status_row)
         self._adjust_button.setMinimumHeight(0)     # sized like its toolbar neighbours
@@ -786,6 +795,10 @@ class LiveODWindow(QWidget):
             except Exception:
                 pass
         self.shutdown("window closed")
+        try:
+            self.hold_badge.shutdown()
+        except Exception:
+            pass
         # liveOD's own windows go with it, so nothing keeps the process alive headless
         for window in (getattr(self, 'live_scalar_plot_window', None),
                        getattr(self, 'fk_tof_window', None),
@@ -1008,6 +1021,9 @@ class LiveODWindow(QWidget):
         count = len(specs)
         self._adjust_button.setText(f"Adjust ({count})" if count else "Adjust")
         self._adjust_button.setEnabled(bool(count))
+        broadcaster = getattr(self, 'broadcaster', None)
+        if broadcaster is not None:
+            broadcaster.broadcast_adjust_specs(specs)
 
     def _on_adjust_value_changed(self, key: str, value: float):
         """Forward spinbox changes to the server's live adjust dict."""
@@ -1080,6 +1096,20 @@ class LiveODWindow(QWidget):
             " · ".join(p for p in (f"Run {run_id}" if run_id else "Run (not saved)", expt_class) if p))
         self._update_run_buttons()
         xvarnames = list(run_info_payload.get('xvarnames', [])) if run_info_payload else []
+        try:
+            self.broadcaster.broadcast_run_started(run_id, xvarnames, info={
+                'expt_name': expt_class,
+                'camera_key': camera_key if capture_images else "",
+                'capture_images': bool(capture_images),
+                'save_data': bool(save_data),
+                'n_shots': int(n_shots),
+                'xvar_ranges': dict(getattr(self.live_od_server, '_current_xvar_ranges', {}) or {}),
+                'pixel_size_m': self.viewer_window._px_size_m,
+                'params': dict(params_payload) if params_payload else {},
+            })
+        except Exception as exc:
+            self.msg(f"Could not tell the remote viewers that run {run_id} started: {exc}",
+                     logging.WARNING)
         self.live_scalar_plot_window.on_new_run(self.live_od_server._current_run_id, xvarnames)
         self.fk_tof_window.on_new_run(
             self.live_od_server._current_run_id,
@@ -1557,6 +1587,10 @@ def main(config):
     win.setWindowTitle(config.window_title)
     win.setWindowIcon(win.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
     win.show()
+    # the person hold: asked of the monitor server from here on (not in tests)
+    badge = getattr(win, 'hold_badge', None)
+    if badge is not None:
+        badge.start()
     sys.exit(app.exec())
 
 

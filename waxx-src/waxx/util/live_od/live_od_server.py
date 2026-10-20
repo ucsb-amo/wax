@@ -2174,6 +2174,7 @@ class LiveODServer(QThread, NetServer):
             # newer keys; a client that predates them ignores them
             "run_state": self._run_state,
             "expt_name": self._current_expt_name,
+            "save_data": bool(self._current_save_data),
             "n_shots_expected": self._current_n_shots,
             "images_expected": self._images_expected,
             "images_received": self._images_received_now(),

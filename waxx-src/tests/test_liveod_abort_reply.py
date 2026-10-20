@@ -521,11 +521,12 @@ class _Remote:
     """Just what RemoteViewerWindow._show_reply / _show_reply_notice use."""
 
     def __init__(self):
-        from PyQt6.QtWidgets import QLabel, QPlainTextEdit
         from types import SimpleNamespace
+        from waxx.util.live_od.gui.log_panel import LogPanel
         from waxx.util.live_od.gui.remote_viewer_window import RemoteViewerWindow
-        self.viewer_window = SimpleNamespace(output_window=QPlainTextEdit())
-        self.run_id_label = QLabel("Run 85600 — saving")
+        from waxx.util.live_od.gui.status_strip import StatusStrip
+        self.viewer_window = SimpleNamespace(output_window=LogPanel())
+        self.status_strip = StatusStrip()
         self.reply_notice_text = RemoteViewerWindow.reply_notice_text
         # the signal's queued hop to the GUI thread, done in place here
         self._reply_notice_signal = SimpleNamespace(
@@ -539,9 +540,10 @@ def test_the_remote_viewer_shows_an_ignored_reset_every_press(app):
              "message": "Reset ignored: run 85600 is being saved (it is complete)"}
     for _ in range(2):
         RemoteViewerWindow._show_reply(win, "Reset", reply)
-    lines = win.viewer_window.output_window.toPlainText().splitlines()
-    assert lines == [reply["message"]] * 2
-    assert win.run_id_label.text() == reply["message"]
+    texts = [r[1] for r in win.viewer_window.output_window._records]
+    assert texts == [reply["message"]] * 2
+    assert win.status_strip.notice() == reply["message"]
+    assert win.status_strip.run_label.text() == reply["message"]
 
 
 def test_the_remote_viewer_words_a_reply_without_a_message(app):
@@ -552,3 +554,6 @@ def test_the_remote_viewer_words_a_reply_without_a_message(app):
     assert text("RUN_EXITED", {"ok": False, "saving": True, "error": "refused, x"}) == \
         "refused, x"
     assert text("Reset", {"ok": True}) == "" and text("Reset", None) == ""
+    # a refusal without the ignored/refused keys (CAMERA_CONTROL during a run) is shown too
+    assert text("Camera control", {"ok": False, "error": "a run is in progress",
+                                   "run_in_progress": True}) ==         "Camera control refused: a run is in progress"
