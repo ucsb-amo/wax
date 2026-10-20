@@ -93,7 +93,8 @@ def served(app, tmp_path, monkeypatch):
 
 def init_msg(**kw):
     msg = {"tag": "INIT_RUN", "save_data": False, "capture_images": True, "camera_key": "cam_b",
-           "camera_params": basler_params(), "params": {"N_img": 3},
+    # the fake camera gives uint16 frames: a 12-bit Basler, declared uint16
+           "camera_params": basler_params(pixel_format="Mono12p"), "params": {"N_img": 3},
            "N_shots_with_repeats": 1, "N_pwa_per_shot": 3, "expt_class": "cam_host_test",
            "images_shape": (3, 4, 6), "images_dtype": "uint16"}
     msg.update(kw)

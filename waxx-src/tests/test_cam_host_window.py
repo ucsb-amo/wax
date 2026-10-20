@@ -160,7 +160,7 @@ def test_a_camera_run_through_the_window(host_window, app):
     win, fakes, host = host_window
     srv = win.live_od_server
     msg = {"tag": "INIT_RUN", "save_data": True, "capture_images": True, "camera_key": "cam_b",
-           "camera_params": basler_params(), "params": {"N_img": 3}, "N_shots_with_repeats": 1,
+           "camera_params": basler_params(pixel_format="Mono12p"), "params": {"N_img": 3}, "N_shots_with_repeats": 1,
            "N_pwa_per_shot": 3, "expt_class": "cam_host_window", "images_shape": (3, 4, 6),
            "images_dtype": "uint16"}
     reply = call_spinning(app, srv._handle_init_run, msg)
