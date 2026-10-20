@@ -472,10 +472,30 @@ def test_a_pause_discards(tmp_path, expts, lib):
     _discarded(q, b, wp, "agent jobs paused")
 
 
-def test_a_person_hold_discards_an_agents_warm_job_not_a_persons(tmp_path, expts, lib):
+def test_a_person_hold_keeps_an_agents_warm_job_ready_and_go_waits_for_the_release(
+        tmp_path, expts, lib):
+    """Decision 1 (user, 2026-10-19): a hold keeps the agent's warm process
+    ready behind it; GO only after the release."""
     q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
     q.hold_request({"reason": "mine", "by": "jp"})
-    _discarded(q, b, wp, "held")
+    q.tick()
+    assert warm_rec(q, b)["state"] == "ready"
+    assert "run_queue_warm_discard" not in q.journal.kinds
+    end_slot(q)
+    for _ in range(3):
+        q.tick()
+    assert job(q, b)["state"] == "queued" and not warm_rec(q, b).get("go")
+    r = wp.ask("poll")
+    assert r["go"] is False and "held" in r["why"]
+    assert len(q.spawner.calls) == 2                      # no cold launch meanwhile
+    assert q.release_request({"by": "jp", "owner": "person"})["status"] == "ok"
+    q.tick()
+    assert job(q, b)["state"] in ("launching", "running")
+    assert wp.ask("poll")["go"] is True
+    assert len(q.spawner.calls) == 2                      # the warm process, not a cold one
+
+
+def test_a_person_hold_keeps_a_persons_warm_job_too(tmp_path, expts, lib):
     q2 = wq(tmp_path / "two", expts)
     slot_running(q2, expts)
     pb = submit(q2, expts, "tof")
@@ -484,6 +504,45 @@ def test_a_person_hold_discards_an_agents_warm_job_not_a_persons(tmp_path, expts
     q2.hold_request({"reason": "mine", "by": "jp"})
     q2.tick()
     assert warm_rec(q2, pb)["state"] == "ready"
+
+
+def test_a_long_hold_goes_stale_once_never_rewarms_while_held_then_launches_cold(
+        tmp_path, expts, lib):
+    q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
+    q.hold_request({"reason": "mine", "by": "jp"})
+    q.clock.t += rq.WARM_READY_MAX_S + 1
+    _discarded(q, b, wp, rq.WARM_STALE_MARK)
+    wp.proc.code = rq.EXIT_WARM_ABORTED
+    q.tick()
+    assert warm_rec(q, b) is None and job(q, b)["state"] == "queued"
+    assert q._jobs[b].warm_attempts == 0                  # a stale discard is given back
+    assert not q._jobs[b].cold and not q._jobs[b].cold_why
+    for _ in range(3):
+        q.tick()
+    assert len(q.spawner.calls) == 2                      # no re-warm while held
+    end_slot(q)
+    q.tick()
+    assert job(q, b)["state"] == "queued" and len(q.spawner.calls) == 2   # still held
+    q.release_request({"by": "jp", "owner": "person"})
+    q.tick()
+    assert job(q, b)["state"] in ("launching", "running")
+    assert len(q.spawner.calls) == 3
+    assert "WAXX_QUEUE_WARM" not in q.spawner.calls[-1]["env"]           # cold
+
+
+def test_a_person_job_placed_ahead_during_a_hold_still_discards(tmp_path, expts, lib):
+    q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
+    q.hold_request({"reason": "mine", "by": "jp"})
+    q.tick()
+    p = submit(q, expts, "cal")                           # a person's job: ahead of the agent's
+    _discarded(q, b, wp, f"no longer next (#{p} is)")
+
+
+def test_a_pause_still_discards_during_a_hold(tmp_path, expts, lib):
+    q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
+    q.hold_request({"reason": "mine", "by": "jp"})
+    q.pause({"scope": "agent", "by": "jp", "owner": "person"})
+    _discarded(q, b, wp, "agent jobs paused")
 
 
 @pytest.mark.parametrize("fields, words", [({"argv": ["x=1"]}, "edited (argv)"),
@@ -615,23 +674,72 @@ def test_experiment_file_drift_discards_then_the_job_is_skipped_as_today(tmp_pat
     assert len(q.spawner.calls) == 2
 
 
-def test_a_discarded_process_that_does_not_exit_raises_the_alarm_and_is_never_killed(
-        tmp_path, expts, lib):
+def _stuck_discard(tmp_path, expts, lib):
     q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
     q.cancel({"id": b, "owner": "agent", "by": "me"})
     q.tick()
-    assert q.info()["warm_alarm"] is None
-    q.clock.t += rq.WARM_EXIT_ALARM_S + 1
+    assert q.info()["warm_alarm"] is None and q.killer.calls == []
+    return q, a, b, wp
+
+
+def test_a_discarded_process_that_does_not_exit_is_stopped_after_the_wait(tmp_path, expts, lib):
+    """Decision 2: told to exit, still alive WARM_KILL_AFTER_S later, never
+    given GO, pid + creation time recorded -> the queue stops it (python
+    first, then the shell), each by its recorded creation time."""
+    q, a, b, wp = _stuck_discard(tmp_path, expts, lib)
+    q.clock.t += rq.WARM_KILL_AFTER_S - 1
+    q.tick()
+    assert q.killer.calls == []
+    q.clock.t += 2
+    q.tick()
+    w = warm_rec(q, b)
+    assert q.killer.calls[0] == (9001, 4321.0)
+    assert q.killer.calls[1:] == [(w["cmd_pid"], w["cmd_started"])]
+    assert w["kill_note"] == "stopped" and q.info()["warm_alarm"] is None
+    assert q.journal.kinds.count("run_queue_warm_killed") == 1
+    assert "run_queue_warm_not_exiting" not in q.journal.kinds
+    q.tick()                                              # the shell's exit is seen
+    assert warm_rec(q, b) is None and job(q, b)["state"] == "cancelled"
+    assert len(q.killer.calls) == 2
+
+
+def test_a_failed_stop_raises_the_alarm_and_is_tried_once(tmp_path, expts, lib):
+    q, a, b, wp = _stuck_discard(tmp_path, expts, lib)
+    w = warm_rec(q, b)
+    q.killer.fail = {9001, w["cmd_pid"]}
+    q.clock.t += rq.WARM_KILL_AFTER_S + 1
     q.tick()
     alarm = q.info()["warm_alarm"]
-    assert alarm["job"] == b and "has not exited" in alarm["text"] and "nothing kills" in alarm["text"]
+    assert alarm["job"] == b and "has not exited" in alarm["text"]
+    assert "stop failed" in alarm["text"] and "Access is denied" in alarm["text"]
+    assert q.journal.kinds.count("run_queue_warm_killed") == 1
     assert q.journal.kinds.count("run_queue_warm_not_exiting") == 1
-    q.tick()
+    n = len(q.killer.calls)
+    for _ in range(3):
+        q.tick()
+    assert len(q.killer.calls) == n                       # once per warm launch
     assert q.journal.kinds.count("run_queue_warm_not_exiting") == 1
-    assert wp.proc.code is None and not hasattr(wp.proc, "killed")
     wp.proc.code = rq.EXIT_WARM_ABORTED
     q.tick()
     assert q.info()["warm_alarm"] is None
+
+
+def test_a_pid_without_a_creation_time_is_never_stopped(tmp_path, expts, lib):
+    q, a, b, wp = _stuck_discard(tmp_path, expts, lib)
+    warm_rec(q, b)["cmd_started"] = None
+    q.clock.t += rq.WARM_KILL_AFTER_S + 1
+    q.tick()
+    assert q.killer.calls == []
+    assert "no recorded creation time" in warm_rec(q, b)["kill_note"]
+    assert "the queue's stop failed" in q.info()["warm_alarm"]["text"]
+
+
+def test_a_process_given_go_is_never_stopped(tmp_path, expts, lib):
+    q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
+    w = warm_rec(q, b)
+    w["state"], w["aborted_at"], w["go"] = "aborting", q.clock.t, {"at": q.clock.t}
+    assert q._stop_warm(q._jobs[b], rq.WARM_KILL_AFTER_S + 1) is False
+    assert q.killer.calls == [] and w["kill_note"] == "not stopped: GO was decided for it"
 
 
 # --- deaths ---------------------------------------------------------------------------------

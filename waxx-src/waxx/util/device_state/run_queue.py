@@ -143,16 +143,24 @@ GO is decided by the tick and SAVED before it is handed out (the job goes
 once the slot job's process has exited, the gate is free and the manifest is
 fresh (re-stat outside the lock).  The reply carries liveOD's ``reset_count``
 as last seen.  A warm launch is discarded -- cooperatively: the process
-exits at its next poll; nothing is ever killed -- when the job is no longer
-the head, is blocked, held or paused, is edited (argv, after, due, paused,
-write_back, cold), cancelled, its chain stops, its files change, or it has
-been ready for :data:`WARM_READY_MAX_S`; a discarded process still alive
-after :data:`WARM_EXIT_ALARM_S` raises a warning (``warm_alarm``) and a
-journal record.  A re-warm waits for the old process to exit.  Jobs marked
+exits at its next poll -- when the job is no longer the head, is blocked
+or paused, is edited (argv, after, due, paused, write_back, cold),
+cancelled, its chain stops, its files change, or it has been ready for
+:data:`WARM_READY_MAX_S`.  A person hold does NOT discard it: an agent's
+warm process stays ready behind the hold (GO waits for the release; the
+ready time still counts, so a hold longer than :data:`WARM_READY_MAX_S`
+discards it as stale, its attempt given back, and no new warm launch starts
+for a held job -- the job then launches cold after the release).  A
+discarded process still alive :data:`WARM_KILL_AFTER_S` after it was told
+to exit is stopped by the queue (:func:`~waxx.util.device_state.detached.
+kill_tree`) only while GO was never delivered to it and its pid and creation
+time still match the record; otherwise it raises a warning (``warm_alarm``).
+Both leave a journal record.  A re-warm waits for the old process to exit.  Jobs marked
 ``cold`` (submit / edit), whose class sets ``warm_launch = False``, or whose
 ``prepare``/``build`` calls a name in :data:`WARM_DENY_NAMES` never warm.  A
-warm process that dies before GO fails its job ("while warming, before it
-took the machine"); one that dies after GO was saved but before it was
+warm process that dies before GO (not told to, not exit 78) makes its job
+cold and leaves it queued ("warm attempt failed ... it launches cold"); one
+that dies after GO was saved but before it was
 handed out puts its job back in the queue; after the hand-out, the usual
 following applies.  At a restart warm processes are taken back by pid AND
 creation time.
@@ -246,8 +254,11 @@ WARM_DUE_LEAD_S = 60.0
 WARM_READY_MAX_S = 900.0
 #: A warm process not ready this long after its launch is discarded.
 WARM_PREP_MAX_S = 600.0
-#: A discarded warm process still alive after this raises the warm alarm.
-WARM_EXIT_ALARM_S = 120.0
+#: A discarded warm process still alive this long after it was told to exit
+#: is stopped by the queue (GO never delivered, pid + creation time
+#: matching), else raises the warm alarm.
+WARM_KILL_AFTER_S = 120.0
+WARM_EXIT_ALARM_S = WARM_KILL_AFTER_S          # the older name
 #: A ready warm process's manifest is re-stat-ed this often while it waits.
 WARM_MANIFEST_CHECK_S = 5.0
 #: Warm launches per job at most (after that it goes cold).  A launch
@@ -1810,9 +1821,10 @@ class RunQueue:
 
     # -- scheduling -------------------------------------------------------------------
 
-    def _blocked_by(self, job: Job, now: float) -> str:
+    def _blocked_by(self, job: Job, now: float, ignore_hold: bool = False) -> str:
         """Why a queued job may not go now ("" when it is eligible) -- the
-        job's own conditions, not the machine's."""
+        job's own conditions, not the machine's.  ``ignore_hold``: the person
+        hold left out (a warm launch stays ready behind it; GO still waits)."""
         if job.state != "queued":
             return f"it is {job.state}"
         if job.paused:
@@ -1829,7 +1841,7 @@ class RunQueue:
         if job.owner == "agent" and self._paused.get("agent"):
             p = self._paused["agent"]
             return f"agent jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
-        if job.owner == "agent" and self.hold.active:
+        if job.owner == "agent" and self.hold.active and not ignore_hold:
             return f"held: {self.hold.info().get('reason')}"
         return ""
 
@@ -2104,15 +2116,17 @@ class RunQueue:
         return sorted((j for j in self._jobs.values()
                        if j.warm is not None and not j.warm.get("go")), key=lambda j: j.id)
 
-    def _warm_candidate(self, now: float) -> Job | None:
+    def _warm_candidate(self, now: float, ignore_hold: bool = False) -> Job | None:
         """The job a warm launch is for: the first queued job in rank order
         not blocked at ``now + WARM_DUE_LEAD_S`` (so a job due within that
         may warm; its GO waits until it is due).  None when a job ahead of it
         waits for the job in the slot (``after``): that one may well go first
         once the slot job is saved, so nobody warms (never an ``after`` on the
-        running job)."""
+        running job).  ``ignore_hold``: held agent jobs count (a live warm
+        launch stays ready behind a person hold); a new warm launch is never
+        started for a held job."""
         for j in self._queued_in_order():
-            if not self._blocked_by(j, now + WARM_DUE_LEAD_S):
+            if not self._blocked_by(j, now + WARM_DUE_LEAD_S, ignore_hold=ignore_hold):
                 return j
             if self._current is not None and self._current in j.after:
                 return None
@@ -2196,11 +2210,16 @@ class RunQueue:
             return
         if w.get("state") == "aborting":
             waited = now - float(w.get("aborted_at") or now)
-            if waited > WARM_EXIT_ALARM_S and not w.get("alarmed"):
+            if waited > WARM_KILL_AFTER_S and not w.get("kill_tried"):
+                if self._stop_warm(job, waited):
+                    return                            # its exit is seen at a later tick
+            if waited > WARM_KILL_AFTER_S and not w.get("alarmed"):
                 text = (f"{job.name}'s discarded warm process (pid "
                         f"{w.get('py_pid') or w.get('cmd_pid') or '?'}) has not exited "
-                        f"{waited:.0f} s after it was told to ({w.get('why')}); nothing kills "
-                        "it -- check it")
+                        f"{waited:.0f} s after it was told to ({w.get('why')}); "
+                        + (f"the queue's stop failed ({w.get('kill_note')})"
+                           if w.get("kill_tried") else "the queue does not stop it")
+                        + " -- check it")
                 with self._lock:
                     w["alarmed"] = now
                     self._warm_alarm = {"job": job.id, "since": now, "text": text}
@@ -2217,6 +2236,61 @@ class RunQueue:
             why = self._warm_stale(job)
         if why:
             self._discard_warm(job, why)
+
+    def _stop_warm(self, job: Job, waited: float) -> bool:
+        """A discarded warm process has not exited ``WARM_KILL_AFTER_S``
+        after it was told to: stop it -- its python, then the shell the queue
+        launched, each with its tree (:func:`~waxx.util.device_state.detached.
+        kill_tree`) -- only while it was never given GO (it has claimed
+        nothing: no hardware, no core connection, no liveOD start) and only
+        a pid whose recorded creation time still matches (Windows reuses
+        pids).  Tried once per warm launch.  True when nothing of it is left
+        alive; False leaves the alarm to the caller."""
+        with self._lock:
+            w = job.warm
+            if w is None or w.get("state") != "aborting" or w.get("kill_tried"):
+                return False
+            targets = [(role, w.get(p), w.get(s)) for role, p, s in
+                       (("experiment", "py_pid", "py_started"), ("shell", "cmd_pid", "cmd_started"))
+                       if w.get(p)]
+            if w.get("go"):
+                note = "not stopped: GO was decided for it"
+                targets = []
+            elif not targets:
+                note = "not stopped: no pid of it is known"
+            elif any(started is None for _, _, started in targets):
+                note = ("not stopped: a pid of it has no recorded creation time (it may be "
+                        "another process with a reused pid)")
+                targets = []
+            else:
+                note = ""
+            w["kill_tried"] = self._clock()
+        results = []
+        for role, pid, started in targets:
+            try:
+                r = dict(self._kill(pid, started))
+            except Exception as exc:                  # noqa: BLE001
+                r = {"pid": pid, "ok": False, "gone": False, "note": f"kill failed: {exc!r}"}
+            r["role"] = role
+            results.append(r)
+        left = [r for r in results if not (r.get("ok") or r.get("gone"))]
+        if not note:
+            note = ("stopped" if not left else "NOT all stopped: " + "; ".join(
+                f"{r['role']} pid {r['pid']}: {r.get('note')}" for r in left))
+        with self._lock:
+            if job.warm is w:
+                w["kill_note"] = note
+                w["kill_results"] = results
+        stopped = bool(results) and not left
+        (log.warning if stopped else log.error)(
+            "Run queue: %s's discarded warm process had not exited %.0f s after it was told to "
+            "(%s); never given GO: %s.", job.name, waited, w.get("why"), note)
+        self._record("run_queue_warm_killed", job=job.id, attempt=w.get("attempt"),
+                     waited_s=round(waited, 1), why=w.get("why"), results=results, note=note,
+                     stopped=stopped)
+        self._save()
+        self._notify()
+        return stopped
 
     def _warm_discard_why(self, job: Job, now: float) -> str:
         """Why the job's live warm launch must stand down ("" when it may
@@ -2235,10 +2309,13 @@ class RunQueue:
             changed = [k for k in WARM_SPEC_FIELDS if k in spec and spec[k] != getattr(job, k)]
             if changed:
                 return "edited (" + ", ".join(changed) + ")"
-            blocked = self._blocked_by(job, now + WARM_DUE_LEAD_S)
+            # a person hold keeps it ready (user, 2026-10-19): GO still waits
+            # for the release (_order / _go check the hold); anything else
+            # that blocks the job discards it
+            blocked = self._blocked_by(job, now + WARM_DUE_LEAD_S, ignore_hold=True)
             if blocked:
                 return blocked
-            cand = self._warm_candidate(now)
+            cand = self._warm_candidate(now, ignore_hold=True)
             if cand is not job:
                 return "no longer next" + (f" (#{cand.id} is)" if cand is not None else "")
             if (w.get("state") == "ready"
