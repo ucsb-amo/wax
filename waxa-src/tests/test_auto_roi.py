@@ -363,3 +363,38 @@ def test_rebox_of_a_failed_detection_is_harmless():
                         light=np.zeros((0, FRAME, FRAME), np.uint16))
     assert not empty.can_rebox
     assert not rebox(empty, 0.3).valid
+
+
+# ---- the scattered gate counts blobs by score mass -------------------------------------
+
+def _grid_with(blobs, shape=(300, 400), n_shots=10):
+    """A score grid holding square blobs [(y, x, half_width, height), ...]."""
+    from waxa.image_processing.auto_roi import _box_from_grid
+    score = np.zeros(shape, dtype=np.float32)
+    for y, x, h, a in blobs:
+        score[y - h:y + h + 1, x - h:x + h + 1] = a
+    grid = (score, n_shots, (0, 0), 1, shape, n_shots)
+    return _box_from_grid(grid, 0.5, {})
+
+
+def test_one_large_cloud_with_specks_beside_it_is_valid():
+    # a cloud over >10 % of the frame plus three specks whose peaks just clear
+    # component_frac (as Mono12p frames of a 12 ms GM cloud give, runs 87420/87422)
+    r = _grid_with([(150, 200, 60, 10.0), (20, 20, 1, 3.1), (280, 30, 1, 3.2),
+                    (25, 380, 2, 3.05)])
+    assert r.n_kept == 4 and r.area_frac > 0.10
+    assert r.n_effective == pytest.approx(1.0, abs=0.01)
+    assert r.valid, r.reason
+
+
+def test_several_comparable_blobs_over_the_frame_are_still_scattered():
+    r = _grid_with([(40, 40, 10, 10.0), (40, 360, 10, 9.0), (260, 40, 10, 9.5),
+                    (260, 360, 10, 8.5)])
+    assert r.n_effective > 3 and r.area_frac > 0.10
+    assert not r.valid and "scattered" in r.reason
+
+
+def test_two_comparable_positions_stay_compact():
+    # a cloud that jumped between two places is a real detection (compact_components=2)
+    r = _grid_with([(40, 40, 10, 10.0), (260, 360, 10, 9.0)])
+    assert r.n_effective == pytest.approx(2.0, abs=0.05) and r.valid

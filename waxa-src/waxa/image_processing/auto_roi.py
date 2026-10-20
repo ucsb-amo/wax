@@ -114,6 +114,13 @@ class AutoRoiResult():
         n_kept (int): components significant enough to be included in the box.
             One is a single cloud, or a cloud whose positions overlap; a few is
             a cloud that jumped. Many means the score map is scattered.
+        n_effective (float): the kept components counted by their share of the
+            score mass, (sum w)^2 / sum w^2: 1.0 for one cloud however many
+            specks sit beside it, ~n for n comparable blobs. The scattered gate
+            uses this, not n_kept -- a few specks of a few grid pixels each,
+            whose peaks just clear component_frac at the edge of a large cloud,
+            are not a scattered map (they appear more often in 12-bit frames,
+            whose finer counts resolve the cloud's wings).
         fill (float): masked area as a fraction of the box area. Reported, not
             gated on: a single cloud fills most of its own box (0.7 and up) and
             a noise field does not (0.03), but so does a legitimate scan whose
@@ -139,7 +146,8 @@ class AutoRoiResult():
     def __init__(self, roix, roiy, valid, confidence, n_components,
                  n_shots, peak, reason, score_map, n_kept=0, area_frac=0.,
                  fill=0., peak_per_shot=0.,
-                 conservativeness=DEFAULT_CONSERVATIVENESS):
+                 conservativeness=DEFAULT_CONSERVATIVENESS, n_effective=0.):
+        self.n_effective = float(n_effective)
         self.roix = roix
         self.roiy = roiy
         self.valid = valid
@@ -169,6 +177,7 @@ class AutoRoiResult():
         return (f"AutoRoiResult({state}, roix={self.roix}, roiy={self.roiy}, "
                 f"confidence={self.confidence:.3f}, fill={self.fill:.3f}, "
                 f"peak_per_shot={self.peak_per_shot:.3f}, n_kept={self.n_kept}, "
+                f"n_effective={self.n_effective:.2f}, "
                 f"area_frac={self.area_frac:.4f}, n_components={self.n_components}, "
                 f"conservativeness={self.conservativeness:.2f})")
 
@@ -648,7 +657,9 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
         max_area_frac (float): box area fraction above which a multi-component
             detection is treated as noise.
         compact_components (int): a detection with at most this many components
-            is a real cloud whatever its size, so the area gate does not apply.
+            -- counted by score mass (AutoRoiResult.n_effective), so specks
+            beside a cloud do not count -- is a real cloud whatever its size,
+            so the area gate does not apply.
         pixel_budget (float): decimate when the touched pixel count exceeds
             this.
         max_workers (int or None): threads to split the shot loop over. None
@@ -732,7 +743,8 @@ def rebox(result, conservativeness, **overrides):
                              n_components=result.n_components,
                              n_shots=result.n_shots, peak=result.peak,
                              reason=result.reason, score_map=result.score_map,
-                             n_kept=result.n_kept, area_frac=result.area_frac,
+                             n_kept=result.n_kept, n_effective=getattr(result, "n_effective", 0.),
+                             area_frac=result.area_frac,
                              fill=result.fill,
                              peak_per_shot=result.peak_per_shot,
                              conservativeness=conservativeness)
@@ -846,6 +858,10 @@ def _box_from_grid(grid, conservativeness, explicit, score_full=None):
     kept = np.isin(labels, keep)
     ys, xs = np.where(kept)
     n_kept = int(keep.size)
+    # The kept components counted by their score mass: specks beside one cloud
+    # add ~0, comparable blobs add ~1 each (what the scattered gate tests).
+    kept_w = weights[keep - 1]
+    n_effective = float(kept_w.sum() ** 2 / np.sum(kept_w ** 2)) if kept_w.sum() > 0 else 0.
 
     y0, y1 = int(ys.min()), int(ys.max())
     x0, x1 = int(xs.min()), int(xs.max())
@@ -879,9 +895,9 @@ def _box_from_grid(grid, conservativeness, explicit, score_full=None):
 
     if confidence < min_confidence:
         reason = f"low confidence ({confidence:.3f} < {min_confidence})"
-    elif n_kept > compact_components and area_frac > max_area_frac:
-        reason = (f"score map is scattered ({n_kept} blobs over "
-                  f"{100 * area_frac:.0f}% of the frame)")
+    elif n_effective > compact_components and area_frac > max_area_frac:
+        reason = (f"score map is scattered ({n_kept} blobs, {n_effective:.1f} by score "
+                  f"mass, over {100 * area_frac:.0f}% of the frame)")
     else:
         reason = "ok"
 
@@ -889,7 +905,7 @@ def _box_from_grid(grid, conservativeness, explicit, score_full=None):
         roix=roix, roiy=roiy, valid=(reason == "ok"),
         confidence=confidence, n_components=int(n_components),
         n_shots=n_shots, peak=peak, reason=reason,
-        score_map=score_full, n_kept=n_kept,
+        score_map=score_full, n_kept=n_kept, n_effective=n_effective,
         area_frac=area_frac, fill=fill,
         peak_per_shot=peak_per_shot,
         conservativeness=float(np.clip(conservativeness, 0., 1.))))
