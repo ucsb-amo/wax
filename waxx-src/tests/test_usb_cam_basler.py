@@ -425,3 +425,22 @@ def test_unsupported_pixel_format_is_refused_before_writing(cam):
     with pytest.raises(ValueError, match="Mono10p"):
         cam.set_pixel_format("Mono10p")
     assert len(cam._fake["writes"]) == n and cam.frame_dtype() == np.uint8
+
+
+def test_a_padded_packed_frame_is_lost(usb, monkeypatch):
+    c = usb.BaslerUSB(ExposureTime=100e-6, Gain=6.0, TriggerSource="Line2",
+                      BaslerSerialNumber="40316451", PixelFormat="Mono12p")
+    try:
+        c._fake["results"].append(("ok", np.full((4, 6), 4000, dtype=np.uint16), 1000))
+        real = fake_pylon._GrabResult.__init__
+
+        def padded(self, *a, **k):
+            real(self, *a, **k)
+            self.PaddingX = 4
+        monkeypatch.setattr(fake_pylon._GrabResult, "__init__", padded)
+        q = Queue()
+        with pytest.raises(FrameLostError, match="row padding"):
+            c.start_grab(1, q)
+        assert q.qsize() == 0
+    finally:
+        c.Close()

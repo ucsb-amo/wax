@@ -109,6 +109,36 @@ def _safe_repr(value) -> str:
         return f"<{type(value).__name__}: repr failed>"
 
 
+def _pixel_format_mismatch(msg: dict, camera_params, capture_images: bool) -> str:
+    """Why an INIT_RUN's Basler pixel format and declared image dtype cannot
+    go together ("" when they can, or when it is not a Basler run that saves
+    frames). A camera_params without pixel_format is a client older than the
+    field: it ran Mono8 and declares uint8."""
+    if not capture_images or not isinstance(camera_params, dict):
+        return ""
+    ctype = camera_params.get("camera_type", "")
+    if isinstance(ctype, bytes):
+        ctype = ctype.decode()
+    if ctype != "basler":
+        return ""
+    shape = tuple(msg.get("images_shape") or ())
+    if len(shape) < 2 or not shape[0]:
+        return ""                       # no frames declared (save_data off)
+    from beacon.camera.schema import pixel_format_dtype
+    pf = camera_params.get("pixel_format", "Mono8")
+    try:
+        want = np.dtype(pixel_format_dtype(pf))
+    except ValueError as exc:
+        return str(exc)
+    declared = msg.get("images_dtype")
+    if declared is None:
+        return ""
+    if np.dtype(str(declared)) != want:
+        return (f"pixel_format {pf!r} gives {want} frames, but the run declares its images "
+                f"{np.dtype(str(declared))}")
+    return ""
+
+
 def _client_of(msg: dict) -> dict:
     """The run's client from an INIT_RUN payload: ``client_pid`` (int or None),
     ``client_host``, ``launcher`` and ``queue_job`` (the run queue's job,
@@ -175,7 +205,11 @@ class LiveODServer(QThread, NetServer):
     #: What this server can do beyond the original protocol (INIT_RUN / RESERVE_RUN
     #: replies, POLL): arrays pushed during the run, a save the client polls for,
     #: and RESERVE_RUN / START_RUN / RELEASE_RESERVATION (queue phase 2).
-    FEATURES = {"put_data": True, "async_save": True, "reserve": True}
+    # what this server can do beyond the original protocol; pixel_format:
+    # it applies a Basler's camera_params pixel_format (an older server ran
+    # every Basler at Mono8)
+    FEATURES = {"put_data": True, "async_save": True, "reserve": True,
+                "pixel_format": True}
 
     def __init__(self, server_talk, data_saver, port: int = 0, marker_path=None):
         super().__init__()  # QThread.__init__
@@ -1266,6 +1300,13 @@ class LiveODServer(QThread, NetServer):
         camera_key = str(msg.get("camera_key", ""))
         imaging_type = int(msg.get("imaging_type", 0))
         camera_params = msg.get('camera_params', {})
+
+        # A Basler's frames must be saved under the dtype its pixel format gives
+        # (Mono8 uint8, Mono12 / Mono12p uint16): refused here, before a run id
+        # is used, rather than written under another declaration.
+        mismatch = _pixel_format_mismatch(msg, camera_params, capture_images)
+        if mismatch:
+            return self._refuse_init_run(mismatch, "INIT_RUN refused: " + mismatch)
 
         # host mode: the run's camera is locked here, before a run id is used;
         # a refusal (profile, persist, camera held elsewhere) is the reply

@@ -121,6 +121,7 @@ def reset(serials=("40316451",), **device_kwargs):
 class _GrabResult:
     def __init__(self, kind, payload=None, ts=0):
         self.kind, self.payload, self.TimeStamp = kind, payload, ts
+        self.PaddingX = 0
         self.released = False
 
     def IsValid(self):

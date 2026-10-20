@@ -446,6 +446,7 @@ class Expt(Scanner, Dealer, Scribe):
         self.run_info.run_id = response['run_id']
         self.run_info.filepath = response['filepath']
         self._adopt_start_time(response)
+        self._refuse_unapplied_pixel_format(_client)
         if response['run_id']:
             if os.environ.get('WAXX_LAUNCHER'):
                 # a launcher (the run queue, the run loop, run_lock) reads
@@ -674,6 +675,27 @@ class Expt(Scanner, Dealer, Scribe):
             print(f"[end] !! source files changed during the run: {names} -- the run's file "
                   f"keeps the texts read at its start (see source_changed_during_run).")
         return expt_text, params_text, base_class_texts
+
+    def _refuse_unapplied_pixel_format(self, client):
+        """A liveOD older than the pixel_format feature runs every Basler at
+        Mono8 whatever camera_params asks: a run asking for anything else
+        there would save 8-bit frames labelled with the requested format. The
+        run is aborted before anything is armed, and the error says why."""
+        cp = getattr(self, 'camera_params', None)
+        if not getattr(self, 'setup_camera', False) or getattr(cp, 'camera_type', '') != 'basler':
+            return
+        pf = str(getattr(cp, 'pixel_format', 'Mono8') or 'Mono8')
+        supports = getattr(client, 'supports', None)
+        if pf == 'Mono8' or (callable(supports) and supports('pixel_format')):
+            return
+        try:
+            client.abort_run()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"pixel_format {pf!r} asked of a liveOD that does not apply it (it runs every "
+            f"Basler at Mono8); run {self.run_info.run_id} aborted before arming. Restart "
+            f"liveOD on code that has the pixel_format feature, or use Mono8.")
 
     # ---- param overrides and calibrations (waxx.calibration) -----------------
 

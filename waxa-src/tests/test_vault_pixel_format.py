@@ -68,3 +68,26 @@ def test_old_runs_only_are_quiet():
         vault._note_camera_differences([_chunk(1, 1, _dv()), _chunk(2, 1, _dv())])
     assert vault.camera_param_disagreements == {}
     assert vault.image_dtype_by_run == {1: "uint8", 2: "uint8"}
+
+
+def test_values_read_back_as_bytes_compare_equal():
+    # h5py hands strings back as bytes: an old run + a new Mono8 run agree
+    from waxa.atomdata_vault import AtomdataVault
+    vault = object.__new__(AtomdataVault)
+    new = _chunk(2, 1, _dv(), pixel_format=b"Mono8")
+    new.camera_params.camera_type = b"basler"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        vault._note_camera_differences([_chunk(1, 1, _dv()), new])
+    assert vault.camera_param_disagreements == {}
+
+
+def test_the_legacy_format_is_only_for_basler_runs():
+    from waxa.atomdata_vault import AtomdataVault
+    vault = object.__new__(AtomdataVault)
+    andor = _chunk(1, 1, _dv(), images_dtype=np.uint16)
+    andor.camera_params.camera_type = "andor"
+    basler = _chunk(2, 1, _dv(), pixel_format="Mono12p", images_dtype=np.uint16)
+    with pytest.warns(UserWarning):
+        vault._note_camera_differences([andor, basler])
+    assert vault.camera_param_disagreements["pixel_format"] == {1: None, 2: "Mono12p"}

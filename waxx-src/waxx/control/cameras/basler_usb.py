@@ -51,6 +51,7 @@ _LAST_CLAMPS = {}
 # set_pixel_format (Mono8 -> uint8, Mono12 / Mono12p -> uint16, unpacked by
 # pypylon).  A frame of another dtype is lost, never stored.
 _FRAME_DTYPES = {}
+_PACKED = {}        # per serial: the format set is a packed one (Mono12p)
 
 def _pixel_format_dtype(pixel_format):
     from beacon.camera.schema import pixel_format_dtype
@@ -197,6 +198,7 @@ class BaslerUSB(pylon.InstantCamera):
         dtype = _pixel_format_dtype(pixel_format)
         self.PixelFormat.SetValue(str(pixel_format))
         _FRAME_DTYPES[self._serial()] = dtype
+        _PACKED[self._serial()] = str(pixel_format).endswith("p")
 
     def frame_dtype(self):
         """The dtype frames have in the pixel format last set (None: not set
@@ -313,6 +315,7 @@ class BaslerUSB(pylon.InstantCamera):
         count = 0
         counters = {}       # FRAME_COUNTERS name -> value on this grab's previous frame
         want_dtype = self.frame_dtype()
+        packed = _PACKED.get(self._serial(), False)
         try:
             if not self.IsGrabbing():
                 raise RuntimeError(f"Basler {self._serial()}: StartGrabbingMax({Nimg}) returned "
@@ -345,6 +348,18 @@ class BaslerUSB(pylon.InstantCamera):
                     # The frame as the pixel format gives it (uint8 for Mono8,
                     # uint16 for Mono12 / Mono12p), copied before Release().
                     # Never cast: np.uint8 of a 12-bit frame wraps modulo 256.
+                    if packed:
+                        # pypylon builds a packed frame's unpacked strides from
+                        # the packed row padding: with padding the rows skew
+                        try:
+                            pad = int(grab.PaddingX)
+                        except Exception:
+                            pad = 0
+                        if pad:
+                            raise FrameLostError(
+                                f"Basler {self._serial()}: frame {count} of {Nimg} is packed with "
+                                f"row padding {pad} (unpacked rows unreliable); not stored.",
+                                lost=(count,))
                     img = np.array(grab.GetArray(), copy=True)
                     if want_dtype is not None and img.dtype != want_dtype:
                         raise FrameLostError(

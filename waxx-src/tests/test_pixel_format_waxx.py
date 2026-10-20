@@ -111,3 +111,72 @@ def test_a_driver_that_cannot_set_12_bit_fails_the_run_settings():
     cam, report = _Cam(with_pixel_format=False), {}
     out = CameraNanny().update_params(cam, _params(pixel_format="Mono12p"), report=report)
     assert out is not cam and "pixel_format" in report["error"]
+
+
+# -- liveOD's INIT_RUN check and the experiment's feature check -------------------------
+
+def _init_msg(pf=None, dtype="uint8", shape=(9, 1200, 1920), ctype="basler", capture=True):
+    cp = {"camera_type": ctype, "key": "xy_basler"}
+    if pf is not None:
+        cp["pixel_format"] = pf
+    return {"camera_params": cp, "images_shape": shape, "images_dtype": dtype}, cp, capture
+
+
+@pytest.mark.parametrize("pf, dtype, ok", [
+    (None, "uint8", True),            # a client older than the field: Mono8, uint8
+    ("Mono8", "uint8", True),
+    ("Mono12p", "uint16", True),
+    ("Mono12", "uint16", True),
+    ("Mono12p", "uint8", False),      # declared 8-bit, camera would give 12-bit
+    ("Mono8", "uint16", False),
+    ("Mono10p", "uint16", False),     # no declared dtype for it
+])
+def test_init_run_pairs_pixel_format_and_declared_dtype(pf, dtype, ok):
+    from waxx.util.live_od.live_od_server import _pixel_format_mismatch
+    msg, cp, capture = _init_msg(pf, dtype)
+    assert (_pixel_format_mismatch(msg, cp, capture) == "") is ok
+
+
+def test_init_run_check_skips_runs_without_basler_frames():
+    from waxx.util.live_od.live_od_server import _pixel_format_mismatch
+    msg, cp, _ = _init_msg("Mono12p", "uint16", shape=(0,))       # save_data off
+    assert _pixel_format_mismatch(msg, cp, True) == ""
+    msg, cp, _ = _init_msg(None, "uint16", ctype="andor")
+    assert _pixel_format_mismatch(msg, cp, True) == ""
+    msg, cp, _ = _init_msg("Mono12p", "uint8")
+    assert _pixel_format_mismatch(msg, cp, False) == ""           # takes no frames
+
+
+class _Client:
+    def __init__(self, features):
+        self.server_features = dict(features)
+        self.aborted = False
+
+    def supports(self, feature):
+        return bool(self.server_features.get(feature))
+
+    def abort_run(self):
+        self.aborted = True
+
+
+def _expt(pf, setup_camera=True, ctype="basler"):
+    from waxx.base.expt import Expt
+    e = object.__new__(Expt)
+    e.setup_camera = setup_camera
+    e.camera_params = types.SimpleNamespace(camera_type=ctype, pixel_format=pf)
+    e.run_info = types.SimpleNamespace(run_id=123)
+    return e
+
+
+def test_a_12_bit_run_against_an_old_liveod_is_aborted_before_arming():
+    e, c = _expt("Mono12p"), _Client({"put_data": True})
+    with pytest.raises(RuntimeError, match="does not apply it"):
+        e._refuse_unapplied_pixel_format(c)
+    assert c.aborted
+
+
+@pytest.mark.parametrize("pf, features", [("Mono8", {}), ("Mono12p", {"pixel_format": True})])
+def test_mono8_anywhere_and_12_bit_on_a_new_liveod_go_ahead(pf, features):
+    e, c = _expt(pf), _Client(features)
+    e._refuse_unapplied_pixel_format(c)
+    assert not c.aborted

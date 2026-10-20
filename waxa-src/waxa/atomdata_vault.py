@@ -1242,10 +1242,21 @@ class AtomdataVault(atomdata_base):
 
         # A run from before a field existed ran at this value (not "same as
         # whatever the first run has"): a Basler without pixel_format was Mono8.
-        legacy = {'pixel_format': 'Mono8'}
+        legacy = {'pixel_format': 'Mono8'}      # for Basler runs only
+
+        def _plain(v):
+            # h5py hands strings back as bytes (or 0-d arrays): b'Mono8' is 'Mono8'
+            if isinstance(v, np.ndarray) and v.ndim == 0:
+                v = v.item()
+            return v.decode() if isinstance(v, bytes) else v
 
         def _get(c, key, default):
-            return vars(c.camera_params).get(key, legacy.get(key, default))
+            cp = vars(c.camera_params)
+            if key in cp:
+                return _plain(cp[key])
+            if key in legacy and _plain(cp.get('camera_type', '')) == 'basler':
+                return legacy[key]
+            return default
 
         disagreements = {}
         keys = list(first_cam) + [k for k in legacy if k not in first_cam
