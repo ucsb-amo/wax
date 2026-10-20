@@ -47,7 +47,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Optional
 
-from PyQt6.QtCore import QByteArray, QEvent, QPointF, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
@@ -355,6 +355,12 @@ class DashboardMainWindow(QMainWindow):
 
         # Pop-out bookkeeping.
         self._popped: dict[str, PanelWindow] = {}
+        # Panels being dragged by their header: once the button is released
+        # with the panel still floating (dropped outside a dock spot), it pops out.
+        self._dragged: set[_PanelDockBase] = set()
+        self._drag_out_timer = QTimer(self)
+        self._drag_out_timer.setInterval(30)
+        self._drag_out_timer.timeout.connect(self._check_drag_out)
 
         # Layout bookkeeping.
         self._settings = QSettings(settings_org, "dashboard")
@@ -776,7 +782,7 @@ class DashboardMainWindow(QMainWindow):
         panel.dockLocationChanged.connect(lambda _a: self._note_user_layout_change())
         panel.visibilityChanged.connect(lambda _v: self._center_policy_timer.start())
         panel.dockLocationChanged.connect(lambda _a: self._center_policy_timer.start())
-        panel.topLevelChanged.connect(lambda _f: self._mark_layout_dirty())
+        panel.topLevelChanged.connect(lambda f, p=panel: self._on_panel_top_level(p, f))
         # Dock sizes change without any signal (splitter drags, a neighbour
         # shown or hidden): watch the resize events so they are saved too.
         panel.installEventFilter(self)
@@ -1149,8 +1155,8 @@ class DashboardMainWindow(QMainWindow):
             if state is not None and not self.restoreState(state):
                 _LOG.warning("restoreState rejected the saved dock state")
                 return False
-            # Panels are no longer floatable; a layout saved with a floating
-            # panel would otherwise leave it with no way back into the dock.
+            # Panels never stay floating (a drag out pops them out); a layout
+            # saved with a floating panel would otherwise strand it there.
             for panel in self._panels:
                 if panel.isFloating():
                     panel.setFloating(False)
@@ -1620,11 +1626,32 @@ class DashboardMainWindow(QMainWindow):
         else:
             self.pop_out(panel)
 
-    def pop_out(self, panel: _PanelDockBase, geometry: Optional[QByteArray] = None) -> None:
+    def _on_panel_top_level(self, panel: _PanelDockBase, floating: bool) -> None:
+        self._mark_layout_dirty()
+        # Qt floats a dock the moment its header is dragged; a programmatic
+        # float (restoreState) has no button held and is re-docked there.
+        if floating and QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._dragged.add(panel)
+            self._drag_out_timer.start()
+
+    def _check_drag_out(self) -> None:
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            return
+        # Released: Qt has already docked the panel if it was dropped on a
+        # dock spot (AnimatedDocks is off, so plugging is immediate).
+        self._drag_out_timer.stop()
+        dragged, self._dragged = self._dragged, set()
+        for panel in dragged:
+            if panel.isFloating() and not panel.is_popped_out():
+                self.pop_out(panel, rect=panel.frameGeometry())
+
+    def pop_out(self, panel: _PanelDockBase, geometry: Optional[QByteArray] = None,
+                rect: Optional[QRect] = None) -> None:
         """Move *panel* into its own top-level window (own taskbar button).
 
-        *geometry* places the window (a named layout's); by default it goes
-        where this panel's window was last.
+        *geometry* places the window (a named layout's), *rect* puts it where
+        a dragged-out panel was dropped (screen coordinates, kept on screen);
+        by default it goes where this panel's window was last.
         """
         if panel.is_popped_out():
             return
@@ -1641,7 +1668,14 @@ class DashboardMainWindow(QMainWindow):
         win = PanelWindow(panel, app_id=f"{self._app_id}.{panel.panel_id}",
                           title_prefix=f"{self.windowTitle().split(' - ')[0]} — ")
         geo = geometry if geometry is not None else             self._settings.value(self._layout_key(f"popped_geometry/{panel.panel_id}"))
-        if geo is not None:
+        if rect is not None:
+            screen = QApplication.screenAt(rect.center()) or self.screen() or QApplication.primaryScreen()
+            avail = screen.availableGeometry()
+            w, h = min(rect.width(), avail.width()), min(rect.height(), avail.height())
+            win.resize(w, h)
+            win.move(max(avail.left(), min(rect.left(), avail.right() - w)),
+                     max(avail.top(), min(rect.top(), avail.bottom() - h)))
+        elif geo is not None:
             try:
                 win.restoreGeometry(geo)
             except Exception:
@@ -1723,6 +1757,8 @@ class DashboardMainWindow(QMainWindow):
 
     def eventFilter(self, obj, ev):  # noqa: N802 - Qt API
         etype = ev.type()
+        if etype == QEvent.Type.MouseButtonDblClick and isinstance(obj, _PanelDockBase):
+            return True   # Qt would float a floatable dock on a header double-click
         if etype in (QEvent.Type.Resize, QEvent.Type.Move):
             if isinstance(obj, PanelWindow):
                 if not obj.isMinimized():

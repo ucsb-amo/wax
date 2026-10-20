@@ -72,11 +72,14 @@ class _PanelDockBase(QDockWidget):
         self._active = False
         # Allow shrinking; embedded GUIs sometimes carry oversized minimums.
         self.setMinimumSize(0, 0)
-        # The header carries its own close glyph.  Not floatable: a panel is
-        # docked or popped out into a real window (PanelWindow), never a Qt
-        # floating dock.
+        # The header carries its own close glyph.  A panel is docked or popped
+        # out into a real window (PanelWindow), never left a Qt floating dock;
+        # Floatable is set only so a header dragged out of the dock area
+        # leaves it (non-floatable docks snap back on release), and the
+        # dashboard turns that drop into a pop-out.
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
 
