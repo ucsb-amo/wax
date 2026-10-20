@@ -129,22 +129,30 @@ class FakeLoop:
             self.key, self.title, self.pick = key, title, pick
 
     def __init__(self, key="auto_tof", title="BEC TOF loop", pick=False, path="x.py",
-                 owner="person"):
+                 owner="person", category=None):
         self.spec = self.Spec(key, title, pick)
         self.path = path
         self.owner = owner
+        #: None: the info names no category (a loop from older code: yields)
+        self.category = category
+        self.on_behalf_of = None
         self.state, self.text = "running", "started by jp"
         self.stops, self.starts = [], []
+        self.start_kwargs = []
 
     @property
     def active(self):
         return self.state in ("running", "stopping")
 
     def info(self):
-        return {"state": self.state, "text": self.text, "owner": self.owner,
-                "operator": "jp"}
+        out = {"state": self.state, "text": self.text, "owner": self.owner, "operator": "jp"}
+        if self.category is not None:
+            out["category"] = self.category
+        if self.on_behalf_of is not None:
+            out["on_behalf_of"] = self.on_behalf_of
+        return out
 
-    def stop(self, operator="", client="", start_monitor=True):
+    def stop(self, operator="", client="", start_monitor=True, owner=None):
         self.stops.append((operator, start_monitor))
         self.state, self.text = "stopping", f"Stop pressed by {operator}@{client}"
         return {"status": "ok"}
@@ -152,9 +160,14 @@ class FakeLoop:
     def finish_stop(self):
         self.state, self.text = "stopped", "stopped by run queue@kong after 3 saved runs"
 
-    def start(self, operator="", client="", path=None, owner="person"):
+    def start(self, operator="", client="", path=None, owner="person", category=None,
+              on_behalf_of=None):
         self.starts.append((operator, path))
+        self.start_kwargs.append({"owner": owner, "category": category,
+                                  "on_behalf_of": on_behalf_of})
         self.owner = owner
+        self.category = category or "yields"
+        self.on_behalf_of = on_behalf_of if owner == "queue" else None
         self.state = "running"
         return {"status": "ok"}
 
@@ -1519,28 +1532,84 @@ def test_a_hold_set_by_live_od_or_an_unreadable_file_is_a_persons(tmp_path):
 
 # --- whose loop a job may stop; a Stop cancels the restart (review S13, S14) -----------------------
 
-def test_an_agents_job_never_stops_a_persons_loop_but_a_persons_job_does(tmp_path, expts):
-    loop = FakeLoop(owner="person")
+@pytest.mark.parametrize("owner", ["person", "agent", "queue"])
+def test_an_agents_job_never_stops_a_holding_loop_but_a_persons_job_does(tmp_path, expts,
+                                                                         owner):
+    # (2026-10-20: "holds" is what every person's loop was before -- now chosen)
+    loop = FakeLoop(owner=owner, category="holds")
     q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
     a = submit(q, expts, owner="agent")
     for _ in range(3):
         q.clock.t += 600
         q.tick()
     assert loop.stops == [] and job(q, a)["state"] == "queued"
-    assert "started by a person" in q.info()["waiting"]
-    assert q.info()["alarm"] is None                     # a person's loop: legitimate use
+    assert "holds" in q.info()["waiting"] and "waits behind it" in q.info()["waiting"]
+    assert q.info()["alarm"] is None                     # a holding loop: legitimate use
     submit(q, expts)                                     # a person's job
     q.tick()
     assert loop.stops == [("run queue", False)]
 
 
-@pytest.mark.parametrize("owner", ["agent", "queue"])
-def test_an_agents_job_stops_an_agents_or_the_queues_loop(tmp_path, expts, owner):
-    loop = FakeLoop(owner=owner)
+@pytest.mark.parametrize("owner", ["person", "agent", "queue"])
+@pytest.mark.parametrize("category", ["yields", None])
+def test_an_agents_job_stops_a_yielding_loop_whoever_started_it(tmp_path, expts, owner,
+                                                                 category):
+    # None: the info names no category (a loop from older code) -- it yields,
+    # a person's included (user decision 2026-10-20)
+    loop = FakeLoop(owner=owner, category=category)
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    a = submit(q, expts, owner="agent")
+    q.tick()
+    assert loop.stops == [("run queue", False)]
+    assert q.info()["resume_loop"]["category"] == "yields"
+    assert q.info()["resume_loop"]["owner"] == owner
+    stop = [e for e in q.journal.entries if e["kind"] == "run_queue_loop_stop"][-1]
+    assert stop["category"] == "yields" and stop["job_owner"] == "agent"
+    assert stop["loop_owner"] == owner and stop["for_job"] == a
+
+
+def test_a_persons_yielding_loop_comes_back_yielding_for_the_person(tmp_path, expts):
+    loop = FakeLoop(owner="person", category="yields")
     q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
     submit(q, expts, owner="agent")
     q.tick()
-    assert loop.stops == [("run queue", False)]
+    loop.finish_stop()
+    q.tick()
+    run_through(q, 101)
+    q.tick()
+    assert loop.start_kwargs == [{"owner": "queue", "category": "yields",
+                                  "on_behalf_of": "person"}]
+    resume = [e for e in q.journal.entries if e["kind"] == "run_queue_loop_resume"][-1]
+    assert resume["category"] == "yields" and resume["on_behalf_of"] == "person"
+
+
+def test_a_holding_loop_a_persons_job_stopped_comes_back_holding(tmp_path, expts):
+    loop = FakeLoop(owner="person", category="holds")
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    submit(q, expts)                                     # a person's job
+    q.tick()
+    loop.finish_stop()
+    q.tick()
+    run_through(q, 101)
+    q.tick()
+    assert loop.start_kwargs[-1]["category"] == "holds"
+    assert loop.info()["category"] == "holds" and loop.info()["on_behalf_of"] == "person"
+    # and an agent's job still waits behind it after the restart
+    a = submit(q, expts, owner="agent")
+    q.tick()
+    q.tick()
+    assert len(loop.stops) == 1 and job(q, a)["state"] == "queued"
+
+
+def test_a_resume_record_from_older_code_restarts_the_loop_with_the_default(tmp_path, expts):
+    loop = FakeLoop(owner="agent")
+    q = make_queue(tmp_path, expts, loops={"auto_tof": loop})
+    loop.state, loop.text = "stopped", "stopped by run queue@kong after 3 saved runs"
+    with q._lock:
+        q._resume_loop = {"key": "auto_tof", "path": None, "since": 0.0}   # no category/owner
+    q.tick()
+    assert loop.start_kwargs == [{"owner": "queue", "category": None, "on_behalf_of": None}]
+    assert loop.info()["category"] == "yields"
 
 
 def test_the_queue_starts_a_loop_again_as_queue(tmp_path, expts):

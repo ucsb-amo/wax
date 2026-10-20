@@ -19,6 +19,13 @@ BEC TOF loop's t_tof) has ⚙ left of ▾: start, stop (blank: repeat the start
 value), points and repeats, sent to the server, which uses them from the next
 run.  The card's status line shows the current scan.
 
+A loop card has a category toggle left of ⚙ (since 2026-10-20;
+:data:`waxx.util.device_state.run_loop.LOOP_CATEGORIES`): "yields to agents"
+(the default at every launch of the GUI) or "holds", sent with the next Start.
+A yielding loop is stopped by an agent's queued job after its run in progress
+and started again by the queue when it runs out; agents' jobs wait behind a
+holding one.  While the loop runs the toggle shows its category, disabled.
+
 Everything shown is the server's: every GUI sees the same loop and reset.
 The reset's Run emits ``reset_requested``; the host GUI confirms and sends it
 (the same dialog as the untrusted banner's button).
@@ -80,6 +87,34 @@ _LOOP_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
 #: reset state -> (pill text, pill level)
 _RESET_PILL = {"idle": ("idle", "unknown"), "running": ("RUNNING", "on"),
                "done": ("done", "off"), "failed": ("FAILED", "hazard")}
+
+#: The category a loop card's Start sends unless toggled (the server's default
+#: too: run_loop.DEFAULT_CATEGORY -- kept as a literal so this module imports
+#: nothing of the server's).
+DEFAULT_LOOP_CATEGORY = "yields"
+#: category -> (button text, what it means), for the card's toggle and the confirm
+LOOP_CATEGORY_TEXT = {
+    "yields": ("yields to agents",
+               "Yields: an agent's queued job may stop it after its run in progress; the "
+               "queue starts it again when it has run out. An agent may also stop it."),
+    "holds": ("holds",
+              "Holds: agents' queued jobs wait behind it for as long as it runs, and agents "
+              "may not stop it. A person's queued job still stops it."),
+}
+
+
+def category_text(category: str) -> tuple[str, str]:
+    return LOOP_CATEGORY_TEXT.get(category, (category, ""))
+
+
+def _category_button_css(category: str) -> str:
+    """The toggle as a small pill: amber for "holds" (agents wait), grey for
+    "yields"."""
+    bg = "#8a6a12" if category == "holds" else "#454545"
+    return (f"QToolButton {{ background: {bg}; color: white; border: 0; border-radius: 9px;"
+            f" padding: 2px 10px; font-size: 11px; font-weight: 600; }}"
+            f"QToolButton:hover {{ border: 1px solid {theme.FG_MUTED}; }}"
+            f"QToolButton:disabled {{ color: #dddddd; }}")
 
 _NO_OUTPUT = ("This monitor server keeps no output (older code): restart the monitor "
               "server to get the log.")
@@ -251,6 +286,18 @@ class SequenceCard(QFrame):
         self.status = _small("")
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.status, 1)
+        #: The category the next Start sends ("yields" by default, each launch
+        #: of the GUI; run_loop.LOOP_CATEGORIES).  While the loop runs the
+        #: button shows the loop's own category instead.
+        self.next_category = DEFAULT_LOOP_CATEGORY
+        self._syncing = False
+        self.category_button = QToolButton()
+        self.category_button.setCheckable(True)
+        self.category_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.category_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.category_button.toggled.connect(self._on_category_toggled)
+        self.category_button.setVisible(kind == "run_loop")
+        row.addWidget(self.category_button)
         #: ⚙: the loop's scan settings (shown when the server offers them).
         self.settings_button = QToolButton()
         self.settings_button.setText("⚙")
@@ -332,7 +379,12 @@ class SequenceCard(QFrame):
             if state in ("running", "stopping"):
                 parts.append(f"{runs} saved since {_clock(info.get('started'))}")
                 if info.get("owner"):
-                    parts.append(f"owner {info['owner']}")
+                    owner = info["owner"]
+                    if owner == "queue" and info.get("on_behalf_of"):
+                        owner += f" for {info['on_behalf_of']}"
+                    parts.append(f"owner {owner}")
+                if info.get("category"):
+                    parts.append(info["category"])
             elif state in ("stopped", "latched") and info.get("ended"):
                 parts.append(f"{runs} saved · ended {_clock(info.get('ended'))}")
             last = info.get("last") or {}
@@ -381,6 +433,7 @@ class SequenceCard(QFrame):
                                 "then run it back to back" if pick else ""))
             self.stop_button.setEnabled(reachable and state == "running")
             self.stop_button.setText("Stopping…" if state == "stopping" else "Stop")
+            self._refresh_category(reachable, state)
             scan = self.info.get("scan")
             self.settings_button.setVisible(bool(scan))
             self.settings_button.setEnabled(reachable)
@@ -394,6 +447,52 @@ class SequenceCard(QFrame):
             self.start_button.setToolTip(
                 unreachable or f"Run {self.info.get('expt')}.py through the monitor server. It "
                                "takes the core; its end state marks the device state trusted.")
+
+    # -- the category toggle ------------------------------------------------------
+
+    @property
+    def shown_category(self) -> str:
+        """The category the toggle shows: the running loop's own, else the
+        one the next Start sends."""
+        if (self.info.get("state") in ("running", "stopping")
+                and self.info.get("category")):
+            return str(self.info["category"])
+        return self.next_category
+
+    def _refresh_category(self, reachable: bool, state: str) -> None:
+        active = state in ("running", "stopping")
+        category = self.shown_category
+        label, meaning = category_text(category)
+        self._syncing = True
+        try:
+            self.category_button.setChecked(category == "holds")
+        finally:
+            self._syncing = False
+        self.category_button.setText(label)
+        set_style_if_changed(self.category_button, _category_button_css(category))
+        supported = bool(self.info.get("categories"))
+        if active:
+            self.category_button.setEnabled(False)
+            tip = (f"This loop {category}." if self.info.get("category") else
+                   "This loop names no category (a monitor server from before 2026-10-20?): "
+                   "it is treated as yielding.")
+            tip += "\n" + meaning + "\nStop it and start it again to change this."
+        else:
+            self.category_button.setEnabled(reachable)
+            tip = ("Next Start: " + meaning + "\nClick to switch between 'yields to agents' "
+                   "(the default) and 'holds'.")
+            if self.info and not supported:
+                tip += ("\nThis monitor server does not know loop categories (older code): "
+                        "it ignores the choice; agents' jobs wait behind a person's loop.")
+        self.category_button.setToolTip(tip)
+
+    def _on_category_toggled(self, checked: bool) -> None:
+        if getattr(self, "_syncing", False):
+            return
+        if self.info.get("state") in ("running", "stopping"):
+            return
+        self.next_category = "holds" if checked else "yields"
+        self.refresh_buttons()
 
     # -- the log ----------------------------------------------------------------
 
@@ -766,6 +865,9 @@ class SequencesPanel(QWidget):
                      "liveOD, a run that fails or saves incomplete, someone else's run, or the "
                      "monitor being started. Stop lets the run in progress finish and save, "
                      "then starts the monitor.")
+        category = card.next_category if card is not None else DEFAULT_LOOP_CATEGORY
+        lines.append(category_text(category)[1]
+                     + " (the card's yields / holds toggle sets this before Start.)")
         if info.get("path"):
             lines.append(f"File{' (on the monitor server)' if path is not None else ''}: "
                          f"{info['path']}")
@@ -777,9 +879,11 @@ class SequencesPanel(QWidget):
                 self.on_run_loop(reply.get("loop"))
             elif card is not None:
                 card.set_message(f"✕ not started: {reply.get('msg')}")
-        # a person is clicking: the loop is a person's (the run queue stops
-        # only agent / queue / idle-started loops for its jobs)
-        request = {"type": "run_loop", "action": "start", "loop": key, "owner": "person"}
+        # a person is clicking: the loop is a person's; its category (the
+        # card's toggle, default "yields") decides whether an agent's queued
+        # job stops it
+        request = {"type": "run_loop", "action": "start", "loop": key, "owner": "person",
+                   "category": category}
         if path is not None:
             request["path"] = path
         self.send_request(request, done)
@@ -824,7 +928,8 @@ class SequencesPanel(QWidget):
                 self.on_run_loop(reply.get("loop"))
             elif card is not None:
                 card.set_message(f"✕ Stop: {reply.get('msg')}")
-        self.send_request({"type": "run_loop", "action": "stop", "loop": key}, done)
+        self.send_request({"type": "run_loop", "action": "stop", "loop": key,
+                           "owner": "person"}, done)
 
     # -- logs -------------------------------------------------------------------------
 

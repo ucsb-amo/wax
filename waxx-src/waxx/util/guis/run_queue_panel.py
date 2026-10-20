@@ -1666,7 +1666,8 @@ class RunQueuePanel(QWidget):
         if isinstance(resume, dict) and self.reachable:
             self.loop_note.setText(
                 f"The queue stopped the loop {resume.get('key')} for its jobs "
-                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out.")
+                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out"
+                + (f" ({resume['category']})." if resume.get("category") else "."))
             self.loop_note.show()
         else:
             self.loop_note.hide()

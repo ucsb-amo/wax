@@ -31,6 +31,13 @@ One run at a time:
   start unless it is already running: an aborted run has usually restarted it
   already (its abort path sends ``run complete``).
 
+Every loop has a *category* (since 2026-10-20), set at Start and kept in
+``info()`` and the journal: ``"yields"`` -- an agent's queued job stops it after
+its run in progress and the queue starts it again when it runs out, and an
+agent may stop it -- or ``"holds"`` -- agents' jobs wait behind it.  A start
+that names none gets ``"yields"`` whoever starts it, a person included
+(:data:`DEFAULT_CATEGORY`); see :data:`LOOP_CATEGORIES`.
+
 A loop is either fixed to one file (``LoopSpec.expt_path``) or a *pick* loop
 (``LoopSpec.root``): its file is chosen at every Start -- the Sequences tab's
 file dialog -- and must be a ``.py`` file inside ``root`` on the server's
@@ -89,6 +96,75 @@ _TAIL_SHOWN = 8
 ACTIVE = ("running", "stopping")
 #: Who may have started a loop (RunLoop.start's owner).
 LOOP_OWNERS = ("person", "agent", "queue")
+
+#: A loop's category (RunLoop.start's ``category``, since 2026-10-20): whether
+#: it gives way to an agent's queued job.
+#:
+#: * ``"yields"`` -- an agent's job that is eligible stops it after its run in
+#:   progress (as the queue has always done for a loop an agent or the queue
+#:   started), and the queue starts it again when it has run out; an agent may
+#:   also stop it with the ``run_loop`` stop request.
+#: * ``"holds"`` -- agents' jobs wait behind it for as long as it runs, and an
+#:   agent's stop request is refused unless an agent started it.
+#:
+#: A person's queued job stops either kind (as before).
+LOOP_CATEGORIES = ("yields", "holds")
+#: The category of a loop whose start request names none -- for EVERY owner,
+#: a person's included.  User decision 2026-10-20: the TOF loop is the lab's
+#: idle filler, and agents are to be able to stop a TOF loop a person started
+#: unless that person said it holds.  This is the one change for old callers:
+#: before 2026-10-20 a person's loop (a start without ``"owner": "agent"``)
+#: always held.  An agent's or the queue's loop behaves as before.
+DEFAULT_CATEGORY = "yields"
+
+
+def loop_category(value) -> tuple[str | None, str]:
+    """A start request's ``category`` -> ``(category, "")``, or ``(None, why it
+    is refused)``.  None / "" -> :data:`DEFAULT_CATEGORY`, whoever starts it."""
+    if value is None or value == "":
+        return DEFAULT_CATEGORY, ""
+    text = str(value).strip().lower()
+    if text in LOOP_CATEGORIES:
+        return text, ""
+    return None, (f"category must be one of {', '.join(LOOP_CATEGORIES)}, not {value!r}")
+
+
+def info_category(info: Mapping | None) -> str:
+    """The category in a loop's ``info()``: :data:`DEFAULT_CATEGORY` when it
+    names none (a loop started by a server from before 2026-10-20 cannot be
+    asked; this code is in the same server as the loop, so in practice every
+    active loop names one)."""
+    value = (info or {}).get("category")
+    return value if value in LOOP_CATEGORIES else DEFAULT_CATEGORY
+
+
+def effective_owner(info: Mapping | None) -> str:
+    """Who a loop is run for: its ``owner`` -- except a loop the queue started
+    again (owner "queue"), which is run for whoever owned it when the queue
+    stopped it (``on_behalf_of``; "queue" when that is not known)."""
+    info = info or {}
+    owner = info.get("owner") or "person"
+    if owner == "queue" and info.get("on_behalf_of") in ("person", "agent"):
+        return info["on_behalf_of"]
+    return owner
+
+
+def agent_may_stop(info: Mapping | None) -> tuple[bool, str]:
+    """May an agent stop this loop (its stop request, ``owner`` "agent")?
+    ``(True, "")`` for a yielding loop and for a holding loop an agent started
+    (or the queue, for an agent); ``(False, why)`` for a holding loop run for a
+    person (or for the queue with its first owner not known -- held: it is the
+    safe reading)."""
+    if info_category(info) == "yields":
+        return True, ""
+    owner = effective_owner(info)
+    if owner == "agent":
+        return True, ""
+    who = (info or {}).get("operator") or (info or {}).get("client") or "?"
+    whose = "a person" if owner == "person" else "the run queue for its first owner"
+    return False, (f"{(info or {}).get('title') or 'the loop'} holds (started by {whose}, {who}): "
+                   "an agent may not stop it -- a person stops it, or starts it as "
+                   "'yields'")
 
 
 #: Characters refused in a picked file's path: the run is launched through the
@@ -329,7 +405,10 @@ class RunLoop:
             out = dict(self._s)
             scan = dict(self._scan) if self._scan is not None else None
         out.update(key=self.spec.key, title=self.spec.title, expt=self.expt,
-                   path=self.path, about=self._read_about())
+                   path=self.path, about=self._read_about(),
+                   # the categories this server takes (a GUI's sign that a
+                   # start's "category" is not ignored, as an older server does)
+                   categories=list(LOOP_CATEGORIES))
         if scan is not None:
             out["scan"] = dict(self.spec.scan.info(), settings=scan,
                                text=loop_scan.describe(self.spec.scan, scan))
@@ -375,13 +454,20 @@ class RunLoop:
     # -- requests ---------------------------------------------------------------
 
     def start(self, operator: str = "", client: str = "", path=None,
-              owner: str = "person") -> dict:
+              owner: str = "person", category=None, on_behalf_of: str | None = None) -> dict:
         """Start the loop; a pick loop needs ``path`` (see :func:`resolve_pick`).
         ``owner``: who starts it -- "person" (the GUI), "agent" (an agent's
         TOF-idle restart) or "queue" (the run queue starting again a loop it
-        stopped); kept in ``info()``: the run queue stops a person's loop only
-        for a person's job."""
+        stopped).  ``category``: "yields" or "holds" (:data:`LOOP_CATEGORIES`;
+        None: :data:`DEFAULT_CATEGORY`, whoever starts it) -- whether an
+        agent's queued job stops it.  ``on_behalf_of``: for the queue's restart,
+        who owned the loop when the queue stopped it.  All kept in ``info()``
+        (``category_source``: "request" or "default")."""
         who = _who(operator, client)
+        category_given = category is not None and category != ""
+        category, why = loop_category(category)
+        if category is None:
+            return self._refused(why, who)
         if self.spec.pick:
             full, why = resolve_pick(self.spec, path)
             if full is None:
@@ -404,23 +490,35 @@ class RunLoop:
             self._stop_by, self._external = "", ""
             self._stop_monitor = True
             self._wake.clear()
+            owner = owner if owner in LOOP_OWNERS else "person"
             self._s = {"state": "running", "text": f"started by {who}", "runs": 0,
                        "run_id": None, "last": None, "started": self._clock(),
                        "ended": None, "operator": operator, "client": client,
-                       "owner": owner if owner in LOOP_OWNERS else "person"}
-        log.info("%s: started by %s (%s).", self.spec.title, who, self.path)
-        self._record("run_loop_start", operator=operator, client=client, owner=owner)
+                       "owner": owner, "category": category,
+                       "category_source": "request" if category_given else "default"}
+            if owner == "queue" and on_behalf_of in ("person", "agent"):
+                self._s["on_behalf_of"] = on_behalf_of
+        log.info("%s: started by %s (%s; %s).", self.spec.title, who, self.path, category)
+        self._record("run_loop_start", operator=operator, client=client, owner=owner,
+                     category=category,
+                     category_source="request" if category_given else "default",
+                     **({"on_behalf_of": on_behalf_of} if owner == "queue" and on_behalf_of
+                        else {}))
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name=f"run-loop-{self.spec.key}")
         self._thread.start()
         self._notify()
         return {"status": "ok", "loop": self.info()}
 
-    def stop(self, operator: str = "", client: str = "", start_monitor: bool = True) -> dict:
+    def stop(self, operator: str = "", client: str = "", start_monitor: bool = True,
+             owner: str | None = None) -> dict:
         """Finish the run in progress, then end the loop.  ``start_monitor``
         False: do not start the monitor at the end (the run queue stops a loop
         to run its own jobs straight after -- a monitor starting then could
-        take the core from the job)."""
+        take the core from the job).  ``owner``: who asks ("person", "agent",
+        "queue"), for the journal only -- whether an agent may stop a holding
+        loop is the caller's check (:func:`agent_may_stop`; the monitor
+        server's ``run_loop`` request)."""
         who = _who(operator, client)
         with self._lock:
             if self._s["state"] not in ACTIVE:
@@ -430,9 +528,11 @@ class RunLoop:
             self._s["state"] = "stopping"
             self._s["text"] = (f"Stop pressed by {who}: run {self._s['run_id']} finishes first"
                                if self._s.get("run_id") else f"Stop pressed by {who}")
+            category = self._s.get("category")
         log.info("%s: stop requested by %s.", self.spec.title, who)
         self._record("run_loop_stop", operator=operator, client=client,
-                     start_monitor=bool(start_monitor))
+                     start_monitor=bool(start_monitor), category=category,
+                     **({"owner": owner} if owner else {}))
         self._wake.set()
         self._notify()
         return {"status": "ok", "loop": self.info()}

@@ -645,3 +645,63 @@ def test_the_supervisor_and_the_server_share_one_uptime_floor():
     from waxx.util.dashboard import exit_codes
     from waxx.util.dashboard.server_supervisor import ServerSupervisor
     assert ServerSupervisor.RESTART_REQUEST_MIN_UPTIME_S == exit_codes.RESTART_REQUEST_MIN_UPTIME_S
+
+
+# --- loop categories through the server (2026-10-20) ---------------------------------------------
+
+def test_an_agents_job_stops_a_persons_loop_started_with_no_category_and_brings_it_back(
+        server, expts, qapp):
+    # a person's Start from older GUI code names no category: it yields (user 2026-10-20)
+    from PyQt6.QtWidgets import QApplication
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    run_ids = iter([81001, 81002])
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, next(run_ids), release)
+    assert server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                       "operator": "jp"})["status"] == "ok"
+    assert loop.info()["category"] == "yields" and loop.info()["owner"] == "person"
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"
+    resume = server.run_queue.info()["resume_loop"]
+    assert resume["category"] == "yields" and resume["owner"] == "person"
+    release.set()
+    loop.join(5)
+    QApplication.processEvents()
+    server.watch_tick()
+    assert len(server.spawner.calls) == 1
+    release.clear()
+    _run(server, 85600)
+    info = loop.info()
+    assert info["state"] == "running" and info["owner"] == "queue"
+    assert info["category"] == "yields" and info["on_behalf_of"] == "person"
+    kinds = {e["kind"]: e for e in server.journal.tail(200)}
+    assert kinds["run_queue_loop_stop"]["category"] == "yields"
+    assert kinds["run_queue_loop_resume"]["on_behalf_of"] == "person"
+    loop.stop()
+    release.set()
+    loop.join(5)
+
+
+def test_an_agents_job_waits_behind_a_holding_loop_and_a_persons_job_does_not(server, expts):
+    loop = server.loops["auto_tof"]
+    release = threading.Event()
+    loop._spawn = lambda command, extra_env=None: LoopProc(server.live, 81001, release)
+    server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof", "operator": "jp",
+                "owner": "person", "category": "holds"})
+    assert _wait_for(lambda: loop.info().get("run_id") == 81001)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "agent"})
+    server.watch_tick()
+    server.watch_tick()
+    assert loop.info()["state"] == "running"
+    assert "holds" in server.run_queue.info()["waiting"]
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
+                "owner": "person"})
+    server.watch_tick()
+    assert loop.info()["state"] == "stopping"
+    assert server.run_queue.info()["resume_loop"]["category"] == "holds"
+    release.set()
+    loop.join(5)
