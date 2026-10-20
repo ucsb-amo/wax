@@ -47,6 +47,8 @@ OFF           = "#777777"   # idle / disconnected / unknown
 EXTERNAL      = "#2e8b57"   # running, but not ours
 PENDING       = "#e08a1e"   # unsaved / staged edits (orange)
 UNDO          = PENDING
+HELD          = "#8a6a12"   # a person hold / a pause is on (its banner, and the button that ends it)
+HELD_EDGE     = "#f0c14b"
 
 # --- state maps ------------------------------------------------------------
 # Keyed by SupervisorState *name* so this module stays import-light and the
@@ -95,6 +97,20 @@ def header_button_css() -> str:
         f"QPushButton:hover {{ background-color: {BG_BUTTON_HOVER}; }}"
         f"QPushButton:disabled {{ color: {FG_DISABLED}; border-color: #333;"
         f" background-color: #2f2f2f; }}"
+    )
+
+
+def held_button_css(radius: int = 3) -> str:
+    """A button while what it ends is on (a person hold, a pause): filled
+    :data:`HELD`, the colour of the banner that says so, so the eye goes from
+    the banner to the button that releases it.  Disabled (the server is not
+    answering) it stays amber, dimmed: the last known state."""
+    return (
+        f"QPushButton {{ color: white; font-weight: 600; background-color: {HELD};"
+        f" border: 1px solid {HELD_EDGE}; border-radius: {radius}px; padding: 3px 10px; }}"
+        f"QPushButton:hover {{ background-color: #a07c18; }}"
+        f"QPushButton:disabled {{ color: rgba(255, 255, 255, 120); background-color: #5a4710;"
+        f" border-color: #7a6420; }}"
     )
 
 

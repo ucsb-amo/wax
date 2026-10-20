@@ -336,6 +336,11 @@ def test_summary_alarm_hold_pause_and_loop_note(panel):
     assert "PAUSED by jp@kong" in panel.pause_labels["agent"].text()
     assert panel.pause_buttons["agent"].text() == "Resume agent"
     assert panel.pause_buttons["all"].text() == "Pause all"
+    # the button that ends a hold / pause wears the banner's colour; the others plain
+    assert rqp.theme.HELD in panel.hold_button.styleSheet()
+    assert rqp.theme.HELD in panel.pause_buttons["agent"].styleSheet()
+    assert panel.pause_buttons["all"].styleSheet() == ""
+    assert rqp.theme.HELD in panel.hold_label.styleSheet()
     assert not panel.loop_note.isHidden() and "auto_tof" in panel.loop_note.text()
     # launching shows as such
     cur = _job(2, "launching")

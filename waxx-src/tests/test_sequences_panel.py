@@ -574,3 +574,22 @@ def test_an_older_server_is_named_in_the_toggles_tooltip(panel):
     panel.set_loops({"auto_tof": LOOP})                  # no "categories": older code
     card = panel.loop_cards["auto_tof"]
     assert "does not know loop categories" in card.category_button.toolTip()
+
+
+def test_the_release_button_wears_the_hold_colour(qapp):
+    """While a hold is on, the button that releases it is amber (the HELD
+    banner's colour) and the row's accent too; released, both go back."""
+    p = sp.SequencesPanel(requester=lambda obj: {"status": "ok"}, synchronous_requests=True,
+                          show_queue=False)
+    p.set_reachable(True)
+    p.set_hold({"active": True, "since": time.time(), "by": "jp@kong", "reason": "aligning",
+                "owner": "person"})
+    row = p.hold_row
+    assert row.button.text() == sp.RELEASE_TEXT
+    assert sp.theme.HELD in row.button.styleSheet()
+    assert sp.theme.HELD_EDGE in row.styleSheet()
+    p.set_hold({"active": False})
+    assert row.button.text() == sp.HOLD_TEXT
+    assert sp.theme.HELD not in row.button.styleSheet()
+    assert sp.theme.HELD_EDGE not in row.styleSheet()
+    p.shutdown()

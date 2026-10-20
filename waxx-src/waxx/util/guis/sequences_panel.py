@@ -618,6 +618,9 @@ class HoldRow(QFrame):
     def refresh_buttons(self) -> None:
         reachable = self.panel.reachable
         self.button.setText(RELEASE_TEXT if self.held else HOLD_TEXT)
+        set_style_if_changed(self.button, theme.held_button_css(radius=12) if self.held else
+                             _pill_button_css(theme.FG, theme.BORDER))
+        set_style_if_changed(self, _card_css(theme.HELD_EDGE if self.held else theme.ACCENT))
         self.button.setEnabled(reachable)
         self.button.setToolTip(
             "the monitor server is unreachable" if not reachable else
