@@ -574,7 +574,7 @@ class CameraStreamClient:
 
     def _tag(self, frame, key):
         """Name the frame ``key`` on its camera server, so a viewer can show
-        this key's frames alone (Camera Viewer: Options -> Frames). For
+        this key's frames alone (Camera Viewer: the Frames dropdown). For
         display only, nothing is saved by it; never raises."""
         if not self._tagging:
             return
