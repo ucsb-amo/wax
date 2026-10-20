@@ -91,7 +91,8 @@ def test_the_request_contract(server, expts, tmp_path):
             "pid", "pid_started", "client_pid", "client_started", "run_id", "log_path",
             "exit_code", "outcome", "launched_at", "ended_at", "cancel", "kill", "adopted",
             "rank", "expt_class",
-            "calibrates_declared", "submitter", "paused", "paused_by", "paused_since"} == set(j)
+            "calibrates_declared", "submitter", "paused", "paused_by", "paused_since",
+            "no_file"} == set(j)
     # the edit, move and insert actions answer through the server
     assert server.ask({"type": "run_queue", "action": "edit", "id": 1, "owner": "agent",
                        "fields": {"label": "rabi2"}})["job"]["label"] == "rabi2"

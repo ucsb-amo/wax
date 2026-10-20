@@ -21,7 +21,9 @@ must end *saved* or *done*), an optional chain name, and the submitter's write-b
 -> ``ending`` (its process has exited; the outcome is being read) ->
 ``saved`` | ``done`` (ran to its end with ``save_data=False``: no file) |
 ``failed`` | ``aborted`` (an Abort pressed in liveOD); or ``cancelled`` /
-``skipped`` (never launched, or launched and cancelled).
+``skipped`` (never launched, or launched and cancelled).  ``no_file`` marks a
+job whose run had ``save_data=False``, whatever it ended as (from liveOD's
+POLL / last_outcome, or "Acquisition for run 0 aborted" in its output).
 
 **Scheduling.**  One slot.  A job is *eligible* when it is queued, its due time
 has passed, every job in ``after`` is saved (or done), it is not paused (scope "all", or
@@ -61,7 +63,10 @@ from a byte offset, so the ``kq`` client
 
 **Cancel.**  A queued job is cancelled at once.  A running job is never
 terminated: the queue sends liveOD's Abort (RESET) for it -- only when liveOD's
-run in progress is that job's run id, on a POLL just before -- and the job
+run in progress is that job's run id, on a POLL just before; for a run with no
+file (``no_file``: run id 0, as every save_data=False run) the POLL must name
+the job's ``queue_job`` too, and the RESET carries it, so liveOD refuses it
+for any other run -- and the job
 stays ``running`` until its process ends; it then ends ``cancelled`` (or
 ``saved``, if it saved before the Abort reached it).  An Abort is what liveOD's
 own button does: the run stops at its next shot and liveOD discards its file.
@@ -143,7 +148,7 @@ from waxx.util.device_state.monitor_manager import ar_command, environment_repor
 from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_loop import (
-    RUN_ID_RE, _SHELL_CHARS, judge_run, live_od_outcome, tell_live_od_exited)
+    ABORTED_RE, RUN_ID_RE, _SHELL_CHARS, judge_run, live_od_outcome, tell_live_od_exited)
 
 log = logging.getLogger(__name__)
 
@@ -375,6 +380,10 @@ class Job:
     paused: bool = False
     paused_by: str = ""
     paused_since: float | None = None
+    #: its run had no file (``save_data=False``): liveOD's POLL showed the
+    #: job's run in progress with run id 0, its last_outcome named it, or the
+    #: run's output says "Acquisition for run 0 aborted".  Whatever it ended as
+    no_file: bool = False
 
     @property
     def name(self) -> str:
@@ -1191,7 +1200,9 @@ class RunQueue:
                     log.warning("Run queue: cancel of running %s asked by %s: liveOD's Abort "
                                 "goes to run %s (its file is discarded, as for any Abort); "
                                 "the job ends when its process does.", job.name, by,
-                                job.run_id if job.run_id is not None else "(no run id yet)")
+                                job.run_id if job.run_id is not None else
+                                "0 (save_data=False: no file)" if job.no_file else
+                                "(no run id yet)")
                 # the tick sends liveOD's Abort (and retries): a request never
                 # waits on liveOD
                 reply = {"status": "ok", "job": job.to_dict(), "pending": True}
@@ -2210,15 +2221,28 @@ class RunQueue:
             self._save()
             self._notify()
 
+    def _note_no_file(self, job: Job, poll) -> None:
+        """liveOD's run in progress is ``job``'s run with no file
+        (``save_data=False``): mark the job ``no_file``."""
+        if (job.no_file or job.run_id is not None or not isinstance(poll, dict)
+                or not poll.get("run_in_progress") or not self._is_job_unsaved_run(job, poll)):
+            return
+        with self._lock:
+            job.no_file = True
+        self._save()
+        self._notify()
+
     def _follow(self, job: Job) -> None:
         if job.state == "launching":
             self._take_lines(job, self._read_log(job))
             self._identify(job, self._last_poll)
+            self._note_no_file(job, self._last_poll)
             self._follow_launch(job)
             return
         self._take_lines(job, self._read_log(job))
         poll = self._last_poll
         self._identify(job, poll)
+        self._note_no_file(job, poll)
         if (job.run_id is not None and job.client_pid is None and isinstance(poll, dict)
                 and poll.get("run_id") == job.run_id and poll.get("client_pid")):
             with self._lock:
@@ -2274,9 +2298,13 @@ class RunQueue:
                    "exit_code": exit_code, "aborted": v.aborted,
                    "lost_core": not v.start_monitor,
                    "told_live_od": None if told is None else told["status"]}
+        aborted_run = ABORTED_RE.search("\n".join(tail))
         with self._lock:
             job.exit_code = exit_code
             job.outcome = outcome
+            if (unsaved is not None or v.nothing_written
+                    or (job.run_id is None and aborted_run and aborted_run.group(1) == "0")):
+                job.no_file = True
             killed_by = (job.kill or {}).get("by")
             if v.saved:
                 state = "done" if v.nothing_written else "saved"
@@ -2349,7 +2377,14 @@ class RunQueue:
             pending = job.cancel is not None and not job.cancel.get("abort_sent")
         if not pending:
             return
-        if job.run_id is None:
+        # a run with no file (save_data=False) is run id 0 in liveOD, like every
+        # such run: it is named by the job's queue_job too, on the POLL and in
+        # the RESET (a liveOD from before 2026-10-19 ignores it in the RESET:
+        # the POLL just before is then the only check)
+        no_file = job.run_id is None and job.no_file
+        target = 0 if no_file else job.run_id
+        name = "its run (save_data=False, run id 0)" if no_file else f"run {target}"
+        if target is None:
             self._cancel_note(job, abort_note="no run id yet: the Abort goes once the run has "
                                               "one")
             return
@@ -2358,14 +2393,16 @@ class RunQueue:
             self._cancel_note(job, abort_note="liveOD is not reachable: the Abort is not sent "
                                               "yet")
             return
-        if not poll.get("run_in_progress") or poll.get("run_id") != job.run_id:
+        if (not poll.get("run_in_progress") or poll.get("run_id") != target
+                or (no_file and not self._is_job_unsaved_run(job, poll))):
             current = poll.get("run_id") if poll.get("run_in_progress") else "none"
+            if no_file and poll.get("run_in_progress") and current == 0:
+                current = f"another run with no file (queue job {poll.get('queue_job') or '?'})"
             self._cancel_note(job, abort_note=f"liveOD's run in progress is {current}, not "
-                                              f"{job.run_id}: no Abort sent")
+                                              f"{name if no_file else target}: no Abort sent")
             return
         if poll.get("save_in_progress") or poll.get("run_state") == "saving":
-            self._cancel_note(job, abort_note=f"liveOD is saving run {job.run_id}: no Abort "
-                                              "sent")
+            self._cancel_note(job, abort_note=f"liveOD is saving {name}: no Abort sent")
             return
         if poll.get("reset_requested"):
             self._cancel_note(job, abort_sent=True, abort_note="an Abort was already pending")
@@ -2373,29 +2410,34 @@ class RunQueue:
         if self._live_od_reset is None:
             self._cancel_note(job, abort_note="this queue has no way to send liveOD's Abort")
             return
-        with self._lock:
-            self._own_abort_ids.add(job.run_id)
+        if not no_file:
+            # (not run id 0: an older liveOD's Reset of any later run-0 run
+            # would be taken for the queue's own -- person_hold.observe_poll)
+            with self._lock:
+                self._own_abort_ids.add(target)
         try:
-            reply = self._live_od_reset(run_id=job.run_id, source="queue")
+            if no_file:
+                reply = self._live_od_reset(run_id=0, source="queue", queue_job=job.queue_job)
+            else:
+                reply = self._live_od_reset(run_id=target, source="queue")
         except Exception as exc:                      # noqa: BLE001
             self._cancel_note(job, abort_note=f"sending the Abort failed: {exc}")
-            log.error("Run queue: liveOD's Abort for run %s (%s) failed: %s", job.run_id,
-                      job.name, exc)
+            log.error("Run queue: liveOD's Abort for %s (%s) failed: %s", name, job.name, exc)
             return
         ok = bool(isinstance(reply, dict) and reply.get("ok"))
         if isinstance(reply, dict) and reply.get("refused"):
             # liveOD's run is no longer this job's (it ended, or another
             # started): nothing was aborted; tried again while the job runs
             self._cancel_note(job, abort_note=f"liveOD refused the Abort: {reply.get('error')}")
-            log.warning("Run queue: liveOD refused the Abort for run %s (%s): %s", job.run_id,
-                        job.name, reply.get("error"))
+            log.warning("Run queue: liveOD refused the Abort for %s (%s): %s", name, job.name,
+                        reply.get("error"))
             return
         self._cancel_note(job, abort_sent=True,
                           abort_note="Abort sent" if ok else f"liveOD refused: {reply}")
-        log.warning("Run queue: liveOD's Abort sent for run %s (%s): %s", job.run_id, job.name,
+        log.warning("Run queue: liveOD's Abort sent for %s (%s): %s", name, job.name,
                     "acknowledged" if ok else reply)
-        self._record("run_queue_abort_sent", job=job.id, run_id=job.run_id, ok=ok,
-                     by=job.cancel.get("by"))
+        self._record("run_queue_abort_sent", job=job.id, run_id=target, ok=ok,
+                     by=job.cancel.get("by"), no_file=no_file)
         self._save()
 
     # -- ending jobs and chains ---------------------------------------------------------------

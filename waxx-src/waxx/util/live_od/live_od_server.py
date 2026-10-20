@@ -2030,6 +2030,18 @@ class LiveODServer(QThread, NetServer):
             return {"ok": False, "refused": True,
                     "run_id": self._current_run_id if self._run_in_progress else None,
                     "error": "RESET carries the token of a run that is not in progress"}
+        # the run queue's job ("<id>:<token>"): every save_data=False run is run
+        # id 0, so the run id alone cannot name one of them
+        queue_job = msg.get("queue_job")
+        if queue_job and (not self._run_in_progress
+                          or str(queue_job) != self._current_client.get("queue_job")):
+            current = self._current_client.get("queue_job") if self._run_in_progress else None
+            logger.warning(f"RESET for queue job {queue_job} refused: the run in progress is "
+                           f"{'queue job ' + current if current else 'not that job'}.")
+            return {"ok": False, "refused": True,
+                    "run_id": self._current_run_id if self._run_in_progress else None,
+                    "error": f"RESET names queue job {queue_job}, but the run in progress is "
+                             f"{'queue job ' + current if current else 'not that job'}"}
         return None
 
     def _handle_reset(self, msg: dict) -> dict:

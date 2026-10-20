@@ -44,10 +44,13 @@ class Live:
         self.state.update(run_in_progress=False, run_state="exited")
         return {"ok": True}
 
-    def reset(self, run_id=None, source="person"):
+    def reset(self, run_id=None, source="person", queue_job=None):
         if run_id is not None and (not self.state["run_in_progress"]
                                    or self.state["run_id"] != run_id):
             return {"ok": False, "refused": True, "error": "not the run in progress"}
+        if queue_job and self.state.get("queue_job") != queue_job:
+            return {"ok": False, "refused": True, "error": "not that queue job's run"}
+        self.queue_jobs = getattr(self, "queue_jobs", []) + [queue_job]
         self.resets.append(self.state["run_id"])
         self.sources = getattr(self, "sources", []) + [source]
         self.state["reset_requested"] = True
@@ -488,6 +491,7 @@ def test_outcomes(q, expts):
     assert incomplete["state"] == "failed" and "saved_incomplete" in incomplete["reason"]
     ends = [e for e in q.journal.entries if e["kind"] == "run_queue_end"]
     assert [e["state"] for e in ends] == ["saved", "aborted", "failed"]
+    assert not any(job(q, i)["no_file"] for i in ids)        # each had a file
 
 
 def no_file_run(q, a, outcome="nothing_written", code=0, lines=(), tag=True):
@@ -511,6 +515,7 @@ def test_a_run_without_a_file_that_runs_to_its_end_is_done(q, expts):
     j = job(q, a)
     assert j["state"] == "done" and j["run_id"] is None and j["exit_code"] == 0
     assert "save_data=False" in j["reason"] and j["outcome"]["outcome"] == "nothing_written"
+    assert j["no_file"]
     q.tick()
     assert job(q, b)["state"] == "running"                # a done job satisfies `after`
 
@@ -521,7 +526,7 @@ def test_a_run_without_a_file_aborted_in_live_od_is_aborted_and_stops_its_chain(
     no_file_run(q, a, outcome="discarded", code=1,
                 lines=["RuntimeError: Acquisition for run 0 aborted."])
     j = job(q, a)
-    assert j["state"] == "aborted" and j["outcome"]["aborted"]
+    assert j["state"] == "aborted" and j["outcome"]["aborted"] and j["no_file"]
     assert "no file" in j["reason"] and "discarded" not in j["reason"]
     assert job(q, b)["state"] == "cancelled" and "aborted" in job(q, b)["reason"]
 
@@ -532,6 +537,7 @@ def test_a_run_without_a_file_is_done_only_on_its_own_record(q, expts):
     no_file_run(q, a, tag=False)                          # liveOD's record names no job
     j = job(q, a)
     assert j["state"] == "failed" and "without a run id" in j["reason"]
+    assert not j["no_file"]                               # nothing said it was this job's
 
 
 def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
@@ -539,6 +545,16 @@ def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
     q.tick()
     no_file_run(q, a, code=1, lines=["Traceback (most recent call last):", "ValueError: x"])
     assert job(q, a)["state"] == "failed"
+    assert job(q, a)["no_file"]                           # seen in liveOD's POLL while running
+
+
+def test_a_run_without_a_file_is_marked_while_it_runs(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    q.live.start_run(0, client_pid=7000, client_host="kong", launcher="kq", queue_job=qj(q, a))
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "running" and j["no_file"] and j["run_id"] is None
 
 
 def test_a_job_killed_hard_is_reported_to_live_od(q, expts):
@@ -598,6 +614,34 @@ def test_cancel_a_running_job_sends_live_ods_abort_for_its_run_only(q, expts):
     assert j["state"] == "cancelled" and j["reason"].startswith("cancelled by agent-7 while running")
     assert 101 in q.own_abort_ids()
     assert "run_queue_abort_sent" in q.journal.kinds
+
+
+def test_cancel_a_running_job_with_no_file_aborts_run_0_named_by_its_queue_job(q, expts):
+    a, b = submit(q, expts), submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    q.cancel({"id": a, "by": "jp", "owner": "person"})
+    q.tick()
+    assert q.live.resets == [] and "no run id yet" in job(q, a)["cancel"]["abort_note"]
+    # another save_data=False run is liveOD's (run id 0 too): never aborted
+    q.live.start_run(0, launcher="kq", queue_job=qj(q, b))
+    q.tick()
+    assert q.live.resets == [] and not job(q, a)["no_file"]
+    q.live.start_run(0, launcher="kq", queue_job=qj(q, a))   # a's own run, no file
+    q.tick()
+    j = job(q, a)
+    assert j["no_file"] and j["cancel"]["abort_sent"] and j["cancel"]["abort_note"] == "Abort sent"
+    assert q.live.resets == [0] and q.live.queue_jobs == [qj(q, a)]
+    assert 0 not in q.own_abort_ids()                 # never whitelists every run-0 Reset
+    q.tick()
+    assert q.live.resets == [0]                       # once
+    proc.write("RuntimeError: Acquisition for run 0 aborted.")
+    q.live.end_run(0, "discarded")
+    proc.code = 1
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "cancelled" and j["no_file"]
+    assert j["reason"].startswith("cancelled by jp while running")
 
 
 def test_no_abort_while_live_od_saves_and_a_late_cancel_still_saves(q, expts):
