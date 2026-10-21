@@ -251,6 +251,51 @@ class _PinnedDirectory:
         pass
 
 
+def _beaconed_now(directory):
+    """``{server_id: (host, port)}`` as a fresh listing of ``directory``
+    would find the servers now: the process's beacon registry, heard within
+    the directory's ``max_age_s`` -- a snapshot, no network and no wait (the
+    process has listened since its first listing). None when that cannot be
+    told: a stand-in directory without it, a real one in a process that is
+    not listening for beacons (its cached listing is then the best there
+    is), or any error."""
+    discover = getattr(directory, "_discover_servers", None)
+    if discover is None:
+        return None
+    try:
+        if getattr(directory, "_discover_fn", None) is None:
+            from beacon.discovery import client as dc
+            if dc.listening_for() is None:
+                return None
+        return {str(sid): (str(addr[0]), int(addr[1]))
+                for sid, addr in dict(discover()).items()}
+    except Exception:
+        return None
+
+
+def find_current(directory, query):
+    """``directory.find(query)``, its cached listing trusted only while the
+    server that entry names still beacons from the same address; otherwise
+    (the server restarted on a new port, or is no longer heard) the camera
+    is listed afresh. Returns ``(entry, stale)``: ``stale`` is the cached
+    entry that was replaced, else None.
+
+    Why: a warm-launched run lists the cameras before its compile (the
+    provisional exposure delays, BaslerParams.prepare_for_run) and claims
+    them minutes later, after GO; a camera server restarted in between
+    (liveOD's camera host on a liveOD restart) beacons from a new port, and
+    the cached entry's old one never answers (job 542, 2026-10-21). The
+    check costs nothing when the address still holds: no request, no wait."""
+    entry = directory.find(query)
+    servers = _beaconed_now(directory)
+    host, port = getattr(entry, "host", None), getattr(entry, "port", None)
+    if servers is None or host is None or port is None:
+        return entry, None
+    if servers.get(str(entry.server_id)) == (str(host), int(port)):
+        return entry, None
+    return directory.find(query, refresh=True), entry
+
+
 class CameraStreamClient:
     """Free-run snaps of one camera, one per ``grab()`` (module docstring).
 
@@ -320,6 +365,7 @@ class CameraStreamClient:
         self._priors = {}           # settings to put back at the end
         self._applied = {}          # readback of what we set
         self._liveod_key = None
+        self._resolve_record = {}   # how the claim found the camera's server, when notable
         self._roi = None
         self._downsample = 1
         self._sensor_shape = ()
@@ -556,6 +602,7 @@ class CameraStreamClient:
         from beacon.camera.stream import CameraStream
 
         directory = directory or shared_camera_directory()
+        self._resolve_record = {}
         self._liveod_key, state = self._liveod_entry()
         if self._liveod_key is not None:
             if state not in ("open", "grabbing"):
@@ -575,7 +622,9 @@ class CameraStreamClient:
                     f"resolves to {entry.server_id}: liveOD's camera server did "
                     f"not answer -- refusing to open it behind liveOD's back")
         else:
-            entry = directory.find(self.serial)
+            entry, stale = find_current(directory, self.serial)
+            if stale is not None:
+                self._note_relisted(stale, entry)
             holder = entry.holder or {}
             if (entry.state == "reserved"
                     and str(holder.get("server_id", "")).endswith(LIVEOD_SERVER_SUFFIX)):
@@ -589,15 +638,49 @@ class CameraStreamClient:
             directory = _PinnedDirectory(directory, entry.server_id)
         return CameraStream(entry, label=self.label, directory=directory)
 
+    def _note_relisted(self, stale, entry):
+        """The cached listing named a server address that no longer beacons:
+        said once, and kept in the provenance record (``resolve``)."""
+        def where(e):
+            return {"server_id": str(getattr(e, "server_id", "?")),
+                    "host": str(getattr(e, "host", "?")), "port": getattr(e, "port", None)}
+        self._resolve_record["relisted"] = {"cached": where(stale), "now": where(entry)}
+        console.info(f"[{self.label}] {self.serial}: {stale.server_id} at "
+                     f"{stale.host}:{stale.port} (listed before the claim) no longer "
+                     f"beacons there; listed afresh: {entry.server_id} at "
+                     f"{entry.host}:{entry.port}")
+
     def _liveod_entry(self):
-        """(liveOD camera key, state) for our serial, or (None, None)."""
-        if self._live_od_client is None:
+        """(liveOD camera key, state) for our serial, or (None, None).
+
+        A request that fails right after the client followed liveOD to a new
+        address (liveOD restarted since this process last asked: the client
+        rediscovers it on the timeout, ``reconnect_generation``) is asked
+        once more, at the new address -- else a camera on liveOD's bar would
+        be taken for one that is not. Any other failure: (None, None), as
+        before."""
+        client = self._live_od_client
+        if client is None:
             return None, None
-        try:
+        cams = None
+        for attempt in (1, 2):
             with _live_od_lock:
-                cams = self._live_od_client.cameras()
-        except Exception:
-            return None, None
+                gen = getattr(client, "reconnect_generation", None)
+                try:
+                    cams = client.cameras()
+                    break
+                except Exception as e:
+                    moved = (gen is not None
+                             and getattr(client, "reconnect_generation", None) != gen)
+                    if attempt == 2 or not moved:
+                        rec = getattr(self, "_resolve_record", None)
+                        if rec is not None:
+                            rec["liveod_query_failed"] = repr(e)
+                        return None, None
+                    rec = getattr(self, "_resolve_record", None)
+                    if rec is not None:
+                        rec["liveod_query_retried"] = (
+                            f"liveOD moved to a new address ({e!r}); asked again")
         for k, v in cams.items():
             if str(v.get("serial_no", "")) == self.serial:
                 return k, v.get("state")
@@ -945,6 +1028,7 @@ class CameraStreamClient:
                      "dummy": True, "dead": True, "serial": self.serial,
                      "triggered": isinstance(self, TriggeredCameraStreamClient),
                      "reason": reason,
+                     "resolve": dict(getattr(self, "_resolve_record", None) or {}),
                      "edges_not_served": int(self.counts.get("edges_not_served", 0)),
                      "note": f"'{k}' is a placeholder (one byte per shot), not a frame"})
             except Exception:
@@ -1045,6 +1129,7 @@ class CameraStreamClient:
             "camera_id": getattr(self._stream, "camera_id", "?"),
             "server_id": getattr(self._stream, "server_id", "?"),
             "liveod_key": self._liveod_key,
+            "resolve": dict(getattr(self, "_resolve_record", None) or {}),
             "settings_applied": _values(self._applied),
             "settings_rev": self._rev,
             "server_defaults": {k: v for k, v in self._defaults.items()
