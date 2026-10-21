@@ -217,3 +217,85 @@ def test_a_kernel_container_is_never_resized():
     d.x = d.add_data_container(1)
     with pytest.raises(TypeError, match="not a host container"):
         d.resize_host_container(d.x, (2,), np.float64)
+
+
+# ---- re-merge 2026-10-21: main's per-frame ROIs and camera exposure delay ----
+
+class _Entry:
+    def __init__(self, delay):
+        self.exposure_start_delay_s = delay
+        self.server_id = "camera_server:test"
+
+
+class _Directory:
+    """A directory whose entry reports ``delay`` (no network)."""
+    def __init__(self, delay):
+        self.entry = _Entry(delay)
+        self.finds = []
+
+    def find(self, query, *, refresh=False):
+        self.finds.append(query)
+        return self.entry
+
+
+def test_per_frame_rois_take_their_shapes_at_the_late_connect():
+    fe = FakeExpt()
+    stream = TrigFakeStream()
+    cs = _trig(fe, stream, key=["img_a", "img_b", "img_c"], crop_to_saved_roi=False,
+               roi=[0, 0, 6, 4], frame_rois={"img_a": [1, 2, 4, 7], 1: None},
+               no_roi_downsample=2)
+    try:
+        for k in ("img_a", "img_b", "img_c"):
+            assert getattr(fe.data, k)._per_shot_data_shape == PROVISIONAL_FRAME_SHAPE
+        fe.data.init()
+        connect_streams([cs])
+        assert cs.live
+        for k, shape in (("img_a", (5, 3)), ("img_b", (5, 6)), ("img_c", (4, 6))):
+            assert getattr(fe.data, k)._per_shot_data_shape == shape
+            assert fe.data.__dict__[k]._run_data.shape == (4, *shape)
+    finally:
+        cs.finish()
+
+
+def test_the_exposure_delay_is_decided_before_the_compile_and_kept_at_connect(capsys):
+    """Built without a connection: the kernel-read exposure_delay comes from
+    the camera server's entry at construction (before bind copies it and
+    before a warm run's compile); the connect records the camera's value and
+    never changes the kernel's."""
+    fe = FakeExpt()
+    stream = TrigFakeStream()
+    stream.exposure_start_delay_s = 23.5e-6
+    directory = _Directory(21.0e-6)
+    cs = _trig(fe, stream, directory=directory)
+    try:
+        assert directory.finds == ["12345"] and stream._settings["trigger_mode"] == "Off"
+        assert cs.exposure_delay == 21.0e-6
+        assert cs.exposure_delay_source == "camera_before_claim"
+        fe.data.init()
+        connect_streams([cs])
+        assert cs.live
+        assert cs.exposure_delay == 21.0e-6                     # unchanged by the claim
+        assert cs.exposure_delay_at_connect == 23.5e-6
+        out = capsys.readouterr().out
+        assert "reports an exposure delay of 23.50 us" in out and "kernel uses 21.00 us" in out
+        extra = cs._provenance_extra()
+        assert extra["exposure_delay"] == 21.0e-6
+        assert extra["exposure_delay_source"] == "camera_before_claim"
+        assert extra["exposure_delay_at_connect"] == 23.5e-6
+    finally:
+        cs.finish()
+
+
+def test_the_exposure_delay_falls_back_to_configured_before_the_compile(capsys):
+    fe = FakeExpt()
+    stream = TrigFakeStream()
+    stream.exposure_start_delay_s = 23.5e-6
+    cs = _trig(fe, stream)              # the conftest's directory finds nothing
+    try:
+        assert cs.exposure_delay == 17e-6 and cs.exposure_delay_source == "configured"
+        assert "before the compile" in capsys.readouterr().out
+        fe.data.init()
+        connect_streams([cs])
+        assert cs.exposure_delay == 17e-6 and cs.exposure_delay_at_connect == 23.5e-6
+    finally:
+        cs.finish()
