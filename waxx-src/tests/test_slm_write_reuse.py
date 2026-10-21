@@ -38,6 +38,11 @@ def _uploads(host):
     return len(host.uploads)
 
 
+def _async(slm, args, skip=True, counter_mu=0):
+    """The kernel's parallel write, as its async RPC arrives on the host."""
+    slm._write_async(*args, skip, counter_mu)
+
+
 def _client(host):
     slm = _slm(host.port)
     slm.core = types.SimpleNamespace(ref_period=1e-9)
@@ -151,7 +156,7 @@ def test_the_first_reuse_is_said_once(slm_host, fast_settle, capsys):
 def test_async_write_then_check_passes(slm_host, fast_settle):
     slm = _client(slm_host)
     n = _uploads(slm_host)
-    slm._write_async(*ARGS)
+    _async(slm, ARGS)
     slm._check_settled(int(1.0 / 1e-9))                      # 1 s of slack
     assert _uploads(slm_host) == n + 1
     assert slm_host.uploads[-1][:2] == (100, 200)
@@ -163,7 +168,7 @@ def test_async_reuses_an_unchanged_mask(slm_host, fast_settle):
     slm._write_for_kernel(*ARGS)
     n = _uploads(slm_host)
     time.sleep(fast_settle + 0.01)
-    slm._write_async(*ARGS)
+    _async(slm, ARGS)
     slm._check_settled(int(0.1 / 1e-9))
     assert _uploads(slm_host) == n
 
@@ -171,7 +176,7 @@ def test_async_reuses_an_unchanged_mask(slm_host, fast_settle):
 def test_check_raises_when_the_settle_would_be_late(slm_host, monkeypatch):
     monkeypatch.setattr(slm_mod, "SLM_RPC_DELAY", 0.5)
     slm = _client(slm_host)
-    slm._write_async(*ARGS)
+    _async(slm, ARGS)
     with pytest.raises(slm_mod.SLMWriteError, match="would settle"):
         slm._check_settled(int(0.2 / 1e-9))
 
@@ -181,7 +186,7 @@ def test_check_raises_when_the_write_is_still_in_flight(fast_settle):
                           if "cmd" not in msg else [(0.0, {"status": "error", "error": "n/a"})])
     try:
         slm = _client(slow)
-        slm._write_async(*ARGS)
+        _async(slm, ARGS)
         t0 = time.monotonic()
         with pytest.raises(slm_mod.SLMWriteError, match="still in flight"):
             slm._check_settled(int(0.15 / 1e-9))
@@ -197,7 +202,7 @@ def test_check_raises_when_the_write_failed():
                                           (0.0, {"status": "error", "error": "bad mask"})])
     try:
         slm = _client(refuses)
-        slm._write_async(*ARGS)
+        _async(slm, ARGS)
         with pytest.raises(slm_mod.SLMWriteError, match="bad mask"):
             slm._check_settled(int(1.0 / 1e-9))
     finally:
@@ -211,23 +216,105 @@ def test_a_check_without_an_async_write_is_a_no_op(slm_host):
 def test_a_sync_write_waits_for_the_async_one_in_flight(slm_host, fast_settle):
     slm_host.init_s = 0.0
     slm = _client(slm_host)
-    slm._write_async(*OTHER)
+    _async(slm, OTHER)
     slm.write_phase_mask(x_center=300, y_center=400, verbose=False)
     assert [u[:2] for u in slm_host.uploads[-2:]] == [(100, 200), (300, 400)]
 
 
-def test_an_unchecked_async_write_is_warned(slm_host, fast_settle, capsys):
+def test_a_failed_write_replaced_before_any_use_is_warned(capsys):
+    refuses = ScriptedServer(lambda msg: [(0.0, {"status": "queued"}),
+                                          (0.0, {"status": "error", "error": "bad mask"})])
+    try:
+        slm = _client(refuses)
+        _async(slm, ARGS)
+        assert _wait(lambda: slm._pending.done())
+        _async(slm, OTHER)
+        assert "an earlier mask write failed" in capsys.readouterr().out
+    finally:
+        slm._join_pending()
+        refuses.close()
+
+
+def test_skip_if_unchanged_false_always_writes(slm_host, fast_settle):
     slm = _client(slm_host)
-    slm._write_async(*ARGS)
-    slm._write_async(*OTHER)
+    slm._write_for_kernel(*ARGS)
+    n = _uploads(slm_host)
+    time.sleep(fast_settle + 0.01)
+    _async(slm, ARGS, skip=False)
     slm._check_settled(int(1.0 / 1e-9))
-    out = capsys.readouterr().out
-    assert out.count("was not followed by wait_phase_mask_settled") == 1
+    assert _uploads(slm_host) == n + 1
+
+
+# --- a first use too close to real time: checked at the end of the shot -------------------
+
+def test_deferred_check_passes_when_the_use_came_after_the_settle(slm_host, fast_settle):
+    slm = _client(slm_host)
+    _async(slm, ARGS, counter_mu=1_000)
+    assert _wait(lambda: slm._pending.done())
+    # the use played out 1 s (timeline) after the write was issued
+    slm._confirm_write(1_000 + int(1.0 / 1e-9))
+    assert slm._pending_checked is True
+
+
+def test_deferred_check_raises_when_the_use_came_before_the_settle(slm_host, monkeypatch):
+    monkeypatch.setattr(slm_mod, "SLM_RPC_DELAY", 0.3)
+    slm = _client(slm_host)
+    _async(slm, ARGS, counter_mu=0)
+    with pytest.raises(slm_mod.SLMWriteError, match="before the mask was settled"):
+        slm._confirm_write(int(0.1 / 1e-9))                  # used 0.1 s after the write
+
+
+def test_deferred_check_raises_on_a_failed_write():
+    refuses = ScriptedServer(lambda msg: [(0.0, {"status": "queued"}),
+                                          (0.0, {"status": "error", "error": "bad mask"})])
+    try:
+        slm = _client(refuses)
+        _async(slm, ARGS)
+        with pytest.raises(slm_mod.SLMWriteError, match="bad mask"):
+            slm._confirm_write(int(5.0 / 1e-9))
+    finally:
+        refuses.close()
+
+
+# --- the kernels' structure (compiled in k-exp tests/test_shot_deadtime_compiles.py) -------
+
+def _body(fn):
+    src = inspect.getsource(fn)
+    return src[src.index('"""', src.index('"""') + 3) + 3:]
+
+
+def test_parallel_write_waits_for_the_timeline_only_after_light_and_marks_the_check():
+    body = _body(slm_mod.SLM.write_phase_mask_kernel)
+    par = body[body.index("if parallel:"):body.index("        else:")]
+    i_light = par.index("if self._light_this_shot:")
+    i_wait = par.index("self.core.wait_until_mu(now_mu())")
+    i_rpc = par.index("self._write_async(")
+    i_pend = par.index("self._use_pending = True")
+    assert i_light < i_wait < i_rpc < i_pend
+    assert "delay(" not in par                                # nothing on the timeline
+
+
+def test_first_use_checks_on_the_spot_only_with_slack():
+    body = _body(slm_mod.SLM.ensure_mask_settled)
+    assert "self._light_this_shot = True" in body
+    i_slack = body.index("if slack > self.core.seconds_to_mu(CHECK_MIN_SLACK_S):")
+    i_check = body.index("self._check_settled(slack)")
+    i_note = body.index("self._t_use_mu = now_mu()")
+    assert i_slack < i_check < i_note
+    assert "delay(" not in body and "break_realtime" not in body
+
+
+def test_the_imaging_beam_asks_its_guard_before_any_light():
+    from waxx.control.beat_lock import BeatLockImaging, NoLightGuard
+    for fn in (BeatLockImaging.on, BeatLockImaging.pulse):
+        body = inspect.getsource(fn)        # on() has no docstring
+        assert body.index("self.light_guard.ensure_mask_settled()") < body.index("self.dds_sw.on()")
+    assert isinstance(BeatLockImaging().light_guard, NoLightGuard)
 
 
 def test_bad_arguments_surface_at_the_check(slm_host):
     slm = _client(slm_host)
-    slm._write_async(10e-6, 0., 1, 2, "hexagon", False, False)
+    _async(slm, (10e-6, 0., 1, 2, "hexagon", False, False))
     with pytest.raises(slm_mod.SLMWriteError, match="mask_type"):
         slm._check_settled(int(1.0 / 1e-9))
 

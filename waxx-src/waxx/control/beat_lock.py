@@ -29,6 +29,16 @@ N_MAX_POWER_MAP_POINTS = 32
 POLMOD_H_IDX = 0
 POLMOD_V_IDX = 1
 
+class NoLightGuard():
+    """What the imaging beam asks before it puts light out when nothing needs
+    asking. A machine with an SLM in the imaging path sets the beam's
+    light_guard to its waxx.control.slm.slm.SLM, whose ensure_mask_settled
+    checks a mask written in parallel with the sequence before its first
+    use."""
+    @kernel
+    def ensure_mask_settled(self):
+        pass
+
 class BeatLockImaging():
     def __init__(self,
                  dds_sw=DDS,
@@ -57,6 +67,9 @@ class BeatLockImaging():
 
         self.phase_mode = 1
 
+        # Asked before every pulse()/on() (see NoLightGuard).
+        self.light_guard = NoLightGuard()
+
     @kernel
     def init(self):
         self.dds_beatref.on()
@@ -81,13 +94,15 @@ class BeatLockImaging():
 
         Args:
             t (float): The time of the imaging pulse.
-        """        
+        """
+        self.light_guard.ensure_mask_settled()
         self.dds_sw.on()
         delay(t)
         self.dds_sw.off()
 
     @kernel
     def on(self):
+        self.light_guard.ensure_mask_settled()
         self.dds_sw.on()
     
     @kernel

@@ -30,13 +30,18 @@ SLM_STATUS_CONNECT_S = 2.
 _STATUS_KEYS = ("instance", "start_count", "pattern_epoch", "reinit_due", "due_for_s",
                 "next_due_in_s", "reinit_in_progress", "slm_ready", "last_reinit_error",
                 "queue_len", "pattern")
-# wait_phase_mask_settled: the mask must be settled this long before the
-# moment it is needed (covers the RPC's transit, which makes the host's idea
-# of "now + slack" a little late) ...
-SETTLE_MARGIN_S = 0.010
+# The settle checks: the mask must be settled this long before the moment it
+# is needed. It covers the RPCs' transit -- an async RPC can wait behind
+# others queued before it -- which makes the host's idea of when a timeline
+# moment plays out a little late ...
+SETTLE_MARGIN_S = 0.050
 # ... and the host waits for a write in flight only until this long before
 # that moment, so the kernel gets its slack back with room to submit.
 RPC_RETURN_MARGIN_S = 0.020
+# The first use of the imaging path after a parallel write is checked on the
+# spot only with at least this much slack; with less, end_of_shot checks it
+# (before the shot is recorded) from the time it played out.
+CHECK_MIN_SLACK_S = 0.030
 
 
 def _expected_pattern(command: dict) -> dict:
@@ -71,12 +76,22 @@ class SLM:
         # "t_settled"} (t_settled: monotonic time its settle ends). None when
         # no such write, or the server could not say it is showing it.
         self._shown = None
-        # write_phase_mask_async: the write in flight (a Future giving its
-        # t_settled), and whether wait_phase_mask_settled has looked at it.
+        # A parallel write: the write in flight (a Future giving its
+        # t_settled), whether a check has looked at it, and when the host took
+        # it (monotonic, with the RTIO counter the kernel read at the call:
+        # maps a timeline moment of this shot to the wall clock).
         self._executor = None
         self._pending = None
         self._pending_checked = True
+        self._pending_issue = (0., 0)
         self._said_reused = False
+        # Kernel state (see ensure_mask_settled / end_of_shot): a parallel
+        # write awaits its first-use check; the first use, when it came with
+        # too little slack to check then (-1: none); whether imaging light or
+        # a camera trigger was used in this shot already.
+        self._use_pending = False
+        self._t_use_mu = np.int64(-1)
+        self._light_this_shot = False
 
     def _command(self, dimension, phase, x_center, y_center, mask_type, initialize):
         """The pattern command for these arguments (defaults from the params),
@@ -253,34 +268,74 @@ class SLM:
 
     @rpc(flags={"async"})
     def _write_async(self, dimension, phase, x_center, y_center, mask_type, initialize,
-                     verbose):
-        """Async RPC of write_phase_mask_async: hand the write to a worker
-        thread and return (an async RPC must never raise)."""
+                     verbose, skip_if_unchanged, counter_mu):
+        """Async RPC of a parallel write: hand it to a worker thread and
+        return (an async RPC must never raise). `counter_mu`: the RTIO
+        counter the kernel read at the call."""
+        t_recv = time.monotonic()
         try:
-            if self._pending is not None and not self._pending_checked:
-                print("[slm] WARNING: write_phase_mask_async() was not followed by "
-                      "wait_phase_mask_settled() before the next one: nothing confirmed "
-                      "that the mask before it was on the SLM and settled when it was "
-                      "used.")
-            self._join_pending()
+            # no wait for a write in flight: the one worker thread keeps the
+            # writes in order, and this RPC must not hold up the ones after it
+            self._warn_if_superseded_failure()
             command, label = self._command(dimension, phase, x_center, y_center,
                                            mask_type, initialize)
         except Exception as e:
             fut = concurrent.futures.Future()
             fut.set_exception(e)
             self._pending, self._pending_checked = fut, False
+            self._pending_issue = (t_recv, int(counter_mu))
             return
         if self._executor is None:
             self._executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="slm_write")
-        self._pending = self._executor.submit(self._async_job, command, label, verbose)
+        self._pending = self._executor.submit(self._async_job, command, label, verbose,
+                                              bool(skip_if_unchanged))
         self._pending_checked = False
+        self._pending_issue = (t_recv, int(counter_mu))
 
-    def _async_job(self, command, label, verbose) -> float:
-        t_settled = self._reuse(command, label, verbose)
+    def _warn_if_superseded_failure(self):
+        """A parallel write that failed and was never checked (nothing used
+        the imaging path after it) is about to be replaced: say so."""
+        fut = self._pending
+        if fut is None or self._pending_checked or not fut.done():
+            return
+        e = fut.exception()
+        if e is not None:
+            print(f"[slm] WARNING: an earlier mask write failed ({e!r}) and is replaced by a "
+                  f"new one before anything used the imaging path after it.")
+
+    def _async_job(self, command, label, verbose, skip_if_unchanged=True) -> float:
+        t_settled = self._reuse(command, label, verbose) if skip_if_unchanged else -1.
         if t_settled < 0.:
             t_settled = self._write_and_note(command, label, verbose)
         return t_settled
+
+    def _confirm_write(self, t_use_mu: TInt64):
+        """RPC of end_of_shot, for a shot whose first use of the imaging path
+        after a parallel write came with too little slack to check then:
+        raise SLMWriteError unless that write is on the SLM and was settled
+        by the wall time `t_use_mu` (timeline) played out."""
+        fut = self._pending
+        if fut is None:
+            return
+        self._pending_checked = True
+        try:
+            t_settled = fut.result(timeout=SLM_FIRST_REPLY_S + SLM_APPLIED_TIMEOUT_S + 5.)
+        except concurrent.futures.TimeoutError:
+            raise self._failed("the mask write never finished; this shot used the imaging "
+                               "path after it")
+        except SLMWriteError:
+            raise
+        except Exception as e:
+            raise self._failed(f"the mask write failed: {e!r}")
+        t_recv, counter0 = self._pending_issue
+        ref = getattr(self.core, "ref_period", 1.e-9)
+        t_use = t_recv + (int(t_use_mu) - counter0) * ref - SETTLE_MARGIN_S
+        if t_settled > t_use:
+            raise self._failed(f"this shot used the imaging path "
+                               f"{(t_settled - t_use) * 1e3:.0f} ms before the mask was "
+                               f"settled (SLM_RPC_DELAY {SLM_RPC_DELAY:g} s after its write); "
+                               f"the shot is not recorded")
 
     def _join_pending(self):
         """Wait for a write_phase_mask_async in flight (its outcome is
@@ -506,7 +561,7 @@ class SLM:
 
     @kernel
     def write_phase_mask_kernel(self, dimension=dv, phase=dv, x_center=di, y_center=di, mask_type='spot',initialize=False,
-                                verbose=True):
+                                verbose=True, skip_if_unchanged=True, parallel=True):
         """Writes a phase spot of given dimension and phase to the specified
         position on the slm display.
 
@@ -526,56 +581,105 @@ class SLM:
             Defaults to ExptParams.slm_mask.
             initialize (booling): True for doing initialization on client side, and
             False for letting SLM self-reinitialze automatically.
-
-        A mask the SLM still shows -- the one this object wrote last, the
-        server confirming no reinit and no write by anyone since -- is not
-        written again: one status query, no wait for the timeline, and only
-        what is left of its SLM_RPC_DELAY settle (normally nothing). The
-        first write of a run is always a real one.
+            skip_if_unchanged (bool): True (default): a mask the SLM still
+            shows -- the one this object wrote last, the server confirming no
+            reinit and no write by anyone since -- is not written again (one
+            status query). The first write of a run is always a real one.
+            parallel (bool): True (default): the write goes to a host thread
+            and the sequence goes on at once -- no wait for the timeline, no
+            SLM_RPC_DELAY on it. The mask is checked, not waited for: the
+            first use of the imaging path after it (imaging light through
+            the imaging beam object, a camera trigger: ensure_mask_settled)
+            raises SLMWriteError unless the write is on the SLM and
+            SLM_RPC_DELAY past by then; with too little slack there to ask,
+            end_of_shot asks before the shot is recorded. If imaging light
+            was already used in this shot, the timeline is waited for first,
+            so no earlier light sees the new mask. False: the old blocking
+            write, then SLM_RPC_DELAY on the timeline (setup at run start).
         """
-        t_left = self._settle_left_if_shown(dimension, phase, x_center, y_center,
-                                            mask_type, initialize, verbose)
-        if t_left >= 0.:
-            # The query took host time; the cursor moves only if it fell behind.
-            self.core.break_realtime()
-            delay(t_left)
+        if parallel:
+            if self._light_this_shot:
+                self.core.wait_until_mu(now_mu())
+                # a use of the previous write still owes its check
+                if self._t_use_mu >= 0:
+                    self._confirm_write(self._t_use_mu)
+                    self._t_use_mu = np.int64(-1)
+                self.core.break_realtime()
+            self._write_async(dimension, phase, x_center, y_center, mask_type, initialize,
+                              verbose, skip_if_unchanged, self.core.get_rtio_counter_mu())
+            self._use_pending = True
+            self._t_use_mu = np.int64(-1)
         else:
-            self.core.wait_until_mu(now_mu())
-            self._write_for_kernel(dimension, phase, x_center, y_center, mask_type,
-                                   initialize, verbose)
-            # The RPC returns once the mask is on the display, which can take
-            # seconds (a reinit ahead of it); that time is not on the timeline.
-            self.core.break_realtime()
-            delay(SLM_RPC_DELAY)
+            if self._t_use_mu >= 0:
+                # a use of an earlier parallel write still owes its check
+                self.core.wait_until_mu(now_mu())
+                self._confirm_write(self._t_use_mu)
+                self._t_use_mu = np.int64(-1)
+                self.core.break_realtime()
+            # this write supersedes a parallel one nothing has used yet; it is
+            # waited for on the timeline itself
+            self._use_pending = False
+            t_left = -1.
+            if skip_if_unchanged:
+                t_left = self._settle_left_if_shown(dimension, phase, x_center, y_center,
+                                                    mask_type, initialize, verbose)
+            if t_left >= 0.:
+                # The query took host time; the cursor moves only if it fell behind.
+                self.core.break_realtime()
+                delay(t_left)
+            else:
+                self.core.wait_until_mu(now_mu())
+                self._write_for_kernel(dimension, phase, x_center, y_center, mask_type,
+                                       initialize, verbose)
+                # The RPC returns once the mask is on the display, which can take
+                # seconds (a reinit ahead of it); that time is not on the timeline.
+                self.core.break_realtime()
+                delay(SLM_RPC_DELAY)
 
     @kernel
     def write_phase_mask_async(self, dimension=dv, phase=dv, x_center=di, y_center=di,
                                mask_type='spot', initialize=False, verbose=True):
-        """write_phase_mask_kernel without waiting: the write goes to a host
-        thread and the sequence goes on at once -- no wait for the timeline,
-        no settle delay. Same arguments.
+        """write_phase_mask_kernel(..., parallel=True), by name."""
+        self.write_phase_mask_kernel(dimension, phase, x_center, y_center, mask_type,
+                                     initialize, verbose, True, True)
 
-        The mask is NOT known to be on the SLM until wait_phase_mask_settled()
-        says so: call that later in the same shot, before anything that needs
-        the mask (the imaging), where the timeline is comfortably ahead of
-        real time (after a long delay(), say). The write starts when the host
-        takes this RPC, i.e. at kernel-CPU time, which is earlier in real
-        time than the cursor; the mask changes then, so nothing between here
-        and the check may depend on the old mask either. A mask the SLM still
-        shows is not rewritten (see write_phase_mask_kernel).
-        """
-        self._write_async(dimension, phase, x_center, y_center, mask_type, initialize,
-                          verbose)
+    @kernel
+    def ensure_mask_settled(self):
+        """Called before every use of the imaging path (the imaging beam's
+        on()/pulse(), Image.trigger_camera). After a parallel write, the
+        first use checks it: on the spot (raising SLMWriteError before the
+        light) when the timeline is at least CHECK_MIN_SLACK_S ahead, else
+        noted for end_of_shot. Otherwise: one flag."""
+        self._light_this_shot = True
+        if self._use_pending:
+            self._use_pending = False
+            slack = now_mu() - self.core.get_rtio_counter_mu()
+            if slack > self.core.seconds_to_mu(CHECK_MIN_SLACK_S):
+                self._check_settled(slack)
+            else:
+                self._t_use_mu = now_mu()
 
     @kernel
     def wait_phase_mask_settled(self):
-        """Raise SLMWriteError (ending the run, as a failed write does) unless
-        the last write_phase_mask_async is on the SLM and SLM_RPC_DELAY past
-        its write by the time the cursor here plays out. Changes nothing on
-        the timeline: a mask that is late is an error, never a silent delay
-        to the sequence. Waits for a write still in flight only while the
-        timeline's slack allows; normally the write finished long before."""
-        self._check_settled(now_mu() - self.core.get_rtio_counter_mu())
+        """The first-use check, placed by hand (it changes nothing on the
+        timeline: a late mask is an error, never a delay to the sequence)."""
+        if self._use_pending:
+            self._use_pending = False
+            self._check_settled(now_mu() - self.core.get_rtio_counter_mu())
+
+    @kernel
+    def end_of_shot(self, shot_completed):
+        """From the machine's cleanup_scan_kernel, before the shot is recorded
+        (and with its hazards already made safe: the RPC may wait for a write
+        in flight). A first use that came with too little slack to check is
+        checked now from when it played out; raises SLMWriteError if the mask
+        was not settled by then. Skipped for a shot that raised (it is not
+        recorded). A parallel write nothing used yet stays pending for the
+        next shot's first use."""
+        if shot_completed and self._t_use_mu >= 0:
+            self._confirm_write(self._t_use_mu)
+        self._t_use_mu = np.int64(-1)
+        self._light_this_shot = False
 
     def _send_command(self, command):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:

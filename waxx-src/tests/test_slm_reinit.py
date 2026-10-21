@@ -396,6 +396,8 @@ def test_kernel_wrapper_resyncs_the_timeline_after_the_rpc():
     from waxx.control.slm.slm import SLM
     src = inspect.getsource(SLM.write_phase_mask_kernel)
     body = src[src.index('"""', src.index('"""') + 3) + 3:]
+    # the blocking path (parallel=False); the parallel one is in test_slm_write_reuse
+    body = body[body.index("t_left = -1."):]
     i_query = body.index("self._settle_left_if_shown(")
     i_brk0 = body.index("self.core.break_realtime()")
     i_left = body.index("delay(t_left)")
