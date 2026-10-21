@@ -117,6 +117,13 @@ class Scanner():
         # data shots when this is True; the host RPCs below decide when.
         self._subscan_enabled = False
 
+        # True while cleanup_scan_kernel runs after a scan_kernel that
+        # returned normally; False after one that raised. After an exception
+        # (an underflow drops the events not yet played) the kernel's cached
+        # device state -- a coil's current, say -- may not be the hardware's,
+        # so a cleanup may skip work only when this is True.
+        self.shot_completed = False
+
     def logspace(self,start,end,n):
         return np.logspace(np.log10(start),np.log10(end),int(n))
     
@@ -560,8 +567,10 @@ class Scanner():
             # the only place the traceback can be kept.  The handlers bind no
             # names (the compiler gives a local one type).
             cleaned = False
+            self.shot_completed = False
             try:
                 self.scan_kernel()
+                self.shot_completed = True
             except RTIOUnderflow:
                 self.core.break_realtime()
                 self.cleanup_scan_kernel()

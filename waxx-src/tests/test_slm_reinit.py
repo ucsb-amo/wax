@@ -391,14 +391,20 @@ def test_client_falls_back_once_for_a_server_that_never_replies(monkeypatch, cap
 
 def test_kernel_wrapper_resyncs_the_timeline_after_the_rpc():
     """The RPC now blocks until the mask is up (seconds behind a reinit), so
-    the kernel must break_realtime after it, before scheduling anything."""
+    the kernel must break_realtime after it, before scheduling anything --
+    and after the status query of a mask that is reused (2026-10-21)."""
     from waxx.control.slm.slm import SLM
     src = inspect.getsource(SLM.write_phase_mask_kernel)
     body = src[src.index('"""', src.index('"""') + 3) + 3:]
-    i_rpc = body.index("self.write_phase_mask(")
-    i_brk = body.index("self.core.break_realtime()")
+    i_query = body.index("self._settle_left_if_shown(")
+    i_brk0 = body.index("self.core.break_realtime()")
+    i_left = body.index("delay(t_left)")
+    assert i_query < i_brk0 < i_left
+    i_wait = body.index("self.core.wait_until_mu(now_mu())")
+    i_rpc = body.index("self._write_for_kernel(")
+    i_brk = body.index("self.core.break_realtime()", i_rpc)
     i_dly = body.index("delay(SLM_RPC_DELAY)")
-    assert i_rpc < i_brk < i_dly
+    assert i_left < i_wait < i_rpc < i_brk < i_dly
 
 
 # --- the run-start reinit (SLM.reinit_if_due) --------------------------------------------
