@@ -132,11 +132,56 @@ def test_apd_keeps_its_one_pixel_resolution():
     assert apd.resolution == (1, 1)
 
 
-def test_basler_prepare_for_run_is_a_no_op():
+class _Directory:
+    """Stands in for beacon's CameraDirectory: ``find`` gives an entry with the
+    given exposure_start_delay_s, or raises ``error``."""
+    def __init__(self, delay=None, error=None):
+        self.delay, self.error, self.queries = delay, error, []
+
+    def find(self, query, refresh=False):
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        from types import SimpleNamespace
+        return SimpleNamespace(exposure_start_delay_s=self.delay,
+                               server_id="camera_server:test:liveod")
+
+
+def test_basler_takes_the_cameras_exposure_delay():
+    b = BaslerParams(serial_number="40316451", exposure_delay=17e-6)
+    d = _Directory(delay=22.5e-6)
+    b.prepare_for_run(directory=d)
+    assert d.queries == ["40316451"]
+    assert b.exposure_delay == 22.5e-6 and b.exposure_delay_source == "camera"
+    assert b.exposure_delay_configured == 17e-6
+    view = payload_view(b)                       # recorded in camera_params/
+    assert view["exposure_delay"] == 22.5e-6 and view["exposure_delay_source"] == "camera"
+
+
+@pytest.mark.parametrize("directory", [_Directory(delay=None),
+                                       _Directory(error=LookupError("no camera server"))])
+def test_basler_falls_back_to_the_configured_delay_loudly(directory, capsys):
+    b = BaslerParams(exposure_delay=17e-6)
+    b.exposure_delay, b.exposure_delay_source = 30e-6, "camera"     # a previous run's
+    b.prepare_for_run(directory=directory)
+    assert b.exposure_delay == 17e-6 and b.exposure_delay_source == "configured"
+    assert "!!" in capsys.readouterr().out
+
+
+def test_basler_exposure_delay_from_camera_off_never_asks():
+    b = BaslerParams(exposure_delay=17e-6, exposure_delay_from_camera=False)
+    d = _Directory(delay=22.5e-6)
+    b.prepare_for_run(directory=d)
+    assert d.queries == [] and b.exposure_delay == 17e-6
+    assert b.exposure_delay_source == "configured"
+
+
+def test_basler_prepare_for_run_touches_only_the_exposure_delay():
     b = BaslerParams()
     before = dict(vars(b))
-    b.prepare_for_run()
-    assert vars(b) == before
+    b.prepare_for_run(directory=_Directory(delay=20e-6))
+    changed = {k for k in before if vars(b)[k] != before[k]}
+    assert changed == {"exposure_delay", "exposure_delay_source"}
 
 
 # -- Scanner hook ---------------------------------------------------------------

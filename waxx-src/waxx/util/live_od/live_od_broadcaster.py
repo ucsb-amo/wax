@@ -8,7 +8,14 @@ being on the server machine.
 
 Message format — every message is a pickled dict with a 'tag' key:
 
-    {'tag': 'RUN_STARTED',  'run_id': int}
+    {'tag': 'RUN_STARTED',  'run_id': int, 'xvarnames': list,
+                             'info': dict (newer servers: expt_name,
+                                     camera_key, capture_images, save_data,
+                                     n_shots, xvar_ranges, pixel_size_m,
+                                     params)}
+    {'tag': 'SHOT_TIMING',  'delta_t': float, 'eta': str}
+    {'tag': 'NEXT_RUN_ID',  'run_id': int or None}
+    {'tag': 'ADJUST_SPECS', 'specs': list}
     {'tag': 'SHOT_PROGRESS','shot_idx': int, 'N_total': int,
                              'xvar_values': dict}
     {'tag': 'OD_IMAGE',     'img_atoms': ndarray, 'img_light': ndarray,
@@ -122,12 +129,34 @@ class LiveODBroadcaster(QThread, NetServer):
     # Public broadcast methods — safe to call from any thread / Qt slot
     # ------------------------------------------------------------------
 
-    def broadcast_run_started(self, run_id: int, xvarnames: object = None):
-        self._enqueue({
+    def broadcast_run_started(self, run_id: int, xvarnames: object = None, info: dict = None):
+        """``info``: what a viewer needs to show the run as the acquisition
+        window does (``expt_name``, ``camera_key``, ``capture_images``,
+        ``save_data``, ``n_shots``, ``xvar_ranges``, ``pixel_size_m`` at the
+        atoms, ``params`` for the FK TOF fits). Viewers that predate it ignore
+        the key."""
+        msg = {
             'tag': 'RUN_STARTED',
             'run_id': int(run_id),
             'xvarnames': list(xvarnames) if xvarnames else [],
-        })
+        }
+        if info is not None:
+            msg['info'] = dict(info)
+        self._enqueue(msg)
+
+    def broadcast_shot_timing(self, delta_t: float, eta: str):
+        """``LiveODServer.shot_timing_signal``: the last shot period and the ETA."""
+        self._enqueue({'tag': 'SHOT_TIMING', 'delta_t': float(delta_t), 'eta': str(eta)})
+
+    def broadcast_next_run_id(self, run_id):
+        """The id the next saved run will get (None: unknown), as the
+        acquisition window polls it."""
+        self._enqueue({'tag': 'NEXT_RUN_ID',
+                       'run_id': None if run_id is None else int(run_id)})
+
+    def broadcast_adjust_specs(self, specs: list):
+        """The run's adjustable params (``adjust_specs_signal``; [] for none)."""
+        self._enqueue({'tag': 'ADJUST_SPECS', 'specs': [dict(s) for s in (specs or [])]})
 
     def broadcast_shot_progress(self, shot_idx: int, N_total: int,
                                  xvar_values: object):

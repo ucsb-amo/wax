@@ -556,10 +556,23 @@ class MonitorStatePanel(QWidget):
                 self.loop_chips_box.addWidget(chip)
                 self.loop_chips[key] = chip
             state = str(info.get("state") or "?")
-            chip.setText(f"{info.get('title') or key}: {state}")
+            active = state in ("running", "stopping")
+            category = str(info.get("category") or "") if active else ""
+            chip.setText(f"{info.get('title') or key}: {state}"
+                         + (f" · {category}" if category else ""))
             set_style_if_changed(chip, chip_css(_LOOP_LEVEL.get(state, "off")))
-            chip.setToolTip(str(info.get("text") or "")
-                            + "\nStart / Stop: open the details (the arrow at the left).")
+            tip = str(info.get("text") or "")
+            if category == "holds":
+                tip += "\nHolds: agents' queued jobs wait behind it; agents may not stop it."
+            elif category == "yields":
+                tip += ("\nYields: an agent's queued job stops it after its run in progress; "
+                        "the queue starts it again when it has run out.")
+            if active and info.get("owner"):
+                owner = str(info["owner"])
+                if owner == "queue" and info.get("on_behalf_of"):
+                    owner += f" (for {info['on_behalf_of']})"
+                tip += f"\nOwner: {owner}"
+            chip.setToolTip(tip + "\nStart / Stop: open the details (the arrow at the left).")
 
     def _on_tick(self) -> None:
         if self.isVisible() and self.reachable:

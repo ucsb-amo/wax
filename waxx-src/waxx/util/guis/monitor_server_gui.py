@@ -23,7 +23,8 @@ from waxx.util.device_state.op_queue import OpQueue
 from waxx.util.device_state.op_journal import OpJournal
 from waxx.util.device_state.op_runner import OpRunner
 from waxx.util.device_state.state_reset import StateReset
-from waxx.util.device_state.run_loop import RunLoop, active_loop, _LiveOD
+from waxx.util.device_state.run_loop import (
+    RunLoop, active_loop, agent_may_stop, loop_category, _LiveOD)
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_queue import RunQueue, default_dir as default_queue_dir
 from waxx.util.dashboard.exit_codes import EXIT_RESTART, RESTART_REQUEST_MIN_UPTIME_S
@@ -957,6 +958,16 @@ class MonitorUDPServer(UdpServer):
     # --- run loops ------------------------------------------------------------------
 
     def _reply_run_loop(self, obj: dict) -> dict:
+        """``{"type": "run_loop", "action": "start" | "stop" | "describe" |
+        "configure", "loop", "operator", "client", ...}``.
+
+        Start takes ``owner`` ("person" when absent, or "agent") and
+        ``category`` ("yields" or "holds"; absent: "yields" for every owner,
+        a person's start included -- run_loop.DEFAULT_CATEGORY, user decision
+        2026-10-20).  Stop takes ``owner`` too (absent: a person, as every
+        stop before 2026-10-20): an agent's stop of a *holding* loop run for
+        a person is refused (run_loop.agent_may_stop); a yielding loop any
+        owner may stop."""
         loop = self.loops.get(str(obj.get("loop") or ""))
         if loop is None:
             return {"status": "error",
@@ -964,13 +975,26 @@ class MonitorUDPServer(UdpServer):
                            f"(offered: {', '.join(self.loops) or 'none'})"}
         operator = str(obj.get("operator") or "")
         client = str(obj.get("client") or "")
+        who = "@".join(p for p in (operator, client) if p) or "?"
         action = obj.get("action")
         if action == "stop":
+            owner = str(obj.get("owner") or "person")
+            if owner not in ("person", "agent"):
+                return {"status": "error",
+                        "msg": f"owner must be person or agent, not {owner!r}"}
+            info = loop.info()
+            if owner == "agent" and loop.active:
+                allowed, why = agent_may_stop(info)
+                if not allowed:
+                    log.warning("%s: stop refused: %s", loop.spec.title, why)
+                    self.journal.record("run_loop_stop_refused", loop=loop.spec.key,
+                                        expt=loop.expt, who=who, owner=owner,
+                                        category=info.get("category"),
+                                        loop_owner=info.get("owner"), msg=why)
+                    return {"status": "error", "msg": why, "loop": info}
             # someone stops it: the run queue must not start it again later
-            self.run_queue.loop_stopped_by_someone(loop.spec.key,
-                                                   "@".join(p for p in (operator, client) if p)
-                                                   or "?")
-            return loop.stop(operator=operator, client=client)
+            self.run_queue.loop_stopped_by_someone(loop.spec.key, who)
+            return loop.stop(operator=operator, client=client, owner=owner)
         if action == "describe":
             return loop.describe(obj.get("path"))
         if action == "configure":
@@ -996,7 +1020,11 @@ class MonitorUDPServer(UdpServer):
         owner = str(obj.get("owner") or "person")
         if owner not in ("person", "agent"):
             return {"status": "error", "msg": f"owner must be person or agent, not {owner!r}"}
-        return loop.start(operator=operator, client=client, path=obj.get("path"), owner=owner)
+        category, why = loop_category(obj.get("category"))
+        if category is None:
+            return {"status": "error", "msg": why}
+        return loop.start(operator=operator, client=client, path=obj.get("path"), owner=owner,
+                          category=obj.get("category"))
 
     def _reply_output(self, obj: dict) -> dict:
         """A loop's or the reset experiment's terminal output after line

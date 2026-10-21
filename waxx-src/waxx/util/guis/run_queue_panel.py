@@ -1690,7 +1690,7 @@ class RunQueuePanel(QWidget):
                 details.append("(" + ", ".join(extra) + ")")
             text = "HELD: " + " ".join(details) + " -- agents' jobs and the run loops wait."
             self.hold_label.setText(text[0].upper() + text[1:])
-            set_style_if_changed(self.hold_label, _banner_css("#8a6a12"))
+            set_style_if_changed(self.hold_label, _banner_css(theme.HELD))
             self.hold_label.setVisible(self.reachable)
         else:
             self.hold_label.setText("No person hold: agents may use the machine when it is free.")
@@ -1716,7 +1716,8 @@ class RunQueuePanel(QWidget):
         if isinstance(resume, dict) and self.reachable:
             self.loop_note.setText(
                 f"The queue stopped the loop {resume.get('key')} for its jobs "
-                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out.")
+                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out"
+                + (f" ({resume['category']})." if resume.get("category") else "."))
             self.loop_note.show()
         else:
             self.loop_note.hide()
@@ -1858,6 +1859,8 @@ class RunQueuePanel(QWidget):
                    "this monitor server has no run queue" if not self.has_queue else "")
         self.hold_button.setEnabled(live)
         self.hold_button.setText("Release hold" if self.hold.get("active") else "Hold...")
+        set_style_if_changed(self.hold_button,
+                             theme.held_button_css() if self.hold.get("active") else "")
         self.hold_button.setToolTip(
             why_not if not live else
             ("Release the person hold: agents' queued jobs and the run loops may run again."
@@ -1868,6 +1871,7 @@ class RunQueuePanel(QWidget):
         for scope, b in self.pause_buttons.items():
             on = isinstance(paused.get(scope), dict)
             b.setText(("Resume " if on else "Pause ") + scope)
+            set_style_if_changed(b, theme.held_button_css() if on else "")
             b.setEnabled(live)
             b.setToolTip(why_not if not live else
                          (f"Let {scope} jobs launch again" if on else

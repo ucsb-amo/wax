@@ -354,3 +354,18 @@ def test_a_log_window_keeps_following_while_the_server_exits(window, qapp, tmp_p
     qp.cancel_selected()
     assert "server is restarting" in qp.message.text()             # a change: refused
     log_window.close()
+
+
+def test_a_loop_chip_names_the_running_loops_category(panel):
+    loop = dict(LOOP, state="running", category="holds", owner="queue", on_behalf_of="person",
+                text="started by run queue@kong")
+    panel.set_state(dict(STATUS, run_loops={"auto_tof": loop}))
+    chip = panel.loop_chips["auto_tof"]
+    assert chip.text() == "BEC TOF loop: running · holds"
+    assert "agents' queued jobs wait behind it" in chip.toolTip()
+    assert "Owner: queue (for person)" in chip.toolTip()
+    panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(loop, category="yields")}))
+    assert chip.text() == "BEC TOF loop: running · yields"
+    assert "an agent's queued job stops it" in chip.toolTip()
+    panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(loop, state="stopped")}))
+    assert chip.text() == "BEC TOF loop: stopped"         # not running: no category

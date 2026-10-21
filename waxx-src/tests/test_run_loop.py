@@ -59,9 +59,11 @@ class FakeProc:
 class Journal:
     def __init__(self):
         self.kinds = []
+        self.entries = []
 
     def record(self, kind, **fields):
         self.kinds.append(kind)
+        self.entries.append(dict(fields, kind=kind))
 
 
 @pytest.fixture
@@ -802,3 +804,137 @@ def test_the_loop_tells_its_runs_who_launched_them(monkeypatch):
     assert run_loop._spawn("ar x.py", {"WAXX_LOOP_SCAN": "{}"}) == "proc"
     assert seen["WAXX_LAUNCHER"] == "run_loop"
     assert seen["PYTHONUNBUFFERED"] == "1" and seen["WAXX_LOOP_SCAN"] == "{}"
+
+
+# --- loop categories: yields / holds (2026-10-20) ----------------------------------------------
+
+def test_a_start_with_no_category_yields_whoever_starts_it(expt):
+    from waxx.util.device_state.run_loop import DEFAULT_CATEGORY
+    assert DEFAULT_CATEGORY == "yields"
+    for owner in ("person", "agent", "queue"):
+        hold = threading.Event()
+        live = FakeLive()
+        loop = _loop(expt, live, [FakeProc(live, 101, hold=hold)])
+        reply = loop.start(operator="jp", client="kong", owner=owner)
+        assert reply["status"] == "ok"
+        info = loop.info()
+        assert info["category"] == "yields" and info["category_source"] == "default"
+        assert info["categories"] == ["yields", "holds"]
+        start = [e for e in loop.journal.entries if e["kind"] == "run_loop_start"][-1]
+        assert start["category"] == "yields" and start["category_source"] == "default"
+        assert start["owner"] == owner
+        loop.stop(owner="person")
+        hold.set()
+        loop.join(5)
+
+
+def test_a_category_is_kept_in_the_info_and_the_journal_and_a_bad_one_is_refused(expt):
+    hold = threading.Event()
+    live = FakeLive()
+    loop = _loop(expt, live, [FakeProc(live, 101, hold=hold)])
+    refused = loop.start(category="sometimes")
+    assert refused["status"] == "error" and "category must be one of yields, holds" in \
+        refused["msg"]
+    assert loop.info()["state"] == "idle" and "run_loop_refused" in loop.journal.kinds
+    assert loop.start(operator="jp", category="HOLDS")["status"] == "ok"
+    info = loop.info()
+    assert info["category"] == "holds" and info["category_source"] == "request"
+    assert "on_behalf_of" not in info
+    loop.stop(operator="a7", owner="agent")
+    stop = [e for e in loop.journal.entries if e["kind"] == "run_loop_stop"][-1]
+    assert stop["category"] == "holds" and stop["owner"] == "agent"
+    hold.set()
+    loop.join(5)
+
+
+def test_the_queues_restart_records_whom_it_runs_the_loop_for(expt):
+    hold = threading.Event()
+    live = FakeLive()
+    loop = _loop(expt, live, [FakeProc(live, 101, hold=hold)])
+    loop.start(operator="run queue", owner="queue", category="holds", on_behalf_of="person")
+    info = loop.info()
+    assert info["owner"] == "queue" and info["on_behalf_of"] == "person"
+    start = [e for e in loop.journal.entries if e["kind"] == "run_loop_start"][-1]
+    assert start["on_behalf_of"] == "person"
+    loop.stop()
+    hold.set()
+    loop.join(5)
+
+
+@pytest.mark.parametrize("info, allowed", [
+    ({"category": "yields", "owner": "person"}, True),
+    ({"owner": "person"}, True),                              # no category: yields
+    ({"category": "holds", "owner": "agent"}, True),          # an agent's own holding loop
+    ({"category": "holds", "owner": "queue", "on_behalf_of": "agent"}, True),
+    ({"category": "holds", "owner": "person"}, False),
+    ({"category": "holds", "owner": "queue", "on_behalf_of": "person"}, False),
+    ({"category": "holds", "owner": "queue"}, False),         # first owner unknown: held
+])
+def test_agent_may_stop(info, allowed):
+    from waxx.util.device_state.run_loop import agent_may_stop
+    ok, why = agent_may_stop(dict(info, title="BEC TOF loop", operator="jp"))
+    assert ok is allowed
+    assert (why == "") is allowed
+    if not allowed:
+        assert "BEC TOF loop holds" in why and "an agent may not stop it" in why
+
+
+def test_server_start_takes_a_category_and_refuses_a_bad_one(server):
+    hold = threading.Event()
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command: FakeProc(server.live, 81001, hold=hold)
+    bad = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                      "category": "maybe"})
+    assert bad["status"] == "error" and "category must be one of" in bad["msg"]
+    reply = server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                        "operator": "jp", "category": "holds"})
+    assert reply["status"] == "ok" and reply["loop"]["category"] == "holds"
+    import json
+    status = json.loads(server.generate_reply("status_json"))
+    assert status["run_loops"]["auto_tof"]["category"] == "holds"
+    kinds = {e["kind"]: e for e in server.journal.tail(50)}
+    assert kinds["run_loop_start"]["category"] == "holds"
+    server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof", "operator": "jp"})
+    hold.set()
+    loop.join(5)
+
+
+def test_server_refuses_an_agents_stop_of_a_persons_holding_loop(server):
+    hold = threading.Event()
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command: FakeProc(server.live, 81001, hold=hold)
+    server.ask({"type": "run_loop", "action": "start", "loop": "auto_tof", "operator": "jp",
+                "owner": "person", "category": "holds"})
+    refused = server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof",
+                          "operator": "a7", "owner": "agent"})
+    assert refused["status"] == "error" and "an agent may not stop it" in refused["msg"]
+    assert loop.info()["state"] == "running"
+    assert "run_loop_stop_refused" in [e["kind"] for e in server.journal.tail(50)]
+    bad = server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof",
+                      "owner": "robot"})
+    assert bad["status"] == "error" and "owner must be" in bad["msg"]
+    # a person may (a stop with no owner is a person's, as before 2026-10-20)
+    ok = server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof", "operator": "jp"})
+    assert ok["status"] == "ok" and ok["loop"]["state"] == "stopping"
+    hold.set()
+    loop.join(5)
+
+
+@pytest.mark.parametrize("start", [
+    {"owner": "person"},                                      # no category: yields
+    {"owner": "person", "category": "yields"},
+    {"owner": "agent", "category": "holds"},                  # an agent's own holding loop
+])
+def test_server_lets_an_agent_stop_a_yielding_loop_or_its_own(server, start):
+    hold = threading.Event()
+    loop = server.loops["auto_tof"]
+    loop._spawn = lambda command: FakeProc(server.live, 81001, hold=hold)
+    server.ask(dict({"type": "run_loop", "action": "start", "loop": "auto_tof",
+                     "operator": "jp"}, **start))
+    reply = server.ask({"type": "run_loop", "action": "stop", "loop": "auto_tof",
+                        "operator": "a7", "owner": "agent"})
+    assert reply["status"] == "ok" and reply["loop"]["state"] == "stopping"
+    stop = [e for e in server.journal.tail(50) if e["kind"] == "run_loop_stop"][-1]
+    assert stop["owner"] == "agent"
+    hold.set()
+    loop.join(5)

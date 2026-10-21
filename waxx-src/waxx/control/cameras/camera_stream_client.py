@@ -32,7 +32,8 @@ Neither ever raises into the run: a frame that fails or goes missing is
 counted, kept in the provenance record (``camera_stream_<key>``) and printed
 at the end. Settings come from the camera's saved beacon-server defaults,
 with ``exposure_time`` / ``gain`` overrides; frames are cropped to the saved
-viewer ROI. The camera is back in free-run after every run.
+viewer ROI or a given ``roi`` (triggered: per frame, ``frame_rois``). The
+camera is back in free-run after every run.
 """
 
 import atexit
@@ -373,15 +374,8 @@ class CameraStreamClient:
             except Exception:
                 pass
             raise
-        if not self._roi and self._no_roi_downsample > 1:
-            self._downsample = self._no_roi_downsample
-            frame0 = block_reduce(frame0, self._downsample)
-            print(f"[{self.label}] !! {self.serial} has no saved ROI: its full "
-                  f"{self._sensor_shape} frames are stored downsampled "
-                  f"{self._downsample}x{self._downsample} -> {frame0.shape}. "
-                  f"Save an ROI for it in the camera viewer.")
-        self._frame_shape = tuple(frame0.shape)
-        self._frame_dtype = frame0.dtype
+        self._set_geometry(frame0)
+        self._probe_full = None
         self._connected = True
 
     def connect(self):
@@ -684,7 +678,25 @@ class CameraStreamClient:
 
         frame0 = self._stream.snap(timeout=self._frame_timeout_s, require_rev=self._rev)
         self._sensor_shape = tuple(frame0.image.shape)
+        self._probe_full = frame0.image         # for _set_geometry, dropped after it
         return crop_to_roi(frame0.image, self._roi)
+
+    def _no_roi_note(self, what, ds, stored_shape):
+        print(f"[{self.label}] !! {self.serial}: {what} no ROI: its full "
+              f"{self._sensor_shape} frames are stored downsampled "
+              f"{ds}x{ds} -> {stored_shape}"
+              + (". Save an ROI for it in the camera viewer." if self._crop_to_saved_roi
+                 else " (give it an roi to store it at full resolution)."))
+
+    def _set_geometry(self, frame0):
+        """The stored frame's shape and dtype from ``frame0``, the probe frame
+        cropped to the ROI; downsampled when there is no ROI."""
+        if not self._roi and self._no_roi_downsample > 1:
+            self._downsample = self._no_roi_downsample
+            frame0 = block_reduce(frame0, self._downsample)
+            self._no_roi_note("has", self._downsample, frame0.shape)
+        self._frame_shape = tuple(frame0.shape)
+        self._frame_dtype = frame0.dtype
 
     def _reduce(self, image):
         """A frame as stored: cropped, and downsampled if the camera has no ROI."""
@@ -793,11 +805,12 @@ class CameraStreamClient:
             # the earlier request's frame may still be in this slot
             self._note("slot_clears_failed", idx=list(idx), reason=reason, **more)
 
-    def _check_shape(self, idx, img, **more):
-        if tuple(img.shape) == self._frame_shape and img.dtype == self._frame_dtype:
+    def _check_shape(self, idx, img, shape=None, **more):
+        shape = self._frame_shape if shape is None else shape
+        if tuple(img.shape) == shape and img.dtype == self._frame_dtype:
             return True
         self._fail(idx, "frame_shape_mismatch", got=[list(img.shape), str(img.dtype)],
-                   expected=[list(self._frame_shape), str(self._frame_dtype)], **more)
+                   expected=[list(shape), str(self._frame_dtype)], **more)
         return False
 
     # ---- worker thread ---------------------------------------------------
@@ -1150,14 +1163,31 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     real values either way). Which frame comes next is learned from the
     order the kernel announces them (frame 0 first, then the listed order
     until the run shows otherwise).
+
+    ``frame_rois`` ({frame index or key: [x1, y1, x2, y2] or None}) gives a
+    frame its own crop of the sensor, stored at its own shape (None: the full
+    frame, downsampled like a camera with no ROI); frames not listed get
+    ``roi``. The camera always reads out the full sensor, so a crop costs
+    nothing between frames.
     """
 
     def __init__(self, expt, camera, key, *, ttl, trigger_source="Line1",
-                 exposure_delay=0., t_trigger=2.e-6, t_match_window=2.0,
-                 t_early_tolerance=0.25, t_stray_grace=0.3, frame_settings=None,
-                 **kw):
+                 exposure_delay=0., exposure_delay_from_camera=True, t_trigger=2.e-6,
+                 t_match_window=2.0, t_early_tolerance=0.25, t_stray_grace=0.3,
+                 frame_settings=None, frame_rois=None, **kw):
         self.ttl = ttl                                  # kernel-visible
+        # ``exposure_delay`` is the configured value: the camera's own
+        # replaces it once our trigger settings are in (_take_camera_exposure_delay);
+        # a stream built without a connection takes the camera server's
+        # before the compile instead (_fix_exposure_delay_before_compile)
         self.exposure_delay = float(exposure_delay)
+        self.exposure_delay_configured = float(exposure_delay)
+        self.exposure_delay_source = "configured"
+        self._exposure_delay_from_camera = bool(exposure_delay_from_camera)
+        # True when built without a connection: exposure_delay is decided
+        # before the compile and the connect never changes it
+        self._exposure_delay_fixed = False
+        self.exposure_delay_at_connect = None
         self.t_trigger = float(t_trigger)
         self.keys = _as_keys(key)
         for k in self.keys:
@@ -1167,6 +1197,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self._t_early_tolerance = float(t_early_tolerance)
         self._t_stray_grace = float(t_stray_grace)
         self._frame_settings = self._parse_frame_settings(frame_settings)
+        self._frame_rois = self._parse_frame_rois(frame_rois)
+        self._geometry = []                 # per frame: (roi, downsample, stored shape)
         self._base_settings = {}            # what frames without their own get
         self._cur_settings = None           # what the camera holds (None = unknown)
         self._settings_done = set()         # pending edges whose settings were handled
@@ -1185,6 +1217,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         if len(self.keys) > 1:
             kw.setdefault("label", f"camera_stream:{self.keys[0]}+{len(self.keys) - 1}")
         super().__init__(expt, camera, self.keys[0], **kw)
+        if not self._connected:
+            self._fix_exposure_delay_before_compile()
         if self._frame_settings:
             console.info(f"[{self.label}] per-frame settings: "
                          + ", ".join(f"{self.keys[j]}={v}"
@@ -1204,6 +1238,16 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                                  f"cannot change between frames (only "
                                  f"{FRAME_SETTING_KEYS})")
             out[jj] = {k: float(v) for k, v in vals.items()}
+        return out
+
+    def _parse_frame_rois(self, frame_rois):
+        out = {}
+        for j, roi in dict(frame_rois or {}).items():
+            jj = (self.keys.index(j) if j in self.keys else -1) if isinstance(j, str) else int(j)
+            if not 0 <= jj < len(self.keys):
+                raise ValueError(f"frame_rois for frame {j!r}: no such frame "
+                                 f"(keys {self.keys})")
+            out[jj] = [int(v) for v in roi] if roi else None
         return out
 
     # ---- kernel side -----------------------------------------------------
@@ -1276,13 +1320,45 @@ class TriggeredCameraStreamClient(CameraStreamClient):
 
     # ---- setup -----------------------------------------------------------
 
+    def _set_geometry(self, frame0):
+        """Each frame's crop, downsampling and stored shape (``frame_rois``,
+        else the stream's ROI)."""
+        if not self._frame_rois:
+            super()._set_geometry(frame0)
+            self._geometry = [(self._roi, self._downsample, self._frame_shape)] * len(self.keys)
+            return
+        full = self._probe_full
+        self._frame_dtype = full.dtype
+        self._geometry = []
+        for j in range(len(self.keys)):
+            roi = self._frame_rois.get(j, self._roi)
+            ds = self._no_roi_downsample if not roi and self._no_roi_downsample > 1 else 1
+            img = crop_to_roi(full, roi)
+            img = block_reduce(img, ds) if ds > 1 else img
+            self._geometry.append((roi, ds, tuple(img.shape)))
+        self._roi, self._downsample, self._frame_shape = self._geometry[0]
+        no_roi = [k for k, g in zip(self.keys, self._geometry) if g[1] > 1]
+        if no_roi:
+            self._no_roi_note(", ".join(no_roi) + (" has" if len(no_roi) == 1 else " have"),
+                              self._no_roi_downsample,
+                              self._geometry[self.keys.index(no_roi[0])][2])
+
+    def _reduce_frame(self, image, j):
+        """Frame ``j`` as stored: its crop, downsampled if it has no ROI."""
+        roi, ds, _ = self._geometry[j]
+        img = crop_to_roi(image, roi)
+        return block_reduce(img, ds) if ds > 1 else img
+
     def _register_containers(self):
         d = self._expt.data
-        for k in self.keys:
-            # stream-only: no copy of the run's frames in this process
+        for j, k in enumerate(self.keys):
+            # stream-only: no copy of the run's frames in this process.
+            # Registered before the connect (connect=False): the provisional
+            # shape; activate() gives each frame its own (_geometry).
+            shape = self._geometry[j][2] if self._geometry else self._frame_shape
             slot = SimpleNamespace(
                 key=k,
-                dc=d.add_host_data_container(self._frame_shape,
+                dc=d.add_host_data_container(shape,
                                              dtype=self._frame_dtype, fill_value=0,
                                              keep_run_data=False),
                 dc_meta=d.add_host_data_container((N_META,), np.float64,
@@ -1294,9 +1370,15 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self.dc, self.dc_meta = self._slots[0].dc, self._slots[0].dc_meta
 
     def _resize_containers(self, shape, dtype, keep_run_data):
+        """activate() (connected, not dead): each frame at its own stored
+        shape (``frame_rois``, _geometry); mark_dead(): every frame the
+        placeholder's ``shape``."""
         d = self._expt.data
-        for slot in self._slots:
-            d.resize_host_container(slot.dc, shape, dtype, keep_run_data=keep_run_data)
+        live = (self._connected and self._dead_reason is None
+                and len(self._geometry) == len(self._slots))
+        for j, slot in enumerate(self._slots):
+            d.resize_host_container(slot.dc, self._geometry[j][2] if live else shape,
+                                    dtype, keep_run_data=keep_run_data)
             d.resize_host_container(slot.dc_meta, (N_META,), np.float64,
                                     keep_run_data=keep_run_data)
 
@@ -1312,12 +1394,96 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             except Exception:
                 pass
             raise
+        self._take_camera_exposure_delay()
         if self._frame_settings:            # what frames without their own get
             current, _ = self._stream.get_settings()
             self._base_settings = {k: current[k] for k in FRAME_SETTING_KEYS
                                    if current.get(k) is not None}
             self._cur_settings = dict(self._base_settings)
         return frame0
+
+    def _take_camera_exposure_delay(self):
+        """``exposure_delay`` from the camera itself: the exposure start delay
+        its server reports (``exposure_start_delay_s``), read after our
+        trigger settings went in.  The configured value stays, with a printed
+        warning, when the camera does not report one;
+        ``exposure_delay_source`` ("camera" / "configured") says which, in
+        the stream's provenance record."""
+        from beacon.camera.directory import seconds_or_none
+        if self._exposure_delay_fixed:
+            # built without a connection: the kernel's value was decided
+            # before the compile (_fix_exposure_delay_before_compile) and
+            # may already be copied / compiled (ARTIQ writes it back at the
+            # kernel's end anyway). Keep it; record what the camera reports.
+            if not self._exposure_delay_from_camera:
+                return
+            try:
+                raw = getattr(self._stream.status(refresh=True), "raw", None) or {}
+                value = seconds_or_none(raw.get("exposure_start_delay_s"))
+            except Exception:
+                value = None
+            self.exposure_delay_at_connect = value
+            if value is not None and value != self.exposure_delay:
+                print(f"[{self.label}] !! {self.serial}: the camera reports an exposure "
+                      f"delay of {value * 1e6:.2f} us at the claim, but this run's kernel "
+                      f"uses {self.exposure_delay * 1e6:.2f} us "
+                      f"({self.exposure_delay_source}, decided before the claim)")
+            return
+        self.exposure_delay = self.exposure_delay_configured
+        self.exposure_delay_source = "configured"
+        if not self._exposure_delay_from_camera:
+            return
+        try:
+            raw = getattr(self._stream.status(refresh=True), "raw", None) or {}
+            value = seconds_or_none(raw.get("exposure_start_delay_s"))
+            why = "the camera server does not report it"
+        except Exception as e:
+            value, why = None, f"status: {type(e).__name__}: {e}"
+        if value is None:
+            print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
+                  f"camera ({why}); using the configured "
+                  f"{self.exposure_delay_configured * 1e6:.2f} us")
+            return
+        self.exposure_delay = value
+        self.exposure_delay_source = "camera"
+        if value != self.exposure_delay_configured:
+            console.info(f"[{self.label}] {self.serial}: exposure delay {value * 1e6:.2f} us "
+                         f"from the camera (configured "
+                         f"{self.exposure_delay_configured * 1e6:.2f} us)", console.VERBOSE)
+
+    def _fix_exposure_delay_before_compile(self):
+        """A stream built without a connection (``connect=False``): the
+        kernel-read ``exposure_delay`` is decided here, before the compile
+        and before anything copies it (diagnostic_frame.bind copies it into
+        each image) -- the delay the camera's server last reported (its
+        directory entry, as BaslerParams.prepare_for_run reads the run
+        camera's; read only, nothing is set on the camera), else the
+        configured one. The connect (the run's claim: after the compile for
+        a warm-launched run, after bind for every run) never changes it; it
+        records what the camera reports then (``exposure_delay_at_connect``)
+        and says so loudly when that differs."""
+        self._exposure_delay_fixed = True
+        if not self._exposure_delay_from_camera:
+            return
+        try:
+            directory = self._directory or shared_camera_directory()
+            entry = directory.find(self.serial)
+            value = getattr(entry, "exposure_start_delay_s", None)
+            value = None if value is None else float(value)
+            why = f"{getattr(entry, 'server_id', '?')} does not report it"
+        except Exception as e:
+            value, why = None, f"camera not found ({type(e).__name__}: {e})"
+        if value is None:
+            print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
+                  f"camera before the compile ({why}); using the configured "
+                  f"{self.exposure_delay_configured * 1e6:.2f} us")
+            return
+        self.exposure_delay = value
+        self.exposure_delay_source = "camera_before_claim"
+        if value != self.exposure_delay_configured:
+            console.info(f"[{self.label}] {self.serial}: exposure delay {value * 1e6:.2f} us "
+                         f"from the camera's server before the compile (configured "
+                         f"{self.exposure_delay_configured * 1e6:.2f} us)", console.VERBOSE)
 
     def _enter_triggered(self):
         """Live stream on, then trigger mode on our line (in that order:
@@ -1545,8 +1711,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             except Exception as e:
                 self._note("reapply_failed", error=repr(e))
             return
-        img = self._reduce(frame.image)
-        if not self._check_shape(idx, img, frame=j):
+        img = self._reduce_frame(frame.image, j)
+        if not self._check_shape(idx, img, shape=self._geometry[j][2], frame=j):
             return
         slot = self._slots[j]
         # _slot_ok[(idx, j)] turns True when liveOD has the frame (_on_pushed)
@@ -1590,6 +1756,9 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 "trigger_ttl_ch": getattr(self.ttl, "ch", None),
                 "trigger_source": self._trigger_source,
                 "exposure_delay": self.exposure_delay,
+                "exposure_delay_source": self.exposure_delay_source,
+                "exposure_delay_configured": self.exposure_delay_configured,
+                "exposure_delay_at_connect": self.exposure_delay_at_connect,
                 "t_trigger": self.t_trigger,
                 "siblings_on_line": [list(s.keys) for s in self._siblings],
                 "frame_settings": {self.keys[j]: v for j, v in sorted(self._frame_settings.items())},
@@ -1600,9 +1769,13 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     def _write_provenance(self):
         record = self._provenance_record()
         for i, k in enumerate(self.keys):
+            roi, ds, shape = self._geometry[i] if self._geometry else (
+                self._roi, self._downsample, self._frame_shape)
             try:
                 self._expt._extra_file_texts[f"camera_stream_{k}"] = \
-                    json.dumps({**record, "key": k, "frame": i}, default=repr)
+                    json.dumps({**record, "key": k, "frame": i, "roi": roi,
+                                "downsample": ds, "frame_shape": list(shape)},
+                               default=repr)
             except Exception as e:
                 print(f"[{self.label}] WARNING: could not store provenance for "
                       f"'{k}' ({e!r})")

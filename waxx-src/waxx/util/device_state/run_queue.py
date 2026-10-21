@@ -104,7 +104,13 @@ by itself.
 (the TOF loop), the queue asks it to stop gracefully (its run in progress
 finishes and saves; no monitor start), remembers it, and runs its jobs; when no
 job is eligible or running any more -- with no hold and nothing paused -- it
-starts that loop again (not a loop that latched off).  Otherwise, when the
+starts that loop again (not a loop that latched off), with the category it had
+and run for the owner it had (``on_behalf_of``).  Which jobs stop which loop
+goes by the loop's category (since 2026-10-20;
+:data:`~waxx.util.device_state.run_loop.LOOP_CATEGORIES`): a person's job stops
+any loop; an agent's job stops a *yielding* loop, whoever started it, and waits
+behind a *holding* one.  A loop started with no category yields
+(:data:`~waxx.util.device_state.run_loop.DEFAULT_CATEGORY`).  Otherwise, when the
 queue has launched jobs and has none left to run, it asks for the monitor (the
 queue's jobs do not restart it; see ``WAXX_LAUNCHER`` in ``Expt.end_wax``).
 
@@ -189,7 +195,8 @@ from waxx.util.device_state.monitor_manager import ar_command, environment_repor
 from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S, SAME_PROCESS_S
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_loop import (
-    ABORTED_RE, RUN_ID_RE, _SHELL_CHARS, judge_run, live_od_outcome, tell_live_od_exited)
+    ABORTED_RE, RUN_ID_RE, _SHELL_CHARS, effective_owner, info_category, judge_run,
+    live_od_outcome, tell_live_od_exited)
 
 log = logging.getLogger(__name__)
 
@@ -2087,11 +2094,13 @@ class RunQueue:
                 self._gate_kind = "live"
                 return (f"{loop.spec.title} is finishing its run in progress (asked to stop "
                         "for the queue)")
-            if (info.get("owner") or "person") == "person":
-                self._gate_kind = "live"          # a person's loop: legitimate use
-                return (f"{loop.spec.title} was started by a person "
-                        f"({info.get('operator') or info.get('client') or '?'}): an agent's "
-                        "job does not stop it")
+            if info_category(info) == "holds":
+                self._gate_kind = "live"          # a holding loop: legitimate use
+                whose = {"person": "a person", "agent": "an agent"}.get(
+                    effective_owner(info), "the run queue")
+                return (f"{loop.spec.title} holds (started by {whose}, "
+                        f"{info.get('operator') or info.get('client') or '?'}): an agent's "
+                        "job waits behind it")
             return f"{loop.spec.title} is running and has not been asked to stop"
         poll = self._poll_now()
         if poll is None:
@@ -3488,11 +3497,14 @@ class RunQueue:
 
     @staticmethod
     def _may_stop(job: Job, loop) -> bool:
-        """A person's job stops any loop; an agent's job only a loop the queue,
-        or an agent (the TOF-idle restart), started -- never a person's."""
+        """A person's job stops any loop; an agent's job a *yielding* loop,
+        whoever started it -- never a *holding* one (run_loop.LOOP_CATEGORIES;
+        a loop that names no category yields).  Before 2026-10-20 this went by
+        the loop's owner: an agent's job stopped only a loop the queue or an
+        agent started."""
         if job.owner == "person":
             return True
-        return (loop.info().get("owner") or "person") in ("queue", "agent")
+        return info_category(loop.info()) == "yields"
 
     def loop_stopped_by_someone(self, key: str, who: str) -> None:
         """Someone (not the queue) asked a loop to stop: if the queue meant
@@ -3509,20 +3521,27 @@ class RunQueue:
         self._notify()
 
     def _stop_loop_for_jobs(self, loop, job: Job) -> None:
-        if loop.info().get("state") != "running":
+        info = loop.info()
+        if info.get("state") != "running":
             # already stopping: by the queue (asked before), or by a person --
             # whose stop it is, and who did not ask for it to start again
             return
-        reply = loop.stop(operator="run queue", client=self._host, start_monitor=False)
+        category, owner = info_category(info), effective_owner(info)
+        reply = loop.stop(operator="run queue", client=self._host, start_monitor=False,
+                          owner="queue")
         if reply.get("status") != "ok":
             return
         with self._lock:
+            # the category and owner it had: the restart keeps them (a holding
+            # loop a person's job stopped comes back holding, for that person)
             self._resume_loop = {"key": loop.spec.key,
                                  "path": loop.path if loop.spec.pick else None,
-                                 "since": self._clock()}
-        log.info("Run queue: %s stops after its run in progress for %s; it starts again "
-                 "when the queue has run out.", loop.spec.title, job.name)
-        self._record("run_queue_loop_stop", loop=loop.spec.key, for_job=job.id)
+                                 "since": self._clock(), "category": category,
+                                 "owner": owner}
+        log.info("Run queue: %s (%s) stops after its run in progress for %s; it starts again "
+                 "when the queue has run out.", loop.spec.title, category, job.name)
+        self._record("run_queue_loop_stop", loop=loop.spec.key, for_job=job.id,
+                     job_owner=job.owner, category=category, loop_owner=owner)
         self._save()
         self._notify()
 
@@ -3556,11 +3575,17 @@ class RunQueue:
                     self._record("run_queue_loop_not_resumed", loop=loop.spec.key,
                                  state=info.get("state"), why=text)
                 else:
+                    # the category it had (a resume record from before
+                    # 2026-10-20 has none: the default, "yields")
+                    category = resume.get("category") or None
                     reply = loop.start(operator="run queue", client=self._host,
-                                       path=resume.get("path"), owner="queue")
+                                       path=resume.get("path"), owner="queue",
+                                       category=category,
+                                       on_behalf_of=resume.get("owner"))
                     ok = reply.get("status") == "ok"
                     self._record("run_queue_loop_resume", loop=loop.spec.key, ok=ok,
-                                 msg=reply.get("msg", ""))
+                                 msg=reply.get("msg", ""), category=category,
+                                 on_behalf_of=resume.get("owner"))
                     if ok:
                         log.info("Run queue: out of jobs -- %s started again.", loop.spec.title)
                         self._owe_monitor = False

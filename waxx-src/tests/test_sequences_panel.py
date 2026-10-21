@@ -527,3 +527,69 @@ def test_a_hosts_requester_carries_the_requests(qapp):
     assert p._sender.requests == []
     assert p.loop_cards["auto_tof"].pill.text() == "RUNNING"
     p.shutdown()
+
+
+# --- the loop category toggle (2026-10-20) --------------------------------------------------------
+
+def test_a_loop_start_sends_yields_by_default_and_holds_when_toggled(panel):
+    panel.set_loops({"auto_tof": dict(LOOP, categories=["yields", "holds"])})
+    card = panel.loop_cards["auto_tof"]
+    row = card.layout().itemAt(0).layout()
+    assert row.indexOf(card.category_button) > row.indexOf(card.status)
+    assert not card.category_button.isHidden() and card.category_button.isEnabled()
+    assert card.category_button.text() == "yields to agents"
+    assert not card.category_button.isChecked()
+    card.start_button.click()
+    title, text, verb = panel.confirm_answers[-1]
+    assert "Yields: an agent's queued job may stop it" in text
+    req = panel._sender.requests[-1]
+    assert req["action"] == "start" and req["category"] == "yields" and req["owner"] == "person"
+    card.category_button.click()                         # -> holds for the next Start
+    assert card.next_category == "holds" and card.category_button.text() == "holds"
+    card.start_button.click()
+    assert "Holds: agents' queued jobs wait behind it" in panel.confirm_answers[-1][1]
+    assert panel._sender.requests[-1]["category"] == "holds"
+
+
+def test_a_running_loop_shows_its_own_category_and_the_toggle_is_locked(panel):
+    panel.set_loops({"auto_tof": dict(LOOP, categories=["yields", "holds"])})
+    card = panel.loop_cards["auto_tof"]
+    panel.on_run_loop(dict(LOOP, state="running", started=time.time(), owner="queue",
+                           on_behalf_of="person", category="holds",
+                           categories=["yields", "holds"], text="started by run queue@kong"))
+    assert card.category_button.text() == "holds" and card.category_button.isChecked()
+    assert not card.category_button.isEnabled()
+    status = card.status.text()
+    assert "owner queue for person" in status and "holds" in status
+    assert card.next_category == "yields"                # the next Start's choice is untouched
+    card.stop_button.click()
+    req = panel._sender.requests[-1]
+    assert req["action"] == "stop" and req["owner"] == "person"
+    panel.on_run_loop(dict(LOOP, state="stopped", ended=time.time(), category="holds",
+                           categories=["yields", "holds"]))
+    assert card.category_button.isEnabled() and card.category_button.text() == "yields to agents"
+
+
+def test_an_older_server_is_named_in_the_toggles_tooltip(panel):
+    panel.set_loops({"auto_tof": LOOP})                  # no "categories": older code
+    card = panel.loop_cards["auto_tof"]
+    assert "does not know loop categories" in card.category_button.toolTip()
+
+
+def test_the_release_button_wears_the_hold_colour(qapp):
+    """While a hold is on, the button that releases it is amber (the HELD
+    banner's colour) and the row's accent too; released, both go back."""
+    p = sp.SequencesPanel(requester=lambda obj: {"status": "ok"}, synchronous_requests=True,
+                          show_queue=False)
+    p.set_reachable(True)
+    p.set_hold({"active": True, "since": time.time(), "by": "jp@kong", "reason": "aligning",
+                "owner": "person"})
+    row = p.hold_row
+    assert row.button.text() == sp.RELEASE_TEXT
+    assert sp.theme.HELD in row.button.styleSheet()
+    assert sp.theme.HELD_EDGE in row.styleSheet()
+    p.set_hold({"active": False})
+    assert row.button.text() == sp.HOLD_TEXT
+    assert sp.theme.HELD not in row.button.styleSheet()
+    assert sp.theme.HELD_EDGE not in row.styleSheet()
+    p.shutdown()
