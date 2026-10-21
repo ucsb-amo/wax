@@ -55,7 +55,8 @@ class PaintedBeam():
     whatever else the beam's controller inherits; see the module docstring for
     the subclass contract."""
 
-    def _init_painting(self, paint_amp_dac=DAC_CH, v_paint_min=-5., core=Core):
+    def _init_painting(self, paint_amp_dac=DAC_CH, v_paint_min=-5., core=Core,
+                       paint_amp_exponent=0.3333):
         """Wire up the painting hardware. Call from the subclass __init__.
 
         Args:
@@ -68,10 +69,15 @@ class PaintedBeam():
                 per beam, fixed by that beam's RF chain (input attenuators and
                 dividers differ between beams). Full scale is +6 V.
             core (Core): the core device, for seconds_to_mu.
+            paint_amp_exponent (float): exponent e of the painting law
+                paint_frac = (P/P_max)**e. 0.3333 (default) holds the trap
+                frequency constant; a subclass may change the attribute per
+                ramp (it is read at every step, in kernels too).
         """
         self.paint_amp_dac = paint_amp_dac
         self.v_paint_min = v_paint_min
         self.core = core
+        self.paint_amp_exponent = paint_amp_exponent
 
     # -------------------------------------------------------------------------
     # painting amplitude
@@ -84,15 +90,17 @@ class PaintedBeam():
 
         The trap frequency goes as sqrt(P / h**3), where P is the power and h
         the painting amplitude, so holding it constant means h scales as the
-        cube root of the fraction by which P changed. That fraction is then
-        rescaled onto the DAC range, which runs from self.v_paint_min (no
-        painting) to v_awg_am_max (full painting).
+        cube root of the fraction by which P changed (the default
+        self.paint_amp_exponent = 0.3333); another exponent e gives
+        h ~ (P/P_max)**e. That fraction is then rescaled onto the DAC range,
+        which runs from self.v_paint_min (no painting) to v_awg_am_max (full
+        painting).
 
         All three arguments are required -- the public wrapper on the subclass
         is where ExptParams defaults get filled in.
         """
         p_frac = v_pd / v_pd_max
-        paint_amp_frac = p_frac**0.3333
+        paint_amp_frac = p_frac**self.paint_amp_exponent
         return (paint_amp_frac - 0.5)*(v_awg_am_max - self.v_paint_min) \
             + (v_awg_am_max + self.v_paint_min)/2
 
