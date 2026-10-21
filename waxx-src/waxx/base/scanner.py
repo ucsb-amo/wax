@@ -412,7 +412,6 @@ class Scanner():
         if not cleaned:
             self.cleanup_calibration_kernel()
             self._subscan_end(True, "")
-        delay(self.params.t_recover)
         self.core.break_realtime()
         return (aborted, what)
 
@@ -529,11 +528,12 @@ class Scanner():
         while scanning:
 
             # No sync here: RPCs execute at kernel-CPU time regardless of the
-            # timeline cursor, so this host block runs during the t_recover
-            # slack banked below (previous shot's events were already drained
-            # by the wait inside put_shot_data). The recovery interval is
-            # still honored: the next shot's events sit >= t_recover after the
-            # previous shot's on the timeline.
+            # timeline cursor (the previous shot's events were already drained
+            # by the wait inside put_shot_data). There is no recovery delay
+            # between shots any more (t_recover, 100 ms, removed 2026-10-21 at
+            # the user's request: it guarded scope reads, which cannot
+            # outlast the next shot's re-arm -- both are blocking RPCs on this
+            # kernel's thread).
             aborted_bool = self._check_for_abort_signal()
 
             # Interleaved sub-scan points due before this data shot (the
@@ -622,9 +622,6 @@ class Scanner():
             if not cleaned:
                 self.cleanup_scan_kernel()
 
-            # Banked as timeline slack (not spun out on the kernel CPU) so the
-            # next iteration's host RPCs overlap it instead of following it.
-            delay(self.params.t_recover)
             self.core.break_realtime()
 
             scanning = self.step_scan()

@@ -63,7 +63,6 @@ class LoopExpt(Scanner, Dealer):
         self.setup_camera = False
         self.p = self.params
         self.params.t_fixed = 1.0
-        self.params.t_recover = 0.0
         self.run_info.save_data = False
         self.run_info.save_on_underflow = save_on_underflow
         self.run_info.run_id = 1
