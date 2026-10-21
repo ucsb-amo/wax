@@ -52,6 +52,7 @@ from artiq.experiment import kernel, rpc, delay, now_mu
 from waxx.control.cameras.camera_param_classes import CameraParams, img_types
 from waxx.control.cameras.camera_stream_client import (
     InactiveCameraStream, TriggeredCameraStreamClient)
+from waxx.control.cameras.exposure_delay import ExposureDelayCell, dummy_cell
 
 _SHOW = ('image', 'counts', None)
 SETTING_KEYS = ('exposure_time', 'gain', 'roi')
@@ -94,6 +95,21 @@ def _connected(stream):
     if not getattr(stream, '_connected', True):
         return None
     return bool(getattr(stream, 'live', True))
+
+
+def _exposure_delay_record(img):
+    """An image's exposure delay for the run's record: its stream's
+    (TriggeredCameraStreamClient.exposure_delay_record: the value the kernel
+    uses, its source, how it reached the kernel, the pre-compile value, the
+    camera's report at the claim), or None values for an image that takes no
+    frames."""
+    rec = getattr(img._stream, 'exposure_delay_record', None) if img.live else None
+    if rec is None:
+        return {"exposure_delay": None, "exposure_delay_source": None}
+    try:
+        return dict(rec())
+    except Exception as e:
+        return {"exposure_delay": None, "exposure_delay_source": f"unknown ({e!r})"}
 
 
 def _number(v):
@@ -212,7 +228,10 @@ class DiagnosticImage:
         self.j = -1                 # frame index on the camera
         self.live = False           # the camera's stream takes frames this run
         self.in_stage = True        # |t_offset| <= t_stage (resolve_stages)
-        self.exposure_delay = 0.
+        # the camera stream's exposure-delay cell (the experiment's spare one
+        # for an image that takes no frames): the kernel writes the claim's
+        # value into it at its start (Scanner.load_exposure_delays)
+        self.exposure_delay_cell = ExposureDelayCell(0.)
         self.t_trigger = 2.e-6
         self._stream = None
         self.t_stage_s = None       # t_stage in s, as resolved
@@ -253,11 +272,12 @@ class DiagnosticImage:
     def trigger(self):
         """Take this frame ``t_offset`` from the cursor; the cursor stays."""
         if self.frame.active and self.live and self.in_stage:
+            t_delay = self.exposure_delay_cell.value
             delay(self.t_offset)
             self.announce_edge(now_mu() - self.core.get_rtio_counter_mu())
-            delay(-self.exposure_delay)
+            delay(-t_delay)
             self.ttl.pulse(self.t_trigger)
-            delay(self.exposure_delay - self.t_trigger - self.t_offset)
+            delay(t_delay - self.t_trigger - self.t_offset)
 
     @rpc(flags={"async"})
     def announce_edge(self, slack_mu):
@@ -387,8 +407,11 @@ class diagnostic_frame:
                 img.j = j
                 img.live = live
                 img._stream = stream if live else None
+                # the stream's cell itself, not a copy of its value: the
+                # kernel writes the claim's delay into it at its start
+                img.exposure_delay_cell = (stream.exposure_delay_cell if live
+                                           else dummy_cell(expt))
                 if live:
-                    img.exposure_delay = float(stream.exposure_delay)
                     img.t_trigger = float(stream.t_trigger)
         self.resolve_stages(getattr(expt, 'params', None), quiet=True)
         # The streams may be built without a connection (queue phase 2: the
@@ -457,7 +480,8 @@ class diagnostic_frame:
                                              and _connected(img._stream)),
                                **img.settings(),
                                "from_camera_entry": [s for s in SETTING_KEYS
-                                                     if s not in img.given]}
+                                                     if s not in img.given],
+                               **_exposure_delay_record(img)}
                            for k, img in self.images().items()}}
 
     def finish(self):

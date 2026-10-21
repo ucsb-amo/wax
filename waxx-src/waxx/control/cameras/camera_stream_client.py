@@ -53,6 +53,9 @@ from artiq.language.core import now_mu
 
 from waxa.data.camera_frames import N_META, meta_row
 
+from waxx.control.cameras import exposure_delay as _xdelay
+from waxx.control.cameras.exposure_delay import ExposureDelayCell
+
 # free-run: renew the attachment while idle (an on_demand server drops it after 30 s)
 HEARTBEAT_S = 8.0
 # free-run: a snap already this late is skipped rather than taken ever later
@@ -1176,18 +1179,33 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                  t_match_window=2.0, t_early_tolerance=0.25, t_stray_grace=0.3,
                  frame_settings=None, frame_rois=None, **kw):
         self.ttl = ttl                                  # kernel-visible
-        # ``exposure_delay`` is the configured value: the camera's own
-        # replaces it once our trigger settings are in (_take_camera_exposure_delay);
-        # a stream built without a connection takes the camera server's
-        # before the compile instead (_fix_exposure_delay_before_compile)
+        # The exposure delay (waxx.control.cameras.exposure_delay). The
+        # kernel reads only the cell. ``exposure_delay`` /
+        # ``exposure_delay_source`` are its host mirror: the value the kernel
+        # uses (configured until decided). Built with a connection: the
+        # camera's own, read once our trigger settings are in, before any
+        # compile (_take_camera_exposure_delay). Built without one
+        # (connect=False, every kexp run): a provisional value before the
+        # compile (_fix_exposure_delay_before_compile), the camera's at the
+        # claim (exposure_delay_at_claim), which the kernel takes at its
+        # start (Scanner.load_exposure_delays -> _exposure_delay_for_kernel).
+        self.exposure_delay_cell = ExposureDelayCell(exposure_delay)    # kernel-visible
         self.exposure_delay = float(exposure_delay)
         self.exposure_delay_configured = float(exposure_delay)
         self.exposure_delay_source = "configured"
         self._exposure_delay_from_camera = bool(exposure_delay_from_camera)
-        # True when built without a connection: exposure_delay is decided
-        # before the compile and the connect never changes it
-        self._exposure_delay_fixed = False
-        self.exposure_delay_at_connect = None
+        # True when built without a connection: the claim decides the delay,
+        # the kernel takes it at its start (set before register(), which
+        # super().__init__ may call)
+        self._exposure_delay_fixed = not bool(kw.get("connect", True))
+        self.exposure_delay_before_claim = None         # the compiled-in (provisional) value
+        self.exposure_delay_before_claim_source = None
+        self.exposure_delay_at_connect = None           # what the camera reported at the claim
+        self.exposure_delay_at_claim = None             # what the claim decided for the kernel
+        self.exposure_delay_at_claim_source = None
+        # "compiled_in" (the cell's value at the compile) or
+        # "loaded_at_kernel_start" (the claim's, by load_exposure_delays)
+        self.exposure_delay_to_kernel = "compiled_in"
         self.t_trigger = float(t_trigger)
         self.keys = _as_keys(key)
         for k in self.keys:
@@ -1254,11 +1272,14 @@ class TriggeredCameraStreamClient(CameraStreamClient):
 
     @kernel
     def trigger(self, j=0):
-        """Expose frame ``j`` at the timeline cursor; the cursor stays."""
+        """Expose frame ``j`` at the timeline cursor; the cursor stays. The
+        edge leads by the exposure delay in the cell (the claim's, once the
+        kernel has loaded it)."""
         self.announce_trigger_mu(now_mu() - self.core.get_rtio_counter_mu(), j)
-        delay(-self.exposure_delay)
+        t_delay = self.exposure_delay_cell.value
+        delay(-t_delay)
         self.ttl.pulse(self.t_trigger)
-        delay(self.exposure_delay - self.t_trigger)
+        delay(t_delay - self.t_trigger)
 
     @kernel
     def grab(self, t_offset=0.):
@@ -1402,43 +1423,51 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             self._cur_settings = dict(self._base_settings)
         return frame0
 
-    def _take_camera_exposure_delay(self):
-        """``exposure_delay`` from the camera itself: the exposure start delay
-        its server reports (``exposure_start_delay_s``), read after our
-        trigger settings went in.  The configured value stays, with a printed
-        warning, when the camera does not report one;
-        ``exposure_delay_source`` ("camera" / "configured") says which, in
-        the stream's provenance record."""
+    def _read_camera_exposure_delay(self):
+        """(seconds or None, why not): the exposure start delay the camera's
+        server reports now (``exposure_start_delay_s``)."""
         from beacon.camera.directory import seconds_or_none
-        if self._exposure_delay_fixed:
-            # built without a connection: the kernel's value was decided
-            # before the compile (_fix_exposure_delay_before_compile) and
-            # may already be copied / compiled (ARTIQ writes it back at the
-            # kernel's end anyway). Keep it; record what the camera reports.
-            if not self._exposure_delay_from_camera:
-                return
-            try:
-                raw = getattr(self._stream.status(refresh=True), "raw", None) or {}
-                value = seconds_or_none(raw.get("exposure_start_delay_s"))
-            except Exception:
-                value = None
-            self.exposure_delay_at_connect = value
-            if value is not None and value != self.exposure_delay:
-                print(f"[{self.label}] !! {self.serial}: the camera reports an exposure "
-                      f"delay of {value * 1e6:.2f} us at the claim, but this run's kernel "
-                      f"uses {self.exposure_delay * 1e6:.2f} us "
-                      f"({self.exposure_delay_source}, decided before the claim)")
-            return
-        self.exposure_delay = self.exposure_delay_configured
-        self.exposure_delay_source = "configured"
-        if not self._exposure_delay_from_camera:
-            return
         try:
             raw = getattr(self._stream.status(refresh=True), "raw", None) or {}
             value = seconds_or_none(raw.get("exposure_start_delay_s"))
-            why = "the camera server does not report it"
+            return value, "the camera server does not report it"
         except Exception as e:
-            value, why = None, f"status: {type(e).__name__}: {e}"
+            return None, f"status: {type(e).__name__}: {e}"
+
+    def _take_camera_exposure_delay(self):
+        """The exposure delay from the camera itself: the exposure start
+        delay its server reports, read after our trigger settings went in.
+        The configured value is used, with a printed warning, when the
+        camera does not report one.
+
+        Built with a connection (before any compile): it is set into the
+        kernel's cell here; ``exposure_delay_source`` "camera" / "configured".
+
+        Built without one (connect=False; this is the run's claim): it is the
+        claim's decision, ``exposure_delay_at_claim`` with
+        ``exposure_delay_at_claim_source`` "camera_at_claim" / "configured".
+        The cell is not touched here (the claim sets no attribute a kernel
+        reads): the kernel writes it at its start (load_exposure_delays)."""
+        if self._exposure_delay_fixed:
+            if not self._exposure_delay_from_camera:
+                self._decide_exposure_delay(self.exposure_delay_configured, "configured")
+                return
+            value, why = self._read_camera_exposure_delay()
+            self.exposure_delay_at_connect = value
+            if value is None:
+                print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
+                      f"camera at the claim ({why}); using the configured "
+                      f"{self.exposure_delay_configured * 1e6:.2f} us")
+                self._decide_exposure_delay(self.exposure_delay_configured, "configured")
+                return
+            self._decide_exposure_delay(value, "camera_at_claim")
+            return
+        self.exposure_delay = self.exposure_delay_configured
+        self.exposure_delay_source = "configured"
+        self.exposure_delay_cell.value = self.exposure_delay
+        if not self._exposure_delay_from_camera:
+            return
+        value, why = self._read_camera_exposure_delay()
         if value is None:
             print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
                   f"camera ({why}); using the configured "
@@ -1446,44 +1475,108 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             return
         self.exposure_delay = value
         self.exposure_delay_source = "camera"
+        self.exposure_delay_cell.value = float(value)
         if value != self.exposure_delay_configured:
             console.info(f"[{self.label}] {self.serial}: exposure delay {value * 1e6:.2f} us "
                          f"from the camera (configured "
                          f"{self.exposure_delay_configured * 1e6:.2f} us)", console.VERBOSE)
 
+    def _decide_exposure_delay(self, value, source):
+        """The claim's decision (connect=False): what the kernel takes at its
+        start. Host-only attributes; says so when it is not the compiled-in
+        value."""
+        self.exposure_delay_at_claim = float(value)
+        self.exposure_delay_at_claim_source = str(source)
+        before = self.exposure_delay_before_claim
+        if before is not None and self.exposure_delay_at_claim != before:
+            console.info(f"[{self.label}] {self.serial}: exposure delay "
+                         f"{self.exposure_delay_at_claim * 1e6:.2f} us at the claim "
+                         f"({source}; {before * 1e6:.2f} us before the compile, "
+                         f"{self.exposure_delay_before_claim_source}); the kernel takes "
+                         f"it at its start")
+
+    def _exposure_delay_for_kernel(self):
+        """For load_exposure_delays' RPC (exposure_delay.exposure_delays_for_kernel):
+        (value the kernel writes into this stream's cell, decided). Decided:
+        the claim's value, and the host mirror (``exposure_delay`` /
+        ``exposure_delay_source``) says the kernel now uses it. Not decided
+        (no claim yet): the cell's own value, nothing changes."""
+        if self.exposure_delay_at_claim is None:
+            return float(self.exposure_delay_cell.value), False
+        self.exposure_delay = self.exposure_delay_at_claim
+        self.exposure_delay_source = self.exposure_delay_at_claim_source
+        self.exposure_delay_to_kernel = "loaded_at_kernel_start"
+        return float(self.exposure_delay_at_claim), True
+
+    def exposure_delay_record(self):
+        """The exposure delay for the run's records. ``exposure_delay`` /
+        ``exposure_delay_source``: the value the kernel uses and where it
+        came from; ``exposure_delay_to_kernel``: "compiled_in" or
+        "loaded_at_kernel_start". The rest: the configured value, the
+        pre-compile (provisional) one, the camera's report at the claim and
+        the claim's decision (None where there was none)."""
+        return {"exposure_delay": self.exposure_delay,
+                "exposure_delay_source": self.exposure_delay_source,
+                "exposure_delay_to_kernel": self.exposure_delay_to_kernel,
+                "exposure_delay_configured": self.exposure_delay_configured,
+                "exposure_delay_before_claim": self.exposure_delay_before_claim,
+                "exposure_delay_before_claim_source": self.exposure_delay_before_claim_source,
+                "exposure_delay_at_connect": self.exposure_delay_at_connect,
+                "exposure_delay_at_claim": self.exposure_delay_at_claim,
+                "exposure_delay_at_claim_source": self.exposure_delay_at_claim_source}
+
+    def register(self):
+        """CameraStreamClient.register, then (connect=False) this stream's
+        exposure-delay cell joins the experiment's list the kernel writes at
+        its start -- before the compile, in registration order."""
+        was = self._registered
+        super().register()
+        if self._exposure_delay_fixed and self._registered and not was:
+            _xdelay.register(self._expt, self, self.exposure_delay_cell)
+
+    def mark_dead(self, reason):
+        """CameraStreamClient.mark_dead; a stream the claim did not decide a
+        delay for (it never connected) gets the configured one: its edges
+        still fire, no frame is kept."""
+        super().mark_dead(reason)
+        if self._exposure_delay_fixed and self.exposure_delay_at_claim is None:
+            self.exposure_delay_at_claim = self.exposure_delay_configured
+            self.exposure_delay_at_claim_source = "configured"
+
     def _fix_exposure_delay_before_compile(self):
         """A stream built without a connection (``connect=False``): the
-        kernel-read ``exposure_delay`` is decided here, before the compile
-        and before anything copies it (diagnostic_frame.bind copies it into
-        each image) -- the delay the camera's server last reported (its
-        directory entry, as BaslerParams.prepare_for_run reads the run
-        camera's; read only, nothing is set on the camera), else the
-        configured one. The connect (the run's claim: after the compile for
-        a warm-launched run, after bind for every run) never changes it; it
-        records what the camera reports then (``exposure_delay_at_connect``)
-        and says so loudly when that differs."""
+        provisional exposure delay, compiled into the kernel's cell -- the
+        delay the camera's server last reported (its directory entry, as
+        BaslerParams.prepare_for_run reads the run camera's; read only,
+        nothing is set on the camera), which is what the previous user's
+        settings left, else the configured one. It is only provisional: the
+        claim reads the camera's with this run's settings
+        (``exposure_delay_at_claim``) and the kernel takes that at its start
+        (Scanner.load_exposure_delays); the records say which the kernel
+        used (``exposure_delay_record``)."""
         self._exposure_delay_fixed = True
-        if not self._exposure_delay_from_camera:
-            return
-        try:
-            directory = self._directory or shared_camera_directory()
-            entry = directory.find(self.serial)
-            value = getattr(entry, "exposure_start_delay_s", None)
-            value = None if value is None else float(value)
-            why = f"{getattr(entry, 'server_id', '?')} does not report it"
-        except Exception as e:
-            value, why = None, f"camera not found ({type(e).__name__}: {e})"
-        if value is None:
-            print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
-                  f"camera before the compile ({why}); using the configured "
-                  f"{self.exposure_delay_configured * 1e6:.2f} us")
-            return
-        self.exposure_delay = value
-        self.exposure_delay_source = "camera_before_claim"
-        if value != self.exposure_delay_configured:
-            console.info(f"[{self.label}] {self.serial}: exposure delay {value * 1e6:.2f} us "
-                         f"from the camera's server before the compile (configured "
-                         f"{self.exposure_delay_configured * 1e6:.2f} us)", console.VERBOSE)
+        value, source = self.exposure_delay_configured, "configured"
+        if self._exposure_delay_from_camera:
+            try:
+                directory = self._directory or shared_camera_directory()
+                entry = directory.find(self.serial)
+                v = getattr(entry, "exposure_start_delay_s", None)
+                if v is not None:
+                    value, source = float(v), "camera_before_claim"
+                else:
+                    why = f"{getattr(entry, 'server_id', '?')} does not report it"
+            except Exception as e:
+                why = f"camera not found ({type(e).__name__}: {e})"
+            if source == "configured":
+                console.info(f"[{self.label}] {self.serial}: no exposure delay from the camera "
+                             f"before the compile ({why}); the configured "
+                             f"{value * 1e6:.2f} us until the claim reads it",
+                             console.VERBOSE)
+        self.exposure_delay_before_claim = float(value)
+        self.exposure_delay_before_claim_source = source
+        self.exposure_delay = float(value)
+        self.exposure_delay_source = source
+        self.exposure_delay_cell.value = float(value)
 
     def _enter_triggered(self):
         """Live stream on, then trigger mode on our line (in that order:
@@ -1755,10 +1848,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 "trigger_ttl": getattr(self.ttl, "key", "") or getattr(self.ttl, "name", ""),
                 "trigger_ttl_ch": getattr(self.ttl, "ch", None),
                 "trigger_source": self._trigger_source,
-                "exposure_delay": self.exposure_delay,
-                "exposure_delay_source": self.exposure_delay_source,
-                "exposure_delay_configured": self.exposure_delay_configured,
-                "exposure_delay_at_connect": self.exposure_delay_at_connect,
+                **self.exposure_delay_record(),
                 "t_trigger": self.t_trigger,
                 "siblings_on_line": [list(s.keys) for s in self._siblings],
                 "frame_settings": {self.keys[j]: v for j, v in sorted(self._frame_settings.items())},

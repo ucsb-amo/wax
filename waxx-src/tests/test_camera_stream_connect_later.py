@@ -257,11 +257,11 @@ def test_per_frame_rois_take_their_shapes_at_the_late_connect():
         cs.finish()
 
 
-def test_the_exposure_delay_is_decided_before_the_compile_and_kept_at_connect(capsys):
-    """Built without a connection: the kernel-read exposure_delay comes from
-    the camera server's entry at construction (before bind copies it and
-    before a warm run's compile); the connect records the camera's value and
-    never changes the kernel's."""
+def test_the_exposure_delay_is_provisional_before_the_compile_and_decided_at_the_claim(capsys):
+    """Built without a connection: the cell the kernel reads holds the camera
+    server's last report (provisional) at construction; the claim reads the
+    camera's own with this run's settings and decides that for the kernel,
+    without touching the cell (the kernel writes it at its start)."""
     fe = FakeExpt()
     stream = TrigFakeStream()
     stream.exposure_start_delay_s = 23.5e-6
@@ -269,33 +269,44 @@ def test_the_exposure_delay_is_decided_before_the_compile_and_kept_at_connect(ca
     cs = _trig(fe, stream, directory=directory)
     try:
         assert directory.finds == ["12345"] and stream._settings["trigger_mode"] == "Off"
-        assert cs.exposure_delay == 21.0e-6
-        assert cs.exposure_delay_source == "camera_before_claim"
+        assert cs.exposure_delay_cell.value == 21.0e-6
+        assert cs.exposure_delay == 21.0e-6 and cs.exposure_delay_source == "camera_before_claim"
+        assert cs.exposure_delay_before_claim == 21.0e-6
+        assert cs.exposure_delay_at_claim is None
         fe.data.init()
         connect_streams([cs])
         assert cs.live
-        assert cs.exposure_delay == 21.0e-6                     # unchanged by the claim
+        assert cs.exposure_delay_cell.value == 21.0e-6           # the claim sets no kernel value
         assert cs.exposure_delay_at_connect == 23.5e-6
+        assert cs.exposure_delay_at_claim == 23.5e-6
+        assert cs.exposure_delay_at_claim_source == "camera_at_claim"
         out = capsys.readouterr().out
-        assert "reports an exposure delay of 23.50 us" in out and "kernel uses 21.00 us" in out
+        assert "23.50 us at the claim" in out and "21.00 us before the compile" in out
+        # not loaded by a kernel yet: the record says the compiled-in value is in use
         extra = cs._provenance_extra()
         assert extra["exposure_delay"] == 21.0e-6
         assert extra["exposure_delay_source"] == "camera_before_claim"
+        assert extra["exposure_delay_to_kernel"] == "compiled_in"
         assert extra["exposure_delay_at_connect"] == 23.5e-6
+        assert extra["exposure_delay_at_claim"] == 23.5e-6
     finally:
         cs.finish()
 
 
-def test_the_exposure_delay_falls_back_to_configured_before_the_compile(capsys):
+def test_the_exposure_delay_is_configured_before_the_compile_without_a_directory_entry(capsys):
     fe = FakeExpt()
     stream = TrigFakeStream()
     stream.exposure_start_delay_s = 23.5e-6
     cs = _trig(fe, stream)              # the conftest's directory finds nothing
     try:
+        assert cs.exposure_delay_cell.value == 17e-6
         assert cs.exposure_delay == 17e-6 and cs.exposure_delay_source == "configured"
-        assert "before the compile" in capsys.readouterr().out
+        assert cs.exposure_delay_before_claim_source == "configured"
+        assert "!!" not in capsys.readouterr().out            # provisional only: no alarm
         fe.data.init()
         connect_streams([cs])
-        assert cs.exposure_delay == 17e-6 and cs.exposure_delay_at_connect == 23.5e-6
+        assert cs.exposure_delay_cell.value == 17e-6
+        assert cs.exposure_delay_at_connect == 23.5e-6
+        assert cs.exposure_delay_at_claim == 23.5e-6
     finally:
         cs.finish()
