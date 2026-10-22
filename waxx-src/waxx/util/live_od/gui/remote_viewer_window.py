@@ -41,6 +41,7 @@ from waxx.util.live_od.gui.camera_control import CameraControl
 from waxx.util.live_od.gui.tool_windows import ToolLauncher
 from waxx.util.live_od.gui.status_strip import ACTIVE_STATES, StatusStrip
 from waxx.util.live_od.gui.hold_badge import HoldBadge
+from waxx.util.live_od.gui.run_again_button import RunAgainButton
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +449,9 @@ class RemoteViewerWindow(QWidget):
 
         # the person hold (monitor server), shown only while it is on
         self.hold_badge = HoldBadge(log=self.msg)
+        # the last run that came through the run queue, queued again as the next job
+        self.run_again_button = RunAgainButton(log=self.msg)
+        self.run_again_button.result_ready.connect(self._on_run_again_result)
 
         # Abort, as in the acquisition window: it aborts the run in progress and
         # nothing else (with no run, the server is asked first and nothing is sent)
@@ -468,6 +472,8 @@ class RemoteViewerWindow(QWidget):
         status_row = QHBoxLayout()
         status_row.setSpacing(4)
         status_row.addWidget(self.status_strip, 1)
+        status_row.addWidget(self.run_again_button)
+        status_row.addSpacing(8)        # apart from Abort: a slip must not abort a run
         status_row.addWidget(self.hold_badge)
         status_row.addWidget(self.abort_button)
         status_row.addWidget(self.connection_label)
@@ -505,6 +511,11 @@ class RemoteViewerWindow(QWidget):
     def _on_status_title(self, text: str):
         self.setWindowTitle(f"{self.TITLE} — {text}" if text else self.TITLE)
 
+    def _on_run_again_result(self, text: str, ok: bool):
+        """A refusal must be seen, not only logged (the log has it either way)."""
+        if not ok:
+            self.status_strip.show_notice(text, 12.0)
+
     def _on_run_started(self, msg: dict):
         """RUN_STARTED. ``info`` (newer servers) carries what the acquisition
         window knows of the run; without it the viewer shows the run id only."""
@@ -534,6 +545,11 @@ class RemoteViewerWindow(QWidget):
                        if p))
         self.live_scalar_plot_window.on_new_run(run_id, xvarnames)
         self.fk_tof_window.on_new_run(run_id, dict(info.get("params") or {}))
+        # the run queue's job ("" for a direct run; None: an older server did not say)
+        self.run_again_button.note_run(
+            run_id, expt_name,
+            str(info.get("queue_job") or "") if "queue_job" in info else None,
+            str(info.get("launcher") or ""))
         if "info" not in msg:
             # an older server sends no ADJUST_SPECS: ask for the run's adjust params
             threading.Thread(target=self._fetch_adjust_state, daemon=True).start()
@@ -626,6 +642,13 @@ class RemoteViewerWindow(QWidget):
         self.status_strip.set_state(str(poll.get('run_state') or 'idle'), "")
         self._run_in_progress = in_progress
         self._update_abort_button()
+        # Run again next, for a viewer that saw no RUN_STARTED: POLL names the
+        # current (or last) run's queue job; init_run_age_s is None before any run
+        if (self.run_again_button.latest is None and 'queue_job' in poll
+                and poll.get('init_run_age_s') is not None):
+            self.run_again_button.note_run(poll.get('run_id'), str(poll.get('expt_name') or ''),
+                                           str(poll.get('queue_job') or ''),
+                                           str(poll.get('launcher') or ''))
         if isinstance(log, dict) and log.get('ok') and log.get('records'):
             run = log.get('run') or {}
             title = f"Run {run.get('run_id')}" if run.get('run_id') else "Run (not saved)"
@@ -883,6 +906,7 @@ class RemoteViewerWindow(QWidget):
             self.subscriber.stop()
             self.subscriber.wait(2000)
         self.hold_badge.shutdown()
+        self.run_again_button.shutdown()
         self.plotter.quit()
         self.plotter.wait(2000)
         # the viewer's own windows go with it, so nothing keeps the process alive
@@ -924,6 +948,7 @@ def main(argv=None) -> int:
     )
     win.show()
     win.hold_badge.start()      # the person hold, from the monitor server
+    win.run_again_button.start()    # Run again next, through the run queue
     return app.exec()
 
 
