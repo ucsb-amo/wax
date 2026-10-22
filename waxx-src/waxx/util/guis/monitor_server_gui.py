@@ -465,11 +465,10 @@ class MonitorUDPServer(UdpServer):
         # The run queue: experiment jobs one at a time (run_queue.py), through
         # the same liveOD link (called late, so it is always the current one),
         # fence, monitor state and loops as the rest of the server.  Warm start
-        # (queue phase 2) stays off unless warm_ahead is given or
-        # WAXX_QUEUE_WARM_AHEAD=1 (until the hardware checks of the plan's M5
-        # have passed); `kq warm on|off` switches it while the server runs.
-        if warm_ahead is None:
-            warm_ahead = os.environ.get("WAXX_QUEUE_WARM_AHEAD", "").strip() == "1"
+        # (queue phase 2) is a stored setting (since 2026-10-21): warm_ahead
+        # None -> WAXX_QUEUE_WARM_AHEAD when set, else the queue folder's
+        # settings.json, else on (run_queue.WARM_AHEAD_DEFAULT); `kq warm
+        # on|off` and the Monitor panel's toggle switch and store it.
         self.run_queue = RunQueue(
             run_queue_dir, poll=lambda: self._live_od(),
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
@@ -667,6 +666,8 @@ class MonitorUDPServer(UdpServer):
             return json.dumps(self._reply_server(obj))
         if mtype == "slm_reinit":
             return json.dumps(self._reply_slm_reinit(obj))
+        if mtype == "live_od_launch":
+            return json.dumps(self._reply_live_od_launch(obj))
         if mtype == "regenerate_state":
             return json.dumps(self._reply_regenerate_state(obj))
         if mtype == "output":
@@ -1350,6 +1351,28 @@ class MonitorUDPServer(UdpServer):
     def _on_slm_reinit_change(self, snapshot: dict) -> None:
         self._broadcaster.send({"type": "slm_reinit", "slm_reinit": snapshot})
 
+    #: the fields of a live_od_launch record (anything else is dropped)
+    _LIVE_OD_LAUNCH_FIELDS = ("by", "owner", "host", "bat", "ok", "pid", "error", "probe")
+
+    def _reply_live_od_launch(self, obj: dict) -> dict:
+        """``{"type": "live_od_launch", "by", "owner", "host", "bat", "ok",
+        "pid", "error", "probe"}``: a person pressed Start liveOD on a Monitor
+        panel (the panel started liveOD's launcher on its own PC; this server
+        starts nothing).  Journalled (kind ``live_od_launch``) and logged."""
+        rec = {}
+        for key in self._LIVE_OD_LAUNCH_FIELDS:
+            value = obj.get(key)
+            if isinstance(value, str):
+                value = value[:500]
+            elif not isinstance(value, (bool, int, float, type(None))):
+                value = str(value)[:500]
+            rec[key] = value
+        log.info("liveOD launcher started from %s by %s (%s): %s", rec.get("host") or "?",
+                 rec.get("by") or "?", rec.get("owner") or "?",
+                 "ok" if rec.get("ok") else f"FAILED ({rec.get('error')})")
+        self.journal.record("live_od_launch", **rec)
+        return {"status": "ok"}
+
     def _reply_slm_reinit(self, obj: dict) -> dict:
         """``action`` "reinit": an operator's reinit now (the Device Control
         GUI's SLM pill) -- refused unless the machine is idle; "restart": an
@@ -1986,6 +2009,7 @@ class MonitorServerGUI(QWidget):
                                              monitor_button=self.status_indicator)
         self.queue_panel = RunQueuePanel(runner=self.request_runner,
                                          settings=self.queue_settings)
+        self.state_panel.message.connect(self.queue_panel.say)
         layout.addWidget(self.state_panel)
         layout.addWidget(self.queue_panel, 1)
         self.setLayout(layout)

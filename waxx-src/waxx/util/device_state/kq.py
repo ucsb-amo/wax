@@ -29,7 +29,7 @@ Commands::
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
     kq release                                lift the person's hold
-    kq warm [on|off]                          warm start (queue phase 2): show / switch
+    kq warm [on|off]                          warm start (queue phase 2): show / switch (stored)
     kq status [--json]                        the queue's state (not occupancy)
 
 Warm start (queue phase 2, when the server has it on): the next job's process
@@ -539,7 +539,7 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
     sp = sub.add_parser("warm", help="warm start (queue phase 2): show, or switch on / off "
-                                     "until the server restarts")
+                                     "(stored: it holds across server restarts)")
     sp.add_argument("state", nargs="?", choices=("on", "off"))
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
@@ -1173,12 +1173,28 @@ def _cmd_warm(ctx: _Ctx, args) -> int:
     on = None if args.state is None else args.state == "on"
     reply = ctx.client.warm_ahead(on, owner=_owner(args))
     now = "on" if reply.get("warm_ahead") else "off"
+    env = reply.get("env_override")
     if on is None:
-        ctx.say(f"[kq] warm start is {now}")
-    elif reply.get("was") == reply.get("warm_ahead"):
-        ctx.say(f"[kq] warm start was already {now}")
+        source = {"env": f"set by {env} where the server started" if env else "",
+                  "stored": "stored", "default": "the default: nothing stored",
+                  "given": "given at the server's start"}.get(str(reply.get("source") or ""), "")
+        ctx.say(f"[kq] warm start is {now}" + (f" ({source})" if source else ""))
+        return EXIT_OK
+    if "persisted" not in reply:
+        # an older server: a runtime switch only
+        stored = "until the monitor server restarts"
+    elif reply.get("persisted"):
+        stored = "stored"
+        if env:
+            stored += (f"; {env} is set where the server started and overrides it at the "
+                       "server's next start")
     else:
-        ctx.say(f"[kq] warm start switched {now} (until the monitor server restarts)")
+        stored = (f"NOT stored ({reply.get('persist_error') or '?'}): until the monitor "
+                  "server restarts")
+    if reply.get("was") == reply.get("warm_ahead"):
+        ctx.say(f"[kq] warm start was already {now} ({stored})")
+    else:
+        ctx.say(f"[kq] warm start switched {now} ({stored})")
     return EXIT_OK
 
 

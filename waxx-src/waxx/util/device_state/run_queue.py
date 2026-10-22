@@ -130,7 +130,13 @@ restart the queue is read back; a running job whose process is still alive
 process is gone is judged from liveOD's record (saved, or failed "server
 restarted; process gone").
 
-**Warm start (queue phase 2; ``RunQueue(warm_ahead=False)`` by default).**
+**Warm start (queue phase 2).**  A stored setting since 2026-10-21: the
+monitor server constructs the queue with ``warm_ahead=None`` -- start value
+``WAXX_QUEUE_WARM_AHEAD`` when set, else ``<dir>/settings.json``, else
+:data:`WARM_AHEAD_DEFAULT` (on); ``kq warm on|off`` and the Monitor panel's
+toggle (:meth:`RunQueue.set_warm_ahead`) switch it and store it, journalled.
+``RunQueue(warm_ahead=False)`` (the class default, for library use and tests)
+takes the value given.
 With ``warm_ahead`` on, the queue starts the NEXT job's process while the job
 in the slot is still running -- once that job has taken its first shot (the
 two compiles never overlap), its end is within :data:`WARM_LEAD_S` (or
@@ -291,6 +297,54 @@ _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 #: Environment variable that moves the queue's folder (tests point it at a
 #: temporary folder; a lab may point it at another LOCAL folder).
 DIR_ENV = "WAXX_RUN_QUEUE_DIR"
+
+#: The queue's settings, beside queue.json (``{"warm_ahead": {"on", "by",
+#: "owner", "at"}}``; atomic replace).  Read at the server's start.
+SETTINGS_FILE = "settings.json"
+#: Warm start when nothing is stored (user, 2026-10-21: on by default).
+WARM_AHEAD_DEFAULT = True
+#: Environment variable that, when set, overrides the stored warm start at
+#: the server's start ("1" / "on" / "true" or "0" / "off" / "false").
+WARM_AHEAD_ENV = "WAXX_QUEUE_WARM_AHEAD"
+
+
+def warm_ahead_from_env() -> bool | None:
+    """``WAXX_QUEUE_WARM_AHEAD`` as a bool, None when unset (or not
+    understood: a warning, and the stored setting applies)."""
+    raw = os.environ.get(WARM_AHEAD_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "on", "true", "yes"):
+        return True
+    if raw in ("0", "off", "false", "no"):
+        return False
+    log.warning("Run queue: %s=%r not understood (1/on or 0/off); the stored warm start "
+                "applies.", WARM_AHEAD_ENV, raw)
+    return None
+
+
+def read_settings(directory: str | None) -> dict:
+    """The queue's stored settings (``{}`` when there are none or the file
+    cannot be read -- logged)."""
+    if not directory:
+        return {}
+    path = os.path.join(directory, SETTINGS_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.error("Run queue: could not read its settings %s (%s); defaults apply.", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def stored_warm_ahead(directory: str | None) -> bool | None:
+    """The stored warm start (None: nothing stored)."""
+    rec = read_settings(directory).get("warm_ahead")
+    on = rec.get("on") if isinstance(rec, dict) else rec
+    return on if isinstance(on, bool) else None
 
 
 #: Environment variable listing the folders the queue runs files from
@@ -675,11 +729,30 @@ class RunQueue:
                  clock: Callable[[], float] = time.time,
                  poll_every_s: float = POLL_EVERY_S, gap_s: float = GAP_S,
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
-                 client_name: str | None = None, warm_ahead: bool = False,
+                 client_name: str | None = None, warm_ahead: bool | None = False,
                  set_priority=None, warm_deny_names=WARM_DENY_NAMES):
         self.directory = directory
-        #: warm start (see the module docstring); off by default
+        #: warm start (see the module docstring).  A bool: that value (the
+        #: class's default, off, for library use and tests).  None -- what the
+        #: monitor server passes -- the server's start value:
+        #: WAXX_QUEUE_WARM_AHEAD when set, else the stored setting
+        #: (``<dir>/settings.json``), else WARM_AHEAD_DEFAULT (on).
+        self._warm_env: bool | None = None
+        if warm_ahead is None:
+            self._warm_env = warm_ahead_from_env()
+            stored = stored_warm_ahead(directory)
+            if self._warm_env is not None:
+                warm_ahead, self.warm_ahead_source = self._warm_env, "env"
+            elif stored is not None:
+                warm_ahead, self.warm_ahead_source = stored, "stored"
+            else:
+                warm_ahead, self.warm_ahead_source = WARM_AHEAD_DEFAULT, "default"
+            self._warm_start_note = (stored, warm_ahead)
+        else:
+            self.warm_ahead_source = "given"
+            self._warm_start_note = None
         self.warm_ahead = bool(warm_ahead)
+        self._settings_lock = threading.Lock()
         self._warm_deny = tuple(warm_deny_names)
         if set_priority is None:
             from waxx.util.device_state.detached import set_normal_priority  # noqa: PLC0415
@@ -789,6 +862,16 @@ class RunQueue:
         #: (job, token) pairs whose abort reply was logged
         self._warm_abort_logged: set = set()
         self._load()
+        if self._warm_start_note is not None:
+            stored, on = self._warm_start_note
+            log.info("Run queue: warm start %s at start (%s).", "ON" if on else "OFF",
+                     {"env": f"{WARM_AHEAD_ENV} is set", "stored": "the stored setting",
+                      "default": "nothing stored: the default"}[self.warm_ahead_source])
+            if self.warm_ahead_source == "env" and stored is not None and stored != on:
+                log.warning("Run queue: %s overrides the stored warm start (%s) with %s.",
+                            WARM_AHEAD_ENV, "on" if stored else "off", "on" if on else "off")
+                self._record("run_queue_warm_ahead", on=on, was=stored, by=WARM_AHEAD_ENV,
+                             owner="env", stored=stored, note="server start")
         self.flush_journal()
 
     # -- paths ----------------------------------------------------------------------
@@ -1701,28 +1784,65 @@ class RunQueue:
 
     def set_warm_ahead(self, obj: Mapping) -> dict:
         """``{"on": bool | None, "by", "owner"}``: switch warm start on or
-        off while the server runs (``on`` absent: report only).  Not kept
-        across a server restart (the server's start value comes back: off
-        unless ``WAXX_QUEUE_WARM_AHEAD=1``).  Switched off, a live warm launch
-        is told to exit at the next tick ("warm start was switched off").
-        Either owner may switch it; the journal records who."""
+        off (``on`` absent: report only).  The value is stored in
+        ``<dir>/settings.json`` (atomic replace) and is the server's start
+        value from then on -- unless ``WAXX_QUEUE_WARM_AHEAD`` is set where
+        the server starts (the reply's ``env_override`` says so).  Switched
+        off, a live warm launch is told to exit at the next tick ("warm start
+        was switched off").  Either owner may switch it; every change (of the
+        value or of what is stored) is journalled with who and when.  Reply:
+        ``{"warm_ahead", "was", "persisted", "env_override"}`` (``persisted``
+        False with ``persist_error`` when it could not be stored: it then
+        holds until the server restarts)."""
         as_owner, refusal = requester_owner(obj)
         if refusal:
             return {"status": "error", "msg": refusal}
         on = obj.get("on")
+        env = (f"{WARM_AHEAD_ENV}={'1' if self._warm_env else '0'}"
+               if self._warm_env is not None else None)
         if on is None:
-            return {"status": "ok", "warm_ahead": self.warm_ahead}
+            return {"status": "ok", "warm_ahead": self.warm_ahead,
+                    "source": self.warm_ahead_source, "env_override": env}
         if not isinstance(on, bool):
             return {"status": "error", "msg": f"on must be true or false, not {on!r}"}
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
         with self._lock:
             was, self.warm_ahead = self.warm_ahead, on
-        if was != on:
-            log.warning("Run queue: warm start switched %s by %s (%s).", "ON" if on else "OFF",
-                        by, as_owner)
-            self._record("run_queue_warm_ahead", on=on, by=by, owner=as_owner)
+        stored_before, persisted, error = self._store_warm_ahead(on, by, as_owner)
+        if was != on or (persisted and stored_before != on):
+            log.warning("Run queue: warm start switched %s by %s (%s)%s.", "ON" if on else "OFF",
+                        by, as_owner, "" if persisted else f"; NOT stored ({error})")
+            self._record("run_queue_warm_ahead", on=on, was=was, by=by, owner=as_owner,
+                         stored=on if persisted else stored_before,
+                         **({} if persisted else {"persist_error": error}))
             self._notify()
-        return {"status": "ok", "warm_ahead": on, "was": was}
+        reply = {"status": "ok", "warm_ahead": on, "was": was, "persisted": persisted,
+                 "env_override": env}
+        if not persisted:
+            reply["persist_error"] = error
+        return reply
+
+    def _store_warm_ahead(self, on: bool, by: str, owner: str) -> tuple:
+        """Store warm start -> ``(stored before, stored now?, error text)``."""
+        if not self.enabled:
+            return None, False, "the queue has no folder"
+        with self._settings_lock:
+            data = read_settings(self.directory)
+            rec = data.get("warm_ahead")
+            before = rec.get("on") if isinstance(rec, dict) else None
+            data["warm_ahead"] = {"on": on, "by": by, "owner": owner, "at": self._clock(),
+                                  "t": _clock_text(self._clock())}
+            try:
+                from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
+                os.makedirs(self.directory, exist_ok=True)
+                atomic_write(self._path(SETTINGS_FILE), data)
+            except Exception as exc:                  # noqa: BLE001
+                log.error("Run queue: could not store warm start in %s (%s).",
+                          self._path(SETTINGS_FILE), exc)
+                return before, False, str(exc)
+        if self.warm_ahead_source != "env":
+            self.warm_ahead_source = "stored"
+        return before, True, ""
 
     def release_request(self, obj: Mapping) -> dict:
         """``{"by", "owner"}``; ``owner`` -- who asks -- is required."""
@@ -1848,6 +1968,9 @@ class RunQueue:
                     "paused": paused, "person_hold": hold,
                     "resume_loop": dict(self._resume_loop) if self._resume_loop else None,
                     "directory": self.directory, "warm_ahead": self.warm_ahead,
+                    "warm_ahead_source": self.warm_ahead_source,
+                    "warm_ahead_env": (None if self._warm_env is None else
+                                       f"{WARM_AHEAD_ENV}={'1' if self._warm_env else '0'}"),
                     "warm": self._warm_summary(now),
                     "warm_alarm": dict(self._warm_alarm) if self._warm_alarm else None}
 

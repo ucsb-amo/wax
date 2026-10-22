@@ -876,7 +876,8 @@ def test_warm_shows_and_switches_warm_start(server, q):
     r = kq(server, "warm")
     assert r.code == 0 and "warm start is off" in r.out and q.warm_ahead is False
     r = kq(server, "warm", "on")
-    assert r.code == 0 and "switched on (until the monitor server restarts)" in r.out
+    # stored since 2026-10-21: no "until the monitor server restarts"
+    assert r.code == 0 and r.out == "[kq] warm start switched on (stored)\n", r.out
     assert q.warm_ahead is True and sent(server, "warm_ahead")[-1]["on"] is True
     assert sent(server, "warm_ahead")[-1]["owner"] == "person"
     assert "already on" in kq(server, "warm", "on").out

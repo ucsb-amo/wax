@@ -1063,7 +1063,8 @@ def test_kq_shows_warm_jobs_and_the_cancel_note(tmp_path, expts, lib):
 def test_switching_warm_start_off_discards_the_live_warm_launch(tmp_path, expts, lib):
     q, a, b, wp = _warm_agent_job(tmp_path, expts, lib)
     r = q.set_warm_ahead({"on": False, "by": "jp", "owner": "person"})
-    assert r == {"status": "ok", "warm_ahead": False, "was": True}
+    assert r == {"status": "ok", "warm_ahead": False, "was": True, "persisted": True,
+                 "env_override": None}
     assert q.journal.kinds.count("run_queue_warm_ahead") == 1
     _discarded(q, b, wp, "warm start was switched off")
     assert q.set_warm_ahead({"owner": "person"})["warm_ahead"] is False      # report only

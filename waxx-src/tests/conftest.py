@@ -13,6 +13,9 @@ def _run_queue_dir_is_temporary(monkeypatch, tmp_path):
     # and the folders it runs files from: the test's own (the defaults are the
     # live code tree and the agents' log folder)
     monkeypatch.setenv("WAXX_RUN_QUEUE_ROOTS", str(tmp_path))
+    # the warm start override of the shell running the tests never applies
+    # (a test that wants it sets it)
+    monkeypatch.delenv("WAXX_QUEUE_WARM_AHEAD", raising=False)
 
 
 @pytest.fixture(autouse=True)
