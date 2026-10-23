@@ -839,15 +839,17 @@ class CameraStreamClient:
             self._note("superseded_frames", idx=list(idx), **more)
         return error is None
 
-    def _tag(self, frame, key):
-        """Name the frame ``key`` on its camera server, so a viewer can show
-        this key's frames alone (Camera Viewer: the Frames dropdown). For
-        display only, nothing is saved by it; never raises."""
+    def _tag(self, frame, key, roi=None):
+        """Name the frame ``key`` on its camera server, with ``roi`` (the
+        crop this stream stores of it; None = the full frame), so a viewer can
+        show this key's frames alone with that ROI as its box (Camera Viewer:
+        the Frames dropdown). For display only, nothing is saved by it; never
+        raises."""
         if not self._tagging or self._stream is None:     # dead / not connected
             return
         from beacon.camera.stream import Unsupported
         try:
-            if not self._stream.tag_frame(frame.seq, key):
+            if not self._stream.tag_frame(frame.seq, key, roi=roi):
                 self._note("tags_gone", seq=int(frame.seq))
         except Unsupported as e:
             self._tagging = False
@@ -945,7 +947,7 @@ class CameraStreamClient:
         if self._check_shape(idx, img):
             self._store(self.dc, self.dc_meta, idx, img, frame, target,
                         slot=idx, gen=gen)
-            self._tag(frame, self.key)
+            self._tag(frame, self.key, self._roi)
 
     def _snap_once(self):
         """One snap at our settings revision; if someone changed the settings
@@ -1896,7 +1898,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         # _slot_ok[(idx, j)] turns True when liveOD has the frame (_on_pushed)
         self._store(slot.dc, slot.dc_meta, idx, img, frame, t_expected,
                     slot=(idx, j), gen=gen, frame_index=j)
-        self._tag(frame, slot.key)
+        self._tag(frame, slot.key, self._geometry[j][0])
 
     def _clear_slot_locked(self, idx, j=None):
         """Start frame ``j`` (every frame when None) of a scan point over as
