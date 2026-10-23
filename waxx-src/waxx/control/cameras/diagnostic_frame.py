@@ -21,6 +21,13 @@ unless the lab's ``setup()`` sets another), and the full frame. The cameras
 are the entries the images name, each known by its key; one stream per
 camera serves all its images.
 
+``max_exposure_time`` (s, optional) is the longest exposure the image's
+timing allows (its edge, the rolling shutter, the time the next frame's
+settings need). While a run takes it, an operator may override the image's
+gain for that run (Camera Viewer: the image shown alone with Frames, then
+Override...), and its exposure only up to this; with none, gain only. Its
+own ``exposure_time`` must not be longer.
+
 An image's key -- the DataVault key it is saved under -- is the attribute
 name. Its frame index is its place among its camera's images in the order
 they are assigned: assign them in the order the sequence takes them. The
@@ -174,6 +181,13 @@ class DiagnosticCamera:
         """{frame key: its ROI, None = the full frame}, every frame."""
         return {img.key: img.roi for img in self.images}
 
+    @property
+    def frame_max_exposure(self):
+        """{frame key: its max_exposure_time} for the frames that give one
+        (an operator may override their exposure, the others' gain only)."""
+        return {img.key: img.max_exposure_time for img in self.images
+                if img.max_exposure_time is not None}
+
     def frame_index(self, key):
         """The index of frame ``key`` on this camera, -1 if it takes none."""
         return self.frames.index(key) if key in self.frames else -1
@@ -191,11 +205,14 @@ class DiagnosticImage:
     ``exposure_time`` (s), ``gain`` (dB) and ``roi`` it is taken at (each
     None: the entry's for ``imaging_type``, and the full frame), and for the
     diagnostic viewer a ``label`` and ``show`` ('image', 'counts' or None:
-    not shown). ``exposure_time`` / ``gain`` / ``roi`` hold the values used;
-    ``given`` names the ones the line gave."""
+    not shown), and ``max_exposure_time`` (s or None) the longest exposure an
+    operator override may give it (module docstring). ``exposure_time`` /
+    ``gain`` / ``roi`` hold the values used; ``given`` names the ones the
+    line gave."""
 
     def __init__(self, camera, t_offset=0., t_stage=None, exposure_time=None, gain=None,
-                 roi=None, label=None, show='counts', imaging_type=DEFAULT_IMAGING_TYPE):
+                 roi=None, label=None, show='counts', imaging_type=DEFAULT_IMAGING_TYPE,
+                 max_exposure_time=None):
         if not isinstance(camera, CameraParams):
             raise TypeError(f"DiagnosticImage: camera must be a camera-frame entry "
                             f"(cameras.<key>), not {camera!r}")
@@ -218,6 +235,12 @@ class DiagnosticImage:
         if self.exposure_time <= 0.:
             raise ValueError(f"image on cameras.{camera.key}: no exposure_time given, and the "
                              f"entry has none for imaging type {imaging_type!r}")
+        self.max_exposure_time = None if max_exposure_time is None else float(max_exposure_time)
+        if self.max_exposure_time is not None and not (
+                0. < self.exposure_time <= self.max_exposure_time * (1 + 1e-9)):
+            raise ValueError(f"image on cameras.{camera.key}: exposure_time "
+                             f"{self.exposure_time:g} s is above its max_exposure_time "
+                             f"{self.max_exposure_time:g} s")
         self._label = label
         self.show = show
         self.key = ""               # the attribute name, set by the frame
@@ -262,6 +285,8 @@ class DiagnosticImage:
                 args.append(f"{k}={_number(vals[k])!r}")
         if 'roi' in vals:
             args.append(f"roi={[int(v) for v in vals['roi']]!r}")
+        if self.max_exposure_time is not None:
+            args.append(f"max_exposure_time={_number(self.max_exposure_time)!r}")
         if self._label:
             args.append(f"label={self._label!r}")
         if self.show != 'counts':
@@ -327,14 +352,15 @@ class diagnostic_frame:
                         "exposure_time=..., gain=..., roi=[...])")
 
     def image(self, camera, t_offset=0., t_stage=None, exposure_time=None, gain=None, roi=None,
-              label=None, show='counts'):
+              label=None, show='counts', max_exposure_time=None):
         """An image the camera entry ``camera`` takes every shot (assign it to
         an attribute: its key). Assign a camera's images in the order they
         are taken."""
         img = DiagnosticImage(camera, t_offset=t_offset, t_stage=t_stage,
                               exposure_time=exposure_time, gain=gain, roi=roi, label=label,
                               show=show, imaging_type=getattr(self, 'default_imaging_type',
-                                                              DEFAULT_IMAGING_TYPE))
+                                                              DEFAULT_IMAGING_TYPE),
+                              max_exposure_time=max_exposure_time)
         self.__dict__.setdefault('_made', []).append(img)
         return img
 
@@ -385,6 +411,7 @@ class diagnostic_frame:
                      exposure_time=c.images[0].exposure_time, gain=c.images[0].gain,
                      crop_to_saved_roi=False, frame_rois=c.frame_rois,
                      frame_settings=c.frame_settings or None,
+                     frame_max_exposure=c.frame_max_exposure or None,
                      no_roi_downsample=self.no_roi_downsample)
                 for c in cams])
         else:
@@ -481,6 +508,7 @@ class diagnostic_frame:
                                **img.settings(),
                                "from_camera_entry": [s for s in SETTING_KEYS
                                                      if s not in img.given],
+                               "max_exposure_time": img.max_exposure_time,
                                **_exposure_delay_record(img)}
                            for k, img in self.images().items()}}
 
