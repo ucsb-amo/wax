@@ -24,6 +24,13 @@ dvlist = np.array([])
 # it reports is flagged as not trusted (see Expt._report_abort_state).
 WRITE_FAILURES = ("RTIOUnderflow", "RTIODestinationUnreachable", "ValueError")
 
+# Feature flag (2026-10-23): every scan-loop cleanup (normal path, the
+# RTIOUnderflow / TriggerTimeout / RTIOOverflow handlers, sub-scan points) and
+# the steps between shots run cleanup_abort_kernel before an exception goes on
+# (_cleanup_or_safe_state). kexp's MOT pre-load, which keeps the MOT on between
+# shots, refuses to run on a scanner without it.
+SAFE_STATE_ON_EVERY_CLEANUP_FAILURE = True
+
 # Parameters of the channel-snapshot kernel (Monitor._build_snapshot_kernel).
 SNAPSHOT_PARAMS = ["expt", "f", "a", "v", "s", "dv", "ts"]
 

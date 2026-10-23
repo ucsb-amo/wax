@@ -122,3 +122,10 @@ def test_a_failing_sub_scan_cleanup_reaches_the_safe_state():
     with pytest.raises(ValueError, match="cleanup of the point failed"):
         e.scan()
     assert _kinds(e)[-2:] == ["cleanup_cal", "cleanup_abort"]
+
+
+def test_the_feature_flag_is_set():
+    """kexp's MOT pre-load checks this flag before it runs (Base._check_mot_preload)."""
+    from waxx.base import scanner
+    assert scanner.SAFE_STATE_ON_EVERY_CLEANUP_FAILURE is True
+    assert hasattr(scanner.Scanner, "_cleanup_or_safe_state")
