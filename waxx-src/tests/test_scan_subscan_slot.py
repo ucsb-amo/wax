@@ -48,6 +48,7 @@ class LoopExpt(Scanner, Dealer):
     push_data_enabled = Expt.push_data_enabled
     add_sub_scan = Expt.add_sub_scan
     _decide_subscan = Expt._decide_subscan
+    _compile_subscan_switch = Expt._compile_subscan_switch
     _subscan_note = Expt._subscan_note
     _subscan_due = Expt._subscan_due
     _subscan_begin = Expt._subscan_begin
@@ -158,6 +159,7 @@ def _prepared(n_data=5, with_sub=True, every=2, **kw):
     if with_sub:
         e._subscan.finish(n_data_shots=n_data, main_xvarnames=e.xvarnames, setup_camera=False)
         _give_core(e._subscan.data, e.core)
+    e._compile_subscan_switch()
     e._decide_subscan()
     return e
 

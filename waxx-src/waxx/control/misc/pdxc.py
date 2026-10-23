@@ -34,6 +34,11 @@ SERVER_ID = "pdxc"
 _BAUD = 115200
 _TIMEOUT_S = 2.0
 _MOVE_MARGIN_S = 0.3        # settle margin added to each move's computed duration
+# After a USB drop the FTDI bridge re-enumerates under the same COM name within
+# a second or two; reopening is retried this long before giving up.
+_REOPEN_WINDOW_S = 5.0
+_REOPEN_INTERVAL_S = 0.5
+_FLUSH_TIMEOUT_S = 0.3      # read timeout for the line flush after opening
 _MOVE_TCP_TIMEOUT = 290.0   # client socket timeout for a full move
 _DEVICE_TCP_TIMEOUT = 10.0  # client socket timeout for other device methods
                             # (they wait on the device lock, i.e. behind a move)
@@ -107,16 +112,12 @@ class PDXC:
                  timeout: float = _TIMEOUT_S) -> None:
         self.port = port
         self.baudrate = int(baudrate)
+        self._timeout = timeout
         self._last_rx_monotonic: Optional[float] = None   # last non-empty reply
-        self._ser = serial.Serial(
-            port=port,
-            baudrate=baudrate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=timeout,
-            write_timeout=timeout,
-        )
+        self.link_error: Optional[str] = None   # set while the serial link is down
+        self.reconnects: int = 0                # successful reopen-after-drop count
+        self._reconnecting = False
+        self._ser = self._open_port(retry_s=0.0)
         self._freq_hz: int = _FRQ_MAX_HZ   # refreshed by initialize()
         _defaults = self._load_defaults()
         self._step_size: int = self._sane(
@@ -168,20 +169,124 @@ class PDXC:
         t = self._last_rx_monotonic
         return None if t is None else time.monotonic() - t
 
-    def _write(self, cmd: str) -> str:
+    # ------------------------------------------------------------------
+    # Link recovery
+    # ------------------------------------------------------------------
+
+    def _open_port(self, retry_s: float = _REOPEN_WINDOW_S) -> serial.Serial:
+        """Open the COM port, retrying for *retry_s* while it re-enumerates.
+
+        Right after a USB drop the port is briefly missing, or still held by
+        the dead handle being torn down ("Access is denied"), so a reopen is
+        retried rather than failing on the first attempt.
+        """
+        deadline = time.monotonic() + retry_s
+        while True:
+            try:
+                ser = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=self._timeout,
+                    write_timeout=self._timeout,
+                )
+                break
+            except serial.SerialException:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_REOPEN_INTERVAL_S)
+        self._flush_line(ser)
+        return ser
+
+    def _flush_line(self, ser: serial.Serial) -> None:
+        """Terminate any partial line in the controller's input and drain it.
+
+        Opening the FTDI port can leave a stray byte on the line, so the first
+        real command would arrive garbled and come back CMD_NOT_DEFINED.  A
+        bare CR ends that line; its reply is read and discarded.
+        """
+        ser.reset_input_buffer()
+        ser.write(b"\r")
+        ser.timeout = _FLUSH_TIMEOUT_S
+        try:
+            ser.read_until(b">")
+        finally:
+            ser.timeout = self._timeout
+        ser.reset_input_buffer()
+
+    def reconnect(self) -> None:
+        """Close the (dead) port, reopen it and re-initialise the controller.
+
+        Re-initialising restores SMC output and the drive frequency in case
+        the controller itself reset along with its USB bridge.
+        """
+        self._reconnecting = True
+        try:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = self._open_port()
+            self.initialize(self._freq_hz)
+        finally:
+            self._reconnecting = False
+        self.reconnects += 1
+        self.link_error = None
+        msg = f"PDXC serial link on {self.port} re-established (reconnect #{self.reconnects})"
+        print(msg)
+        logger.warning(msg)
+
+    def _transact(self, cmd: str, resend_after_send: bool = True) -> str:
+        """Write *cmd* and read to the '>' prompt, recovering a dropped link.
+
+        On a serial failure (e.g. ``WriteFile failed ... Access is denied``
+        after the USB bridge re-enumerated) the port is reopened and the
+        command sent once more.  A failure *before* the write completed means
+        the controller never saw the command, so resending is always safe.
+        A failure *after* it was written is resent only when
+        *resend_after_send* is True (idempotent commands and queries); for a
+        move it raises instead, since the move may already have run.
+        """
+        if not cmd.endswith("\r"):
+            cmd += "\r"
+        for attempt in range(2):
+            sent = False
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.write(cmd.encode("ascii"))
+                sent = True
+                raw = self._ser.read_until(b">").decode("ascii", errors="ignore")
+            except (serial.SerialException, OSError) as exc:
+                self.link_error = f"{type(exc).__name__}: {exc}"
+                msg = (f"PDXC serial link on {self.port} failed during "
+                       f"{cmd.strip()!r} ({'after' if sent else 'before'} send): {exc}")
+                print(msg)
+                logger.error(msg)
+                if self._reconnecting or attempt:
+                    raise
+                self.reconnect()
+                if sent and not resend_after_send:
+                    raise RuntimeError(
+                        f"{msg}; link re-established, but {cmd.strip()!r} may or "
+                        f"may not have executed -- not resent") from exc
+                continue
+            if raw:
+                self._last_rx_monotonic = time.monotonic()
+            return raw
+        raise AssertionError("unreachable")
+
+    def _write(self, cmd: str, resend_after_send: bool = True) -> str:
         """Send a command; return the reply text up to the '>' ready-prompt.
 
         The controller reports failures in-band as ``CMD_NOT_DEFINED`` or
         ``Data Out-Of-Range!`` (manual 6.1), so those are printed and raised
         here rather than discarded.
         """
-        self._ser.reset_input_buffer()
         if not cmd.endswith("\r"):
             cmd += "\r"
-        self._ser.write(cmd.encode("ascii"))
-        resp = self._ser.read_until(b">").decode("ascii", errors="ignore")
-        if resp:
-            self._last_rx_monotonic = time.monotonic()
+        resp = self._transact(cmd, resend_after_send=resend_after_send)
         if "CMD_NOT_DEFINED" in resp or "Out-Of-Range" in resp:
             msg = f"PDXC rejected {cmd.strip()!r}: {resp.strip()}"
             print(msg)
@@ -202,13 +307,7 @@ class PDXC:
 
         Single-line replies only; not usable for POSP? (8192-row dump).
         """
-        self._ser.reset_input_buffer()
-        if not cmd.endswith("\r"):
-            cmd += "\r"
-        self._ser.write(cmd.encode("ascii"))
-        raw = self._ser.read_until(b">").decode("ascii", errors="ignore")
-        if raw:
-            self._last_rx_monotonic = time.monotonic()
+        raw = self._transact(cmd)
         body = raw.split(">")[0].replace("\r", "\n")
         lines = [ln.strip() for ln in body.split("\n")]
         lines = [ln for ln in lines if ln and ln != cmd.strip()]
@@ -424,7 +523,8 @@ class PDXC:
         """Issue a single MOVF or MOVB command (non-blocking on device)."""
         if not 1 <= steps <= MAX_PULSES:
             raise ValueError(f"steps must be 1-{MAX_PULSES}, got {steps}")
-        self._write(f"{direction}={steps}.{channel}")
+        # Never resend a move the controller may already have started.
+        self._write(f"{direction}={steps}.{channel}", resend_after_send=False)
 
     def _wait_stopped(self, steps: int) -> bool:
         """Block for the expected duration of a *steps*-pulse move.
@@ -631,14 +731,20 @@ class PDXC_Server(NetServer):
     def _com_snapshot(self) -> dict:
         """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
 
-        The PDXC server opens its port once in ``start()`` and has no
-        reconnect logic, so ``status`` is: open failed -> error (the process
-        then exits anyway); device present and its port open -> connected;
-        otherwise disconnected.  Read lock-free so it never queues behind a
-        move holding the device lock.
+        The port is opened in ``start()``; after a USB drop the device reopens
+        it on the next command (``PDXC.reconnect``).  ``status``: open failed
+        -> error (the process then exits anyway); the last command found the
+        link down and could not reopen it -> error; device present and its
+        port open -> connected; otherwise disconnected.  A drop is only seen
+        when a command is sent -- there is no idle polling.  Read lock-free so
+        it never queues behind a move holding the device lock.
         """
         device = self._device
-        if self._com_status == "connected" and (device is None or not device.is_open):
+        last_error = self._com_last_error
+        if device is not None and device.link_error:
+            status = "error"
+            last_error = device.link_error
+        elif self._com_status == "connected" and (device is None or not device.is_open):
             status = "disconnected"
         else:
             status = self._com_status
@@ -647,9 +753,9 @@ class PDXC_Server(NetServer):
             "port": self._com_port,
             "baud": int(device.baudrate) if device is not None else _BAUD,
             "status": status,
-            "last_error": self._com_last_error,
+            "last_error": last_error,
             "last_rx_seconds_ago": None if last_rx is None else round(last_rx, 3),
-            "reconnect_attempts": 0,   # no auto-reconnect on this server
+            "reconnect_attempts": device.reconnects if device is not None else 0,
             "config_valid": True,
         }
 

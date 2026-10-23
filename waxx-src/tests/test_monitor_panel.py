@@ -330,3 +330,39 @@ def test_a_worker_stuck_in_a_request_is_reported_at_shutdown(qapp, caplog):
         runner.shutdown(timeout=0.2)
     release.set()
     assert any("still waiting on a request" in r.getMessage() for r in caplog.records)
+
+
+def test_start_live_od_and_warm_start_in_the_monitor_panel(qapp, factory):
+    """2026-10-21: Start liveOD (launcher, probe injected: the real bat never
+    runs) and the warm start switch, both through the panel's one link; their
+    messages land on the queue's message line."""
+    starts = []
+    p = mp.MonitorServerPanel(link=mp.MonitorLink(factory), listener_factory=None,
+                              synchronous=True, by="jp@test", live_od_bat="C:/k/live_od.bat",
+                              live_od_start=lambda bat: starts.append(bat) or 4242,
+                              live_od_probe=lambda: ("absent", "no liveOD beacon"))
+    try:
+        p.poll_status(force=True)
+        button = p.state_panel.live_od_button
+        assert button is not None and button.isEnabled()
+        button.click()
+        button.click()
+        assert starts == ["C:/k/live_od.bat"]
+        client = factory.made[0]
+        sent = [o for o, _ in client.requests if o.get("type") == "live_od_launch"]
+        assert len(sent) == 1 and sent[0]["ok"] is True and sent[0]["by"] == "jp@test"
+        assert [a for o, a in client.requests if o.get("type") == "live_od_launch"] == [1]
+        assert "liveOD launcher started" in p.queue_panel.message.text()
+        # warm start: the status's value, a click sends a person's switch once
+        client.answers["warm_ahead"] = {"status": "ok", "warm_ahead": False, "was": True,
+                                        "persisted": True, "env_override": None}
+        p.state_panel.set_state(dict(client.status, run_queue=dict(
+            client.status.get("run_queue") or {}, warm_ahead=True)))
+        assert p.state_panel.warm_box.isChecked()
+        p.state_panel.warm_box.click()
+        warm = [(o, a) for o, a in client.requests if o.get("action") == "warm_ahead"]
+        assert warm == [({"type": "run_queue", "action": "warm_ahead", "on": False,
+                          "owner": "person", "by": "jp@test"}, 1)]
+        assert p.queue_panel.message.text() == "warm start off; stored"
+    finally:
+        p.cleanup()

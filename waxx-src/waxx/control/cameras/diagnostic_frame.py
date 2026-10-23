@@ -52,6 +52,7 @@ from artiq.experiment import kernel, rpc, delay, now_mu
 from waxx.control.cameras.camera_param_classes import CameraParams, img_types
 from waxx.control.cameras.camera_stream_client import (
     InactiveCameraStream, TriggeredCameraStreamClient)
+from waxx.control.cameras.exposure_delay import ExposureDelayCell, dummy_cell
 
 _SHOW = ('image', 'counts', None)
 SETTING_KEYS = ('exposure_time', 'gain', 'roi')
@@ -80,6 +81,35 @@ def camera_trigger_ttl(ttl, camera):
     raise ValueError(
         f"Camera '{camera.key}' names trigger_ttl '{name}' (ch {ch}), which "
         f"is not a TTL on the experiment's ttl frame (ttl_id).")
+
+
+def _connected(stream):
+    """True: a triggered stream that takes frames (connected, registered, not
+    dead). False: no frames this run (a placeholder, diagnostics off, or dead).
+    None: built without a connection and not connected yet (the claim
+    connects it)."""
+    if not isinstance(stream, TriggeredCameraStreamClient):
+        return False
+    if getattr(stream, '_dead_reason', None) is not None:
+        return False
+    if not getattr(stream, '_connected', True):
+        return None
+    return bool(getattr(stream, 'live', True))
+
+
+def _exposure_delay_record(img):
+    """An image's exposure delay for the run's record: its stream's
+    (TriggeredCameraStreamClient.exposure_delay_record: the value the kernel
+    uses, its source, how it reached the kernel, the pre-compile value, the
+    camera's report at the claim), or None values for an image that takes no
+    frames."""
+    rec = getattr(img._stream, 'exposure_delay_record', None) if img.live else None
+    if rec is None:
+        return {"exposure_delay": None, "exposure_delay_source": None}
+    try:
+        return dict(rec())
+    except Exception as e:
+        return {"exposure_delay": None, "exposure_delay_source": f"unknown ({e!r})"}
 
 
 def _number(v):
@@ -198,7 +228,10 @@ class DiagnosticImage:
         self.j = -1                 # frame index on the camera
         self.live = False           # the camera's stream takes frames this run
         self.in_stage = True        # |t_offset| <= t_stage (resolve_stages)
-        self.exposure_delay = 0.
+        # the camera stream's exposure-delay cell (the experiment's spare one
+        # for an image that takes no frames): the kernel writes the claim's
+        # value into it at its start (Scanner.load_exposure_delays)
+        self.exposure_delay_cell = ExposureDelayCell(0.)
         self.t_trigger = 2.e-6
         self._stream = None
         self.t_stage_s = None       # t_stage in s, as resolved
@@ -239,11 +272,12 @@ class DiagnosticImage:
     def trigger(self):
         """Take this frame ``t_offset`` from the cursor; the cursor stays."""
         if self.frame.active and self.live and self.in_stage:
+            t_delay = self.exposure_delay_cell.value
             delay(self.t_offset)
             self.announce_edge(now_mu() - self.core.get_rtio_counter_mu())
-            delay(-self.exposure_delay)
+            delay(-t_delay)
             self.ttl.pulse(self.t_trigger)
-            delay(self.exposure_delay - self.t_trigger - self.t_offset)
+            delay(t_delay - self.t_trigger - self.t_offset)
 
     @rpc(flags={"async"})
     def announce_edge(self, slack_mu):
@@ -373,16 +407,34 @@ class diagnostic_frame:
                 img.j = j
                 img.live = live
                 img._stream = stream if live else None
+                # the stream's cell itself, not a copy of its value: the
+                # kernel writes the claim's delay into it at its start
+                img.exposure_delay_cell = (stream.exposure_delay_cell if live
+                                           else dummy_cell(expt))
                 if live:
-                    img.exposure_delay = float(stream.exposure_delay)
                     img.t_trigger = float(stream.t_trigger)
         self.resolve_stages(getattr(expt, 'params', None), quiet=True)
-        if self.enabled:
-            up = [c.key for c in cams if isinstance(c.stream, TriggeredCameraStreamClient)]
-            down = [c.key for c in cams if c.key not in up]
-            print("[diag cams] connected: " + (", ".join(up) or "none")
-                  + (f" | NOT connected: {', '.join(down)}" if down else ""))
+        # The streams may be built without a connection (queue phase 2: the
+        # run's claim connects them, after the compile). ``live`` above is
+        # what the kernel sees and is decided here, before the compile; a
+        # stream that then fails to connect is dead -- its edges still fire,
+        # nothing is stored -- and record() says so. A frame whose streams
+        # are connected already reports now; otherwise the claim calls
+        # report_connected().
+        if self.enabled and all(_connected(c.stream) is not None for c in cams):
+            self.report_connected()
         return self
+
+    def report_connected(self):
+        """One line: which cameras take frames this run (after the streams
+        were connected). Nothing with diagnostics off."""
+        if not self.enabled:
+            return
+        cams = [c for c in self.entries() if c.images]
+        up = [c.key for c in cams if _connected(c.stream)]
+        down = [c.key for c in cams if c.key not in up]
+        print("[diag cams] connected: " + (", ".join(up) or "none")
+              + (f" | NOT connected: {', '.join(down)}" if down else ""))
 
     def streams(self):
         """{camera key: its stream} (bound cameras with images)."""
@@ -424,10 +476,12 @@ class diagnostic_frame:
                 "images": {k: {"camera": img.camera.key, "camera_id": img.camera.key,
                                "frame": img.j, "t_offset": img.t_offset,
                                "t_stage": img.t_stage, "t_stage_s": img.t_stage_s,
-                               "taken": bool(img.live and img.in_stage),
+                               "taken": bool(img.live and img.in_stage
+                                             and _connected(img._stream)),
                                **img.settings(),
                                "from_camera_entry": [s for s in SETTING_KEYS
-                                                     if s not in img.given]}
+                                                     if s not in img.given],
+                               **_exposure_delay_record(img)}
                            for k, img in self.images().items()}}
 
     def finish(self):

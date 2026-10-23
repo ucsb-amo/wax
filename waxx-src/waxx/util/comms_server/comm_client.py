@@ -207,12 +207,16 @@ class MonitorClient(CommClient):
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def withdraw_run(self, token, run_id=None, timeout: float = 2.0):
-        """The announced run is exiting without having taken the core: lift
-        its fence.  One short try (it is sent from a dying process)."""
+    def withdraw_run(self, token, run_id=None, timeout: float = 2.0, took_core=None):
+        """The announced run is exiting without an accepted end state: lift
+        its fence.  ``took_core``: whether the process talked to the core
+        device (True / False; None: unknown) -- the monitor gives back the
+        trust from before the announcement only on False.  One short try (it
+        is sent from a dying process)."""
         import json  # noqa: PLC0415
+        took = None if took_core is None else bool(took_core)
         reply = self.send_message(json.dumps({"type": "run_withdrawn", "token": token,
-                                              "run_id": run_id}),
+                                              "run_id": run_id, "took_core": took}),
                                   timeout=timeout, attempts=1)
         if reply is None:
             return None

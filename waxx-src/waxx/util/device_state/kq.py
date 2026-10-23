@@ -17,7 +17,8 @@ Commands::
             [--chain C]
             [--stop-on-failure | --no-stop-on-failure] [--no-write-back |
             --write-back-default] [--at T | --no-at] [--allow-drift |
-            --no-allow-drift] [--pause | --unpause]     change a queued job
+            --no-allow-drift] [--pause | --unpause] [--cold | --no-cold]
+                                              change a queued job
     kq list [--all] [--state S ...] [--json]  the jobs and the queue's state
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
@@ -28,7 +29,16 @@ Commands::
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
     kq release                                lift the person's hold
+    kq warm [on|off]                          warm start (queue phase 2): show / switch (stored)
     kq status [--json]                        the queue's state (not occupancy)
+
+Warm start (queue phase 2, when the server has it on): the next job's process
+may start while the job before it runs (it imports, prepares and compiles,
+then waits for GO).  ``kq list`` shows it as "warming N s" / "ready" in the
+last column, ``kq show`` its pids and manifest; estimates count from GO to the
+end (warm time excluded).  ``--cold`` (run / submit / insert; ``kq edit
+--cold``) keeps a job from ever warm-launching.  Cancelling a warm job prints
+"not started (warm process told to exit)".
 
 Words after the file (``key=value``, as artiq_run takes them, before or after
 kq's options) and everything after ``--`` are passed to the experiment:
@@ -277,6 +287,12 @@ def queue_line(info: dict, hold: dict | None = None) -> str:
     a = _alarm_text(info.get("alarm"))
     if a:
         parts.append(a)
+    w = info.get("warm")
+    if w:
+        parts.append(f"next #{w.get('job')} {w.get('text') or w.get('state')}")
+    wa = info.get("warm_alarm")
+    if wa:
+        parts.append(f"ALARM: {wa.get('text')}")
     return " | ".join(parts)
 
 
@@ -409,6 +425,9 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
                              "with WAXX_CAL_NO_WRITE_BACK=1)")
         sp.add_argument("--allow-drift", action="store_true",
                         help="run even if the file changed after submit")
+        sp.add_argument("--cold", action="store_true",
+                        help="never warm-launch this job (its process starts only once "
+                             "the machine is free)")
         sp.add_argument("--cwd", help="working folder on the server's machine "
                                       "(default: the file's folder)")
         sp.add_argument("--agent", action="store_true",
@@ -468,6 +487,10 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     flag.add_argument("--pause", dest="paused", action="store_const", const=True,
                       help="this job is not launched until --unpause")
     flag.add_argument("--unpause", dest="paused", action="store_const", const=False)
+    flag = sp.add_mutually_exclusive_group()
+    flag.add_argument("--cold", dest="cold", action="store_const", const=True,
+                      help="never warm-launch this job")
+    flag.add_argument("--no-cold", dest="cold", action="store_const", const=False)
     sp.add_argument("--token")
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
@@ -515,6 +538,11 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp = sub.add_parser("release", help="lift the person's hold")
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
+    sp = sub.add_parser("warm", help="warm start (queue phase 2): show, or switch on / off "
+                                     "(stored: it holds across server restarts)")
+    sp.add_argument("state", nargs="?", choices=("on", "off"))
+    sp.add_argument("--agent", action="store_true", help="as an agent")
+
     sp = sub.add_parser("status", help="the queue's state, not machine occupancy (exit 0 "
                                        "queue free / 5 a job in the slot or a hold)")
     sp.add_argument("--json", action="store_true")
@@ -560,7 +588,8 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
             at_end=getattr(args, "at_end", False),
             at_index=(None if getattr(args, "at_index", None) is None
                       else args.at_index - 1),
-            before_id=getattr(args, "before", None), after_id=getattr(args, "after_id", None))
+            before_id=getattr(args, "before", None), after_id=getattr(args, "after_id", None),
+            **({"cold": True} if getattr(args, "cold", False) else {}))
         jobs = reply.get("jobs") or []
         ids = [int(i) for i in reply.get("ids") or [j["id"] for j in jobs]]
         tokens = {int(j["id"]): j.get("token") for j in jobs}
@@ -802,9 +831,44 @@ def _note(view: dict, row: dict | None) -> str:
         text = str(view.get("reason") or "")
     else:
         text = str((row or {}).get("waiting") or view.get("waiting") or "")
+        warm = warm_text(view, row)
+        if warm and warm not in text:
+            text = f"[{warm}] {text}" if text else warm
         if view.get("paused"):
             text = f"PAUSED by {view.get('paused_by') or '?'}" + (f"; {text}" if text else "")
     return text[:67] + "..." if len(text) > 70 else text
+
+
+def warm_text(view: dict, row: dict | None = None) -> str:
+    """"warming 4 s" / "ready" / "warm process exiting" for a queued job with
+    a warm process (queue phase 2), else "" (an older server sends none)."""
+    if view.get("state") != "queued":
+        return ""
+    return str((row or {}).get("warm") or (view.get("warm") or {}).get("text") or "")
+
+
+def _warm_lines(j: dict) -> list[str]:
+    """``kq show``'s lines about the job's warm process (none when it has
+    none)."""
+    w = j.get("warm") or {}
+    if not w:
+        return []
+    out = [f"  warm: {w.get('text') or w.get('state')} (attempt {w.get('attempt') or '?'})"]
+    pids = ", ".join(f"{k} {w[k]}" for k in ("py_pid", "cmd_pid") if w.get(k))
+    if pids:
+        out.append(f"    pids: {pids}")
+    if w.get("spawned_at"):
+        out.append(f"    launched: {_when(w['spawned_at'])}"
+                   + (f"; ready: {_when(w['ready_at'])}" if w.get("ready_at") else "")
+                   + f"; manifest: {w.get('manifest_n') or 0} files")
+    go = w.get("go") or {}
+    if go:
+        out.append(f"    GO decided {_when(go.get('at'))}"
+                   + (f", handed out {_when(go['delivered'])}" if go.get("delivered") else
+                      ", not handed out yet"))
+    if w.get("why"):
+        out.append(f"    told to exit: {w['why']}")
+    return out
 
 
 def _list_rows(jobs: list[dict], rows: dict) -> list[list[str]]:
@@ -899,6 +963,11 @@ def _cmd_show(ctx: _Ctx, args) -> int:
     for key in ("due", "submitted_at", "launched_at", "ended_at"):
         if j.get(key):
             ctx.say(f"  {key}: {_when(j[key])}")
+    for line in _warm_lines(j):
+        ctx.say(line)
+    if j.get("cold") or j.get("cold_why"):
+        ctx.say("  cold (never warm-launched)"
+                + (f": {j.get('cold_why')}" if j.get("cold_why") else ""))
     est = j.get("estimate")
     if est and j.get("state") not in ENDED:
         ctx.say(f"  {est_text(est, str(j.get('state')))} -- basis: {est.get('basis') or '?'}")
@@ -963,6 +1032,8 @@ def _cmd_edit(ctx: _Ctx, args) -> int:
         fields["allow_drift"] = args.allow_drift
     if args.paused is not None:
         fields["paused"] = args.paused
+    if getattr(args, "cold", None) is not None:
+        fields["cold"] = args.cold
     if not fields:
         ctx.warn("kq: nothing to change (kq edit --help lists the fields)")
         return EXIT_USAGE
@@ -1007,8 +1078,9 @@ def _cmd_cancel(ctx: _Ctx, args) -> int:
     job = ctx.client.describe(args.id, args.token)["job"]
     if job["state"] == "queued":
         try:
-            ctx.client.cancel(args.id, token=args.token, owner=owner, queued_only=True)
-            ctx.say(f"[kq] {_job_word(job)} cancelled (it had not started)")
+            reply = ctx.client.cancel(args.id, token=args.token, owner=owner, queued_only=True)
+            note = (reply or {}).get("note") if isinstance(reply, dict) else None
+            ctx.say(f"[kq] {_job_word(job)} cancelled ({note or 'it had not started'})")
             return EXIT_OK
         except RunQueueError:
             job = ctx.client.describe(args.id, args.token)["job"]
@@ -1029,6 +1101,10 @@ def _cmd_cancel(ctx: _Ctx, args) -> int:
             ctx.say("[kq] nothing cancelled")
             return EXIT_OK
     reply = ctx.client.cancel(args.id, token=args.token, owner=owner)
+    if reply.get("note"):
+        # a warm job whose GO had not been handed out: nothing of it ran
+        ctx.say(f"[kq] {_job_word(job)} cancelled: {reply['note']}")
+        return EXIT_OK
     ctx.say(_abort_text(reply.get("job") or job)
             + f" (kq show {args.id}, kq tail {args.id} -f)")
     return EXIT_OK
@@ -1093,6 +1169,35 @@ def _cmd_release(ctx: _Ctx, args) -> int:
     return EXIT_OK
 
 
+def _cmd_warm(ctx: _Ctx, args) -> int:
+    on = None if args.state is None else args.state == "on"
+    reply = ctx.client.warm_ahead(on, owner=_owner(args))
+    now = "on" if reply.get("warm_ahead") else "off"
+    env = reply.get("env_override")
+    if on is None:
+        source = {"env": f"set by {env} where the server started" if env else "",
+                  "stored": "stored", "default": "the default: nothing stored",
+                  "given": "given at the server's start"}.get(str(reply.get("source") or ""), "")
+        ctx.say(f"[kq] warm start is {now}" + (f" ({source})" if source else ""))
+        return EXIT_OK
+    if "persisted" not in reply:
+        # an older server: a runtime switch only
+        stored = "until the monitor server restarts"
+    elif reply.get("persisted"):
+        stored = "stored"
+        if env:
+            stored += (f"; {env} is set where the server started and overrides it at the "
+                       "server's next start")
+    else:
+        stored = (f"NOT stored ({reply.get('persist_error') or '?'}): until the monitor "
+                  "server restarts")
+    if reply.get("was") == reply.get("warm_ahead"):
+        ctx.say(f"[kq] warm start was already {now} ({stored})")
+    else:
+        ctx.say(f"[kq] warm start switched {now} ({stored})")
+    return EXIT_OK
+
+
 #: ``kq status`` reports the queue's state only, never the machine's.
 OCCUPANCY_NOTE = ("queue state only, not machine occupancy (liveOD, direct artiq_run "
                   "runs, the run loops): for occupancy use occupancy.py (agents) or the "
@@ -1128,7 +1233,7 @@ _COMMANDS = {"list": _cmd_list, "show": _cmd_show, "tail": _cmd_tail, "cancel": 
              "kill": _cmd_kill,
              "move": _cmd_move, "edit": _cmd_edit,
              "pause": _cmd_pause, "resume": _cmd_resume, "hold": _cmd_hold,
-             "release": _cmd_release, "status": _cmd_status}
+             "release": _cmd_release, "warm": _cmd_warm, "status": _cmd_status}
 
 
 def main(argv=None, *, client_factory=None, out=None, err=None, ask=None,

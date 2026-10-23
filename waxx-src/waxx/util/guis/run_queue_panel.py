@@ -174,6 +174,8 @@ ROW_TINT = {"saved": (95, 211, 141, 30), "done": (95, 211, 141, 30),
             "ending": (90, 160, 255, 34),
             # an ended run that had no file (save_data=False): repeats, diagnostics
             "no_file": (150, 150, 150, 40)}
+#: a queued job with a warm process (queue phase 2): warming / ready
+WARM_TINT = {"warming": (90, 160, 255, 14), "ready": (90, 160, 255, 24)}
 #: states whose other cells are drawn muted
 _MUTED_STATES = ("cancelled", "skipped")
 #: ended states drawn gray when the run had no file (a failed one stays red)
@@ -497,6 +499,41 @@ def order_jobs(jobs: list[dict]) -> list[dict]:
     return [j for _, j in sorted(enumerate(jobs), key=key)]
 
 
+def warm_text(job: dict) -> str:
+    """"warming 4 s" / "ready" / "warm process exiting" for a queued job whose
+    process the queue started ahead (queue phase 2); "" otherwise (and from an
+    older server, which sends no ``warm``)."""
+    if job.get("state") != "queued":
+        return ""
+    return str((job.get("warm") or {}).get("text") or "")
+
+
+def warm_lines(job: dict) -> list[str]:
+    """Tooltip lines about the job's warm process (none when it has none)."""
+    w = job.get("warm") or {}
+    if not w:
+        return [f"cold: {job['cold_why']}"] if job.get("cold_why") else (
+            ["cold (never warm-launched)"] if job.get("cold") else [])
+    lines = [f"warm process: {w.get('text') or w.get('state')} (attempt "
+             f"{w.get('attempt') or '?'}) -- it prepares and compiles ahead and takes "
+             "nothing until the queue's GO"]
+    pids = ", ".join(f"{k} {w[k]}" for k in ("py_pid", "cmd_pid") if w.get(k))
+    if pids:
+        lines.append(pids)
+    if w.get("spawned_at"):
+        lines.append(f"launched {_clock(w['spawned_at'], True)}"
+                     + (f", ready {_clock(w['ready_at'], True)}" if w.get("ready_at") else "")
+                     + f", manifest {w.get('manifest_n') or 0} files")
+    go = w.get("go") or {}
+    if go:
+        lines.append(f"GO decided {_clock(go.get('at'), True)}"
+                     + (f", handed out {_clock(go['delivered'], True)}" if go.get("delivered")
+                        else ", not handed out yet"))
+    if w.get("why"):
+        lines.append(f"told to exit: {w['why']}")
+    return lines
+
+
 def _estimate(job: dict) -> dict:
     """``{duration_s, eta_start, eta_end, basis}`` from the job's
     ``estimate`` (phase 1b), or flat ``estimated_s`` / ``eta_*`` fields."""
@@ -704,6 +741,8 @@ class JobTableModel(QAbstractTableModel):
             return QColor(theme.FG)
         if role == Qt.ItemDataRole.BackgroundRole:
             tint = ROW_TINT["no_file"] if gray_no_file(job) else ROW_TINT.get(state)
+            if tint is None and state == "queued":
+                tint = WARM_TINT.get(str((job.get("warm") or {}).get("state") or ""))
             return QColor(*tint) if tint else None
         if role == Qt.ItemDataRole.FontRole and state in IN_SLOT:
             font = QFont()
@@ -752,6 +791,8 @@ class JobTableModel(QAbstractTableModel):
                 s += " (cancel asked)"
             elif job.get("paused") and s == "queued":
                 s += " (paused)"
+            elif s == "queued" and warm_text(job):
+                s += f" ({warm_text(job)})"
             elif s in ENDED and s != "done" and ran_without_file(job):
                 s += " (no file)"
             return s
@@ -835,6 +876,7 @@ class JobTableModel(QAbstractTableModel):
                 lines.append(f"paused by {job.get('paused_by') or '?'}"
                              + (f" since {_clock(job['paused_since'])}"
                                 if job.get("paused_since") else ""))
+            lines.extend(warm_lines(job))
             return "\n".join(lines)
         if key == "position" and job.get("position") is not None:
             return (f"place {self.position_text(job)} in the queue's order (the server's "
@@ -1604,7 +1646,11 @@ class RunQueuePanel(QWidget):
             state = self.queue_state()
             self.pill.setText(state)
             set_style_if_changed(self.pill, _pill_css(_QUEUE_LEVEL.get(state, "unknown")))
-            self.summary.setText(str(self.info.get("text") or ""))
+            text = str(self.info.get("text") or "")
+            warm = self.info.get("warm")
+            if isinstance(warm, dict):
+                text += f" -- next #{warm.get('job')} {warm.get('text') or warm.get('state')}"
+            self.summary.setText(text)
         self.summary.setToolTip(self.summary.text())
         counts = self.info.get("counts") or {}
         shown = [f"{counts[s]} {s}" for s in ("queued", "launching", "running", "ending",
@@ -1616,7 +1662,11 @@ class RunQueuePanel(QWidget):
         self.counts.setText(" | ".join(shown) if self.reachable and self.has_queue else "")
 
         alarm = self.info.get("alarm") if self.reachable else None
-        if isinstance(alarm, dict):
+        warm_alarm = self.info.get("warm_alarm") if self.reachable else None
+        if isinstance(warm_alarm, dict) and not isinstance(alarm, dict):
+            self.alarm.setText(f"RUN QUEUE ALARM: {warm_alarm.get('text')}")
+            self.alarm.show()
+        elif isinstance(alarm, dict):
             waited = alarm.get("waited_s")
             self.alarm.setText(
                 f"RUN QUEUE ALARM: job {alarm.get('job')} has been ready to start for "
@@ -1869,6 +1919,9 @@ class RunQueuePanel(QWidget):
         if state == "queued":
             title = f"Cancel {job_name(job)}?"
             text = ("It has not started: it is taken out of the queue and never runs.")
+            if warm_text(job):
+                text += ("\n\nIts process was started ahead (warm: it prepares and compiles, "
+                         "and takes nothing until the queue's GO); it is told to exit.")
             yes, no = "Cancel the job", "Keep it"
         elif state in ("launching", "running") and ran_without_file(job):
             title = f"Abort {job_name(job)}?"
@@ -1891,6 +1944,10 @@ class RunQueuePanel(QWidget):
             return False
 
         def done(reply: dict) -> None:
+            if reply.get("status") == "ok" and reply.get("note"):
+                self.say(f"cancel {job_name(job)}: {reply['note']}")
+                self.schedule_list()
+                return
             if reply.get("status") != "ok" and state == "queued" and reply.get("state") in IN_SLOT:
                 self.say(f"{job_name(job)} launched before the cancel arrived: not cancelled. "
                          "Press Cancel again to abort its run (that discards its data).",

@@ -1079,3 +1079,59 @@ def test_follow_off_leaves_the_scroll_where_it_is(panel, server):
     server.answers["list"] = _list_reply(_many_jobs(41), nxt=(2,))
     panel.refresh_list()
     assert bar.value() == 0
+
+
+# --- warm start (queue phase 2) -------------------------------------------------------------
+
+def _warm(state="ready", **kw):
+    w = {"state": state, "attempt": 1, "spawned_at": NOW - 20, "ready_at": NOW - 5,
+         "py_pid": 9001, "cmd_pid": 5001, "manifest_n": 412, "go": None,
+         "text": {"ready": "ready", "warming": "warming 20 s",
+                  "aborting": "warm process exiting"}[state]}
+    w.update(kw)
+    return w
+
+
+def test_a_warm_job_shows_its_state_tint_and_tooltip(panel):
+    jobs = _phase1_jobs()
+    jobs[2] = _job(3, warm=_warm("ready"))
+    jobs[3] = _job(4, due=NOW + 3600, warm=None)
+    panel.model.set_jobs(jobs, INFO)
+    assert _cell(panel, 3, "state") == "queued (ready)"
+    assert _cell(panel, 4, "state") == "queued"                       # no warm field: as before
+    bg = Qt.ItemDataRole.BackgroundRole
+    assert _cell(panel, 3, "label", bg).getRgb() == rqp.WARM_TINT["ready"]
+    assert _cell(panel, 4, "label", bg) is None
+    tip = _cell(panel, 3, "state", Qt.ItemDataRole.ToolTipRole)
+    assert "warm process: ready (attempt 1)" in tip and "py_pid 9001" in tip
+    assert "manifest 412 files" in tip
+    panel.model.set_jobs([_job(3, warm=_warm("warming"))], INFO)
+    assert _cell(panel, 3, "state") == "queued (warming 20 s)"
+    assert _cell(panel, 3, "label", bg).getRgb() == rqp.WARM_TINT["warming"]
+    panel.model.set_jobs([_job(3, cold_why="class x sets warm_launch = False")], INFO)
+    assert "cold: class x sets warm_launch = False" in _cell(
+        panel, 3, "state", Qt.ItemDataRole.ToolTipRole)
+
+
+def test_the_summary_names_the_ready_job_and_the_warm_alarm(panel):
+    info = dict(INFO, warm={"job": 3, "label": "expt_3", "state": "ready", "text": "ready",
+                            "attempt": 1},
+                warm_alarm={"job": 4, "since": NOW, "text": "job 4's discarded warm process "
+                                                           "has not exited"})
+    panel.set_state(_status(info))
+    assert panel.summary.text().endswith("-- next #3 ready")
+    assert not panel.alarm.isHidden() and "has not exited" in panel.alarm.text()
+
+
+def test_cancelling_a_warm_job_says_its_process_is_told_to_exit(panel, server):
+    jobs = _phase1_jobs()
+    jobs[2] = _job(3, warm=_warm("ready"))
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    server.answers["cancel"] = {"status": "ok", "job": _job(3, "cancelled"),
+                                "note": "not started (warm process told to exit)"}
+    assert panel.select_job(3)
+    assert panel.cancel_selected()
+    title, text, yes, no = panel.confirms[-1]
+    assert "has not started" in text and "told to exit" in text
+    assert "not started (warm process told to exit)" in panel.message.text()

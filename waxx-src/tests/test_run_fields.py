@@ -245,10 +245,16 @@ def test_the_check_runs_before_init_run():
     from waxx.base.scanner import Scanner
     path = REPO / "wax" / "waxx-src" / "waxx" / "base" / "expt.py"
     text = path.read_text(encoding="utf-8")
-    func = next(n for n in ast.walk(ast.parse(text))
-                if isinstance(n, ast.FunctionDef) and n.name == "finish_prepare_wax")
-    src = ast.get_source_segment(text, func)
-    assert src.index("self.init_xvars(") < src.index(".init_run(")
+    funcs = {n.name: ast.get_source_segment(text, n) for n in ast.walk(ast.parse(text))
+             if isinstance(n, ast.FunctionDef)}
+    src = funcs["finish_prepare_wax"]
+    # INIT_RUN is sent by the claim (queue phase 2), which a cold run calls at
+    # the end of finish_prepare_wax and a warm one later still
+    assert src.index("self.init_xvars(") < src.index("self.claim()")
+    assert src.index("self.init_xvars(") < src.index("register_claim(self.claim)")
+    assert "self._start_liveod_run()" in funcs["claim"]
+    assert ".init_run(" in funcs["_start_liveod_run"]
+    assert ".init_run(" not in src
     assert "self.prepare_image_array()" in inspect.getsource(Scanner.init_xvars)
 
 

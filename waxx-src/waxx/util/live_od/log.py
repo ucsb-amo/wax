@@ -179,8 +179,15 @@ class LogBuffer(logging.Handler):
                 "logger": record.name,
             }
             with self._lock_:
-                entry["seq"] = self._seq
-                entry["run_id"] = self._run_id
+                if getattr(record, "run_log", True) is False:
+                    # about no run (logged with extra={"run_log": False}: a
+                    # RESERVE_RUN for the next run, a refused START_RUN): kept
+                    # for run_id="all", never in the current run's GET_LOG
+                    entry["seq"] = 0
+                    entry["run_id"] = 0
+                else:
+                    entry["seq"] = self._seq
+                    entry["run_id"] = self._run_id
                 self._records.append(entry)
         except Exception:
             self.handleError(record)

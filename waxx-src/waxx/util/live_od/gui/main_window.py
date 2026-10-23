@@ -27,6 +27,7 @@ from waxx.util.live_od.gui.fk_tof_window import FkTofWindow
 from waxx.util.live_od.gui.adjust_panel import AdjustPanel
 from waxx.util.live_od.gui.status_strip import StatusStrip
 from waxx.util.live_od.gui.hold_badge import HoldBadge
+from waxx.util.live_od.gui.run_again_button import RunAgainButton
 from waxx.util.live_od.log import get_logger, setup_logging, install_excepthooks, DEFAULT_LOG_DIR
 from waxx.util.live_od import console_guard
 from waxx.control.cameras import DummyCamera
@@ -645,7 +646,15 @@ class LiveODWindow(QWidget):
         self.fix_button = self.abort_button     # the name it had as 'Reset'
         # the person hold (monitor server), shown only while it is on; Abort puts it on
         self.hold_badge = HoldBadge(log=self.msg)
+        # the last run that came through the run queue, queued again as the next job
+        self.run_again_button = RunAgainButton(log=self.msg)
+        self.run_again_button.result_ready.connect(self._on_run_again_result)
         self._update_run_buttons()
+
+    def _on_run_again_result(self, text: str, ok: bool):
+        """A refusal must be seen, not only logged (the log has it either way)."""
+        if not ok:
+            self.status_strip.show_notice(text, 12.0)
 
     def _run_is_active(self) -> bool:
         server = getattr(self, 'live_od_server', None)
@@ -683,6 +692,8 @@ class LiveODWindow(QWidget):
         status_row = QHBoxLayout()
         status_row.setSpacing(4)
         status_row.addWidget(self.status_strip, 1)
+        status_row.addWidget(self.run_again_button)
+        status_row.addSpacing(8)        # apart from Abort: a slip must not abort a run
         status_row.addWidget(self.hold_badge)
         status_row.addWidget(self.abort_button)
         layout.addLayout(status_row)
@@ -795,10 +806,12 @@ class LiveODWindow(QWidget):
             except Exception:
                 pass
         self.shutdown("window closed")
-        try:
-            self.hold_badge.shutdown()
-        except Exception:
-            pass
+        for badge in (getattr(self, 'hold_badge', None), getattr(self, 'run_again_button', None)):
+            try:
+                if badge is not None:
+                    badge.shutdown()
+            except Exception:
+                pass
         # liveOD's own windows go with it, so nothing keeps the process alive headless
         for window in (getattr(self, 'live_scalar_plot_window', None),
                        getattr(self, 'fk_tof_window', None),
@@ -1095,6 +1108,11 @@ class LiveODWindow(QWidget):
         self.output_window.append_separator(
             " · ".join(p for p in (f"Run {run_id}" if run_id else "Run (not saved)", expt_class) if p))
         self._update_run_buttons()
+        # the run queue's job of this run ("" for a run the queue did not launch)
+        client = dict(getattr(self.live_od_server, '_current_client', None) or {})
+        queue_job = str(client.get('queue_job') or '')
+        launcher = str(client.get('launcher') or '')
+        self.run_again_button.note_run(run_id, expt_class, queue_job, launcher)
         xvarnames = list(run_info_payload.get('xvarnames', [])) if run_info_payload else []
         try:
             self.broadcaster.broadcast_run_started(run_id, xvarnames, info={
@@ -1106,6 +1124,9 @@ class LiveODWindow(QWidget):
                 'xvar_ranges': dict(getattr(self.live_od_server, '_current_xvar_ranges', {}) or {}),
                 'pixel_size_m': self.viewer_window._px_size_m,
                 'params': dict(params_payload) if params_payload else {},
+                # the remote viewers' Run again next
+                'queue_job': queue_job,
+                'launcher': launcher,
             })
         except Exception as exc:
             self.msg(f"Could not tell the remote viewers that run {run_id} started: {exc}",
@@ -1591,6 +1612,10 @@ def main(config):
     badge = getattr(win, 'hold_badge', None)
     if badge is not None:
         badge.start()
+    # Run again next: asks the run queue from here on (not in tests)
+    again = getattr(win, 'run_again_button', None)
+    if again is not None:
+        again.start()
     sys.exit(app.exec())
 
 

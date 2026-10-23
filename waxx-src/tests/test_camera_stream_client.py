@@ -128,6 +128,7 @@ def _expt_methods():
              "drain_shot_data", "_stream_only_keys", "_close_shot_data_queue",
              "push_shot_data", "push_raw", "_push", "_note_push_failure",
              "_push_whole_container", "_serialize_end_payload",
+             "_source_texts_for_end", "_source_files", "_read_source", "_expt_file_path",
              "PUSH_QUEUE_MAX_BYTES", "PUSH_QUEUE_RETRIES", "T_PUSH_QUEUE_CLOSE_S",
              "BULK_PUSH_BYTES", "PUT_DATA_SLICE_BYTES")
     return {n: vars(Expt)[n] for n in names}
@@ -443,7 +444,7 @@ def test_deferred_stream_registers_nothing_until_register():
         assert cs._frame_shape == (6, 5)            # set up: probe frame taken
         assert not hasattr(fe.data, "img_test")
         assert fe.camera_streams == []
-        assert not hasattr(cs, "_worker")
+        assert cs._worker is None
         cs.register()
         cs.register()                               # once only
         assert isinstance(fe.data.img_test, HostDataContainer)
@@ -1324,3 +1325,239 @@ def test_dummy_for_triggered_keys_has_one_record_per_key():
     rec = json.loads(fe._extra_file_texts["camera_stream_img_other"])
     assert rec["dummy"] and rec["triggered"] and rec["keys"] == [
         "img_test", "img_other"]
+
+
+# ---- the claim finds a camera server that moved since the listing before the
+# compile (job 542, 2026-10-21: liveOD restarted while a warm job waited for
+# GO; its img_2dmot stream said HELLO to liveOD's old camera-server port).
+# A real beacon CameraDirectory whose discovery and per-server query are
+# stand-ins (no ZMQ socket, no UDP, no server); CameraStream is replaced by a
+# recorder (stream_made). Nothing here imports beacon.discovery.
+
+RL_SERIAL = "40277703"
+RL_LIVEOD = "camera_server:kong:liveod"
+RL_BEACON = "camera_server:kong"
+RL_HOST = "192.0.2.76"          # TEST-NET: never a real address
+RL_OLD, RL_NEW, RL_BEACON_PORT = 61361, 60529, 55000
+
+
+class _NoStore:
+    def all(self):
+        return {}
+
+
+class _Network:
+    """What the stand-in discovery hears and what each server answers."""
+
+    def __init__(self):
+        self.beacons = {RL_LIVEOD: (RL_HOST, RL_OLD), RL_BEACON: (RL_HOST, RL_BEACON_PORT)}
+        self.queries = []           # (host, port) of every server query
+
+    def discover(self, prefix):
+        return {sid: a for sid, a in self.beacons.items() if sid.startswith(prefix)}
+
+    def serve(self, host, port, server_ids):
+        from beacon.camera.directory import CameraDirectory
+        self.queries.append((host, port))
+        sid = {a: s for s, a in self.beacons.items()}.get((host, port))
+        if sid is None:
+            raise TimeoutError(f"{host}:{port} does not answer")
+        if sid == RL_LIVEOD:
+            d = {"camera_id": f"basler_usb:{RL_SERIAL}", "state": "streaming"}
+        else:   # the lender lists the camera it lent to liveOD as reserved
+            d = {"camera_id": f"basler_usb:{RL_SERIAL}", "state": "reserved",
+                 "holder": {"server_id": RL_LIVEOD}}
+        return [CameraDirectory._v2_entry(d, server_ids[0], server_ids, host, port)]
+
+
+@pytest.fixture
+def rl_net():
+    return _Network()
+
+
+@pytest.fixture
+def rl_directory(rl_net):
+    from beacon.camera.directory import CameraDirectory
+    d = CameraDirectory(collect_for=0.0, discover=rl_net.discover, store=_NoStore())
+    d._query_server = rl_net.serve
+    yield d
+    d.close()
+
+
+def _rl_client(live_od_client=None):
+    cs = object.__new__(CameraStreamClient)
+    cs.label, cs.serial = "camera_stream:img_2dmot", RL_SERIAL
+    cs._live_od_client = live_od_client
+    return cs
+
+
+class _RLLiveOD:
+    """A LiveODClient stand-in. ``moves``: the first request times out and
+    the client follows liveOD to its new address (as LiveODClient does on a
+    zmq timeout: _rediscover bumps reconnect_generation, then it raises)."""
+
+    def __init__(self, moves=False, fails=False, state="open"):
+        self.moves, self.fails, self.state = moves, fails, state
+        self.reconnect_generation = 0
+        self.calls = 0
+        self.opened = []
+
+    def cameras(self):
+        self.calls += 1
+        if self.fails:
+            raise ConnectionError("no response from liveOD")
+        if self.moves:
+            self.moves = False
+            self.reconnect_generation += 1
+            raise ConnectionError("[LiveODClient] No response from liveOD server")
+        return {"basler_2dmot": {"state": self.state, "serial_no": RL_SERIAL}}
+
+    def open_camera(self, key):
+        self.opened.append(key)
+
+
+def test_relist_address_changed_between_ready_and_claim(rl_net, rl_directory, stream_made):
+    from waxx.control.cameras.camera_stream_client import _PinnedDirectory
+    before = rl_directory.find(RL_SERIAL)                # pre-compile listing
+    assert (before.server_id, before.port) == (RL_LIVEOD, RL_OLD)
+    rl_net.beacons[RL_LIVEOD] = (RL_HOST, RL_NEW)        # liveOD restarted
+    cs = _rl_client(None)                                # liveOD not asked
+    cs._resolve_and_connect(rl_directory)
+    entry, d = stream_made[0]
+    assert (entry.server_id, entry.host, entry.port) == (RL_LIVEOD, RL_HOST, RL_NEW)
+    assert isinstance(d, _PinnedDirectory)
+    assert cs._resolve_record["relisted"] == {
+        "cached": {"server_id": RL_LIVEOD, "host": RL_HOST, "port": RL_OLD},
+        "now": {"server_id": RL_LIVEOD, "host": RL_HOST, "port": RL_NEW}}
+    assert (RL_HOST, RL_OLD) not in rl_net.queries[1:]   # the old port never asked again
+
+
+def test_relist_job_542_liveod_moved_too(rl_net, rl_directory, stream_made):
+    """The 542 sequence: the liveOD client's first request after the restart
+    times out (old command port) and the client follows liveOD; the camera is
+    on liveOD's bar, so liveOD is asked again and the bar path (fresh
+    listing, pinned to liveOD) is taken."""
+    from waxx.control.cameras.camera_stream_client import _PinnedDirectory
+    rl_directory.find(RL_SERIAL)
+    rl_net.beacons[RL_LIVEOD] = (RL_HOST, RL_NEW)
+    lod = _RLLiveOD(moves=True)
+    cs = _rl_client(lod)
+    cs._resolve_and_connect(rl_directory)
+    assert lod.calls == 2
+    assert cs._liveod_key == "basler_2dmot"
+    assert "liveod_query_retried" in cs._resolve_record
+    entry, d = stream_made[0]
+    assert entry.port == RL_NEW and isinstance(d, _PinnedDirectory)
+
+
+def test_relist_not_needed_when_the_cached_address_holds(rl_net, rl_directory, stream_made):
+    rl_directory.find(RL_SERIAL)
+    n = len(rl_net.queries)
+    cs = _rl_client(None)
+    t0 = time.monotonic()
+    cs._resolve_and_connect(rl_directory)
+    assert time.monotonic() - t0 < 0.2                    # no discovery wait
+    assert len(rl_net.queries) == n                      # no server asked
+    assert stream_made[0][0].port == RL_OLD
+    assert cs._resolve_record == {}
+
+
+def test_relist_when_the_server_is_no_longer_heard(rl_net, rl_directory, stream_made):
+    rl_directory.find(RL_SERIAL)
+    del rl_net.beacons[RL_LIVEOD]                        # liveOD down at the claim
+    with pytest.raises(RuntimeError, match="lent to liveOD"):
+        _rl_client(None)._resolve_and_connect(rl_directory)
+    assert stream_made == []                             # the old port never tried
+
+
+def test_relist_never_on_a_stand_in_directory():
+    from waxx.control.cameras.camera_stream_client import find_current
+
+    class StandIn:
+        def __init__(self):
+            self.calls = []
+
+        def find(self, query, *, refresh=False):
+            self.calls.append(refresh)
+            return SimpleNamespace(server_id=RL_BEACON, host=RL_HOST, port=1, camera_id="x")
+    d = StandIn()
+    entry, stale = find_current(d, RL_SERIAL)
+    assert stale is None and d.calls == [False]
+
+
+def test_relist_never_through_a_pinned_directory(rl_net, rl_directory):
+    from waxx.control.cameras.camera_stream_client import _PinnedDirectory, find_current
+    rl_directory.find(RL_SERIAL)
+    rl_net.beacons[RL_LIVEOD] = (RL_HOST, RL_NEW)
+    # the wrapper has no registry view (resolve checks before it pins)
+    entry, stale = find_current(_PinnedDirectory(rl_directory, RL_LIVEOD), RL_SERIAL)
+    assert stale is None and entry.port == RL_OLD
+
+
+def test_relist_not_listening_for_beacons_keeps_the_cache(monkeypatch):
+    """A real directory (no discovery stand-in) in a process whose beacon
+    listener is not running: the cached listing is the best there is."""
+    import sys
+    import types
+    from beacon.camera.directory import CameraDirectory
+    from waxx.control.cameras.camera_stream_client import find_current
+    fake_client = types.SimpleNamespace(listening_for=lambda: None)
+    fake_pkg = types.ModuleType("beacon.discovery")
+    fake_pkg.client = fake_client
+    monkeypatch.setitem(sys.modules, "beacon.discovery", fake_pkg)
+    monkeypatch.setitem(sys.modules, "beacon.discovery.client", fake_client)
+    d = CameraDirectory(collect_for=0.0, store=_NoStore())
+    d._discover_servers = lambda: pytest.fail("registry read while not listening")
+    d._entries = [CameraDirectory._v2_entry(
+        {"camera_id": f"basler_usb:{RL_SERIAL}", "state": "open"},
+        RL_BEACON, (RL_BEACON,), RL_HOST, RL_OLD)]
+    entry, stale = find_current(d, RL_SERIAL)
+    assert stale is None and entry.port == RL_OLD
+
+
+def test_liveod_failure_without_a_move_is_not_retried():
+    lod = _RLLiveOD(fails=True)
+    cs = _rl_client(lod)
+    cs._resolve_record = {}
+    assert cs._liveod_entry() == (None, None)
+    assert lod.calls == 1
+    assert "ConnectionError" in cs._resolve_record["liveod_query_failed"]
+
+
+def test_liveod_moving_twice_gives_up_after_one_retry():
+    class Mover(_RLLiveOD):
+        def cameras(self):
+            self.calls += 1
+            self.reconnect_generation += 1
+            raise ConnectionError("gone again")
+    lod = Mover()
+    cs = _rl_client(lod)
+    cs._resolve_record = {}
+    assert cs._liveod_entry() == (None, None)
+    assert lod.calls == 2
+
+
+def test_liveod_client_without_reconnect_generation_is_asked_once():
+    class Old:
+        calls = 0
+
+        def cameras(self):
+            Old.calls += 1
+            raise ConnectionError("x")
+    cs = _rl_client(Old())
+    assert cs._liveod_entry() == (None, None)       # no _resolve_record: still fine
+    assert Old.calls == 1
+
+
+def test_dead_stream_record_carries_the_resolve_notes():
+    cs = _rl_client(None)
+    cs.key = "img_2dmot"
+    cs._lock = threading.RLock()
+    cs._finished = False
+    cs._dead_reason = "setup failed: StreamTimeout(...)"
+    cs.counts = {}
+    cs._expt = SimpleNamespace(_extra_file_texts={})
+    cs._resolve_record = {"relisted": {"cached": {"port": RL_OLD}, "now": {"port": RL_NEW}}}
+    cs._finish_unconnected()
+    rec = json.loads(cs._expt._extra_file_texts["camera_stream_img_2dmot"])
+    assert rec["resolve"]["relisted"]["now"]["port"] == RL_NEW

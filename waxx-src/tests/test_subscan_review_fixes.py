@@ -50,6 +50,7 @@ def _prep(cls, n_data=5, every=2, **kw):
     H._give_core(e.data, e.core)
     e._subscan.finish(n_data_shots=n_data, main_xvarnames=e.xvarnames, setup_camera=False)
     H._give_core(e._subscan.data, e.core)
+    e._compile_subscan_switch()
     e._decide_subscan()
     return e
 

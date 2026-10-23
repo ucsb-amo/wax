@@ -519,10 +519,13 @@ def test_run_start_counts_a_new_server_process_as_reinitialised(monkeypatch):
 
 def test_the_run_start_hook_comes_before_init_run():
     """The camera arms and the run id is handed out at INIT_RUN: the wait for
-    a reinit must come before it (waxx Expt.finish_prepare_wax)."""
+    a reinit must come before it (waxx Expt.claim; kexp does the reinit in
+    claim_hardware, waxx's pre_init_run hook follows it)."""
     from waxx.base.expt import Expt
-    src = inspect.getsource(Expt.finish_prepare_wax)
-    assert src.index("self.pre_init_run()") < src.index("_client.init_run(")
+    src = inspect.getsource(Expt.claim)
+    assert (src.index("self.claim_hardware()") < src.index("self.pre_init_run()")
+            < src.index("self._start_liveod_run()"))
+    assert "_client.init_run(" in inspect.getsource(Expt._start_liveod_run)
 
 
 # --- SlmReinitService, fake link and clock ---------------------------------------------

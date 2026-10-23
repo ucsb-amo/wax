@@ -10,9 +10,10 @@ embedded from it.  :class:`MonitorServerPanel` shows the same from any PC:
 * the bar -- :class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`:
   the monitor experiment's READY / LOADING / NOT READY pill (click: start it,
   or restart it after a confirm -- the server's ``reset``, through
-  :class:`MonitorControl`), trust, the run fence, connections, the SLM lease
-  and the run loops as chips; its arrow opens the details, the loop cards and
-  the ops journal;
+  :class:`MonitorControl`), trust and the run fence as chips, the run loops
+  under a "Sequences" dropdown, the queue's Warm start switch and (when the
+  lab gives its launcher) Start liveOD; its arrow opens the details and the
+  ops journal;
 * the queue -- :class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`: its
   toolbar (filter, hold, pause), the jobs, each job's right-click menu.
 
@@ -31,8 +32,8 @@ How it talks to the server:
   the panel is visible;
 * broadcasts -- a :class:`~waxx.util.comms_server.state_broadcast.StateListener`
   (UDP, receive only), started when the panel is first shown; ``run_queue``,
-  ``person_hold``, trust, the run fence, connections, the SLM reinit and the
-  loops are fed to the bar and the queue as they come.
+  ``person_hold``, trust, the run fence and the loops are fed to the bar and
+  the queue as they come.
 
 The dashboard calls :meth:`MonitorServerPanel.cleanup` when the panel goes:
 the poll stops, the listener and the worker thread end.
@@ -244,14 +245,21 @@ class MonitorServerPanel(WidgetPanelBase):
     ``synchronous``: requests on the GUI thread (tests); ``by``: who is
     clicking (default ``user@host``); ``settings``: a QSettings for the queue
     table's columns and filter (``run_queue_panel.panel_settings()``), None
-    remembers nothing."""
+    remembers nothing.
+
+    ``live_od_bat``: the lab's liveOD launcher (kexp passes
+    ``_bat/live_od.bat``): the bar then has Start liveOD
+    (:class:`~waxx.util.guis.live_od_launch.LiveODButton`); ``live_od_start``,
+    ``live_od_probe``, ``live_od_refusal`` go to it (tests pass fakes)."""
 
     #: How often status_json is asked for while the panel is visible.
     STATUS_POLL_MS = 1000
 
     def __init__(self, parent=None, *, link: MonitorLink | None = None,
                  listener_factory: Callable[[], Any] | None | str = "default",
-                 synchronous: bool = False, by: str | None = None, settings=None):
+                 synchronous: bool = False, by: str | None = None, settings=None,
+                 live_od_bat: str | None = None, live_od_start=None, live_od_probe=None,
+                 live_od_refusal=None):
         super().__init__(parent)
         self.link = link or MonitorLink()
         # "default": a StateListener, imported at first show (importing the
@@ -262,8 +270,12 @@ class MonitorServerPanel(WidgetPanelBase):
         self._polling = False
         self._cleaned = False
         self.runner = RequestRunner(self.link.request, synchronous=synchronous, parent=self)
-        self.state_panel = MonitorStatePanel(runner=self.runner, by=by)
+        self.state_panel = MonitorStatePanel(runner=self.runner, by=by, live_od_bat=live_od_bat,
+                                             live_od_start=live_od_start,
+                                             live_od_probe=live_od_probe,
+                                             live_od_refusal=live_od_refusal)
         self.queue_panel = RunQueuePanel(runner=self.runner, by=by, settings=settings)
+        self.state_panel.message.connect(self.queue_panel.say)
         self.monitor_control = MonitorControl(self)
         box = QVBoxLayout(self)
         box.setContentsMargins(4, 4, 4, 4)

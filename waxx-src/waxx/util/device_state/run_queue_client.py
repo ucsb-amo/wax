@@ -181,7 +181,7 @@ class RunQueueClient:
                stop_on_failure: bool | None = None, write_back: bool | None = None,
                allow_drift: bool = False, at_end: bool = False,
                at_index: int | None = None, before_id: int | None = None,
-               after_id: int | None = None) -> dict:
+               after_id: int | None = None, cold: bool = False) -> dict:
         """Queue ``path`` (absolute on the server's machine; a relative path is
         made absolute here).  Placement: by default the server's owner rule (a
         person's job ahead of every queued agent job); ``at_end`` opts out;
@@ -193,7 +193,9 @@ class RunQueueClient:
         this machine's name.  ``client_sha256`` (this machine's hash of the
         file, when readable) and ``client_host`` let the server refuse a path
         whose copy on its machine -- the one that runs -- differs.  ``cwd`` is
-        made absolute here.  -> ``{"status": "ok", "ids": [...], "jobs": [...]}``."""
+        made absolute here.  ``cold``: never warm-launched (queue phase 2; an
+        older server ignores it).  -> ``{"status": "ok", "ids": [...], "jobs":
+        [...]}``."""
         position = {"at_index": None if at_index is None else int(at_index),
                     "before_id": None if before_id is None else int(before_id),
                     "after_id": None if after_id is None else int(after_id)}
@@ -209,7 +211,7 @@ class RunQueueClient:
             "due": None if due is None else float(due), "after": [int(a) for a in after],
             "repeat": int(repeat), "chain": chain, "stop_on_failure": stop_on_failure,
             "write_back": write_back, "allow_drift": bool(allow_drift),
-            "at_end": True if at_end else None,
+            "at_end": True if at_end else None, "cold": True if cold else None,
             "agent_label": os.environ.get(AGENT_LABEL_ENV, "").strip() or None,
             "host": socket.gethostname(), "by": self.by}, **position), retry=False)
 
@@ -229,7 +231,7 @@ class RunQueueClient:
              owner: str | None = None) -> dict:
         """Change a queued job: ``fields`` from argv, label, after, chain,
         stop_on_failure, write_back (None | False), due (epoch | None),
-        allow_drift, paused.  An agent may edit only agent jobs.  -> ``{"job",
+        allow_drift, paused, cold.  An agent may edit only agent jobs.  -> ``{"job",
         "changed": [names]}``."""
         return self._ask("edit", {"id": int(job_id), "token": token, "fields": dict(fields),
                                   "owner": self._owner(owner), "by": self.by}, retry=False)
@@ -241,7 +243,10 @@ class RunQueueClient:
         ``pending``.  ``queued_only``: refuse (RunQueueError) when the job is
         no longer queued, so a job that has just launched is not aborted by a
         cancel meant for a queued one.  ``owner``: who is cancelling (default
-        this client's owner; an agent may not cancel a person's job)."""
+        this client's owner; an agent may not cancel a person's job).  A job
+        with a warm process (queue phase 2) that had not been given the
+        machine: the reply's ``note`` says "not started (warm process told to
+        exit)"."""
         return self._ask("cancel", {"id": int(job_id), "token": token,
                                     "owner": self._owner(owner),
                                     "queued_only": True if queued_only else None,
@@ -290,6 +295,11 @@ class RunQueueClient:
     def hold(self, reason: str = "", *, owner: str | None = None) -> dict:
         return self._ask("hold", {"reason": reason, "owner": self._owner(owner),
                                   "by": self.by}, retry=False)
+
+    def warm_ahead(self, on: bool | None = None, *, owner: str | None = None) -> dict:
+        """Switch warm start on / off (None: report) -> ``{"warm_ahead", "was"}``."""
+        return self._ask("warm_ahead", {"on": on, "owner": self._owner(owner), "by": self.by},
+                         retry=on is None)
 
     def release(self, *, owner: str | None = None) -> dict:
         return self._ask("release", {"owner": self._owner(owner), "by": self.by},

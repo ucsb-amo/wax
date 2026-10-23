@@ -60,7 +60,8 @@ def test_pushed_arrays_land_in_their_slots_and_the_rest_keeps_the_fill(server):
     srv, saver = server
     init = srv._handle_init_run(_init_msg())
     token, path = init["run_token"], init["filepath"]
-    assert init["features"] == {"put_data": True, "async_save": True}
+    # (queue phase 2 added "reserve")
+    assert {"put_data": True, "async_save": True}.items() <= init["features"].items()
     frame = (np.arange(20, dtype=np.uint8) + 3).reshape(4, 5)
     meta = np.array([1., 2., 3.])
     msg, bufs = _put_msg(token, [

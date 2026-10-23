@@ -80,7 +80,16 @@ def panel(qapp, monkeypatch):
     p.shutdown()
 
 
-def test_renders_monitor_trust_fence_connections_slm(panel):
+def bar_texts(panel) -> str:
+    """Every label / button text and tooltip in the bar."""
+    from PyQt6.QtWidgets import QAbstractButton, QLabel
+    out = []
+    for w in panel.bar.findChildren(QLabel) + panel.bar.findChildren(QAbstractButton):
+        out += [w.text(), w.toolTip()]
+    return "\n".join(out)
+
+
+def test_renders_monitor_trust_fence_no_connections_no_slm(panel):
     panel.set_state(dict(STATUS, run_pending=dict(STATUS["run_pending"],
                                                   since=time.time() - 12.2)))
     assert panel.monitor_pill.text() == "NOT READY"
@@ -91,14 +100,15 @@ def test_renders_monitor_trust_fence_connections_slm(panel):
     fence = panel.fence_line.text()
     assert "run 85602 (rabi) from kong" in fence and "held 12 s" in fence
     assert "NOT_READY, so it does not lapse" in fence
-    pill, line = panel.conn_rows["awg"]
-    assert pill.text() == "Tweezer AWG: disconnected" and "released for run 85601" in line.text()
     assert panel.trust_chip.text() == "state UNTRUSTED"
     assert panel.fence_chip.text() == "fence: run 85602" and not panel.fence_chip.isHidden()
-    assert panel.slm_chip.text() == "SLM: due"
-    assert panel.loop_chips["auto_tof"].text() == "BEC TOF loop: running"
-    assert "blocked by: run 85602" in panel.slm_line.text() and "reinit due" in \
-        panel.slm_line.text()
+    # user 2026-10-21: the SLM lease and the tweezer AWG connection are not shown
+    for gone in ("conn_rows", "conn_chips", "slm_chip", "slm_line", "no_conn", "loop_chips"):
+        assert not hasattr(panel, gone), gone
+    texts = bar_texts(panel) + "\n" + "\n".join(
+        w.text() for w in panel.details.findChildren(__import__("PyQt6.QtWidgets").QtWidgets.QLabel))
+    assert "SLM" not in texts and "AWG" not in texts and "reinit" not in texts
+    assert panel.sequences_chip.text() == "BEC TOF loop: running"
     card = panel.sequences.loop_cards["auto_tof"]
     assert card.pill.text() == "RUNNING" and "owner person" in card.status.text()
 
@@ -110,7 +120,6 @@ def test_trusted_ready_no_fence(panel):
     assert panel.monitor_pill.text() == "READY"
     assert panel.trust_banner.text() == "Device state trusted."
     assert panel.fence_line.text().startswith("No run fence")
-    assert panel.conn_rows == {} and "holds no connections" in panel.no_conn.text()
     assert msp.fence_text({"run_id": 1, "since": NOW - 5}, "READY", NOW).endswith(
         "it lapses if the run never takes the core.")
 
@@ -144,11 +153,14 @@ def test_broadcasts_update_at_once(panel):
     assert panel.fence_line.text().startswith("No run fence")
     panel.on_broadcast({"type": "connections", "connections": {"awg": dict(
         STATUS["connections"]["awg"], state="connected", detail="")}})
-    assert panel.conn_rows["awg"][0].text() == "Tweezer AWG: connected"
+    panel.on_broadcast({"type": "slm_reinit", "slm_reinit": dict(STATUS["slm_reinit"],
+                                                                 state="failed")})
+    assert "AWG" not in bar_texts(panel) and "SLM" not in bar_texts(panel)   # not shown
     panel.on_broadcast({"type": "run_loop", "loop": dict(LOOP, state="stopped", ended=NOW,
                                                          text="stopped")})
     assert panel.sequences.loop_cards["auto_tof"].pill.text() == "stopped"
-    assert panel.loop_chips["auto_tof"].text() == "BEC TOF loop: stopped"
+    assert panel.sequences_chip.text() == "idle"
+    assert "BEC TOF loop: stopped" in panel.sequences_chip.toolTip()
     assert panel._journal_soon.isActive()                         # the journal, shortly
 
 
@@ -360,7 +372,7 @@ def test_a_loop_chip_names_the_running_loops_category(panel):
     loop = dict(LOOP, state="running", category="holds", owner="queue", on_behalf_of="person",
                 text="started by run queue@kong")
     panel.set_state(dict(STATUS, run_loops={"auto_tof": loop}))
-    chip = panel.loop_chips["auto_tof"]
+    chip = panel.sequences_chip
     assert chip.text() == "BEC TOF loop: running · holds"
     assert "agents' queued jobs wait behind it" in chip.toolTip()
     assert "Owner: queue (for person)" in chip.toolTip()
@@ -368,4 +380,6 @@ def test_a_loop_chip_names_the_running_loops_category(panel):
     assert chip.text() == "BEC TOF loop: running · yields"
     assert "an agent's queued job stops it" in chip.toolTip()
     panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(loop, state="stopped")}))
-    assert chip.text() == "BEC TOF loop: stopped"         # not running: no category
+    assert chip.text() == "idle"                          # nothing active
+    assert "BEC TOF loop: stopped" in chip.toolTip()      # not running: no category
+    assert "· yields" not in chip.toolTip() and "· holds" not in chip.toolTip()

@@ -130,6 +130,53 @@ restart the queue is read back; a running job whose process is still alive
 process is gone is judged from liveOD's record (saved, or failed "server
 restarted; process gone").
 
+**Warm start (queue phase 2).**  A stored setting since 2026-10-21: the
+monitor server constructs the queue with ``warm_ahead=None`` -- start value
+``WAXX_QUEUE_WARM_AHEAD`` when set, else ``<dir>/settings.json``, else
+:data:`WARM_AHEAD_DEFAULT` (on); ``kq warm on|off`` and the Monitor panel's
+toggle (:meth:`RunQueue.set_warm_ahead`) switch it and store it, journalled.
+``RunQueue(warm_ahead=False)`` (the class default, for library use and tests)
+takes the value given.
+With ``warm_ahead`` on, the queue starts the NEXT job's process while the job
+in the slot is still running -- once that job has taken its first shot (the
+two compiles never overlap), its end is within :data:`WARM_LEAD_S` (or
+unknown), it declares no calibration, and liveOD's POLL advertises
+``features.reserve``.  One warm process at a time, for the head of the order
+(a job due within :data:`WARM_DUE_LEAD_S` counts).  The warm process gets
+``WAXX_QUEUE_WARM=<warm token>`` and BELOW_NORMAL priority; it imports,
+prepares and compiles, claims nothing, says "ready" with a manifest of the
+files it loaded (:mod:`~waxx.util.device_state.queue_gate`) and polls the
+``warm`` request.  The job stays ``queued`` with a ``warm`` sub-record
+(``{token, state: warming | ready | aborting, attempt, cmd_pid, cmd_started,
+py_pid, py_started, sha256, manifest, spawned_at, ready_at, go, ...}``); an
+older queue.json loads (no record), and an older server ignores the field.
+GO is decided by the tick and SAVED before it is handed out (the job goes
+``launching`` -> ``running`` with the warm process as its process): only
+once the slot job's process has exited, the gate is free and the manifest is
+fresh (re-stat outside the lock).  The reply carries liveOD's ``reset_count``
+as last seen.  A warm launch is discarded -- cooperatively: the process
+exits at its next poll -- when the job is no longer the head, is blocked
+or paused, is edited (argv, after, due, paused, write_back, cold),
+cancelled, its chain stops, its files change, or it has been ready for
+:data:`WARM_READY_MAX_S`.  A person hold does NOT discard it: an agent's
+warm process stays ready behind the hold (GO waits for the release; the
+ready time still counts, so a hold longer than :data:`WARM_READY_MAX_S`
+discards it as stale, its attempt given back, and no new warm launch starts
+for a held job -- the job then launches cold after the release).  A
+discarded process still alive :data:`WARM_KILL_AFTER_S` after it was told
+to exit is stopped by the queue (:func:`~waxx.util.device_state.detached.
+kill_tree`) only while GO was never delivered to it and its pid and creation
+time still match the record; otherwise it raises a warning (``warm_alarm``).
+Both leave a journal record.  A re-warm waits for the old process to exit.  Jobs marked
+``cold`` (submit / edit), whose class sets ``warm_launch = False``, or whose
+``prepare``/``build`` calls a name in :data:`WARM_DENY_NAMES` never warm.  A
+warm process that dies before GO (not told to, not exit 78) makes its job
+cold and leaves it queued ("warm attempt failed ... it launches cold"); one
+that dies after GO was saved but before it was
+handed out puts its job back in the queue; after the hand-out, the usual
+following applies.  At a restart warm processes are taken back by pid AND
+creation time.
+
 Machine-agnostic: nothing here knows the K machine.
 """
 
@@ -149,9 +196,9 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Mapping
 
-from waxx.util.device_state import run_gate
+from waxx.util.device_state import queue_gate, run_gate
 from waxx.util.device_state.monitor_manager import ar_command, environment_report
-from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S
+from waxx.util.device_state.detached import LAUNCH_TIMEOUT_S, SAME_PROCESS_S
 from waxx.util.device_state.person_hold import PersonHold
 from waxx.util.device_state.run_loop import (
     ABORTED_RE, RUN_ID_RE, _SHELL_CHARS, effective_owner, info_category, judge_run,
@@ -207,11 +254,97 @@ SPAWN_WARN_S = 60.0
 #: ended failed.
 ORPHAN_WAIT_S = 300.0
 
+#: A warm launch's environment variable (queue_gate pops it at first read).
+WARM_ENV = queue_gate.WARM_ENV
+#: The exit code of a warm process that stood down before GO.
+EXIT_WARM_ABORTED = queue_gate.EXIT_WARM_ABORTED
+#: A warm launch starts only when the slot job's expected end is this close
+#: (or unknown).
+WARM_LEAD_S = 300.0
+#: A job due this soon may warm (GO only once it is due).
+WARM_DUE_LEAD_S = 60.0
+#: A warm process ready for longer than this is discarded (stale).
+WARM_READY_MAX_S = 900.0
+#: A warm process not ready this long after its launch is discarded.
+WARM_PREP_MAX_S = 600.0
+#: A discarded warm process still alive this long after it was told to exit
+#: is stopped by the queue (GO never delivered, pid + creation time
+#: matching), else raises the warm alarm.
+WARM_KILL_AFTER_S = 120.0
+WARM_EXIT_ALARM_S = WARM_KILL_AFTER_S          # the older name
+#: A ready warm process's manifest is re-stat-ed this often while it waits.
+WARM_MANIFEST_CHECK_S = 5.0
+#: Warm launches per job at most (after that it goes cold).  A launch
+#: discarded only because it went stale (ready too long) is not counted.
+WARM_MAX_ATTEMPTS = 3
+#: The end of the discard reason of a warm process ready too long.
+WARM_STALE_MARK = "(stale)"
+#: A warm launch whose launcher gave no answer is waited for (its hello)
+#: this long before it is forgotten.
+WARM_HELLO_WAIT_S = 120.0
+#: At most this many manifest entries are kept.
+WARM_MANIFEST_MAX = 20000
+#: The job fields whose edit discards a warm launch.
+WARM_SPEC_FIELDS = ("argv", "after", "due", "paused", "write_back", "cold")
+#: Names that make a job cold when its prepare / build / __init__ calls them
+#: (hardware or shared lab state touched before GO).  ``RunQueue(
+#: warm_deny_names=)`` replaces them.
+WARM_DENY_NAMES = ("_announce_to_monitor", "announce_run", "withdraw_run", "picomotor",
+                   "stage_dev", "objective_stage")
+
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 #: Environment variable that moves the queue's folder (tests point it at a
 #: temporary folder; a lab may point it at another LOCAL folder).
 DIR_ENV = "WAXX_RUN_QUEUE_DIR"
+
+#: The queue's settings, beside queue.json (``{"warm_ahead": {"on", "by",
+#: "owner", "at"}}``; atomic replace).  Read at the server's start.
+SETTINGS_FILE = "settings.json"
+#: Warm start when nothing is stored (user, 2026-10-21: on by default).
+WARM_AHEAD_DEFAULT = True
+#: Environment variable that, when set, overrides the stored warm start at
+#: the server's start ("1" / "on" / "true" or "0" / "off" / "false").
+WARM_AHEAD_ENV = "WAXX_QUEUE_WARM_AHEAD"
+
+
+def warm_ahead_from_env() -> bool | None:
+    """``WAXX_QUEUE_WARM_AHEAD`` as a bool, None when unset (or not
+    understood: a warning, and the stored setting applies)."""
+    raw = os.environ.get(WARM_AHEAD_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "on", "true", "yes"):
+        return True
+    if raw in ("0", "off", "false", "no"):
+        return False
+    log.warning("Run queue: %s=%r not understood (1/on or 0/off); the stored warm start "
+                "applies.", WARM_AHEAD_ENV, raw)
+    return None
+
+
+def read_settings(directory: str | None) -> dict:
+    """The queue's stored settings (``{}`` when there are none or the file
+    cannot be read -- logged)."""
+    if not directory:
+        return {}
+    path = os.path.join(directory, SETTINGS_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.error("Run queue: could not read its settings %s (%s); defaults apply.", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def stored_warm_ahead(directory: str | None) -> bool | None:
+    """The stored warm start (None: nothing stored)."""
+    rec = read_settings(directory).get("warm_ahead")
+    on = rec.get("on") if isinstance(rec, dict) else rec
+    return on if isinstance(on, bool) else None
 
 
 #: Environment variable listing the folders the queue runs files from
@@ -223,13 +356,10 @@ def default_roots() -> list[str]:
     """The folders a job's file must be inside: ``$WAXX_RUN_QUEUE_ROOTS``
     (os.pathsep-separated), else the lab's code folder (``%code%``) and
     ``C:\\lab\\skynet_log`` (agents' work).  A server may pass its own
-    (``RunQueue(roots=)``); the lab can override them there later."""
-    env = os.environ.get(ROOTS_ENV)
-    if env:
-        return [r for r in env.split(os.pathsep) if r]
-    roots = [os.environ.get("code") or ""]
-    roots.append(r"C:\lab\skynet_log")
-    return [r for r in roots if r]
+    (``RunQueue(roots=)``); the lab can override them there later.  One
+    definition (:func:`queue_gate.queue_roots`): a warm process builds its
+    manifest from the same roots."""
+    return queue_gate.queue_roots()
 
 
 def default_dir() -> str:
@@ -290,6 +420,50 @@ def _read_source(path) -> tuple[str, list]:
     return (classes[0] if len(classes) == 1 else ""), keys
 
 
+#: The methods whose calls decide a job's warm eligibility (they run before GO).
+_PRE_GO_METHODS = ("prepare", "build", "__init__", "finish_prepare")
+
+
+def cold_reason(path, deny_names=WARM_DENY_NAMES) -> str:
+    """Why a job of this experiment file must never warm-launch ("" when it
+    may), read with :mod:`ast` (never imported): a class body that sets
+    ``warm_launch = False``, or a call in ``prepare`` / ``build`` /
+    ``__init__`` / ``finish_prepare`` whose dotted name contains one of
+    ``deny_names`` (hardware or shared lab state touched before GO).  A file
+    that cannot be read or parsed is cold (nothing shows it is safe)."""
+    import ast  # noqa: PLC0415
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:                          # noqa: BLE001
+        return f"its source could not be read for the warm check ({type(exc).__name__})"
+    deny = [d.lower() for d in deny_names if d]
+    try:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if (isinstance(item, (ast.Assign, ast.AnnAssign))
+                        and isinstance(getattr(item, "value", None), ast.Constant)
+                        and item.value.value is False
+                        and any(isinstance(t, ast.Name) and t.id == "warm_launch"
+                                for t in (item.targets if isinstance(item, ast.Assign)
+                                          else [item.target]))):
+                    return f"class {node.name} sets warm_launch = False"
+                if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and item.name in _PRE_GO_METHODS):
+                    for sub in ast.walk(item):
+                        if not isinstance(sub, ast.Call):
+                            continue
+                        name = ast.unparse(sub.func).lower()
+                        hit = next((d for d in deny if d in name), None)
+                        if hit:
+                            return (f"{node.name}.{item.name} calls {ast.unparse(sub.func)} "
+                                    f"(touches the lab before GO)")
+    except Exception as exc:                          # noqa: BLE001
+        return f"its source could not be checked for warm start ({type(exc).__name__})"
+    return ""
+
+
 def _since_text(t) -> str:
     """"15:48", or "Oct 08 15:48" when not today."""
     try:
@@ -317,6 +491,41 @@ def _close(proc) -> None:
             close()
         except Exception:                             # noqa: BLE001
             log.exception("Run queue: closing a process watch failed")
+
+
+def _warm_text(w: Mapping, now: float) -> str:
+    """"warming 4 s" / "ready" / "warm process exiting" / "GO given"."""
+    if w.get("go"):
+        return "GO given" if w["go"].get("delivered") else "GO decided"
+    state = w.get("state")
+    if state == "ready":
+        return "ready"
+    if state == "aborting":
+        return "warm process exiting"
+    try:
+        return f"warming {max(0.0, now - float(w.get('spawned_at') or now)):.0f} s"
+    except (TypeError, ValueError):
+        return "warming"
+
+
+def _warm_public(w: Mapping | None, now: float) -> dict | None:
+    """A warm record as replies show it: no token (it is the warm process's
+    credential), the manifest's size instead of the manifest."""
+    if not w:
+        return None
+    out = {k: v for k, v in w.items() if k not in ("token", "manifest", "spec")}
+    out["manifest_n"] = len(w.get("manifest") or ())
+    out["text"] = _warm_text(w, now)
+    return out
+
+
+def _parse_queue_job(text) -> tuple[int | None, str]:
+    """"<id>:<token>" -> (id, token); (None, "") when it is not one."""
+    head, _, token = str(text or "").partition(":")
+    try:
+        return int(head), token
+    except ValueError:
+        return None, ""
 
 
 def _quote(arg: str) -> str:
@@ -387,6 +596,17 @@ class Job:
     paused: bool = False
     paused_by: str = ""
     paused_since: float | None = None
+    #: never warm-launched: asked for at submit / edit ("cold")
+    cold: bool = False
+    #: never warm-launched, from its source at submit (cold_reason): why
+    cold_why: str = ""
+    #: the warm launch while the job is queued (see the module docstring), or
+    #: None; kept on the job once GO was given
+    warm: dict | None = None
+    #: when its (last) warm process was launched
+    warm_started_at: float | None = None
+    #: warm launches so far (WARM_MAX_ATTEMPTS at most)
+    warm_attempts: int = 0
     #: its run had no file (``save_data=False``): liveOD's POLL showed the
     #: job's run in progress with run id 0, its last_outcome named it, or the
     #: run's output says "Acquisition for run 0 aborted".  Whatever it ended as
@@ -509,8 +729,36 @@ class RunQueue:
                  clock: Callable[[], float] = time.time,
                  poll_every_s: float = POLL_EVERY_S, gap_s: float = GAP_S,
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
-                 client_name: str | None = None):
+                 client_name: str | None = None, warm_ahead: bool | None = False,
+                 set_priority=None, warm_deny_names=WARM_DENY_NAMES):
         self.directory = directory
+        #: warm start (see the module docstring).  A bool: that value (the
+        #: class's default, off, for library use and tests).  None -- what the
+        #: monitor server passes -- the server's start value:
+        #: WAXX_QUEUE_WARM_AHEAD when set, else the stored setting
+        #: (``<dir>/settings.json``), else WARM_AHEAD_DEFAULT (on).
+        self._warm_env: bool | None = None
+        if warm_ahead is None:
+            self._warm_env = warm_ahead_from_env()
+            stored = stored_warm_ahead(directory)
+            if self._warm_env is not None:
+                warm_ahead, self.warm_ahead_source = self._warm_env, "env"
+            elif stored is not None:
+                warm_ahead, self.warm_ahead_source = stored, "stored"
+            else:
+                warm_ahead, self.warm_ahead_source = WARM_AHEAD_DEFAULT, "default"
+            self._warm_start_note = (stored, warm_ahead)
+        else:
+            self.warm_ahead_source = "given"
+            self._warm_start_note = None
+        self.warm_ahead = bool(warm_ahead)
+        self._settings_lock = threading.Lock()
+        self._warm_deny = tuple(warm_deny_names)
+        if set_priority is None:
+            from waxx.util.device_state.detached import set_normal_priority  # noqa: PLC0415
+            set_priority = set_normal_priority
+        #: set_priority(pid, started) -> bool: the server's backstop at GO
+        self._set_priority = set_priority
         self._poll_fn = poll
         self._run_exited = run_exited
         self._live_od_reset = live_od_reset
@@ -597,7 +845,33 @@ class RunQueue:
         self._spawning: dict | None = None
         #: how long _launch waits for its launch thread before the tick follows it
         self._spawn_join_s = 5.0
+        #: warm processes followed: job id -> process watch (the launched
+        #: shell, or the experiment's python adopted by pid + creation time)
+        self._warm_procs: dict[int, object] = {}
+        #: the warm launch in progress: {"job", "token", "thread", "result", "since", "slot"}
+        self._warm_spawn: dict | None = None
+        #: jobs whose GO is on disk (handed out only then)
+        self._go_saved: set = set()
+        #: job id -> the slot job's id for which its warm launch failed to
+        #: start (not tried again behind that job)
+        self._warm_skip: dict[int, int] = {}
+        #: job id -> when its manifest was last checked
+        self._warm_checked: dict[int, float] = {}
+        #: the warm alarm: {"job", "since", "text"} or None
+        self._warm_alarm: dict | None = None
+        #: (job, token) pairs whose abort reply was logged
+        self._warm_abort_logged: set = set()
         self._load()
+        if self._warm_start_note is not None:
+            stored, on = self._warm_start_note
+            log.info("Run queue: warm start %s at start (%s).", "ON" if on else "OFF",
+                     {"env": f"{WARM_AHEAD_ENV} is set", "stored": "the stored setting",
+                      "default": "nothing stored: the default"}[self.warm_ahead_source])
+            if self.warm_ahead_source == "env" and stored is not None and stored != on:
+                log.warning("Run queue: %s overrides the stored warm start (%s) with %s.",
+                            WARM_AHEAD_ENV, "on" if stored else "off", "on" if on else "off")
+                self._record("run_queue_warm_ahead", on=on, was=stored, by=WARM_AHEAD_ENV,
+                             owner="env", stored=stored, note="server start")
         self.flush_journal()
 
     # -- paths ----------------------------------------------------------------------
@@ -713,6 +987,10 @@ class RunQueue:
         sha = file_sha256(path)
         self._check_client_copy(obj, path, sha)
         expt_class, calibrates = describe_source(path)
+        cold = obj.get("cold")
+        if cold not in (None, True, False):
+            raise QueueError(f"cold must be true or false, not {cold!r}")
+        cold_why = cold_reason(path, self._warm_deny)
         # TODO(INIT_RUN): the live list of calibrated keys, sent by the
         # experiment at prepare, overrides calibrates_declared once known.
         with self._lock:
@@ -736,7 +1014,8 @@ class RunQueue:
                           allow_drift=bool(obj.get("allow_drift")), repeat_index=i + 1,
                           repeat_of=repeat, submitted_at=now, submitted_by=by,
                           rank=ranks[i], expt_class=expt_class,
-                          calibrates_declared=list(calibrates), submitter=submitter)
+                          calibrates_declared=list(calibrates), submitter=submitter,
+                          cold=bool(cold), cold_why=cold_why)
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
@@ -984,7 +1263,7 @@ class RunQueue:
         for job in jobs:
             dur, basis = self._duration_estimate(job, medians)
             estimate = {"duration_s": dur, "eta_start": None, "eta_end": None, "basis": basis}
-            view = dict(job.to_dict(), position=positions.get(job.id),
+            view = dict(self._public(job, now), position=positions.get(job.id),
                         waiting=self._why_waiting(job, now, order), source_changed=None,
                         estimate=estimate)
             if job.state == "queued":
@@ -996,6 +1275,10 @@ class RunQueue:
                     estimate["basis"] += "; est. (ignores blocked jobs ahead)"
             elif job.state in IN_SLOT:
                 estimate["eta_end"], estimate["basis"] = self._running_end(job, now, medians)
+            if job.warm is not None or job.warm_started_at is not None:
+                # a warm job's launch time is its GO: the time it spent warming
+                # before (behind the previous job) is not in its duration
+                estimate["basis"] += "; GO to end, warm time excluded"
             out.append(view)
         return out, pending
 
@@ -1006,15 +1289,16 @@ class RunQueue:
                 "owner": view["owner"], "submitter": view.get("submitter") or "",
                 "label": view["label"], "expt_class": view.get("expt_class") or "",
                 "run_id": view.get("run_id"), "est": view.get("estimate"),
-                "waiting": view.get("waiting") or ""}
+                "waiting": view.get("waiting") or "",
+                "warm": ((view.get("warm") or {}).get("text") or "")}
 
     #: the fields `edit` may change on a queued job
     EDITABLE = ("argv", "label", "after", "chain", "stop_on_failure", "write_back", "due",
-                "allow_drift", "paused")
+                "allow_drift", "paused", "cold")
 
     def edit(self, obj: Mapping) -> dict:
         """``{"id", "owner", "by", "fields": {argv?, label?, after?, chain?,
-        stop_on_failure?, write_back?, due?, allow_drift?, paused?}}``: change
+        stop_on_failure?, write_back?, due?, allow_drift?, paused?, cold?}}``: change
         a QUEUED job (launching / running refused); each field checked as at
         submit; ``paused`` pauses this job alone.  An agent may edit only
         agent jobs.  Journaled (run_queue_edit) with every changed field's
@@ -1087,7 +1371,7 @@ class RunQueue:
         if "chain" in fields_:
             chain = fields_["chain"]
             new["chain"] = str(chain).strip() if chain not in (None, "") else None
-        for key in ("stop_on_failure", "allow_drift", "paused"):
+        for key in ("stop_on_failure", "allow_drift", "paused", "cold"):
             if key in fields_:
                 if not isinstance(fields_[key], bool):
                     raise QueueError(f"{key} must be true or false, not {fields_[key]!r}")
@@ -1155,7 +1439,7 @@ class RunQueue:
                      to_position=after, from_rank=old_rank, to_rank=job.rank)
         self._save()
         self._notify()
-        return {"status": "ok", "job": dict(job.to_dict(), position=after), "position": after,
+        return {"status": "ok", "job": dict(self._public(job), position=after), "position": after,
                 "clamped": clamped}
 
     def _find(self, obj: Mapping) -> Job:
@@ -1197,7 +1481,10 @@ class RunQueue:
                         "msg": f"{job.name} is {job.state}, not queued: not cancelled"}
             if job.state == "queued":
                 self._end(job, "cancelled", f"cancelled by {by}")
-                reply = {"status": "ok", "job": job.to_dict()}
+                reply = {"status": "ok", "job": self._public(job)}
+                if job.warm is not None and not job.warm.get("go"):
+                    self._mark_aborting(job, f"cancelled by {by}")
+                    reply["note"] = "not started (warm process told to exit)"
             elif job.state in ("launching", "running"):
                 if job.cancel is None:
                     job.cancel = {"by": by, "at": self._clock(), "abort_sent": False,
@@ -1212,7 +1499,12 @@ class RunQueue:
                                 "(no run id yet)")
                 # the tick sends liveOD's Abort (and retries): a request never
                 # waits on liveOD
-                reply = {"status": "ok", "job": job.to_dict(), "pending": True}
+                reply = {"status": "ok", "job": self._public(job), "pending": True}
+                go = (job.warm or {}).get("go")
+                if go and not go.get("delivered"):
+                    # GO decided, not handed out yet: the warm process is told
+                    # to exit at its next poll, nothing of it ran
+                    reply["note"] = "not started (warm process told to exit)"
             else:
                 return {"status": "error", "msg": f"{job.name} is already {job.state}"}
         self._save()
@@ -1310,7 +1602,7 @@ class RunQueue:
                      results=results, note=note)
         self._save()
         self._notify()
-        reply = {"status": "ok" if not alive_left else "error", "job": job.to_dict(),
+        reply = {"status": "ok" if not alive_left else "error", "job": self._public(job),
                  "results": results, "pending": True, "note": note}
         if alive_left:
             reply["msg"] = f"{job.name}: {note}"
@@ -1490,6 +1782,68 @@ class RunQueue:
         self._notify()
         return reply
 
+    def set_warm_ahead(self, obj: Mapping) -> dict:
+        """``{"on": bool | None, "by", "owner"}``: switch warm start on or
+        off (``on`` absent: report only).  The value is stored in
+        ``<dir>/settings.json`` (atomic replace) and is the server's start
+        value from then on -- unless ``WAXX_QUEUE_WARM_AHEAD`` is set where
+        the server starts (the reply's ``env_override`` says so).  Switched
+        off, a live warm launch is told to exit at the next tick ("warm start
+        was switched off").  Either owner may switch it; every change (of the
+        value or of what is stored) is journalled with who and when.  Reply:
+        ``{"warm_ahead", "was", "persisted", "env_override"}`` (``persisted``
+        False with ``persist_error`` when it could not be stored: it then
+        holds until the server restarts)."""
+        as_owner, refusal = requester_owner(obj)
+        if refusal:
+            return {"status": "error", "msg": refusal}
+        on = obj.get("on")
+        env = (f"{WARM_AHEAD_ENV}={'1' if self._warm_env else '0'}"
+               if self._warm_env is not None else None)
+        if on is None:
+            return {"status": "ok", "warm_ahead": self.warm_ahead,
+                    "source": self.warm_ahead_source, "env_override": env}
+        if not isinstance(on, bool):
+            return {"status": "error", "msg": f"on must be true or false, not {on!r}"}
+        by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "?")
+        with self._lock:
+            was, self.warm_ahead = self.warm_ahead, on
+        stored_before, persisted, error = self._store_warm_ahead(on, by, as_owner)
+        if was != on or (persisted and stored_before != on):
+            log.warning("Run queue: warm start switched %s by %s (%s)%s.", "ON" if on else "OFF",
+                        by, as_owner, "" if persisted else f"; NOT stored ({error})")
+            self._record("run_queue_warm_ahead", on=on, was=was, by=by, owner=as_owner,
+                         stored=on if persisted else stored_before,
+                         **({} if persisted else {"persist_error": error}))
+            self._notify()
+        reply = {"status": "ok", "warm_ahead": on, "was": was, "persisted": persisted,
+                 "env_override": env}
+        if not persisted:
+            reply["persist_error"] = error
+        return reply
+
+    def _store_warm_ahead(self, on: bool, by: str, owner: str) -> tuple:
+        """Store warm start -> ``(stored before, stored now?, error text)``."""
+        if not self.enabled:
+            return None, False, "the queue has no folder"
+        with self._settings_lock:
+            data = read_settings(self.directory)
+            rec = data.get("warm_ahead")
+            before = rec.get("on") if isinstance(rec, dict) else None
+            data["warm_ahead"] = {"on": on, "by": by, "owner": owner, "at": self._clock(),
+                                  "t": _clock_text(self._clock())}
+            try:
+                from waxx.util.device_state.state_file_io import atomic_write  # noqa: PLC0415
+                os.makedirs(self.directory, exist_ok=True)
+                atomic_write(self._path(SETTINGS_FILE), data)
+            except Exception as exc:                  # noqa: BLE001
+                log.error("Run queue: could not store warm start in %s (%s).",
+                          self._path(SETTINGS_FILE), exc)
+                return before, False, str(exc)
+        if self.warm_ahead_source != "env":
+            self.warm_ahead_source = "stored"
+        return before, True, ""
+
     def release_request(self, obj: Mapping) -> dict:
         """``{"by", "owner"}``; ``owner`` -- who asks -- is required."""
         as_owner, refusal = requester_owner(obj)
@@ -1553,7 +1907,7 @@ class RunQueue:
         """The job in the slot (launching / running / ending), or None."""
         with self._lock:
             cur = self._jobs.get(self._current) if self._current is not None else None
-            return cur.to_dict() if cur is not None else None
+            return self._public(cur) if cur is not None else None
 
     def has_work(self) -> bool:
         """Jobs queued or in the slot (a loop's Start is refused then)."""
@@ -1608,18 +1962,24 @@ class RunQueue:
             else:
                 state, text = "idle", "no jobs"
             return {"enabled": self.enabled, "state": state, "text": text,
-                    "current": cur.to_dict() if cur is not None else None,
+                    "current": self._public(cur, now) if cur is not None else None,
                     "next": [j.id for j in order[:20]], "counts": counts,
                     "waiting": self._waiting, "alarm": dict(self._alarm) if self._alarm else None,
                     "paused": paused, "person_hold": hold,
                     "resume_loop": dict(self._resume_loop) if self._resume_loop else None,
-                    "directory": self.directory}
+                    "directory": self.directory, "warm_ahead": self.warm_ahead,
+                    "warm_ahead_source": self.warm_ahead_source,
+                    "warm_ahead_env": (None if self._warm_env is None else
+                                       f"{WARM_AHEAD_ENV}={'1' if self._warm_env else '0'}"),
+                    "warm": self._warm_summary(now),
+                    "warm_alarm": dict(self._warm_alarm) if self._warm_alarm else None}
 
     # -- scheduling -------------------------------------------------------------------
 
-    def _blocked_by(self, job: Job, now: float) -> str:
+    def _blocked_by(self, job: Job, now: float, ignore_hold: bool = False) -> str:
         """Why a queued job may not go now ("" when it is eligible) -- the
-        job's own conditions, not the machine's."""
+        job's own conditions, not the machine's.  ``ignore_hold``: the person
+        hold left out (a warm launch stays ready behind it; GO still waits)."""
         if job.state != "queued":
             return f"it is {job.state}"
         if job.paused:
@@ -1636,7 +1996,7 @@ class RunQueue:
         if job.owner == "agent" and self._paused.get("agent"):
             p = self._paused["agent"]
             return f"agent jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
-        if job.owner == "agent" and self.hold.active:
+        if job.owner == "agent" and self.hold.active and not ignore_hold:
             return f"held: {self.hold.info().get('reason')}"
         return ""
 
@@ -1683,7 +2043,10 @@ class RunQueue:
             return own
         if self._current is not None:
             cur = self._jobs.get(self._current)
-            return f"after #{self._current} ({cur.state if cur else 'in the slot'})"
+            text = f"after #{self._current} ({cur.state if cur else 'in the slot'})"
+            if job.warm is not None:
+                text += f"; {_warm_text(job.warm, now)}"
+            return text
         order = self._order(now) if order is None else order
         if order and order[0].id != job.id:
             return f"#{order[0].id} goes first"
@@ -1709,6 +2072,7 @@ class RunQueue:
             if cur is not None:
                 self._follow(cur)
             self._settle(now)
+            self._warm_tick(self._clock())
             if self._current is None:
                 self._schedule(self._clock())
             self._alarm_tick(self._clock())
@@ -1792,14 +2156,22 @@ class RunQueue:
                     self._stop_loop_for_jobs(loop, stopper)
             if self._last_end_t is not None and now - self._last_end_t < self._gap_s:
                 return
+            head = order[0]
+            if head.warm is not None:
+                self._go_or_wait(head, self._clock())
+                return
             why = self._gate()
             if why:
                 if why != self._waiting:
-                    log.info("Run queue: %s waits: %s", order[0].name, why)
+                    log.info("Run queue: %s waits: %s", head.name, why)
                 self._waiting = why
                 return
             self._waiting = ""
             for job in order:
+                if job.warm is not None:
+                    # its warm process decides (never a second, cold one)
+                    self._go_or_wait(job, self._clock())
+                    return
                 if self._launch(job):          # else skipped at launch: try the next
                     return
             return
@@ -1878,6 +2250,782 @@ class RunQueue:
             return ""
         return verdict.reason
 
+    # -- warm start ---------------------------------------------------------------------
+
+    def _public(self, job: Job, now: float | None = None) -> dict:
+        """The job's record as replies show it (the warm record trimmed:
+        :func:`_warm_public`)."""
+        d = job.to_dict()
+        d["warm"] = _warm_public(job.warm, self._clock() if now is None else now)
+        return d
+
+    def _warm_summary(self, now: float) -> dict | None:
+        """The live warm launch for ``info()``: ``{"job", "label", "state",
+        "text", "attempt"}``, or None."""
+        for j in self._warm_live():
+            return {"job": j.id, "label": j.label, "state": j.warm.get("state"),
+                    "text": _warm_text(j.warm, now), "attempt": j.warm.get("attempt")}
+        return None
+
+    def _warm_live(self) -> list[Job]:
+        """The jobs with a warm record whose GO was not given (one at most,
+        normally), by id."""
+        return sorted((j for j in self._jobs.values()
+                       if j.warm is not None and not j.warm.get("go")), key=lambda j: j.id)
+
+    def _warm_candidate(self, now: float, ignore_hold: bool = False) -> Job | None:
+        """The job a warm launch is for: the first queued job in rank order
+        not blocked at ``now + WARM_DUE_LEAD_S`` (so a job due within that
+        may warm; its GO waits until it is due).  None when a job ahead of it
+        waits for the job in the slot (``after``): that one may well go first
+        once the slot job is saved, so nobody warms (never an ``after`` on the
+        running job).  ``ignore_hold``: held agent jobs count (a live warm
+        launch stays ready behind a person hold); a new warm launch is never
+        started for a held job."""
+        for j in self._queued_in_order():
+            if not self._blocked_by(j, now + WARM_DUE_LEAD_S, ignore_hold=ignore_hold):
+                return j
+            if self._current is not None and self._current in j.after:
+                return None
+        return None
+
+    @staticmethod
+    def _reserve_advertised(poll) -> bool:
+        """liveOD's POLL advertises ``features.reserve`` (absent: no)."""
+        f = poll.get("features") if isinstance(poll, dict) else None
+        if isinstance(f, dict):
+            return bool(f.get("reserve"))
+        if isinstance(f, (list, tuple, set)):
+            return "reserve" in f
+        return False
+
+    def _job_env(self, job: Job, warm_token: str | None = None) -> dict:
+        """A launch's environment.  ``WAXX_QUEUE_WARM`` only on a warm
+        launch (never inherited from the server's own environment)."""
+        # unbuffered: output reaches the log as printed; UTF-8: the log is read
+        # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        env[run_gate.LAUNCHER_ENV] = LAUNCHER
+        env[JOB_ENV] = job.queue_job
+        env[OWNER_ENV] = job.owner
+        if job.write_back is False:
+            env[NO_WRITE_BACK_ENV] = "1"
+        else:
+            env.pop(NO_WRITE_BACK_ENV, None)
+        env.pop(WARM_ENV, None)
+        if warm_token:
+            env[WARM_ENV] = warm_token
+        return env
+
+    def _command(self, job: Job) -> str:
+        command = ar_command(_quote(job.path))
+        if job.argv:
+            command += " " + " ".join(_quote(a) for a in job.argv)
+        return command
+
+    def _mark_aborting(self, job: Job, why: str) -> bool:
+        """Under the lock: tell the job's warm process to stand down (it
+        exits at its next poll).  False when there is nothing to tell (no
+        live warm launch, GO given, or already told)."""
+        w = job.warm
+        if w is None or w.get("go") or w.get("state") == "aborting":
+            return False
+        w["state"] = "aborting"
+        w["why"] = why
+        w["aborted_at"] = self._clock()
+        log.info("Run queue: %s's warm process is told to exit: %s", job.name, why)
+        self._record("run_queue_warm_discard", job=job.id, attempt=w.get("attempt"), why=why,
+                     py_pid=w.get("py_pid"), cmd_pid=w.get("cmd_pid"))
+        return True
+
+    def _discard_warm(self, job: Job, why: str) -> None:
+        with self._lock:
+            done = self._mark_aborting(job, why)
+            if done and why.endswith(WARM_STALE_MARK):
+                # only stale (the slot job ran long): its attempt is given
+                # back at its exit, so waiting never makes the job cold
+                job.warm["refund_attempt"] = True
+        if done:
+            self._save()
+            self._notify()
+
+    def _warm_tick(self, now: float) -> None:
+        """Follow the warm launches (their processes, discards, the alarm),
+        then start one when it is time (``warm_ahead``)."""
+        self._follow_warm_spawn()
+        for job in self._warm_live():
+            self._follow_warm(job, now)
+        self._maybe_warm(now)
+
+    def _follow_warm(self, job: Job, now: float) -> None:
+        code = self._warm_exit_code(job, now)
+        if code is not None:
+            self._warm_exited(job, code)
+            return
+        w = job.warm
+        if w is None:
+            return
+        if w.get("state") == "aborting":
+            waited = now - float(w.get("aborted_at") or now)
+            if waited > WARM_KILL_AFTER_S and not w.get("kill_tried"):
+                if self._stop_warm(job, waited):
+                    return                            # its exit is seen at a later tick
+            if waited > WARM_KILL_AFTER_S and not w.get("alarmed"):
+                text = (f"{job.name}'s discarded warm process (pid "
+                        f"{w.get('py_pid') or w.get('cmd_pid') or '?'}) has not exited "
+                        f"{waited:.0f} s after it was told to ({w.get('why')}); "
+                        + (f"the queue's stop failed ({w.get('kill_note')})"
+                           if w.get("kill_tried") else "the queue does not stop it")
+                        + " -- check it")
+                with self._lock:
+                    w["alarmed"] = now
+                    self._warm_alarm = {"job": job.id, "since": now, "text": text}
+                log.warning("RUN QUEUE ALARM: %s", text)
+                self._record("run_queue_warm_not_exiting", job=job.id, waited_s=round(waited, 1),
+                             py_pid=w.get("py_pid"), cmd_pid=w.get("cmd_pid"), why=w.get("why"))
+                self._save()
+                self._notify()
+            return
+        why = self._warm_discard_why(job, now)
+        if (not why and w.get("state") == "ready"
+                and now - self._warm_checked.get(job.id, float("-inf")) >= WARM_MANIFEST_CHECK_S):
+            self._warm_checked[job.id] = now
+            why = self._warm_stale(job)
+        if why:
+            self._discard_warm(job, why)
+
+    def _stop_warm(self, job: Job, waited: float) -> bool:
+        """A discarded warm process has not exited ``WARM_KILL_AFTER_S``
+        after it was told to: stop it -- its python, then the shell the queue
+        launched, each with its tree (:func:`~waxx.util.device_state.detached.
+        kill_tree`) -- only while it was never given GO (it has claimed
+        nothing: no hardware, no core connection, no liveOD start) and only
+        a pid whose recorded creation time still matches (Windows reuses
+        pids).  Tried once per warm launch.  True when nothing of it is left
+        alive; False leaves the alarm to the caller."""
+        with self._lock:
+            w = job.warm
+            if w is None or w.get("state") != "aborting" or w.get("kill_tried"):
+                return False
+            targets = [(role, w.get(p), w.get(s)) for role, p, s in
+                       (("experiment", "py_pid", "py_started"), ("shell", "cmd_pid", "cmd_started"))
+                       if w.get(p)]
+            if w.get("go"):
+                note = "not stopped: GO was decided for it"
+                targets = []
+            elif not targets:
+                note = "not stopped: no pid of it is known"
+            elif any(started is None for _, _, started in targets):
+                note = ("not stopped: a pid of it has no recorded creation time (it may be "
+                        "another process with a reused pid)")
+                targets = []
+            else:
+                note = ""
+            w["kill_tried"] = self._clock()
+        results = []
+        for role, pid, started in targets:
+            try:
+                r = dict(self._kill(pid, started))
+            except Exception as exc:                  # noqa: BLE001
+                r = {"pid": pid, "ok": False, "gone": False, "note": f"kill failed: {exc!r}"}
+            r["role"] = role
+            results.append(r)
+        left = [r for r in results if not (r.get("ok") or r.get("gone"))]
+        if not note:
+            note = ("stopped" if not left else "NOT all stopped: " + "; ".join(
+                f"{r['role']} pid {r['pid']}: {r.get('note')}" for r in left))
+        with self._lock:
+            if job.warm is w:
+                w["kill_note"] = note
+                w["kill_results"] = results
+        stopped = bool(results) and not left
+        (log.warning if stopped else log.error)(
+            "Run queue: %s's discarded warm process had not exited %.0f s after it was told to "
+            "(%s); never given GO: %s.", job.name, waited, w.get("why"), note)
+        self._record("run_queue_warm_killed", job=job.id, attempt=w.get("attempt"),
+                     waited_s=round(waited, 1), why=w.get("why"), results=results, note=note,
+                     stopped=stopped)
+        self._save()
+        self._notify()
+        return stopped
+
+    def _warm_discard_why(self, job: Job, now: float) -> str:
+        """Why the job's live warm launch must stand down ("" when it may
+        stay)."""
+        with self._lock:
+            w = job.warm
+            if w is None:
+                return ""
+            if job.state != "queued":
+                return f"{job.name} is {job.state}" + (f" ({job.reason})" if job.reason else "")
+            if job.cold or job.cold_why:
+                return "it was made cold" + (f" ({job.cold_why})" if job.cold_why else "")
+            if not self.warm_ahead:
+                return "warm start was switched off"
+            spec = w.get("spec") or {}
+            changed = [k for k in WARM_SPEC_FIELDS if k in spec and spec[k] != getattr(job, k)]
+            if changed:
+                return "edited (" + ", ".join(changed) + ")"
+            # a person hold keeps it ready (user, 2026-10-19): GO still waits
+            # for the release (_order / _go check the hold); anything else
+            # that blocks the job discards it
+            blocked = self._blocked_by(job, now + WARM_DUE_LEAD_S, ignore_hold=True)
+            if blocked:
+                return blocked
+            cand = self._warm_candidate(now, ignore_hold=True)
+            if cand is not job:
+                return "no longer next" + (f" (#{cand.id} is)" if cand is not None else "")
+            if (w.get("state") == "ready"
+                    and now - float(w.get("ready_at") or now) > WARM_READY_MAX_S):
+                return f"ready for more than {WARM_READY_MAX_S / 60.0:.0f} min {WARM_STALE_MARK}"
+            if (w.get("state") == "warming"
+                    and now - float(w.get("spawned_at") or now) > WARM_PREP_MAX_S):
+                return f"not ready {WARM_PREP_MAX_S / 60.0:.0f} min after its launch"
+        return ""
+
+    def _warm_stale(self, job: Job) -> str:
+        """Called OUTSIDE the lock: why the ready warm process's code is no
+        longer what is on disk -- a manifest file changed or is gone, or the
+        experiment file differs from its hash at the warm launch -- or ""."""
+        with self._lock:
+            w = job.warm
+            if w is None:
+                return ""
+            manifest = list(w.get("manifest") or ())
+            sha, path = w.get("sha256"), job.path
+        for entry in manifest:
+            try:
+                p, mtime, size = str(entry[0]), int(entry[1]), int(entry[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if queue_gate.is_network_path(p):
+                continue                              # never stat a share from the tick
+            try:
+                st = os.stat(p)
+            except OSError:
+                return f"a file it loaded is gone: {p}"
+            if st.st_mtime_ns != mtime or st.st_size != size:
+                return f"a file it loaded changed: {p}"
+        view: dict = {}
+        self._fill_source_changed([(view, self._stat_key(path), sha)])
+        if view.get("source_changed") is None:
+            return "its experiment file cannot be read"
+        if view["source_changed"]:
+            return "its experiment file changed since its warm launch"
+        return ""
+
+    def _adopt_warm(self, w: Mapping):
+        """A watch on a warm process from its record -- the launched shell,
+        else the experiment's python -- by pid AND creation time (a pid with
+        no recorded creation time is never taken: Windows reuses pids)."""
+        for pid_key, started_key in (("cmd_pid", "cmd_started"), ("py_pid", "py_started")):
+            pid, started = w.get(pid_key), w.get(started_key)
+            if not pid or started is None:
+                continue
+            try:
+                proc = self._adopt(pid, started)
+            except Exception:                         # noqa: BLE001
+                proc = None
+            if proc is not None:
+                return proc
+        return None
+
+    def _warm_exit_code(self, job: Job, now: float):
+        """None while the job's warm process lives (or may: its launch is
+        still being answered); its exit code once it is gone (-1: unknown)."""
+        proc = self._warm_procs.get(job.id)
+        if proc is None:
+            sp = self._warm_spawn
+            if sp is not None and sp["job"] == job.id:
+                return None
+            w = job.warm or {}
+            if w.get("py_pid"):
+                proc = self._adopt_warm({"py_pid": w.get("py_pid"),
+                                         "py_started": w.get("py_started")})
+                if proc is None:
+                    return -1
+                self._warm_procs[job.id] = proc
+            else:
+                since = max(float(w.get("spawned_at") or 0.0), float(w.get("adopt_from") or 0.0))
+                return None if now - since < WARM_HELLO_WAIT_S else -1
+        try:
+            return proc.poll()
+        except Exception:                             # noqa: BLE001
+            return None
+
+    def _warm_exited(self, job: Job, code) -> None:
+        """A warm process (no GO given) has exited: its record goes.  Told to
+        stand down, or it stood down itself (exit 78), or gone with no exit
+        code known: the job stays as it is (a launch discarded only for
+        being stale gives its attempt back).  Any other exit -- it died
+        while warming or ready, before it took the machine -- makes the job
+        COLD and leaves it queued: some failures happen only because the
+        launch was warm (a host kernel call in prepare refused before GO, a
+        lazy device touched before GO, a person ending a stuck warm
+        process); a genuine bug then fails the cold launch as before."""
+        proc = self._warm_procs.pop(job.id, None)
+        _close(proc)
+        self._warm_checked.pop(job.id, None)
+        with self._lock:
+            w = job.warm
+            if w is None or w.get("go"):
+                return
+            state = w.get("state")
+            job.warm = None
+            refund = bool(w.get("refund_attempt")) and job.warm_attempts > 0
+            if refund:
+                job.warm_attempts -= 1
+            cold = (state != "aborting" and code not in (-1, EXIT_WARM_ABORTED)
+                    and job.state == "queued")
+            if cold:
+                job.cold_why = (f"warm attempt failed (exit {code}): its warm process exited "
+                                f"while {state}, before it took the machine; it launches cold")
+            if self._warm_alarm is not None and self._warm_alarm.get("job") == job.id:
+                self._warm_alarm = None
+        if cold:
+            log.warning("Run queue: %s: its warm process exited (code %s) while %s, before "
+                        "it took the machine; the job stays queued and launches cold.",
+                        job.name, code, state)
+        else:
+            log.info("Run queue: %s's warm process exited (code %s; it was %s%s).", job.name,
+                     code, state, f": {w.get('why')}" if w.get("why") else "")
+        self._record("run_queue_warm_exited", job=job.id, attempt=w.get("attempt"), code=code,
+                     state=state, why=w.get("why") or "", failed=False, made_cold=cold,
+                     attempt_refunded=refund)
+        if cold:
+            self._record("run_queue_warm_made_cold", job=job.id, attempt=w.get("attempt"),
+                         code=code, cold_why=job.cold_why)
+        self._save()
+        self._notify()
+
+    def _maybe_warm(self, now: float) -> None:
+        """Start a warm launch when it is time (see the module docstring)."""
+        if not self.warm_ahead or self._stop_launching or self._warm_spawn is not None:
+            return
+        with self._lock:
+            if self._warm_live():
+                return                                # one warm process at a time
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if cur is None or cur.state != "running" or cur.calibrates_declared:
+                return
+            poll = self._last_poll
+            if not self._reserve_advertised(poll):
+                return
+            if not (self._is_job_run(cur, poll) and poll.get("run_in_progress")
+                    and int(poll.get("n_shots") or 0) >= 1):
+                return                                # the two compiles never overlap
+            end, _ = self._running_end(cur, now)
+            if end is None or end - now > WARM_LEAD_S:
+                # an unknown ETA waits until liveOD's shot timing (or a
+                # duration estimate) gives one: warming at once would go stale
+                # on a long run
+                return
+            cand = self._warm_candidate(now)
+            if (cand is None or cand.cold or cand.cold_why
+                    or cand.warm_attempts >= WARM_MAX_ATTEMPTS
+                    or self._warm_skip.get(cand.id) == cur.id):
+                return
+            path = cand.path
+        try:
+            sha = file_sha256(path)
+        except OSError:
+            return
+        if sha != cand.sha256 and not cand.allow_drift:
+            return                                    # skipped at its cold launch, as today
+        self._warm_launch(cand, cur, sha, now)
+
+    def _warm_launch(self, job: Job, cur: Job, sha: str, now: float) -> None:
+        """Launch ``job``'s warm process: its record is SAVED first (a server
+        that dies meanwhile knows its token), then the process is started on
+        a thread of its own, at BELOW_NORMAL priority, with
+        ``WAXX_QUEUE_WARM=<token>``."""
+        token = secrets.token_hex(8)
+        log_path = self._path("logs", f"{job.id}_{job.label}.out")
+        command = self._command(job)
+        with self._lock:
+            if (job.state != "queued" or job.warm is not None or self._stop_launching
+                    or self._warm_candidate(now) is not job):
+                return
+            job.warm_attempts += 1
+            job.warm = {"token": token, "state": "warming", "attempt": job.warm_attempts,
+                        "spawned_at": now, "for_slot": cur.id, "sha256": sha,
+                        "spec": {k: getattr(job, k) for k in WARM_SPEC_FIELDS},
+                        "cmd_pid": None, "cmd_started": None, "py_pid": None,
+                        "py_started": None, "manifest": None, "ready_at": None, "go": None,
+                        "log_offset": None}
+            job.warm_started_at = now
+            job.log_path = log_path
+        if not self._save():
+            with self._lock:
+                if job.warm is not None and job.warm.get("token") == token:
+                    job.warm = None
+                    job.warm_attempts -= 1
+            log.error("Run queue: %s not warm-launched: queue.json could not be saved first (%s).",
+                      job.name, self._save_error or "it is not to be overwritten")
+            return
+        self._record("run_queue_warm_launch", job=job.id, attempt=job.warm_attempts,
+                     command=command, for_slot=cur.id, log_path=log_path)
+        env = self._job_env(job, warm_token=token)
+        try:
+            os.makedirs(self._path("logs"), exist_ok=True)
+            with open(log_path, "ab") as f:
+                f.write((f"-- run queue {time.strftime('%Y-%m-%d %H:%M:%S')}: {job.name}, warm "
+                         f"launch {job.warm_attempts} (behind job {cur.id}), owner {job.owner}, "
+                         f"sha256 {sha[:12]} --\n$ {command}\n").encode("utf-8"))
+                offset = f.tell()
+        except OSError as exc:
+            with self._lock:
+                if job.warm is not None and job.warm.get("token") == token:
+                    job.warm = None
+                self._warm_skip[job.id] = cur.id
+            log.error("Run queue: %s not warm-launched: cannot write its log %s (%s).", job.name,
+                      log_path, exc)
+            self._record("run_queue_warm_launch_failed", job=job.id, error=str(exc))
+            self._save()
+            return
+        with self._lock:
+            job.warm["log_offset"] = offset
+        result: dict = {}
+        record: dict = {}
+
+        def spawn():
+            try:
+                proc = self._spawn(command, cwd=job.cwd, env=env, log_path=log_path,
+                                   below_normal=True)
+            except BaseException as exc:              # noqa: BLE001
+                result["error"] = exc
+                return
+            with self._lock:
+                result["proc"] = proc
+                abandoned = self._warm_spawn is not record
+            if abandoned:
+                # the queue stopped waiting for this launch: the process is
+                # found by its hello (pid + creation time) instead
+                _close(proc)
+        thread = threading.Thread(target=spawn, daemon=True, name=f"run-queue-warm-{job.id}")
+        record.update({"job": job.id, "token": token, "thread": thread, "result": result,
+                       "since": self._clock(), "slot": cur.id})
+        self._warm_spawn = record
+        log.info("Run queue: %s warm-launched behind %s (attempt %d).", job.name, cur.name,
+                 job.warm_attempts)
+        thread.start()
+        thread.join(self._spawn_join_s)
+        self._follow_warm_spawn()
+        self._notify()
+
+    def _follow_warm_spawn(self) -> None:
+        """The warm launch thread's answer: the process to follow, or why
+        there is none."""
+        sp = self._warm_spawn
+        if sp is None:
+            return
+        job = self._jobs.get(sp["job"])
+        if sp["thread"].is_alive():
+            if self._clock() - sp["since"] <= LAUNCH_TIMEOUT_S + WARM_HELLO_WAIT_S:
+                return
+            with self._lock:
+                self._warm_spawn = None               # a late answer is closed by the thread
+            log.error("Run queue: %s: its warm launch did not answer; the process (if any) is "
+                      "followed by its hello.", job.name if job else sp["job"])
+            self._record("run_queue_warm_launch_unknown", job=sp["job"], error="no answer")
+            return
+        self._warm_spawn = None
+        result = sp["result"]
+        if "proc" in result:
+            proc = result["proc"]
+            with self._lock:
+                w = job.warm if job is not None else None
+                keep = w is not None and w.get("token") == sp["token"]
+                if keep:
+                    w["cmd_pid"] = int(proc.pid)
+                    w["cmd_started"] = getattr(proc, "started", None)
+                    self._warm_procs[job.id] = proc
+            if not keep:
+                _close(proc)
+                return
+            self._record("run_queue_warm_launched", job=job.id, cmd_pid=int(proc.pid))
+            self._save()
+            return
+        exc = result.get("error")
+        from waxx.util.device_state.detached import LaunchUnknown  # noqa: PLC0415
+        if isinstance(exc, LaunchUnknown):
+            log.error("Run queue: %s: warm launch: %s", job.name if job else sp["job"], exc)
+            self._record("run_queue_warm_launch_unknown", job=sp["job"], error=str(exc))
+            return
+        with self._lock:
+            if job is not None and job.warm is not None and job.warm.get("token") == sp["token"]:
+                job.warm = None
+            self._warm_skip[sp["job"]] = sp["slot"]
+        log.error("Run queue: could not warm-launch %s: %r (it launches cold).",
+                  job.name if job else sp["job"], exc)
+        self._record("run_queue_warm_launch_failed", job=sp["job"], error=repr(exc))
+        self._save()
+        self._notify()
+
+    def _set_waiting(self, why: str, job: Job) -> None:
+        if why != self._waiting:
+            log.info("Run queue: %s waits: %s", job.name, why)
+        self._waiting = why
+
+    def _go_or_wait(self, job: Job, now: float) -> None:
+        """The slot is free and ``job`` -- the next to go -- has a warm
+        launch: GO when it is ready, the gate is free and its files are as
+        it loaded them; otherwise wait (a discarded process first exits:
+        never two processes for one job)."""
+        with self._lock:
+            w = dict(job.warm or {})
+        state = w.get("state")
+        if state == "aborting":
+            self._gate_kind = "live"
+            self._set_waiting(f"#{job.id}'s discarded warm process is exiting ({w.get('why')})",
+                              job)
+            return
+        if state != "ready":
+            self._gate_kind = "live"
+            self._set_waiting(f"#{job.id} is {_warm_text(w, now)}: GO once it is ready", job)
+            return
+        why = self._gate()
+        if why:
+            self._set_waiting(why, job)
+            return
+        stale = self._warm_stale(job)
+        if stale:
+            self._discard_warm(job, stale)
+            self._set_waiting(f"#{job.id}'s warm process is discarded: {stale}", job)
+            return
+        self._waiting = ""
+        self._go(job, now)
+
+    def _go(self, job: Job, now: float) -> None:
+        """Give ``job``'s warm process the machine: the decision is SAVED
+        (job ``launching``, ``warm.go``) before the ``warm`` request may hand
+        it out; then the job is ``running`` with the warm process as its
+        process.  The server raises the process's priority too (backstop)."""
+        poll = self._last_poll
+        reset_count = poll.get("reset_count") if isinstance(poll, dict) else None
+        # the liveOD process that count belongs to (absent: an older liveOD)
+        instance = poll.get("instance") if isinstance(poll, dict) else None
+        proc = self._warm_procs.get(job.id)
+        if proc is None:
+            with self._lock:
+                w = dict(job.warm or {})
+            proc = self._adopt_warm(w)
+            if proc is None:
+                self._discard_warm(job, "its process cannot be followed (no watch, no pid with "
+                                        "a creation time)")
+                return
+            self._warm_procs[job.id] = proc
+        with self._lock:
+            w = job.warm
+            if (job.state != "queued" or w is None or w.get("state") != "ready" or w.get("go")
+                    or self._current is not None or self._stop_launching
+                    or self._blocked_by(job, now)):
+                return
+            job.state = "launching"
+            job.launched_at = now
+            job.reason = ""
+            self._current = job.id
+            w["go"] = {"at": now, "reset_count": reset_count, "liveod_instance": instance,
+                       "delivered": None}
+            self._procs[job.id] = None
+            self._log_pos[job.id] = int(w.get("log_offset") or 0)
+            self._log_partial[job.id] = ""
+            self._tails[job.id] = deque(maxlen=TAIL_LINES)
+            self._owe_monitor = True
+            self._owed_since = None
+        if not self._save():                           # GO is on disk before it is handed out
+            with self._lock:
+                if job.state == "launching" and w.get("go"):
+                    job.state = "queued"
+                    w["go"] = None
+                    job.launched_at = None
+                    self._current = None
+                    self._procs.pop(job.id, None)
+                self._launch_blocked_until = self._clock() + SAVE_RETRY_S
+            log.error("Run queue: GO for %s not given: it could not be saved first (%s); "
+                      "launches wait %.0f s.", job.name,
+                      self._save_error or "queue.json is not to be overwritten", SAVE_RETRY_S)
+            self._record("run_queue_launch_refused", job=job.id, reason="GO could not be saved")
+            self._notify()
+            return
+        self._go_saved.add(job.id)
+        self._warm_procs.pop(job.id, None)
+        spawned, ready = float(w.get("spawned_at") or now), float(w.get("ready_at") or now)
+        log.info("Run queue: GO for %s (warm %.0f s, ready for %.0f s).", job.name,
+                 now - spawned, now - ready)
+        self._record("run_queue_warm_go", job=job.id, attempt=w.get("attempt"),
+                     reset_count=reset_count, warm_s=round(now - spawned, 1),
+                     ready_s=round(now - ready, 1), py_pid=w.get("py_pid"))
+        if w.get("py_pid"):
+            try:
+                self._set_priority(w.get("py_pid"), w.get("py_started"))
+            except Exception:                         # noqa: BLE001
+                log.exception("Run queue: raising %s's priority failed", job.name)
+        self._launched(job, proc)
+        if self._alarm is not None:
+            self._clear_alarm("a job was given GO")
+
+    def _warm_requeue(self, job: Job, proc, code) -> None:
+        """The job's warm process exited after its GO was decided and saved,
+        but before it was handed out: nothing of it ran.  Back in the queue
+        (or cancelled, when a cancel came meanwhile)."""
+        _close(proc)
+        with self._lock:
+            w = job.warm or {}
+            self._go_saved.discard(job.id)
+            self._procs.pop(job.id, None)
+            self._current = None
+            self._last_end_t = self._clock()
+            job.pid = job.pid_started = job.launched_at = job.client_pid = None
+            job.warm = None
+            if job.cancel is not None:
+                self._end(job, "cancelled", f"cancelled by {job.cancel.get('by')} before its "
+                                            "warm process was given the machine (nothing ran)",
+                          stop_chain=True)
+            else:
+                job.state = "queued"
+                job.reason = (f"its warm process exited (code {code}) after GO was decided, "
+                              "before it was handed out: back in the queue (nothing ran)")
+        log.warning("Run queue: %s: %s", job.name, job.reason)
+        self._record("run_queue_warm_requeued", job=job.id, attempt=w.get("attempt"), code=code,
+                     state=job.state)
+        self._save()
+        self._notify()
+
+    def warm_request(self, obj: Mapping) -> dict:
+        """``{"stage": "warming" | "ready" | "poll", "job": "<id>:<token>",
+        "warm": <warm token>, "pid", "started", "manifest"?}`` -- the warm
+        process's request (:mod:`~waxx.util.device_state.queue_gate`).  Short:
+        memory and queue.json only, never liveOD.  ->
+        ``{"status": "ok", "go": false, "why"}`` (``resend_ready`` when the
+        queue needs the manifest again) | ``{"status": "ok", "go": true,
+        "reset_count"}`` | ``{"status": "ok", "abort": why}``.  GO only for
+        the matching job, warm token, pid and creation time, and only once it
+        is on disk; repeats from the same process are answered the same
+        (idempotent); anything else is told to abort."""
+        stage = obj.get("stage")
+        if stage not in ("warming", "ready", "poll"):
+            return {"status": "error", "msg": f"stage must be warming, ready or poll, not "
+                                              f"{stage!r}"}
+        jid, token = _parse_queue_job(obj.get("job"))
+        wtok = str(obj.get("warm") or "")
+        try:
+            pid = int(obj.get("pid"))
+        except (TypeError, ValueError):
+            pid = None
+        started = obj.get("started")
+        try:
+            started = None if started is None else float(started)
+        except (TypeError, ValueError):
+            started = None
+        now = self._clock()
+        changed, delivered, records = False, False, []
+
+        def abort(why: str) -> dict:
+            key = (jid, wtok)
+            if key not in self._warm_abort_logged:
+                self._warm_abort_logged.add(key)
+                records.append(("run_queue_warm_abort_sent", {"job": jid, "pid": pid,
+                                                              "why": why}))
+            return {"status": "ok", "abort": why}
+
+        with self._lock:
+            job = self._jobs.get(jid) if jid is not None else None
+            w = job.warm if job is not None else None
+            if job is None or not token or job.token != token:
+                reply = abort(f"job {obj.get('job')!r} is not a job of this run queue")
+            elif w is None or not wtok or w.get("token") != wtok:
+                reply = abort(f"{job.name}: this warm launch is not the queue's current one "
+                              "(discarded or replaced)")
+            elif pid is None:
+                reply = abort("no pid given")
+            elif started is None:
+                # Windows reuses pids: a pid alone never names a process
+                reply = abort("no process creation time given (a pid alone is never trusted)")
+            elif w.get("py_pid") is not None and (
+                    pid != w.get("py_pid") or w.get("py_started") is None
+                    or abs(started - float(w["py_started"])) > SAME_PROCESS_S):
+                reply = abort(f"{job.name}'s warm launch belongs to pid {w.get('py_pid')}, "
+                              f"not {pid}")
+            else:
+                if w.get("py_pid") is None:
+                    w["py_pid"], w["py_started"] = pid, started
+                    w.setdefault("hello_at", now)
+                    changed = True
+                    records.append(("run_queue_warm_hello", {"job": job.id, "py_pid": pid,
+                                                             "stage": stage}))
+                go = w.get("go")
+                if w.get("state") == "aborting":
+                    reply = abort(str(w.get("why") or "discarded"))
+                elif go and job.id in self._go_saved:
+                    if job.cancel is not None and not go.get("delivered"):
+                        reply = abort(f"cancelled by {job.cancel.get('by')} before it was "
+                                      "given the machine")
+                    elif job.state not in ("launching", "running"):
+                        reply = abort(f"{job.name} is {job.state}")
+                    else:
+                        if not go.get("delivered"):
+                            go["delivered"] = now
+                            delivered = True
+                        reply = {"status": "ok", "go": True, "reset_count": go.get("reset_count"),
+                                 "liveod_instance": go.get("liveod_instance")}
+                elif go:
+                    reply = {"status": "ok", "go": False, "why": "GO is being saved"}
+                elif job.state != "queued":
+                    reply = abort(f"{job.name} is {job.state}"
+                                  + (f" ({job.reason})" if job.reason else ""))
+                else:
+                    if stage == "ready" and w.get("state") != "ready":
+                        manifest = []
+                        for entry in list(obj.get("manifest") or ())[:WARM_MANIFEST_MAX]:
+                            try:
+                                e = [str(entry[0]), int(entry[1]), int(entry[2])]
+                            except (TypeError, ValueError, IndexError):
+                                continue
+                            # a network path is never kept: the tick re-stats
+                            # the manifest, and a hung share must not stall it
+                            if not queue_gate.is_network_path(e[0]):
+                                manifest.append(e)
+                        w["state"], w["ready_at"], w["manifest"] = "ready", now, manifest
+                        changed = True
+                        records.append(("run_queue_warm_ready", {
+                            "job": job.id, "py_pid": pid, "manifest_n": len(manifest),
+                            "warm_s": round(now - float(w.get("spawned_at") or now), 1)}))
+                    reply = {"status": "ok", "go": False, "why": self._warm_why(job, now)}
+                    if stage == "poll" and w.get("state") != "ready":
+                        reply["resend_ready"] = True
+        if changed or delivered:
+            saved = self._save()
+            if delivered and not saved:
+                with self._lock:
+                    go = (job.warm or {}).get("go")
+                    if go and go.get("delivered") == now:
+                        go["delivered"] = None
+                reply = {"status": "ok", "go": False,
+                         "why": "queue.json could not be saved: GO waits until it can be"}
+                delivered = False
+        if delivered:
+            log.info("Run queue: GO handed to %s (pid %s).", job.name, pid)
+            records.append(("run_queue_warm_go_delivered", {"job": job.id, "py_pid": pid}))
+        for kind, fields_ in records:
+            self._record(kind, **fields_)
+        if changed or delivered:
+            self._notify()
+        else:
+            self.flush_journal()
+        return reply
+
+    def _warm_why(self, job: Job, now: float) -> str:
+        """Why a ready warm process waits (under the lock; memory only)."""
+        cur = self._jobs.get(self._current) if self._current is not None else None
+        if cur is not None:
+            return (f"#{cur.id} ({cur.label}) is {cur.state}"
+                    + (f", run {cur.run_id}" if cur.run_id else ""))
+        blocked = self._blocked_by(job, now)
+        if blocked:
+            return blocked
+        return self._waiting or "the queue's next step"
+
     # -- launch -----------------------------------------------------------------------
 
     def _launch(self, job: Job) -> bool:
@@ -1890,8 +3038,8 @@ class RunQueue:
         a hung launcher stalls nothing else, and a server that dies meanwhile
         finds a ``launching`` job at restart -- never launched again, looked
         for in liveOD instead (:meth:`_follow_orphan`)."""
-        # TODO(phase 2): warm-ahead / GO handshake and liveOD RESERVE/START
-        # attach here (run-queue plan); nothing of it in phase 1.
+        # (a job with a warm launch never comes here: _schedule hands it to
+        # _go_or_wait -- never a second, cold process for one job)
         try:
             sha = file_sha256(job.path)
         except OSError as exc:
@@ -1907,6 +3055,8 @@ class RunQueue:
                 return False
             if self._stop_launching:                   # the server is restarting
                 return False
+            if job.warm is not None:                   # its warm process decides
+                return True
             if unreadable is not None:
                 self._end(job, "skipped", f"the file cannot be read at launch ({unreadable})")
                 skipped = True
@@ -1916,9 +3066,7 @@ class RunQueue:
             else:
                 skipped = False
                 log_path = self._path("logs", f"{job.id}_{job.label}.out")
-                command = ar_command(_quote(job.path))
-                if job.argv:
-                    command += " " + " ".join(_quote(a) for a in job.argv)
+                command = self._command(job)
                 job.state = "launching"
                 job.launched_at = self._clock()
                 job.log_path = log_path
@@ -1955,16 +3103,7 @@ class RunQueue:
             return True
         self._record("run_queue_launching", job=job.id, command=command, log_path=log_path,
                      owner=job.owner, drift=sha != job.sha256)
-        # unbuffered: output reaches the log as printed; UTF-8: the log is read
-        # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
-        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-        env[run_gate.LAUNCHER_ENV] = LAUNCHER
-        env[JOB_ENV] = job.queue_job
-        env[OWNER_ENV] = job.owner
-        if job.write_back is False:
-            env[NO_WRITE_BACK_ENV] = "1"
-        else:
-            env.pop(NO_WRITE_BACK_ENV, None)
+        env = self._job_env(job)
         try:
             os.makedirs(self._path("logs"), exist_ok=True)
             with open(log_path, "ab") as f:
@@ -2265,6 +3404,10 @@ class RunQueue:
         proc = self._procs.get(job.id)
         code = proc.poll() if proc is not None else -1
         if code is None:
+            return
+        go = (job.warm or {}).get("go")
+        if go and not go.get("delivered"):
+            self._warm_requeue(job, proc, code)
             return
         self._finish(job, proc, code)
 
@@ -2746,8 +3889,9 @@ class RunQueue:
             self._paused[scope] = (data.get("paused") or {}).get(scope) or None
         self._resume_loop = data.get("resume_loop") or None
         self._own_abort_ids = set(data.get("own_abort_ids") or ())
+        self._load_warm(jobs)
         for job in sorted(jobs, key=lambda j: j.id):
-            if job.state not in IN_SLOT:
+            if job.state not in IN_SLOT or job.id in self._procs:
                 continue
             self._log_pos[job.id] = 0
             self._log_partial[job.id] = ""
@@ -2783,6 +3927,68 @@ class RunQueue:
                              run_id=job.run_id)
         self._take_leftover()
         self._save()
+
+    def _load_warm(self, jobs) -> None:
+        """At a restart: the warm launches in queue.json.  A live one (no GO)
+        is taken back by pid + creation time, or -- recorded but gone -- its
+        record goes (the job stays queued; nothing of it ran); one with no
+        pid recorded yet waits for the process's hello.  A job whose GO was
+        saved: its process taken back runs on (the GO is handed out again if
+        it was not); gone before the hand-out, the job goes back in the queue;
+        gone after it, the usual orphan / process-gone path judges it."""
+        now = self._clock()
+        for job in sorted(jobs, key=lambda j: j.id):
+            w = job.warm
+            if w is None:
+                continue
+            if not isinstance(w, dict):
+                job.warm = None
+                continue
+            go = w.get("go")
+            if go:
+                self._go_saved.add(job.id)            # on disk, by definition
+                if job.state != "launching":
+                    continue                          # running: adopted by job.pid below
+                proc = self._adopt_warm(w)
+                if proc is not None:
+                    job.state = "running"
+                    job.pid = int(proc.pid)
+                    job.pid_started = getattr(proc, "started", None)
+                    job.adopted = True
+                    self._procs[job.id] = proc
+                    self._log_pos[job.id] = int(w.get("log_offset") or 0)
+                    self._log_partial[job.id] = ""
+                    self._tails[job.id] = deque(maxlen=TAIL_LINES)
+                    self._owe_monitor = True
+                    log.warning("Run queue: %s had its GO decided when the server stopped; its "
+                                "warm process is alive: followed.", job.name)
+                    self._record("run_queue_warm_adopted", job=job.id, go=True, pid=job.pid)
+                elif not go.get("delivered"):
+                    self._go_saved.discard(job.id)
+                    job.state, job.launched_at, job.warm = "queued", None, None
+                    job.reason = ("its warm process was gone at a server restart, before its "
+                                  "GO was handed out: back in the queue (nothing ran)")
+                    log.warning("Run queue: %s: %s", job.name, job.reason)
+                    self._record("run_queue_warm_requeued", job=job.id, at_restart=True)
+                # else: delivered and gone -- the launching (orphan) path below
+                continue
+            if job.state in ENDED:
+                if w.get("state") != "aborting":
+                    w.update(state="aborting", why=f"{job.name} is {job.state}", aborted_at=now)
+            w["adopt_from"] = now
+            proc = self._adopt_warm(w)
+            if proc is not None:
+                self._warm_procs[job.id] = proc
+                log.warning("Run queue: %s's warm process (%s) is alive after the restart: "
+                            "followed.", job.name, w.get("state"))
+                self._record("run_queue_warm_adopted", job=job.id, go=False,
+                             state=w.get("state"), pid=getattr(proc, "pid", None))
+            elif w.get("cmd_pid") or w.get("py_pid"):
+                job.warm = None
+                log.warning("Run queue: %s's warm process is gone after the restart: its record "
+                            "is dropped (nothing of it ran).", job.name)
+                self._record("run_queue_warm_gone_at_restart", job=job.id, state=w.get("state"))
+            # else: no pid known yet -- its hello is waited for (WARM_HELLO_WAIT_S)
 
     # -- out ------------------------------------------------------------------------------
 

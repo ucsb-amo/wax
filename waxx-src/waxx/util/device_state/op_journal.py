@@ -187,6 +187,17 @@ def describe_entry(e: dict) -> str:
         text = f"SLM reinit {e.get('state')}"
         if e.get("detail"):
             text += f": {e['detail']}"
+    elif kind == "run_queue_warm_ahead":
+        text = (f"warm start {'ON' if e.get('on') else 'OFF'} by {e.get('by') or '?'}"
+                f" ({e.get('owner') or '?'})")
+        if e.get("persist_error"):
+            text += f"; NOT stored: {e['persist_error']}"
+        if e.get("note"):
+            text += f" -- {e['note']}"
+    elif kind == "live_od_launch":
+        text = (f"Start liveOD pressed by {e.get('by') or '?'} on {e.get('host') or '?'}: "
+                + (f"launcher started (pid {e.get('pid')})" if e.get("ok") else
+                   f"launcher FAILED: {e.get('error')}"))
     elif kind.startswith("state_reset_"):
         text = f"{e.get('expt') or 'reset'} {kind[12:]}{_who(e)}"
         if e.get("text") or e.get("msg"):

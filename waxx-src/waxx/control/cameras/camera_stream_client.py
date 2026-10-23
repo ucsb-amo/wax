@@ -53,6 +53,9 @@ from artiq.language.core import now_mu
 
 from waxa.data.camera_frames import N_META, meta_row
 
+from waxx.control.cameras import exposure_delay as _xdelay
+from waxx.control.cameras.exposure_delay import ExposureDelayCell
+
 # free-run: renew the attachment while idle (an on_demand server drops it after 30 s)
 HEARTBEAT_S = 8.0
 # free-run: a snap already this late is skipped rather than taken ever later
@@ -74,6 +77,10 @@ T_QUEUE_DRAIN_S = 30.0
 # the provenance record keeps at most this many events, and per kind
 MAX_EVENTS = 100
 MAX_EVENTS_PER_KIND = 5
+
+# a stream registered before its connect (the claim) has containers of this
+# shape until activate() / mark_dead() sets the real one
+PROVISIONAL_FRAME_SHAPE = (1,)
 
 LIVEOD_SERVER_SUFFIX = ":liveod"      # liveOD's camera host: camera_server:<host>:liveod
 
@@ -151,6 +158,68 @@ def _values(readback):
             for k, r in (readback or {}).items()}
 
 
+def connect_streams(streams):
+    """The claim's connect of every stream in ``streams`` built with
+    ``connect=False`` (others are skipped): all at once, in parallel -- one
+    camera's round trips and probe frames do not wait for another's. Then,
+    in ``streams`` order, from the calling (experiment) thread: a connected
+    stream is activated (container shapes, worker); a failed one follows its
+    ``on_error``: ``'dummy'`` -> a loud line and ``mark_dead`` (no frames
+    this run, the kernel unchanged); ``'raise'`` -> it and every stream after
+    it that connected are put back (marked dead) and the error is raised.
+    Returns ``[(stream, error or None)]`` for the streams it connected."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    todo = [s for s in streams
+            if isinstance(s, CameraStreamClient) and not s._connected
+            and s._dead_reason is None and not s._finished]
+    errors = {}
+
+    def one(s):
+        try:
+            s.connect()
+        except Exception as e:
+            errors[id(s)] = e
+
+    if len(todo) == 1:
+        one(todo[0])
+    elif todo:
+        pool = ThreadPoolExecutor(max_workers=len(todo),
+                                  thread_name_prefix="camera_stream_connect")
+        try:
+            for f in [pool.submit(one, s) for s in todo]:
+                f.result()
+        except BaseException:
+            # interrupted: let the connects in flight finish, then put every
+            # camera back
+            pool.shutdown(wait=True)
+            for s in todo:
+                s.mark_dead("the claim was interrupted")
+            raise
+        pool.shutdown(wait=True)
+
+    out = []
+    for i, s in enumerate(todo):
+        error = errors.get(id(s))
+        if error is None:
+            try:
+                s.activate()
+            except Exception as e:
+                error = e
+        out.append((s, error))
+        if error is None:
+            continue
+        if s.on_error == "raise":
+            for q in todo[i + 1:]:
+                q.mark_dead("the claim stopped: an earlier stream failed")
+            s.mark_dead(f"setup failed: {error!r}")
+            raise error
+        print(f"[camera_stream:{s.key}] !! {s.serial} could not be set up ({error!r}); "
+              f"no such frames this run")
+        s.mark_dead(f"setup failed: {error!r}")
+    return out
+
+
 def link_trigger_line(*streams):
     """Make triggered streams on one TTL siblings (module docstring)."""
     for s in streams:
@@ -182,6 +251,51 @@ class _PinnedDirectory:
         pass
 
 
+def _beaconed_now(directory):
+    """``{server_id: (host, port)}`` as a fresh listing of ``directory``
+    would find the servers now: the process's beacon registry, heard within
+    the directory's ``max_age_s`` -- a snapshot, no network and no wait (the
+    process has listened since its first listing). None when that cannot be
+    told: a stand-in directory without it, a real one in a process that is
+    not listening for beacons (its cached listing is then the best there
+    is), or any error."""
+    discover = getattr(directory, "_discover_servers", None)
+    if discover is None:
+        return None
+    try:
+        if getattr(directory, "_discover_fn", None) is None:
+            from beacon.discovery import client as dc
+            if dc.listening_for() is None:
+                return None
+        return {str(sid): (str(addr[0]), int(addr[1]))
+                for sid, addr in dict(discover()).items()}
+    except Exception:
+        return None
+
+
+def find_current(directory, query):
+    """``directory.find(query)``, its cached listing trusted only while the
+    server that entry names still beacons from the same address; otherwise
+    (the server restarted on a new port, or is no longer heard) the camera
+    is listed afresh. Returns ``(entry, stale)``: ``stale`` is the cached
+    entry that was replaced, else None.
+
+    Why: a warm-launched run lists the cameras before its compile (the
+    provisional exposure delays, BaslerParams.prepare_for_run) and claims
+    them minutes later, after GO; a camera server restarted in between
+    (liveOD's camera host on a liveOD restart) beacons from a new port, and
+    the cached entry's old one never answers (job 542, 2026-10-21). The
+    check costs nothing when the address still holds: no request, no wait."""
+    entry = directory.find(query)
+    servers = _beaconed_now(directory)
+    host, port = getattr(entry, "host", None), getattr(entry, "port", None)
+    if servers is None or host is None or port is None:
+        return entry, None
+    if servers.get(str(entry.server_id)) == (str(host), int(port)):
+        return entry, None
+    return directory.find(query, refresh=True), entry
+
+
 class CameraStreamClient:
     """Free-run snaps of one camera, one per ``grab()`` (module docstring).
 
@@ -200,11 +314,21 @@ class CameraStreamClient:
                  no_roi_downsample=1, frame_timeout_s=5.0, t_snap_lead=0.0,
                  t_late_tolerance=T_LATE_TOLERANCE_S, label=None,
                  live_od_client=None, directory=None, defer_register=False,
+                 connect=True, on_error="raise",
                  _stream=None, _server_defaults=None):
         """``defer_register``: set the camera up but register nothing with
         the experiment (no containers, no worker); the caller then calls
         ``register()`` -- from the thread that owns the experiment, in a fixed
-        order -- or ``abandon()``. For setting several streams up in parallel."""
+        order -- or ``abandon()``. For setting several streams up in parallel.
+
+        ``connect=False``: no network at all now. The stream object -- what
+        the kernel sees -- is complete, and ``register()`` gives it
+        containers with a provisional shape; the experiment's claim then
+        calls ``connect()`` (camera, settings, probe frame; any thread) and
+        ``activate()`` (real container shapes, worker; the experiment's
+        thread), or ``mark_dead(reason)`` when the connect failed: the kernel
+        code still runs, its edges / snaps are counted and nothing is stored
+        (``on_error`` is the caller's policy for that, kept here)."""
         from beacon.camera.directory import query_string
 
         self._expt = expt
@@ -241,24 +365,57 @@ class CameraStreamClient:
         self._priors = {}           # settings to put back at the end
         self._applied = {}          # readback of what we set
         self._liveod_key = None
+        self._resolve_record = {}   # how the claim found the camera's server, when notable
         self._roi = None
         self._downsample = 1
+        self._sensor_shape = ()
         self._tagging = True        # off once the server turns out to keep no tags
+
+        # connect-later state (see __init__'s docstring)
+        self._directory = directory
+        self._stream_hook = _stream                 # test hooks, used at connect
+        self._defaults_hook = _server_defaults
+        self._stream = None
+        self._defaults = {}
+        self._connected = False
+        self._dead_reason = None
+        self._worker = None
+        self.on_error = str(on_error)
+        # what register() gives the containers before the probe frame is known
+        self._frame_shape = PROVISIONAL_FRAME_SHAPE
+        self._frame_dtype = np.dtype(np.uint8)
+        self._registered = False
 
         self._check_key_available(expt, self.key)
 
         # Network: resolve the camera, read its defaults, apply ours, take a
-        # probe frame. This is prepare(): a failure here is loud and costs
-        # no run id.
-        if _stream is not None:                  # test hook
-            self._stream = _stream
-            self._defaults = dict(_server_defaults or {})
+        # probe frame. Here (connect=True) this is prepare(): a failure is
+        # loud and costs no run id.
+        if connect:
+            self._connect_network()
+        if not defer_register:
+            self.register()
+
+    @property
+    def live(self) -> bool:
+        """Connected, registered and not dead: frames are taken."""
+        return self._connected and self._registered and self._dead_reason is None
+
+    def _connect_network(self):
+        """Resolve and open the camera, read its defaults, apply ours, take
+        the probe frame (the stored shape and dtype). Raises on a failure,
+        with the camera put back as it was found."""
+        if self._stream_hook is not None:              # test hook
+            self._stream = self._stream_hook
+            self._defaults = dict(self._defaults_hook or {})
         else:
-            self._stream = self._resolve_and_connect(directory)
-            fully_given = (exposure_time is not None and gain is not None
-                           and (self._roi_override or not self._crop_to_saved_roi))
-            self._defaults = {} if fully_given else self._read_server_defaults()
+            self._stream = self._resolve_and_connect(self._directory)
         try:
+            if self._stream_hook is None:
+                fully_given = (self._exposure_override is not None
+                               and self._gain_override is not None
+                               and (self._roi_override or not self._crop_to_saved_roi))
+                self._defaults = {} if fully_given else self._read_server_defaults()
             frame0 = self._setup_settings_and_probe()
         except BaseException:
             try:
@@ -268,13 +425,58 @@ class CameraStreamClient:
             raise
         self._set_geometry(frame0)
         self._probe_full = None
-        self._registered = False
-        if not defer_register:
-            self.register()
+        self._connected = True
+
+    def connect(self):
+        """The claim's connect of a stream built with ``connect=False``:
+        camera, settings, probe frame (and, triggered, waiting for edges).
+        Thread-safe with other streams' connects; touches nothing of the
+        experiment. Raises on a failure (camera put back as found); the
+        caller then calls ``mark_dead`` or stops the run."""
+        if self._connected or self._dead_reason is not None or self._finished:
+            return
+        self._connect_network()
+
+    def activate(self):
+        """After a successful ``connect()``, from the experiment's thread:
+        the containers get the probe frame's shape and dtype (before the
+        liveOD start payload is built), the worker starts. Raises when the
+        run has already started (the shapes are then fixed)."""
+        if not self._connected or self._dead_reason is not None:
+            raise RuntimeError(f"[{self.label}] activate() without a connect")
+        if self._registered and self._worker is None:
+            self._resize_containers(self._frame_shape, self._frame_dtype,
+                                    keep_run_data=False)
+            self._start_worker()
+            self._say_connected()
+
+    def mark_dead(self, reason):
+        """The connect failed (or the run stood it down): this run takes no
+        frames with it. The kernel code is unchanged -- its edges / snaps are
+        counted, nothing is stored -- and the containers become the
+        placeholder's (one byte per shot, NaN records), as a camera that
+        could not be set up has always had. Never raises."""
+        self._dead_reason = str(reason)
+        try:
+            if self._connected:
+                self._connected = False
+                self._restore_and_close()
+            if self._registered and not getattr(self._expt, "_run_started", False):
+                self._resize_containers((1,), np.uint8, keep_run_data=True)
+        except Exception as e:
+            print(f"[{self.label}] WARNING: marking the stream dead: {e!r}")
+
+    def _resize_containers(self, shape, dtype, keep_run_data):
+        d = self._expt.data
+        d.resize_host_container(self.dc, shape, dtype, keep_run_data=keep_run_data)
+        d.resize_host_container(self.dc_meta, (N_META,), np.float64,
+                                keep_run_data=keep_run_data)
 
     def register(self):
         """Containers, ``expt.camera_streams``, the worker thread and the
-        abort-path cleanup (done by ``__init__`` unless ``defer_register``)."""
+        abort-path cleanup (done by ``__init__`` unless ``defer_register``).
+        A stream not connected yet gets provisional containers and no
+        worker (``activate()`` does that)."""
         if self._registered:
             return
         expt = self._expt
@@ -286,12 +488,17 @@ class CameraStreamClient:
         if not hasattr(expt, "camera_streams"):
             expt.camera_streams = []
         expt.camera_streams.append(self)
+        if self._connected:
+            self._start_worker()
+            self._say_connected()
 
+    def _start_worker(self):
         self._worker = threading.Thread(target=self._work, daemon=True,
                                         name=f"CameraStreamClient:{self.key}")
         self._worker.start()
         atexit.register(self._atexit_cleanup)
 
+    def _say_connected(self):
         console.info(f"[{self.label}] {self.serial} via {self._stream.server_id}: "
                      f"frame {self._frame_shape} {self._frame_dtype}"
                      + (f", roi {self._roi}" if self._roi else "")
@@ -306,6 +513,15 @@ class CameraStreamClient:
         self._finished = True
         self._restore_and_close()
 
+    def _dead_or_unconnected(self):
+        """True when a kernel call must not be served (dead, or the claim
+        never connected it); counts the call as ``edges_not_served``."""
+        if self.live:
+            return False
+        with self._lock:
+            self.counts["edges_not_served"] = self.counts.get("edges_not_served", 0) + 1
+        return True
+
     # ---- kernel side -----------------------------------------------------
 
     @kernel
@@ -319,6 +535,8 @@ class CameraStreamClient:
     def request_snap_mu(self, slack_mu, t_offset):
         """Async RPC target; must never raise (it would kill the run)."""
         try:
+            if self._dead_or_unconnected():
+                return
             idx = self._shot_index()
             target = time.monotonic() + self._slack_s(slack_mu) + float(t_offset)
             with self._lock:
@@ -384,6 +602,7 @@ class CameraStreamClient:
         from beacon.camera.stream import CameraStream
 
         directory = directory or shared_camera_directory()
+        self._resolve_record = {}
         self._liveod_key, state = self._liveod_entry()
         if self._liveod_key is not None:
             if state not in ("open", "grabbing"):
@@ -403,7 +622,9 @@ class CameraStreamClient:
                     f"resolves to {entry.server_id}: liveOD's camera server did "
                     f"not answer -- refusing to open it behind liveOD's back")
         else:
-            entry = directory.find(self.serial)
+            entry, stale = find_current(directory, self.serial)
+            if stale is not None:
+                self._note_relisted(stale, entry)
             holder = entry.holder or {}
             if (entry.state == "reserved"
                     and str(holder.get("server_id", "")).endswith(LIVEOD_SERVER_SUFFIX)):
@@ -417,15 +638,49 @@ class CameraStreamClient:
             directory = _PinnedDirectory(directory, entry.server_id)
         return CameraStream(entry, label=self.label, directory=directory)
 
+    def _note_relisted(self, stale, entry):
+        """The cached listing named a server address that no longer beacons:
+        said once, and kept in the provenance record (``resolve``)."""
+        def where(e):
+            return {"server_id": str(getattr(e, "server_id", "?")),
+                    "host": str(getattr(e, "host", "?")), "port": getattr(e, "port", None)}
+        self._resolve_record["relisted"] = {"cached": where(stale), "now": where(entry)}
+        console.info(f"[{self.label}] {self.serial}: {stale.server_id} at "
+                     f"{stale.host}:{stale.port} (listed before the claim) no longer "
+                     f"beacons there; listed afresh: {entry.server_id} at "
+                     f"{entry.host}:{entry.port}")
+
     def _liveod_entry(self):
-        """(liveOD camera key, state) for our serial, or (None, None)."""
-        if self._live_od_client is None:
+        """(liveOD camera key, state) for our serial, or (None, None).
+
+        A request that fails right after the client followed liveOD to a new
+        address (liveOD restarted since this process last asked: the client
+        rediscovers it on the timeout, ``reconnect_generation``) is asked
+        once more, at the new address -- else a camera on liveOD's bar would
+        be taken for one that is not. Any other failure: (None, None), as
+        before."""
+        client = self._live_od_client
+        if client is None:
             return None, None
-        try:
+        cams = None
+        for attempt in (1, 2):
             with _live_od_lock:
-                cams = self._live_od_client.cameras()
-        except Exception:
-            return None, None
+                gen = getattr(client, "reconnect_generation", None)
+                try:
+                    cams = client.cameras()
+                    break
+                except Exception as e:
+                    moved = (gen is not None
+                             and getattr(client, "reconnect_generation", None) != gen)
+                    if attempt == 2 or not moved:
+                        rec = getattr(self, "_resolve_record", None)
+                        if rec is not None:
+                            rec["liveod_query_failed"] = repr(e)
+                        return None, None
+                    rec = getattr(self, "_resolve_record", None)
+                    if rec is not None:
+                        rec["liveod_query_retried"] = (
+                            f"liveOD moved to a new address ({e!r}); asked again")
         for k, v in cams.items():
             if str(v.get("serial_no", "")) == self.serial:
                 return k, v.get("state")
@@ -588,7 +843,7 @@ class CameraStreamClient:
         """Name the frame ``key`` on its camera server, so a viewer can show
         this key's frames alone (Camera Viewer: the Frames dropdown). For
         display only, nothing is saved by it; never raises."""
-        if not self._tagging:
+        if not self._tagging or self._stream is None:     # dead / not connected
             return
         from beacon.camera.stream import Unsupported
         try:
@@ -723,6 +978,9 @@ class CameraStreamClient:
         camera's settings back, close. Never raises."""
         if self._finished:
             return
+        if not self._connected:
+            self._finish_unconnected()
+            return
         try:
             deadline = time.monotonic() + (timeout_s if timeout_s is not None
                                            else self._frame_timeout_s + 10.0)
@@ -755,6 +1013,33 @@ class CameraStreamClient:
 
     def close(self):
         self.finish()
+
+    def _finish_unconnected(self):
+        """finish() of a stream that never took frames (dead, or the claim
+        never connected it): the placeholder's record per key, with why and
+        how many kernel calls went unserved."""
+        with self._lock:
+            self._finished = True
+        reason = self._dead_reason or "not connected (the run's claim never connected it)"
+        for k in getattr(self, "keys", (self.key,)):
+            try:
+                self._expt._extra_file_texts[f"camera_stream_{k}"] = json.dumps(
+                    {"key": k, "keys": list(getattr(self, "keys", (self.key,))),
+                     "dummy": True, "dead": True, "serial": self.serial,
+                     "triggered": isinstance(self, TriggeredCameraStreamClient),
+                     "reason": reason,
+                     "resolve": dict(getattr(self, "_resolve_record", None) or {}),
+                     "edges_not_served": int(self.counts.get("edges_not_served", 0)),
+                     "note": f"'{k}' is a placeholder (one byte per shot), not a frame"})
+            except Exception:
+                pass
+        n = int(self.counts.get("edges_not_served", 0))
+        console.info(f"[{self.label}] no frames this run ({reason}); {n} kernel "
+                     f"call(s) not served", console.VERBOSE)
+        try:
+            atexit.unregister(self._atexit_cleanup)
+        except Exception:
+            pass
 
     def _drain_shot_queue(self):
         """Wait (bounded) for the experiment's shot queue to be empty. The
@@ -809,7 +1094,7 @@ class CameraStreamClient:
         """The stream must not be closed under a request in flight (run
         84562 hung in zmq term() on exactly that)."""
         w = self._worker
-        if w is threading.current_thread() or not w.is_alive():
+        if w is None or w is threading.current_thread() or not w.is_alive():
             return
         w.join(WORKER_JOIN_S)
         if w.is_alive():
@@ -844,6 +1129,7 @@ class CameraStreamClient:
             "camera_id": getattr(self._stream, "camera_id", "?"),
             "server_id": getattr(self._stream, "server_id", "?"),
             "liveod_key": self._liveod_key,
+            "resolve": dict(getattr(self, "_resolve_record", None) or {}),
             "settings_applied": _values(self._applied),
             "settings_rev": self._rev,
             "server_defaults": {k: v for k, v in self._defaults.items()
@@ -911,6 +1197,8 @@ class CameraStreamClient:
         """Trigger mode off whatever it was before; the trigger line and --
         only if nobody else changed the camera during the run -- exposure
         and gain back to what we found. Then close the stream."""
+        if self._stream is None:
+            return
         try:
             try:
                 self._before_restore()
@@ -976,12 +1264,33 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                  t_match_window=2.0, t_early_tolerance=0.25, t_stray_grace=0.3,
                  frame_settings=None, frame_rois=None, **kw):
         self.ttl = ttl                                  # kernel-visible
-        # ``exposure_delay`` is the configured value: the camera's own
-        # replaces it once our trigger settings are in (_take_camera_exposure_delay)
+        # The exposure delay (waxx.control.cameras.exposure_delay). The
+        # kernel reads only the cell. ``exposure_delay`` /
+        # ``exposure_delay_source`` are its host mirror: the value the kernel
+        # uses (configured until decided). Built with a connection: the
+        # camera's own, read once our trigger settings are in, before any
+        # compile (_take_camera_exposure_delay). Built without one
+        # (connect=False, every kexp run): a provisional value before the
+        # compile (_fix_exposure_delay_before_compile), the camera's at the
+        # claim (exposure_delay_at_claim), which the kernel takes at its
+        # start (Scanner.load_exposure_delays -> _exposure_delay_for_kernel).
+        self.exposure_delay_cell = ExposureDelayCell(exposure_delay)    # kernel-visible
         self.exposure_delay = float(exposure_delay)
         self.exposure_delay_configured = float(exposure_delay)
         self.exposure_delay_source = "configured"
         self._exposure_delay_from_camera = bool(exposure_delay_from_camera)
+        # True when built without a connection: the claim decides the delay,
+        # the kernel takes it at its start (set before register(), which
+        # super().__init__ may call)
+        self._exposure_delay_fixed = not bool(kw.get("connect", True))
+        self.exposure_delay_before_claim = None         # the compiled-in (provisional) value
+        self.exposure_delay_before_claim_source = None
+        self.exposure_delay_at_connect = None           # what the camera reported at the claim
+        self.exposure_delay_at_claim = None             # what the claim decided for the kernel
+        self.exposure_delay_at_claim_source = None
+        # "compiled_in" (the cell's value at the compile) or
+        # "loaded_at_kernel_start" (the claim's, by load_exposure_delays)
+        self.exposure_delay_to_kernel = "compiled_in"
         self.t_trigger = float(t_trigger)
         self.keys = _as_keys(key)
         for k in self.keys:
@@ -1011,6 +1320,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         if len(self.keys) > 1:
             kw.setdefault("label", f"camera_stream:{self.keys[0]}+{len(self.keys) - 1}")
         super().__init__(expt, camera, self.keys[0], **kw)
+        if not self._connected:
+            self._fix_exposure_delay_before_compile()
         if self._frame_settings:
             console.info(f"[{self.label}] per-frame settings: "
                          + ", ".join(f"{self.keys[j]}={v}"
@@ -1046,11 +1357,14 @@ class TriggeredCameraStreamClient(CameraStreamClient):
 
     @kernel
     def trigger(self, j=0):
-        """Expose frame ``j`` at the timeline cursor; the cursor stays."""
+        """Expose frame ``j`` at the timeline cursor; the cursor stays. The
+        edge leads by the exposure delay in the cell (the claim's, once the
+        kernel has loaded it)."""
         self.announce_trigger_mu(now_mu() - self.core.get_rtio_counter_mu(), j)
-        delay(-self.exposure_delay)
+        t_delay = self.exposure_delay_cell.value
+        delay(-t_delay)
         self.ttl.pulse(self.t_trigger)
-        delay(self.exposure_delay - self.t_trigger)
+        delay(t_delay - self.t_trigger)
 
     @kernel
     def grab(self, t_offset=0.):
@@ -1063,6 +1377,11 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         try:
             idx = self._shot_index()
             t_expected = time.monotonic() + self._slack_s(slack_mu)
+            if self._dead_or_unconnected():
+                # the TTL still pulsed: a live sibling on the line must know
+                for sib in self._siblings:
+                    sib.announce_sibling_edge(idx, t_expected)
+                return
             j = int(j)
             if not 0 <= j < len(self.keys):
                 self._note("bad_frame_index", idx=list(idx), j=j)
@@ -1076,6 +1395,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     def announce_sibling_edge(self, idx, t_expected):
         """A sibling fired our line: the frame is expected, not kept."""
         try:
+            if not self.live:
+                return
             self._note("sibling_edges")
             self._queue.put_nowait((float(t_expected), tuple(idx), -1, 0))
         except Exception:
@@ -1137,10 +1458,13 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     def _register_containers(self):
         d = self._expt.data
         for j, k in enumerate(self.keys):
-            # stream-only: no copy of the run's frames in this process
+            # stream-only: no copy of the run's frames in this process.
+            # Registered before the connect (connect=False): the provisional
+            # shape; activate() gives each frame its own (_geometry).
+            shape = self._geometry[j][2] if self._geometry else self._frame_shape
             slot = SimpleNamespace(
                 key=k,
-                dc=d.add_host_data_container(self._geometry[j][2],
+                dc=d.add_host_data_container(shape,
                                              dtype=self._frame_dtype, fill_value=0,
                                              keep_run_data=False),
                 dc_meta=d.add_host_data_container((N_META,), np.float64,
@@ -1150,6 +1474,19 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             setattr(d, k + "_meta", slot.dc_meta)
             self._slots.append(slot)
         self.dc, self.dc_meta = self._slots[0].dc, self._slots[0].dc_meta
+
+    def _resize_containers(self, shape, dtype, keep_run_data):
+        """activate() (connected, not dead): each frame at its own stored
+        shape (``frame_rois``, _geometry); mark_dead(): every frame the
+        placeholder's ``shape``."""
+        d = self._expt.data
+        live = (self._connected and self._dead_reason is None
+                and len(self._geometry) == len(self._slots))
+        for j, slot in enumerate(self._slots):
+            d.resize_host_container(slot.dc, self._geometry[j][2] if live else shape,
+                                    dtype, keep_run_data=keep_run_data)
+            d.resize_host_container(slot.dc_meta, (N_META,), np.float64,
+                                    keep_run_data=keep_run_data)
 
     def _setup_settings_and_probe(self):
         frame0 = super()._setup_settings_and_probe()
@@ -1171,24 +1508,51 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             self._cur_settings = dict(self._base_settings)
         return frame0
 
-    def _take_camera_exposure_delay(self):
-        """``exposure_delay`` from the camera itself: the exposure start delay
-        its server reports (``exposure_start_delay_s``), read after our
-        trigger settings went in.  The configured value stays, with a printed
-        warning, when the camera does not report one;
-        ``exposure_delay_source`` ("camera" / "configured") says which, in
-        the stream's provenance record."""
+    def _read_camera_exposure_delay(self):
+        """(seconds or None, why not): the exposure start delay the camera's
+        server reports now (``exposure_start_delay_s``)."""
         from beacon.camera.directory import seconds_or_none
-        self.exposure_delay = self.exposure_delay_configured
-        self.exposure_delay_source = "configured"
-        if not self._exposure_delay_from_camera:
-            return
         try:
             raw = getattr(self._stream.status(refresh=True), "raw", None) or {}
             value = seconds_or_none(raw.get("exposure_start_delay_s"))
-            why = "the camera server does not report it"
+            return value, "the camera server does not report it"
         except Exception as e:
-            value, why = None, f"status: {type(e).__name__}: {e}"
+            return None, f"status: {type(e).__name__}: {e}"
+
+    def _take_camera_exposure_delay(self):
+        """The exposure delay from the camera itself: the exposure start
+        delay its server reports, read after our trigger settings went in.
+        The configured value is used, with a printed warning, when the
+        camera does not report one.
+
+        Built with a connection (before any compile): it is set into the
+        kernel's cell here; ``exposure_delay_source`` "camera" / "configured".
+
+        Built without one (connect=False; this is the run's claim): it is the
+        claim's decision, ``exposure_delay_at_claim`` with
+        ``exposure_delay_at_claim_source`` "camera_at_claim" / "configured".
+        The cell is not touched here (the claim sets no attribute a kernel
+        reads): the kernel writes it at its start (load_exposure_delays)."""
+        if self._exposure_delay_fixed:
+            if not self._exposure_delay_from_camera:
+                self._decide_exposure_delay(self.exposure_delay_configured, "configured")
+                return
+            value, why = self._read_camera_exposure_delay()
+            self.exposure_delay_at_connect = value
+            if value is None:
+                print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
+                      f"camera at the claim ({why}); using the configured "
+                      f"{self.exposure_delay_configured * 1e6:.2f} us")
+                self._decide_exposure_delay(self.exposure_delay_configured, "configured")
+                return
+            self._decide_exposure_delay(value, "camera_at_claim")
+            return
+        self.exposure_delay = self.exposure_delay_configured
+        self.exposure_delay_source = "configured"
+        self.exposure_delay_cell.value = self.exposure_delay
+        if not self._exposure_delay_from_camera:
+            return
+        value, why = self._read_camera_exposure_delay()
         if value is None:
             print(f"[{self.label}] !! {self.serial}: exposure delay not read from the "
                   f"camera ({why}); using the configured "
@@ -1196,10 +1560,108 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             return
         self.exposure_delay = value
         self.exposure_delay_source = "camera"
+        self.exposure_delay_cell.value = float(value)
         if value != self.exposure_delay_configured:
             console.info(f"[{self.label}] {self.serial}: exposure delay {value * 1e6:.2f} us "
                          f"from the camera (configured "
                          f"{self.exposure_delay_configured * 1e6:.2f} us)", console.VERBOSE)
+
+    def _decide_exposure_delay(self, value, source):
+        """The claim's decision (connect=False): what the kernel takes at its
+        start. Host-only attributes; says so when it is not the compiled-in
+        value."""
+        self.exposure_delay_at_claim = float(value)
+        self.exposure_delay_at_claim_source = str(source)
+        before = self.exposure_delay_before_claim
+        if before is not None and self.exposure_delay_at_claim != before:
+            console.info(f"[{self.label}] {self.serial}: exposure delay "
+                         f"{self.exposure_delay_at_claim * 1e6:.2f} us at the claim "
+                         f"({source}; {before * 1e6:.2f} us before the compile, "
+                         f"{self.exposure_delay_before_claim_source}); the kernel takes "
+                         f"it at its start")
+
+    def _exposure_delay_for_kernel(self):
+        """For load_exposure_delays' RPC (exposure_delay.exposure_delays_for_kernel):
+        (value the kernel writes into this stream's cell, decided). Decided:
+        the claim's value, and the host mirror (``exposure_delay`` /
+        ``exposure_delay_source``) says the kernel now uses it. Not decided
+        (no claim yet): the cell's own value, nothing changes."""
+        if self.exposure_delay_at_claim is None:
+            return float(self.exposure_delay_cell.value), False
+        self.exposure_delay = self.exposure_delay_at_claim
+        self.exposure_delay_source = self.exposure_delay_at_claim_source
+        self.exposure_delay_to_kernel = "loaded_at_kernel_start"
+        return float(self.exposure_delay_at_claim), True
+
+    def exposure_delay_record(self):
+        """The exposure delay for the run's records. ``exposure_delay`` /
+        ``exposure_delay_source``: the value the kernel uses and where it
+        came from; ``exposure_delay_to_kernel``: "compiled_in" or
+        "loaded_at_kernel_start". The rest: the configured value, the
+        pre-compile (provisional) one, the camera's report at the claim and
+        the claim's decision (None where there was none)."""
+        return {"exposure_delay": self.exposure_delay,
+                "exposure_delay_source": self.exposure_delay_source,
+                "exposure_delay_to_kernel": self.exposure_delay_to_kernel,
+                "exposure_delay_configured": self.exposure_delay_configured,
+                "exposure_delay_before_claim": self.exposure_delay_before_claim,
+                "exposure_delay_before_claim_source": self.exposure_delay_before_claim_source,
+                "exposure_delay_at_connect": self.exposure_delay_at_connect,
+                "exposure_delay_at_claim": self.exposure_delay_at_claim,
+                "exposure_delay_at_claim_source": self.exposure_delay_at_claim_source}
+
+    def register(self):
+        """CameraStreamClient.register, then (connect=False) this stream's
+        exposure-delay cell joins the experiment's list the kernel writes at
+        its start -- before the compile, in registration order."""
+        was = self._registered
+        super().register()
+        if self._exposure_delay_fixed and self._registered and not was:
+            _xdelay.register(self._expt, self, self.exposure_delay_cell)
+
+    def mark_dead(self, reason):
+        """CameraStreamClient.mark_dead; a stream the claim did not decide a
+        delay for (it never connected) gets the configured one: its edges
+        still fire, no frame is kept."""
+        super().mark_dead(reason)
+        if self._exposure_delay_fixed and self.exposure_delay_at_claim is None:
+            self.exposure_delay_at_claim = self.exposure_delay_configured
+            self.exposure_delay_at_claim_source = "configured"
+
+    def _fix_exposure_delay_before_compile(self):
+        """A stream built without a connection (``connect=False``): the
+        provisional exposure delay, compiled into the kernel's cell -- the
+        delay the camera's server last reported (its directory entry, as
+        BaslerParams.prepare_for_run reads the run camera's; read only,
+        nothing is set on the camera), which is what the previous user's
+        settings left, else the configured one. It is only provisional: the
+        claim reads the camera's with this run's settings
+        (``exposure_delay_at_claim``) and the kernel takes that at its start
+        (Scanner.load_exposure_delays); the records say which the kernel
+        used (``exposure_delay_record``)."""
+        self._exposure_delay_fixed = True
+        value, source = self.exposure_delay_configured, "configured"
+        if self._exposure_delay_from_camera:
+            try:
+                directory = self._directory or shared_camera_directory()
+                entry = directory.find(self.serial)
+                v = getattr(entry, "exposure_start_delay_s", None)
+                if v is not None:
+                    value, source = float(v), "camera_before_claim"
+                else:
+                    why = f"{getattr(entry, 'server_id', '?')} does not report it"
+            except Exception as e:
+                why = f"camera not found ({type(e).__name__}: {e})"
+            if source == "configured":
+                console.info(f"[{self.label}] {self.serial}: no exposure delay from the camera "
+                             f"before the compile ({why}); the configured "
+                             f"{value * 1e6:.2f} us until the claim reads it",
+                             console.VERBOSE)
+        self.exposure_delay_before_claim = float(value)
+        self.exposure_delay_before_claim_source = source
+        self.exposure_delay = float(value)
+        self.exposure_delay_source = source
+        self.exposure_delay_cell.value = float(value)
 
     def _enter_triggered(self):
         """Live stream on, then trigger mode on our line (in that order:
@@ -1471,9 +1933,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 "trigger_ttl": getattr(self.ttl, "key", "") or getattr(self.ttl, "name", ""),
                 "trigger_ttl_ch": getattr(self.ttl, "ch", None),
                 "trigger_source": self._trigger_source,
-                "exposure_delay": self.exposure_delay,
-                "exposure_delay_source": self.exposure_delay_source,
-                "exposure_delay_configured": self.exposure_delay_configured,
+                **self.exposure_delay_record(),
                 "t_trigger": self.t_trigger,
                 "siblings_on_line": [list(s.keys) for s in self._siblings],
                 "frame_settings": {self.keys[j]: v for j, v in sorted(self._frame_settings.items())},

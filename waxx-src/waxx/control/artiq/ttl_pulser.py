@@ -196,6 +196,7 @@ class TTLPulser:
                 return list(self.last_notes)
             notes: list = []
             self._dropped = ""
+            self._core_opened = False
             self._announce(notes)
             try:
                 self._connect_and_compile()
@@ -273,6 +274,8 @@ class TTLPulser:
             self._dmgr, self._core, self._ttl = self._core_factory()
         comm = self._core.comm
         comm.open()
+        # connected: from here the running kernel's session has ended
+        self._core_opened = True
         sock = getattr(comm, "socket", None)
         if sock is not None:
             try:
@@ -365,12 +368,19 @@ class TTLPulser:
         notes.append(f"{self.label}: announced to the monitor server (composite ops fenced)")
 
     def _withdraw(self, notes: list):
-        """acquire() failed after the announcement: lift our fence."""
+        """acquire() failed after the announcement: lift our fence. The
+        monitor server gives the trust from before the announcement back only
+        when the connection was never opened (``took_core=False``); once it
+        was, the running kernel's session has ended and the state stays
+        untrusted."""
         if not self._announced or self._monitor is None:
             return
+        opened = bool(getattr(self, "_core_opened", False))
         try:
-            self._monitor.withdraw_run(self._token, None)
-            notes.append(f"{self.label}: announcement withdrawn (the core was not taken)")
+            self._monitor.withdraw_run(self._token, None, took_core=opened)
+            notes.append(f"{self.label}: announcement withdrawn ("
+                         + ("the core connection had been opened: the device state stays "
+                            "untrusted)" if opened else "the core was not taken)"))
         except Exception:
             pass
         self._announced = False

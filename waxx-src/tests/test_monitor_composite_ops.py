@@ -197,7 +197,7 @@ def test_a_run_fence_is_lifted_only_by_its_own_token(server):
     assert server._run_pending is not None
     # the run withdraws itself at exit
     assert _ask(server, {"type": "run_withdrawn", "token": "tok-a",
-                         "run_id": 81000})["status"] == "ok"
+                         "run_id": 81000, "took_core": False})["status"] == "ok"
     assert server._run_pending is None
     assert server._broadcaster.sent[-1] == {"type": "run_pending", "run_pending": None}
     assert "exited without taking the core" in server.journal.tail(1)[0]["why"]
@@ -247,6 +247,7 @@ class FakeServer:
         self.replaced = []
         self.registrations = 0
         self.withdrawn = []
+        self.withdrawn_took = []
         self.announced = None
 
     # MonitorClient API used by Monitor
@@ -288,8 +289,9 @@ class FakeServer:
         self.announced = token
         return {"status": "ok"}
 
-    def withdraw_run(self, token, run_id=None, timeout=2.0):
+    def withdraw_run(self, token, run_id=None, timeout=2.0, took_core=None):
         self.withdrawn.append((token, run_id))
+        self.withdrawn_took.append(took_core)
         return {"status": "ok"}
 
     def send_ready(self):
@@ -585,6 +587,24 @@ def test_a_run_that_dies_before_its_end_withdraws_its_fence_at_exit(monitor, mon
     assert monitor.fake.withdrawn == [(token, 81001)]
     registered[0]()                                          # nothing twice
     assert len(monitor.fake.withdrawn) == 1
+
+
+def test_the_withdraw_says_whether_this_process_took_the_core(monitor, monkeypatch):
+    """took_core: from the waxx Core's process-wide record (True / False),
+    None when the experiment's core is not the waxx Core (unknown)."""
+    import atexit
+    from waxx.util.artiq import core as waxx_core
+    monkeypatch.setattr(atexit, "register", lambda fn: None)
+    monkeypatch.setattr(waxx_core, "_contact", {"taken": False})
+    monitor.expt.core = waxx_core.Core(None, None, 1e-9)    # host None: a dummy comm
+    for taken in (False, True):
+        waxx_core._contact["taken"] = taken
+        monitor.announce_run(run_id=82000, expt="x")
+        monitor.withdraw_run_at_exit()
+    monitor.expt.core = SimpleNamespace()                    # not the waxx Core
+    monitor.announce_run(run_id=82001, expt="x")
+    monitor.withdraw_run_at_exit()
+    assert monitor.fake.withdrawn_took == [False, True, None]
 
 
 def test_a_run_whose_end_state_landed_withdraws_nothing(monitor, monkeypatch):

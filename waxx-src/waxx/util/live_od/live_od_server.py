@@ -8,6 +8,13 @@ coordinates HDF5 file creation, camera spawning, and final data saving.
 The server runs as a QThread to stay compatible with PyQt6 event dispatch
 on the GUI machine. All HDF5 I/O stays on the server side; the experiment
 client never needs the data drive mounted.
+
+Queue phase 2 (2026-10-14): RESERVE_RUN lets the run queue's next (warm)
+experiment check in while the current run runs -- it creates nothing --, and
+START_RUN starts it: INIT_RUN behind refusals that come before any run id, with
+the server's own start time in the file's name. RELEASE_RESERVATION gives the
+slot back. A plain INIT_RUN from the queue (launcher "kq") never supersedes a
+run whose client is not known to be gone.
 """
 
 import collections
@@ -54,6 +61,43 @@ SAVE_WAIT_BEFORE_INIT_S = 45.0
 # the aborted run at once, as the next run start would (a second press, not the
 # window's own echo of the first).
 ABORT_AGAIN_MIN_S = 3.0
+# RESERVE_RUN (queue phase 2): a reservation lasts its ttl_s (default, and the
+# bounds it is clamped to), or until its process is known to be gone
+RESERVATION_TTL_DEFAULT_S = 900.0
+RESERVATION_TTL_MIN_S = 5.0
+RESERVATION_TTL_MAX_S = 3600.0
+# START_RUN waits this long for the last frames of a run whose experiment
+# exited (RUN_EXITED with frames due) before it refuses
+START_EXITED_WAIT_S = EXITED_FRAME_GRACE_S + 2.0
+# a reply carries at most this many warning / refusal lines
+MAX_REPLY_LINES = 20
+# RESERVE_RUN's data directory check gives up after this long (a hung share)
+RESERVE_DIR_CHECK_S = 2.0
+
+
+def _bounded(fn, timeout_s: float, default):
+    """``fn()`` on a daemon thread, waited for ``timeout_s``: its result, else
+    ``default`` (also when it raised: ``(False, "<error>")`` for a check). A
+    call that hangs is left to finish on its own; nothing waits for it."""
+    out = {}
+
+    def run():
+        try:
+            out["value"] = fn()
+        except Exception as exc:                      # noqa: BLE001
+            out["value"] = (False, f"{type(exc).__name__}: {exc}")
+    t = threading.Thread(target=run, name="liveod-bounded-check", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return out.get("value", default)
+
+
+def _capped(lines, limit: int = MAX_REPLY_LINES) -> list:
+    """At most ``limit`` lines, the last one saying how many were left out."""
+    lines = [str(x) for x in lines]
+    if len(lines) <= limit:
+        return lines
+    return lines[:limit - 1] + [f"... and {len(lines) - limit + 1} more (see liveOD's log)"]
 
 
 def _safe_repr(value) -> str:
@@ -127,6 +171,11 @@ class LiveODServer(QThread, NetServer):
     markers_changed_signal = pyqtSignal(str, list)            # camera_key, markers (a remote viewer edited them)
     exited_run_signal = pyqtSignal(str)                       # how an exited run was closed: stop its camera thread, file untouched
 
+    #: What this server can do beyond the original protocol (INIT_RUN / RESERVE_RUN
+    #: replies, POLL): arrays pushed during the run, a save the client polls for,
+    #: and RESERVE_RUN / START_RUN / RELEASE_RESERVATION (queue phase 2).
+    FEATURES = {"put_data": True, "async_save": True, "reserve": True}
+
     def __init__(self, server_talk, data_saver, port: int = 0, marker_path=None):
         super().__init__()  # QThread.__init__
         NetServer.__init__(self, scoped_server_id("live_od"), port)  # explicit — avoids MRO conflict
@@ -186,6 +235,10 @@ class LiveODServer(QThread, NetServer):
                                 "launcher": "", "queue_job": ""}
         # every Abort set (request_reset), for POLL's reset_count / last_reset
         self._reset_count = 0
+        # this server process (POLL "instance"): reset_count is counted per
+        # process, so a START whose GO named another instance (liveOD restarted
+        # since GO) cannot tell whether a Reset was pressed in between
+        self._instance = uuid.uuid4().hex[:16]
         self._reset_counts = {"person": 0, "queue": 0, "agent": 0, "liveod": 0}
         self._last_reset = None
         # the run a Reset during its save was last warned about (one WARNING each)
@@ -252,6 +305,10 @@ class LiveODServer(QThread, NetServer):
         # no array); the window sets it to the broadcaster's thread-safe
         # broadcast_aux_notice (set_aux_notice_sink). None: no notices.
         self._aux_notice_sink = None
+        # The one RESERVE_RUN slot (queue phase 2): {token, client (as
+        # _client_of), expt, since (time.time()), mono, ttl_s}, or None. It
+        # reserves nothing on disk or in a camera: no run id, file or lock.
+        self._reservation = None
 
     def set_aux_notice_sink(self, sink):
         """``sink(notice)`` is called on the server thread for every PUT_DATA,
@@ -882,6 +939,12 @@ class LiveODServer(QThread, NetServer):
             tag = msg.get("tag", "")
             if tag == "INIT_RUN":
                 reply = self._handle_init_run(msg)
+            elif tag == "RESERVE_RUN":
+                reply = self._handle_reserve_run(msg)
+            elif tag == "START_RUN":
+                reply = self._handle_start_run(msg)
+            elif tag == "RELEASE_RESERVATION":
+                reply = self._handle_release_reservation(msg)
             elif tag == "WAIT_CAM_READY":
                 reply = self._handle_wait_cam_ready(msg)
             elif tag == "SHOT_COMPLETE":
@@ -1160,20 +1223,43 @@ class LiveODServer(QThread, NetServer):
             images_received=self._images_received_now(),
         )
 
+    def _wait_previous_save(self, tag: str = "INIT_RUN"):
+        """The previous run's save may still be running (an asynchronous
+        END_RUN): a new run's file is not made under it. None once it is over
+        (at once when none runs), else the refusal (no run id used)."""
+        if self._run_file.saving:
+            logger.info(f"{tag}: waiting for the previous run's save to finish")
+            if not self._run_file.wait_save(SAVE_WAIT_BEFORE_INIT_S):
+                reply = self._refuse_init_run(
+                    f"the previous run is still being saved after "
+                    f"{SAVE_WAIT_BEFORE_INIT_S:.0f} s; try again",
+                    f"{tag} refused: the previous run is still being saved")
+                reply.update(refused=True, refused_reason="save_in_progress")
+                return reply
+        return None
+
     def _handle_init_run(self, msg: dict) -> dict:
+        refused = self._wait_previous_save("INIT_RUN")
+        if refused is not None:
+            return refused
+        # M0 (queue phase 2): a run the queue launched never supersedes a run
+        # whose client is not known to be gone. A person's / direct INIT_RUN
+        # supersedes as it always has.
+        if _client_of(msg)["launcher"] == "kq":
+            refused = self._live_run_refusal("INIT_RUN")
+            if refused is not None:
+                return refused
+        return self._start_new_run(msg, "INIT_RUN")
+
+    def _start_new_run(self, msg: dict, tag: str) -> dict:
+        """INIT_RUN as it always was, after its refusals (and START_RUN's):
+        the run's camera lock (host mode), its run id and file, then the run
+        takes over from the one in progress (superseded, or its pending Abort
+        finalized / its file kept) and the reply."""
         # The new run's name, provisional until this INIT_RUN is accepted: one
         # that is refused leaves the run in progress as it was (its token, so
         # its messages still count; its camera; its state).
         token = uuid.uuid4().hex
-        # The previous run's save may still be running (an asynchronous
-        # END_RUN): this run's file is not made under it.
-        if self._run_file.saving:
-            logger.info("INIT_RUN: waiting for the previous run's save to finish")
-            if not self._run_file.wait_save(SAVE_WAIT_BEFORE_INIT_S):
-                return self._refuse_init_run(
-                    f"the previous run is still being saved after "
-                    f"{SAVE_WAIT_BEFORE_INIT_S:.0f} s; try again",
-                    "INIT_RUN refused: the previous run is still being saved")
         save_data = bool(msg.get("save_data", False))
         capture_images = bool(msg.get("capture_images", False))
         camera_key = str(msg.get("camera_key", ""))
@@ -1189,6 +1275,9 @@ class LiveODServer(QThread, NetServer):
 
         run_id = 0
         filepath = ""
+        # what the file's fill could not store as the payload had it (see
+        # DataSaver._populate_data_file): told to the experiment in the reply
+        fill_problems = []
 
         if save_data:
             # Synchronous on purpose, and a small write: see RunFile.reserve. Only
@@ -1197,6 +1286,8 @@ class LiveODServer(QThread, NetServer):
             _t_create = time.time()
             try:
                 run_id, filepath = self._data_saver.reserve_run_id_and_path(msg)
+                fill_problems = [str(p) for p in
+                                 (getattr(self._data_saver, "last_fill_problems", None) or [])]
             except Exception as exc:
                 logger.exception(f"INIT_RUN: could not create data file: {exc}")
                 # host mode: nor will this run use the camera it locked
@@ -1212,7 +1303,7 @@ class LiveODServer(QThread, NetServer):
         # including the rest of a run this INIT_RUN takes over from (which it
         # does, as before).
         if self._run_in_progress and not self._reset_requested:
-            logger.warning(f"INIT_RUN while run {self._current_run_id} is still in progress: "
+            logger.warning(f"{tag} while run {self._current_run_id} is still in progress: "
                            f"that run is superseded; its further messages will be ignored.")
             # Its outcome, before the new token: nothing else records one (its file
             # is closed with what it has by begin() below -- not saved, not
@@ -1223,7 +1314,7 @@ class LiveODServer(QThread, NetServer):
                    + (f", launched by {c['launcher']}" if c["launcher"] else "")
                    if c["client_pid"] is not None else "client not recorded (older client)")
             self._record_outcome("superseded",
-                                 f"superseded by a new INIT_RUN while in progress; its client "
+                                 f"superseded by a new {tag} while in progress; its client "
                                  f"was {who}; file closed with what it had, not saved, "
                                  f"not deleted")
         # If the previous run was reset but the experiment process was killed
@@ -1353,20 +1444,342 @@ class LiveODServer(QThread, NetServer):
         self._run_state = "idle"    # so the new run's first state is always emitted
         self._set_run_state("waiting_camera" if capture_images else "running", camera_key)
         logger.info(
-            f"INIT_RUN: run_id={run_id}, {self._current_expt_name}, "
+            f"{tag}: run_id={run_id}, {self._current_expt_name}, "
             f"{n_shots} shots, save={save_data}, "
             f"camera={camera_key if capture_images else 'none'}"
         )
+        for problem in fill_problems:
+            logger.warning(f"run {run_id}: not in the file as sent: {problem}")
+        # a reservation this run's own process held is spent by its start
+        held = self._reservation
+        if held is not None and self._same_process(held["client"], self._current_client):
+            self._reservation = None
         reply = {"ok": True, "run_id": run_id, "filepath": filepath, "run_token": self._run_token,
                  # what this server can do beyond the original protocol: arrays
-                 # pushed during the run, and a save the client polls for
-                 "features": {"put_data": True, "async_save": True}}
+                 # pushed during the run, a save the client polls for, and
+                 # RESERVE_RUN / START_RUN / RELEASE_RESERVATION
+                 "features": dict(self.FEATURES)}
+        if fill_problems:
+            # what the file's fill could not store as sent; the client prints it
+            reply["warnings"] = _capped(fill_problems)
         # camera settings this run will get that differ from its camera_params
         # (Persist, host mode); the client prints them as a banner
         overrides = self.camera_overrides_record()
         if overrides:
             reply["camera_overrides"] = overrides
         return reply
+
+    # ------------------------------------------------------------------
+    # Queue phase 2: RESERVE_RUN / START_RUN / RELEASE_RESERVATION
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quiet(level: int, text: str) -> None:
+        """A log line about no run (a reservation for the next run, a refused
+        START): terminal, file and the log panel as usual, but never in the
+        current run's GET_LOG (LogBuffer keeps it under no run)."""
+        logger.log(level, text, extra={"run_log": False})
+
+    def _refuse_before_id(self, tag: str, reason: str, text: str, **extra) -> dict:
+        """A refused START_RUN (or the queue's INIT_RUN): no run id used, no
+        file, no camera lock; the run in progress, its token, its state and the
+        status strip are left exactly as they were."""
+        self._quiet(logging.WARNING, f"{tag} refused before any run id was used: {text}")
+        return {"ok": False, "refused": True, "refused_reason": reason,
+                "error": f"{tag} refused (no run id used): {text}", **extra}
+
+    def _process_known_dead(self, client: dict) -> bool:
+        """``client`` (as _client_of gives it) is a process known to be gone:
+        its pid was recorded, its host is this machine, and Windows says the
+        process has ended -- or the pid is alive but provably another process
+        (creation times differ by more than detached.SAME_PROCESS_S). A client
+        on another host, or without a pid, is never known dead; nor is a live
+        pid whose creation time was not sent or cannot be read."""
+        pid = (client or {}).get("client_pid")
+        if not pid:
+            return False
+        import socket  # noqa: PLC0415
+        if str(client.get("client_host") or "").lower() != socket.gethostname().lower():
+            return False
+        try:
+            from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
+            if not pid_alive(pid):
+                return True
+            started = client.get("client_started")
+            if started is None:
+                return False
+            from waxx.util.device_state import detached  # noqa: PLC0415
+            now = detached.process_started(pid)
+            return now is not None and abs(now - float(started)) > detached.SAME_PROCESS_S
+        except Exception:                             # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _same_process(a: dict, b: dict) -> bool:
+        """Two client records name one process: same pid and host, and
+        creation times that agree.  A missing creation time is "unknown",
+        never a match (Windows reuses pids): a reservation is then neither
+        spent by nor renewed for that client -- the safe direction for both
+        callers (it lapses by release, dead pid or ttl)."""
+        if not a or not b or not a.get("client_pid") or a.get("client_pid") != b.get("client_pid"):
+            return False
+        if str(a.get("client_host") or "").lower() != str(b.get("client_host") or "").lower():
+            return False
+        sa, sb = a.get("client_started"), b.get("client_started")
+        if sa is None or sb is None:
+            return False
+        try:
+            from waxx.util.device_state import detached  # noqa: PLC0415
+            tol = float(detached.SAME_PROCESS_S)
+        except Exception:                             # noqa: BLE001
+            tol = 0.05
+        return abs(float(sa) - float(sb)) <= tol
+
+    def _who_text(self, client: dict) -> str:
+        c = client or {}
+        if c.get("client_pid") is None:
+            return "client not recorded (older client)"
+        text = f"pid {c['client_pid']} on {c.get('client_host') or '?'}"
+        if c.get("launcher"):
+            text += f", launched by {c['launcher']}"
+        if c.get("queue_job"):
+            text += f", queue job {c['queue_job']}"
+        return text
+
+    def _live_run_refusal(self, tag: str):
+        """None, or the refusal of a run start that would supersede a run in
+        progress whose client is not known to be gone (never for the queue).
+        A run whose experiment told liveOD it is exiting (RUN_EXITED, frames
+        still due) counts as gone, pid or not -- as run_gate's dead_client
+        waiver has it (START_RUN first waits for its last frames)."""
+        if not self._run_in_progress or self.client_known_dead() or self.exited_run_pending():
+            return None
+        state = "an Abort is pending on it" if self._reset_requested else "it is running"
+        return self._refuse_before_id(
+            tag, "run_in_progress",
+            f"run {self._current_run_id} ({self._current_expt_name or '?'}) is in progress and "
+            f"its client ({self._who_text(self._current_client)}) is not known to be gone "
+            f"({state}); a queued run never supersedes a live run. It ends by itself, or a "
+            f"person ends it (Reset in liveOD).",
+            run_id=self._current_run_id)
+
+    def _wait_exited_run(self, tag: str, limit_s: float = None):
+        """A run whose experiment exited with frames still due is closed as the
+        server loop would close it (_check_exited_run), waiting for that up to
+        ``limit_s``: a start must not cut off frames the core device had
+        already queued. None once closed (or none pending), else the refusal."""
+        if not self.exited_run_pending():
+            return None
+        limit_s = START_EXITED_WAIT_S if limit_s is None else float(limit_s)
+        self._quiet(logging.INFO, f"{tag}: waiting up to {limit_s:.0f} s for run "
+                                  f"{self._current_run_id}'s last frames (its experiment exited)")
+        deadline = time.monotonic() + limit_s
+        while True:
+            self._check_exited_run()
+            if not self.exited_run_pending():
+                return None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        return self._refuse_before_id(
+            tag, "exited_frames_due",
+            f"run {self._current_run_id}'s experiment exited with frames still due and the "
+            f"run is not closed after {limit_s:.0f} s; try again", run_id=self._current_run_id)
+
+    def _expire_reservation(self) -> None:
+        """The reservation goes when its ttl has run out or its process is known
+        to be gone."""
+        held = self._reservation
+        if held is None:
+            return
+        why = ""
+        if time.monotonic() - held["mono"] > held["ttl_s"]:
+            why = f"its {held['ttl_s']:.0f} s ran out"
+        elif self._process_known_dead(held["client"]):
+            why = "its process is gone"
+        if why:
+            self._reservation = None
+            self._quiet(logging.INFO, f"Reservation for {held['expt'] or '?'} "
+                                      f"({self._who_text(held['client'])}) expired: {why}.")
+
+    def _reservation_view(self):
+        """The reservation as POLL shows it (no token), or None."""
+        held = self._reservation
+        if held is None:
+            return None
+        c = held["client"]
+        return {"expt": held["expt"], "pid": c.get("client_pid"), "host": c.get("client_host"),
+                "queue_job": c.get("queue_job"), "since": held["since"], "ttl": held["ttl_s"],
+                "expires_in_s": max(0.0, held["ttl_s"] - (time.monotonic() - held["mono"]))}
+
+    def _handle_reserve_run(self, msg: dict) -> dict:
+        """RESERVE_RUN: the next run checks in while the current one runs. It
+        creates NOTHING -- no run id, no file, no camera lock, no run state, no
+        line in the current run's log -- and predicts no run id. It holds the
+        one reservation slot (refused while another process holds it, unless
+        that one's ttl ran out or its process is gone) and dry-runs what the
+        start would meet: the data directory, the run file's fill into an
+        in-memory file (DataSaver.dry_run_fill), the camera profile (host mode,
+        CameraHost.preview_run). Reply: ``reservation``, ``features``,
+        ``ttl_s``, ``warnings`` (values the file would not hold as sent,
+        persisted camera values not carried) and ``preview``
+        (``camera_overrides``, ``refused``: what would refuse the start now).
+        START_RUN is what counts: everything is checked again there."""
+        client = _client_of(msg)
+        expt = str(msg.get("expt_file") or msg.get("expt_class", ""))
+        self._expire_reservation()
+        held = self._reservation
+        if held is not None and not self._same_process(held["client"], client):
+            text = (f"liveOD already holds a reservation for {held['expt'] or '?'} "
+                    f"({self._who_text(held['client'])}) for "
+                    f"{self._reservation_view()['expires_in_s']:.0f} s more; one at a time")
+            self._quiet(logging.WARNING, f"RESERVE_RUN for {expt or '?'} "
+                                         f"({self._who_text(client)}) refused: {text}")
+            return {"ok": False, "refused": True, "error": f"RESERVE_RUN refused: {text}",
+                    "holder": self._reservation_view(), "features": dict(self.FEATURES)}
+        try:
+            ttl = float(msg.get("ttl_s", RESERVATION_TTL_DEFAULT_S))
+        except (TypeError, ValueError):
+            ttl = RESERVATION_TTL_DEFAULT_S
+        if not np.isfinite(ttl):
+            ttl = RESERVATION_TTL_DEFAULT_S
+        ttl = min(max(ttl, RESERVATION_TTL_MIN_S), RESERVATION_TTL_MAX_S)
+        warnings, refused, overrides = [], [], {}
+        save_data = bool(msg.get("save_data", False))
+        capture_images = bool(msg.get("capture_images", False))
+        saver = self._data_saver
+        if save_data:
+            check = getattr(saver, "data_dir_reachable", None)
+            if check is not None:
+                # on a helper thread, bounded: a share that hangs must not hold
+                # up the running run's messages behind this one
+                ok, why = _bounded(check, RESERVE_DIR_CHECK_S,
+                                   (False, f"the data directory did not answer within "
+                                           f"{RESERVE_DIR_CHECK_S:g} s"))
+                if not ok:
+                    refused.append(str(why))
+            dry = getattr(saver, "dry_run_fill", None)
+            if dry is not None:
+                result = dry(dict(msg))
+                warnings.extend(str(p) for p in result.get("problems") or [])
+                if result.get("error"):
+                    refused.append(f"the run file's fill would fail: {result['error']}")
+        host = self._camera_host
+        if capture_images and host is not None and hasattr(host, "preview_run"):
+            camera_key = str(msg.get("camera_key", ""))
+            try:
+                pv = host.preview_run(camera_key, capture_images,
+                                      dict(msg.get("camera_params") or {}))
+            except Exception as exc:                  # noqa: BLE001
+                warnings.append(f"camera {camera_key}: dry run failed: "
+                                f"{type(exc).__name__}: {exc}")
+            else:
+                refused.extend(f"camera {camera_key}: {r}" for r in pv.get("refusals") or [])
+                warnings.extend(f"camera {camera_key}: persisted {k} not carried: {why}"
+                                for k, why in (pv.get("not_carried") or {}).items())
+                if pv.get("overrides"):
+                    overrides = self._json_safe_record(
+                        {"schema": 1, "camera_key": camera_key, "persist_since": None,
+                         "fields": {k: dict(v) for k, v in pv["overrides"].items()}})
+        token = uuid.uuid4().hex
+        self._reservation = {"token": token, "client": client, "expt": expt,
+                             "since": time.time(), "mono": time.monotonic(), "ttl_s": ttl}
+        self._quiet(logging.INFO,
+                    f"RESERVE_RUN: {expt or '?'} ({self._who_text(client)}) reserved the next "
+                    f"start for {ttl:.0f} s (no run id, no file, no camera lock); "
+                    f"{len(warnings)} warning(s), {len(refused)} refusal(s) found"
+                    + ("".join(f"\n    refused: {r}" for r in refused)))
+        return {"ok": True, "reservation": token, "features": dict(self.FEATURES), "ttl_s": ttl,
+                "warnings": _capped(warnings),
+                "preview": {"camera_overrides": overrides, "refused": _capped(refused)}}
+
+    def _handle_start_run(self, msg: dict) -> dict:
+        """START_RUN: the reserved (or any queued, warm) run takes the machine.
+        Refused BEFORE any run id when a feature the experiment's compiled code
+        needs is missing (``require_features``), when a Reset was counted since
+        the queue gave GO (``go_reset_count``: POLL's reset_count then; a
+        ``go_instance`` that is not this liveOD process -- restarted since GO
+        -- refuses too, as its count says nothing), or when
+        a run is in progress whose client is not known to be gone (a live run
+        is never superseded); it waits first, bounded, for the previous run's
+        save and for the last frames of a run whose experiment exited. Then the
+        server stamps its own time into run_date_str / run_datetime_str (the
+        file's name and day folder: a warm process's own stamp is from when it
+        started, long before) and it is exactly INIT_RUN; the reply is
+        INIT_RUN's plus ``run_date_str``, ``run_datetime_str``,
+        ``run_started_at`` (epoch s) and ``reservation_known``. An unknown
+        reservation (liveOD restarted, expired, released) is a plain start."""
+        tag = "START_RUN"
+        need = [str(f) for f in (msg.get("require_features") or [])]
+        missing = [f for f in need if not self.FEATURES.get(f)]
+        if missing:
+            return self._refuse_before_id(
+                tag, "feature", f"this liveOD lacks {', '.join(missing)} (it has "
+                                f"{', '.join(sorted(self.FEATURES))})", missing=missing)
+        go = msg.get("go_reset_count")
+        if go is not None:
+            try:
+                go = int(go)
+            except (TypeError, ValueError):
+                return self._refuse_before_id(tag, "bad_request", f"bad go_reset_count {go!r}")
+        go_instance = msg.get("go_instance")
+        if go_instance and str(go_instance) != self._instance:
+            # the GO's reset_count was counted by another liveOD process: a
+            # Reset pressed in this one before now would be missed
+            return self._refuse_before_id(
+                tag, "liveod_restarted",
+                f"liveOD restarted since the queue gave GO (instance {go_instance} then, "
+                f"{self._instance} now): a Reset in between cannot be ruled out",
+                instance=self._instance)
+        for wait in (self._wait_previous_save, self._wait_exited_run):
+            refused = wait(tag)
+            if refused is not None:
+                return refused
+        # after the waits: a Reset pressed during them counts too
+        if go is not None and self._reset_count > go:
+            last = self._last_reset or {}
+            when = (time.strftime("%H:%M:%S", time.localtime(last["at"]))
+                    if last.get("at") else "?")
+            return self._refuse_before_id(
+                tag, "reset_since_go",
+                f"{self._reset_count - go} Reset(s) counted since the queue gave GO (reset_count "
+                f"{go} -> {self._reset_count}; last at {when} from {last.get('source', '?')}); "
+                f"a Reset between runs means stop", reset_count=self._reset_count)
+        refused = self._live_run_refusal(tag)
+        if refused is not None:
+            return refused
+        token = str(msg.get("reservation") or "")
+        held = self._reservation
+        known = bool(token) and held is not None and held["token"] == token
+        if token and not known:
+            self._quiet(logging.INFO, f"START_RUN: reservation {token[:8]}... unknown to this "
+                                      f"liveOD (restarted, expired or released): a plain start")
+        now = time.time()
+        stamp = time.localtime(now)
+        msg = dict(msg)
+        msg["run_date_str"] = time.strftime("%Y-%m-%d", stamp)
+        msg["run_datetime_str"] = time.strftime("%Y-%m-%d_%H-%M-%S", stamp)
+        reply = self._start_new_run(msg, tag)
+        if reply.get("ok"):
+            if known and self._reservation is not None and self._reservation["token"] == token:
+                self._reservation = None
+            reply.update(run_date_str=msg["run_date_str"],
+                         run_datetime_str=msg["run_datetime_str"],
+                         run_started_at=now, reservation_known=known)
+        return reply
+
+    def _handle_release_reservation(self, msg: dict) -> dict:
+        """RELEASE_RESERVATION: the warm process stands down. Idempotent: an
+        unknown, expired or already released token is ``released: False``,
+        never an error."""
+        token = str(msg.get("reservation") or "")
+        held = self._reservation
+        if held is not None and token and held["token"] == token:
+            self._reservation = None
+            self._quiet(logging.INFO, f"Reservation for {held['expt'] or '?'} "
+                                      f"({self._who_text(held['client'])}) released.")
+            return {"ok": True, "released": True}
+        return {"ok": True, "released": False}
 
     def _handle_wait_cam_ready(self, msg: dict) -> dict:
         """Wait up to ``timeout`` s for the camera.
@@ -1958,25 +2371,7 @@ class LiveODServer(QThread, NetServer):
         is a live pid whose creation time was not sent or cannot be read."""
         if not self._run_in_progress:
             return False
-        client = self._current_client
-        pid = client.get("client_pid")
-        if not pid:
-            return False
-        import socket  # noqa: PLC0415
-        if str(client.get("client_host") or "").lower() != socket.gethostname().lower():
-            return False
-        try:
-            from waxx.util.device_state.run_gate import pid_alive  # noqa: PLC0415
-            if not pid_alive(pid):
-                return True
-            started = client.get("client_started")
-            if started is None:
-                return False
-            from waxx.util.device_state import detached  # noqa: PLC0415
-            now = detached.process_started(pid)
-            return now is not None and abs(now - float(started)) > detached.SAME_PROCESS_S
-        except Exception:                             # noqa: BLE001
-            return False
+        return self._process_known_dead(self._current_client)
 
     def reset_dead_client(self, source: str = "person") -> str | None:
         """A Reset on a run whose process is known to be gone (user ruling
@@ -2156,14 +2551,23 @@ class LiveODServer(QThread, NetServer):
         """
         now = time.time()
         last_shot = self._shot_timestamps[-1] if self._shot_timestamps else None
+        self._expire_reservation()
         return {
             "ok": True,
+            # queue phase 2: what this server can do ("reserve": RESERVE_RUN /
+            # START_RUN / RELEASE_RESERVATION), and the reservation for the next
+            # run: {expt, pid, host, queue_job, since, ttl, expires_in_s} or None
+            "features": dict(self.FEATURES),
+            "reservation": self._reservation_view(),
             "reset_requested": self._reset_requested,
             # every Abort set (Reset button or RESET), counted: a watcher sees a
             # quick Reset that the level above hides (cleared by ABORT_RUN or
             # the next INIT_RUN between two polls); last_reset: {at, count,
             # run_id, source "person" | "queue" | "agent"} or None
             "reset_count": self._reset_count,
+            # this liveOD process (random at start): reset_count is counted
+            # per instance, so the queue hands it to START with the count
+            "instance": self._instance,
             "reset_counts": dict(self._reset_counts),      # by source
             "last_reset": dict(self._last_reset) if self._last_reset else None,
             "run_in_progress": self._run_in_progress,
