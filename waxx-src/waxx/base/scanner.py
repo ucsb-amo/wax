@@ -361,6 +361,32 @@ class Scanner():
         return 0
 
     @kernel
+    def _cleanup_or_safe_state(self):
+        """cleanup_scan_kernel, and if IT raises, the machine's safe state
+        (cleanup_abort_kernel) before the exception goes on. Used after every
+        shot: the normal path and the RTIOUnderflow / TriggerTimeout /
+        RTIOOverflow handlers (2026-10-23). A cleanup that raised before its
+        coil reset (kexp: a wrong image count after an underflow before the
+        first frame) used to end the run with no cleanup at all. If it raises
+        inside a handler, the cleanup's exception is the one re-raised."""
+        try:
+            self.cleanup_scan_kernel()
+        except:
+            self.core.break_realtime()
+            self.cleanup_abort_kernel()
+            raise
+
+    @kernel
+    def _cleanup_calibration_or_safe_state(self):
+        """As _cleanup_or_safe_state, for a sub-scan point's cleanup."""
+        try:
+            self.cleanup_calibration_kernel()
+        except:
+            self.core.break_realtime()
+            self.cleanup_abort_kernel()
+            raise
+
+    @kernel
     def _run_subscan_point(self) -> TTuple([TBool, TStr]):
         """One sub-scan point, with the data shot's exception handling (see
         _scan): an RTIO error ends the run as it would a data shot (saved
@@ -380,7 +406,7 @@ class Scanner():
             self.calibration_kernel()
         except RTIOUnderflow:
             self.core.break_realtime()
-            self.cleanup_calibration_kernel()
+            self._cleanup_calibration_or_safe_state()
             self._subscan_end(False, "RTIOUnderflow")
             if not self._abort_shot("RTIOUnderflow"):
                 raise
@@ -391,7 +417,7 @@ class Scanner():
             aprint("[scan] sub-scan point aborted: a triggered wait saw no edge "
                    "(TriggerTimeout). Cleaning up and ending the run.")
             self.core.break_realtime()
-            self.cleanup_calibration_kernel()
+            self._cleanup_calibration_or_safe_state()
             self._subscan_end(False, "TriggerTimeout")
             if not self._abort_shot("TriggerTimeout"):
                 raise
@@ -402,7 +428,7 @@ class Scanner():
             aprint("[scan] sub-scan point aborted: an RTIO input FIFO overflowed "
                    "(RTIOOverflow). Cleaning up and ending the run.")
             self.core.break_realtime()
-            self.cleanup_calibration_kernel()
+            self._cleanup_calibration_or_safe_state()
             self._subscan_end(False, "RTIOOverflow")
             if not self._abort_shot("RTIOOverflow"):
                 raise
@@ -418,7 +444,7 @@ class Scanner():
             self._subscan_end(False, "error")
             raise
         if not cleaned:
-            self.cleanup_calibration_kernel()
+            self._cleanup_calibration_or_safe_state()
             self._subscan_end(True, "")
         self.core.break_realtime()
         return (aborted, what)
@@ -651,7 +677,7 @@ class Scanner():
                 self.shot_completed = True
             except RTIOUnderflow:
                 self.core.break_realtime()
-                self.cleanup_scan_kernel()
+                self._cleanup_or_safe_state()
                 if not self._abort_shot("RTIOUnderflow"):
                     raise
                 # save_on_underflow: finish the run with the shots taken
@@ -665,7 +691,7 @@ class Scanner():
                        "(TriggerTimeout, see the line above). Cleaning up and "
                        "ending the run.")
                 self.core.break_realtime()
-                self.cleanup_scan_kernel()
+                self._cleanup_or_safe_state()
                 if not self._abort_shot("TriggerTimeout"):
                     raise
                 aborted_bool = True
@@ -678,7 +704,7 @@ class Scanner():
                        "(RTIOOverflow) -- a TTL input is toggling far faster "
                        "than expected. Cleaning up and ending the run.")
                 self.core.break_realtime()
-                self.cleanup_scan_kernel()
+                self._cleanup_or_safe_state()
                 if not self._abort_shot("RTIOOverflow"):
                     raise
                 aborted_bool = True
@@ -705,12 +731,7 @@ class Scanner():
             # 2026-10-23). It now runs the safe state first, as the shot's
             # own handler does.
             if not cleaned:
-                try:
-                    self.cleanup_scan_kernel()
-                except:
-                    self.core.break_realtime()
-                    self.cleanup_abort_kernel()
-                    raise
+                self._cleanup_or_safe_state()
 
             self.core.break_realtime()
 

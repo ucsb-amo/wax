@@ -73,3 +73,52 @@ def test_an_underflow_in_a_shot_is_cleaned_once_as_before():
     with pytest.raises(RTIOUnderflow):
         e.scan()
     assert _kinds(e) == ["data", "data"] and e.aborts == ["RTIOUnderflow"]
+
+
+# ---- cleanups inside the shot's error handlers (organizer / reviewer B, 2026-10-23) ----
+# kexp: an underflow before the first frame leaves the image counters at 0, so
+# cleanup_scan_kernel's first step (cleanup_image_count) raises ValueError
+# before reset_coils. The handler's cleanup is now wrapped too: the safe state
+# (which includes the full coil reset in kexp) runs before anything re-raises.
+
+from artiq.coredevice.exceptions import RTIOOverflow  # noqa: E402
+from waxx.control.exceptions import TriggerTimeout  # noqa: E402
+
+
+def _cleanup_raising_when_no_image(e):
+    real = type(e).cleanup_scan_kernel
+
+    def cleanup(self=e):
+        if not e.shot_completed:
+            raise ValueError("Incorrect number of PWA acquired during the shot.")
+        real(e)
+    e.cleanup_scan_kernel = cleanup
+
+
+@pytest.mark.parametrize("exc", [RTIOUnderflow, TriggerTimeout, RTIOOverflow])
+def test_a_cleanup_failing_inside_a_shot_handler_reaches_the_safe_state(exc):
+    e = _prepared(with_sub=False)
+    _cleanup_raising_when_no_image(e)
+    real_kernel = type(e).scan_kernel
+
+    def shot(self=e):
+        if len(e.calls) == 1:               # the 2nd shot fails before imaging
+            raise exc("test")
+        real_kernel(e)
+    e.scan_kernel = shot
+    with pytest.raises(ValueError, match="Incorrect number"):
+        e.scan()
+    assert _kinds(e) == ["data", "cleanup_abort"]
+
+
+def test_a_failing_sub_scan_cleanup_reaches_the_safe_state():
+    e = _prepared(n_data=3, every=2)
+    e.fail_point = 0                          # the first point underflows
+
+    def cal_cleanup():
+        e.calls.append(("cleanup_cal",))
+        raise ValueError("cleanup of the point failed")
+    e.cleanup_calibration_kernel = cal_cleanup
+    with pytest.raises(ValueError, match="cleanup of the point failed"):
+        e.scan()
+    assert _kinds(e)[-2:] == ["cleanup_cal", "cleanup_abort"]
