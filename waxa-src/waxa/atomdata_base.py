@@ -690,6 +690,37 @@ def aux_frames_dropped_banner(run_id, record) -> str:
     return (f"!! run {run_id}: per-shot auxiliary data never reached the file (those "
             f"slots hold the fill value; see ad.aux_frames_dropped): " + "; ".join(parts))
 
+def operator_override_banner(run_id, attrs) -> str:
+    """The one-line ``!!`` notice for a run during which an operator
+    overrode an auxiliary camera frame's exposure / gain (the
+    ``operator_overrides`` of its ``camera_stream_<key>`` provenance
+    records), or ``""``. Each frame's ``<key>_meta`` holds the exposure and
+    gain it was taken at."""
+    import json
+    seen, parts = set(), []
+    for name in sorted(k for k in attrs.keys() if str(k).startswith('camera_stream_')):
+        raw = attrs[name]
+        if isinstance(raw, bytes):
+            raw = raw.decode(errors='replace')
+        try:
+            rec = json.loads(str(raw))
+        except Exception:
+            continue
+        if not isinstance(rec, dict) or not rec.get('operator_overrides'):
+            continue
+        cam = rec.get('camera_id') or rec.get('serial') or name
+        if cam in seen:
+            continue                        # one record per camera, repeated per key
+        seen.add(cam)
+        said = ", ".join((f"{c.get('values')} by {c.get('by') or '?'}" if c.get('values')
+                          else "cleared") for c in rec['operator_overrides'])
+        parts.append(f"{cam} ({said}; frames under it {rec.get('operator_override_frames') or {}})")
+    if not parts:
+        return ""
+    return (f"!! run {run_id}: an operator overrode auxiliary camera settings during the run "
+            f"(each frame's <key>_meta has what it was taken at; see ad.run_records): "
+            + "; ".join(parts))
+
 class analysis_tags():
     """A simple container to hold analysis tags for analysis logic.
     """    
@@ -3155,6 +3186,9 @@ class atomdata_base():
             # recorded with counts and reasons; those slots hold the fill.
             self.aux_frames_dropped = read_aux_frames_dropped(f.attrs)
             _banner = aux_frames_dropped_banner(self.run_info.run_id, self.aux_frames_dropped)
+            if _banner:
+                print(_banner)
+            _banner = operator_override_banner(self.run_info.run_id, f.attrs)
             if _banner:
                 print(_banner)
             if self._has_images:
