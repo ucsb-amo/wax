@@ -839,15 +839,17 @@ class CameraStreamClient:
             self._note("superseded_frames", idx=list(idx), **more)
         return error is None
 
-    def _tag(self, frame, key):
-        """Name the frame ``key`` on its camera server, so a viewer can show
-        this key's frames alone (Camera Viewer: the Frames dropdown). For
-        display only, nothing is saved by it; never raises."""
+    def _tag(self, frame, key, roi=None):
+        """Name the frame ``key`` on its camera server, with ``roi`` (the
+        crop this stream stores of it; None = the full frame), so a viewer can
+        show this key's frames alone with that ROI as its box (Camera Viewer:
+        the Frames dropdown). For display only, nothing is saved by it; never
+        raises."""
         if not self._tagging or self._stream is None:     # dead / not connected
             return
         from beacon.camera.stream import Unsupported
         try:
-            if not self._stream.tag_frame(frame.seq, key):
+            if not self._stream.tag_frame(frame.seq, key, roi=roi):
                 self._note("tags_gone", seq=int(frame.seq))
         except Unsupported as e:
             self._tagging = False
@@ -945,7 +947,7 @@ class CameraStreamClient:
         if self._check_shape(idx, img):
             self._store(self.dc, self.dc_meta, idx, img, frame, target,
                         slot=idx, gen=gen)
-            self._tag(frame, self.key)
+            self._tag(frame, self.key, self._roi)
 
     def _snap_once(self):
         """One snap at our settings revision; if someone changed the settings
@@ -1257,12 +1259,27 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     frame, downsampled like a camera with no ROI); frames not listed get
     ``roi``. The camera always reads out the full sensor, so a crop costs
     nothing between frames.
+
+    The stream declares itself the camera's run stream on its server
+    (beacon.camera.core, "Run streams"), naming its keys -- the tags its
+    frames carry: nobody else may change its exposure or gain until it
+    closes, and an operator may override them for one of its frames, for
+    this run only (Camera Viewer: that frame shown alone, Override...): gain
+    always, exposure only for a frame with a ``frame_max_exposure`` ({frame
+    index or key: s}, the longest its timing allows; this run's own exposure
+    for it must not be longer). The server puts the override into this
+    stream's own write for that frame and tags it as such; the stream picks a
+    change up from the status block every server reply carries and from then
+    on sets every frame's settings itself, exactly as for ``frame_settings``.
+    Each change is printed, kept in the provenance (``operator_overrides``,
+    with the frames taken under it), and every frame's record has the
+    exposure and gain it was taken at. The override ends with the stream.
     """
 
     def __init__(self, expt, camera, key, *, ttl, trigger_source="Line1",
                  exposure_delay=0., exposure_delay_from_camera=True, t_trigger=2.e-6,
                  t_match_window=2.0, t_early_tolerance=0.25, t_stray_grace=0.3,
-                 frame_settings=None, frame_rois=None, **kw):
+                 frame_settings=None, frame_rois=None, frame_max_exposure=None, **kw):
         self.ttl = ttl                                  # kernel-visible
         # The exposure delay (waxx.control.cameras.exposure_delay). The
         # kernel reads only the cell. ``exposure_delay`` /
@@ -1301,9 +1318,18 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self._t_stray_grace = float(t_stray_grace)
         self._frame_settings = self._parse_frame_settings(frame_settings)
         self._frame_rois = self._parse_frame_rois(frame_rois)
+        self._frame_max_exposure = self._parse_frame_max_exposure(frame_max_exposure)
+        self._check_max_exposure(kw.get("exposure_time"))
         self._geometry = []                 # per frame: (roi, downsample, stored shape)
         self._base_settings = {}            # what frames without their own get
         self._cur_settings = None           # what the camera holds (None = unknown)
+        self._run_stream = False            # declared on the server (RUN_STREAM)
+        self._operator = {}                 # the operator override: {frame key: {key: value}}
+        self._op_rev = None                 # the server's operator_rev we last read
+        self._per_frame = False             # set every frame's settings (an override was seen)
+        self.operator_overrides = []        # each change, as recorded
+        self._override_frames = {}          # key -> frames stored under an override
+        self._last_idx = None               # shot index of the last announced edge
         self._settings_done = set()         # pending edges whose settings were handled
         self._last_frame = None             # index of the last frame received
         self._last_announced = None         # index of the last frame announced
@@ -1352,6 +1378,33 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                                  f"(keys {self.keys})")
             out[jj] = [int(v) for v in roi] if roi else None
         return out
+
+    def _parse_frame_max_exposure(self, frame_max_exposure):
+        out = {}
+        for j, v in dict(frame_max_exposure or {}).items():
+            jj = (self.keys.index(j) if j in self.keys else -1) if isinstance(j, str) else int(j)
+            if not 0 <= jj < len(self.keys):
+                raise ValueError(f"frame_max_exposure for frame {j!r}: no such frame "
+                                 f"(keys {self.keys})")
+            if v is None:
+                continue
+            if not float(v) > 0:
+                raise ValueError(f"frame_max_exposure for {self.keys[jj]!r}: {v!r} must be "
+                                 f"positive")
+            out[jj] = float(v)
+        return out
+
+    def _check_max_exposure(self, exposure_time):
+        """This run's own exposure of each frame must respect its declared
+        max (the server bounds only the operator's)."""
+        bad = []
+        for j, mx in sorted(self._frame_max_exposure.items()):
+            own = self._frame_settings.get(j, {}).get("exposure_time", exposure_time)
+            if own is not None and float(own) > mx * (1 + 1e-9):
+                bad.append(f"{self.keys[j]} exposure_time {float(own):g} s")
+        if bad:
+            raise ValueError(f"camera stream {self.keys}: {', '.join(bad)} above its "
+                             f"frame_max_exposure")
 
     # ---- kernel side -----------------------------------------------------
 
@@ -1417,6 +1470,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 self._req_count[(idx, j)] = n
                 self.counts["requested"] += 1
                 self._slot_ok[(idx, j)] = False
+                self._last_idx = idx
                 if n > 1:                   # a warm-up shot: start this frame over
                     self._clear_slot_locked(idx, j)
                     duplicate = True
@@ -1489,6 +1543,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                                     keep_run_data=keep_run_data)
 
     def _setup_settings_and_probe(self):
+        # first: a stale run stream (a run that died) would refuse our settings
+        self._declare_run_stream()
         frame0 = super()._setup_settings_and_probe()
         try:
             self._enter_triggered()
@@ -1501,12 +1557,87 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 pass
             raise
         self._take_camera_exposure_delay()
-        if self._frame_settings:            # what frames without their own get
-            current, _ = self._stream.get_settings()
-            self._base_settings = {k: current[k] for k in FRAME_SETTING_KEYS
-                                   if current.get(k) is not None}
-            self._cur_settings = dict(self._base_settings)
+        # what frames without their own get (also the base an override changes)
+        current, _ = self._stream.get_settings()
+        self._base_settings = {k: current[k] for k in FRAME_SETTING_KEYS
+                               if current.get(k) is not None}
+        self._cur_settings = dict(self._base_settings)
         return frame0
+
+    def _declare_run_stream(self):
+        """RUN_STREAM on the server (class docstring). A server without run
+        streams, or one that refuses, leaves the stream as it always was:
+        noted, never fatal."""
+        declare = getattr(self._stream, "declare_run_stream", None)
+        if declare is None:
+            self._note("run_stream_unsupported", error="client library has no run streams")
+            return
+        mx = {self.keys[j]: v for j, v in sorted(self._frame_max_exposure.items())}
+        try:
+            op = declare(list(self.keys), max_exposure_time=mx)
+        except Exception as e:
+            self._run_stream = False
+            kind = ("run_stream_unsupported" if "unknown_command" in str(e).lower()
+                    or "unknown command" in str(e).lower() else "run_stream_failed")
+            self._note(kind, error=repr(e))
+            console.info(f"[{self.label}] note: {self.serial} could not be declared this run's "
+                         f"stream ({e}); others may change its exposure / gain during the run",
+                         console.VERBOSE)
+            return
+        self._run_stream = True
+        self._adopt_operator(op)
+
+    def _poll_operator(self):
+        """Pick up an operator override change (worker thread): the status
+        block of the last reply carries the server's operator_rev."""
+        if not self._run_stream:
+            return
+        raw = getattr(self._stream.status(refresh=False), "raw", None) or {}
+        rev = raw.get("operator_rev")
+        if rev is None or rev == self._op_rev:
+            return
+        self._adopt_operator(self._stream.operator_state())
+
+    def _adopt_operator(self, op):
+        """Take the server's operator state: record and print a change."""
+        op = dict(op or {})
+        rs = op.get("run_stream")
+        ov = op.get("override") or {}
+        values = {str(t): {k: float(v) for k, v in dict(kv).items()}
+                  for t, kv in dict(ov.get("values") or {}).items() if str(t) in self.keys}
+        with self._lock:
+            self._op_rev = op.get("rev")
+            if rs is None or list(rs.get("frames") or ()) != list(self.keys):
+                self._note("run_stream_lost", run_stream=rs)
+            changed = values != self._operator
+            if changed:
+                self._operator = values
+                if values:
+                    self._per_frame = True
+                event = {"t": time.time(), "at": ov.get("at") or time.strftime("%H:%M:%S"),
+                         "by": ov.get("by", ""), "host": ov.get("host", ""),
+                         "values": values, "requests_before": self.counts["requested"],
+                         "last_announced_idx": (None if self._last_idx is None
+                                                else list(self._last_idx))}
+                self.operator_overrides.append(event)
+        if changed:
+            print(f"[{self.label}] !! operator override "
+                  + (f"{values} by {event['by'] or '?'} on {event['host'] or '?'}"
+                     if values else "cleared")
+                  + f" (after {event['requests_before']} frames requested); frames "
+                    f"record the exposure / gain they were taken at")
+
+    def _frame_target(self, j):
+        """Frame ``j``'s settings as this run configured them."""
+        return self._frame_settings.get(j, self._base_settings)
+
+    def _effective_target(self, j):
+        """Frame ``j``'s settings with its operator override on top (what
+        the server will apply for it)."""
+        t = dict(self._frame_target(j))
+        if self._operator and 0 <= j < len(self.keys):
+            t.update(self._operator.get(self.keys[j]) or {})
+        return t
 
     def _read_camera_exposure_delay(self):
         """(seconds or None, why not): the exposure start delay the camera's
@@ -1704,11 +1835,13 @@ class TriggeredCameraStreamClient(CameraStreamClient):
     # ---- worker thread ---------------------------------------------------
 
     def _work(self):
-        poll = TRIGGERED_POLL_FAST_S if self._frame_settings else TRIGGERED_POLL_S
         while not self._stop.is_set():
             frame = None
+            poll = (TRIGGERED_POLL_FAST_S if (self._frame_settings or self._per_frame)
+                    else TRIGGERED_POLL_S)
             try:
                 self._check_instance()
+                self._poll_operator()
                 self._drain_announcements()
                 self._apply_frame_settings()
                 frame = self._stream.latest(after_seq=self._after, timeout=poll,
@@ -1734,6 +1867,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self._note("server_restarted", old=self._instance, new=inst)
         self._instance = inst
         self._after = 0
+        self._declare_run_stream()          # the new process knows nothing of it
         self._enter_triggered()
 
     def _drain_announcements(self):
@@ -1749,9 +1883,9 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         entry = self._pending.pop(i)
         if entry[2] >= 0:
             self._last_frame = entry[2]
-        if (self._frame_settings and entry[2] >= 0
+        if ((self._frame_settings or self._per_frame) and entry[2] >= 0
                 and entry not in self._settings_done):
-            target = self._frame_settings.get(entry[2], self._base_settings)
+            target = self._effective_target(entry[2])
             if target and self._settings_differ(target):
                 self._note("frame_settings_late", idx=list(entry[1]), frame=entry[2])
         self._settings_done.discard(entry)
@@ -1783,39 +1917,56 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         frame's own settings go in once it is the earliest pending one (so no
         earlier frame can carry the new revision) and FRAME_SETTINGS_LEAD_S
         remains; later than that the frame is taken as the camera stands and
-        flagged."""
-        if not self._frame_settings:
+        flagged.
+
+        With an operator override (or after one), every frame is handled so:
+        the comparison is against the frame's settings with its override on
+        top, and the write sends the run's own values tagged with the frame,
+        for the server to substitute."""
+        if not (self._frame_settings or self._per_frame):
             return
         if not self._pending:
             last = self._last_frame
             j = 0 if last is None else self._next_after.get(last, (last + 1) % len(self.keys))
-            target = self._frame_settings.get(j, self._base_settings)
+            target = self._effective_target(j)
             if target and self._settings_differ(target):
-                self._set_now(target, frame=j)
+                self._set_now(j, frame=j)
             return
         entry = self._pending[0]
         t_expected, idx, j = entry[:3]
         if j < 0 or entry in self._settings_done:
             return
-        target = self._frame_settings.get(j, self._base_settings)
+        target = self._effective_target(j)
         if target and self._settings_differ(target):
             late = time.monotonic() - (t_expected - FRAME_SETTINGS_LEAD_S)
             if late > 0:
                 self._note("frame_settings_late", idx=list(idx), frame=j,
                            late_s=round(late, 3))
             else:
-                self._set_now(target, frame=j, idx=list(idx))
+                self._set_now(j, frame=j, idx=list(idx))
         self._settings_done.add(entry)
 
-    def _set_now(self, target, **fields):
+    def _set_now(self, j, **fields):
+        """Write frame ``j``'s own settings, tagged with its key (the server
+        puts an operator override in); remember what the camera now holds."""
+        target = dict(self._frame_target(j))
+        if not target:                      # the camera reported no exposure / gain
+            self._note("frame_settings_failed", error="no base settings to send", **fields)
+            return
         try:
-            rb = self._stream.set(**target)
+            set_values = getattr(self._stream, "set_values", None)
+            if self._run_stream and set_values is not None:
+                rb = set_values(target, frame=self.keys[j])
+            else:
+                rb = self._stream.set(**target)
             if rb.get("errors"):
                 raise RuntimeError(str(rb["errors"]))
             self._rev = rb["settings_rev"]
             applied = {k: v for k, v in _values(rb.get("readback")).items()
                        if k in FRAME_SETTING_KEYS}
             self._cur_settings = {**target, **applied}
+            if rb.get("operator_substituted"):
+                fields["operator"] = list(rb["operator_substituted"])
             self._note("frame_settings_applied", **fields)
         except Exception as e:
             self._cur_settings = None
@@ -1892,11 +2043,17 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         img = self._reduce_frame(frame.image, j)
         if not self._check_shape(idx, img, shape=self._geometry[j][2], frame=j):
             return
+        if self._operator:
+            own, eff = self._frame_target(j), self._effective_target(j)
+            if any(_differs(own.get(k), v) for k, v in eff.items()):
+                with self._lock:
+                    k = self.keys[j]
+                    self._override_frames[k] = self._override_frames.get(k, 0) + 1
         slot = self._slots[j]
         # _slot_ok[(idx, j)] turns True when liveOD has the frame (_on_pushed)
         self._store(slot.dc, slot.dc_meta, idx, img, frame, t_expected,
                     slot=(idx, j), gen=gen, frame_index=j)
-        self._tag(frame, slot.key)
+        self._tag(frame, slot.key, self._geometry[j][0])
 
     def _clear_slot_locked(self, idx, j=None):
         """Start frame ``j`` (every frame when None) of a scan point over as
@@ -1938,6 +2095,13 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 "siblings_on_line": [list(s.keys) for s in self._siblings],
                 "frame_settings": {self.keys[j]: v for j, v in sorted(self._frame_settings.items())},
                 "base_settings": dict(self._base_settings),
+                "run_stream": self._run_stream,
+                "frame_max_exposure": {self.keys[j]: v
+                                       for j, v in sorted(self._frame_max_exposure.items())},
+                # each operator override change in this run (values: every frame's in
+                # force after it, {} = none), and per key the frames stored under one
+                "operator_overrides": list(self.operator_overrides),
+                "operator_override_frames": dict(self._override_frames),
                 "t_match_window": self._t_match_window,
                 "t_early_tolerance": self._t_early_tolerance}
 
@@ -1975,6 +2139,19 @@ class TriggeredCameraStreamClient(CameraStreamClient):
             discarded = c.get("sibling_frames_discarded", 0)
             print(f"[{self.label}] {c['ok']}/{c['requested']} frames captured into {keys}"
                   + (f" ({discarded} sibling-edge frames discarded)" if discarded else ""))
+        self._report_operator()
+
+    def _report_operator(self):
+        """An operator override during the run, said out loud at its end."""
+        changes = list(self.operator_overrides)
+        if not changes:
+            return
+        said = "; ".join((f"{e['at']} {e['values']} by {e['by'] or '?'} on {e['host'] or '?'}"
+                          if e["values"] else f"{e['at']} cleared") for e in changes)
+        print(f"[{self.label}] !! OPERATOR OVERRIDE during this run: {said}. Frames taken "
+              f"under it: {dict(self._override_frames) or 'none'}. Each frame's <key>_meta "
+              f"has the exposure / gain it was taken at; provenance camera_stream_<key> "
+              f"has the record.")
 
     def _before_restore(self):
         if self._live_started:

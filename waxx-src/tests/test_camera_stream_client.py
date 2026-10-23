@@ -49,10 +49,12 @@ class FakeStream:
         self.closed = False
         self.snap_hook = None     # optional callable -> raise / frame
         self.tags = []            # (seq, tag) of every tag_frame
+        self.tag_rois = {}        # tag -> the roi its last tag_frame gave
         self.tag_hook = None      # optional callable(seq, tag) -> raise / bool
 
-    def tag_frame(self, seq, tag):
+    def tag_frame(self, seq, tag, roi=None):
         self.tags.append((int(seq), tag))
+        self.tag_rois[tag] = roi
         return True if self.tag_hook is None else self.tag_hook(seq, tag)
 
     def snap(self, timeout=5.0, policy="restart", require_rev=None):
@@ -1302,6 +1304,8 @@ def test_per_frame_rois_crop_each_frame_to_its_own_shape(capsys):
         assert F(fe, "img_b")[0].shape == (5, 6) and np.all(F(fe, "img_b")[0] == 2)
         assert F(fe, "img_c")[0].shape == (4, 6) and np.all(F(fe, "img_c")[0] == 3)
         assert cs._n_missing() == 0 and not cs.counts.get("frame_shape_mismatch")
+        # each frame's tag carries its own crop, for a viewer's ROI box
+        assert stream.tag_rois == {"img_a": [1, 2, 4, 7], "img_b": None, "img_c": [0, 0, 6, 4]}
     finally:
         cs.finish()
     rec = {k: json.loads(fe._extra_file_texts[f"camera_stream_{k}"]) for k in ("img_a", "img_b", "img_c")}
