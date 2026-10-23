@@ -490,7 +490,9 @@ class Scanner():
         shots taken (no traceback).  Any other exception out of scan_kernel
         runs cleanup_abort_kernel (the machine's safe state, no data write)
         and is re-raised.  So does any exception out of pre_scan (the
-        warm-up shots).
+        warm-up shots), out of cleanup_scan_kernel after a shot that returned
+        normally, and out of the steps between two shots (the abort check,
+        the parameter update, init_scan_kernel) -- since 2026-10-23.
 
         raise_underflow: ignored since 2026-09-27 (it used to re-raise without
         cleanup to get the traceback, which the default now gives).
@@ -593,7 +595,19 @@ class Scanner():
             # the user's request: it guarded scope reads, which cannot
             # outlast the next shot's re-arm -- both are blocking RPCs on this
             # kernel's thread).
-            aborted_bool = self._check_for_abort_signal()
+            # Between two shots the machine may be left running on purpose
+            # (kexp's MOT pre-load keeps the MOT coil and beams on from the
+            # previous shot's cleanup to this shot's MOT). Anything that
+            # raises here -- the liveOD Abort, a host-side parameter error,
+            # an exception in init_scan_kernel -- therefore first puts the
+            # machine in its safe state (cleanup_abort_kernel), as an
+            # exception inside a shot does, then ends the run (2026-10-23).
+            try:
+                aborted_bool = self._check_for_abort_signal()
+            except:
+                self.core.break_realtime()
+                self.cleanup_abort_kernel()
+                raise
 
             # Interleaved sub-scan points due before this data shot (the
             # first ones before shot 0). A point that ends the run leaves
@@ -605,13 +619,18 @@ class Scanner():
                     scanning = False
                     continue
 
-            self.update_params_from_xvars()
-            
-            self.write_host_params_to_kernel()
-            self.core.break_realtime()
+            try:
+                self.update_params_from_xvars()
 
-            # overloaded in kexp.Base
-            self.init_scan_kernel()
+                self.write_host_params_to_kernel()
+                self.core.break_realtime()
+
+                # overloaded in kexp.Base
+                self.init_scan_kernel()
+            except:
+                self.core.break_realtime()
+                self.cleanup_abort_kernel()
+                raise
 
             self.core.break_realtime()
 
@@ -677,9 +696,21 @@ class Scanner():
                 self.cleanup_abort_kernel()
                 raise
 
-            # overloaded in kexp.Base
+            # overloaded in kexp.Base. An exception out of the cleanup
+            # itself (kexp: a wrong image count, the raman DDS restore, the
+            # SLM first-use check, the liveOD Abort in the shot-complete
+            # RPC) used to end the run with no further cleanup, so a step
+            # that raised before the coil reset left a coil at its last
+            # current (kexp HF: the outer coil at 182 A, PID on; reviewer B,
+            # 2026-10-23). It now runs the safe state first, as the shot's
+            # own handler does.
             if not cleaned:
-                self.cleanup_scan_kernel()
+                try:
+                    self.cleanup_scan_kernel()
+                except:
+                    self.core.break_realtime()
+                    self.cleanup_abort_kernel()
+                    raise
 
             self.core.break_realtime()
 
