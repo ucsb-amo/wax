@@ -141,6 +141,7 @@ def client(server):
 def test_every_action_sends_its_request(client, server, expts, monkeypatch):
     import socket
     monkeypatch.delenv("WAXX_AGENT_LABEL", raising=False)
+    monkeypatch.setenv("code", r"C:\Users\jp\code")
     reply = client.submit(str(expts / "rabi.py"), argv=["-a", "x=1"], priority=3,
                           owner="agent", label="r1", write_back=False)
     assert reply["ids"] == [1] and reply["jobs"][0]["owner"] == "agent"
@@ -151,7 +152,7 @@ def test_every_action_sends_its_request(client, server, expts, monkeypatch):
                     "after": [], "repeat": 1, "write_back": False, "allow_drift": False,
                     "host": socket.gethostname(), "by": "jp@kong",
                     "client_sha256": local_sha256(str(expts / "rabi.py")),
-                    "client_host": socket.gethostname()}
+                    "client_host": socket.gethostname(), "client_code_root": r"C:\Users\jp\code"}
     assert len(sent["client_sha256"]) == 64
     token = reply["jobs"][0]["token"]
     assert client.list()["next"] == [1]

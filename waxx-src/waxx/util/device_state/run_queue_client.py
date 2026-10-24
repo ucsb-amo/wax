@@ -205,6 +205,8 @@ class RunQueueClient:
             "path": path, "argv": [str(a) for a in argv],
             # the file that runs is the server's copy: it must match this one
             "client_sha256": local_sha256(path), "client_host": socket.gethostname(),
+            # a path under this PC's %code% runs from the server's %code%
+            "client_code_root": os.environ.get("code") or None,
             "cwd": None if cwd is None else os.path.abspath(str(cwd)),
             "label": label, "owner": self._owner(owner),
             "priority": None if priority is None else int(priority),

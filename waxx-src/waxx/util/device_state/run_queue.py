@@ -730,7 +730,8 @@ class RunQueue:
                  poll_every_s: float = POLL_EVERY_S, gap_s: float = GAP_S,
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
                  client_name: str | None = None, warm_ahead: bool | None = False,
-                 set_priority=None, warm_deny_names=WARM_DENY_NAMES):
+                 set_priority=None, warm_deny_names=WARM_DENY_NAMES,
+                 code_root: str | None = None):
         self.directory = directory
         #: warm start (see the module docstring).  A bool: that value (the
         #: class's default, off, for library use and tests).  None -- what the
@@ -787,6 +788,10 @@ class RunQueue:
         self._exclude = {self._norm(p) for p in exclude if p}
         #: the folders a job's file must be inside (default_roots())
         self.roots = list(roots) if roots is not None else default_roots()
+        #: this machine's workspace (%code%): a submitter's path under ITS
+        #: %code% (``client_code_root``) that does not exist here is looked up
+        #: at the same place under this one
+        self.code_root = code_root if code_root is not None else os.environ.get("code") or ""
         self._clock = clock
         self.poll_every_s = float(poll_every_s)
         self._gap_s = float(gap_s)
@@ -935,7 +940,7 @@ class RunQueue:
         path = Path(text)
         if not path.is_absolute():
             raise QueueError(f"the path must be absolute (the server's machine): {text}")
-        path = path.resolve()
+        path = self._mapped_path(path.resolve(), obj)
         bad = sorted(_SHELL_CHARS & set(str(path)))
         if bad:
             # a link resolving to such a path: the command line would carry it
@@ -948,6 +953,11 @@ class RunQueue:
         if path.suffix.lower() != ".py":
             raise QueueError(f"not a Python file: {path}")
         if not path.is_file():
+            host = str(obj.get("client_host") or "").strip()
+            if host and host.lower() != str(self._host).lower():
+                raise QueueError(f"no such file on {self._host}: {path} (the file that runs is "
+                                 f"{self._host}'s copy: put it in the workspace on both PCs, "
+                                 f"or copy it to {self._host} and submit that path)")
             raise QueueError(f"no such file on the monitor server's machine: {path}")
         if self._norm(path) in self._exclude:
             raise QueueError(f"{path.name} is the monitor's own experiment: the monitor server "
@@ -1020,6 +1030,36 @@ class RunQueue:
                 self._jobs[job.id] = job
                 jobs.append(job)
         return jobs, clamped
+
+    def _mapped_path(self, path: Path, obj: Mapping) -> Path:
+        """``path`` as given when it exists here; else, when it lies under the
+        submitter's workspace (``client_code_root``, its %code%), the same
+        place under this machine's (:attr:`code_root`).  The submitter's copy
+        is still checked against the one that runs (:meth:`_check_client_copy`).
+        Without a usable ``client_code_root`` (an older client, %code% unset
+        there), the longest tail of ``path`` that starts with a top-level
+        folder of this workspace (``k-exp\\...``) is taken -- only when the
+        submitter's ``client_sha256`` matches the file there."""
+        if path.exists() or not self.code_root:
+            return path
+        mine = Path(self.code_root)
+        theirs = str(obj.get("client_code_root") or "").strip()
+        if theirs:
+            try:
+                return (mine / path.relative_to(Path(theirs).resolve())).resolve()
+            except ValueError:
+                pass
+        sha = str(obj.get("client_sha256") or "").lower()
+        if not sha:
+            return path
+        parts = path.parts
+        for i in range(1, len(parts) - 1):
+            if not (mine / parts[i]).is_dir():
+                continue
+            candidate = mine.joinpath(*parts[i:]).resolve()
+            if candidate.is_file() and file_sha256(candidate) == sha:
+                return candidate
+        return path
 
     def _check_client_copy(self, obj: Mapping, path: Path, sha: str) -> None:
         """The file that runs is this machine's copy, so it must be the one

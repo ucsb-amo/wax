@@ -1662,6 +1662,32 @@ def test_a_file_outside_the_roots_is_refused_even_by_a_dotdot_path(tmp_path, exp
     assert reply["status"] == "error" and "outside the folders" in reply["msg"]
 
 
+def test_a_path_under_the_submitters_workspace_runs_from_this_one(tmp_path, expts):
+    queue = make_queue(tmp_path, expts, code_root=str(expts.parent))
+    path = expts / "rabi.py"
+    theirs = r"C:\Users\someone_else\code"
+    obj = {"path": theirs + r"\experiments\rabi.py", "client_code_root": theirs,
+           "client_sha256": rq.file_sha256(path), "client_host": "pc2"}
+    reply = queue.submit(obj)
+    assert reply["status"] == "ok", reply
+    assert reply["jobs"][0]["path"] == str(path.resolve())
+    reply = queue.submit(dict(obj, client_sha256="0" * 64))         # the copies differ
+    assert reply["status"] == "error" and "your copy differs" in reply["msg"]
+    reply = queue.submit(dict(obj, path=theirs + r"\experiments\nope.py"))
+    assert reply["status"] == "error" and "no such file on kong" in reply["msg"]
+    assert "workspace on both PCs" in reply["msg"] and str(expts / "nope.py") in reply["msg"]
+    # an older client (no client_code_root): mapped by the workspace folder + the hash
+    reply = queue.submit(dict(obj, client_code_root=None))
+    assert reply["status"] == "ok", reply
+    assert reply["jobs"][0]["path"] == str(path.resolve())
+    reply = queue.submit(dict(obj, client_code_root=None, client_sha256="0" * 64))
+    assert reply["status"] == "error" and "outside the folders" in reply["msg"]
+    reply = queue.submit(dict(obj, client_code_root=None, client_sha256=None))  # nothing to map by
+    assert reply["status"] == "error" and "outside the folders" in reply["msg"]
+    reply = queue.submit(dict(obj, client_code_root=None, path=r"C:\elsewhere\rabi.py"))
+    assert reply["status"] == "error" and "outside the folders" in reply["msg"]
+
+
 # --- nits N6-N9 -------------------------------------------------------------------------------
 
 def test_a_cancelled_running_job_stops_its_chain(q, expts):
