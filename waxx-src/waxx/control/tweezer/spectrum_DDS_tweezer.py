@@ -656,8 +656,13 @@ class TweezerController(AwgConnection):
                                                           dt=dt,trigger=trigger)
 
     def save_trap_list(self):
-        from copy import deepcopy
-        self.traps_saved = deepcopy(self.traps)
+        # A shallow copy of each trap: it freezes the scalars the saved list is
+        # read for (amplitude, position, frequency) and shares core, params,
+        # the trigger TTL, the mesh and the dds handle. A deepcopy reached the
+        # core, whose comm holds an open socket during a run ("cannot pickle
+        # 'socket' object" when amp_tweezer_list is scanned, run 88196).
+        from copy import copy
+        self.traps_saved = [copy(trap) for trap in self.traps]
 
     def add_tweezer_list(self,
                          position_list=dv_array,
