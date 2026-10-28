@@ -9,7 +9,7 @@ The windows hand each run to :meth:`RunAgainButton.note_run`; the button keeps
 the most recent run that had a queue job, whether it saved, failed or was
 aborted.
 
-One press (after a confirmation naming the job and its file) sends the run
+One press sends, at once and with no question (as the queue panel's), the run
 queue's ``insert`` at ``at_index`` 0 through
 :class:`~waxx.util.device_state.run_queue_client.RunQueueClient` -- the
 request the queue panel's "Run again next" sends
@@ -24,8 +24,9 @@ unless this PC is the queue machine).
 
 The button is enabled only when a last queued job is known, the run queue
 answers, and it has described that job (its file); otherwise it is disabled
-and its tooltip says why.  While a request is out it stays disabled (one press
-= one submission).  Every network call and the file hash run on a worker
+and its tooltip says why; enabled, the tooltip names the job and the file a
+press re-submits, and the log names them again when it is pressed.  While a
+request is out it stays disabled (one press = one submission).  Every network call and the file hash run on a worker
 thread (:class:`~waxx.util.guis.request_runner.RequestRunner`); the result
 (the new job id, or the queue's refusal) goes to the window's log and
 :attr:`RunAgainButton.result_ready`.
@@ -43,7 +44,7 @@ import time
 from typing import Any, Callable
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QMessageBox, QPushButton
+from PyQt6.QtWidgets import QPushButton
 
 from waxx.util.device_state.run_queue_client import (
     NoRunQueue, RunQueueError, default_by, local_sha256)
@@ -123,9 +124,8 @@ class RunAgainButton(QPushButton):
     ``client``: a RunQueueClient-like object (``status()``, ``describe(id,
     token)``, ``submit(path, **kw)``; default :func:`make_client`, made at
     :meth:`start`); ``synchronous``: requests on the GUI thread (tests);
-    ``log(text, level)``: the window's log; ``confirm(title, text) -> bool``:
-    asked before sending (default a Yes / No box); ``by``: who is asking
-    (default ``user@host (liveOD)``)."""
+    ``log(text, level)``: the window's log; ``by``: who is asking (default
+    ``user@host (liveOD)``)."""
 
     #: How often the run queue is asked whether it answers.
     POLL_MS = 5000
@@ -134,13 +134,11 @@ class RunAgainButton(QPushButton):
     result_ready = pyqtSignal(str, bool)
 
     def __init__(self, parent=None, *, client=None, synchronous: bool = False,
-                 log: Callable[[str, int], Any] | None = None,
-                 confirm: Callable[[str, str], bool] | None = None, by: str | None = None):
+                 log: Callable[[str, int], Any] | None = None, by: str | None = None):
         super().__init__(BUTTON_TEXT, parent)
         self.client = client
         self._synchronous = bool(synchronous)
         self._log = log
-        self._confirm = confirm
         self.by = by or f"{default_by()} (liveOD)"
         self.runner = None
         self._closed = False
@@ -347,7 +345,7 @@ class RunAgainButton(QPushButton):
         return True, head + "\n\n" + self.details()
 
     def details(self) -> str:
-        """What a press re-submits, in words (tooltip and confirmation)."""
+        """What a press re-submits, in words (the tooltip)."""
         rec = self.record or {}
         lines = [f"Queue job: {self._job_words()}"
                  + (f", {rec['state']}" if rec.get("state") else "")
@@ -383,8 +381,8 @@ class RunAgainButton(QPushButton):
     # -- pressing it -----------------------------------------------------------------------
 
     def resubmit(self) -> bool:
-        """Confirm, then send the ``insert`` (worker thread).  False when
-        nothing was sent (disabled, a request already out, or declined)."""
+        """Send the ``insert`` (worker thread), with no question.  False when
+        nothing was sent (disabled, or a request already out)."""
         enabled, _tip = self.state()
         if not enabled or self.busy:
             return False
@@ -392,15 +390,8 @@ class RunAgainButton(QPushButton):
         self._refresh()
         job = dict(self.record or {})
         ref = self.job_ref
-        title = f"Run {_base(job.get('path'))} again next?"
-        text = (f"Queue {self._job_words()} again as the NEXT job (ahead of every queued "
-                f"job, behind the one running), as a person's job.\n\n{self.details()}")
-        if not self._ask(title, text):
-            self.busy = False
-            self._refresh()
-            return False
         self._say(f"Run again next: re-submitting {self._job_words()}, "
-                  f"{_base(job.get('path'))} ...", 20)
+                  f"{job.get('path')} ...", 20)
         client = self.client
         self.runner.call(lambda: self._submit(client, job),
                          lambda result, job=job, ref=ref: self._on_submitted(job, ref, result))
@@ -453,16 +444,6 @@ class RunAgainButton(QPushButton):
             self._say(text, 40)
             self.result_ready.emit(text, False)
         self._refresh()
-
-    def _ask(self, title: str, text: str) -> bool:
-        if self._confirm is not None:
-            return bool(self._confirm(title, text))
-        box = QMessageBox(QMessageBox.Icon.Question, title, text, parent=self.window())
-        go = box.addButton("Queue it next", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(go)
-        box.exec()
-        return box.clickedButton() is go
 
     # -- the rest ---------------------------------------------------------------------------
 

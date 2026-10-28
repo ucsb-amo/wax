@@ -12,14 +12,19 @@ Client contract (duck-typed):
 * ``get_snapshot() -> dict``  - raises on network failure
 * ``request_shutdown() -> bool``  - optional; enables graceful stop
 * ``timeout`` attribute <= 2 s  - checked by :class:`SnapshotPoller`
+* ``com_disconnect() / com_connect() -> (ok, message)``  - optional; the COM
+  pill's clicks (the server closes the port and holds it closed / releases
+  the hold and connects).  Called on a worker thread, never the GUI's.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QMessageBox, QWidget
 
 from waxx.util.dashboard.server_supervisor import SupervisorState
 from waxx.util.dashboard.snapshot_poller import SnapshotPoller
@@ -51,6 +56,8 @@ class ServerLink(QObject):
     snapshot_received = pyqtSignal(dict)
     #: Emitted once the client exists.
     client_ready = pyqtSignal(object)
+    #: (request, ok, message) when a COM pill request has been answered.
+    com_request_done = pyqtSignal(str, bool, str)
 
     # How long after RUNNING to wait before the first connection attempt so
     # the server has bound its socket and sent a beacon.
@@ -78,6 +85,12 @@ class ServerLink(QObject):
         self._retry = QTimer(self)
         self._retry.setSingleShot(True)
         self._retry.timeout.connect(self._build_client)
+        self._com_busy = False
+        self.com_request_done.connect(self._on_com_request_done)
+        com_btn = header.com_button() if header is not None else None
+        if com_btn is not None:
+            com_btn.disconnect_requested.connect(lambda: self.request_com("com_disconnect"))
+            com_btn.reconnect_requested.connect(lambda: self.request_com("com_connect"))
 
         if supervisor is not None:
             supervisor.state_changed.connect(self._on_supervisor_state)
@@ -133,6 +146,33 @@ class ServerLink(QObject):
             _LOG.debug("%s: request_shutdown raised: %r", self.panel_id, exc)
             return False
 
+    def request_com(self, request: str) -> None:
+        """Ask the server to ``com_disconnect`` (close + hold) or ``com_connect``
+        (release + connect).  The client call runs on a worker thread; the
+        answer arrives as :attr:`com_request_done`."""
+        client = self._client
+        fn = getattr(client, request, None) if client is not None else None
+        if client is None:
+            self.com_request_done.emit(request, False, "not connected to the server yet")
+            return
+        if not callable(fn):
+            self.com_request_done.emit(request, False,
+                                       "this server cannot connect or disconnect its COM port "
+                                       "remotely")
+            return
+        if self._com_busy:
+            return
+        self._com_busy = True
+
+        def work():
+            try:
+                ok, message = fn()
+            except Exception as exc:  # noqa: BLE001 - network failure
+                ok, message = False, f"{type(exc).__name__}: {exc}"
+            self.com_request_done.emit(request, bool(ok), str(message or ""))
+
+        threading.Thread(target=work, name=f"ComRequest-{self.panel_id}", daemon=True).start()
+
     def stop(self) -> None:
         self.disconnect_now()
 
@@ -181,6 +221,17 @@ class ServerLink(QObject):
             if self._header is not None:
                 self._poller.conn_changed.connect(self._header.set_conn)
         self._poller.start()
+
+    def _on_com_request_done(self, request: str, ok: bool, message: str) -> None:
+        self._com_busy = False
+        what = "disconnect" if request == "com_disconnect" else "connect"
+        if ok:
+            _LOG.info("%s: COM %s requested%s", self.panel_id, what,
+                      f" ({message})" if message else "")
+            return
+        _LOG.warning("%s: COM %s not done: %s", self.panel_id, what, message)
+        parent = self._header if isinstance(self._header, QWidget) else None
+        QMessageBox.warning(parent, f"COM {what} not done", f"{self.panel_id}: {message}")
 
     def _on_snapshot(self, snap: dict) -> None:
         if self._header is not None:

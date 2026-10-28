@@ -85,16 +85,10 @@ class FakeClient:
         return {"status": "ok", "ids": [self.next_id], "jobs": []}
 
 
-def _button(client, *, synchronous=True, confirm=True, log=None, start=True):
+def _button(client, *, synchronous=True, log=None, start=True):
     from waxx.util.live_od.gui.run_again_button import RunAgainButton
-    asked = []
-
-    def ask(title, text):
-        asked.append((title, text))
-        return confirm
-    b = RunAgainButton(client=client, synchronous=synchronous, log=log, confirm=ask,
+    b = RunAgainButton(client=client, synchronous=synchronous, log=log,
                        by="jp@kong (liveOD)")
-    b.asked = asked
     if start:
         b.start()
         b.timer.stop()            # polls are made by hand here
@@ -252,21 +246,12 @@ def test_one_press_sends_one_insert_next_as_a_person(app, expt_file):
     assert path == str(expt_file)
     assert kw["at_index"] == 0 and kw["owner"] == "person"
     assert kw["argv"] == ["--fast"] and kw["label"] == "hf_bec" and kw["write_back"] is False
-    assert "job 41" in b.asked[0][1] and str(expt_file) in b.asked[0][1]
-    assert "hf_bec.py" in b.asked[0][0]
+    assert any("re-submitting job 41 (hf_bec)" in t and str(expt_file) in t for _, t in lines)
     assert results == [(results[0][0], True)] and "re-submitted as job 58" in results[0][0]
     assert any("re-submitted as job 58" in t for _, t in lines)
     assert b.isEnabled() and "queued as job 58" in b.toolTip()
     b.shutdown()
 
-
-def test_declining_the_confirmation_sends_nothing(app, expt_file):
-    client = FakeClient(_record(expt_file))
-    b = _button(client, confirm=False)
-    b.note_run(86003, "hf_bec.py", "41:abc", "kq")
-    assert b.resubmit() is False
-    assert client.submits == [] and b.isEnabled() and not b.busy
-    b.shutdown()
 
 
 def test_a_refusal_is_shown(app, expt_file):

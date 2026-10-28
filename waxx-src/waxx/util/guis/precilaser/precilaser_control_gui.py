@@ -649,12 +649,24 @@ class PrecilaserControlGUI(QMainWindow):
     def _toggle_serial_connection(self):
         is_connected = self.connection_state_value.text().strip().upper() == "CONNECTED"
         try:
-            if is_connected:
-                if self.client.disconnect_serial():
-                    self._set_status_message("Serial disconnect requested")
+            ok, message = (
+                self.client.com_disconnect() if is_connected else self.client.com_connect()
+            )
+            if not ok and message.lower().startswith("unknown command"):
+                # A server that predates COM_CONNECT / COM_DISCONNECT.
+                ok = (
+                    self.client.disconnect_serial() if is_connected
+                    else self.client.connect_serial()
+                )
+                message = "request rejected"
+            if ok:
+                self._set_status_message(
+                    "Serial disconnect requested" if is_connected else "Serial connection requested"
+                )
             else:
-                if self.client.connect_serial():
-                    self._set_status_message("Serial connection requested")
+                # e.g. the server refuses a disconnect while a sequence runs.
+                self._append_log(f"ERROR toggle serial: {message}")
+                self._set_status_message(f"Serial request refused: {message}")
         except Exception as exc:
             self._append_log(f"ERROR toggle serial: {exc}")
 

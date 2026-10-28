@@ -333,3 +333,31 @@ def test_data_handler_grab_finished_after_every_frame_is_harmless(app, monkeypat
     handler.grab_finished()
     handler.wait()
     assert handler.images_received == 2
+
+
+def test_camera_loggers_reach_the_live_od_file_handler():
+    """2026-10-22: the camera worker's and drivers' lines (frame-path stalls, backlog
+    bursts, mid-run ops) reached no file; they now go to live_od.log at INFO."""
+    from waxx.util.live_od.log import CAMERA_LOGGERS, route_camera_loggers
+
+    class ListHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    h = ListHandler()
+    saved = {n: logging.getLogger(n).level for n in CAMERA_LOGGERS}
+    try:
+        route_camera_loggers(h)
+        route_camera_loggers(h)                      # once per handler
+        logging.getLogger("beacon.camera.worker").info("worker line")
+        logging.getLogger("waxx.control.cameras.emccd_backend").warning("backend line")
+        logging.getLogger("beacon.camera.worker").debug("not at INFO")
+        assert h.messages == ["worker line", "backend line"]
+    finally:
+        for n, level in saved.items():
+            logging.getLogger(n).removeHandler(h)
+            logging.getLogger(n).setLevel(level)

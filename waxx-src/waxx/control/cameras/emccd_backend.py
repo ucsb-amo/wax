@@ -58,6 +58,16 @@ SHUTTER_MODES = ("open", "closed")
 FAN_MODES = ("full", "low", "off")
 MODES = ("live", "run", "snap")
 
+# Frame-path diagnostics (2026-10-22: runs 87347, 87709, 87809, 87832 lost a frame and got
+# the next ones ~5.9 s late, and nothing was logged). A read / wait-for-frame that blocks
+# longer than its allowance plus SLOW_SDK_CALL_S is a WARNING. While a run waits for frames,
+# the SDK's acquired count is sampled every PROGRESS_SAMPLE_S: frames the SDK holds that
+# the read does not return are a WARNING, and the last sample goes into the worker's
+# backlog lines (run_diagnostics) -- a count that stayed flat means the camera or driver
+# held the frames, not the read.
+SLOW_SDK_CALL_S = 0.5
+PROGRESS_SAMPLE_S = 0.5
+
 
 def _plain(value):
     if isinstance(value, bytes):
@@ -127,6 +137,12 @@ class EMCCDBackend:
         self._n_frames = None
         self._next_idx = 0
         self._live_lost = 0
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self):
+        self._progress = None          # (t_monotonic, sdk frames_done, next_idx) of the last sample
+        self._unread_since = None      # when the SDK was first seen holding frames the read did not return
+        self._unread_warned = False
 
     # -- open / close ------------------------------------------------------------
     def open(self) -> dict:
@@ -507,6 +523,7 @@ class EMCCDBackend:
         self._n_frames = n_frames
         self._next_idx = 0
         self._live_lost = 0
+        self._reset_diagnostics()
         if mode == "snap" and trigger == "software":
             cam.send_software_trigger()
 
@@ -566,18 +583,76 @@ class EMCCDBackend:
 
     def retrieve(self, timeout_s: float) -> list:
         cam = self._require_open()
+        t0 = time.monotonic()
         new = self._read_then_stop(cam)
+        self._note_slow("read", time.monotonic() - t0, 0.0)
         if not new and timeout_s > 0 and cam.acquisition_in_progress():
+            t0 = time.monotonic()
             try:
                 cam.wait_for_frame(since="lastread", nframes=1, timeout=timeout_s)
             except cam.TimeoutError:
-                return []
-            new = self._read_then_stop(cam)
+                pass
+            else:
+                new = self._read_then_stop(cam)
+            finally:
+                self._note_slow("wait_for_frame + read", time.monotonic() - t0, timeout_s)
+        if self._mode == "run":
+            self._watch_progress(cam, bool(new))
         if self._mode == "snap" and new:
             cam.stop_acquisition()
             first = [f for f in new if f.hw_idx == 0]
             return first[:1] if first else new[:1]
         return new
+
+    def _note_slow(self, what: str, dt: float, allowed: float) -> None:
+        if dt > allowed + SLOW_SDK_CALL_S:
+            logger.warning("[EMCCDBackend] %s: %s blocked %.2f s (allowed %.2f s); mode %s, "
+                           "next frame index %d", self.camera_id, what, dt, allowed, self._mode,
+                           self._next_idx)
+
+    def _watch_progress(self, cam, got_frames: bool) -> None:
+        """While a run waits for frames, sample the SDK's acquired count (at most
+        every PROGRESS_SAMPLE_S) and warn when it holds frames the read does not
+        return."""
+        now = time.monotonic()
+        if got_frames:
+            if self._unread_warned:
+                logger.info("[EMCCDBackend] %s: frames readable again after %.2f s (next "
+                            "frame index %d)", self.camera_id, now - self._unread_since,
+                            self._next_idx)
+            self._unread_since, self._unread_warned = None, False
+            return
+        if self._progress is not None and now - self._progress[0] < PROGRESS_SAMPLE_S:
+            return
+        try:
+            if not cam.acquisition_in_progress():
+                return
+            done = int(cam.get_acquisition_progress().frames_done)
+        except Exception as exc:
+            logger.debug("[EMCCDBackend] %s: progress sample failed: %s", self.camera_id, exc)
+            return
+        self._progress = (now, done, self._next_idx)
+        if done <= self._next_idx:
+            self._unread_since, self._unread_warned = None, False
+        elif self._unread_since is None:
+            self._unread_since = now
+        elif not self._unread_warned:
+            self._unread_warned = True
+            logger.warning("[EMCCDBackend] %s: the SDK reports %d frame(s) acquired but the "
+                           "read returns none from index %d for %.2f s", self.camera_id, done,
+                           self._next_idx, now - self._unread_since)
+
+    def run_diagnostics(self) -> dict:
+        """The frame path as this backend last saw it, for the worker's backlog and
+        stall lines (worker thread only)."""
+        out = {"next_idx": self._next_idx}
+        if self._progress is not None:
+            t, done, idx = self._progress
+            out.update(sdk_frames_done=done, at_next_idx=idx,
+                       sampled_s_ago=round(time.monotonic() - t, 2))
+        if self._unread_since is not None:
+            out["unread_for_s"] = round(time.monotonic() - self._unread_since, 2)
+        return out
 
     # -- telemetry ------------------------------------------------------------------
     def status(self) -> dict:

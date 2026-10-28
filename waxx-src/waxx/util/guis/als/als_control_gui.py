@@ -48,6 +48,22 @@ def create_emoji_icon(emoji: str) -> QIcon:
 
     return icon
 
+
+def _com_request(client: ALSGuiClient, connect: bool) -> None:
+    """A person's serial Connect / Disconnect through the server's COM link.
+
+    Raises with the server's reason when it refuses (e.g. "a sequence is
+    running"), so ``_remote_call`` shows it in the status bar.  A server that
+    predates COM_CONNECT / COM_DISCONNECT gets the old command instead.
+    """
+    ok, message = client.com_connect() if connect else client.com_disconnect()
+    if not ok and message.lower().startswith("unknown command"):
+        ok = client.connect_serial() if connect else client.disconnect_serial()
+        message = "request rejected"
+    if not ok:
+        raise RuntimeError(message)
+
+
 class LogEmitter(QObject):
     message_logged = pyqtSignal(str)
 
@@ -1224,10 +1240,10 @@ class ALSControlGUI(QMainWindow):
             return
         if self.status.connection_state == ConnectionState.CONNECTED:
             self.statusBar().showMessage("Disconnect requested")
-            self._remote_call("Serial disconnect", lambda c: c.disconnect_serial())
+            self._remote_call("Serial disconnect", lambda c: _com_request(c, connect=False))
         else:
             self.statusBar().showMessage("Connect requested")
-            self._remote_call("Serial connect", lambda c: c.connect_serial())
+            self._remote_call("Serial connect", lambda c: _com_request(c, connect=True))
 
     def _toggle_power_status(self):
         if self.remote_client is None:

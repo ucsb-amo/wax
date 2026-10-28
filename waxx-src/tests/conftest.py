@@ -35,6 +35,15 @@ def _queue_gate_never_reaches_the_real_queue(monkeypatch):
     monkeypatch.setattr(queue_gate, "_transport", no_real_transport)
 
 
+@pytest.fixture(autouse=True)
+def _no_beacon_is_ever_broadcast(monkeypatch):
+    """kong runs the real servers: a test server that beaconed its id (pdxc,
+    precilaser, ...) could take requests meant for the real one.  No test
+    broadcasts a beacon (as beacon's own tests already ensure)."""
+    from beacon.discovery import server as dserver
+    monkeypatch.setattr(dserver.NetServer, "_start_beacon", lambda self: None)
+
+
 class _OfflineCameraDirectory:
     """No camera server on the network: what a test gets in place of the
     process's shared beacon CameraDirectory, so nothing asks kong's real

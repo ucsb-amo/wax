@@ -62,6 +62,16 @@ class ALSGuiClient(NetClient):
         response = self._send_command(command)
         return json.loads(response)
 
+    def _send_ok_or_reason_command(self, command: str) -> tuple[bool, str]:
+        """``(True, "")`` on "OK", else ``(False, <the server's error text>)``."""
+        response = self._send_command(command)
+        if response.upper() == "OK":
+            return True, ""
+        reason = response
+        if reason.upper().startswith("ERROR:"):
+            reason = reason[len("ERROR:"):].strip()
+        return False, reason or "no reply from the server"
+
     def run_startup_sequence(self) -> bool:
         """Request the server to start the startup sequence."""
         return self._send_ok_command("START_STARTUP")
@@ -79,6 +89,21 @@ class ALSGuiClient(NetClient):
 
     def disconnect_serial(self) -> bool:
         return self._send_ok_command("DISCONNECT_SERIAL")
+
+    def com_connect(self) -> tuple[bool, str]:
+        """Release a Disconnect hold and open the COM port now (the server
+        opens it in the background; the snapshot's ``com`` shows how it goes).
+
+        Returns ``(ok, message)``: message is the server's refusal or error
+        when not ok (e.g. "a sequence is running").  Raises on any network
+        failure, like :meth:`get_snapshot`.
+        """
+        return self._send_ok_or_reason_command("COM_CONNECT")
+
+    def com_disconnect(self) -> tuple[bool, str]:
+        """Close the COM port and hold it closed: nothing reconnects it until
+        :meth:`com_connect`.  Returns ``(ok, message)`` as :meth:`com_connect`."""
+        return self._send_ok_or_reason_command("COM_DISCONNECT")
 
     def set_power_percent(self, power_percent: float) -> bool:
         return self._send_ok_command(f"SET_POWER_PERCENT {float(power_percent):.6f}")

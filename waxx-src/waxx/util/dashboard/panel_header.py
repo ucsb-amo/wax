@@ -232,6 +232,8 @@ class PanelHeaderBar(QWidget):
             parts.append(f"last rx {rx:.1f} s ago")
         if com.get("reconnect_attempts"):
             parts.append(f"{com['reconnect_attempts']} reconnects")
+        if isinstance(com.get("next_retry_s"), (int, float)):
+            parts.append(f"next try in {com['next_retry_s']:.0f} s")
         if com.get("last_error"):
             parts.append(f"error: {com['last_error']}")
         self._com_btn.set_status(

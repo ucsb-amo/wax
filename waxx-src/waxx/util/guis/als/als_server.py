@@ -17,6 +17,7 @@ from typing import Optional
 
 from waxx.util.guis.als.als_fiber_amplifier import ALSLaserController, ALSLaserStartupController
 from waxx.util.notifications import send_email
+from waxx.util.comms_server.com_link import ComLink, ComLinkRefused
 from beacon.discovery.server import NetServer
 
 
@@ -26,8 +27,7 @@ LOGGER.setLevel(logging.INFO)
 ALS_STARTUP_NOTIFICATION_RECIPIENT = "herberthearsall@gmail.com"
 
 # Baud rate the controller opens the port with (its constructor default); the
-# server never overrides it, so this is what the "com" snapshot reports before
-# a controller exists.
+# server never overrides it, so this is what the "com" snapshot reports.
 _DEFAULT_BAUD = int(inspect.signature(ALSLaserController.__init__).parameters["baudrate"].default)
 
 # Grace period between answering "OK" to SHUTDOWN and starting to tear down,
@@ -75,15 +75,23 @@ class LogBufferHandler(logging.Handler):
 
 
 class _LockedLaserProxy:
-    """Thread-safe proxy that serializes each laser command with the server lock."""
+    """Thread-safe proxy that serializes each laser command with the server lock.
 
-    def __init__(self, server: "ALSLaserServer"):
+    ``bound`` is the controller a sequence started on: once the link has
+    reopened the port (a new controller), every call raises, so a sequence
+    fails on a reconnect exactly as it did when the port went away.
+    """
+
+    def __init__(self, server: "ALSLaserServer", bound: Optional[ALSLaserController] = None):
         self._server = server
+        self._bound = bound
 
     def _get_laser(self) -> ALSLaserController:
         laser = self._server.laser
         if laser is None:
             raise RuntimeError("Laser not connected")
+        if self._bound is not None and laser is not self._bound:
+            raise RuntimeError("Serial port was reopened during the sequence")
         return laser
 
     def __getattr__(self, name: str):
@@ -97,6 +105,38 @@ class _LockedLaserProxy:
                 return live_attr(*args, **kwargs)
 
         return _locked_call
+
+
+class _ALSComLink(ComLink):
+    """The laser's COM port (``waxx.util.comms_server.com_link``).
+
+    An open sends only what the old connect path sent: open the port, the
+    firmware-info handshake, then one status read (``_on_connected``) --
+    nothing that changes the laser's output, relays or second stage.
+    """
+
+    def __init__(self, server: "ALSLaserServer"):
+        super().__init__(
+            server.serial_port,
+            baud=_DEFAULT_BAUD,
+            server=server,
+            name=f"ALS {server.serial_port}",
+            io_lock=server._laser_lock,
+            logger=LOGGER,
+        )
+        self._als = server
+
+    def _open(self) -> ALSLaserController:
+        return self._als._open_laser()
+
+    def _close(self, device: ALSLaserController) -> None:
+        device.close()
+
+    def _on_connected(self, device: ALSLaserController) -> None:
+        self._als._on_laser_connected()
+
+    def _disconnect_refusal(self) -> Optional[str]:
+        return self._als._serial_refusal()
 
 
 class ALSLaserServer(NetServer):
@@ -140,7 +180,6 @@ class ALSLaserServer(NetServer):
         self.poll_thread: Optional[threading.Thread] = None
         self.sequence_thread: Optional[threading.Thread] = None
 
-        self.laser: Optional[ALSLaserController] = None
         self.status = LaserStatus()
         self.sequence_state = SequenceState.IDLE
         self.sequence_type: Optional[str] = None
@@ -155,18 +194,21 @@ class ALSLaserServer(NetServer):
         self._interrupt_requested = False
 
         self._state_lock = threading.Lock()
-        self._laser_lock = threading.Lock()
-        self._sequence_laser = _LockedLaserProxy(self)
+        # Re-entrant: it is also the link's io_lock, and a failed poll (lock
+        # held) reports the error to the link, which takes it again.
+        self._laser_lock = threading.RLock()
         self._log_lock = threading.Lock()
         self._log_entries: list[str] = []
         self._log_offset = 0
         self._cleanup_registered = False
         self._stopped = False
 
-        # Serial-link bookkeeping for the "com" snapshot (SerialSnapshot shape).
-        self._com_connecting = False
-        self._com_last_error: Optional[str] = None
-        self._com_last_rx_monotonic: Optional[float] = None
+        # The COM port: opened, retried and held by the link.  A saved
+        # sequence is resumed only after the very first open attempt at
+        # startup (as before the link), never after a reconnect.
+        self._link = _ALSComLink(self)
+        self._open_attempts = 0
+        self._resume_pending = False
 
         # Set once a graceful SHUTDOWN has been fully processed (stop() done);
         # main() waits on it and exits 0.
@@ -188,13 +230,18 @@ class ALSLaserServer(NetServer):
             logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
         )
 
+    @property
+    def laser(self) -> Optional[ALSLaserController]:
+        """The open controller (the link's device), or None while not connected."""
+        return self._link.device
+
     def start(self) -> None:
         if self.running:
             return
         # Pre-bind and start listening so the TCP server is ready before the
         # beacon fires and before we attempt the COM connection.  This lets the
-        # GUI connect and display server status even while connect_laser() is
-        # still running (or has failed).
+        # GUI connect and display server status even while the link is still
+        # opening the port (or retrying it).
         _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         _sock.bind((self.host, 0))
@@ -213,25 +260,12 @@ class ALSLaserServer(NetServer):
             atexit.register(self._cleanup_on_exit)
             self._cleanup_registered = True
         if self.auto_connect:
-            threading.Thread(target=self._initial_connect, daemon=True).start()
-
-    def _initial_connect(self) -> None:
-        """Connect to the serial port in a background thread.
-
-        Called once from start() so that the TCP server is already accepting
-        connections (and the GUI can poll status) while the COM port is being
-        opened.  After a successful connection, checks for a saved sequence
-        state and resumes it if one exists.
-        """
-        try:
-            self.connect_laser()
-        except Exception as exc:
-            LOGGER.exception("Initial serial connection failed: %s", exc)
-            return
-        try:
-            self._check_and_resume_sequence()
-        except Exception as exc:
-            LOGGER.exception("Failed to resume saved sequence state: %s", exc)
+            # The link opens the port on its own thread (retrying with backoff
+            # while it fails); after the first open it checks for a saved
+            # sequence state and resumes it (_on_laser_connected).
+            with self._state_lock:
+                self._resume_pending = True
+            self._link.start()
 
     def stop(self) -> None:
         if self._stopped:
@@ -261,27 +295,15 @@ class ALSLaserServer(NetServer):
 
         ``disconnect_laser()`` refuses while a sequence runs (correct for an
         operator request).  At stop the process is going away regardless, so
-        the port must be released anyway; this only closes the serial handle
-        and does not send anything to the laser.
+        the port must be released anyway: the link is stopped (bounded by
+        ``ComLink.STOP_TIMEOUT_S``), which only closes the serial handle and
+        does not send anything to the laser.
         """
-        self.disconnect_laser()
-        if self.laser is None:
-            return
-        LOGGER.warning(
-            "Sequence still running at stop; force-closing serial port %s", self.serial_port
-        )
-        acquired = self._laser_lock.acquire(timeout=1.0)
-        try:
-            laser = self.laser
-            if laser is not None:
-                try:
-                    laser.close()
-                except Exception:
-                    pass
-                self.laser = None
-        finally:
-            if acquired:
-                self._laser_lock.release()
+        if self.sequence_state == SequenceState.RUNNING and self.laser is not None:
+            LOGGER.warning(
+                "Sequence still running at stop; force-closing serial port %s", self.serial_port
+            )
+        self._link.stop()
         with self._state_lock:
             self.status = LaserStatus(connected=False, connection_state=ConnectionState.DISCONNECTED)
 
@@ -320,7 +342,7 @@ class ALSLaserServer(NetServer):
             if self.running:
                 self.stop()
             else:
-                self.disconnect_laser()
+                self._link.stop()
         except Exception:
             pass
 
@@ -428,45 +450,31 @@ class ALSLaserServer(NetServer):
         }
 
     def _com_snapshot_locked(self) -> dict:
-        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
+        """Serial-link summary (``ComLink.snapshot()``: ``SerialSnapshot`` shape plus ``held``)."""
+        return self._link.snapshot()
 
-        Caller must hold ``_state_lock``.  ``status`` is derived from the
-        existing ``LaserStatus.connection_state`` (CONNECTED / ERROR /
-        DISCONNECTED) plus a transient ``connecting`` flag set while
-        ``connect_laser()`` is opening the port.
-        """
-        state = self.status.connection_state
-        if self._com_connecting:
-            status = "connecting"
-        elif state == ConnectionState.CONNECTED:
-            status = "connected"
-        elif state == ConnectionState.ERROR:
-            status = "error"
-        else:
-            status = "disconnected"
-        laser = self.laser
-        baud = getattr(laser, "baudrate", None) if laser is not None else None
-        last_rx = self._com_last_rx_monotonic
-        return {
-            "port": self.serial_port,
-            "baud": int(baud) if baud is not None else _DEFAULT_BAUD,
-            "status": status,
-            "last_error": self._com_last_error,
-            "last_rx_seconds_ago": (
-                None if last_rx is None else round(time.monotonic() - last_rx, 3)
-            ),
-            "reconnect_attempts": 0,   # this server has no auto-reconnect loop
-            "config_valid": True,
-        }
+    def _connection_state_locked(self, com: dict) -> ConnectionState:
+        """``LaserStatus.connection_state`` as the GUIs see it: CONNECTED only
+        while the link has the port open; without it, ERROR when the link's
+        last open or I/O failed (it is retrying), else DISCONNECTED (held,
+        not started, stopped)."""
+        if self.laser is not None:
+            return self.status.connection_state
+        if com.get("held") or not com.get("last_error"):
+            return ConnectionState.DISCONNECTED
+        return ConnectionState.ERROR
 
     def get_snapshot(self) -> dict:
         with self._state_lock:
+            com = self._com_snapshot_locked()
+            connection_state = self._connection_state_locked(com)
             status_dict = asdict(self.status)
-            status_dict["connection_state"] = self.status.connection_state.value
+            status_dict["connection_state"] = connection_state.value
+            status_dict["connected"] = connection_state == ConnectionState.CONNECTED
             return {
                 "status": status_dict,
                 "serial_port": self.serial_port,
-                "com": self._com_snapshot_locked(),
+                "com": com,
                 "sequence": {
                     "state": self.sequence_state.value,
                     "type": self.sequence_type,
@@ -542,10 +550,14 @@ class ALSLaserServer(NetServer):
                 return json.dumps(self.get_logs_since(start_index))
             if command in {"GET_POWER_SETPOINT", "GET_POWER_SETPOINT_PERCENT"}:
                 return f"POWER_SETPOINT: {self.status.power_setpoint_percent:.3f}"
-            if command == "CONNECT_SERIAL":
+            # COM_CONNECT / COM_DISCONNECT are the generic link commands; the
+            # old CONNECT_SERIAL / DISCONNECT_SERIAL do the same.  "OK" means
+            # the request was taken: a connect opens the port in the
+            # background (see the snapshot's "com"), a disconnect is held.
+            if command in {"CONNECT_SERIAL", "COM_CONNECT"}:
                 self.connect_laser()
                 return "OK"
-            if command == "DISCONNECT_SERIAL":
+            if command in {"DISCONNECT_SERIAL", "COM_DISCONNECT"}:
                 self.disconnect_laser()
                 return "OK"
             if command == "SHUTDOWN":
@@ -575,6 +587,8 @@ class ALSLaserServer(NetServer):
                 return "OK" if self.set_second_stage_on() else "ERROR: 2nd-stage-on request rejected"
             if command == "SET_SECOND_STAGE_OFF":
                 return "OK" if self.set_second_stage_off() else "ERROR: 2nd-stage-off request rejected"
+        except ComLinkRefused as exc:
+            return f"ERROR: {exc}"   # already logged by connect_laser / disconnect_laser
         except Exception as exc:
             LOGGER.exception("Command failed: %s", exc)
             return f"ERROR: {exc}"
@@ -594,14 +608,17 @@ class ALSLaserServer(NetServer):
             self._poll_status_locked()
 
     def _poll_status_locked(self) -> None:
-        if self.laser is None:
+        # Never opens the port: while the link has none (failed, retrying or
+        # held) there is nothing to read.
+        laser = self.laser
+        if laser is None:
             return
         try:
-            frame = self.laser.stop_and_read()
+            frame = laser.stop_and_read()
             if frame is None:
                 return
-            converted = self.laser.convert_frame(frame)
-            power_raw = self.laser.cmd_ask_power_consign()
+            converted = laser.convert_frame(frame)
+            power_raw = laser.cmd_ask_power_consign()
             power_enabled = bool(frame.statuses.get("STS_RELAY_PSU", 0))
             if not power_enabled:
                 power_raw = 0
@@ -610,8 +627,8 @@ class ALSLaserServer(NetServer):
                 pmon_w = converted.PMON_W
             updated_status = LaserStatus(
                 power_enabled=power_enabled,
-                interlock_enabled=bool(self.laser.cmd_ask_interlock_sts()),
-                second_stage_enabled=bool(self.laser.cmd_ask_secondstage_sts()),
+                interlock_enabled=bool(laser.cmd_ask_interlock_sts()),
+                second_stage_enabled=bool(laser.cmd_ask_secondstage_sts()),
                 power_setpoint_percent=power_raw / 65535.0 * 100.0,
                 temperature_act_p=converted.TACT_P,
                 temperature_set_p=converted.TSET_P,
@@ -623,60 +640,82 @@ class ALSLaserServer(NetServer):
             )
             with self._state_lock:
                 self.status = updated_status
-                self._com_last_rx_monotonic = time.monotonic()
+            self._link.note_rx()
         except Exception as exc:
             self._handle_serial_error(exc)
 
     def _handle_serial_error(self, exc: Exception) -> None:
+        """The server's own I/O failed: the link closes the port and reopens it on its backoff."""
         LOGGER.exception("Serial communication failed: %s", exc)
-        try:
-            if self.laser is not None:
-                self.laser.close()
-        except Exception:
-            pass
-        self.laser = None
+        self._link.report_error(exc, where="status poll")
         with self._state_lock:
             self.status = LaserStatus(connected=False, connection_state=ConnectionState.ERROR)
-            self._com_last_error = f"{type(exc).__name__}: {exc}"
+
+    def _serial_refusal(self) -> Optional[str]:
+        """Why a person's Connect / Disconnect is refused now, or None."""
+        if self.sequence_state == SequenceState.RUNNING:
+            return "a sequence is running"
+        return None
+
+    def _open_laser(self) -> ALSLaserController:
+        """Open the port and handshake (the link's ``_open``; io lock held)."""
+        with self._state_lock:
+            self._open_attempts += 1
+        laser = ALSLaserController(port=self.serial_port)
+        try:
+            laser.connect()
+            laser.handshake()
+        except Exception:
+            laser.close()
+            raise
+        LOGGER.info("Serial connection opened on %s", self.serial_port)
+        return laser
+
+    def _on_laser_connected(self) -> None:
+        """After every open (link thread): read the status once.  After the
+        very first open attempt at startup only, resume a saved sequence."""
+        self.poll_status()
+        with self._state_lock:
+            resume_pending, self._resume_pending = self._resume_pending, False
+            first_attempt = self._open_attempts == 1
+            connected = self.status.connection_state == ConnectionState.CONNECTED
+        if not resume_pending:
+            return
+        if not (first_attempt and connected):
+            saved = self._load_sequence_state()
+            if saved is not None and saved.get("sequence_state") == "RUNNING":
+                LOGGER.warning(
+                    "Saved %s sequence state not resumed: the first serial connection "
+                    "at startup failed; start the sequence by hand if it is wanted",
+                    saved.get("sequence_type"),
+                )
+            return
+        try:
+            self._check_and_resume_sequence()
+        except Exception as exc:
+            LOGGER.exception("Failed to resume saved sequence state: %s", exc)
 
     def connect_laser(self) -> None:
-        with self._laser_lock:
-            if self.sequence_state == SequenceState.RUNNING:
-                LOGGER.warning("Cannot connect laser while a sequence is running")
-                return
-            with self._state_lock:
-                self._com_connecting = True
-            try:
-                if self.laser is None:
-                    self.laser = ALSLaserController(port=self.serial_port)
-                self.laser.connect()
-                self.laser.handshake()
-                LOGGER.info("Serial connection opened on %s", self.serial_port)
-                with self._state_lock:
-                    self._com_last_error = None
-                    self._com_last_rx_monotonic = time.monotonic()
-                self._poll_status_locked()
-            except Exception as exc:
-                self._handle_serial_error(exc)
-                raise
-            finally:
-                with self._state_lock:
-                    self._com_connecting = False
+        """A person's Connect: release a hold and open the port now (on the
+        link's thread; returns at once).  Refused while a sequence runs."""
+        reason = self._serial_refusal()
+        if reason:
+            LOGGER.warning("Cannot connect laser: %s", reason)
+            raise ComLinkRefused(reason)
+        self._link.connect()
 
     def disconnect_laser(self) -> None:
-        with self._laser_lock:
-            if self.sequence_state == SequenceState.RUNNING:
-                LOGGER.warning("Cannot disconnect laser while a sequence is running")
-                return
-            if self.laser is not None:
-                try:
-                    self.laser.close()
-                    LOGGER.info("Serial connection closed on %s", self.serial_port)
-                except Exception:
-                    pass
-                self.laser = None
-            with self._state_lock:
-                self.status = LaserStatus(connected=False, connection_state=ConnectionState.DISCONNECTED)
+        """A person's Disconnect: close the port and hold it closed -- nothing
+        reopens it until the next Connect.  Refused while a sequence runs."""
+        try:
+            self._link.disconnect(hold=True)
+        except ComLinkRefused as exc:
+            LOGGER.warning("Cannot disconnect laser: %s", exc)
+            raise
+        with self._state_lock:
+            self._resume_pending = False
+            self.status = LaserStatus(connected=False, connection_state=ConnectionState.DISCONNECTED)
+        LOGGER.info("Serial connection closed on %s", self.serial_port)
 
     def set_power_percent(self, power_percent: float) -> None:
         with self._laser_lock:
@@ -826,7 +865,8 @@ class ALSLaserServer(NetServer):
         start_from_step = self._start_from_step
         warmup_seconds_override = self._resume_warmup_seconds
         try:
-            if self.laser is None:
+            laser = self.laser
+            if laser is None:
                 raise RuntimeError("Laser not connected")
             controller_kwargs: dict = dict(
                 interrogate_callback=self._on_sequence_interrogated_state,
@@ -835,7 +875,7 @@ class ALSLaserServer(NetServer):
             if warmup_seconds_override is not None:
                 controller_kwargs["warmup_seconds"] = warmup_seconds_override
             startup_controller = ALSLaserStartupController(
-                self._sequence_laser,
+                _LockedLaserProxy(self, bound=laser),
                 **controller_kwargs,
             )
             for step_num, step_name, method_name in steps:

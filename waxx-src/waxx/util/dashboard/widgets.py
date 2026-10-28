@@ -36,18 +36,20 @@ from PyQt6.QtWidgets import (
 )
 
 
-# Match SerialConnection status strings (kept as plain str to avoid Qt depending
-# on the serial helper module).
+# Match the ComLink / SerialConnection status strings (kept as plain str to
+# avoid Qt depending on either module).
 _COM_STATUS_CONNECTED = "connected"
 _COM_STATUS_CONNECTING = "connecting"
 _COM_STATUS_DISCONNECTED = "disconnected"
 _COM_STATUS_ERROR = "error"
+_COM_STATUS_HELD = "held"
 
 _COM_PALETTE = {
     _COM_STATUS_CONNECTED: (theme.OK, "white", "\u2713"),
     _COM_STATUS_CONNECTING: (theme.WARN, "white", "\u22ef"),
     _COM_STATUS_DISCONNECTED: (theme.OFF, "white", "\u00b7"),
     _COM_STATUS_ERROR: (theme.ERR, "white", "\u2717"),
+    _COM_STATUS_HELD: (theme.HELD, "white", "\u23f8"),
 }
 
 
@@ -56,8 +58,9 @@ class ComStatusButton(QToolButton):
 
     The button is *driven* by the panel's snapshot poller via
     :meth:`set_status`.  Clicking emits :attr:`disconnect_requested` (when
-    currently connected) or :attr:`reconnect_requested` (when currently
-    disconnected or in error).
+    currently connected: the server closes the port and holds it closed, no
+    auto-reconnect, until the next click) or :attr:`reconnect_requested`
+    (when held, disconnected or in error: release the hold and connect now).
 
     Click is debounced for ``debounce_ms`` after every emit to prevent rapid
     toggle storms (e.g. accidental double-clicks).  The button is non-clickable
@@ -102,7 +105,8 @@ class ComStatusButton(QToolButton):
         Parameters
         ----------
         status:
-            One of ``"connected"``, ``"connecting"``, ``"disconnected"``, ``"error"``.
+            One of ``"connected"``, ``"connecting"``, ``"disconnected"``,
+            ``"error"``, ``"held"``.
         port:
             Optional port name to use as the button label.
         detail:
@@ -142,6 +146,8 @@ class ComStatusButton(QToolButton):
             "QToolButton:hover { padding: 2px 9px; }"
         )
         tip = f"{self._label} - {self._status}"
+        if self._status == _COM_STATUS_HELD:
+            tip += " (disconnected by hand: nothing reconnects it; click to reconnect)"
         if self._tooltip_detail:
             tip = f"{tip}\n{self._tooltip_detail}"
         set_tooltip(self, tip)
@@ -158,7 +164,8 @@ class ComStatusButton(QToolButton):
                 self,
                 "Disconnect COM port?",
                 f"Disconnect {self._label}?\n"
-                "Hardware will stop responding until reconnect.",
+                "The server closes the port and keeps it closed: nothing reconnects "
+                "it until you click here again.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -166,7 +173,7 @@ class ComStatusButton(QToolButton):
                 return
             self.disconnect_requested.emit()
         else:
-            # disconnected or error
+            # held, disconnected or error: release any hold and connect now
             self.reconnect_requested.emit()
 
         self._debounce_active = True

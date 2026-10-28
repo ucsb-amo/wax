@@ -222,6 +222,23 @@ class LogBuffer(logging.Handler):
 _qt_handler = None
 _buffer = None
 
+# The camera host's workers and the camera drivers under them log on their own
+# loggers (beacon.camera.*, waxx.control.cameras.*), which reach no file unless
+# routed: their INFO and above go to live_od.log too (frame-path stalls, backlog
+# bursts, ops run on a camera mid-run, run summaries; 2026-10-22).
+CAMERA_LOGGERS = ("beacon.camera", "waxx.control.cameras")
+
+
+def route_camera_loggers(handler, level=logging.INFO) -> None:
+    """Send the camera loggers' records at ``level`` and above to ``handler``
+    (once per handler). They keep propagating to the root logger as before."""
+    for name in CAMERA_LOGGERS:
+        clog = logging.getLogger(name)
+        if clog.getEffectiveLevel() > level:
+            clog.setLevel(level)
+        if handler not in clog.handlers:
+            clog.addHandler(handler)
+
 
 def get_log_buffer() -> LogBuffer:
     """The process's :class:`LogBuffer`, attached to the liveOD logger on first
@@ -273,6 +290,7 @@ def setup_logging(log_dir=DEFAULT_LOG_DIR, level=VERBOSE) -> QtLogHandler:
             file_handler.setFormatter(logging.Formatter(
                 "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"))
             logger.addHandler(file_handler)
+            route_camera_loggers(file_handler)
         except Exception as exc:
             logger.warning(f"Could not open the log file in {log_dir}: {exc}")
 

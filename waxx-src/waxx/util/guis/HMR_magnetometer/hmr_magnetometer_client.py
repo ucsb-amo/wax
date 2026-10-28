@@ -155,6 +155,23 @@ class HMRClient(NetClient):
         """Force-restart (disconnect then reconnect) the serial device on server."""
         return self._request("RESTART_SERIAL", timeout)
 
+    def com_connect(self) -> tuple[bool, str]:
+        """Release a Disconnect hold; the server opens the COM port in the
+        background.  Returns ``(ok, message)``; raises on network failure."""
+        return self._com_request("COM_CONNECT")
+
+    def com_disconnect(self) -> tuple[bool, str]:
+        """Close the COM port and hold it closed until :meth:`com_connect`.
+        Returns ``(ok, message)`` (message = the refusal when not ok); raises
+        on network failure."""
+        return self._com_request("COM_DISCONNECT")
+
+    def _com_request(self, command: str) -> tuple[bool, str]:
+        result = self._request(command, self.timeout)
+        if not result.get("ok"):
+            return False, str(result.get("error", f"{command} failed"))
+        return True, str(result.get("message", ""))
+
     def get_field_magnitude(self, timeout: float = 5.) -> float:
         """Return the latest total field magnitude in Gauss.
 

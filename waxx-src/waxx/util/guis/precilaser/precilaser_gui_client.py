@@ -50,6 +50,16 @@ class PrecilaserGuiClient(NetClient):
         response = self._send_command(command)
         return response.upper() == "OK"
 
+    def _send_result_command(self, command: str) -> tuple[bool, str]:
+        """``(ok, message)``: message is the server's error / refusal text
+        when not ok, "" when ok.  Raises on network failure."""
+        response = self._send_command(command)
+        if response.upper() == "OK":
+            return True, ""
+        if response.upper().startswith("ERROR:"):
+            return False, response[len("ERROR:"):].strip()
+        return False, response
+
     def _send_json_command(self, command: str) -> dict:
         response = self._send_command(command)
         return json.loads(response)
@@ -78,6 +88,16 @@ class PrecilaserGuiClient(NetClient):
 
     def disconnect_serial(self) -> bool:
         return self._send_ok_command("DISCONNECT_SERIAL")
+
+    def com_connect(self) -> tuple[bool, str]:
+        """Release a Disconnect hold and open the COM port (in the background
+        on the server; this returns at once).  ``(ok, message)``."""
+        return self._send_result_command("COM_CONNECT")
+
+    def com_disconnect(self) -> tuple[bool, str]:
+        """Close the COM port and hold it closed until :meth:`com_connect`.
+        ``(False, reason)`` when the server refuses (a sequence is running)."""
+        return self._send_result_command("COM_DISCONNECT")
 
     def run_startup_sequence(self) -> bool:
         return self._send_ok_command("START_STARTUP")

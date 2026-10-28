@@ -471,3 +471,50 @@ def test_clean_close_stops_closes_the_shutter_and_frees_the_sdk(make_backend):
     assert names.index("AbortAcquisition") < names.index("SetShutterEx") < names.index("ShutDown")
     assert fake.hw["cooler_mode"] == 1
     DeviceLock(andor_mod.DEVICE_LOCK_KEY).acquire().release()
+
+
+def test_the_run_frame_path_is_watched(make_backend, monkeypatch, caplog):
+    """2026-10-22 (runs 87809, 87832): frames came ~5.9 s late and nothing was logged.
+    While a run waits, the SDK's acquired count is sampled: frames it holds that the
+    read does not return are a WARNING; a read that blocks is a WARNING."""
+    import logging
+    import time
+    import waxx.control.cameras.emccd_backend as eb
+    monkeypatch.setattr(eb, "PROGRESS_SAMPLE_S", 0.02)
+    monkeypatch.setattr(eb, "SLOW_SDK_CALL_S", 0.05)
+    caplog.set_level(logging.INFO, logger=eb.__name__)
+    be, fake = make_backend()
+    be.apply(RUN, "run")
+    be.start_acquisition("run", n_frames=5)
+    cam = cam_of(be)
+    real = cam.read_frames_from
+    monkeypatch.setattr(cam, "read_frames_from", lambda i: ([], [], i))
+    fake.trigger(1)
+    deadline = time.monotonic() + 2.0
+    while "read returns none" not in caplog.text and time.monotonic() < deadline:
+        assert be.retrieve(0.0) == []
+        time.sleep(0.01)
+    assert "the SDK reports 1 frame(s) acquired but the read returns none from index 0" in caplog.text
+    assert be.run_diagnostics()["sdk_frames_done"] == 1
+    monkeypatch.setattr(cam, "read_frames_from", real)
+    assert [f.hw_idx for f in be.retrieve(0.0)] == [0]
+    assert "frames readable again" in caplog.text
+
+    def slow(i):
+        time.sleep(0.1)
+        return real(i)
+    monkeypatch.setattr(cam, "read_frames_from", slow)
+    be.retrieve(0.0)
+    assert "read blocked" in caplog.text
+
+
+def test_no_frame_path_warning_in_a_clean_run(backend, caplog):
+    import logging
+    be, fake = backend
+    caplog.set_level(logging.INFO, logger="waxx.control.cameras.emccd_backend")
+    be.apply(RUN, "run")
+    be.start_acquisition("run", n_frames=3)
+    assert be.retrieve(0.05) == []
+    fake.trigger(3)
+    assert [f.hw_idx for f in be.retrieve(0.5)] == [0, 1, 2]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

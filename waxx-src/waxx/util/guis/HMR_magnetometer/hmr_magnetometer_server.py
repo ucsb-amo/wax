@@ -15,6 +15,18 @@ Protocol (one command per TCP connection, newline-terminated JSON response):
                                             "latest": {...}|null, "history_len": int}
     SHUTDOWN                 â†’ {"ok": true}; the server then closes the serial
                                port, stops its beacon and exits the process (code 0).
+    COM_CONNECT              â†’ {"ok": true, "message": str, "connected": bool}; releases
+                               a Disconnect hold, the port opens in the background.
+    COM_DISCONNECT           â†’ {"ok": true, "connected": false}; closes the port and
+                               holds it closed until COM_CONNECT ({"ok": false,
+                               "error": reason} if refused).
+    SERIAL_DISCONNECT / SERIAL_RECONNECT / RESTART_SERIAL / GET_SERIAL_STATUS:
+                               the older names, kept (disconnect = the same hold).
+
+The serial port is owned by a ComLink (waxx.util.comms_server.com_link): it is
+opened on the link's thread after the server is up, reopened with backoff after
+a failure, and a person's Disconnect holds it closed.  The read loop only reads
+from the open device.
 
 Usage:
     python hmr_magnetometer_server.py [--serial-port COM33] [--server-port 50000]
@@ -39,6 +51,7 @@ import serial
 import serial.tools.list_ports
 
 from beacon.discovery.server import NetServer
+from waxx.util.comms_server.com_link import ComLink, ComLinkRefused
 
 DEFAULT_SERIAL_PORT = "COM33"
 DEFAULT_BAUD = 9600
@@ -187,6 +200,48 @@ class HMR2300Reader:
         raise ValueError(f"Could not parse sensor reply: {last_reply!r}")
 
 
+class _LinkDebugLog:
+    """ComLink's own log lines, at DEBUG (this server's log file only).
+
+    The server logs each link event itself, with its existing dedup: a stuck
+    sensor is reset every ~4.5 s, sometimes for days, and the link's per-reset
+    WARNING/INFO lines would otherwise fill the dashboard log.
+    """
+
+    def debug(self, msg, *args, **kwargs):
+        logger.debug(msg, *args, **kwargs)
+
+    info = warning = debug
+
+
+class HMRLink(ComLink):
+    """The HMR2300's serial port; opened on the link's thread, never by the read loop."""
+
+    # 0.2 s before reopening after a read error or stuck reset (the old
+    # reconnect's pause), then the link's usual steps up to every 30 s.
+    BACKOFF_S = (0.2, 2.0, 5.0, 10.0, 30.0)
+    # Below the stuck detection (~4.5 s of identical samples), so a sensor that
+    # stays stuck keeps being reset 0.2 s after each detection, as before,
+    # instead of the link's growing backoff for devices that fail at once.
+    STABLE_S = 3.0
+
+    def __init__(self, owner, **kwargs):
+        self._owner = owner
+        baud = int(owner.baud) if owner.baud is not None else None
+        super().__init__(owner.serial_port, baud=baud, server=owner,
+                         name=f"HMR2300 {owner.serial_port}", io_lock=owner.serial_lock,
+                         logger=_LinkDebugLog(), **kwargs)
+
+    def _open(self):
+        return self._owner._open_reader()
+
+    def _close(self, device):
+        device.close()
+
+    def _on_connected(self, device):
+        self._owner._link_up.set()
+
+
 class MagnetometerServer(NetServer):
     """Headless server: reads HMR2300 and serves field data over TCP."""
 
@@ -218,12 +273,17 @@ class MagnetometerServer(NetServer):
         # Last write error (type name, str), to log a repeating failure once.
         self._field_log_failure_sig: tuple[str, str] | None = None
 
-        self.reader = None
         self.stop_event = threading.Event()
         self.history_lock = threading.Lock()
         self.reference_lock = threading.Lock()
-        self.serial_lock = threading.Lock()
-        self.serial_should_be_connected = True
+        # Held around each read and by the link while it opens/closes the
+        # port (re-entrant: ComLink's io_lock).
+        self.serial_lock = threading.RLock()
+        # Set when the link has (re)opened the port; the read loop waits on it.
+        self._link_up = threading.Event()
+        # True when the next open follows a repeat stuck reset: its log lines
+        # go to DEBUG (see _note_stuck).
+        self._quiet_reconnect = False
         self.history = deque(maxlen=MAX_HISTORY)
         # Signature (exc type name, exc str) of the most recent reconnect
         # failure.  Used to suppress identical repeating warnings — only the
@@ -234,15 +294,24 @@ class MagnetometerServer(NetServer):
         # Set True once we've successfully opened the port at least once;
         # used to keep the very first connection attempt visible.
         self._serial_was_ever_connected = False
-        # Monotonic time of the last parsed sensor reading (for the "com"
-        # snapshot's last_rx_seconds_ago).
-        self._last_rx_monotonic: float | None = None
+        # The serial port: opened, reopened and held by the link (started in run()).
+        self.link = HMRLink(self)
         # The current stuck-sensor episode, for the log only (see
         # STUCK_SUMMARY_INTERVAL_S); None while the readings change.
         self._stuck_episode: dict | None = None
         # Listening socket, kept so shutdown() can close it and unblock accept().
         self._srv: socket.socket | None = None
         self._shutdown_requested = False
+
+    @property
+    def reader(self):
+        """The open HMR2300Reader (the link's device), or None."""
+        return self.link.device
+
+    @property
+    def serial_should_be_connected(self) -> bool:
+        """False while a person's Disconnect holds the port closed."""
+        return not self.link.held
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -279,11 +348,11 @@ class MagnetometerServer(NetServer):
                 target=self._field_log_loop, name="hmr-field-log", daemon=True
             ).start()
 
-        # The read loop opens the port itself (and keeps retrying).  Opening it
-        # here as well raced that loop at every start: one thread closed the
-        # other's port and the second open got "Access is denied".
+        # The link opens the port on its own thread (and keeps retrying); the
+        # read loop only reads from it, so only one thread ever opens it.
         logger.info("Opening %s at %d baud (device ID: %r); polling every %.3f s",
                     self.serial_port, self.baud, self.device_id, self.poll_interval)
+        self.link.start()
         read_thread = threading.Thread(target=self._read_loop, daemon=True)
         read_thread.start()
 
@@ -297,12 +366,11 @@ class MagnetometerServer(NetServer):
         """Stop the beacon, stop the loops, close the serial port.  Idempotent."""
         self._stop_beacon()
         self.stop_event.set()
-        if self.reader is not None:
-            try:
-                self.reader.close()
-            except Exception as exc:
-                logger.warning("shutdown: error closing reader: %s", exc)
-            self.reader = None
+        self._link_up.set()             # wake the read loop
+        try:
+            self.link.stop()            # closes the port (bounded)
+        except Exception as exc:
+            logger.warning("shutdown: error closing reader: %s", exc)
         # Unblock _server_loop's accept() immediately instead of waiting for
         # its 1 s timeout.
         srv = self._srv
@@ -342,38 +410,10 @@ class MagnetometerServer(NetServer):
         threading.Thread(target=_worker, name="hmr-shutdown", daemon=True).start()
 
     def _com_snapshot(self) -> dict:
-        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape.
-
-        ``status`` is derived from the read loop's existing state: the port
-        is open -> connected; operator asked for disconnect -> disconnected;
-        the auto-reconnect loop has a recorded failure -> error; otherwise
-        (first open still pending / retrying with no failure yet) -> connecting.
-        ``reconnect_attempts`` is the current consecutive-failure streak of
-        that loop.
-        """
-        connected = self._is_serial_connected_nolock()
-        failure_sig = self._last_reconnect_failure_sig
-        if connected:
-            status = "connected"
-        elif not self.serial_should_be_connected:
-            status = "disconnected"
-        elif failure_sig is not None:
-            status = "error"
-        else:
-            status = "connecting"
-        last_error = f"{failure_sig[0]}: {failure_sig[1]}" if failure_sig is not None else None
-        last_rx = self._last_rx_monotonic
-        return {
-            "port": self.serial_port,
-            "baud": int(self.baud) if self.baud is not None else None,
-            "status": status,
-            "last_error": last_error,
-            "last_rx_seconds_ago": (
-                None if last_rx is None else round(time.monotonic() - last_rx, 3)
-            ),
-            "reconnect_attempts": int(self._reconnect_failure_streak),
-            "config_valid": True,
-        }
+        """Serial-link summary in ``SerialSnapshot.as_dict()`` shape (+ ``held``):
+        the link's snapshot (connecting / connected / error / disconnected /
+        held; a person's Disconnect shows as held)."""
+        return self.link.snapshot()
 
     def get_snapshot(self) -> dict:
         with self.history_lock:
@@ -398,68 +438,29 @@ class MagnetometerServer(NetServer):
         last_values = None
         same_count = 0
         stuck_values = None
-        # True after a repeat stuck reset: the reconnect that follows is
-        # routine and logged at DEBUG (see _note_stuck).
-        quiet_reconnect = False
+        # The reader the counts above came from: a reopened port starts over.
+        last_dev = None
 
         while not self.stop_event.is_set():
-            if not self.serial_should_be_connected:
-                if self.stop_event.wait(self.poll_interval):
-                    break
-                continue
-
-            # --- ensure serial is open (retry forever, never crash) ---
-            if not self._is_serial_connected():
-                first_try = self._last_reconnect_failure_sig is None
-                loud = first_try and not quiet_reconnect
-                quiet_reconnect = False
-                # Only announce the attempt itself the first time (or after
-                # a streak break).  Subsequent silent retries every few
-                # seconds would otherwise spam the dashboard log.
-                if loud:
-                    logger.info("Serial not connected, attempting reconnect on %s.", self.serial_port)
-                else:
-                    logger.debug("Serial not connected, attempting reconnect on %s.", self.serial_port)
-                try:
-                    self._reconnect(quiet=not loud)
-                    last_values = None
-                    same_count = 0
-                    (logger.info if loud else logger.debug)("Sensor reconnected.")
-                    self._last_reconnect_failure_sig = None
-                    self._reconnect_failure_streak = 0
-                except Exception as exc:
-                    if self.stop_event.is_set():
-                        break
-                    sig = (type(exc).__name__, str(exc))
-                    if sig != self._last_reconnect_failure_sig:
-                        logger.warning(
-                            "Reconnect failed (%s: %s) — will keep retrying quietly.",
-                            sig[0], sig[1],
-                        )
-                        self._last_reconnect_failure_sig = sig
-                        self._reconnect_failure_streak = 1
-                    else:
-                        self._reconnect_failure_streak += 1
-                        # Periodically remind at INFO so the log shows the
-                        # condition is still active without flooding it.
-                        if self._reconnect_failure_streak % 60 == 0:
-                            logger.info(
-                                "Reconnect still failing (%s) after %d attempts.",
-                                sig[0], self._reconnect_failure_streak,
-                            )
-                        else:
-                            logger.debug(
-                                "Reconnect failed (%s: %s).", sig[0], sig[1],
-                            )
-                    # Back off: 5 s, then grow to a 30 s cap.
-                    wait_s = min(5.0 + 0.5 * self._reconnect_failure_streak, 30.0)
-                    self.stop_event.wait(wait_s)
-                    continue
-
-            # --- read one sample ---
+            # --- read one sample from the port the link holds open ---
+            # This loop never opens the port: the link does (retrying forever
+            # on its backoff, never crashing), and a person's Disconnect holds
+            # it closed -- nothing here can reopen it behind that hold.
+            dev = None
             try:
                 with self.serial_lock:
-                    x_counts, y_counts, z_counts = self.reader.read_one()
+                    dev = self.link.device
+                    if dev is not None:
+                        x_counts, y_counts, z_counts = dev.read_one()
+                if dev is None:
+                    # not open (opening, retrying, held): wait for the link
+                    self._link_up.wait(0.5)
+                    self._link_up.clear()
+                    continue
+                if dev is not last_dev:
+                    last_dev = dev
+                    last_values = None
+                    same_count = 0
                 values = (x_counts, y_counts, z_counts)
 
                 if values == last_values:
@@ -494,30 +495,27 @@ class MagnetometerServer(NetServer):
                 reading = {"t": time.time(), "Bx": x_G, "By": y_G, "Bz": z_G, "Btot": btot}
                 with self.history_lock:
                     self.history.append(reading)
-                self._last_rx_monotonic = time.monotonic()
+                self.link.note_rx()
                 self._queue_field_log(reading)
                 self._note_reading_ok()
 
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                if not self.serial_should_be_connected:
-                    continue
+                if dev is None or self.link.device is not dev:
+                    continue    # closed meanwhile (Disconnect, stop): not a device failure
                 if isinstance(exc, SensorStuckError):
-                    quiet_reconnect = self._note_stuck(exc, stuck_values)
+                    self._quiet_reconnect = self._note_stuck(exc, stuck_values)
                 else:
                     logger.warning("Read error (%s: %s) — resetting serial for reconnect.",
                                    type(exc).__name__, exc)
                 with self.serial_lock:
-                    if self.reader is not None:
-                        try:
-                            self.reader.close()
-                        except Exception as close_exc:
-                            logger.debug("_read_loop: error closing reader after read failure: %s", close_exc)
-                        self.reader = None
+                    if self.link.device is dev:     # not closed / reopened meanwhile
+                        # closes the port; the link reopens it (unless held)
+                        self.link.report_error(exc, where="read")
                 last_values = None
                 same_count = 0
-                # skip to top of loop which will reconnect
+                # skip to top of loop, which waits for the reconnect
                 continue
 
             if self.stop_event.wait(self.poll_interval):
@@ -665,67 +663,103 @@ class MagnetometerServer(NetServer):
                 "Btot": reading["Btot"],
             })
 
-    def _reconnect(self, quiet: bool = False):
-        """(Re)open the serial port.
+    # ------------------------------------------------------------------
+    # Serial port (opened by the link: HMRLink._open -> _open_reader)
+    # ------------------------------------------------------------------
 
-        ``quiet`` demotes the routine open/close chatter to DEBUG.  The
-        auto-retry loop sets it once the first failure has been announced
-        so subsequent retries don't repeat the same four log lines every
-        few seconds.
+    def _open_reader(self):
+        """Open and configure the sensor; return the reader, raise on failure.
+
+        Runs on the link's thread.  The routine open chatter is at INFO only
+        for the first attempt (not after a failure has been announced, nor
+        after a repeat stuck reset); failures are logged once per distinct
+        error (_note_open_failure), so retries don't spam the dashboard log.
         """
-        log_open = logger.debug if quiet else logger.info
-        if self.stop_event.is_set():
-            raise RuntimeError("Server stopping")
-        with self.serial_lock:
-            if self.reader is not None:
-                try:
-                    log_open("Disconnecting serial device on %s.", self.serial_port)
-                    self.reader.close()
-                    log_open("Serial device disconnected.")
-                except Exception as exc:
-                    logger.debug("_reconnect: close before reconnect failed: %s", exc)
-                self.reader = None
+        first_try = self._last_reconnect_failure_sig is None
+        loud = first_try and not self._quiet_reconnect
+        self._quiet_reconnect = False
+        log_open = logger.info if loud else logger.debug
+        log_open("Serial not connected, attempting reconnect on %s.", self.serial_port)
+        log_open("Reconnecting serial device on %s.", self.serial_port)
+        reader = HMR2300Reader(
+            port=self.serial_port,
+            baud=self.baud,
+            device_id=self.device_id,
+        )
+        try:
+            reader.open()
+            reader.setup()
+        except Exception as exc:
+            reader.close()      # a port that opened but failed setup must not stay open
+            self._note_open_failure(exc)
+            raise
+        log_open("Serial device reconnected and configured.")
+        log_open("Sensor reconnected.")
+        self._serial_was_ever_connected = True
+        self._last_reconnect_failure_sig = None
+        self._reconnect_failure_streak = 0
+        return reader
 
-            log_open("Reconnecting serial device on %s.", self.serial_port)
-            time.sleep(0.2)
-            if self.stop_event.is_set():
-                raise RuntimeError("Server stopping")
-            self.reader = HMR2300Reader(
-                port=self.serial_port,
-                baud=self.baud,
-                device_id=self.device_id,
+    def _note_open_failure(self, exc: Exception) -> None:
+        """Log a failed open: WARNING once per distinct error, then DEBUG with
+        an INFO reminder every 60 attempts."""
+        sig = (type(exc).__name__, str(exc))
+        if sig != self._last_reconnect_failure_sig:
+            logger.warning(
+                "Reconnect failed (%s: %s) — will keep retrying quietly.",
+                sig[0], sig[1],
             )
-            self.reader.open()
-            self.reader.setup()
-            log_open("Serial device reconnected and configured.")
-            self._serial_was_ever_connected = True
+            self._last_reconnect_failure_sig = sig
+            self._reconnect_failure_streak = 1
+        else:
+            self._reconnect_failure_streak += 1
+            # Periodically remind at INFO so the log shows the
+            # condition is still active without flooding it.
+            if self._reconnect_failure_streak % 60 == 0:
+                logger.info(
+                    "Reconnect still failing (%s) after %d attempts.",
+                    sig[0], self._reconnect_failure_streak,
+                )
+            else:
+                logger.debug(
+                    "Reconnect failed (%s: %s).", sig[0], sig[1],
+                )
+
+    def _connect_serial(self):
+        """A person's Connect: release the hold; the link opens the port now
+        (in the background, skipping any backoff wait)."""
+        if self.link.held:
+            logger.info("Serial connect requested by operator on %s.", self.serial_port)
+        self.link.connect()
+
+    def _reconnect(self):
+        """Close the port and reopen it (in the background), releasing any hold."""
+        logger.info("Restarting serial device on %s.", self.serial_port)
+        self.link.disconnect(hold=True)
+        self.link.connect()
 
     def _disconnect_serial(self):
-        with self.serial_lock:
-            if self.reader is not None:
-                try:
-                    logger.info("Manually disconnecting serial device on %s.", self.serial_port)
-                    self.reader.close()
-                    logger.info("Serial device disconnected by operator.")
-                except Exception as exc:
-                    logger.warning("_disconnect_serial: close failed: %s", exc)
-                self.reader = None
+        """A person's Disconnect: close the port and hold it closed until a
+        connect.  Raises ComLinkRefused if the link refuses."""
+        logger.info("Manually disconnecting serial device on %s.", self.serial_port)
+        self.link.disconnect(hold=True)
+        logger.info("Serial device disconnected by operator (held closed until Connect).")
+
+    def _await_link(self, timeout_s: float = 2.0) -> str:
+        """Wait, at most ``timeout_s``, for an open the link has started; return
+        the link's state.  Only the older reconnect/restart commands wait (on
+        their request's own thread), so their replies still say how it went."""
+        deadline = time.monotonic() + timeout_s
+        while self.link.state == "connecting" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.link.state
 
     def _is_serial_connected(self):
-        with self.serial_lock:
-            return (
-                self.reader is not None
-                and self.reader.ser is not None
-                and self.reader.ser.is_open
-            )
+        return self.link.connected
 
     def _is_serial_connected_nolock(self):
-        """Lock-free variant for snapshots: must not queue behind a slow read_one()."""
-        reader = self.reader
-        try:
-            return bool(reader is not None and reader.ser is not None and reader.ser.is_open)
-        except Exception:
-            return False
+        """Lock-free (snapshots must not queue behind a slow read_one())."""
+        return self.link.connected
 
     # ------------------------------------------------------------------
     # TCP server loop (main thread)
@@ -788,32 +822,53 @@ class MagnetometerServer(NetServer):
                 "target_connected": bool(self.serial_should_be_connected),
             }
 
-        if command == "SERIAL_DISCONNECT":
-            self.serial_should_be_connected = False
-            self._disconnect_serial()
-            return {"ok": True, "connected": False}
-
-        if command == "SERIAL_RECONNECT":
-            self.serial_should_be_connected = True
-            try:
-                self._reconnect()
-            except Exception as exc:
-                return {"ok": False, "error": str(exc)}
-            return {"ok": True, "connected": self._is_serial_connected()}
-
-        if command == "RESTART_SERIAL":
-            self.serial_should_be_connected = True
-            try:
-                self._reconnect()
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "error": f"Restart failed ({type(exc).__name__}: {exc})",
-                    "connected": False,
-                }
+        if command == "COM_CONNECT":
+            was_connected = self._is_serial_connected()
+            self._connect_serial()
             return {
                 "ok": True,
                 "connected": self._is_serial_connected(),
+                "message": ("Serial already connected" if was_connected
+                            else "Serial connect requested (the port opens in the background)"),
+            }
+
+        if command in ("COM_DISCONNECT", "SERIAL_DISCONNECT"):
+            try:
+                self._disconnect_serial()
+            except ComLinkRefused as exc:
+                return {"ok": False, "error": f"Disconnect refused: {exc}",
+                        "connected": self._is_serial_connected()}
+            return {"ok": True, "connected": False}
+
+        if command == "SERIAL_RECONNECT":
+            self._connect_serial()
+            state = self._await_link()
+            if state == "error":
+                return {"ok": False, "error": self.link.snapshot()["last_error"] or "connect failed"}
+            reply = {"ok": True, "connected": self._is_serial_connected()}
+            if not reply["connected"]:
+                reply["message"] = f"Serial connect requested (link: {state})"
+            return reply
+
+        if command == "RESTART_SERIAL":
+            try:
+                self._reconnect()
+            except ComLinkRefused as exc:
+                return {"ok": False, "error": f"Restart refused: {exc}",
+                        "connected": self._is_serial_connected()}
+            state = self._await_link()
+            if state == "error":
+                return {
+                    "ok": False,
+                    "error": f"Restart failed ({self.link.snapshot()['last_error']})",
+                    "connected": False,
+                }
+            if not self._is_serial_connected():
+                return {"ok": True, "connected": False,
+                        "message": f"Serial restart requested (link: {state})"}
+            return {
+                "ok": True,
+                "connected": True,
                 "message": "Serial restarted successfully",
             }
 

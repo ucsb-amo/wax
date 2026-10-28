@@ -59,7 +59,19 @@ def server(monkeypatch):
     monkeypatch.setattr(srv_mod.serial, "Serial", _no_serial)
     s = srv_mod.MagnetometerServer(serial_port="LRS-FAKE", poll_interval=0.0)
     monkeypatch.setattr(s, "_start_beacon", lambda: (_ for _ in ()).throw(AssertionError("no beacon")))
-    return s
+    yield s
+    s.link.stop()
+
+
+def _run_read_loop(server):
+    """The read loop only reads; the server's link opens the (fake) port, here
+    without waiting between a reset and the reopen."""
+    server.link.BACKOFF_S = (0.0,)
+    server.link.start()
+    try:
+        server._read_loop()
+    finally:
+        server.link.stop()
 
 
 def test_stuck_episode_logs_first_event_summaries_and_recovery(server, monkeypatch, caplog):
@@ -72,7 +84,7 @@ def test_stuck_episode_logs_first_event_summaries_and_recovery(server, monkeypat
     monkeypatch.setattr(srv_mod, "HMR2300Reader", _make_fake_reader(server, clock, counters))
 
     with caplog.at_level(logging.DEBUG, logger=srv_mod.__name__):
-        server._read_loop()
+        _run_read_loop(server)
 
     recs = [r for r in caplog.records if r.name == srv_mod.__name__]
     visible = [r for r in recs if r.levelno >= logging.INFO]     # what the dashboard gets
@@ -149,7 +161,7 @@ def test_a_sensor_that_moves_a_little_after_each_reset_stays_one_episode(server,
     monkeypatch.setattr(srv_mod, "HMR2300Reader", _FlapReader)
 
     with caplog.at_level(logging.DEBUG, logger=srv_mod.__name__):
-        server._read_loop()
+        _run_read_loop(server)
 
     msgs = [r.getMessage() for r in caplog.records
             if r.name == srv_mod.__name__ and r.levelno >= logging.INFO]
