@@ -2557,14 +2557,17 @@ class DataBrowserWindow(QMainWindow):
         return normalize_match_text(value)
 
     def _get_selected_row(self):
-        indexes = self.table.selectionModel().selectedRows()
-        if not indexes:
+        rows = self._get_selected_rows()
+        if not rows:
             return -1
-        return indexes[0].row()
+        current = self.table.currentRow()
+        return current if current in rows else rows[0]
 
     def _get_selected_rows(self):
+        # A shift-click range selection also covers the rows the filter hides;
+        # those are not what the user selected, so leave them out.
         indexes = self.table.selectionModel().selectedRows()
-        rows = sorted({idx.row() for idx in indexes})
+        rows = sorted({idx.row() for idx in indexes if not self.table.isRowHidden(idx.row())})
         return rows
 
     def _on_selection_changed(self):
