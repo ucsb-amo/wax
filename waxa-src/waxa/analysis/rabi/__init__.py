@@ -30,11 +30,15 @@ Modules
 :mod:`.rabi_fit`   ``fit_rabi``, ``rabi``, ``RabiFit``, ``rabi_model``.
 :mod:`.linearize`  ``linearize``, ``linearize_signal``, ``SignalMapping``.
 :mod:`.plotting`   ``plot_rabi``, ``plot_linearization``.
+:mod:`.dead_time`  ``fit_split_pulse_dead_time``: the dead time from split pulses (N sub-pulses
+                   at a fixed commanded total), separate from the Rabi rate.
 """
 
 from .rabi_fit import MODELS, RabiFit, envelope, fit_rabi, rabi, rabi_model
 from .linearize import SignalMapping, linearize, linearize_signal
 from .plotting import plot_linearization, plot_rabi
+from .dead_time import SplitPulseDeadTime, fit_split_pulse_dead_time
 
-__all__ = ["MODELS", "RabiFit", "SignalMapping", "envelope", "fit_rabi", "linearize", "linearize_signal",
-           "plot_linearization", "plot_rabi", "rabi", "rabi_model"]
+__all__ = ["MODELS", "RabiFit", "SignalMapping", "SplitPulseDeadTime", "envelope", "fit_rabi",
+           "fit_split_pulse_dead_time", "linearize", "linearize_signal", "plot_linearization", "plot_rabi", "rabi",
+           "rabi_model"]
