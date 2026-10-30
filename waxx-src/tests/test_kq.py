@@ -537,8 +537,8 @@ def test_kill(server, q, expts, monkeypatch):
     assert r.code == 0 and "killed" in r.out and q.killer.calls == [(5000, 1234.5)], r.err
     assert sent(server, "kill")[-1]["owner"] == "person"
     monkeypatch.setenv("WAXX_OWNER", "agent")
-    r = kq(server, "kill", "1", "--yes", tty=False)
-    assert r.code == 6 and "only a person" in r.err and len(sent(server, "kill")) == 1
+    r = kq(server, "kill", "1", "--yes", tty=False)      # job 1 is a person's: the server refuses
+    assert r.code == 6 and "only an agent's job" in r.err, r.err
 
 
 def test_an_agent_cannot_abort_a_persons_job(server, q, expts):

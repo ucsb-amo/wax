@@ -23,8 +23,9 @@ Commands::
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
     kq cancel <id> [--yes]                    cancel (a running job: liveOD's Abort)
-    kq kill <id> [--yes]                      force-kill a running job (a person only;
-                                              no cleanup; liveOD keeps its file)
+    kq kill <id> [--yes]                      force-kill a running job (a person; an agent
+                                              only its own stuck job; no cleanup; liveOD
+                                              keeps its file)
     kq pause [--all] [--reason R]             stop launching agent (or all) jobs
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
@@ -518,8 +519,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("--token")
     sp.add_argument("--agent", action="store_true", help="cancel as an agent")
 
-    sp = sub.add_parser("kill", help="force-kill a running job's processes (a person only; "
-                                     "no cleanup runs)")
+    sp = sub.add_parser("kill", help="force-kill a running job's processes (a person; an "
+                                     "agent only its own stuck job; no cleanup runs)")
     sp.add_argument("id", type=int)
     sp.add_argument("--yes", action="store_true", help="kill without asking")
     sp.add_argument("--token")
@@ -1111,11 +1112,7 @@ def _cmd_cancel(ctx: _Ctx, args) -> int:
 
 
 def _cmd_kill(ctx: _Ctx, args) -> int:
-    owner = _owner(args)
-    if owner != "person":
-        ctx.warn("kq: only a person may force-kill a job (no cleanup runs); an agent asks a "
-                 "person")
-        return EXIT_REFUSED
+    owner = _owner(args)            # the server decides whether an agent may
     job = ctx.client.describe(args.id, args.token)["job"]
     if job["state"] not in ("launching", "running"):
         ctx.warn(f"kq: {_job_word(job)} is {job['state']}: no process to kill")

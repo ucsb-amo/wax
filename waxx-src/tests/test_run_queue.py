@@ -718,12 +718,39 @@ def test_a_force_kill_is_a_persons_and_only_for_a_job_with_a_process(q, expts):
     q.tick()
     assert q.kill({"id": a, "by": "x"})["status"] == "error"          # no owner
     refused = q.kill({"id": a, "by": "agent-7", "owner": "agent"})
-    assert refused["status"] == "error" and "only a person" in refused["msg"]
+    assert refused["status"] == "error" and "only an agent's job" in refused["msg"]
     queued = q.kill({"id": b, "by": "jp", "owner": "person"})
     assert queued["status"] == "error" and "remove it" in queued["msg"]
     assert q.killer.calls == [] and job(q, a)["kill"] is None
     run_through(q, 101)
     assert q.kill({"id": a, "by": "jp", "owner": "person"})["status"] == "error"   # saved
+
+
+def _agent_job_on_run(q, expts):
+    a = submit(q, expts, owner="agent")
+    q.tick()
+    q.spawner.procs[-1].write("Run ID: 101")
+    q.live.start_run(101)
+    q.tick()
+    return a
+
+
+def test_an_agent_may_force_kill_its_own_job_only_when_its_run_is_stuck(q, expts, monkeypatch):
+    a = _agent_job_on_run(q, expts)
+    healthy = q.kill({"id": a, "by": "agent-7", "owner": "agent"})
+    assert healthy["status"] == "error" and "only when its run is stuck" in healthy["msg"]
+    assert q.killer.calls == []
+    from waxx.util.device_state import run_gate
+    for state in ("wedged", "reset_pending", "dead_client"):
+        monkeypatch.setattr(run_gate, "classify",
+                            lambda *x, st=state, **k: run_gate.GateState(st, 101, "stuck"))
+        assert q._agent_kill_refusal(q._find({"id": a})) == ""
+    other = run_gate.GateState("wedged", 999, "someone else's run")
+    monkeypatch.setattr(run_gate, "classify", lambda *x, **k: other)
+    assert "only when its run is stuck" in q.kill({"id": a, "by": "a", "owner": "agent"})["msg"]
+    monkeypatch.setattr(run_gate, "classify", lambda *x, **k: run_gate.GateState("wedged", 101, "x"))
+    reply = q.kill({"id": a, "by": "agent-7", "owner": "agent"})
+    assert reply["status"] != "error" and q.killer.calls, reply
 
 
 def test_a_kill_that_fails_says_so_and_the_job_stays(q, expts):

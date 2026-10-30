@@ -74,7 +74,9 @@ An agent may not cancel a person's running job.
 
 **Kill.**  For when the Abort cannot work -- liveOD closed, the experiment's
 terminal or process hung, the queue out of step with what runs -- a person
-(never an agent) may force-kill a launching or running job (``kill``): the
+may force-kill a launching or running job (``kill``), and so may an agent for
+its own job while liveOD says that job's run is stuck (user, 2026-10-30:
+wedged, or an Abort pending and unanswered, or its client dead; ``AGENT_KILL_STATES``): the
 experiment's process (``client_pid``, only when its creation time matches
 the one recorded from liveOD) and the shell the queue followed, each with
 everything under it (:func:`~waxx.util.device_state.detached.kill_tree`).
@@ -641,6 +643,10 @@ def requester_owner(obj: Mapping) -> tuple[str, str]:
                     if owner in (None, "") else
                     f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
     return str(owner), ""
+
+
+#: liveOD verdicts on a job's own run under which an agent may force-kill it.
+AGENT_KILL_STATES = ("wedged", "reset_pending", "dead_client")
 
 
 class QueueError(ValueError):
@@ -1551,10 +1557,31 @@ class RunQueue:
         self._notify()
         return reply
 
+    def _agent_kill_refusal(self, job: Job) -> str:
+        """Why an agent may not force-kill ``job`` ("" when it may): only an
+        agent's job, and only while liveOD's verdict on that job's own run is
+        one of :data:`AGENT_KILL_STATES` (no cleanup runs, so a run that can
+        still end by itself keeps its Abort)."""
+        if job.owner != "agent":
+            return ("an agent may force-kill only an agent's job (no cleanup runs: the hardware "
+                    f"stays as the run left it); {job.name} is a {job.owner}'s: ask a person")
+        poll = self._poll_now()
+        if poll is None:
+            return "liveOD is not reachable: an agent's force-kill needs its verdict on the run"
+        fence = self._fence() if self._fence is not None else None
+        monitor = self._monitor_state() if self._monitor_state is not None else None
+        verdict = run_gate.classify(poll, fence, monitor_state=monitor)
+        if verdict.run_id != job.run_id or verdict.state not in AGENT_KILL_STATES:
+            return (f"an agent may force-kill its job only when its run is stuck ("
+                    f"{', '.join(AGENT_KILL_STATES)}); run {job.run_id}: liveOD says "
+                    f"{verdict.state} for run {verdict.run_id}. Try kq cancel first")
+        return ""
+
     def kill(self, obj: Mapping) -> dict:
         """``{"id", "token"?, "by", "owner"}``: force-kill a launching or
-        running job (see **Kill** in the module docstring).  Only a person may
-        (``owner`` "person").  Kills, in order, the experiment's process
+        running job (see **Kill** in the module docstring).  A person may
+        (``owner`` "person"), and an agent for its own stuck job
+        (:meth:`_agent_kill_refusal`).  Kills, in order, the experiment's process
         (``client_pid``, only with a recorded creation time that still
         matches) and the process the queue follows (the shell; the queue's
         handle on it keeps its pid from being reused), each with its tree.
@@ -1567,9 +1594,14 @@ class RunQueue:
         if refusal:
             return {"status": "error", "msg": refusal}
         if as_owner != "person":
-            return {"status": "error",
-                    "msg": "only a person may force-kill a job (no cleanup runs: the hardware "
-                           "stays as the run left it)"}
+            with self._lock:
+                try:
+                    asked = self._find(obj)
+                except QueueError as exc:
+                    return {"status": "error", "msg": str(exc)}
+            refusal = self._agent_kill_refusal(asked)      # outside the lock: it polls liveOD
+            if refusal:
+                return {"status": "error", "msg": refusal}
         with self._lock:
             try:
                 job = self._find(obj)
