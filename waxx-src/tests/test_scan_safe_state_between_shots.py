@@ -121,11 +121,59 @@ def test_a_failing_sub_scan_cleanup_reaches_the_safe_state():
     e.cleanup_calibration_kernel = cal_cleanup
     with pytest.raises(ValueError, match="cleanup of the point failed"):
         e.scan()
-    assert _kinds(e)[-2:] == ["cleanup_cal", "cleanup_abort"]
+    # the point's own safe state, then the sub-scan block's (2026-10-28)
+    assert _kinds(e)[-3:] == ["cleanup_cal", "cleanup_abort", "cleanup_abort"]
+
+
+# ---- the sub-scan block between shots (2026-10-28) ----
+# A completed point may leave the machine running on purpose (kexp re-arms its
+# MOT pre-load in cleanup_calibration_kernel), so an exception from the RPCs
+# around a point -- the liveOD Abort raised by _subscan_end -- must reach the
+# safe state too.
+
+def test_the_liveod_abort_after_a_point_runs_the_safe_state_first():
+    e = _prepared(n_data=3, every=2)
+    real_end = type(e)._subscan_end
+
+    def end(ok, what, self=e):
+        real_end(e, ok, what)
+        raise TerminationRequested
+    e._subscan_end = end
+    with pytest.raises(TerminationRequested):
+        e.scan()
+    assert _kinds(e) == ["init_cal", "cal", "cleanup_cal", "cleanup_abort"]
+
+
+def test_an_exception_in_sub_scan_due_runs_the_safe_state_first():
+    e = _prepared(n_data=3, every=2)
+
+    def due():
+        if e._shot_complete_count == 2:
+            raise RuntimeError("due failed")
+        return type(e)._subscan_due(e)
+    e._subscan_due = due
+    with pytest.raises(RuntimeError, match="due failed"):
+        e.scan()
+    assert _kinds(e)[-1] == "cleanup_abort" and _kinds(e).count("data") == 2
+
+
+def test_point_completed_flag_seen_by_the_point_cleanup():
+    e = _prepared(n_data=3, every=2)
+    e.fail_point = 2                          # the second event's first point underflows
+    seen = []
+
+    def cal_cleanup():
+        seen.append(e.subscan_point_completed)
+        e.calls.append(("cleanup_cal",))
+    e.cleanup_calibration_kernel = cal_cleanup
+    with pytest.raises(RTIOUnderflow):
+        e.scan()
+    assert seen == [True, True, False]
 
 
 def test_the_feature_flag_is_set():
-    """kexp's MOT pre-load checks this flag before it runs (Base._check_mot_preload)."""
+    """kexp's MOT pre-load checks these flags before it runs (Base._check_mot_preload)."""
     from waxx.base import scanner
     assert scanner.SAFE_STATE_ON_EVERY_CLEANUP_FAILURE is True
+    assert scanner.SAFE_STATE_AROUND_SUBSCAN is True
     assert hasattr(scanner.Scanner, "_cleanup_or_safe_state")

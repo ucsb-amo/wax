@@ -31,6 +31,14 @@ WRITE_FAILURES = ("RTIOUnderflow", "RTIODestinationUnreachable", "ValueError")
 # shots, refuses to run on a scanner without it.
 SAFE_STATE_ON_EVERY_CLEANUP_FAILURE = True
 
+# Feature flag (2026-10-28): the sub-scan block between data shots (the
+# _subscan_due / _subscan_begin / _subscan_end RPCs, which can raise the liveOD
+# Abort, and the points themselves) runs cleanup_abort_kernel before an
+# exception goes on, and subscan_point_completed tells a point's cleanup whether
+# calibration_kernel returned normally. kexp's MOT pre-load with a sub-scan
+# (a completed point re-arms the pre-load) refuses to run without it.
+SAFE_STATE_AROUND_SUBSCAN = True
+
 # Parameters of the channel-snapshot kernel (Monitor._build_snapshot_kernel).
 SNAPSHOT_PARAMS = ["expt", "f", "a", "v", "s", "dv", "ts"]
 
@@ -130,6 +138,9 @@ class Scanner():
         # device state -- a coil's current, say -- may not be the hardware's,
         # so a cleanup may skip work only when this is True.
         self.shot_completed = False
+        # The same for a sub-scan point's calibration_kernel, read by
+        # cleanup_calibration_kernel.
+        self.subscan_point_completed = False
 
         # Triggered camera streams' exposure delays, decided at the run's
         # claim and written into the kernel at its start (load_exposure_delays;
@@ -353,7 +364,9 @@ class Scanner():
     @kernel
     def cleanup_calibration_kernel(self):
         """After a sub-scan point (also after one that raised an RTIO error):
-        the safety cleanup plus the TTL input drain. Overloaded in kexp.Base."""
+        the safety cleanup plus the TTL input drain. ``subscan_point_completed``
+        says whether calibration_kernel returned normally. Overloaded in
+        kexp.Base."""
         pass
 
     # Host RPCs, overridden in Expt (they never raise except to end the run
@@ -409,8 +422,10 @@ class Scanner():
         self.init_calibration_kernel()
         self.core.break_realtime()
         cleaned = False
+        self.subscan_point_completed = False
         try:
             self.calibration_kernel()
+            self.subscan_point_completed = True
         except RTIOUnderflow:
             self.core.break_realtime()
             self._cleanup_calibration_or_safe_state()
@@ -644,10 +659,20 @@ class Scanner():
 
             # Interleaved sub-scan points due before this data shot (the
             # first ones before shot 0). A point that ends the run leaves
-            # the loop as a data shot would.
+            # the loop as a data shot would. Anything raised here -- the
+            # liveOD Abort from _subscan_end, a point's own exception (its
+            # handler has already cleaned up; the second safe state is
+            # harmless) -- first puts the machine in its safe state: a
+            # completed point may have left the machine running on purpose
+            # (kexp re-arms its MOT pre-load) (2026-10-28).
             if self._subscan_enabled:
-                while self._subscan_due() and not aborted_bool:
-                    aborted_bool, abort_what = self._run_subscan_point()
+                try:
+                    while self._subscan_due() and not aborted_bool:
+                        aborted_bool, abort_what = self._run_subscan_point()
+                except:
+                    self.core.break_realtime()
+                    self.cleanup_abort_kernel()
+                    raise
                 if aborted_bool:
                     scanning = False
                     continue
