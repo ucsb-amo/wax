@@ -20,8 +20,11 @@ subpackage you want by name.
 
 Modules
 -------
+:mod:`.ramsey`     the phase of a Ramsey fringe from a phase scan, per scan cell,
+                    against a reference arm or an assumed phase, and models of it
+                    along a scan axis (``ramsey_phase_scan``, ``fit_phase_model``).
 :mod:`.lightshift`  light shift from the phase jump of a Ramsey fringe
-                    (``ramsey_light_shift``).
+                    (``ramsey_light_shift``; built on :mod:`.ramsey`).
 :mod:`.rabi`        pi time from a Rabi pulse-length scan (``rabi``, ``fit_rabi``;
                     ``python -m waxa.analysis.rabi RUN``).
 :mod:`.readout`     a spin-state readout signal calibrated against a Rabi flop:

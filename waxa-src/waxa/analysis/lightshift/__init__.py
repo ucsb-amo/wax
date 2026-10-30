@@ -21,10 +21,15 @@ Every xvar other than the phase (and the on/off xvar, if there is one) is a scan
 axis of the result, so a (compression, phase, detuning) vault gives light shifts
 of shape (n_compression, n_detuning).
 
+The fringe fitting is :mod:`waxa.analysis.ramsey` (``ramsey_phase_scan``): any
+reference arm, contrast per cell, and models of the phase along a scan axis
+(``fit_phase_model``).  This package adds the conversion to a frequency.
+
 Modules
 -------
-:mod:`.ramsey_phase`  ``fit_fringe``, ``ramsey_light_shift``, the result classes,
-                      and ``probe_offset_from_midpoint``.
+:mod:`.ramsey_phase`  ``ramsey_light_shift``, ``RamseyLightShift`` and
+                      ``probe_offset_from_midpoint`` (``fit_fringe`` etc. re-exported
+                      from :mod:`waxa.analysis.ramsey`).
 :mod:`.plotting`      the fringe grid and the light shift versus scan plot.
 """
 
