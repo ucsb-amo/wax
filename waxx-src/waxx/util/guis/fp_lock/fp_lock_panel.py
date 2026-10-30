@@ -1,12 +1,14 @@
 """FPLockPanel: dashboard panel for the FP peak-separation lock server.
 
-Shows the lock state, the peak separation against its setpoint, the server's warnings (first peak near the sweep start,
-second peak near the sweep end, HOLD, rail, no data, COM), the latest
-readings, and plots of the error, the output and the two peak positions with
-the edge bands shaded.  Controls: lock on / off, reset setpoint (setp = the
-measured separation), clear integrator, a settings dialog (gains, window,
-peak finding), and a console for raw firmware commands.  Every control that
-moves the laser asks first.
+Laid out for a small dock: one header line (lock state, the peak separation
+against its setpoint, the plot picker), the server's warnings (first peak near
+the sweep start, second peak near the sweep end, HOLD, rail, no data, COM), a
+compact grid of the latest readings (names spelled out in tooltips), one row
+of buttons, and one plot showing the separation, the error, the output or the
+two peak positions (edge bands shaded).  Controls: lock on / off, reset
+setpoint (setp = the measured separation), clear integrator, a settings dialog
+(gains, window, peak finding), and a console for raw firmware commands (hidden
+until its button is pressed).  Every control that moves the laser asks first.
 
 Construction never blocks: the client is discovered on a worker thread, polls
 and actions run off the GUI thread (SnapshotPoller, RequestRunner).
@@ -16,6 +18,7 @@ Machine-agnostic: the host passes the server id.
 from __future__ import annotations
 
 import collections
+import html
 import logging
 import math
 import time
@@ -23,12 +26,12 @@ from typing import Any, Callable, Optional
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout,
+    QWidget,
 )
 
 from waxx.util.dashboard.embed_helpers import WidgetPanelBase, auto_cleanup_timers
-from waxx.util.dashboard.widgets import CollapsibleGroupBox
 from waxx.util.guis.fp_lock import fp_lock_protocol as proto
 from waxx.util.guis.qt_upkeep import set_style_if_changed
 from waxx.util.guis.request_runner import RequestRunner
@@ -48,6 +51,14 @@ _PILL = {
     "CONNECTING": ("#888888", "connecting…"),
 }
 _LEVEL_COLOR = {"error": "#b22222", "warn": "#b8860b", "info": "#555555"}
+_VAL_CSS = "font-family: Consolas, monospace; font-size: 11px;"
+_VAL_STYLE = "QLabel { " + _VAL_CSS + " }"
+_BTN_STYLE = "QPushButton { padding: 2px 6px; }"
+# plot views: combo label, the history keys drawn
+_VIEWS = {"sep": ("sep (ms)", ("sep",)),
+          "err": ("err (ms)", ("err",)),
+          "output": ("output (V)", ("feedback", "integ")),
+          "peaks": ("peaks (ms)", ("tfirst", "t2"))}
 
 
 def _ask(parent, title: str, text: str) -> bool:
@@ -195,89 +206,127 @@ class FPLockPanel(WidgetPanelBase):
         self._plots: dict = {}
         self._bands: list = []
 
+        self._view = "sep"
+
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 4, 6, 4)
-        outer.setSpacing(4)
+        outer.setContentsMargins(4, 2, 4, 2)
+        outer.setSpacing(2)
 
         top = QHBoxLayout()
+        top.setSpacing(6)
         self._pill = QLabel(self)
         self._pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         top.addWidget(self._pill, 0)
         self._sep_big = QLabel("sep --", self)
         self._sep_big.setToolTip("peak separation (latest) and its setpoint")
-        self._sep_big.setStyleSheet("QLabel { font-family: Consolas, monospace; font-size: 15px;"
-                                    " font-weight: 700; padding: 0 8px; }")
+        self._sep_big.setStyleSheet("QLabel { font-family: Consolas, monospace; font-size: 13px;"
+                                    " font-weight: 700; }")
         top.addWidget(self._sep_big, 0)
-        self._board = QLabel("", self)
-        self._board.setStyleSheet("QLabel { color: #666; }")
-        top.addWidget(self._board, 1)
+        top.addStretch(1)
+        self._view_box = None
+        if plots:
+            self._view_box = QComboBox(self)
+            for key, (label, _) in _VIEWS.items():
+                self._view_box.addItem(label, key)
+            self._view_box.addItem("no plot", "none")
+            self._view_box.setToolTip("what the plot shows (time axis: s, 0 = now)")
+            self._view_box.currentIndexChanged.connect(
+                lambda _i: self._set_view(self._view_box.currentData()))
+            top.addWidget(self._view_box, 0)
         outer.addLayout(top)
 
         self._warn = QLabel("", self)
         self._warn.setWordWrap(True)
         self._warn.setTextFormat(Qt.TextFormat.RichText)
+        self._warn.setStyleSheet("QLabel { font-size: 11px; }")
         self._warn.hide()
         outer.addWidget(self._warn)
 
+        # sep / setp are in the header; the rail state is a warning
         grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(1)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(0)
         self._vals: dict[str, QLabel] = {}
-        cells = (("sep", "sep"), ("setp", "setp"), ("err", "err"),
-                 ("feedback", "output"), ("integ", "integ"), ("rail", "rail"),
-                 ("tfirst", "1st peak"), ("t2", "2nd peak"), ("period", "period"),
-                 ("h1", "h1"), ("h2", "h2"), ("bad", "bad"),
-                 ("why", "skipped"), ("unlocks", "unlocks"), ("sats", "rail hits"))
-        for i, (key, label) in enumerate(cells):
-            r, c = divmod(i, 3)
+        cells = (("err", "err", "error = sep - setp"),
+                 ("feedback", "out", "lock output"),
+                 ("integ", "int", "integral term"),
+                 ("sats", "rails", "rail hits"),
+                 ("tfirst", "pk1", "1st peak position in the sweep"),
+                 ("t2", "pk2", "2nd peak position in the sweep"),
+                 ("h1", "h1", "1st peak height"),
+                 ("h2", "h2", "2nd peak height"),
+                 ("period", "per", "measured sweep period"),
+                 ("bad", "bad", "bad sweeps in a row"),
+                 ("why", "skip", "skipped sweeps: no peak / one peak / outside window"),
+                 ("unlocks", "unl", "unlocks"))
+        for i, (key, label, tip) in enumerate(cells):
+            r, c = divmod(i, 4)
             name = QLabel(label, self)
-            name.setStyleSheet("QLabel { color: #666; }")
+            name.setStyleSheet("QLabel { color: #666; font-size: 11px; }")
+            name.setToolTip(tip)
             val = QLabel("--", self)
-            val.setStyleSheet("QLabel { font-family: Consolas, monospace; }")
+            val.setStyleSheet(_VAL_STYLE)
+            val.setToolTip(tip)
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(name, r, 2 * c)
             grid.addWidget(val, r, 2 * c + 1)
             self._vals[key] = val
+        for c in range(4):
+            grid.setColumnStretch(2 * c + 1, 1)
         outer.addLayout(grid)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(3)
         self._lock_btn = QPushButton("Lock …", self)
         self._lock_btn.clicked.connect(self._on_lock_clicked)
-        self._reset_btn = QPushButton("Reset setpoint", self)
-        self._reset_btn.setToolTip("setp = the separation the lock measures now")
+        self._reset_btn = QPushButton("Reset setp", self)
+        self._reset_btn.setToolTip("setp = the separation the lock measures now (asks first)")
         self._reset_btn.clicked.connect(self._on_reset_setpoint)
-        self._clear_btn = QPushButton("Clear integrator", self)
-        self._clear_btn.setToolTip("zero the integral and the output (0 V); the state is kept")
+        self._clear_btn = QPushButton("Clear int", self)
+        self._clear_btn.setToolTip("zero the integral and the output (0 V); the state is kept "
+                                   "(asks first)")
         self._clear_btn.clicked.connect(self._on_clear)
         self._settings_btn = QPushButton("Settings…", self)
+        self._settings_btn.setToolTip("gains, window, peak finding")
         self._settings_btn.clicked.connect(self._on_settings)
-        for b in (self._lock_btn, self._reset_btn, self._clear_btn, self._settings_btn):
+        self._console_btn = QPushButton("Console", self)
+        self._console_btn.setCheckable(True)
+        self._console_btn.setToolTip("raw firmware commands")
+        self._console_btn.toggled.connect(self._on_console_toggled)
+        for b in (self._lock_btn, self._reset_btn, self._clear_btn, self._settings_btn,
+                  self._console_btn):
+            b.setStyleSheet(_BTN_STYLE)
             buttons.addWidget(b)
         outer.addLayout(buttons)
 
         self._msg = QLabel("", self)
         self._msg.setWordWrap(True)
-        self._msg.setStyleSheet("QLabel { color: #444; }")
+        self._msg.setStyleSheet("QLabel { color: #444; font-size: 11px; }")
+        self._msg.hide()
         outer.addWidget(self._msg)
 
+        self._plot_box = None
         if plots:
-            self._plot_group = CollapsibleGroupBox("Separation · error · output · peak positions",
-                                                   expanded=True)
-            outer.addWidget(self._plot_group, 1)
+            self._plot_box = QVBoxLayout()
+            self._plot_box.setContentsMargins(0, 0, 0, 0)
+            outer.addLayout(self._plot_box, 1)
             self._init_plots()
 
-        self._console_group = CollapsibleGroupBox("Console (raw firmware commands)", expanded=False)
         self._console = QPlainTextEdit(self)
         self._console.setReadOnly(True)
         self._console.setMaximumBlockCount(500)
-        self._console.setStyleSheet("QPlainTextEdit { font-family: Consolas, monospace; }")
+        self._console.setStyleSheet("QPlainTextEdit { font-family: Consolas, monospace;"
+                                    " font-size: 11px; }")
+        self._console.setMaximumHeight(140)
         self._console_in = QLineEdit(self)
         self._console_in.setPlaceholderText("command, e.g. help or tmin 1.5 (Enter sends)")
         self._console_in.returnPressed.connect(self._on_console_send)
-        self._console_group.addWidget(self._console)
-        self._console_group.addWidget(self._console_in)
-        outer.addWidget(self._console_group)
+        outer.addWidget(self._console)
+        outer.addWidget(self._console_in)
+        self._console.hide()
+        self._console_in.hide()
 
         self._set_controls_enabled(False)
         self._set_pill("CONNECTING")
@@ -338,7 +387,9 @@ class FPLockPanel(WidgetPanelBase):
         else:
             self._set_pill(row.get("state_name") or "CONNECTING")
         label = snap.get("label") or ""
-        self._board.setText(f"{self._title} · {com.get('port', '')}" + (f" · {label}" if label else ""))
+        self._sep_big.setToolTip("peak separation (latest) and its setpoint\n"
+                                 f"{self._title} · {com.get('port', '')}"
+                                 + (f" · {label}" if label else ""))
 
         if warnings:
             html = "<br>".join(
@@ -352,12 +403,9 @@ class FPLockPanel(WidgetPanelBase):
         v = self._vals
         self._sep_big.setText(f"sep {_fmt(row.get('sep'), '.3f', 'ms')}  "
                               f"(setp {_fmt(settings.get('setp'), '.3f')})")
-        v["sep"].setText(_fmt(row.get("sep"), ".3f", "ms"))
-        v["setp"].setText(_fmt(settings.get("setp"), ".3f", "ms"))
         v["err"].setText(_fmt(row.get("err"), "+.3f", "ms"))
         v["feedback"].setText(_fmt(row.get("feedback"), "+.4f", "V"))
         v["integ"].setText(_fmt(row.get("integ"), "+.4f", "V"))
-        v["rail"].setText("AT RAIL" if row.get("saturated") else ("-" if row else "--"))
         v["tfirst"].setText(_fmt(row.get("tfirst"), ".2f", "ms"))
         v["t2"].setText(_fmt(row.get("t2"), ".2f", "ms"))
         v["period"].setText(_fmt(row.get("period"), ".1f", "ms"))
@@ -365,7 +413,7 @@ class FPLockPanel(WidgetPanelBase):
         v["h2"].setText(_fmt(row.get("h2"), ".2f", "V"))
         v["bad"].setText(_fmt(row.get("bad"), "d"))
         if "bad_none" in row:
-            v["why"].setText(f"{row['bad_none']} none / {row['bad_one']} 1pk / {row['bad_win']} win")
+            v["why"].setText(f"{row['bad_none']}/{row['bad_one']}/{row['bad_win']}")
         v["unlocks"].setText(_fmt(row.get("unlocks"), "d"))
         v["sats"].setText(_fmt(row.get("sats"), "d"))
         edge = snap.get("edge") or {}
@@ -373,11 +421,13 @@ class FPLockPanel(WidgetPanelBase):
         self._tint(v["t2"], "second_near_end" in codes)
 
         lock_on = settings.get("lock")
-        self._lock_btn.setText("Lock ON — turn off…" if lock_on == 1 else
-                               ("Lock OFF — turn on" if lock_on == 0 else "Lock …"))
+        self._lock_btn.setText("Lock ON" if lock_on == 1 else
+                               ("Lock OFF" if lock_on == 0 else "Lock …"))
+        self._lock_btn.setToolTip("click to turn the lock off (asks first)" if lock_on == 1 else
+                                  "click to turn the lock on")
         set_style_if_changed(self._lock_btn,
-                             "QPushButton { background-color: #2e8b57; color: white; font-weight: 600; }"
-                             if lock_on == 1 else "")
+                             "QPushButton { padding: 2px 6px; background-color: #2e8b57; color: white;"
+                             " font-weight: 600; }" if lock_on == 1 else _BTN_STYLE)
         self._set_controls_enabled(com.get("status") == "connected")
 
         for row_ in snap.get("_new_rows", []):
@@ -400,76 +450,107 @@ class FPLockPanel(WidgetPanelBase):
         t = np.asarray(self._hist["t"]) - time.time()
         for key, curve in self._plots["curves"].items():
             curve.setData(t, np.asarray(self._hist[key], dtype=float), connect="finite")
-        if isinstance(setp, (int, float)) and math.isfinite(setp):
+        self._setp_ok = isinstance(setp, (int, float)) and math.isfinite(setp)
+        if self._setp_ok:
             self._plots["setp"].setValue(setp)
-            self._plots["setp"].show()
-        else:
-            self._plots["setp"].hide()
+        self._plots["setp"].setVisible(self._setp_ok and self._view == "sep")
         right, margin = edge.get("right_edge_ms"), edge.get("margin_ms")
         if isinstance(right, (int, float)) and isinstance(margin, (int, float)):
             lo, hi = self._bands
             lo.setRegion((0.0, margin))
             hi.setRegion((right - margin, right))
-            self._plots["pos"].setYRange(0, right, padding=0.02)
+            self._right_edge = right
+            if self._view == "peaks":
+                self._plots["plot"].setYRange(0, right, padding=0.02)
 
     def _init_plots(self) -> None:
         try:
             import pyqtgraph as pg  # noqa: PLC0415
         except Exception:
-            self._plot_group.addWidget(QLabel("pyqtgraph not available"))
+            self._plot_box.addWidget(QLabel("pyqtgraph not available"))
             return
         lay = pg.GraphicsLayoutWidget()
         lay.setBackground("w")
-        p_sep = lay.addPlot(row=0, col=0)
-        p_err = lay.addPlot(row=1, col=0)
-        p_out = lay.addPlot(row=2, col=0)
-        p_pos = lay.addPlot(row=3, col=0)
-        for p, label in ((p_sep, "sep (ms)"), (p_err, "err (ms)"), (p_out, "output (V)"),
-                         (p_pos, "peak (ms)")):
-            p.showGrid(x=True, y=True, alpha=0.3)
-            p.setLabel("left", label)
-            p.getAxis("left").setWidth(48)
-        p_err.setXLink(p_sep)
-        p_out.setXLink(p_sep)
-        p_pos.setXLink(p_sep)
-        p_sep.addLegend(offset=(5, 5))
-        p_pos.setLabel("bottom", "time (s, 0 = now)")
-        p_out.addLegend(offset=(5, 5))
-        p_pos.addLegend(offset=(5, 5))
+        lay.setMinimumHeight(80)
+        lay.ci.setContentsMargins(0, 2, 2, 0)
+        lay.setToolTip("time axis: s, 0 = now")
+        plot = lay.addPlot(row=0, col=0)
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.getAxis("left").setWidth(40)
+        plot.getAxis("bottom").setHeight(18)
+        font = self.font()
+        font.setPointSize(7)
+        for ax in ("left", "bottom"):
+            try:
+                plot.getAxis(ax).setTickFont(font)
+            except AttributeError:                  # older pyqtgraph
+                pass
+        legend = plot.addLegend(offset=(2, 2), labelTextSize="7pt", verSpacing=-6)
         curves = {
-            "sep": p_sep.plot(pen=pg.mkPen("#000000", width=1.2), name="sep"),
-            "err": p_err.plot(pen=pg.mkPen("#1f77b4", width=1.2)),
-            "feedback": p_out.plot(pen=pg.mkPen("#d62728", width=1.2), name="output"),
-            "integ": p_out.plot(pen=pg.mkPen("#ff9896", width=1.0, style=Qt.PenStyle.DashLine),
-                                name="integ"),
-            "tfirst": p_pos.plot(pen=pg.mkPen("#2ca02c", width=1.2), name="1st"),
-            "t2": p_pos.plot(pen=pg.mkPen("#9467bd", width=1.2), name="2nd"),
+            "sep": plot.plot(pen=pg.mkPen("#000000", width=1.2)),
+            "err": plot.plot(pen=pg.mkPen("#1f77b4", width=1.2)),
+            "feedback": plot.plot(pen=pg.mkPen("#d62728", width=1.2)),
+            "integ": plot.plot(pen=pg.mkPen("#ff9896", width=1.0, style=Qt.PenStyle.DashLine)),
+            "tfirst": plot.plot(pen=pg.mkPen("#2ca02c", width=1.2)),
+            "t2": plot.plot(pen=pg.mkPen("#9467bd", width=1.2)),
         }
         for _ in range(2):
             band = pg.LinearRegionItem(values=(0, 0), orientation="horizontal", movable=False,
                                        brush=pg.mkBrush(178, 34, 34, 40), pen=pg.mkPen(None))
-            p_pos.addItem(band)
+            plot.addItem(band)
             self._bands.append(band)
         setp_line = pg.InfiniteLine(angle=0, movable=False,
                                     pen=pg.mkPen("#d62728", width=1.0, style=Qt.PenStyle.DashLine),
                                     label="setp", labelOpts={"position": 0.03, "color": "#d62728"})
-        p_sep.addItem(setp_line)
+        plot.addItem(setp_line)
         setp_line.hide()
-        self._plots = {"layout": lay, "curves": curves, "pos": p_pos, "sep": p_sep,
+        self._plots = {"layout": lay, "curves": curves, "plot": plot, "legend": legend,
                        "setp": setp_line}
-        self._plot_group.addWidget(lay)
+        self._setp_ok = False
+        self._right_edge = None
+        self._plot_box.addWidget(lay)
+        self._set_view(self._view)
+
+    _LEGEND_NAMES = {"feedback": "output", "integ": "integ", "tfirst": "1st", "t2": "2nd"}
+
+    def _set_view(self, view: str) -> None:
+        """Show one view (``_VIEWS``) in the plot, or hide the plot (``"none"``)."""
+        self._view = view
+        if not self._plots:
+            return
+        keys = _VIEWS.get(view, ("", ()))[1]
+        legend = self._plots["legend"]
+        legend.clear()
+        for key, curve in self._plots["curves"].items():
+            curve.setVisible(key in keys)
+            if key in keys and len(keys) > 1:
+                legend.addItem(curve, self._LEGEND_NAMES.get(key, key))
+        for band in self._bands:
+            band.setVisible(view == "peaks")
+        self._plots["setp"].setVisible(view == "sep" and self._setp_ok)
+        plot = self._plots["plot"]
+        if view == "peaks" and self._right_edge is not None:
+            plot.setYRange(0, self._right_edge, padding=0.02)
+        else:
+            plot.enableAutoRange(axis="y")
+        self._plots["layout"].setVisible(view != "none")
 
     def _set_pill(self, key: str, detail: str = "") -> None:
+        # the pill stays short (a long detail would widen the dock); the detail
+        # goes on the warnings line, which the next snapshot rewrites
         color, text = _PILL.get(key, ("#888888", key))
-        self._pill.setText(text + (f" — {detail}" if detail else ""))
-        self._pill.setToolTip(self._pill.text())
+        self._pill.setText(text)
+        self._pill.setToolTip(text + (f" — {detail}" if detail else ""))
+        if detail:
+            self._warn.setText(f"<span style='color:{color}'>⚠ {text}: {html.escape(detail)}</span>")
+            self._warn.show()
         set_style_if_changed(self._pill, f"QLabel {{ background-color: {color}; color: white;"
-                                         " font-size: 15px; font-weight: 700; padding: 4px 12px;"
+                                         " font-size: 13px; font-weight: 700; padding: 1px 8px;"
                                          " border-radius: 4px; }")
 
     @staticmethod
     def _tint(label: QLabel, on: bool) -> None:
-        set_style_if_changed(label, "QLabel { font-family: Consolas, monospace;"
+        set_style_if_changed(label, "QLabel { " + _VAL_CSS
                                     + (" color: #b8860b; font-weight: 700;" if on else "") + " }")
 
     def _set_controls_enabled(self, on: bool) -> None:
@@ -479,7 +560,13 @@ class FPLockPanel(WidgetPanelBase):
 
     def _say(self, text: str, error: bool = False) -> None:
         self._msg.setText(text)
-        set_style_if_changed(self._msg, "QLabel { color: %s; }" % ("#b22222" if error else "#444"))
+        self._msg.setVisible(bool(text))
+        set_style_if_changed(self._msg, "QLabel { color: %s; font-size: 11px; }"
+                             % ("#b22222" if error else "#444"))
+
+    def _on_console_toggled(self, on: bool) -> None:
+        self._console.setVisible(on)
+        self._console_in.setVisible(on)
 
     # ------------------------------------------------------------------ #
     # Actions (worker thread; reply on the GUI thread)

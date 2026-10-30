@@ -1,5 +1,5 @@
-"""Dashboard: a panel header dragged out of the dock area pops the panel out
-(own window, as the pop-out button does); a drop on a dock spot re-docks it.
+"""Dashboard: a header drag only rearranges the dock - it never floats a panel
+or pops it out; the pop-out button alone moves a panel into its own window.
 Offscreen Qt; QSettings is redirected to an INI file in tmp_path (never the registry)."""
 import os
 import time
@@ -7,7 +7,7 @@ import time
 import pytest
 from PyQt6.QtCore import QPoint, QSettings, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication, QDockWidget, QLabel
 
 from waxx.util.dashboard import dashboard_window as dw
 from waxx.util.dashboard.panel_container import ClientPanel
@@ -63,32 +63,33 @@ def _drag_header(qapp, panel, offset: QPoint):
     for i in range(1, 11):
         QTest.mouseMove(panel, hdr.mapTo(panel, start) + offset * i / 10)
         qapp.processEvents()
-    assert panel.isFloating(), "Qt did not start a dock drag"
     QTest.mouseRelease(panel, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                        panel.mapFromGlobal(panel.mapToGlobal(QPoint(0, 0))))
     qapp.processEvents()
 
 
-def test_drag_out_pops_out(qapp, win):
+def test_panels_are_not_floatable(qapp, win):
+    for panel in win._panels:
+        assert not panel.features() & QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        assert panel.features() & QDockWidget.DockWidgetFeature.DockWidgetMovable
+
+
+def test_drag_out_of_dock_area_does_not_pop_out(qapp, win):
     panel = win._by_id["alpha"]
     _drag_header(qapp, panel, QPoint(-700, 300))
+    _pump(qapp, lambda: not panel.isFloating())
+    assert not panel.is_popped_out()
+    assert not panel.isFloating() and panel.isVisible()   # re-docked, not stranded
+    assert not win._popped
+
+
+def test_popout_button_pops_out(qapp, win):
+    panel = win._by_id["alpha"]
+    panel.header()._popout_btn.click()
     _pump(qapp, lambda: panel.is_popped_out())
-    assert panel.is_popped_out()
-    assert not panel.isFloating()
-    pw = win._popped["alpha"]
-    assert pw.isVisible()
-    # Back into the dashboard by the header glyph, as for a button pop-out.
+    assert panel.is_popped_out() and win._popped["alpha"].isVisible()
     win.return_panel(panel)
     assert not panel.is_popped_out() and not panel.isFloating() and panel.isVisible()
-
-
-def test_programmatic_float_is_left_to_restore(qapp, win):
-    """No button held: not a drag, so it is not turned into a pop-out."""
-    panel = win._by_id["beta"]
-    panel.setFloating(True)
-    _pump(qapp, rounds=10)
-    assert not panel.is_popped_out()
-    panel.setFloating(False)
 
 
 def test_double_click_does_not_float(qapp, win):
