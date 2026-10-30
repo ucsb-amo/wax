@@ -45,13 +45,13 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 
 import serial
 import serial.tools.list_ports
 
 from beacon.discovery.server import NetServer
 from waxx.util.comms_server.com_link import ComLink, ComLinkRefused
+from waxx.util.dashboard import logging_setup
 
 DEFAULT_SERIAL_PORT = "COM33"
 DEFAULT_BAUD = 9600
@@ -93,8 +93,13 @@ _LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def _configure_logging(log_path: str | None = None) -> None:
-    """Attach a StreamHandler and (optionally) a RotatingFileHandler to the
-    root logger.  Safe to call multiple times — handlers are only added once."""
+    """Attach a StreamHandler and (optionally) a rotating log file to the root
+    logger.  Safe to call multiple times — handlers are only added once.
+
+    The file usually lives on the data share, so it goes through logging_setup:
+    written on a background thread (the read loop must not wait on the share),
+    and a handle killed by an SMB reconnect moves to a local file and the share
+    is retried."""
     root = logging.getLogger()
     if root.handlers:
         return  # already configured (e.g. called by a parent process)
@@ -111,15 +116,7 @@ def _configure_logging(log_path: str | None = None) -> None:
     if log_path:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
-            fh = RotatingFileHandler(
-                log_path,
-                maxBytes=5 * 1024 * 1024,  # 5 MB per file
-                backupCount=5,
-                encoding="utf-8",
-            )
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(fmt)
-            root.addHandler(fh)
+            logging_setup.install_file_logging(log_path, level=logging.DEBUG)
             logger.info("Logging to file: %s", log_path)
         except Exception as exc:
             logger.warning("Could not open log file %r: %s", log_path, exc)

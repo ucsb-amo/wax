@@ -7,11 +7,15 @@ a long stretch (one stuck episode, many resets), then changing counts.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import logging.handlers
+import time
 import types
 
 import pytest
 
+from waxx.util.dashboard import logging_setup
 from waxx.util.guis.HMR_magnetometer import hmr_magnetometer_server as srv_mod
 
 STUCK_READS = 21 * 1000         # ~2500 fake s stuck: several summary intervals
@@ -171,19 +175,83 @@ def test_a_sensor_that_moves_a_little_after_each_reset_stays_one_episode(server,
     assert len(msgs) < 30, msgs[:30]
 
 
-def test_dashboard_stream_handler_is_info(monkeypatch, tmp_path):
+@contextlib.contextmanager
+def _empty_root_logger(monkeypatch, tmp_path):
+    """An empty root logger, with logging_setup's process-wide hooks kept out.
+    Entered in the test body: pytest adds its capture handlers after fixtures."""
+    monkeypatch.setattr(logging_setup.faulthandler, "enable", lambda **kw: None)
+    monkeypatch.setattr(logging_setup, "install_excepthooks", lambda: None)
+    monkeypatch.setattr(logging_setup, "install_qt_message_handler", lambda: False)
+    monkeypatch.setattr(logging_setup, "_FAULTHANDLER_FILE", logging_setup._FAULTHANDLER_FILE)
+    monkeypatch.setattr(logging_setup, "_FILE_WRITERS", {})
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     root = logging.getLogger()
     saved = list(root.handlers), root.level
     root.handlers[:] = []
     try:
-        srv_mod._configure_logging(str(tmp_path / "lrs_server.log"))
-        streams = [h for h in root.handlers
-                   if type(h) is logging.StreamHandler]
-        files = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
-        assert streams and all(h.level == logging.INFO for h in streams)
-        assert files and all(h.level == logging.DEBUG for h in files)
+        yield root
     finally:
+        _stop_writers()
         for h in root.handlers:
             h.close()
         root.handlers[:] = saved[0]
         root.setLevel(saved[1])
+
+
+def _stop_writers():
+    """Drain the log queue; idempotent."""
+    for writer in logging_setup._FILE_WRITERS.values():
+        if writer._thread is not None:
+            writer.stop()
+        for h in writer.handlers:
+            h.close()
+
+
+def test_dashboard_stream_handler_is_info(monkeypatch, tmp_path):
+    log_path = tmp_path / "lrs_server.log"
+    with _empty_root_logger(monkeypatch, tmp_path) as root:
+        srv_mod._configure_logging(str(log_path))
+        streams = [h for h in root.handlers
+                   if type(h) is logging.StreamHandler]
+        queues = [h for h in root.handlers
+                  if isinstance(h, logging.handlers.QueueHandler)]
+        assert streams and all(h.level == logging.INFO for h in streams)
+        assert queues and all(h.level == logging.DEBUG for h in queues)
+
+        logging.getLogger("unit.test").debug("detail for the file only")
+        _stop_writers()
+        assert "detail for the file only" in log_path.read_text(encoding="utf-8")
+
+
+class _DeadStream:
+    """What an SMB reconnect leaves in the handler: every call is Errno 22."""
+    closed = False
+
+    def tell(self):
+        raise OSError(22, "Invalid argument")
+
+    write = flush = close = tell
+
+
+def test_dead_log_handle_moves_to_local_file(monkeypatch, tmp_path, capfd):
+    """2026-10-30: the plain rotating handler printed a "--- Logging error ---"
+    traceback to the dashboard for every record, for 17 hours."""
+    log_path = tmp_path / "lrs_server.log"
+    with _empty_root_logger(monkeypatch, tmp_path):
+        srv_mod._configure_logging(str(log_path))
+        log = logging.getLogger("unit.test")
+        log.info("before")
+        writer = next(iter(logging_setup._FILE_WRITERS.values()))
+        handler = writer.handlers[0]
+        deadline = time.monotonic() + 5.0
+        while handler.stream is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        handler.stream.close()
+        handler.stream = _DeadStream()
+        log.info("after the handle died")
+        _stop_writers()
+
+        fallback = logging_setup._local_fallback_root() / "server" / log_path.name
+        assert "after the handle died" in fallback.read_text(encoding="utf-8")
+        assert "--- Logging error ---" not in capfd.readouterr().err

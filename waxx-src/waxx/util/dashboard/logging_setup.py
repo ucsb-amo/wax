@@ -33,6 +33,7 @@ Public API:
 * :func:`configure`              - one-time app config (log root + app name).
 * :func:`configure_server_logging` - call at top of every ``*_server.py`` ``main()``.
 * :func:`configure_client_logging` - call at top of every dashboard / GUI ``main()``.
+* :func:`install_file_logging`   - the same file handling for a server that names its own log file.
 * :func:`attach_panel_logger`    - returns a child logger tagged with the panel id.
 * :func:`active_log_dir`         - returns the directory the helper is currently writing to.
 * :func:`pop_boot_warnings`      - returns and clears any startup warnings.
@@ -551,6 +552,14 @@ def configure_server_logging(server_id: str, level: int = logging.INFO) -> Path:
     return log_path
 
 
+def install_file_logging(log_path, level: int = logging.INFO) -> None:
+    """Send the root logger to *log_path*, for a server that names its own log
+    file: the same background writer, rotation and local fallback as
+    :func:`configure_server_logging`."""
+    path = Path(log_path)
+    _install_handlers(path, _local_fallback_root() / "server" / path.name, level=level)
+
+
 def configure_client_logging(level: int = logging.INFO) -> Path:
     """Configure logging for a dashboard / GUI process.
 
@@ -611,6 +620,7 @@ __all__ = [
     "configure",
     "configure_server_logging",
     "configure_client_logging",
+    "install_file_logging",
     "attach_panel_logger",
     "server_child_logger",
     "active_log_dir",
