@@ -26,6 +26,7 @@ import time
 from typing import Optional
 
 from waxx.control.misc.bristol_wavemeter import BristolWavemeter, _C_LIGHT
+from waxx.util.daily_csv import DailyCsvLog
 from beacon.discovery.server import NetServer
 
 LOGGER = logging.getLogger("bristol_wavemeter_server")
@@ -35,6 +36,12 @@ SERVER_ID = "bristol_wavemeter"
 
 # Readings kept for GET_AVERAGE (one per poll, ~0.1-0.2 s apart).
 HISTORY_LEN = 1000
+
+# Daily CSV history: one row per LOG_INTERVAL_S, the mean of the polls in that
+# window. ~42 B/row at 1 row/s = ~3.6 MB/day = ~0.66 GB in 6 months.
+LOG_INTERVAL_S = 1.0
+LOG_HEADER = ("unix_s", "frequency_thz", "std_hz", "n")
+LOG_FLUSH_S = 10.0
 
 
 class BristolWavemeterServer(NetServer):
@@ -46,8 +53,16 @@ class BristolWavemeterServer(NetServer):
         host: str = "0.0.0.0",
         port: int = 0,
         poll_interval_s: float = 0.1,
+        log_dir: Optional[str] = None,
+        log_interval_s: float = LOG_INTERVAL_S,
     ):
         NetServer.__init__(self, SERVER_ID, port)
+        self.log_interval_s = float(log_interval_s)
+        self._csv: Optional[DailyCsvLog] = (
+            DailyCsvLog(log_dir, LOG_HEADER, name="bristol-csv", logger=LOGGER)
+            if log_dir else None)
+        # (timestamp, frequency_hz) polls of the current log window; poll thread only.
+        self._log_window: list = []
         self.wavemeter_host = wavemeter_host
         self.host = host
         self.poll_interval_s = float(poll_interval_s)
@@ -151,6 +166,11 @@ class BristolWavemeterServer(NetServer):
         self._accept_thread.start()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True, name="BristolPoll")
         self._poll_thread.start()
+        if self._csv is not None:
+            self._csv.start(LOG_FLUSH_S)
+            LOGGER.info("History log: one row per %g s to %s", self.log_interval_s, self._csv.directory)
+        else:
+            LOGGER.warning("No log directory: wavemeter history is NOT being logged")
         LOGGER.info("Server started on port %d, polling %s", self._waxx_port, self.wavemeter_host)
 
     def stop(self) -> None:
@@ -165,6 +185,8 @@ class BristolWavemeterServer(NetServer):
             except OSError:
                 pass
         self._disconnect_wavemeter()
+        if self._csv is not None:
+            self._csv.stop()
         LOGGER.info("Server stopped")
 
     # ------------------------------------------------------------------
@@ -203,6 +225,7 @@ class BristolWavemeterServer(NetServer):
             self._wavemeter = None
             self._reading["connected"] = False
             self._history.clear()
+        self._log_window.clear()
         if wm is not None:
             try:
                 wm._dev.close()
@@ -236,6 +259,7 @@ class BristolWavemeterServer(NetServer):
                         self._reading["connected"] = True
                         self._error = None
                         self._history.append((t_now, freq_hz))
+                    self._log_poll(t_now, freq_hz)
                     self._consecutive_poll_failures = 0
                 except Exception as exc:
                     self._consecutive_poll_failures += 1
@@ -270,6 +294,28 @@ class BristolWavemeterServer(NetServer):
                 time.sleep(backoff)
                 self._connect_wavemeter()
             time.sleep(self.poll_interval_s)
+
+    def _log_poll(self, t: float, freq_hz: float) -> None:
+        """Collect polls; once a window spans ``log_interval_s`` queue one row.
+
+        The row is the mean time and mean frequency of the window's polls, the
+        sample std (Hz) and the poll count ``n``. A window cut short by a
+        disconnect is dropped (``_disconnect_wavemeter`` clears it): no row is
+        written for an outage, so a gap in the file means no readings.
+        """
+        if self._csv is None:
+            return
+        win = self._log_window
+        win.append((t, freq_hz))
+        if t - win[0][0] < self.log_interval_s:
+            return
+        f_ref = win[0][1]   # offsets keep full precision (values ~4e14 Hz, spread MHz)
+        offsets = [f - f_ref for _, f in win]
+        mean_f = f_ref + statistics.fmean(offsets)
+        std = statistics.stdev(offsets) if len(offsets) > 1 else 0.
+        t_mean = statistics.fmean(ti for ti, _ in win)
+        self._csv.add(t_mean, (f"{t_mean:.3f}", f"{mean_f / 1e12:.9f}", f"{std:.0f}", len(win)))
+        win.clear()
 
     def _accept_loop(self) -> None:
         while self.running:
@@ -314,9 +360,9 @@ class BristolWavemeterServer(NetServer):
                 pass
 
 
-def main(wavemeter_host: str = "192.168.1.105") -> None:
+def main(wavemeter_host: str = "192.168.1.105", log_dir: Optional[str] = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
-    server = BristolWavemeterServer(wavemeter_host=wavemeter_host)
+    server = BristolWavemeterServer(wavemeter_host=wavemeter_host, log_dir=log_dir)
     atexit.register(server.stop)
 
     def _sigterm(signum, frame):
