@@ -1,6 +1,6 @@
 """Monitor panel changes of 2026-10-21 (user): warm start a stored setting
 (default on) with a toggle on the panel; no SLM / tweezer AWG display; the run
-loops under a "Sequences" dropdown; a Start liveOD button.
+loops under a dropdown ("Loops" since 2026-10-31); a Start liveOD button.
 
 Offscreen Qt.  No socket is opened by the panel tests (socket.socket fails the
 test); the run queue is built on a temporary folder with fakes and never
@@ -251,7 +251,7 @@ def test_both_loops_are_under_the_sequences_dropdown_collapsed_at_start(panel, q
     panel.set_state(dict(STATUS))
     panel.show()
     qapp.processEvents()
-    assert panel.sequences_toggle.text() == "Sequences"
+    assert panel.sequences_toggle.text() == "Loops"
     assert not panel.sequences_expanded and not panel.sequences_area.isVisible()
     cards = panel.sequences.loop_cards
     assert set(cards) == {"auto_tof", "expt_loop"}
@@ -259,7 +259,7 @@ def test_both_loops_are_under_the_sequences_dropdown_collapsed_at_start(panel, q
         assert panel.sequences_area.isAncestorOf(card)
         assert not panel.details.isAncestorOf(card) and not panel.bar.isAncestorOf(card)
     # the summary beside the toggle: the one active loop, both in its tooltip
-    assert panel.sequences_chip.text() == "BEC TOF loop: running · yields"
+    assert panel.sequences_chip.text() == "BEC TOF loop running"
     tip = panel.sequences_chip.toolTip()
     assert "BEC TOF loop: running · yields" in tip and "Experiment loop: idle" in tip
     panel.sequences_toggle.click()
@@ -287,7 +287,7 @@ def test_sequences_controls_send_as_before(server):
         p.set_state(dict(STATUS, run_loops=two))
         assert p.sequences_chip.text() == "2 active"
         p.set_state(dict(STATUS, run_loops={"auto_tof": dict(TOF, state="failed")}))
-        assert p.sequences_chip.text() == "BEC TOF loop: failed"
+        assert p.sequences_chip.text() == "BEC TOF loop failed"
     finally:
         p.shutdown()
 
@@ -360,6 +360,19 @@ class Clock:
 
 def test_no_button_without_a_launcher(panel):
     assert panel.live_od_button is None
+
+
+def test_the_button_shows_only_when_it_can_start_one(server):
+    probe = Probe("running")
+    p = make_panel(server, live_od_bat="C:/k/live_od.bat", live_od_start=Starter(),
+                   live_od_probe=probe)
+    try:
+        assert p.live_od_button.isHidden()
+        probe.state = "absent"
+        p.live_od_button.refresh()
+        assert not p.live_od_button.isHidden()
+    finally:
+        p.shutdown()
 
 
 def test_the_button_is_off_while_live_od_beacons(server):

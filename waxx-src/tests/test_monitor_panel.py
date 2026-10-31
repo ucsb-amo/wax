@@ -126,7 +126,7 @@ def test_no_discovery_until_the_first_request(qapp, factory):
     # one page: the state bar over the queue, no tabs
     assert p.isAncestorOf(p.state_panel) and p.isAncestorOf(p.queue_panel)
     assert not hasattr(p, "tabs")
-    assert p.monitor_control.button is p.state_panel.monitor_pill
+    assert p.monitor_control.button is p.state_panel.monitor_button
     p.cleanup()
     p.cleanup()                                                  # twice is harmless
 
@@ -137,8 +137,8 @@ def test_show_polls_lists_listens_and_feeds_the_parts(panel, factory, qapp):
     client = factory.made[0]
     assert panel.listeners and panel.listeners[0].started
     assert panel.queue_panel.reachable and panel.queue_panel.queue_state() == "idle"
-    assert panel.state_panel.monitor_pill.text() == "NOT READY"
-    assert panel.monitor_control.button.text() == "NOT READY"
+    assert panel.state_panel.headline.text() == "Live control off"
+    assert panel.monitor_control.button.text() == "Start live control"
     sent = [obj for obj, _ in client.requests]
     assert {"type": "run_queue", "action": "list", "limit": 200} in sent
     # a broadcast from the listener reaches the bar and the queue
@@ -147,7 +147,7 @@ def test_show_polls_lists_listens_and_feeds_the_parts(panel, factory, qapp):
     assert panel.queue_panel.hold_button.text() == "Release hold"
     panel.listeners[0].state_received.emit({"type": "trust", "trust": {"trusted": False,
                                                                        "reason": "r"}})
-    assert "UNTRUSTED" in panel.state_panel.trust_banner.text()
+    assert "may not match" in panel.state_panel.trust_banner.text()
     panel.hide()
 
 
@@ -190,7 +190,8 @@ def test_the_monitor_button(panel, factory):
     assert client.texts == [("reset", 1)] and panel.confirms == []
     client.status = dict(STATUS, state=0, state_name="READY", sub_state="running")
     panel.poll_status(force=True)
-    assert panel.monitor_control.button.text() == "READY"
+    assert panel.monitor_control.button.text() == "Restart live control"
+    assert panel.state_panel.headline.text() == "Live control ready"
     panel.confirm = lambda title, text: False
     assert not panel.monitor_control.clicked()                        # READY: asks; declined
     assert len(client.texts) == 1

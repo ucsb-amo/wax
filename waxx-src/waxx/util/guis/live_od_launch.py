@@ -13,8 +13,8 @@ no liveOD is running.
   never blocks): "running" (a beacon heard within :data:`BEACON_FRESH_S`),
   "absent" (none, after the registry has listened :data:`LISTEN_FIRST_S`) or
   "unknown" (not listened long enough to tell).
-* :class:`LiveODButton` -- "Start liveOD": enabled only when the probe says
-  "absent", the host's ``refusal()`` says nothing, and no launch from this
+* :class:`LiveODButton` -- "Start liveOD": shown and enabled only when the probe
+  says "absent", the host's ``refusal()`` says nothing, and no launch from this
   button is younger than :data:`LAUNCH_GUARD_S` without a beacon since (the
   double-click guard).  A press calls ``start(bat)`` once and hands the record
   (who, where, which file, pid or error) to ``record`` -- the host journals it.
@@ -144,7 +144,8 @@ class LiveODButton(QPushButton):
     # -- state ---------------------------------------------------------------------------
 
     def _tick(self) -> None:
-        if self.isVisible():
+        parent = self.parentWidget()                  # it hides itself: look at its host
+        if parent is not None and parent.isVisible():
             self.refresh()
 
     def assess(self) -> tuple[bool, str]:
@@ -182,6 +183,8 @@ class LiveODButton(QPushButton):
         ok, why = self.assess()
         self.why = why
         self.setEnabled(ok)
+        if self.parentWidget() is not None:           # never a window of its own
+            self.setVisible(ok)
         self.setStyleSheet(_css(ok))
         head = (f"Start liveOD: runs {self.bat} in a console of its own, as a double-click "
                 "would." if ok else "Start liveOD is off:")

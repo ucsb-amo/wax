@@ -17,12 +17,10 @@ MonitorClient-backed callable.
 
 What it shows:
 
-* a top strip: the queue's state pill (idle / running / launching / waiting /
-  paused / held), its text and counts; the alarm banner while ``alarm`` is set
-  (which job, why, how long); the person hold (since, by, owner, source,
-  reason) with Hold / Release; the pause of agent jobs and of all jobs with
-  Pause / Resume; the note that the queue will start a run loop it stopped
-  (``resume_loop``);
+* a top strip: what the queue is doing and how many jobs wait (the other
+  counts in the tooltip); the alarm banner while ``alarm`` is set (which job,
+  why, how long); the person hold (since, by, owner, source, reason) with
+  Hold / Release; the pause of agent jobs and of all jobs behind Pause;
 * the jobs, one row each, in the server's order (phase 1b: ended, the slot,
   then the queued jobs by ``position``; before it: the list's order):
   place (the server's 0-based ``position`` shown from 1; "slot" for the job
@@ -36,22 +34,22 @@ What it shows:
   fields for a server that does not send it), and when / by whom it was
   submitted.  Fields a server does not send are blank.
 
-Layout: one toolbar (the state pill and text, the counts, the filter -- a
+Layout: one toolbar (what the queue is doing, how many wait, the filter -- a
 dropdown: All; Last N, the default: the last N ended jobs (N from the spin
 box beside it, default :data:`DEFAULT_LAST_N`) and every job not ended;
-Pending, without the ended jobs --, Hold / Release, Pause / Resume agent and
-all jobs); banners only while there is something to say (the alarm, the person
-hold, a pause, the loop the queue stopped); the table (rows tinted: saved
-green, failed red, the job in the slot blue and bold, an ended run that had no
-file -- ``save_data=False``, done / aborted / cancelled; a failed one stays
-red -- gray; less-used columns hidden until the header's right-click menu
-shows them; a column moves by dragging its header); a message line.  The
-header's menu also holds Save as default columns, Default columns, Follow new
-jobs and Refresh list.  With Follow on (the default) the table scrolls to its
-bottom when a list brings a job the previous list did not have (a newly queued
-job).  Given a ``settings`` (a QSettings), the panel remembers the columns'
-order, widths and shown set, a saved default, the filter, N and Follow, on
-every change (:func:`panel_settings`).
+Pending, without the ended jobs --, Hold / Release, Pause with agent and all
+jobs on its menu); banners only while there is something to say (the alarm,
+the person hold, a pause); the table (rows tinted: saved green, failed red,
+the job in the slot blue and bold, an ended run that had no file --
+``save_data=False``, done / aborted / cancelled; a failed one stays red --
+gray; less-used columns hidden until the header's right-click menu shows
+them; a column moves by dragging its header); a message line, only while
+there is a message.  The header's menu also holds Save as default columns,
+Default columns, Follow new jobs and Refresh list.  With Follow on (the
+default) the table scrolls to its bottom when a list brings a job the previous
+list did not have (a newly queued job).  Given a ``settings`` (a QSettings),
+the panel remembers the columns' order, widths and shown set, a saved default,
+the filter, N and Follow, on every change (:func:`panel_settings`).
 
 A job's actions are on its right-click menu (:meth:`RunQueuePanel.job_menu`;
 what each allows: :meth:`RunQueuePanel.action_state`).  With several rows
@@ -123,6 +121,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
     QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QTableView, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from waxx.util.dashboard import theme
@@ -161,9 +160,6 @@ ERR_TEXT = "#ff6b6b"
 
 _PILL_BG = {"on": theme.OK, "off": "#4d4d4d", "partial": "#8a6a12", "warn": "#8a6a12",
             "hazard": "#c62828", "unknown": "#454545"}
-#: queue state -> pill level
-_QUEUE_LEVEL = {"idle": "off", "running": "on", "launching": "partial", "waiting": "partial",
-                "paused": "warn", "held": "warn"}
 #: job state -> text colour of its state cell
 _STATE_COLOR = {"queued": theme.FG, "launching": WARN_TEXT, "running": OK_TEXT,
                 "ending": WARN_TEXT, "saved": OK_TEXT, "done": OK_TEXT, "failed": ERR_TEXT,
@@ -212,19 +208,6 @@ def _dur(seconds) -> str:
         return f"{s / 60:.1f} min"
     h, rest = divmod(int(round(s)), 3600)
     return f"{h} h {rest // 60:02d} min"
-
-
-def _pill_css(level: str) -> str:
-    bg = _PILL_BG.get(level, "#454545")
-    return (f"QLabel {{ background: {bg}; color: white; border-radius: 9px;"
-            f" padding: 2px 10px; font-size: 12px; font-weight: 600; }}")
-
-
-def chip_css(level: str) -> str:
-    """A small pill for a one-line status bar."""
-    bg = _PILL_BG.get(level, "#454545")
-    return (f"QLabel {{ background: {bg}; color: white; border-radius: 8px;"
-            f" padding: 1px 8px; font-size: 11px; font-weight: 600; }}")
 
 
 def _banner_css(bg: str, fg: str = "white") -> str:
@@ -606,6 +589,8 @@ DEFAULT_HIDDEN = ("id", "owner", "expt_class", "path", "priority", "due", "after
 DEFAULT_WIDTHS = {"position": 40, "id": 44, "state": 100, "owner": 120, "label": 160,
                   "expt_class": 110, "file": 220, "path": 320, "run_id": 60, "priority": 50,
                   "due": 60, "after": 100, "est": 150, "source_changed": 64, "waiting": 200}
+#: Job states the counts' tooltip lists, in this order.
+COUNTED = ("queued", "launching", "running", "ending", "failed", "aborted", "saved", "done")
 #: The table's filters: every listed job; the last N ended ones and every one
 #: not ended; only those not ended.
 FILTERS = ("all", "last", "pending")
@@ -1291,11 +1276,9 @@ class RunQueuePanel(QWidget):
         box.setContentsMargins(0, 4, 0, 0)
         box.setSpacing(4)
 
-        # the toolbar: the queue's state, the filter, hold / pause
+        # the toolbar: what the queue is doing, the filter, hold / pause
         top = QHBoxLayout()
         top.setSpacing(6)
-        self.pill = QLabel("?")
-        top.addWidget(self.pill)
         self.summary = QLabel("")
         self.summary.setStyleSheet(f"color: {theme.FG}; font-size: 12px;")
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1325,12 +1308,20 @@ class RunQueuePanel(QWidget):
         self.hold_button = _button("Hold...")
         self.hold_button.clicked.connect(lambda _=False: self.toggle_hold())
         top.addWidget(self.hold_button)
+        # Pause: agent jobs and all jobs, on one button's menu
+        self.pause_button = _button("Pause")
+        pause_menu = QMenu(self.pause_button)
         self.pause_buttons: dict[str, QPushButton] = {}
         for scope in ("agent", "all"):
             button = _button("")
-            button.clicked.connect(lambda _=False, s=scope: self.toggle_pause(s))
+            button.clicked.connect(lambda _=False, s=scope, m=pause_menu:
+                                   (m.close(), self.toggle_pause(s)))
+            action = QWidgetAction(pause_menu)
+            action.setDefaultWidget(button)
+            pause_menu.addAction(action)
             self.pause_buttons[scope] = button
-            top.addWidget(button)
+        self.pause_button.setMenu(pause_menu)
+        top.addWidget(self.pause_button)
         box.addLayout(top)
 
         # on the header's menu (see header_menu)
@@ -1357,9 +1348,6 @@ class RunQueuePanel(QWidget):
             label.hide()
             self.pause_labels[scope] = label
             box.addWidget(label)
-        self.loop_note = _small("")
-        self.loop_note.hide()
-        box.addWidget(self.loop_note)
 
         # the jobs
         self.model = JobTableModel(self)
@@ -1417,6 +1405,7 @@ class RunQueuePanel(QWidget):
 
         self.message = _small("")
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.message.hide()
         box.addWidget(self.message)
 
         self._list_timer = QTimer(self)
@@ -1640,31 +1629,24 @@ class RunQueuePanel(QWidget):
 
     def _show_summary(self) -> None:
         if not self.reachable:
-            self.pill.setText("?")
-            set_style_if_changed(self.pill, _pill_css("unknown"))
             self.summary.setText("The monitor server is not answering.")
         elif not self.has_queue:
-            self.pill.setText("none")
-            set_style_if_changed(self.pill, _pill_css("unknown"))
             self.summary.setText("This monitor server has no run queue (older code).")
         else:
-            state = self.queue_state()
-            self.pill.setText(state)
-            set_style_if_changed(self.pill, _pill_css(_QUEUE_LEVEL.get(state, "unknown")))
             text = str(self.info.get("text") or "")
+            text = text[:1].upper() + text[1:]
             warm = self.info.get("warm")
             if isinstance(warm, dict):
                 text += f" -- next #{warm.get('job')} {warm.get('text') or warm.get('state')}"
             self.summary.setText(text)
         self.summary.setToolTip(self.summary.text())
         counts = self.info.get("counts") or {}
-        shown = [f"{counts[s]} {s}" for s in ("queued", "launching", "running", "ending",
-                                               "failed", "aborted", "saved", "done")
-                 if counts.get(s)]
+        shown = [f"{counts['queued']} queued"] if counts.get("queued") else []
         if self.not_listed:
             shown.append(f"{self.not_listed} more queued not listed" if self.not_listed > 0
                          else "more queued not listed")
         self.counts.setText(" | ".join(shown) if self.reachable and self.has_queue else "")
+        self.counts.setToolTip(" | ".join(f"{counts[s]} {s}" for s in COUNTED if counts.get(s)))
 
         alarm = self.info.get("alarm") if self.reachable else None
         warm_alarm = self.info.get("warm_alarm") if self.reachable else None
@@ -1716,16 +1698,6 @@ class RunQueuePanel(QWidget):
                 label.setText(f"{title}: not paused")
                 set_style_if_changed(label, f"color: {theme.FG_MUTED}; font-size: 11px;")
                 label.hide()
-
-        resume = self.info.get("resume_loop")
-        if isinstance(resume, dict) and self.reachable:
-            self.loop_note.setText(
-                f"The queue stopped the loop {resume.get('key')} for its jobs "
-                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out"
-                + (f" ({resume['category']})." if resume.get("category") else "."))
-            self.loop_note.show()
-        else:
-            self.loop_note.hide()
 
     # -- selection and buttons ------------------------------------------------------------------
 
@@ -1875,16 +1847,22 @@ class RunQueuePanel(QWidget):
         paused = self.info.get("paused") or {}
         for scope, b in self.pause_buttons.items():
             on = isinstance(paused.get(scope), dict)
-            b.setText(("Resume " if on else "Pause ") + scope)
+            b.setText(("Resume " if on else "Pause ") + scope + " jobs")
             set_style_if_changed(b, theme.held_button_css() if on else "")
             b.setEnabled(live)
             b.setToolTip(why_not if not live else
                          (f"Let {scope} jobs launch again" if on else
                           f"Stop launching {scope} jobs (the running one goes on)"))
+        any_paused = any(isinstance(p, dict) for p in paused.values())
+        self.pause_button.setText("Paused" if any_paused else "Pause")
+        set_style_if_changed(self.pause_button, theme.held_button_css() if any_paused else "")
+        self.pause_button.setEnabled(live)
+        self.pause_button.setToolTip(why_not or "Pause or resume agent jobs or all jobs")
 
     def say(self, text: str, color: str = theme.FG_MUTED) -> None:
         self._list_error_shown = False        # a newer message is not cleared by a list
         self.message.setText(text)
+        self.message.setVisible(bool(text))
         set_style_if_changed(self.message, f"color: {color}; font-size: 11px;")
 
     # -- actions ---------------------------------------------------------------------------------
@@ -2608,8 +2586,7 @@ class QueueSummaryLine(QFrame):
 
 __all__ = ["COLUMNS", "DEFAULT_HIDDEN", "EditJobDialog", "FILTERS", "JobLogWindow",
            "JobTableModel", "QueueSummaryLine", "RunQueuePanel", "SourceWindow", "again_request",
-           "cancel_request", "chip_css", "derived_waiting", "edit_request", "file_name",
-           "find_editor",
+           "cancel_request", "derived_waiting", "edit_request", "file_name", "find_editor",
            "hold_request", "kq_commands", "list_request", "move_request", "not_carried_over",
            "order_jobs", "pause_request", "ran_without_file", "release_request",
            "resume_request", "tail_request"]
