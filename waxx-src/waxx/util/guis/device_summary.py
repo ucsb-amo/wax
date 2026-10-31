@@ -3,18 +3,20 @@
 It answers "is anything dangerous on, can I trust what the tabs show, and can
 I act right now?" without opening the Composite tab:
 
-* banners -- the device state is untrusted (with Run <reset experiment> and
-  Trust state), a run is starting or in progress, the interlock has tripped,
-  the hardware is busy playing out a ramp, a watchdog is about to act;
+* banners -- the tabs may not match the hardware (with Run <reset experiment>
+  and Trust state; not while a run has the machine, whose end state settles
+  it), a run started that the queue is not watching (with Unlock), the
+  interlock has tripped, the hardware is busy playing out a ramp, a watchdog
+  is about to act;
 * hazard chips -- one per device that says it is dangerous to leave on (a
   coil at current), with how long this GUI has seen it so; a click shows the
   card;
 * Make safe -- opens :class:`MakeSafeDialog`, which lists each hazardous
   device's safe op with its values and sends the ticked ones.
 
-Whether the monitor applies edits at all is not a banner: it is
-:class:`MonitorNotice`, one short line beside the monitor pill in the status
-row.
+Whether live control applies edits at all is not a banner: it is
+:class:`MonitorNotice`, one short line beside the status pill in the status
+row, which also names a run in progress.
 
 It only displays what it is given (``set_*``) and emits requests; the host
 GUI does the talking.
@@ -48,8 +50,51 @@ _BANNER_COLORS = {
 #: What :class:`MonitorNotice` says -- short on purpose; the reason in full is
 #: its tooltip.
 NOTICE_UNREACHABLE = "Monitor server unreachable: edits do not reach the hardware"
-NOTICE_INTERRUPTED = "Monitor interrupted: an experiment was likely submitted"
-NOTICE_NOT_RUNNING = "Monitor not running: edits are not applied until it is started"
+NOTICE_INTERRUPTED = "A run took over: edits are not applied until live control is started"
+NOTICE_NOT_RUNNING = "Edits are not applied until live control is started"
+#: The button that lifts a run's block on the controls.
+UNLOCK_TEXT = "Run is dead, unlock controls…"
+
+
+def run_in_use(run_queue: dict | None = None, live_od: dict | None = None,
+               pending: dict | None = None) -> str:
+    """The run the queue, liveOD or an announcement shows using the machine, in
+    words; "" for none.  The queue's job comes first: the queue watches its
+    process, so that one is alive.  An announcement alone proves only that a
+    run started and has not ended (it may have died; the server cannot see a
+    run take the core while the monitor is already stopped)."""
+    current = (run_queue or {}).get("current")
+    if isinstance(current, dict):
+        name = f" ({current['label']})" if current.get("label") else ""
+        if current.get("run_id"):
+            return f"Run {current['run_id']}{name} in progress"
+        return f"Job {current.get('id')}{name} starting"
+    live_od = live_od or {}
+    if live_od.get("run_in_progress"):
+        return (f"Run {live_od.get('run_id')} ({live_od.get('expt_name') or 'experiment'}) "
+                "in progress")
+    if isinstance(pending, dict):
+        return (f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) "
+                "started and has not ended")
+    return ""
+
+
+def live_control_text(state_name: str, sub_state: str = "", run: str = "",
+                      reachable: bool = True) -> tuple[str, str]:
+    """``(sentence, level)`` for live control, the monitor experiment.  Level:
+    "on" ready, "run" a run has the machine (normal, never an alarm),
+    "partial" starting or off, "hazard" no answer.  ``run``: :func:`run_in_use`."""
+    if not reachable:
+        return "Monitor server not answering", "hazard"
+    if state_name == "READY":
+        return (f"Live control on hold: {run}", "run") if run else ("Live control ready", "on")
+    if state_name == "LOADING":
+        return "Live control starting…", "partial"
+    if run:
+        return f"Live control paused: {run}", "run"
+    if sub_state == "interrupted_by_run":
+        return "Live control off: a run took over", "partial"
+    return "Live control off", "partial"
 
 
 def _fmt_s(seconds) -> str:
@@ -120,9 +165,10 @@ class _Banner(QFrame):
 
 class MonitorNotice(QFrame):
     """The monitor's state in one short line, for the status row beside the
-    monitor pill: shown only while edits are not applied (the server
+    status pill: shown only while edits are not applied (the server
     unreachable, the monitor interrupted by a run or not running), with Start
-    while the monitor can be started.  Hidden while it runs or starts."""
+    while the monitor can be started.  Hidden while it runs or starts, and
+    while a run has the machine (the status row says so)."""
 
     start_requested = pyqtSignal()
 
@@ -136,18 +182,18 @@ class MonitorNotice(QFrame):
         row.addWidget(self.label)
         self.button = QPushButton("Start")
         self.button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.button.setToolTip("Start the monitor experiment.")
+        self.button.setToolTip("Start live control (the monitor experiment).")
         self.button.clicked.connect(self.start_requested.emit)
         row.addWidget(self.button)
         self.level = ""
         self.hide()
 
     def set_monitor(self, state, reachable: bool, sub_state: str = "",
-                    reason: str = "") -> None:
+                    reason: str = "", run_active: bool = False) -> None:
         if not reachable:
             level, text, start = "error", NOTICE_UNREACHABLE, False
             reason = reason or "Click the status to retry now."
-        elif state == STATES.NOT_READY:
+        elif state == STATES.NOT_READY and not run_active:
             start = True
             if sub_state == "interrupted_by_run":
                 level, text = "info", NOTICE_INTERRUPTED
@@ -234,27 +280,29 @@ class SummaryStrip(QWidget):
 
     # -- inputs -------------------------------------------------------------------
 
-    def set_trust(self, trust: dict | None, reset: dict | None = None) -> None:
+    def set_trust(self, trust: dict | None, reset: dict | None = None,
+                  run_active: bool = False) -> None:
         """*reset* is the monitor server's reset experiment (``None``: it has
-        none, and there is no Reset button)."""
+        none, and there is no Reset button).  *run_active*: a run has the
+        machine, and its end state settles this: nothing is shown."""
         b = self.banners["trust"]
-        if not (trust and trust.get("trusted") is False):
+        state = (reset or {}).get("state")
+        if not (trust and trust.get("trusted") is False) or (run_active and state != "running"):
             b.hide()
             return
         # Why it is untrusted, and a failed reset's output, go in the tooltip.
         tip = ["Untrusted since: " + str(trust.get("reason", ""))]
-        state = (reset or {}).get("state")
         title = reset_title(reset)
         if state == "running":
             who = "@".join(p for p in (reset.get("operator"), reset.get("client")) if p)
             started = reset.get("started")
             elapsed = "" if started is None else _fmt_s(time.time() - started)
             detail = ", ".join(p for p in (who, elapsed) if p)
-            b.show_text("warn", f"Device state untrusted: running {title}"
+            b.show_text("warn", f"The tabs may not match the hardware: running {title}"
                         + (f" ({detail})" if detail else "") + "…")
             b.label.setToolTip(tip[0])
             return
-        text = "Device state untrusted: the tabs may not match the hardware."
+        text = "The tabs may not match the hardware."
         if state == "failed":
             text += f" Last {title} failed."
             tip.append(str(reset.get("text") or ""))
@@ -263,27 +311,17 @@ class SummaryStrip(QWidget):
         b.show_text("error", text, "Trust state…", f"Run {title}" if reset else "")
         b.label.setToolTip("\n\n".join(tip))
 
-    def set_run(self, pending: dict | None, live_od: dict | None) -> None:
-        """A fence (a run announced itself and has not yet taken the core)
-        always gets a Clear button: a run that died before taking the core
-        still looks "in progress" to liveOD, which is told nothing either."""
+    def set_run(self, pending: dict | None, run_queue: dict | None = None) -> None:
+        """A run that started (announced itself) and has not ended blocks the
+        controls.  Shown, with Unlock, only while the queue has no job in its
+        slot: the queue watches its job's process, so that run is alive and
+        unlocking would be wrong (the status row names it).  Any other such
+        run may be dead: one that died early still looks "in progress" to
+        liveOD, which is told nothing either."""
         b = self.banners["run"]
-        live_od = live_od or {}
-        text = ""
-        if live_od.get("run_in_progress"):
-            shots = ""
-            if live_od.get("n_shots_expected"):
-                shots = f", shot {live_od.get('n_shots') or 0}/{live_od.get('n_shots_expected')}"
-            text = (f"Run {live_od.get('run_id')} "
-                    f"({live_od.get('expt_name') or 'experiment'}) in progress{shots} (liveOD).")
-        if pending:
-            text = (text + " " if text else "") + (
-                f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) announced "
-                "itself and has not taken the core yet: composite ops are refused until it "
-                "does or ends.")
-            b.show_text("info", text, "Clear fence…" if pending.get("token") else "")
-        elif text:
-            b.show_text("info", text + " The hardware belongs to it.")
+        if isinstance(pending, dict) and not (run_queue or {}).get("current"):
+            b.show_text("info", run_in_use(pending=pending) + ": controls stay blocked until "
+                                "it ends.", UNLOCK_TEXT if pending.get("token") else "")
         else:
             b.hide()
 

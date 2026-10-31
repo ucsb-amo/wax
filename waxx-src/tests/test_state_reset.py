@@ -282,7 +282,7 @@ def test_trust_banner_is_short_and_offers_reset_only_when_the_server_has_one(qap
     b = strip.banners["trust"]
     strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
     assert not b.isHidden()
-    assert b.label.text() == "Device state untrusted: the tabs may not match the hardware."
+    assert b.label.text() == "The tabs may not match the hardware."
     assert "run 5 (x) took the core" in b.label.toolTip()      # why: tooltip only
     assert b.alt_button.text() == "Run MOT Observe" and not b.alt_button.isHidden()
     assert b.button.text() == "Trust state…" and not b.button.isHidden()
@@ -290,6 +290,16 @@ def test_trust_banner_is_short_and_offers_reset_only_when_the_server_has_one(qap
     assert b.alt_button.isHidden() and not b.button.isHidden()
     strip.set_trust({"trusted": True}, {"expt": "mot_observe", "state": "idle"})
     assert b.isHidden()
+
+
+def test_trust_banner_is_hidden_while_a_run_has_the_machine(qapp):
+    """Its end state settles it; a reset running is still worth saying."""
+    strip = SummaryStrip()
+    b = strip.banners["trust"]
+    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "idle"}, run_active=True)
+    assert b.isHidden()
+    strip.set_trust(UNTRUSTED, {"expt": "mot_observe", "state": "running"}, run_active=True)
+    assert not b.isHidden()
 
 
 def test_trust_banner_while_a_reset_runs_and_after_it_failed(qapp):
@@ -400,24 +410,27 @@ def test_gui_reset_warns_about_a_live_run_and_sends_the_request(gui, monkeypatch
     assert not sent
 
 
-def test_the_sequences_tab_reset_card_follows_the_server(gui):
-    card = gui.sequences_panel.reset_card
+def test_the_reset_card_follows_the_server(gui):
+    from waxx.util.guis.sequences_panel import SequencesPanel
+    panel = SequencesPanel(start_sender=False)
+    card = panel.reset_card
     b = card.start_button
     assert card.isHidden()                                # no reset info yet
-    gui._set_monitor_state(STATES.READY)
-    gui._set_reset({"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
+    panel.set_reachable(True)
+    panel.set_reset({"expt": "mot_observe", "state": "idle", "about": MOT_ABOUT})
     assert not card.isHidden() and b.isEnabled() and b.text() == "Run"
     assert card.title.text() == "MOT Observe"
-    gui._set_reset({"expt": "mot_observe", "state": "running", "started": 1.,
-                    "about": MOT_ABOUT})
+    panel.set_reset({"expt": "mot_observe", "state": "running", "started": 1.,
+                     "about": MOT_ABOUT})
     assert b.text() == "Running…" and not b.isEnabled()
-    gui._set_reset({"expt": "mot_observe", "state": "done", "started": 1.,
-                    "about": MOT_ABOUT})
+    panel.set_reset({"expt": "mot_observe", "state": "done", "started": 1.,
+                     "about": MOT_ABOUT})
     assert b.isEnabled()
-    gui.on_connection_failed()
+    panel.set_reachable(False)
     assert not b.isEnabled()
-    gui._set_reset(None)
+    panel.set_reset(None)
     assert card.isHidden()
+    panel.shutdown()
 
 
 def test_the_resets_output_is_served_to_the_gui(server):

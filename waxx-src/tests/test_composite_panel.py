@@ -477,9 +477,9 @@ def gui(qapp, monkeypatch):
     g.close()
 
 
-def test_composite_tab_comes_after_the_channel_tabs_then_sequences(gui):
+def test_composite_tab_comes_after_the_channel_tabs(gui):
     tabs = [gui.tab_widget.tabText(i) for i in range(gui.tab_widget.count())]
-    assert tabs == ["DDS", "DAC", "TTL", "Composite", "Sequences"]
+    assert tabs == ["DDS", "DAC", "TTL", "Composite"]
 
 
 def test_no_composite_tab_without_definitions(qapp, monkeypatch):
@@ -488,7 +488,7 @@ def test_no_composite_tab_without_definitions(qapp, monkeypatch):
         monkeypatch.setattr(dc.DeviceStateGUI, name, lambda self, *a, **k: None)
     g = dc.DeviceStateGUI()
     tabs = [g.tab_widget.tabText(i) for i in range(g.tab_widget.count())]
-    assert g.composite_panel is None and tabs == ["DDS", "DAC", "TTL", "Sequences"]
+    assert g.composite_panel is None and tabs == ["DDS", "DAC", "TTL"]
     g.close()
 
 
@@ -924,12 +924,14 @@ class _AcceptingBox:
         return self._yes
 
 
-def test_the_run_banner_offers_to_clear_a_fence(gui, monkeypatch):
+def test_the_run_banner_offers_to_unlock(gui, monkeypatch):
     strip = gui.summary
     gui._on_state_broadcast({"type": "run_pending", "run_pending": {
         "run_id": 81000, "expt": "rabi", "token": "tok"}})
     banner = strip.banners["run"]
-    assert banner.button.isVisibleTo(strip) and banner.button.text() == "Clear fence…"
+    assert banner.button.isVisibleTo(strip)
+    assert banner.button.text() == "Run is dead, unlock controls…"
+    assert "fence" not in banner.label.text() and "core" not in banner.label.text()
     # liveOD also still shows the dead run as in progress: the button stays
     gui._telemetry_samples = {"live_od/run_in_progress": cmp.Sample(True),
                               "live_od/run_id": cmp.Sample(81000)}
@@ -945,7 +947,28 @@ def test_the_run_banner_offers_to_clear_a_fence(gui, monkeypatch):
     assert "81000" in _AcceptingBox.texts[-1]
     callback({"status": "ok"})
     assert gui._run_pending is None and gui.composite_panel.run_pending is None
-    assert "Run 81000" in banner.label.text() and not banner.button.isVisibleTo(strip)
+    assert banner.isHidden()
+
+
+def test_a_queue_job_is_never_offered_unlock(gui):
+    """The queue watches its job's process, so that run is alive: unlocking
+    would hand its devices back to the monitor server under it."""
+    gui._on_status_detail({"state": STATES.NOT_READY, "sub_state": "interrupted_by_run",
+                           "run_pending": {"run_id": 90528, "expt": "rabi", "token": "tok"},
+                           "run_queue": {"current": {"id": 2598, "label": "rabi",
+                                                     "state": "running", "run_id": 90528}},
+                           "trust": {"trusted": False, "reason": "run took the core"}})
+    assert gui.summary.banners["run"].isHidden()
+    assert gui.status_pill.text() == "Live control paused"
+    assert gui.status_detail_label.text() == "Run 90528 (rabi) in progress"
+    assert gui.summary.banners["trust"].isHidden()
+    assert gui.monitor_notice.isHidden()
+    gui._on_status_detail({"state": STATES.NOT_READY, "sub_state": "interrupted_by_run",
+                           "run_pending": None, "run_queue": {"current": None},
+                           "trust": {"trusted": False, "reason": "run took the core"}})
+    assert not gui.summary.banners["trust"].isHidden()              # the run ended: it matters
+    assert not gui.monitor_notice.isHidden()
+    assert gui.status_pill.text() == "Live control off"
 
 
 def test_search_bar_placeholder_is_short(gui):
@@ -962,8 +985,8 @@ def test_strip_interlock_and_live_od_from_telemetry(gui):
                               "live_od/n_shots_expected": cmp.Sample(40)}
     gui._refresh_summary()
     assert "TRIPPED" in gui.summary.banners["interlock"].label.text()
-    assert "81234" in gui.summary.banners["run"].label.text()
-    assert "3/40" in gui.summary.banners["run"].label.text()
+    gui._on_status_detail({"state": STATES.NOT_READY, "sub_state": "interrupted_by_run"})
+    assert gui.status_detail_label.text() == "Run 81234 (rabi) in progress, shot 3/40"
 
 
 def test_changes_window_shows_the_server_journal(gui, qapp):

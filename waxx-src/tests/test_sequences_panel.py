@@ -248,29 +248,26 @@ def gui(qapp, monkeypatch):
     g.close()
 
 
-def test_sequences_is_the_last_tab_and_follows_the_server(gui):
+def test_there_is_no_sequences_tab_and_loop_news_is_ignored(gui):
+    """The run loops are the Monitor panel's (user, 2026-10-31)."""
     tabs = [gui.tab_widget.tabText(i) for i in range(gui.tab_widget.count())]
-    assert tabs[-2:] == ["Composite", "Sequences"]
-    seq = gui.sequences_panel
+    assert tabs[-1] == "Composite" and "Sequences" not in tabs
+    assert not hasattr(gui, "sequences_panel")
     gui._on_status_detail({"state": STATES.READY, "sub_state": "running",
-                           "run_loops": {"auto_tof": LOOP}})
-    assert seq.reachable and "auto_tof" in seq.loop_cards
+                           "run_loops": {"auto_tof": LOOP}, "person_hold": {"active": True}})
     gui._on_state_broadcast({"type": "run_loop", "loop": dict(LOOP, state="running")})
-    assert seq.loop_cards["auto_tof"].pill.text() == "RUNNING"
-    gui._set_reset(dict(RESET))
-    assert not seq.reset_card.isHidden()
-    gui.on_connection_failed()
-    assert not seq.reachable
+    gui._on_state_broadcast({"type": "person_hold", "person_hold": {"active": False}})
+    gui._on_state_broadcast({"type": "run_queue", "run_queue": {"state": "idle"}})
+    gui._set_reset(dict(RESET))                                  # the banner's still uses it
+    assert gui._reset == RESET
 
 
-def test_the_reset_cards_run_goes_through_the_hosts_dialog(gui, monkeypatch):
-    gui._set_monitor_state(STATES.READY)
-    gui._set_reset(dict(RESET))
-    sent = []
-    monkeypatch.setattr(dc, "QMessageBox", _AcceptingBox)
-    gui._send_request = lambda obj, callback: sent.append(obj)
-    gui.sequences_panel.reset_card.start_button.click()
-    assert sent and sent[-1]["type"] == "reset_state"
+def test_the_status_row_groups_the_connected_devices(gui):
+    from PyQt6.QtWidgets import QLabel
+    group = gui.connected_devices
+    assert "Connected devices" in [w.text() for w in group.findChildren(QLabel)]
+    assert group.isAncestorOf(gui.composite_panel.connection_bar)
+    assert group.isAncestorOf(gui.slm_pill)
 
 
 def test_the_connection_bar_sits_in_the_status_row(gui):
@@ -301,7 +298,7 @@ def test_the_notice_sits_in_the_middle_and_moves_nothing(gui, qapp):
     assert not notice.isHidden()
     after = (bar.mapTo(gui, bar.rect().topLeft()), log.mapTo(gui, log.rect().topLeft()))
     assert after == before
-    assert gui.status_pill.x() < notice.x() < bar.x()
+    assert gui.status_pill.x() < notice.x() < gui.connected_devices.x()
 
 
 def test_the_status_row_has_no_monitor_buttons_and_the_strip_no_monitor_banner(gui):
@@ -493,18 +490,18 @@ QUEUE = {"enabled": True, "state": "running", "text": "job 2 (rabi) running, run
          "counts": {"queued": 2, "running": 1}, "alarm": None}
 
 
-def test_the_queue_line_follows_status_json_and_broadcasts(gui):
-    seq = gui.sequences_panel
+def test_the_queue_line(qapp):
+    seq = sp.SequencesPanel(start_sender=False)
     assert seq.queue_line.isHidden()
-    gui._on_status_detail({"state": STATES.READY, "sub_state": "running", "run_queue": QUEUE})
+    seq.set_queue(QUEUE)
     assert not seq.queue_line.isHidden()
     assert seq.queue_line.label.text() == ("Queue: running (2 queued) -- open the Monitor "
                                            "panel in the Server Dashboard")
-    gui._on_state_broadcast({"type": "run_queue", "run_queue": dict(QUEUE, state="idle",
-                                                                    counts={"queued": 0})})
+    seq.set_queue(dict(QUEUE, state="idle", counts={"queued": 0}))
     assert seq.queue_line.label.text().startswith("Queue: idle (0 queued)")
-    gui._on_status_detail({"state": STATES.READY, "sub_state": "running"})   # older server
+    seq.set_queue(None)                                          # older server
     assert seq.queue_line.isHidden()
+    seq.shutdown()
 
 
 def test_a_hosts_requester_carries_the_requests(qapp):
