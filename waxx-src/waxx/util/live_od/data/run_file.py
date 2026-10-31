@@ -254,12 +254,22 @@ class RunFile:
         ``writer_reopens`` (the writer wrote it too when its reopen worked;
         this one is complete, and lands even when every reopen failed).
         Written before the END_RUN save, which sets run_complete last."""
+        import json
         import h5py
         try:
             with h5py.File(filepath, "r+") as f:
                 f.attrs["writer_reopens"] = reopens_json
+            # short summary only; the full records (with the HDF5 error text) are in the file
+            try:
+                recs = json.loads(reopens_json).get("reopens", [])
+                summary = "; ".join(f"{r.get('time')} {r.get('item')}: {r.get('outcome')}"
+                                    for r in recs[:5])
+                if len(recs) > 5:
+                    summary += f"; +{len(recs) - 5} more"
+            except Exception:
+                summary = f"{len(reopens_json)} chars"
             logger.warning(f"END_RUN: the image writer's handle failed during this run; "
-                           f"recorded in writer_reopens: {reopens_json[:500]}")
+                           f"recorded in writer_reopens ({summary})")
         except Exception as exc:
             logger.error(f"END_RUN: could not record writer_reopens in {filepath}: "
                          f"{type(exc).__name__}: {exc}. The record was: {reopens_json[:2000]}")
