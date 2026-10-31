@@ -45,7 +45,7 @@ CAPTION_PT = 9           # the small '170 A' caption next to each value
 # Rolling current-history plot.  Samples are whatever the server's poll
 # worker read.  The buffer holds ``PLOT_RANGE_MAX_S``; the visible window
 # is the "plot range" spinbox (``PLOT_RANGE_DEFAULT_S`` at start).
-PLOT_RANGE_DEFAULT_S = 240
+PLOT_RANGE_DEFAULT_S = 120
 PLOT_RANGE_MIN_S = 10
 PLOT_RANGE_MAX_S = 3600
 PLOT_MIN_HEIGHT_PX = 90   # the plot grows with the dock; this is the floor
@@ -248,7 +248,7 @@ class _CurrentPlot(QWidget):
         self._toggle.setAutoRaise(True)
         self._toggle.toggled.connect(self._on_toggled)
 
-        # "plot range = [  240] s" -- only shown while expanded.
+        # "plot range = [  120] s" -- only shown while expanded.
         self._range = QSpinBox()
         self._range.setRange(PLOT_RANGE_MIN_S, PLOT_RANGE_MAX_S)
         self._range.setValue(PLOT_RANGE_DEFAULT_S)
