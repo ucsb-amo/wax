@@ -490,6 +490,18 @@ class Op:
 
 # --- indicators -------------------------------------------------------------
 
+def action_text(label: str, word: str) -> str:
+    """What a click on the lamp or toggle ``label`` does, ``word`` being the
+    state it goes to: "Turn switch off", "Close shutter", "Set AOs to ARTIQ"."""
+    if word in ("on", "off"):
+        return f"Turn {label} {word}"
+    if word == "open":
+        return f"Open {label}"
+    if word == "closed":
+        return f"Close {label}"
+    return f"Set {label} to {word}"
+
+
 @dataclass(frozen=True)
 class Lamp:
     """On/off of one channel: a DDS RF switch (``sw_state``) or a TTL.
@@ -501,7 +513,11 @@ class Lamp:
     confirmations -- for a line whose bare flip would skip what the device's
     ops guard (a coil's IGBT, an H-bridge).  Each is an op key of this device,
     ``"device.op"`` of another, or ``""`` for no click in that state, so
-    ``("", "")`` leaves the lamp an indicator only."""
+    ``("", "")`` leaves the lamp an indicator only.
+
+    The button reads what a click does (:func:`action_text`, or ``actions``:
+    (text when off, text when on), where the state word would mislead); its dot
+    shows the state.  With no click it reads the state."""
 
     label: str
     dtype: str
@@ -511,6 +527,12 @@ class Lamp:
     on_level: str = "ok"
     tooltip: str = ""
     ops: tuple = ()
+    actions: tuple = ()
+
+    def action(self, on: bool) -> str:
+        if self.actions:
+            return self.actions[1] if on else self.actions[0]
+        return action_text(self.label, self.off_text if on else self.on_text)
 
     def click_op(self, on: bool) -> str | None:
         """What a click does in this state: an op reference, ``""`` (nothing)
@@ -600,7 +622,8 @@ class FieldRow:
 @dataclass(frozen=True)
 class ChannelToggle:
     """A single TTL, switched through the ordinary channel path (the same as
-    the TTL tab) -- for PID hold / enable lines that are one channel each."""
+    the TTL tab) -- for PID hold / enable lines that are one channel each.  The
+    button reads what a click does, as a :class:`Lamp`'s."""
 
     name: str
     label: str
@@ -609,6 +632,12 @@ class ChannelToggle:
     on_level: str = "warn"
     tooltip: str = ""
     dtype: str = "ttl"
+    actions: tuple = ()
+
+    def action(self, on: bool) -> str:
+        if self.actions:
+            return self.actions[1] if on else self.actions[0]
+        return action_text(self.label, self.off_text if on else self.on_text)
 
 
 @dataclass(frozen=True)
@@ -674,7 +703,8 @@ class CompositeDevice:
     pill_ops: tuple | None = None
 
     def pill_click_ops(self) -> tuple:
-        """(op when off, op when on) for the state pill; ``""`` = no click."""
+        """(op when off, op when on) for the collapsed header's button; ``""``
+        = none."""
         if self.pill_ops is not None:
             return tuple(self.pill_ops)
         keys = {op.key for op in self.ops}

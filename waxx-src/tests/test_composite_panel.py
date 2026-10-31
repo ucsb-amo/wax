@@ -152,7 +152,7 @@ def _card(p):
 def test_lamps_state_and_readback(panel):
     card = _card(panel)
     assert card.state_pill.text() == "ON"
-    assert "switch" in card.lamps[0][1].text() and "on" in card.lamps[0][1].text()
+    assert "Turn switch off" in card.lamps[0][1].text()            # what a click does
     assert card.editors["v"].value() == pytest.approx(2.0)         # hardware readback
     assert card.readouts[0][1].text() == "pid 2.00 V"
 
@@ -298,16 +298,37 @@ def test_other_clients_results_are_logged(panel):
 def test_channel_toggle_uses_the_channel_path(panel):
     card = _card(panel)
     toggle, button = card.toggles[0]
-    assert "off" in button.text()
+    assert button.text() == "Turn Hold on" and "Now: off" in button.toolTip()
     button.click()
     assert panel.channel_sends[-1] == ("ttl", "hold", {"ttl_state": 1})
+
+
+def test_a_channel_toggle_with_no_known_state_sends_nothing(panel):
+    """It used to show "?" and turn the channel on."""
+    card = _card(panel)
+    toggle, button = card.toggles[0]
+    del panel.config["ttl"]["hold"]
+    panel.refresh()
+    n = len(panel.channel_sends)
+    assert not button.isEnabled() and button.text().endswith("?")
+    button.click()
+    card._toggle_channel(toggle)
+    assert len(panel.channel_sends) == n
+
+
+def test_main_buttons_are_not_lit_by_the_state(panel):
+    card = _card(panel)
+    card.set_collapsed(False)
+    on, off = card.op_buttons["on"][0], card.op_buttons["off"][0]
+    assert on.styleSheet() == on.property("base_css")
+    assert off.styleSheet() == off.property("base_css")
 
 
 def test_lamp_is_a_button_that_flips_its_channel(panel):
     card = _card(panel)
     lamp, button = card.lamps[0]
     assert isinstance(button, cp.QPushButton) and button.isEnabled()
-    assert "Click: off" in button.toolTip()
+    assert "Click: off" in button.toolTip() and "switch now: on" in button.toolTip()
     button.click()
     assert panel.channel_sends[-1] == ("ttl", "sw", {"ttl_state": 0})
     assert panel._sender.sent == []                                 # no op for a bare lamp
@@ -316,32 +337,39 @@ def test_lamp_is_a_button_that_flips_its_channel(panel):
     assert button.isEnabled()
 
 
-def test_state_pill_is_a_button_off_while_on_and_on_while_off(panel):
+def test_the_collapsed_header_button_is_off_while_on_and_on_while_off(panel):
     card = _card(panel)
-    assert card.state_pill.text() == "ON" and card.state_pill.isEnabled()
-    assert "Click: Off" in card.state_pill.toolTip()
-    card.state_pill.click()
+    card.set_collapsed(True)
+    assert card.state_pill.text() == "ON" and not card.state_pill.isEnabled()  # only shows
+    assert card.quick_button.text() == "Off" and not card.quick_button.isHidden()
+    assert "Click: Off" in card.quick_button.toolTip()
+    card.quick_button.click()
     assert panel._sender.sent[-1]["op"] == "beam.off"
     assert panel.confirm_answers == []                              # switching off: no question
     panel.config["ttl"]["sw"]["ttl_state"] = 0
     card._pending_ops.clear()
     panel.refresh()
-    assert card.state_pill.text() == "off" and "Click: On" in card.state_pill.toolTip()
-    card.state_pill.click()
+    assert card.state_pill.text() == "off" and card.quick_button.text() == "On"
+    card.quick_button.click()
     assert panel._sender.sent[-1]["op"] == "beam.on"
     assert panel._sender.sent[-1]["args"] == {"v": pytest.approx(2.0)}
     assert panel.confirm_answers == []                              # switching on: no question either
+    card.set_collapsed(False)
+    assert card.quick_button.isHidden()                             # open: the card's buttons
+    card.set_collapsed(True)
+    assert not card.quick_button.isHidden()
 
 
-def test_state_pill_is_not_clickable_when_unknown_or_ops_are_refused(panel):
+def test_the_header_button_is_off_or_gone_when_unknown_or_ops_are_refused(panel):
     card = _card(panel)
+    card.set_collapsed(True)
     panel.set_monitor_state(STATES.NOT_READY, reachable=True)
-    assert not card.state_pill.isEnabled()
-    assert "not now" in card.state_pill.toolTip()
+    assert not card.quick_button.isEnabled()
+    assert "not now" in card.quick_button.toolTip()
     panel.set_monitor_state(STATES.READY, reachable=True)
     del panel.config["ttl"]["sw"]
     panel.refresh()
-    assert not card.state_pill.isEnabled()
+    assert card.quick_button.isHidden()
     assert not card.lamps[0][1].isEnabled()                         # state unknown
 
 
@@ -552,6 +580,7 @@ def test_panel_toggle_updates_the_ttl_tab_too(gui, monkeypatch):
             return True
 
     gui._update_sender = Sender()
+    gui.composite_panel.refresh()                 # (the coalesced refresh, due by now)
     card = gui.composite_panel.cards[0]
     card.toggles[0][1].click()
     assert sent[-1] == ("ttl", "hold", {"ttl_state": 1})
@@ -760,10 +789,11 @@ def test_watchdog_arm_never_replays_a_measurement(panel2):
     assert req["op"] == "coil.off" and req["args"]["i_meas"] == -1.
     assert req["sig"] == panel2.table.get("coil.off").signature
     panel2._sender.requested.emit(req["req"], {"status": "ok", "fires_in_s": 180.})
-    assert card.watchdog_extend.isVisibleTo(card) and "armed" in card.watchdog_label.text()
+    assert card.watchdog_extend.isVisibleTo(card)
+    assert "Turns off automatically" in card.watchdog_label.text()
     panel2.on_watchdog({"type": "watchdog", "device": "coil", "state": "warning",
                         "fires_in_s": 100.})
-    assert "WATCHDOG" in card.watchdog_label.text()
+    assert "AUTO TURN-OFF" in card.watchdog_label.text()
     panel2.on_watchdog({"type": "watchdog", "device": "coil", "state": "fired",
                         "text": "sent coil.off (#4)"})
     assert card.watchdog is None and "fired" in card.footer.text()
