@@ -165,6 +165,8 @@ def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
     full = "C:/code/kexp/experiments/JP/expt_3.py"
     assert _cell(panel, 3, "path") == full
     assert full in _cell(panel, 3, "path", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 3, "file") == "expt_3.py"                  # the name; full in its tooltip
+    assert full in _cell(panel, 3, "file", Qt.ItemDataRole.ToolTipRole)
     for key in ("expt_class", "est", "source_changed"):
         assert _cell(panel, 3, key) == ""
     # why it waits is derived when the server does not say (before 1b)
@@ -221,6 +223,12 @@ def test_phase1b_fields_order_and_render(panel, server):
     assert _cell(panel, 5, "est") == ""                             # unknown: blank
     assert _cell(panel, 1, "est") == "~30 s est."                   # ended: no times
     assert _cell(panel, 3, "source_changed") == "CHANGED"
+    # the source column is hidden by default: the file's name says it too
+    assert _cell(panel, 3, "file", Qt.ItemDataRole.ForegroundRole).name() == \
+        rqp.QColor(rqp.ERR_TEXT).name()
+    assert "skipped at launch" in _cell(panel, 3, "file", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 4, "file", Qt.ItemDataRole.ForegroundRole).name() != \
+        rqp.QColor(rqp.ERR_TEXT).name()
     assert "skipped at launch" in _cell(panel, 3, "source_changed", Qt.ItemDataRole.ToolTipRole)
     assert _cell(panel, 4, "source_changed") == ""
     assert _cell(panel, 3, "waiting") == "job 4 goes first"        # the server's, as sent
