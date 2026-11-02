@@ -12,6 +12,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import Qt  # noqa: E402
+from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QCheckBox, QLineEdit  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent / "fakes"))
@@ -90,20 +92,16 @@ def test_display_states_warnings_and_separation_monitor(rig):
     assert len(panel._hist["sep"]) == 3                 # only the new row was added
 
 
-def test_lock_toggle_asks_before_turning_off(rig):
+def test_lock_toggle_does_not_ask(rig):
     panel, dev, srv, poll, answers, asked = rig
     poll()
     assert panel._lock_btn.text().startswith("Lock ON")
-    answers["yes"] = False
-    panel._lock_btn.click()
-    assert dev.values["lock"] == 1 and asked == ["Turn the lock off?"]
-    answers["yes"] = True
-    panel._lock_btn.click()
-    assert dev.values["lock"] == 0
+    panel._lock_btn.click()                              # turning off: no confirmation
+    assert dev.values["lock"] == 0 and asked == []
     poll()
     assert panel._lock_btn.text().startswith("Lock OFF")
-    panel._lock_btn.click()                              # turning on does not ask
-    assert dev.values["lock"] == 1 and asked == ["Turn the lock off?"] * 2
+    panel._lock_btn.click()                              # turning on: no confirmation
+    assert dev.values["lock"] == 1 and asked == []
 
 
 def test_reset_setpoint_and_clear(rig):
@@ -113,13 +111,84 @@ def test_reset_setpoint_and_clear(rig):
     panel._reset_btn.click()
     assert dev.values["setp"] == pytest.approx(6.437)
     assert "→ 6.437 ms" in panel._msg.text()
+    asked.clear()
     dev.values["integ"] = 0.3
-    answers["yes"] = False
-    panel._clear_btn.click()
-    assert dev.values["integ"] == 0.3
-    answers["yes"] = True
-    panel._clear_btn.click()
-    assert dev.values["integ"] == 0.0
+    panel._clear_btn.click()                             # clear: no confirmation
+    assert dev.values["integ"] == 0.0 and asked == []
+
+
+def test_override_button_toggles_the_override_setting(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    panel._client.set_value("ovolt", "1.25")
+    poll()
+    assert panel._override_btn.text() == "Override"
+    panel._override_btn.click()
+    assert dev.values["override"] == 1 and asked == []
+    poll()
+    assert panel._override_btn.text() == "Override ON"
+    assert "1.250 V" in panel._override_btn.toolTip()
+    assert panel._vals["feedback"].text() == "+1.2500 V"     # ovolt shown in "out"
+    panel._override_btn.click()
+    assert dev.values["override"] == 0
+    poll()
+    assert panel._override_btn.text() == "Override"
+
+
+def test_out_turns_orange_beyond_8_volts_under_override(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    panel._client.set_value("ovolt", "9.0")
+    panel._client.set_value("override", "1")
+    poll()
+    assert "#b8860b" in panel._vals["feedback"].styleSheet()
+    panel._client.set_value("ovolt", "7.5")
+    poll()
+    assert "#b8860b" not in panel._vals["feedback"].styleSheet()
+
+
+def test_override_disables_the_lock_button(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    poll()
+    assert panel._lock_btn.isEnabled()
+    panel._client.set_value("override", "1")
+    poll()
+    assert not panel._lock_btn.isEnabled()
+    assert "disabled while override" in panel._lock_btn.toolTip()
+    panel._client.set_value("override", "0")
+    poll()
+    assert panel._lock_btn.isEnabled()
+
+
+def test_voltage_box_sends_ovolt_and_follows_the_board(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    poll()
+    panel._ovolt_spin.setValue(2.5)                      # starts the pause timer
+    panel._ovolt_timer.stop()
+    panel._send_ovolt()                                  # what the timer does after its pause
+    assert dev.values["ovolt"] == pytest.approx(2.5)
+    panel._client.set_value("ovolt", "-3.25")
+    poll()
+    assert panel._ovolt_spin.value() == pytest.approx(-3.25)
+
+
+def test_console_up_recalls_last_commands(rig):
+    panel, dev, srv, poll, _, _ = rig
+    poll()                                               # enables the controls (COM connected)
+    panel._console_btn.click()                           # show the console, as a user would
+    line = panel._console_in
+    for text in ("tmin 1.5", "help"):
+        line.setText(text)
+        line.returnPressed.emit()
+    line.setText("partial")
+    QTest.keyClick(line, Qt.Key.Key_Up)                  # last command
+    assert line.text() == "help"
+    QTest.keyClick(line, Qt.Key.Key_Up)
+    assert line.text() == "tmin 1.5"
+    QTest.keyClick(line, Qt.Key.Key_Up)                  # stops at the oldest
+    assert line.text() == "tmin 1.5"
+    QTest.keyClick(line, Qt.Key.Key_Down)
+    assert line.text() == "help"
+    QTest.keyClick(line, Qt.Key.Key_Down)
+    assert line.text() == ""
 
 
 def test_settings_dialog_sends_only_edits(rig):

@@ -47,6 +47,8 @@ class Setting:
 #: Every setting the panel shows and may change, in display order.
 SETTINGS: tuple[Setting, ...] = (
     Setting("lock", "switch", "", "1 = on; anything else = off (0 V, integral cleared)"),
+    Setting("override", "switch", "", "1 = force the output to ovolt (the lock keeps running, its output not sent); 0 = lock drives it"),
+    Setting("ovolt", "float", "V", "forced output while override = 1 (clamped to +/-10 V)"),
     Setting("hold", "switch", "", "1 = skip bad sweeps and pause in HOLD; 0 = use every pair"),
     Setting("setp", "float", "ms", "peak-separation setpoint"),
     Setting("p1", "float", "V/ms", "proportional gain: feedback = g1*p1*err + integ"),
