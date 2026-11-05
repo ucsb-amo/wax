@@ -13,6 +13,14 @@ class RotationOperation:
     angle_rad: float
 
 
+@dataclass(frozen=True)
+class AttenuationOperation:
+    """Component-wise shrink of the Bloch vector: s_x, s_y by `transverse`, s_z by `longitudinal`."""
+
+    transverse: float
+    longitudinal: float
+
+
 class BlochVector:
     """Bloch-sphere vector helper with simple rotation and plotting utilities."""
 
@@ -20,6 +28,7 @@ class BlochVector:
         "sphere_color": "steelblue",
         "sphere_alpha": 0.10,
         "sphere_lw": 0.0,
+        "sphere_shade": True,  # matplotlib's surface lighting; False = flat sphere_color, no grey side
         "sphere_grid_color": "0.35",
         "sphere_grid_alpha": 0.30,
         "sphere_grid_lw": 1.1,
@@ -76,6 +85,7 @@ class BlochVector:
         previous: Optional["BlochVector"] = None,
         last_rotation: Optional[RotationOperation] = None,
         normalize: bool = True,
+        last_attenuation: Optional[AttenuationOperation] = None,
     ):
         v = np.asarray(vector, dtype=float).reshape(3)
         if not np.all(np.isfinite(v)):
@@ -90,6 +100,33 @@ class BlochVector:
         self.vector = v
         self.previous = previous
         self.last_rotation = last_rotation
+        self.last_attenuation = last_attenuation
+
+    @property
+    def length(self) -> float:
+        return float(np.linalg.norm(self.vector))
+
+    def history(self) -> list["BlochVector"]:
+        """Every state from the first one to this one, in order."""
+        chain = []
+        b = self
+        while b is not None:
+            chain.append(b)
+            b = b.previous
+        return chain[::-1]
+
+    def step_path(self, n_points: int = 60) -> np.ndarray:
+        """(n_points, 3) path from previous.vector to this vector through the last operation:
+        an arc for a rotation (at the vector's own length), a straight chord for an attenuation."""
+        if self.previous is None:
+            return self.vector[None, :].copy()
+        v0 = self.previous.vector
+        ts = np.linspace(0.0, 1.0, max(2, int(n_points)))
+        if self.last_rotation is not None:
+            k = self.last_rotation.axis
+            a = self.last_rotation.angle_rad
+            return np.array([self._rodrigues_rotate(v0, k, t * a) for t in ts])
+        return v0[None, :] + ts[:, None] * (self.vector - v0)[None, :]
 
     @staticmethod
     def _unit_axis(axis: Sequence[float]) -> np.ndarray:
@@ -137,11 +174,26 @@ class BlochVector:
         k = self._unit_axis(axis)
         angle_rad = np.deg2rad(angle) if degrees else float(angle)
         v_new = self._rodrigues_rotate(self.vector, k, angle_rad)
+        # A rotation keeps the length, so no renormalisation: an attenuated vector stays
+        # attenuated (unit vectors are unchanged by this; 2026-11-05).
         return BlochVector(
             v_new,
             previous=self,
             last_rotation=RotationOperation(axis=k, angle_rad=angle_rad),
-            normalize=True,
+            normalize=False,
+        )
+
+    def attenuate(self, transverse: float = 1.0, longitudinal: float = 1.0) -> "BlochVector":
+        """Scale s_x, s_y by `transverse` and s_z by `longitudinal` (a decoherence step,
+        e.g. a read's back-action coherence). The result is not renormalised."""
+        f = np.array([transverse, transverse, longitudinal], dtype=float)
+        if not np.all(np.isfinite(f)) or np.any(f < 0.0):
+            raise ValueError("Attenuation factors must be finite and non-negative")
+        return BlochVector(
+            self.vector * f,
+            previous=self,
+            last_attenuation=AttenuationOperation(float(transverse), float(longitudinal)),
+            normalize=False,
         )
 
     def rotate_x(self, angle: float, degrees: bool = False) -> "BlochVector":
@@ -237,22 +289,7 @@ class BlochVector:
     ):
         s = self._resolve_style(style)
         ax, fig = self._make_axis(ax=ax)
-        draw_bloch_sphere(
-            ax,
-            sphere_alpha=s["sphere_alpha"],
-            sphere_color=s["sphere_color"],
-            sphere_lw=s["sphere_lw"],
-            sphere_grid_color=s["sphere_grid_color"],
-            sphere_grid_alpha=s["sphere_grid_alpha"],
-            sphere_grid_lw=s["sphere_grid_lw"],
-            equator_front_color=s["equator_front_color"],
-            equator_back_color=s["equator_back_color"],
-            equator_front_alpha=s["equator_front_alpha"],
-            equator_back_alpha=s["equator_back_alpha"],
-            equator_lw=s["equator_lw"],
-            equator_front_ls=s["equator_front_ls"],
-            equator_back_ls=s["equator_back_ls"],
-        )
+        _draw_styled_sphere(ax, s)
         self._draw_vector(
             ax,
             self.vector,
@@ -295,22 +332,7 @@ class BlochVector:
 
         s = self._resolve_style(style)
         ax, fig = self._make_axis(ax=ax)
-        draw_bloch_sphere(
-            ax,
-            sphere_alpha=s["sphere_alpha"],
-            sphere_color=s["sphere_color"],
-            sphere_lw=s["sphere_lw"],
-            sphere_grid_color=s["sphere_grid_color"],
-            sphere_grid_alpha=s["sphere_grid_alpha"],
-            sphere_grid_lw=s["sphere_grid_lw"],
-            equator_front_color=s["equator_front_color"],
-            equator_back_color=s["equator_back_color"],
-            equator_front_alpha=s["equator_front_alpha"],
-            equator_back_alpha=s["equator_back_alpha"],
-            equator_lw=s["equator_lw"],
-            equator_front_ls=s["equator_front_ls"],
-            equator_back_ls=s["equator_back_ls"],
-        )
+        _draw_styled_sphere(ax, s)
 
         v_old = self.previous.vector
         v_new = self.vector
@@ -420,22 +442,7 @@ class BlochVector:
     ):
         s = self._resolve_style(style)
         ax, fig = self._make_axis(ax=ax)
-        draw_bloch_sphere(
-            ax,
-            sphere_alpha=s["sphere_alpha"],
-            sphere_color=s["sphere_color"],
-            sphere_lw=s["sphere_lw"],
-            sphere_grid_color=s["sphere_grid_color"],
-            sphere_grid_alpha=s["sphere_grid_alpha"],
-            sphere_grid_lw=s["sphere_grid_lw"],
-            equator_front_color=s["equator_front_color"],
-            equator_back_color=s["equator_back_color"],
-            equator_front_alpha=s["equator_front_alpha"],
-            equator_back_alpha=s["equator_back_alpha"],
-            equator_lw=s["equator_lw"],
-            equator_front_ls=s["equator_front_ls"],
-            equator_back_ls=s["equator_back_ls"],
-        )
+        _draw_styled_sphere(ax, s)
         self._draw_vector(
             ax,
             self.vector,
@@ -534,13 +541,20 @@ def draw_bloch_sphere(
     equator_lw: float = 1.05,
     equator_front_ls: Any = "-",
     equator_back_ls: Any = (0, (1.2, 2.2)),
+    sphere_mesh: tuple[int, int] = (120, 60),
+    sphere_shade: bool = True,
 ):
-    u = np.linspace(0, 2 * np.pi, 120)
-    v = np.linspace(0, np.pi, 60)
+    """Translucent unit sphere with axes and the three great circles.
+
+    sphere_mesh: (azimuthal, polar) points of the surface; each facet is one polygon in a
+    vector export, so a coarser mesh (e.g. (48, 24)) gives a much lighter SVG."""
+    u = np.linspace(0, 2 * np.pi, int(sphere_mesh[0]))
+    v = np.linspace(0, np.pi, int(sphere_mesh[1]))
     xs = np.outer(np.cos(u), np.sin(v))
     ys = np.outer(np.sin(u), np.sin(v))
     zs = np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(xs, ys, zs, color=sphere_color, alpha=sphere_alpha, linewidth=sphere_lw)
+    ax.plot_surface(xs, ys, zs, color=sphere_color, alpha=sphere_alpha, linewidth=sphere_lw,
+                    shade=sphere_shade)
 
     t = np.linspace(-1, 1, 200)
     ax.plot(t, 0 * t, 0 * t, color=sphere_grid_color, lw=sphere_grid_lw, alpha=sphere_grid_alpha)
@@ -597,6 +611,136 @@ def draw_bloch_sphere(
     ax.set_yticks([])
     ax.set_zticks([])
     ax.set_axis_off()
+
+
+def _draw_styled_sphere(ax: plt.Axes, s: dict, sphere_mesh: tuple[int, int] = (120, 60)):
+    draw_bloch_sphere(
+        ax,
+        sphere_mesh=sphere_mesh,
+        **{k: s[k] for k in (
+            "sphere_alpha", "sphere_color", "sphere_lw", "sphere_shade", "sphere_grid_color",
+            "sphere_grid_alpha", "sphere_grid_lw", "equator_front_color",
+            "equator_back_color", "equator_front_alpha", "equator_back_alpha",
+            "equator_lw", "equator_front_ls", "equator_back_ls")},
+    )
+
+
+def plot_bloch_sequence(
+    traces: Sequence[BlochVector],
+    stages: Optional[Sequence[tuple[str, int]]] = None,
+    labels: Optional[Sequence[str]] = None,
+    colors: Optional[Sequence[Any]] = None,
+    show_axes: bool = True,
+    overview: bool = True,
+    ncols: int = 3,
+    panel_size: float = 2.7,
+    elev: float = 22.0,
+    azim: float = -58.0,
+    zoom: float = 1.3,
+    sphere_mesh: tuple[int, int] = (120, 60),
+    title: Optional[str] = None,
+    legend_title: Optional[str] = None,
+    start_alpha: float = 0.25,
+    show: bool = True,
+    style: Optional[dict] = None,
+):
+    """One Bloch-sphere panel per stage of a pulse sequence, several traces at once.
+
+    Parameters
+    ----------
+    traces
+        The final BlochVector of each trace (e.g. one per detuning). Each must have been
+        built by the same number of operations (rotate / attenuate) from its own start;
+        the chain is read back through `history()`.
+    stages
+        (name, n_operations) per panel, in order; the counts must add up to the number
+        of operations. A read made of a z rotation and an attenuation is one stage of 2.
+        Default: one panel per operation.
+    zoom
+        Passed to `set_box_aspect`; > 1 enlarges the sphere inside its panel.
+    sphere_mesh
+        Surface resolution, passed to `draw_bloch_sphere`; lower it for a lighter SVG.
+    ncols
+        Panels per row; `ncols >= number of panels` puts every sphere in one row.
+    show_axes
+        Draw each trace's rotation axis in the stages where it rotates (axes along z
+        are skipped: the z grid line already marks them).
+    overview
+        Add a last panel with every trace's whole path.
+
+    Each stage panel shows, per trace, the vector at the stage start (faint), the path
+    through the stage (solid arc for a rotation, dashed chord for an attenuation) and
+    the vector at the stage end. Returns (fig, list of axes).
+    """
+    s = dict(BlochVector.STYLE)
+    s.update(style or {})
+    chains = [t.history() for t in traces]
+    n_ops = len(chains[0]) - 1
+    if any(len(c) - 1 != n_ops for c in chains):
+        raise ValueError("Every trace must have the same number of operations")
+    if stages is None:
+        stages = [(f"step {i + 1}", 1) for i in range(n_ops)]
+    if sum(int(n) for _, n in stages) != n_ops:
+        raise ValueError(f"stages cover {sum(int(n) for _, n in stages)} operations, traces have {n_ops}")
+    n_tr = len(traces)
+    if colors is None:
+        colors = [plt.cm.coolwarm(x) for x in np.linspace(0.0, 1.0, n_tr)] if n_tr > 1 else [s["state_vector_color"]]
+    if labels is None:
+        labels = [None] * n_tr
+
+    n_panels = len(stages) + int(bool(overview))
+    nrows = int(np.ceil(n_panels / ncols))
+    fig = plt.figure(figsize=(ncols * panel_size, nrows * panel_size + (0.5 if title else 0.0)),
+                     layout="constrained")
+    axes = []
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    lw = s["state_vector_lw"]
+
+    def _new_ax(i, name):
+        ax = fig.add_subplot(nrows, ncols, i + 1, projection="3d")
+        ax.view_init(elev=elev, azim=azim)
+        _draw_styled_sphere(ax, s, sphere_mesh)
+        ax.set_box_aspect((1, 1, 1), zoom=zoom)  # 3D axes leave wide margins; zoom fills the panel
+        ax.set_title(f"({letters[i % 26]}) {name}", loc="left", fontsize="small")
+        axes.append(ax)
+        return ax
+
+    i0 = 0
+    for p, (name, n) in enumerate(stages):
+        ax = _new_ax(p, name)
+        i1 = i0 + int(n)
+        for chain, c in zip(chains, colors):
+            BlochVector._draw_vector(ax, chain[i0].vector, color=c, alpha=start_alpha, lw=max(1.0, lw - 0.6))
+            for k in range(i0 + 1, i1 + 1):
+                b = chain[k]
+                path = b.step_path()
+                ls = "-" if b.last_rotation is not None else "--"
+                ax.plot(path[:, 0], path[:, 1], path[:, 2], color=c, lw=1.4, alpha=0.9, linestyle=ls)
+                if show_axes and b.last_rotation is not None and abs(b.last_rotation.axis[2]) < 0.999:
+                    a = b.last_rotation.axis
+                    ax.plot([0.0, a[0]], [0.0, a[1]], [0.0, a[2]], color=c, lw=1.0, alpha=0.45,
+                            linestyle=(0, (3, 2)))
+            BlochVector._draw_vector(ax, chain[i1].vector, color=c, alpha=1.0, lw=lw)
+        i0 = i1
+
+    if overview:
+        ax = _new_ax(len(stages), "whole sequence")
+        for chain, c, lab in zip(chains, colors, labels):
+            path = np.vstack([b.step_path() for b in chain[1:]])
+            ax.plot(path[:, 0], path[:, 1], path[:, 2], color=c, lw=1.3, alpha=0.9, label=lab)
+            v0 = chain[0].vector
+            ax.scatter([v0[0]], [v0[1]], [v0[2]], color="0.2", s=14, depthshade=False)
+            BlochVector._draw_vector(ax, chain[-1].vector, color=c, alpha=1.0, lw=lw)
+
+    if any(l is not None for l in labels):
+        handles = [plt.Line2D([], [], color=c, lw=2.0) for c in colors]
+        fig.legend(handles, [str(l) for l in labels], loc="outside right center",
+                   title=legend_title, fontsize="small", frameon=False)
+    if title:
+        fig.suptitle(title)
+    if show:
+        plt.show()
+    return fig, axes
 
 
 def _extract_replay_state_series(replay_result: Any, repeat_index: int = 0):
