@@ -308,6 +308,61 @@ def test_applying_a_spec_moves_the_range_not_the_value(qapp):
     assert row._spinbox.singleStep() == pytest.approx(5.0)
 
 
+# ---------------------------------------------------------------- locked rows, range edits
+
+def test_a_locked_row_is_greyed_and_cannot_change(qapp):
+    row = ap.AdjustParamRow(dict(spec(current_val=100.e-6), locked="save_data"))
+    published, specs = [], []
+    row.value_changed.connect(lambda *a: published.append(a))
+    row.spec_updated.connect(lambda *a: specs.append(a))
+    assert not row._spinbox.isEnabled() and not row._spec_btn.isEnabled()
+    assert not row._reset_btn.isEnabled()
+    assert "saves data" in row._label.toolTip()
+    row.update_value(50.e-6)                     # a broadcast still shows
+    assert row.value() == pytest.approx(5.e-5)
+    row.reset()
+    row.edit_spec()                              # no dialog for a locked row
+    assert not row.try_spec(0., 1., 1.e-6)
+    assert published == [] and specs == []
+
+
+def test_the_panel_says_a_saving_run_is_read_only(qapp):
+    panel = ap.AdjustPanel()
+    panel.populate([dict(spec(), locked="save_data")])
+    assert not panel._lock_banner.isHidden()
+    assert "read-only" in panel._lock_banner.text()
+    panel.populate([spec()])
+    assert panel._lock_banner.isHidden()
+    panel.populate([dict(spec(), locked="derived")])
+    assert panel._lock_banner.isHidden()         # per-row only
+    assert "compute_derived" in panel._rows["t_tof"]._label.toolTip()
+
+
+def test_a_range_that_excludes_the_value_is_refused(qapp):
+    row = ap.AdjustParamRow(spec(current_val=100.e-6))
+    specs = []
+    row.spec_updated.connect(lambda *a: specs.append(a))
+    assert not row.try_spec(200.e-6, 1.e-3, 1.e-6)
+    assert "excludes the current value" in row.last_spec_error
+    assert row.value() == pytest.approx(1.e-4) and specs == []
+    assert row._spinbox.minimum() == pytest.approx(20.0)        # unchanged (µs)
+    assert row.try_spec(50.e-6, 1.e-3, 1.e-6)
+    assert specs == [("t_tof", 50.e-6, 1.e-3, 1.e-6)]
+
+
+def test_a_refused_dialog_edit_warns_and_changes_nothing(qapp, monkeypatch):
+    warned = []
+    monkeypatch.setattr(ap.AdjustSpecDialog, "exec",
+                        lambda self: ap.QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(ap.AdjustSpecDialog, "get_values",
+                        lambda self: (200.e-6, 1.e-3, 1.e-6))
+    monkeypatch.setattr(ap.QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: warned.append(a)))
+    row = ap.AdjustParamRow(spec(current_val=100.e-6))
+    row.edit_spec()
+    assert len(warned) == 1 and row.spec['min_val'] == 20.e-6
+
+
 # ---------------------------------------------------------------- experiment side
 
 def test_adjust_gives_every_spec_a_unit():
@@ -322,15 +377,24 @@ def test_adjust_gives_every_spec_a_unit():
             self.i_mot = 60.
             self.n_repeats = 3
 
-    stub = _types.SimpleNamespace(params=FakeParams(), _adjust_specs=[], xvarnames=[])
-    stub._detect_adjust_unit = _types.MethodType(Scanner._detect_adjust_unit, stub)
-    adjust = _types.MethodType(Scanner.adjust, stub)
+    class Stub:
+        adjust = Scanner.adjust
+        _resolve_adjust_specs = Scanner._resolve_adjust_specs
+        _adjust_key_is_derived = Scanner._adjust_key_is_derived
+        _detect_adjust_unit = Scanner._detect_adjust_unit
+        compute_new_derived = Scanner.compute_new_derived
+
+    stub = Stub()
+    stub.params, stub.xvarnames = FakeParams(), []
+    stub.params.compute_derived = lambda: None
+    adjust = stub.adjust
 
     adjust('t_tof', min_val=20.e-6, max_val=20.e-3)
     adjust('t_probe', min_val=0., max_val=10.e-3)
     adjust('i_mot', min_val=0., max_val=80.)
     adjust('n_repeats', min_val=1, max_val=10)
     adjust('t_tof_forced', min_val=0., max_val=1., default_val=0.5, unit='ms')
+    stub._resolve_adjust_specs()           # what finish_prepare does
 
     units = {s.key: s.unit for s in stub._adjust_specs}
     assert units == {'t_tof': 'µs', 't_probe': 'ms', 'i_mot': 'A',
