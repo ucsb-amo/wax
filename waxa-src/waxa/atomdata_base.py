@@ -860,12 +860,13 @@ class atomdata_base():
         self._repeat_lazy_stat_context = None
         self._data_file_path = None
         self._saved_roi_from_file = False
-        # An interleaved sub-scan (waxx SubScan): its description (root attr
-        # cal_scan), its raw containers (keys with its prefix, taken out of
-        # ad.data at load) and the view built from them on first use (ad.cal).
+        # Runs taken 2026-10-10 .. 2026-11 with the interleaved readout
+        # sub-scan (waxx SubScan, removed 2026-11-04): its description (root
+        # attr cal_scan) and its raw containers by file key (cal_*, taken out
+        # of ad.data at load: their first axis is the sub-scan's slot, not the
+        # scan grid). Read-only legacy; empty for every other run.
         self.cal_scan = {}
-        self._subscan_raw = {}
-        self._cal_view = None
+        self.legacy_cal_data = {}
 
         self.server_talk = server_talk
 
@@ -1198,10 +1199,9 @@ class atomdata_base():
                     )
                 create_image_dataset(data_grp, key, data=val)
 
-            # an interleaved sub-scan's containers (they live in ad.cal, not
-            # in ad.data; small, never shuffled); its cal_scan attr is copied
-            # with the other root attrs below
-            for key, val in getattr(self, '_subscan_raw', {}).items():
+            # a legacy sub-scan's containers (not in ad.data; small, never
+            # shuffled); its cal_scan attr is copied with the other root attrs
+            for key, val in getattr(self, 'legacy_cal_data', {}).items():
                 create_image_dataset(data_grp, key, data=np.asarray(val))
 
             # sort metadata (kept in shuffled-order form in the file)
@@ -1276,107 +1276,6 @@ class atomdata_base():
         )
 
     ### Analysis
-
-    # ---- the interleaved sub-scan ------------------------------------------
-
-    @property
-    def has_cal(self) -> bool:
-        """The run took an interleaved sub-scan (root attr cal_scan)."""
-        return bool(getattr(self, '_subscan_raw', None)) and bool(getattr(self, 'cal_scan', None))
-
-    @property
-    def cal(self):
-        """The run's interleaved sub-scan as an atomdata of its own (None
-        when the run has none): ``ad.cal.xvars``, ``ad.cal.data.<key>``,
-        ``ad.cal.timestamp_shot_end`` (when each point finished),
-        ``ad.cal.data.main_index`` (flat acquisition index and final slot of
-        the data shot before each point), ``ad.cal.data.status`` (1 taken,
-        2 failed, 0 never taken), ``ad.cal.cal_scan`` (the description) and
-        ``ad.cal.calibration_log`` (its point log and end-of-run windows).
-        Shares params, camera_params and run_info with the run. Its repeated
-        values are not consecutive (the points alternate), so ``avg/std/sem``
-        pass through; group by value with a vault or the readout estimator."""
-        if not self.has_cal:
-            return None
-        if getattr(self, '_cal_view', None) is None:
-            self._cal_view = self._build_subscan_view()
-        return self._cal_view
-
-    def _build_subscan_view(self):
-        spec = self.cal_scan
-        prefix = str(spec.get('prefix', 'cal_'))
-        ad = object.__new__(self.__class__)
-        ad.params = self.params
-        ad.p = ad.params
-        ad.camera_params = self.camera_params
-        ad.run_info = self.run_info
-        ad.roi = None
-        tags = getattr(self, '_analysis_tags', None)
-        ad._analysis_tags = analysis_tags(None, getattr(tags, 'imaging_type', None))
-        ad.xvarnames = [str(k) for k in spec.get('xvarnames', [])]
-        xvars = spec.get('xvars', {})
-        ad.xvars = [np.asarray(xvars.get(k, []), dtype=float) for k in ad.xvarnames]
-        ad.Nvars = len(ad.xvars)
-        ad.xvardims = np.array([len(x) for x in ad.xvars], dtype=int)
-        ad.sort_idx = np.array([])
-        ad.sort_N = np.array([])
-        ad._lite = getattr(self, '_lite', False)
-        ad._ds = getattr(self, '_ds', None)
-        ad.server_talk = getattr(self, 'server_talk', None)
-        ad._timing_enabled = False
-        ad._timing = {}
-        ad.avg = None
-        ad.std = None
-        ad.sem = None
-        ad._repeat_sem_source = None
-        ad._repeat_sem_divisor = None
-        ad._repeat_zero_proxy = None
-        ad._repeat_lazy_stat_context = None
-        ad._data_file_path = getattr(self, '_data_file_path', None)
-        ad._saved_roi_from_file = False
-        ad._has_images = False
-        ad._ignore_images = True
-        ad.images = np.array([])
-        ad.image_timestamps = np.array([])
-        ad.experiment_code = getattr(self, 'experiment_code', None)
-        ad.camera_overrides = {}
-        ad.aux_frames_dropped = {}
-        ad.run_records = getattr(self, 'run_records', {})
-        ad.scope_data = {}
-        ad.cal_scan = spec
-        ad._subscan_raw = {}
-        ad._cal_view = None
-        ad.part = str(spec.get('name', 'cal'))
-        ad.calibration_log = spec.get('log', {}) if isinstance(spec.get('log', {}), dict) else {}
-        ad.data = _RepeatDataVault()
-        # declaration order (the description's key list), then anything else
-        strip = lambda full: full[len(prefix):] if full.startswith(prefix) else full
-        raw = {strip(full): arr for full, arr in self._subscan_raw.items()}
-        order = [k for k in spec.get('keys', []) if k in raw] + [k for k in raw if k not in spec.get('keys', [])]
-        # A point that failed (status 2) or was never taken (0) holds the file's fill in its
-        # containers: 0.0 for a kernel container, which reads like a measurement. The view shows
-        # NaN in every float container for those rows; the raw arrays (ad._subscan_raw of the
-        # parent, i.e. the file) are untouched.
-        status = raw.get('status', None)
-        bad = None
-        if status is not None:
-            st = np.asarray(status).reshape(-1)
-            bad = st != 1
-        for key in order:
-            arr = raw[key]
-            if (bad is not None and bad.any() and key != 'status'
-                    and np.issubdtype(np.asarray(arr).dtype, np.floating)
-                    and np.asarray(arr).shape[:1] == bad.shape):
-                arr = np.array(arr, dtype=float, copy=True)
-                arr[bad] = np.nan
-            vars(ad.data)[key] = arr
-            ad.data.keys.append(key)
-        t = vars(ad.data).get('time', None)
-        ad.timestamp_shot_end = np.asarray(t, dtype=float).ravel() if t is not None else np.array([])
-        ad._dealer = ad._init_dealer()
-        ad._clear_image_analysis_attrs()
-        ad._refresh_repeat_statistics()
-        return ad
 
     def acquisition_order(self):
         """Flat indices of the shots in the order they were taken: a stable
@@ -2085,7 +1984,7 @@ class atomdata_base():
             'experiment_code', '_camera_overrides', '_aux_frames_dropped',
             'axis_x', 'axis_y', 'axis_camera_x', 'axis_camera_y',
             'axis_camera_px_x', 'axis_camera_px_y',
-            'cal_scan', '_subscan_raw', '_cal_view',
+            'cal_scan', 'legacy_cal_data',
         ):
             if hasattr(self, attr):
                 setattr(ad, attr, getattr(self, attr))
@@ -3242,18 +3141,17 @@ class atomdata_base():
 
                 vars(self.data)[k] = data_k
                 self.data.keys.append(k)
-            # An interleaved sub-scan's containers (waxx SubScan, root attr
-            # cal_scan): their first axis is the sub-scan's slot, not the
-            # scan grid, so they leave ad.data here -- no grid-shaped loop
-            # (slices, repeats, reshuffle, the vault) ever sees them -- and
-            # load as ad.cal, a scan of its own.
+            # A legacy interleaved sub-scan's containers (root attr cal_scan,
+            # 2026-10-10 .. 2026-11): their first axis is the sub-scan's slot,
+            # not the scan grid, so they leave ad.data here -- no grid-shaped
+            # loop (slices, repeats, reshuffle, the vault) ever sees them --
+            # and stay as raw arrays in ad.legacy_cal_data.
             self.cal_scan = read_json_attr(f.attrs, 'cal_scan')
-            self._subscan_raw = {}
-            self._cal_view = None
+            self.legacy_cal_data = {}
             _prefix = self.cal_scan.get('prefix') if isinstance(self.cal_scan, dict) else None
             if _prefix:
                 for k in [k for k in self.data.keys if k.startswith(_prefix)]:
-                    self._subscan_raw[k] = vars(self.data).pop(k)
+                    self.legacy_cal_data[k] = vars(self.data).pop(k)
                     self.data.keys.remove(k)
             timing['h5_read_datavault_s'] = time.perf_counter() - t_stage
 

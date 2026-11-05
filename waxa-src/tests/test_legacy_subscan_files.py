@@ -1,13 +1,12 @@
-"""A run with an interleaved sub-scan (waxx SubScan) in atomdata: its
-containers leave ad.data and load as ad.cal, a scan of its own; siblings and
-slices carry it; the vault takes it as part='cal' and a main vault gets a lazy
-.cal. Files are made the way liveOD makes them, in pytest's temp folder."""
+"""Run files from the interleaved readout sub-scan era (waxx SubScan,
+2026-10-10 .. 2026-11, removed 2026-11-04) still load: the sub-scan's cal_*
+containers stay out of ad.data (their first axis is not the scan grid) and are
+kept raw in ad.legacy_cal_data; slices, reshuffles, lite copies and vaults are
+unaffected. Files are made the way liveOD made them, in pytest's temp folder."""
 import json
-import os
 
 import h5py
 import numpy as np
-import pytest
 
 from end_run_helpers import make_run_file, write_during_run, finish_run
 from waxa.atomdata import atomdata
@@ -73,49 +72,37 @@ def _load(path):
     return atomdata(path=path, roi_id="auto", lite=False, ignore_images=True)
 
 
-def test_the_sub_scans_containers_leave_ad_data_and_load_as_ad_cal(tmp_path):
+def test_legacy_sub_scan_containers_stay_out_of_ad_data(tmp_path):
     path, c = _make_run(tmp_path / DATE, 90001)
     ad = _load(path)
-    assert ad.data.keys == ["apd"] and ad.has_cal
-    cal = ad.cal
-    assert cal is ad.cal                                     # built once
-    assert cal.xvarnames == ["t_pulse"] and cal.Nvars == 1 and list(cal.xvardims) == [N_CAL]
-    assert np.allclose(cal.xvars[0], [0.0, 2.5e-6, 2.5e-6, 0.0, 0.0, 2.5e-6])
-    assert cal.data.keys == ["apd", "mode", "time", "main_index", "status"]
-    assert np.allclose(cal.data.apd, c["cal_apd"]) and np.allclose(cal.data.mode, c["cal_mode"])
-    assert np.array_equal(cal.data.main_index, c["cal_main_index"])
-    assert np.allclose(cal.timestamp_shot_end, c["cal_time"])
-    assert cal.run_info.run_id == ad.run_info.run_id and cal.p is ad.p
-    assert cal.cal_scan["every_n_shots"] == 2 and cal.calibration_log["summary"]["n_ok"] == N_CAL
-    assert cal.calibration_log["windows"][0]["v_up"] == -0.08
-    assert cal.part == "cal" and cal.roi is None and cal.od is None
-    # the points alternate, so repeat statistics pass through rather than average
-    assert np.allclose(cal.avg.data.apd, cal.data.apd)
-    assert np.array_equal(cal.acquisition_order(), np.arange(N_CAL))
+    assert ad.data.keys == ["apd"]
+    assert sorted(ad.legacy_cal_data) == sorted(k for k in c if k.startswith("cal_"))
+    np.testing.assert_allclose(ad.legacy_cal_data["cal_apd"], c["cal_apd"])
+    assert ad.cal_scan["prefix"] == "cal_" and ad.cal_scan["every_n_shots"] == 2
+    assert not hasattr(ad, "cal") and not hasattr(ad, "has_cal")
     assert np.array_equal(ad.acquisition_order(), np.arange(N_DATA))
-    assert "cal_scan" in ad.run_records
 
 
-def test_a_run_without_a_sub_scan_has_none(tmp_path):
+def test_a_run_without_a_sub_scan_has_no_legacy_data(tmp_path):
     path, _ = _make_run(tmp_path / DATE, 90002, with_cal=False)
     ad = _load(path)
-    assert not ad.has_cal and ad.cal is None and ad.cal_scan == {}
+    assert ad.cal_scan == {} and ad.legacy_cal_data == {}
     assert ad.data.keys == ["apd"]
 
 
-def test_siblings_slices_and_reshuffles_carry_the_sub_scan(tmp_path):
+def test_siblings_slices_and_reshuffles_ignore_the_legacy_containers(tmp_path):
     path, c = _make_run(tmp_path / DATE, 90003)
     ad = _load(path)
-    assert ad.avg.cal is not None and np.allclose(ad.avg.cal.data.apd, c["cal_apd"])
-    assert ad.std.has_cal and ad.sem.has_cal
+    assert ad.avg.data.keys == ["apd"]
     sl = ad.slice_atomdata(which_xvar_idx=0, xvar_value=2.0)
-    assert sl.has_cal and np.allclose(sl.cal.data.apd, c["cal_apd"])
+    assert sl.data.keys == ["apd"]
     ad.reshuffle()
     ad.unshuffle()
-    assert ad.data.keys == ["apd"] and np.allclose(ad.cal.data.apd, c["cal_apd"])
+    assert ad.data.keys == ["apd"]
+    np.testing.assert_allclose(ad.legacy_cal_data["cal_apd"], c["cal_apd"])
 
 
-def test_a_lite_copy_carries_the_sub_scan(tmp_path):
+def test_a_lite_copy_keeps_the_legacy_containers(tmp_path):
     folder = tmp_path / DATE
     path, c = _make_run(folder, 90004)
     talk = server_talk(data_dir=str(tmp_path))
@@ -123,29 +110,16 @@ def test_a_lite_copy_carries_the_sub_scan(tmp_path):
     ad.save_lite_copy()
     lite = next((tmp_path / "_lite" / DATE).glob("*.hdf5"))
     with h5py.File(lite, "r") as f:
-        assert "cal_apd" in f["data"] and "cal_scan" in f.attrs and "cal_apd" not in ad.data.keys
+        assert "cal_apd" in f["data"] and "cal_scan" in f.attrs
         np.testing.assert_allclose(f["data"]["cal_apd"][()], c["cal_apd"])
-        np.testing.assert_array_equal(f["data"]["cal_main_index"][()], c["cal_main_index"])
     ad2 = atomdata(path=str(lite), ignore_images=True, server_talk=talk)
-    assert ad2.has_cal and np.allclose(ad2.cal.data.apd, c["cal_apd"]) and ad2.data.keys == ["apd"]
+    assert ad2.data.keys == ["apd"]
+    np.testing.assert_allclose(ad2.legacy_cal_data["cal_apd"], c["cal_apd"])
 
 
-def test_a_vault_of_sub_scans_and_a_main_vaults_lazy_cal(tmp_path):
-    p1, c1 = _make_run(tmp_path / DATE, 90005, seed=1)
-    p2, c2 = _make_run(tmp_path / DATE, 90006, seed=2)
-    p3, _ = _make_run(tmp_path / DATE, 90007, with_cal=False, seed=3)
-    ads = [_load(p) for p in (p1, p2, p3)]
-    cal_vault = AtomdataVault([a.cal for a in ads if a.cal is not None], lite=False,
-                              ignore_images=True, uniform_roi=False, sort=False)
-    assert cal_vault.data.apd.shape == (2 * N_CAL, P)
-    assert cal_vault.shot_run_id.tolist() == [90005] * N_CAL + [90006] * N_CAL
-    assert np.allclose(cal_vault.timestamp_shot_end, np.concatenate([c1["cal_time"], c2["cal_time"]]))
-    assert np.allclose(cal_vault.data.apd, np.concatenate([c1["cal_apd"], c2["cal_apd"]]))
-    main = AtomdataVault(ads, lite=False, ignore_images=True, uniform_roi=False)
-    assert main.data.keys == ["apd"] and main.data.apd.shape == (3 * N_DATA, P)
-    assert main.cal is not None and main.cal.data.apd.shape == (2 * N_CAL, P)
-    assert main.cal is main.cal                                  # cached
-    main.drop_runs([90005])
-    assert main.cal.data.apd.shape == (N_CAL, P) and main.cal.shot_run_id.tolist() == [90006] * N_CAL
-    main.drop_runs([90006])
-    assert main.cal is None
+def test_a_vault_of_legacy_and_plain_runs(tmp_path):
+    paths = [_make_run(tmp_path / DATE, 90005, seed=1)[0],
+             _make_run(tmp_path / DATE, 90006, with_cal=False, seed=2)[0]]
+    main = AtomdataVault([_load(p) for p in paths], lite=False, ignore_images=True, uniform_roi=False)
+    assert main.data.keys == ["apd"] and main.data.apd.shape == (2 * N_DATA, P)
+    assert not hasattr(main, "cal")

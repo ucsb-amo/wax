@@ -6,22 +6,22 @@ exception in the cleanup before reset_coils left the outer coil at 182 A;
 a MOT pre-loaded at the end of a shot would stay on).
 
 Runs the real Scanner.scan / _scan on the host with the fake core of
-test_scan_subscan_slot. Nothing touches a device or the network."""
+scan_loop_harness. Nothing touches a device or the network."""
 import pytest
 from artiq.experiment import RTIOUnderflow
 from artiq.language.core import TerminationRequested
 
-from test_scan_subscan_slot import _prepared, _kinds, sim_time  # noqa: F401 (fixture)
+from scan_loop_harness import _prepared, _kinds, sim_time  # noqa: F401 (fixture)
 
 
 def test_a_normal_run_runs_no_safe_state_kernel():
-    e = _prepared(with_sub=False)
+    e = _prepared()
     e.scan()
     assert _kinds(e) == ["data"] * 5
 
 
 def test_an_exception_out_of_the_cleanup_runs_the_safe_state_first():
-    e = _prepared(with_sub=False)
+    e = _prepared()
     real = type(e).cleanup_scan_kernel
 
     def cleanup(self=e):
@@ -35,7 +35,7 @@ def test_an_exception_out_of_the_cleanup_runs_the_safe_state_first():
 
 
 def test_the_liveod_abort_between_shots_runs_the_safe_state_first():
-    e = _prepared(with_sub=False)
+    e = _prepared()
 
     def abort_check(raise_error=True):
         if e._shot_complete_count == 3:
@@ -48,7 +48,7 @@ def test_the_liveod_abort_between_shots_runs_the_safe_state_first():
 
 
 def test_an_exception_in_init_scan_kernel_runs_the_safe_state_first():
-    e = _prepared(with_sub=False)
+    e = _prepared()
 
     def init():
         if e._shot_complete_count == 1:
@@ -62,7 +62,7 @@ def test_an_exception_in_init_scan_kernel_runs_the_safe_state_first():
 def test_an_underflow_in_a_shot_is_cleaned_once_as_before():
     """The shot's own handler runs cleanup_scan_kernel; the new wrapper
     around the normal-path cleanup does not add a second cleanup."""
-    e = _prepared(with_sub=False)
+    e = _prepared()
     real_kernel = type(e).scan_kernel
 
     def shot(self=e):
@@ -97,7 +97,7 @@ def _cleanup_raising_when_no_image(e):
 
 @pytest.mark.parametrize("exc", [RTIOUnderflow, TriggerTimeout, RTIOOverflow])
 def test_a_cleanup_failing_inside_a_shot_handler_reaches_the_safe_state(exc):
-    e = _prepared(with_sub=False)
+    e = _prepared()
     _cleanup_raising_when_no_image(e)
     real_kernel = type(e).scan_kernel
 
@@ -111,69 +111,8 @@ def test_a_cleanup_failing_inside_a_shot_handler_reaches_the_safe_state(exc):
     assert _kinds(e) == ["data", "cleanup_abort"]
 
 
-def test_a_failing_sub_scan_cleanup_reaches_the_safe_state():
-    e = _prepared(n_data=3, every=2)
-    e.fail_point = 0                          # the first point underflows
-
-    def cal_cleanup():
-        e.calls.append(("cleanup_cal",))
-        raise ValueError("cleanup of the point failed")
-    e.cleanup_calibration_kernel = cal_cleanup
-    with pytest.raises(ValueError, match="cleanup of the point failed"):
-        e.scan()
-    # the point's own safe state, then the sub-scan block's (2026-10-28)
-    assert _kinds(e)[-3:] == ["cleanup_cal", "cleanup_abort", "cleanup_abort"]
-
-
-# ---- the sub-scan block between shots (2026-10-28) ----
-# A completed point may leave the machine running on purpose (kexp re-arms its
-# MOT pre-load in cleanup_calibration_kernel), so an exception from the RPCs
-# around a point -- the liveOD Abort raised by _subscan_end -- must reach the
-# safe state too.
-
-def test_the_liveod_abort_after_a_point_runs_the_safe_state_first():
-    e = _prepared(n_data=3, every=2)
-    real_end = type(e)._subscan_end
-
-    def end(ok, what, self=e):
-        real_end(e, ok, what)
-        raise TerminationRequested
-    e._subscan_end = end
-    with pytest.raises(TerminationRequested):
-        e.scan()
-    assert _kinds(e) == ["init_cal", "cal", "cleanup_cal", "cleanup_abort"]
-
-
-def test_an_exception_in_sub_scan_due_runs_the_safe_state_first():
-    e = _prepared(n_data=3, every=2)
-
-    def due():
-        if e._shot_complete_count == 2:
-            raise RuntimeError("due failed")
-        return type(e)._subscan_due(e)
-    e._subscan_due = due
-    with pytest.raises(RuntimeError, match="due failed"):
-        e.scan()
-    assert _kinds(e)[-1] == "cleanup_abort" and _kinds(e).count("data") == 2
-
-
-def test_point_completed_flag_seen_by_the_point_cleanup():
-    e = _prepared(n_data=3, every=2)
-    e.fail_point = 2                          # the second event's first point underflows
-    seen = []
-
-    def cal_cleanup():
-        seen.append(e.subscan_point_completed)
-        e.calls.append(("cleanup_cal",))
-    e.cleanup_calibration_kernel = cal_cleanup
-    with pytest.raises(RTIOUnderflow):
-        e.scan()
-    assert seen == [True, True, False]
-
-
 def test_the_feature_flag_is_set():
     """kexp's MOT pre-load checks these flags before it runs (Base._check_mot_preload)."""
     from waxx.base import scanner
     assert scanner.SAFE_STATE_ON_EVERY_CLEANUP_FAILURE is True
-    assert scanner.SAFE_STATE_AROUND_SUBSCAN is True
     assert hasattr(scanner.Scanner, "_cleanup_or_safe_state")

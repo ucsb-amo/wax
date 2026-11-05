@@ -106,7 +106,6 @@ class Stand(SimpleNamespace):
 _METHODS = ("claim", "claim_hardware", "claim_after_start", "pre_init_run",
             "_start_liveod_run", "_adopt_start_time", "_reserve_warm_run",
             "_release_reservation", "_liveod_has_reserve", "_restamp_run_time_now",
-            "_decide_subscan", "_compile_subscan_switch",
             "_expt_file_stem", "_serialize_init_payload", "_xvar_ranges",
             "_source_texts_for_end", "_source_files", "_read_source",
             "_snapshot_source_texts", "_expt_file_path")
@@ -122,7 +121,6 @@ def _stand(events, client):
     e._run_started = False
     e._reservation = None
     e._liveod_features = None
-    e._subscan = None
     e._extra_file_texts = {}
     e.live_od_client = client
     e.run_info = RunInfo(None, save_data=False)
@@ -340,23 +338,6 @@ def test_claim_waits_for_go_first(monkeypatch):
     monkeypatch.setattr(queue_gate, "ensure_go", lambda: (ev.append("go"), real()))
     e.claim()
     assert ev[0] == "go" and ev[1] == "hardware"
-
-
-def test_the_kernel_switch_is_fixed_before_the_claim():
-    ev = []
-    e = _stand(ev, FakeLiveOD(ev))
-    e.sort_idx = []
-    sub = SimpleNamespace(enabled=True, require_push=True, quiet=False, name="cal",
-                          disabled_reason="")
-    sub.disable = lambda why: (setattr(sub, "enabled", False),
-                               setattr(sub, "disabled_reason", why))
-    sub.describe = lambda: "cal"
-    e._subscan = sub
-    e._compile_subscan_switch()
-    assert e._subscan_enabled
-    e.push_data_enabled = False
-    e._decide_subscan()                           # after the start: disabled, switch untouched
-    assert not sub.enabled and e._subscan_enabled
 
 
 # ---- the source-text snapshot (M0) ------------------------------------------
