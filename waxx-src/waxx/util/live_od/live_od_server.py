@@ -34,6 +34,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from beacon.discovery.server import NetServer
 from waxx.util.comms_server.hardware_id import scoped_server_id
 from waxx.util.live_od.config import get_config
+from waxx.util.live_od.adjust_rules import adjust_range_error
 # Everything the server does to the run's data file (reserve, save, delete) is
 # in live_od/data/run_file.py; this module keeps the protocol and the run state.
 from waxx.util.live_od.data.image_writer import PutItem, writer_queue_stats
@@ -1433,10 +1434,12 @@ class LiveODServer(QThread, NetServer):
             self._adjust_values = {s['key']: s['current_val'] for s in adjust_specs}
         self.adjust_specs_signal.emit(adjust_specs)
         if adjust_specs and save_data:
-            logger.warning(
-                "Adjustable params are active with save_data=True. Values changed "
-                "in the Adjust panel will NOT be reflected in saved data."
-            )
+            # the experiment locks every spec of a saving run (waxx 2026-11-04);
+            # one from before that is locked here, so no saving run is adjusted
+            for s in adjust_specs:
+                if not s.get('locked'):
+                    s['locked'] = 'save_data'
+            logger.info("save_data=True: the Adjust panel is read-only for this run.")
 
         self._note_spawn_token(capture_images)
         self.run_started_signal.emit(run_id, list(run_info_payload.get('xvarnames', [])))
@@ -2692,6 +2695,8 @@ class LiveODServer(QThread, NetServer):
             if key not in self._adjust_values:
                 return {"ok": False, "error": f"Unknown adjust key: {key!r}"}
             spec = next((s for s in self._adjust_specs if s['key'] == key), None)
+            if spec and spec.get('locked'):
+                return {"ok": False, "error": f"{key!r} is read-only ({spec['locked']})"}
             if spec:
                 value = max(spec['min_val'], min(spec['max_val'], float(value)))
                 if spec['dtype'] == 'int':
@@ -2706,16 +2711,21 @@ class LiveODServer(QThread, NetServer):
             spec = next((s for s in self._adjust_specs if s['key'] == key), None)
             if spec is None:
                 return {"ok": False, "error": f"Unknown adjust key: {key!r}"}
+            if spec.get('locked'):
+                return {"ok": False, "error": f"{key!r} is read-only ({spec['locked']})"}
+            # a range that would exclude the current value is refused, never
+            # clamped: narrowing the range must not move a live param
+            error = adjust_range_error(key, self._adjust_values.get(key),
+                                       msg.get('min_val', spec['min_val']),
+                                       msg.get('max_val', spec['max_val']))
+            if error:
+                return {"ok": False, "error": error}
             if 'min_val' in msg:
                 spec['min_val'] = float(msg['min_val'])
             if 'max_val' in msg:
                 spec['max_val'] = float(msg['max_val'])
             if 'step' in msg:
                 spec['step'] = float(msg['step'])
-            # Clamp current value to new bounds
-            current = self._adjust_values.get(key, spec['min_val'])
-            current = max(spec['min_val'], min(spec['max_val'], current))
-            self._adjust_values[key] = current
         return {"ok": True}
 
     def update_adjust_spec(self, key: str, min_val: float, max_val: float, step: float):
@@ -2727,6 +2737,9 @@ class LiveODServer(QThread, NetServer):
     def update_adjust_value(self, key: str, value: float):
         """Update an adjust value from the GUI thread (same process as server)."""
         with self._adjust_lock:
+            spec = next((s for s in self._adjust_specs if s['key'] == key), None)
+            if spec is not None and spec.get('locked'):
+                return
             if key in self._adjust_values:
                 self._adjust_values[key] = float(value)
 

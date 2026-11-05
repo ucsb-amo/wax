@@ -293,6 +293,11 @@ class Expt(Scanner, Dealer, Scribe):
 
         self.init_xvars(shuffle,N_repeats)
 
+        # the Adjust panel's specs, from the params as prepare() left them
+        # (start values, limits widened to them, xvar wins, derived and
+        # save_data rows read-only); before the claim, which sends them
+        self._resolve_adjust_specs(save_data=bool(self.run_info.save_data))
+
         self.data.init()
 
         # Reset per-run shot counter
@@ -310,13 +315,6 @@ class Expt(Scanner, Dealer, Scribe):
             raise RuntimeError(
                 "No liveOD server connection found. "
                 "Start the liveOD GUI before running experiments."
-            )
-
-        if self._adjust_specs and self.run_info.save_data:
-            print(
-                "[adjust] WARNING: adjustable params detected with save_data=True. "
-                "Values changed in the Adjust panel between shots will NOT be reflected "
-                "in saved data."
             )
 
         from waxx.util.device_state import queue_gate
@@ -945,14 +943,28 @@ class Expt(Scanner, Dealer, Scribe):
             print(f"[Monitor] WARNING: could not ask for a monitor restart ({e!r}).")
 
     def apply_pending_adjust_values(self):
-        """Apply any adjust-panel values received from the last SHOT_COMPLETE reply."""
+        """Apply the adjust-panel values received from the last SHOT_COMPLETE reply.
+
+        Only a value changed from the run's start value is applied, so an
+        untouched row never writes its param. A row set back to its start value
+        writes the start value once (undoing the earlier change) and is then
+        left alone again. Locked specs (save_data, derived) and keys that are
+        not this run's specs are never applied."""
         specs = {s.key: s for s in self._adjust_specs}
+        applied = self.__dict__.setdefault('_adjust_applied', set())
         for key, val in self._pending_adjust_values.items():
             spec = specs.get(key)
-            if spec is not None:
-                # values arrive from the GUI as floats -- restore the registered dtype
-                val = spec.coerce(val, like=getattr(self.params, key, None))
-            setattr(self.params, key, val)
+            if spec is None or spec.locked:
+                continue
+            # values arrive from the GUI as floats -- restore the registered dtype
+            val = spec.coerce(val, like=getattr(self.params, key, None))
+            if val != spec.current_val:
+                setattr(self.params, key, val)
+                applied.add(key)
+            elif key in applied:
+                setattr(self.params, key, spec.coerce(spec.current_val,
+                                                      like=getattr(self.params, key, None)))
+                applied.discard(key)
 
     def end_wax(self, expt_filepath,
                 notify=True,

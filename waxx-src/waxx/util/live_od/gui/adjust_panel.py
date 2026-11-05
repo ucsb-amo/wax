@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -43,6 +44,7 @@ from PyQt6.QtWidgets import (
 )
 
 from waxa.units import format_si, mult_for, unit_for_param, unit_options
+from waxx.util.live_od.adjust_rules import adjust_range_error, lock_reason_text
 
 _SCI_RE = re.compile(r'^-?[0-9]*\.?[0-9]*([eE][+-]?[0-9]*)?$')
 
@@ -55,6 +57,7 @@ _SPEC_BUTTON_SIZE = 16
 
 _SETTINGS_ORG, _SETTINGS_APP = "waxx", "liveod"
 _CHANGED_STYLE = "color: #b35c00; font-weight: bold;"
+_LOCKED_STYLE = "color: #888;"
 
 
 def _settings():
@@ -218,11 +221,17 @@ class AdjustParamRow(QWidget):
     The checkbox controls whether this row is included in "Copy params".
     Clicking the key label copies an assignment line prefix for that param.
     The ⚙ button opens the min/max/step dialog.
-    The reset button (↺) reverts to the value present when adjust() was called,
+    The reset button (↺) reverts to the run's start value (the param's value
+    when prepare() finished),
     and is enabled only while the value differs from it.  Right-clicking the row
     opens min/max/step editing and the copy actions.
 
     Values held and emitted here are SI; ``unit`` only scales what is displayed.
+
+    A spec with ``locked`` set (a run that saves data, or a param the per-shot
+    derived recompute overwrites) is shown greyed and read-only: no value,
+    range or reset can be changed from it. A range edit that would exclude the
+    current value is refused rather than clamping the value.
 
     While the spinbox is being typed into, remote value updates (which arrive at
     the start of every shot) are ignored so an in-progress edit is not clobbered;
@@ -245,6 +254,7 @@ class AdjustParamRow(QWidget):
         self._default_val = float(spec['current_val'])
         self._value_si = float(spec['current_val'])
         self._editing = False
+        self.locked = spec.get('locked') or ''
 
         self._unit = '' if self._is_int else self._valid_unit(unit)
         self._mult = mult_for(self._unit)
@@ -332,6 +342,12 @@ class AdjustParamRow(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
         self._refresh_changed()
+        if self.locked:
+            reason = lock_reason_text(self.locked)
+            self._spinbox.setEnabled(False)
+            self._spec_btn.setEnabled(False)
+            self._label.setToolTip(f"{self.key}\n{reason}")
+            self._spinbox.setToolTip(f"{self._spinbox.toolTip()}\n{reason}")
 
     # ------------------------------------------------------------------
     # Units
@@ -412,6 +428,8 @@ class AdjustParamRow(QWidget):
 
     def reset(self):
         """Revert spinbox to the default value."""
+        if self.locked:
+            return
         self._editing = False
         if self._is_int:
             self._spinbox.setValue(int(round(self._default_val)))
@@ -422,6 +440,10 @@ class AdjustParamRow(QWidget):
     def _refresh_changed(self):
         """Highlight the name while the value differs from the default."""
         changed = self.is_changed()
+        if self.locked:
+            self._label.setStyleSheet(_LOCKED_STYLE)
+            self._reset_btn.setEnabled(False)
+            return
         self._label.setStyleSheet(_CHANGED_STYLE if changed else "")
         self._reset_btn.setEnabled(changed)
 
@@ -433,8 +455,9 @@ class AdjustParamRow(QWidget):
     def _show_context_menu(self, pos):
         menu = QMenu(self)
         edit_action  = menu.addAction("Edit min / max / step…")
+        edit_action.setEnabled(not self.locked)
         reset_action = menu.addAction("Reset to default")
-        reset_action.setEnabled(self.is_changed())
+        reset_action.setEnabled(self.is_changed() and not self.locked)
         menu.addSeparator()
         prefix_action = menu.addAction("Copy assignment prefix")
         line_action   = menu.addAction("Copy assignment line")
@@ -515,12 +538,30 @@ class AdjustParamRow(QWidget):
         self._refresh_changed()
 
     def edit_spec(self):
-        """Open the min/max/step dialog and publish the result."""
+        """Open the min/max/step dialog and publish the result.
+
+        A range that excludes the current value is refused (with a message)
+        and nothing changes; the value is never clamped into a new range."""
+        if self.locked:
+            return
         dlg = AdjustSpecDialog(self.spec, self, unit=self._unit)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             min_v, max_v, step = dlg.get_values()
-            self.apply_spec(min_v, max_v, step)
-            self.spec_updated.emit(self.key, min_v, max_v, step)
+            if not self.try_spec(min_v, max_v, step):
+                QMessageBox.warning(self, "Adjust range refused", self.last_spec_error)
+
+    def try_spec(self, min_val: float, max_val: float, step: float) -> bool:
+        """Apply and publish a new SI range if it keeps the current value inside
+        it; else leave everything as it was, set ``last_spec_error`` and return
+        False."""
+        self.last_spec_error = adjust_range_error(self.key, self._value_si, min_val, max_val)
+        if self.locked:
+            self.last_spec_error = f"{self.key}: {lock_reason_text(self.locked)}"
+        if self.last_spec_error:
+            return False
+        self.apply_spec(min_val, max_val, step)
+        self.spec_updated.emit(self.key, min_val, max_val, step)
+        return True
 
 
 class AdjustPanel(QWidget):
@@ -600,7 +641,14 @@ class AdjustPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(4)
+        # shown when the run locks every row (save_data=True)
+        self._lock_banner = QLabel("")
+        self._lock_banner.setWordWrap(True)
+        self._lock_banner.setStyleSheet("color: #8a6d00; background: #fff4cc; padding: 3px;")
+        self._lock_banner.hide()
+
         outer.addLayout(bar)
+        outer.addWidget(self._lock_banner)
         outer.addWidget(self._empty_label)
         outer.addWidget(scroll)
         self._scroll = scroll
@@ -647,6 +695,11 @@ class AdjustPanel(QWidget):
             row.set_checked(self._checked_state.get(key, True))
             self._rows[key] = row
             self._row_layout.addWidget(row)
+        save_locked = [r for r in self._rows.values() if r.locked == "save_data"]
+        if save_locked:
+            self._lock_banner.setText(lock_reason_text("save_data")
+                                      + " (values shown are the run's).")
+        self._lock_banner.setVisible(bool(save_locked))
         self._update_check_all_button()
         self._apply_filter(self._filter_box.text())
         self._update_empty_state()
