@@ -5,6 +5,7 @@ from artiq.coredevice.ad9910 import _AD9910_REG_FTW, _AD9910_REG_PROFILE0
 from artiq.coredevice import ad9910
 from artiq.coredevice import spi2 as spi
 from artiq.coredevice import urukul
+from artiq.coredevice.rtio import rtio_output
 from artiq.experiment import TArray, TFloat, TTuple, parallel, TInt64
 from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
@@ -23,9 +24,17 @@ TWOPI = 2*np.pi
 DDS0_IDX = 0
 DDS1_IDX = 1
 
+# Who moves when the two-photon frequency changes.
+RAMAN_AO_BOTH = 0   # both AOs, in the ratio of their centre frequencies
+RAMAN_AO_SINGLE = 1 # only the AO with the larger centre frequency, about a fixed reference
+
 class RamanBeamPair():
     kernel_invariants = {
-        "_sysclk_per_mu"
+        "_sysclk_per_mu",
+        "_ao_mode", "_ao_moving", "_ao_uses0", "_ao_uses1",
+        "_ao_ref_f0", "_ao_ref_f1", "_ao_ref_delta",
+        "_fw_on", "_fw_cfg_target", "_fw_data_target", "_fw_io_target", "_fw_cfg8", "_fw_cfg32",
+        "_fw_addr", "_fw_ref_mu", "_fw_xfer8_mu", "_fw_xfer32_mu", "_fw_ref_ftw", "_fw_ftw_per_delta",
     }
     def __init__(self,
                  dds0:DDS,
@@ -94,6 +103,112 @@ class RamanBeamPair():
         self._phi0_mu = np.int64(0)
         self._phi1_mu = np.int64(0)
 
+        self._ao_mode = RAMAN_AO_BOTH
+        self._ao_moving = DDS0_IDX if self._frequency_center_0 >= self._frequency_center_1 else DDS1_IDX
+        self._ao_uses0 = np.int32(1)
+        self._ao_uses1 = np.int32(1)
+        self._ao_ref_f0 = 0.
+        self._ao_ref_f1 = 0.
+        self._ao_ref_delta = 0.
+
+        self._fw_on = np.int32(0)
+        self._fw_cfg_target = np.int32(0)
+        self._fw_data_target = np.int32(0)
+        self._fw_io_target = np.int32(0)
+        self._fw_cfg8 = np.int32(0)
+        self._fw_cfg32 = np.int32(0)
+        self._fw_addr = np.int32(0)
+        self._fw_ref_mu = np.int64(0)
+        self._fw_xfer8_mu = np.int64(0)
+        self._fw_xfer32_mu = np.int64(0)
+        self._fw_ref_ftw = np.int32(0)
+        self._fw_ftw_per_delta = 0.
+
+    def prepare_direct_fast_path(self):
+        """Host-side: compute once what the fast update otherwise recomputes every step, for the one
+        moving DDS of RAMAN_AO_SINGLE. The SPI config words, targets and transfer lengths come from
+        the same expressions as spi2.SPIMaster.set_config_mu and update_xfer_duration_mu, so the
+        events on the wire are the same; only the wrappers are skipped. The FTW is the reference
+        word plus a scaled offset, which can differ from the full float path by 1 LSB (.23 Hz).
+        """
+        if self._ao_mode != RAMAN_AO_SINGLE:
+            raise ValueError("the direct fast path is for RAMAN_AO_SINGLE")
+        dds = self.dds0 if self._ao_moving == DDS0_IDX else self.dds1
+        dev = dds.dds_device
+        bus = dev.bus
+        div = urukul.SPIT_DDS_WR
+
+        def config_word(flags, length):
+            return np.int32(flags | ((length - 1) << 8) | ((div - 2) << 16) | (dev.chip_select << 24))
+
+        def xfer_mu(length):
+            return np.int64(((length + 1) * div + 1) * bus.ref_period_mu)
+
+        self._fw_cfg_target = np.int32((bus.channel << 8) | spi.SPI_CONFIG_ADDR)
+        self._fw_data_target = np.int32((bus.channel << 8) | spi.SPI_DATA_ADDR)
+        self._fw_io_target = np.int32(dev.cpld.io_update.target_o)
+        self._fw_cfg8 = config_word(urukul.SPI_CONFIG, 8)
+        self._fw_cfg32 = config_word(urukul.SPI_CONFIG | spi.SPI_END, 32)
+        self._fw_addr = np.int32(_AD9910_REG_FTW << 24)
+        self._fw_ref_mu = np.int64(bus.ref_period_mu)
+        self._fw_xfer8_mu = xfer_mu(8)
+        self._fw_xfer32_mu = xfer_mu(32)
+
+        a0, a1 = self.dds0.aom_order, self.dds1.aom_order
+        if a0 * a1 > 0:
+            c0 = float(self._frequency_diff_sign)
+        else:
+            c0 = 1.
+        if self._ao_moving == DDS0_IDX:
+            f_ref, sign = self._ao_ref_f0, c0
+        else:
+            f_ref, sign = self._ao_ref_f1, -c0 * a0 * a1
+        self._fw_ref_ftw = np.int32(round(dev.ftw_per_hz * f_ref))
+        self._fw_ftw_per_delta = float(dev.ftw_per_hz * sign / 2)
+        self._fw_on = np.int32(1)
+        self.p.raman_fast_direct = 1
+
+    def set_ao_mode(self, mode, frequency_reference=None):
+        """Host-side, in prepare(), after the params are final; the kernel compiles it in.
+
+        RAMAN_AO_BOTH (the default) is the split the pair has always used. RAMAN_AO_SINGLE moves
+        only the AO with the larger centre frequency, so a fast update writes one DDS.
+
+        The single mode is anchored at frequency_reference (Hz, a two-photon frequency): both AOs
+        sit there exactly where RAMAN_AO_BOTH puts them, the static AO stays, and only a change
+        away from it goes on the moving AO. Without the anchor the static AO would sit at its
+        centre frequency, megahertz away from the both-AO split, which would move each beam's
+        absolute frequency and with it the Rabi rate and the light shift.
+
+        Call before finish_prepare: the mode and reference are written to the params, so the run
+        file records them. A file without p.raman_ao_mode ran RAMAN_AO_BOTH.
+        """
+        self._fw_on = np.int32(0)
+        self.p.raman_fast_direct = 0
+        if mode == RAMAN_AO_BOTH:
+            self._ao_mode = RAMAN_AO_BOTH
+            self._ao_uses0 = np.int32(1)
+            self._ao_uses1 = np.int32(1)
+            self.p.raman_ao_mode = RAMAN_AO_BOTH
+            self.p.frequency_raman_ao_reference = 0.
+            return
+        if mode != RAMAN_AO_SINGLE:
+            raise ValueError(f"unknown AO mode {mode}")
+        if frequency_reference is None or not frequency_reference > 0.:
+            raise ValueError("RAMAN_AO_SINGLE needs a frequency_reference > 0 (Hz)")
+        self._ao_mode = RAMAN_AO_BOTH
+        saved = self._dummy.copy()
+        try:
+            self._ao_ref_f0, self._ao_ref_f1 = self.state_splitting_to_ao_frequency(float(frequency_reference))
+        finally:
+            self._dummy[:] = saved
+        self._ao_ref_delta = float(frequency_reference)
+        self._ao_mode = RAMAN_AO_SINGLE
+        self._ao_uses0 = np.int32(1 if self._ao_moving == DDS0_IDX else 0)
+        self._ao_uses1 = np.int32(1 if self._ao_moving == DDS1_IDX else 0)
+        self.p.raman_ao_mode = RAMAN_AO_SINGLE
+        self.p.frequency_raman_ao_reference = float(frequency_reference)
+
     @kernel
     def get_t(self):
         self.t_timeline[self.t_idx] = now_mu()
@@ -159,8 +274,19 @@ class RamanBeamPair():
 
         df_1 = df_0 * f
 
-        f0 = fc0 + c0 * df_0
-        f1 = fc1 - c0 * a0 * a1 * df_1
+        if self._ao_mode == RAMAN_AO_SINGLE:
+            # the same invariant as the split above (2 * sgn * (f0 - f1), or 2 * (f0 + f1), is the
+            # transition frequency), reached by moving one AO from the reference pair
+            d = (delta - self._ao_ref_delta) / 2
+            if self._ao_moving == DDS0_IDX:
+                f0 = self._ao_ref_f0 + c0 * d
+                f1 = self._ao_ref_f1
+            else:
+                f0 = self._ao_ref_f0
+                f1 = self._ao_ref_f1 - c0 * a0 * a1 * d
+        else:
+            f0 = fc0 + c0 * df_0
+            f1 = fc1 - c0 * a0 * a1 * df_1
 
         self._dummy[DDS0_IDX] = f0
         self._dummy[DDS1_IDX] = f1
@@ -349,10 +475,19 @@ class RamanBeamPair():
         # Stage 8-bit header-write config for the next FTW transaction.
         if self._fast_freq_addr_pending0 == 1 or self._fast_freq_addr_pending1 == 1:
             self._invalidate_fast_frequency_update_state()
-        with parallel:
+        if self._ao_uses0 == 1 and self._ao_uses1 == 1:
+            with parallel:
+                self.dds0.dds_device.bus.set_config_mu(
+                    urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+                )
+                self.dds1.dds_device.bus.set_config_mu(
+                    urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+                )
+        elif self._ao_uses0 == 1:
             self.dds0.dds_device.bus.set_config_mu(
                 urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
             )
+        else:
             self.dds1.dds_device.bus.set_config_mu(
                 urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
             )
@@ -371,28 +506,53 @@ class RamanBeamPair():
             return
 
         self._fast_freq_stage_valid = np.int32(0)
-        with parallel:
-            with sequential:
-                self.dds0.dds_device.bus.set_config_mu(
-                    urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
-                )
-                self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
-                self.dds0.dds_device.bus.set_config_mu(
-                    urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
-                )
-            with sequential:
-                self.dds1.dds_device.bus.set_config_mu(
-                    urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
-                )
-                self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
-                self.dds1.dds_device.bus.set_config_mu(
-                    urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
-                )
+        if self._fw_on == 1:
+            # the same three events as the elif branches below, words computed in prepare_direct_fast_path
+            rtio_output(self._fw_cfg_target, self._fw_cfg8)
+            delay_mu(self._fw_ref_mu)
+            rtio_output(self._fw_data_target, self._fw_addr)
+            delay_mu(self._fw_xfer8_mu)
+            rtio_output(self._fw_cfg_target, self._fw_cfg32)
+            delay_mu(self._fw_ref_mu)
+        elif self._ao_uses0 == 1 and self._ao_uses1 == 1:
+            with parallel:
+                with sequential:
+                    self.dds0.dds_device.bus.set_config_mu(
+                        urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+                    )
+                    self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                    self.dds0.dds_device.bus.set_config_mu(
+                        urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+                    )
+                with sequential:
+                    self.dds1.dds_device.bus.set_config_mu(
+                        urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+                    )
+                    self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                    self.dds1.dds_device.bus.set_config_mu(
+                        urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+                    )
+        elif self._ao_uses0 == 1:
+            self.dds0.dds_device.bus.set_config_mu(
+                urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+            )
+            self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
+            self.dds0.dds_device.bus.set_config_mu(
+                urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+            )
+        else:
+            self.dds1.dds_device.bus.set_config_mu(
+                urukul.SPI_CONFIG, 8, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+            )
+            self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
+            self.dds1.dds_device.bus.set_config_mu(
+                urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+            )
         self._fast_freq_pending_token = np.int32(self._fast_freq_event_token)
-        self._fast_freq_addr_pending0 = np.int32(1)
-        self._fast_freq_addr_pending1 = np.int32(1)
-        self._aggressive_config_pending0 = np.int32(1)
-        self._aggressive_config_pending1 = np.int32(1)
+        self._fast_freq_addr_pending0 = self._ao_uses0
+        self._fast_freq_addr_pending1 = self._ao_uses1
+        self._aggressive_config_pending0 = self._ao_uses0
+        self._aggressive_config_pending1 = self._ao_uses1
 
     @kernel
     def _finish_pending_fast_frequency_update(self):
@@ -424,6 +584,12 @@ class RamanBeamPair():
         self._aggressive_config_pending0 = np.int32(0)
         self._aggressive_config_pending1 = np.int32(0)
         self._restore_default_profile_mode()
+        if self._fw_on == 1:
+            # the direct path skips the conversion back to Hz; the cached frequency is caught up here
+            self._new_f0 = self.dds0.dds_device.ftw_to_frequency(self.dds0._ftw)
+            self._new_f1 = self.dds1.dds_device.ftw_to_frequency(self.dds1._ftw)
+            self.dds0.frequency = self._new_f0
+            self.dds1.frequency = self._new_f1
 
     @kernel
     def io_update(self) -> TTuple([TInt64, TInt64]):
@@ -432,22 +598,39 @@ class RamanBeamPair():
         dt0 = int64(self.dds0.dds_device.sync_data.io_update_delay)
         dt1 = int64(self.dds1.dds_device.sync_data.io_update_delay)
 
-        with parallel:
-            with sequential:
+        if self._fw_on == 1:
+            if self._ao_uses0 == 1:
                 delay_mu(dt0)
-                self.dds0.dds_device.cpld.io_update.pulse_mu(8)
-                
-            with sequential:
+            else:
                 delay_mu(dt1)
-                self.dds1.dds_device.cpld.io_update.pulse_mu(8)
-                
+            rtio_output(self._fw_io_target, 1)
+            delay_mu(int64(8))
+            rtio_output(self._fw_io_target, 0)
+        elif self._ao_uses0 == 1 and self._ao_uses1 == 1:
+            with parallel:
+                with sequential:
+                    delay_mu(dt0)
+                    self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+
+                with sequential:
+                    delay_mu(dt1)
+                    self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+        elif self._ao_uses0 == 1:
+            delay_mu(dt0)
+            self.dds0.dds_device.cpld.io_update.pulse_mu(8)
+        else:
+            delay_mu(dt1)
+            self.dds1.dds_device.cpld.io_update.pulse_mu(8)
+
         at_mu(now_mu() & ~7)
 
-        self.dds0.frequency = self._new_f0
+        if self._fw_on == 0:
+            # the direct path never computes _new_f*; clean_up_fast_frequency_update catches these up
+            self.dds0.frequency = self._new_f0
+            self.dds1.frequency = self._new_f1
         self.dds0._ftw = self._new_ftw0
         # self.dds0.update_phase_at_set()
 
-        self.dds1.frequency = self._new_f1
         self.dds1._ftw = self._new_ftw1
         # self.dds1.update_phase_at_set()
 
@@ -493,6 +676,11 @@ class RamanBeamPair():
     def _write_ftw_fast(self, ftw0, ftw1, do_io_update=True):
         # Shared hot path for fast FTW updates of both DDSes. Programs the exact
         # integer FTW words (no SI round-trip) via the staged SPI path.
+        # RAMAN_AO_SINGLE: the static DDS is not written, so its word stays what the chip holds.
+        if self._ao_uses0 == 0:
+            ftw0 = self.dds0._ftw
+        if self._ao_uses1 == 0:
+            ftw1 = self.dds1._ftw
         self.dds0._last_ftw = self.dds0._ftw
         self.dds1._last_ftw = self.dds1._ftw
 
@@ -506,19 +694,25 @@ class RamanBeamPair():
         # Aggressive: only write data + io_update if address and config pre-staged.
         use_aggressive = (
             self._fast_freq_aggressive_enabled == 1 and
-            self._fast_freq_addr_pending0 == 1 and
-            self._fast_freq_addr_pending1 == 1 and
-            self._aggressive_config_pending0 == 1 and
-            self._aggressive_config_pending1 == 1 and
+            self._fast_freq_addr_pending0 == self._ao_uses0 and
+            self._fast_freq_addr_pending1 == self._ao_uses1 and
+            self._aggressive_config_pending0 == self._ao_uses0 and
+            self._aggressive_config_pending1 == self._ao_uses1 and
             self._fast_freq_pending_token == self._fast_freq_event_token
         )
 
+        both = self._ao_uses0 == 1 and self._ao_uses1 == 1
         if use_aggressive:
-            with parallel:
-                with sequential:
-                    self.dds0.dds_device.bus.write(ftw0)
-                with sequential:
-                    self.dds1.dds_device.bus.write(ftw1)
+            if both:
+                with parallel:
+                    with sequential:
+                        self.dds0.dds_device.bus.write(ftw0)
+                    with sequential:
+                        self.dds1.dds_device.bus.write(ftw1)
+            elif self._ao_uses0 == 1:
+                self.dds0.dds_device.bus.write(ftw0)
+            else:
+                self.dds1.dds_device.bus.write(ftw1)
             self.reset_fast_frequency_update_stage()
         else:
             if self._fast_freq_addr_pending0 == 1 or self._fast_freq_addr_pending1 == 1:
@@ -526,19 +720,32 @@ class RamanBeamPair():
             if self._fast_freq_stage_valid == 0:
                 self.stage_ffu()
 
-            with parallel:
-                with sequential:
-                    self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
-                    self.dds0.dds_device.bus.set_config_mu(
-                        urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
-                    )
-                    self.dds0.dds_device.bus.write(ftw0)
-                with sequential:
-                    self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
-                    self.dds1.dds_device.bus.set_config_mu(
-                        urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
-                    )
-                    self.dds1.dds_device.bus.write(ftw1)
+            if both:
+                with parallel:
+                    with sequential:
+                        self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                        self.dds0.dds_device.bus.set_config_mu(
+                            urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+                        )
+                        self.dds0.dds_device.bus.write(ftw0)
+                    with sequential:
+                        self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                        self.dds1.dds_device.bus.set_config_mu(
+                            urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+                        )
+                        self.dds1.dds_device.bus.write(ftw1)
+            elif self._ao_uses0 == 1:
+                self.dds0.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                self.dds0.dds_device.bus.set_config_mu(
+                    urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds0.dds_device.chip_select
+                )
+                self.dds0.dds_device.bus.write(ftw0)
+            else:
+                self.dds1.dds_device.bus.write(_AD9910_REG_FTW << 24)
+                self.dds1.dds_device.bus.set_config_mu(
+                    urukul.SPI_CONFIG | spi.SPI_END, 32, urukul.SPIT_DDS_WR, self.dds1.dds_device.chip_select
+                )
+                self.dds1.dds_device.bus.write(ftw1)
             self._fast_freq_stage_valid = np.int32(0)
 
         if do_io_update:
@@ -556,6 +763,32 @@ class RamanBeamPair():
                  do_io_update=True):
 
         self.frequency_transition = frequency_transition
+
+        if self._fw_on == 1:
+            # the moving DDS only; no float round trip for the static word or back to Hz
+            ftw = self._fw_ref_ftw + int32(round(self._fw_ftw_per_delta * (frequency_transition - self._ao_ref_delta)))
+            ready = (self._fast_freq_aggressive_enabled == 1 and
+                     self._fast_freq_addr_pending0 == self._ao_uses0 and
+                     self._fast_freq_addr_pending1 == self._ao_uses1 and
+                     self._aggressive_config_pending0 == self._ao_uses0 and
+                     self._aggressive_config_pending1 == self._ao_uses1 and
+                     self._fast_freq_pending_token == self._fast_freq_event_token)
+            if ready:
+                self.dds0._last_ftw = self.dds0._ftw
+                self.dds1._last_ftw = self.dds1._ftw
+                if self._ao_uses0 == 1:
+                    self._new_ftw0 = ftw
+                    self._new_ftw1 = self.dds1._ftw
+                else:
+                    self._new_ftw0 = self.dds0._ftw
+                    self._new_ftw1 = ftw
+                at_mu(now_mu() & ~7)
+                rtio_output(self._fw_data_target, ftw)
+                delay_mu(self._fw_xfer32_mu)
+                self.reset_fast_frequency_update_stage()
+                if do_io_update:
+                    self.io_update()
+                return
 
         self.state_splitting_to_ao_frequency(frequency_transition)
         f0 = self._dummy[DDS0_IDX]

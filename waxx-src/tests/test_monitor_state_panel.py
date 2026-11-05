@@ -92,23 +92,25 @@ def bar_texts(panel) -> str:
 def test_renders_monitor_trust_fence_no_connections_no_slm(panel):
     panel.set_state(dict(STATUS, run_pending=dict(STATUS["run_pending"],
                                                   since=time.time() - 12.2)))
-    assert panel.monitor_pill.text() == "NOT READY"
+    assert panel.headline.text() == "Live control paused: Run 85602 (rabi) started and has " \
+                                    "not ended"
     assert "interrupted by run" in panel.monitor_line.text()
-    assert "UNTRUSTED" in panel.trust_banner.text()
+    assert "may not match" in panel.trust_banner.text()
     assert "took the core" in panel.trust_banner.toolTip()
     assert "took the core" in panel.trust_line.text()
     fence = panel.fence_line.text()
-    assert "run 85602 (rabi) from kong" in fence and "held 12 s" in fence
-    assert "NOT_READY, so it does not lapse" in fence
-    assert panel.trust_chip.text() == "state UNTRUSTED"
-    assert panel.fence_chip.text() == "fence: run 85602" and not panel.fence_chip.isHidden()
+    assert "Run 85602 (rabi) from kong" in fence and "12 s ago" in fence
+    assert "stays until the run ends" in fence
+    # a run has the machine: nothing to act on in the bar
+    assert panel.monitor_button.isHidden() and panel.trust_chip.isHidden()
+    assert not hasattr(panel, "fence_chip")
     # user 2026-10-21: the SLM lease and the tweezer AWG connection are not shown
     for gone in ("conn_rows", "conn_chips", "slm_chip", "slm_line", "no_conn", "loop_chips"):
         assert not hasattr(panel, gone), gone
     texts = bar_texts(panel) + "\n" + "\n".join(
         w.text() for w in panel.details.findChildren(__import__("PyQt6.QtWidgets").QtWidgets.QLabel))
     assert "SLM" not in texts and "AWG" not in texts and "reinit" not in texts
-    assert panel.sequences_chip.text() == "BEC TOF loop: running"
+    assert panel.sequences_chip.text() == "BEC TOF loop running"
     card = panel.sequences.loop_cards["auto_tof"]
     assert card.pill.text() == "RUNNING" and "owner person" in card.status.text()
 
@@ -117,17 +119,22 @@ def test_trusted_ready_no_fence(panel):
     panel.set_state(dict(STATUS, state=0, state_name="READY", sub_state="running",
                          trust={"trusted": True, "reason": "end state of run 85601",
                                 "since": NOW}, run_pending=None, connections={}))
-    assert panel.monitor_pill.text() == "READY"
-    assert panel.trust_banner.text() == "Device state trusted."
-    assert panel.fence_line.text().startswith("No run fence")
+    assert panel.headline.text() == "Live control ready"
+    assert panel.monitor_button.isHidden() and panel.trust_chip.isHidden()
+    assert panel.monitor_action.text() == "Restart live control"
+    assert panel.trust_banner.text() == "No known mismatch with the hardware."
+    assert panel.fence_line.text() == "" and panel.fence_line.isHidden()
+    assert panel.fence_head.isHidden()
     assert msp.fence_text({"run_id": 1, "since": NOW - 5}, "READY", NOW).endswith(
-        "it lapses if the run never takes the core.")
+        "dropped by itself if the run never starts.")
 
 
 def test_unreachable(panel):
     panel.set_state(dict(STATUS))
     panel.set_state(None)
-    assert panel.monitor_pill.text() == "?" and "not answering" in panel.monitor_line.text()
+    assert panel.headline.text() == "Monitor server not answering"
+    assert "not answering" in panel.monitor_line.text()
+    assert panel.monitor_button.isHidden() and not panel.monitor_action.isEnabled()
     assert not panel.sequences.reachable
 
 
@@ -148,9 +155,9 @@ def test_loop_start_and_stop_go_through_the_requester_as_a_person(panel):
 def test_broadcasts_update_at_once(panel):
     panel.set_state(dict(STATUS))
     panel.on_broadcast({"type": "trust", "trust": {"trusted": True, "reason": "ok"}})
-    assert panel.trust_banner.text() == "Device state trusted."
+    assert panel.trust_banner.text() == "No known mismatch with the hardware."
     panel.on_broadcast({"type": "run_pending", "run_pending": None})
-    assert panel.fence_line.text().startswith("No run fence")
+    assert panel.fence_line.text() == ""
     panel.on_broadcast({"type": "connections", "connections": {"awg": dict(
         STATUS["connections"]["awg"], state="connected", detail="")}})
     panel.on_broadcast({"type": "slm_reinit", "slm_reinit": dict(STATUS["slm_reinit"],
@@ -159,7 +166,7 @@ def test_broadcasts_update_at_once(panel):
     panel.on_broadcast({"type": "run_loop", "loop": dict(LOOP, state="stopped", ended=NOW,
                                                          text="stopped")})
     assert panel.sequences.loop_cards["auto_tof"].pill.text() == "stopped"
-    assert panel.sequences_chip.text() == "idle"
+    assert panel.sequences_chip.text() == ""
     assert "BEC TOF loop: stopped" in panel.sequences_chip.toolTip()
     assert panel._journal_soon.isActive()                         # the journal, shortly
 
@@ -250,10 +257,10 @@ def window(qapp, monkeypatch, tmp_path):
     assert w.spawner.calls == []
 
 
-def test_the_window_is_one_page_with_the_monitor_pill_in_the_bar(window, qapp):
+def test_the_window_is_one_page_with_its_monitor_button_in_the_bar(window, qapp):
     assert not hasattr(window, "tabs")
     assert window.state_panel.bar.isAncestorOf(window.status_indicator)
-    assert window.state_panel.monitor_pill is window.status_indicator
+    assert window.state_panel.monitor_button is window.status_indicator
     assert window.isAncestorOf(window.queue_panel)
     # the existing content still works: NOT READY -> click starts the monitor
     assert window.status_indicator.text() == "NOT READY"
@@ -267,7 +274,7 @@ def test_the_window_feeds_its_panels_by_direct_calls(window, qapp):
     window.poll_status()
     qp, sp = window.queue_panel, window.state_panel
     assert qp.reachable and qp.has_queue and qp.queue_state() == "idle"
-    assert sp.monitor_pill.text() == "NOT READY"
+    assert sp.monitor_button.text() == "NOT READY"
     assert window.direct_request({"type": "run_queue", "action": "list"})["status"] == "ok"
     # a hold put on from the panel reaches the server, and its broadcast the panel
     qp.ask_text = lambda *a, **k: "aligning"
@@ -373,13 +380,62 @@ def test_a_loop_chip_names_the_running_loops_category(panel):
                 text="started by run queue@kong")
     panel.set_state(dict(STATUS, run_loops={"auto_tof": loop}))
     chip = panel.sequences_chip
-    assert chip.text() == "BEC TOF loop: running · holds"
+    assert chip.text() == "BEC TOF loop running"
     assert "agents' queued jobs wait behind it" in chip.toolTip()
     assert "Owner: queue (for person)" in chip.toolTip()
     panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(loop, category="yields")}))
-    assert chip.text() == "BEC TOF loop: running · yields"
+    assert chip.text() == "BEC TOF loop running"
     assert "an agent's queued job stops it" in chip.toolTip()
     panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(loop, state="stopped")}))
-    assert chip.text() == "idle"                          # nothing active
+    assert chip.text() == "" and chip.isHidden()          # nothing active
     assert "BEC TOF loop: stopped" in chip.toolTip()      # not running: no category
     assert "· yields" not in chip.toolTip() and "· holds" not in chip.toolTip()
+
+
+QUEUED = {"state": "running", "text": "job 2598 (rabi) running, run 90528",
+          "current": {"id": 2598, "label": "rabi", "state": "running", "run_id": 90528}}
+
+
+def test_a_queue_run_is_one_sentence_and_nothing_to_press(panel):
+    """Normal data-taking is not an alarm: the screenshot of 2026-10-31 had a
+    red pill, a red chip and an amber one for this."""
+    panel.set_monitor_clickable(True)
+    panel.set_state(dict(STATUS, run_queue=QUEUED))
+    assert panel.headline.text() == "Live control paused"     # the queue's line names it
+    assert panel.dot.styleSheet().startswith(f"color: {msp._DOT_COLOR['run']}")
+    assert panel.monitor_button.isHidden() and panel.trust_chip.isHidden()
+    # Start anyway stays on the menu, behind its question
+    assert panel.monitor_action.text() == "Start live control"
+    assert panel.monitor_action.isEnabled()
+
+
+def test_a_job_with_no_run_id_yet_is_starting(panel):
+    queued = dict(QUEUED, current={"id": 7, "label": "tof", "state": "launching"})
+    panel.set_state(dict(STATUS, run_queue=queued))
+    assert panel.headline.text() == "Live control paused"
+    assert panel.run_text() == "Job 7 (tof) starting"
+
+
+def test_off_with_no_run_offers_start_and_says_what_may_be_wrong(panel):
+    panel.set_monitor_clickable(True)
+    panel.set_state(dict(STATUS, run_pending=None, run_queue={"state": "idle"}))
+    assert panel.headline.text() == "Live control off: a run took over"
+    assert not panel.monitor_button.isHidden() and panel.monitor_button.isEnabled()
+    assert panel.monitor_button.text() == "Start live control"
+    assert not panel.trust_chip.isHidden()
+    assert "took the core" in panel.trust_chip.toolTip()
+
+
+def test_a_run_announced_while_live_control_is_ready_puts_it_on_hold(panel):
+    panel.set_state(dict(STATUS, state=0, state_name="READY", sub_state="running",
+                         run_queue={"state": "idle"}))
+    assert panel.headline.text().startswith("Live control on hold: Run 85602 (rabi)")
+
+
+def test_the_loop_the_queue_stopped_shows_beside_loops(panel):
+    resume = {"key": "auto_tof", "since": NOW}
+    panel.set_state(dict(STATUS, run_loops={"auto_tof": dict(LOOP, state="stopped")},
+                         run_queue={"state": "running", "resume_loop": resume}))
+    chip = panel.sequences_chip
+    assert chip.text() == "BEC TOF loop waiting for the queue" and not chip.isHidden()
+    assert "starts it again when it has run out" in chip.toolTip()

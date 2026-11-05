@@ -121,7 +121,6 @@ ERR_TEXT = "#ff6b6b"
 HAZARD = "#ff5252"
 HAZARD_FILL = "#5c1f1f"
 DIRTY_FILL = "#4d3a1f"
-ON_FILL = "#2f4a3a"
 CHIP_BG = "#2e2e2e"
 CHIP_BORDER = "#4c4c4c"
 
@@ -213,14 +212,12 @@ def _pill_button_css(color: str, border: str, background: str = theme.BG_BUTTON)
 
 
 def _state_pill_css(level: str) -> str:
-    """The state pill is a button; disabled it looks the same (it still
-    shows the state), only the hover outline is gone."""
+    """The state pill only shows the state: a disabled button, drawn as one
+    that is not."""
     bg = _PILL_BG.get(level, "#454545")
     base = (f"background: {bg}; color: white; border: 1px solid {bg}; border-radius: 9px;"
             f" padding: 2px 10px; font-size: 12px; font-weight: 600;")
-    return (f"QPushButton {{ {base} }}"
-            f"QPushButton:hover {{ border-color: {theme.FG_STRONG}; }}"
-            f"QPushButton:disabled {{ {base} }}")
+    return f"QPushButton {{ {base} }}QPushButton:disabled {{ {base} }}"
 
 
 def _lamp_button_css(border: str) -> str:
@@ -851,8 +848,10 @@ class _Lamp(QLabel):
 
 
 class _LampButton(QPushButton):
-    """A lamp that is a button: coloured dot, name, state word, as a chip.
-    What a click does is the card's business (``CompositeCard._lamp_clicked``).
+    """A lamp that is a button, as a chip: coloured dot (the state) and what a
+    click does -- the device's parts together, for quick control.  With no
+    click: name and state word.  What a click does is the card's business
+    (``CompositeCard._lamp_clicked``).
     The rich text sits in a label the clicks pass through, because a
     QPushButton cannot colour parts of its own text."""
 
@@ -886,7 +885,7 @@ class _LampButton(QPushButton):
             self.setStyleSheet(css)
 
     def set_state(self, label: str, on: bool | None, on_text: str, off_text: str,
-                  on_level: str, tooltip: str = "") -> None:
+                  on_level: str, tooltip: str = "", action: str = "") -> None:
         if on is None:
             color, word = theme.FG_DISABLED, "?"
         elif on:
@@ -894,8 +893,9 @@ class _LampButton(QPushButton):
         else:
             color, word = theme.OFF, off_text
         word_color = color if on else theme.FG_MUTED
-        text = (f"<span style='color:{color}'>●</span> {label} "
-                f"<span style='color:{word_color}'>{word}</span>")
+        text = (f"<span style='color:{color}'>●</span> "
+                + (f"<span style='color:{theme.FG}'>{action}</span>" if action else
+                   f"{label} <span style='color:{word_color}'>{word}</span>"))
         if text != self._label.text():
             self._label.setText(text)
             self.updateGeometry()
@@ -927,8 +927,9 @@ class _HoverWatcher(QObject):
 
 
 class CompositeCard(QFrame):
-    """One device: header (collapse, title, state pill, ⋯), chips, rows,
-    watchdog line, footer."""
+    """One device: header (collapse, title, state pill, while collapsed a button
+    for the op it would most likely want, ⋯), chips, rows, watchdog line,
+    footer."""
 
     def __init__(self, panel: "CompositePanel", device: cmp.CompositeDevice):
         super().__init__()
@@ -1002,8 +1003,14 @@ class CompositeCard(QFrame):
         self.state_pill = QPushButton("")
         self.state_pill.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.state_pill.setStyleSheet(_state_pill_css("unknown"))
-        self.state_pill.clicked.connect(self._pill_clicked)
+        self.state_pill.setEnabled(False)
         head.addWidget(self.state_pill)
+        self.quick_button = QPushButton("")
+        self.quick_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.quick_button.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
+        self.quick_button.clicked.connect(self._quick_clicked)
+        self.quick_button.hide()
+        head.addWidget(self.quick_button)
         head.addWidget(self._menu_button())
         box.addLayout(head)
 
@@ -1150,9 +1157,9 @@ class CompositeCard(QFrame):
         line.setSpacing(6)
         self.watchdog_label = _small("")
         line.addWidget(self.watchdog_label, 1)
-        self.watchdog_arm = QPushButton("Arm watchdog")
+        self.watchdog_arm = QPushButton("Auto turn-off")
         self.watchdog_extend = QPushButton("Keep on")
-        self.watchdog_disarm = QPushButton("Disarm")
+        self.watchdog_disarm = QPushButton("Cancel auto turn-off")
         for b in (self.watchdog_arm, self.watchdog_extend, self.watchdog_disarm):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setStyleSheet(_pill_button_css(theme.FG, theme.BORDER))
@@ -1283,6 +1290,7 @@ class CompositeCard(QFrame):
         self.body.setVisible(not self._collapsed)
         self.chevron.setText("▸" if self._collapsed else "▾")
         self.summary.setVisible(self._collapsed)
+        self.quick_button.setVisible(self._collapsed and bool(self.quick_button.text()))
         self.updateGeometry()
         self.panel.relayout()
 
@@ -1311,8 +1319,10 @@ class CompositeCard(QFrame):
         for lamp, widget in self.lamps:
             on = ctx.is_on(lamp.dtype, lamp.name)
             self._lamp_on[id(lamp)] = on
+            clicks = on is not None and lamp.click_op(on) != ""
             widget.set_state(lamp.label, on, lamp.on_text, lamp.off_text, lamp.on_level,
-                             lamp.tooltip or f"{lamp.dtype}.{lamp.name}")
+                             lamp.tooltip or f"{lamp.dtype}.{lamp.name}",
+                             lamp.action(on) if clicks else "")
         for readout, widget in self.readouts:
             try:
                 value = readout.value(ctx)
@@ -1355,12 +1365,14 @@ class CompositeCard(QFrame):
             on = ctx.is_on(toggle.dtype, toggle.name)
             word = "?" if on is None else (toggle.on_text if on else toggle.off_text)
             color = _LEVEL_COLOR.get(toggle.on_level, WARN_TEXT)
-            button.setText(f"{toggle.label}: {word}")
+            button.setText(f"{toggle.label}: ?" if on is None else toggle.action(on))
+            button.setEnabled(on is not None)        # unknown: no way to know what to send
+            button.setToolTip(f"Now: {word}\n"
+                              + (toggle.tooltip or f"{toggle.dtype}.{toggle.name}"))
             css = _pill_button_css(color, color) if on else _pill_button_css(theme.FG, theme.BORDER)
             if button.property("css") != css:
                 button.setProperty("css", css)
                 button.setStyleSheet(css)
-        self._refresh_main_buttons(level)
         self._refresh_summary()
         self._refresh_watchdog()
         self._refresh_enabled()
@@ -1383,27 +1395,6 @@ class CompositeCard(QFrame):
                                     f"{m.tooltip}\n\nRead {sample.age_s:.1f} s ago.".strip())
         self._refresh_summary()
 
-    def _refresh_main_buttons(self, level: str) -> None:
-        """The main button matching the state is lit: On while on, Off while
-        off -- the buttons read as the state at a glance."""
-        lit = {"on": "on", "hazard": "on", "off": "off"}.get(level)
-        for key, buttons in self.op_buttons.items():
-            for b in buttons:
-                if not b.property("main"):
-                    continue
-                base = b.property("base_css")
-                if key == lit == "on":
-                    css = _button_css(color=theme.FG_STRONG, border=OK_TEXT, bold=True,
-                                      height=34, background=ON_FILL, radius=6)
-                elif key == lit == "off":
-                    css = _button_css(color=theme.FG_STRONG, border=theme.BORDER_STRONG,
-                                      bold=True, height=34, background="#404040", radius=6)
-                else:
-                    css = base
-                if b.property("lit_css") != css and not b.property("flashing"):
-                    b.setProperty("lit_css", css)
-                    b.setStyleSheet(css)
-
     def _refresh_summary(self) -> None:
         """What a collapsed card still shows: the measured values."""
         parts = []
@@ -1419,7 +1410,7 @@ class CompositeCard(QFrame):
         hazardous = bool(self.hazard)
         if dog is None:
             seen = self.panel.hazard_age(self.device.key)
-            text = "Watchdog off"
+            text = "Auto turn-off not set"
             color = theme.FG_MUTED
             if hazardous and seen is not None:
                 text += f" · on (seen) for {_fmt_s(seen)}"
@@ -1436,11 +1427,11 @@ class CompositeCard(QFrame):
         fires = dog.get("fires_in_s")
         warned = dog.get("warned")
         if warned:
-            text = f"WATCHDOG: '{self.device.get_op(self.device.safe_op).label}' in " \
+            text = f"AUTO TURN-OFF: '{self.device.get_op(self.device.safe_op).label}' in " \
                    f"{_fmt_s(fires or 0)} unless kept on"
             color = HAZARD
         else:
-            text = f"Watchdog armed · acts in {_fmt_s(fires or 0)}"
+            text = f"Turns off automatically in {_fmt_s(fires or 0)}"
             color = OK_TEXT
         self.watchdog_label.setText(text)
         # Runs every 1 s tick: restyle only on change.
@@ -1466,11 +1457,11 @@ class CompositeCard(QFrame):
             item.setEnabled(allowed and key not in self._pending_ops)
         self._refresh_clicks(allowed, why)
 
-    # -- lamps and the state pill as buttons ------------------------------------------
+    # -- lamps and the collapsed header's button ---------------------------------------
 
     def pill_action(self) -> str:
-        """The op reference a click on the state pill sends now: the "on" op
-        while off, the "off" op while anything is on; ``""`` when the state
+        """The op reference the collapsed header's button sends now: the "on"
+        op while off, the "off" op while anything is on; ``""`` when the state
         is unknown or the device has no op for it."""
         level = "hazard" if self.hazard else self.status.level
         if level == "unknown":
@@ -1496,7 +1487,9 @@ class CompositeCard(QFrame):
     def _refresh_clicks(self, allowed: bool, why: str) -> None:
         for lamp, widget in self.lamps:
             on = self._lamp_on.get(id(lamp))
-            base = lamp.tooltip or f"{lamp.dtype}.{lamp.name}"
+            base = f"{lamp.label} now: " + (
+                "?" if on is None else lamp.on_text if on else lamp.off_text)
+            base += "\n" + (lamp.tooltip or f"{lamp.dtype}.{lamp.name}")
             ref = None if on is None else lamp.click_op(on)
             if on is None:
                 ok, line = False, "State unknown -- no click."
@@ -1509,15 +1502,16 @@ class CompositeCard(QFrame):
                 ok, line = self._op_click(ref, allowed, why)
             widget.set_clickable(ok)
             widget.setToolTip(f"{base}\n\n{line}")
+        self.state_pill.setToolTip(self.status.detail or self.state_pill.text())
         ref = self.pill_action()
         ok, line = self._op_click(ref, allowed, why) if ref else (False, "")
-        self.state_pill.setEnabled(ok)
-        self.state_pill.setCursor(Qt.CursorShape.PointingHandCursor if ok
-                                  else Qt.CursorShape.ArrowCursor)
-        detail = self.status.detail or self.state_pill.text()
-        self.state_pill.setToolTip(f"{detail}\n\n{line}".strip())
+        card, key = self.panel.resolve_ref(self, ref) if ref else (None, "")
+        self.quick_button.setText(card.device.get_op(key).label if card is not None else "")
+        self.quick_button.setVisible(self._collapsed and card is not None)
+        self.quick_button.setEnabled(ok)
+        self.quick_button.setToolTip(line)
 
-    def _pill_clicked(self) -> None:
+    def _quick_clicked(self) -> None:
         ref = self.pill_action()
         if ref:
             self.panel.trigger_ref(self, ref)
@@ -1650,14 +1644,14 @@ class CompositeCard(QFrame):
                     table.mark_clean()
         for b in self.op_buttons.get(key, []):
             b.setText(entry.op.label)
-            current = b.property("lit_css") or b.property("base_css") or ""
+            current = b.property("base_css") or ""
             color = OK_TEXT if ok else ERR_TEXT
             b.setProperty("flashing", True)
             b.setStyleSheet(current + f"QPushButton {{ border: 1px solid {color}; }}")
 
             def unflash(b=b):
                 b.setProperty("flashing", False)
-                b.setStyleSheet(b.property("lit_css") or b.property("base_css") or "")
+                b.setStyleSheet(b.property("base_css") or "")
             QTimer.singleShot(FLASH_MS, unflash)
         stamp = time.strftime("%H:%M:%S")
         if ok:
@@ -1693,6 +1687,8 @@ class CompositeCard(QFrame):
 
     def _toggle_channel(self, toggle: cmp.ChannelToggle) -> None:
         on = self.ctx().is_on(toggle.dtype, toggle.name)
+        if on is None:
+            return
         new = 0 if on else 1
         key = "ttl_state" if toggle.dtype == "ttl" else "sw_state"
         self.panel.send_channel(toggle.dtype, toggle.name, {key: new})
@@ -1965,15 +1961,15 @@ class ConnectionBar(QFrame):
         super().__init__(panel)
         self.panel = panel
         self.setObjectName("composite_connections")
-        self.setStyleSheet(f"QFrame#composite_connections {{ background: {theme.BG_RAISED};"
-                           f" border: 1px solid {theme.BORDER}; border-radius: 6px; }}")
+        self.setStyleSheet("QFrame#composite_connections { background: transparent;"
+                           " border: none; }")
         self._order = [c.key for c in definitions]
         self._defs = {c.key: c for c in definitions}
         self._states: dict = {}
         # Pills only: each one's state detail is in its tooltip.
         self._pills: dict[str, QPushButton] = {}
         self._pill_host = QHBoxLayout(self)
-        self._pill_host.setContentsMargins(6, 1, 6, 1)
+        self._pill_host.setContentsMargins(0, 0, 0, 0)
         self._pill_host.setSpacing(6)
         # In the host's status row: as wide as its content, never wider.
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
@@ -2053,7 +2049,7 @@ class ConnectionBar(QFrame):
             self.panel.request_connection(key, "connect")
 
 
-# --- small helpers shared with the Sequences tab -------------------------------------
+# --- small helpers shared with the loop cards -----------------------------------------
 
 def _label_pill_css(level: str) -> str:
     bg = _PILL_BG.get(level, "#454545")
@@ -2440,8 +2436,8 @@ class CompositePanel(QWidget):
                            "monitor experiment, or its composite ops were rejected or did "
                            "not compile (see the monitor log)")
         if self.run_pending:
-            return False, (f"run {self.run_pending.get('run_id')} is starting -- ops are "
-                           "refused until it ends")
+            return False, (f"run {self.run_pending.get('run_id')} has not ended -- the "
+                           "controls are blocked until it does")
         return True, ""
 
     @property

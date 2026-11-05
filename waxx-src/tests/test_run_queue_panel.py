@@ -165,6 +165,8 @@ def test_phase1_listing_renders_in_list_order_with_1b_columns_blank(panel):
     full = "C:/code/kexp/experiments/JP/expt_3.py"
     assert _cell(panel, 3, "path") == full
     assert full in _cell(panel, 3, "path", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 3, "file") == "expt_3.py"                  # the name; full in its tooltip
+    assert full in _cell(panel, 3, "file", Qt.ItemDataRole.ToolTipRole)
     for key in ("expt_class", "est", "source_changed"):
         assert _cell(panel, 3, key) == ""
     # why it waits is derived when the server does not say (before 1b)
@@ -221,6 +223,12 @@ def test_phase1b_fields_order_and_render(panel, server):
     assert _cell(panel, 5, "est") == ""                             # unknown: blank
     assert _cell(panel, 1, "est") == "~30 s est."                   # ended: no times
     assert _cell(panel, 3, "source_changed") == "CHANGED"
+    # the source column is hidden by default: the file's name says it too
+    assert _cell(panel, 3, "file", Qt.ItemDataRole.ForegroundRole).name() == \
+        rqp.QColor(rqp.ERR_TEXT).name()
+    assert "skipped at launch" in _cell(panel, 3, "file", Qt.ItemDataRole.ToolTipRole)
+    assert _cell(panel, 4, "file", Qt.ItemDataRole.ForegroundRole).name() != \
+        rqp.QColor(rqp.ERR_TEXT).name()
     assert "skipped at launch" in _cell(panel, 3, "source_changed", Qt.ItemDataRole.ToolTipRole)
     assert _cell(panel, 4, "source_changed") == ""
     assert _cell(panel, 3, "waiting") == "job 4 goes first"        # the server's, as sent
@@ -315,7 +323,7 @@ def test_less_used_columns_start_hidden(panel):
 
 # --- the top strip --------------------------------------------------------------------------
 
-def test_summary_alarm_hold_pause_and_loop_note(panel):
+def test_summary_alarm_hold_and_pause(panel):
     info = dict(INFO, state="held", alarm={"since": NOW - 700, "job": 3, "waited_s": 700.0,
                                            "why": "liveOD is not reachable"},
                 person_hold={"active": True, "since": NOW - 60, "by": "jp@kong",
@@ -325,7 +333,7 @@ def test_summary_alarm_hold_pause_and_loop_note(panel):
                                   "owner": "person"}, "all": None},
                 resume_loop={"key": "auto_tof", "path": None, "since": NOW})
     panel.set_state(_status(info))
-    assert panel.pill.text() == "held"
+    assert panel.queue_state() == "held"
     assert not panel.alarm.isHidden()
     assert "job 3" in panel.alarm.text() and "liveOD is not reachable" in panel.alarm.text()
     assert "11.7 min" in panel.alarm.text()
@@ -334,18 +342,28 @@ def test_summary_alarm_hold_pause_and_loop_note(panel):
         assert word in hold
     assert panel.hold_button.text() == "Release hold"
     assert "PAUSED by jp@kong" in panel.pause_labels["agent"].text()
-    assert panel.pause_buttons["agent"].text() == "Resume agent"
-    assert panel.pause_buttons["all"].text() == "Pause all"
+    assert panel.pause_buttons["agent"].text() == "Resume agent jobs"
+    assert panel.pause_buttons["all"].text() == "Pause all jobs"
+    assert panel.pause_button.text() == "Paused"
     # the button that ends a hold / pause wears the banner's colour; the others plain
     assert rqp.theme.HELD in panel.hold_button.styleSheet()
     assert rqp.theme.HELD in panel.pause_buttons["agent"].styleSheet()
     assert panel.pause_buttons["all"].styleSheet() == ""
     assert rqp.theme.HELD in panel.hold_label.styleSheet()
-    assert not panel.loop_note.isHidden() and "auto_tof" in panel.loop_note.text()
     # launching shows as such
     cur = _job(2, "launching")
     panel.set_state(_status(dict(INFO, current=cur)))
-    assert panel.pill.text() == "launching"
+    assert panel.queue_state() == "launching"
+    assert panel.pause_button.text() == "Pause"
+
+
+def test_the_toolbar_says_how_many_wait_and_keeps_the_history_in_a_tooltip(panel):
+    panel.set_state(_status(dict(INFO, counts={"queued": 9, "running": 1, "failed": 68,
+                                               "saved": 446})))
+    assert panel.counts.text() == "9 queued"
+    assert panel.counts.toolTip() == "9 queued | 1 running | 68 failed | 446 saved"
+    assert not hasattr(panel, "pill") and not hasattr(panel, "loop_note")
+    assert not hasattr(panel, "refresh_button")
 
 
 def test_unreachable_and_no_queue(panel):
@@ -718,7 +736,7 @@ def test_first_show_lists_and_broadcasts_are_debounced(qapp, server):
         for _ in range(5):
             p.on_broadcast({"type": "run_queue", "run_queue": dict(INFO, text="x")})
         assert len(server.of("list")) == 1                          # not yet
-        assert p.summary.text() == "x"                               # the summary at once
+        assert p.summary.text() == "X"                               # the summary at once
         QTest.qWait(rqp.LIST_DEBOUNCE_MS + 150)
         assert len(server.of("list")) == 2                          # one list for five
         p.on_broadcast({"type": "trust", "trust": {}})               # not the queue's

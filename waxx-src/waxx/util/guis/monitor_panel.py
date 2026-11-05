@@ -8,11 +8,11 @@ so the server's own window
 embedded from it.  :class:`MonitorServerPanel` shows the same from any PC:
 
 * the bar -- :class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`:
-  the monitor experiment's READY / LOADING / NOT READY pill (click: start it,
-  or restart it after a confirm -- the server's ``reset``, through
-  :class:`MonitorControl`), trust and the run fence as chips, the run loops
-  under a "Sequences" dropdown, the queue's Warm start switch and (when the
-  lab gives its launcher) Start liveOD; its arrow opens the details and the
+  one sentence on live control (the monitor experiment) and which run has the
+  machine, Start while it is off (Start / Restart also on its ⋯: the server's
+  ``reset``, through :class:`MonitorControl`), the run loops under a "Loops"
+  dropdown, the queue's warm start on its ⋯, and (when the lab gives its
+  launcher) Start liveOD while none runs; its arrow opens the details and the
   ops journal;
 * the queue -- :class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`: its
   toolbar (filter, hold, pause), the jobs, each job's right-click menu.
@@ -146,10 +146,10 @@ class MonitorLink:
 
 class MonitorControl:
     """The monitor experiment's start / restart, behind the state bar's
-    monitor pill (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`):
-    READY (click: restart it, after a confirm), NOT READY (click: start it; a
-    confirm first, as in Device Control, whenever the status shows the core
-    may be held -- :meth:`core_signs`), LOADING (no click).  The click sends
+    Start / Restart (:class:`~waxx.util.guis.monitor_state_panel.MonitorStatePanel`):
+    READY (restart it, after a confirm), NOT READY (start it; a confirm first,
+    as in Device Control, whenever the status shows the core may be held --
+    :meth:`core_signs`), LOADING (nothing).  The click sends
     the server's ``reset`` command, which (re)starts the monitor -- unless the
     run queue has a job in its slot or about to launch, in which case the
     server defers it until the queue runs out.  What happened goes to the
@@ -166,8 +166,8 @@ class MonitorControl:
 
     @property
     def button(self):
-        """The pill that shows the monitor's state (the state bar's)."""
-        return self.panel.state_panel.monitor_pill
+        """The state bar's Start."""
+        return self.panel.state_panel.monitor_button
 
     def set_state(self, state: dict | None) -> None:
         self.state = dict(state) if isinstance(state, dict) else {}

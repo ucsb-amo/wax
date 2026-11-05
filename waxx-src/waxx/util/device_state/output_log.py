@@ -2,8 +2,8 @@
 
 The server runs experiment files itself -- a run loop's runs
 (:mod:`~waxx.util.device_state.run_loop`), the reset experiment
-(:mod:`~waxx.util.device_state.state_reset`) -- and the Device Control GUI's
-Sequences tab shows their output under each card.  :class:`OutputLog` keeps
+(:mod:`~waxx.util.device_state.state_reset`) -- and the Monitor panel's Loops
+shows their output under each card.  :class:`OutputLog` keeps
 the last lines, numbered from 1 since the server started, so a GUI asks only
 for what it has not seen (``since(after)``) and can tell when lines it never
 saw were dropped (``first > after + 1``) or the server restarted

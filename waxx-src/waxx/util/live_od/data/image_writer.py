@@ -877,10 +877,11 @@ class SaveWorker(QThread):
                "pending": len(self._pending), "rewritten": 0, "recreated": [], "verify": "",
                "outcome": ""}
         if exc is not None:
-            logger.error(f"SaveWorker: the run file's handle stopped answering at {what} ({err}); "
-                         f"closing it and opening the file again ({len(waits)} tries). "
-                         f"{len(self._pending)} item(s) written since the last flush will be "
-                         f"written again.")
+            # the full error goes to the reopen record (rec["error"]) and, if the reopen
+            # fails, to the fault message; a recovered drop only needs this short line
+            logger.warning(f"SaveWorker: the run file's handle stopped answering at {what} "
+                           f"({type(exc).__name__}); reopening the file (up to {len(waits)} tries), "
+                           f"{len(self._pending)} pending item(s) will be written again.")
         self._close_quietly(self._f, rec)
         self._f = None
         last = ""

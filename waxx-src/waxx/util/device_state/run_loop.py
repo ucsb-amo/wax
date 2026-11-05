@@ -39,7 +39,7 @@ that names none gets ``"yields"`` whoever starts it, a person included
 (:data:`DEFAULT_CATEGORY`); see :data:`LOOP_CATEGORIES`.
 
 A loop is either fixed to one file (``LoopSpec.expt_path``) or a *pick* loop
-(``LoopSpec.root``): its file is chosen at every Start -- the Sequences tab's
+(``LoopSpec.root``): its file is chosen at every Start -- the Loops card's
 file dialog -- and must be a ``.py`` file inside ``root`` on the server's
 machine, not one of ``LoopSpec.exclude`` (the monitor experiment).  The file is
 read at every launch, so an edit takes effect at the loop's next run.

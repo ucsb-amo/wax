@@ -10,50 +10,57 @@ with the server's ``status_json`` dict (None when it does not answer),
 :class:`~waxx.util.guis.request_runner.RequestRunner`).  It never discovers
 the server or opens a socket.
 
-The bar (always shown, one line):
+The bar (always shown, one line; plain since the user's 2026-10-31 review --
+nothing is shown that needs no attention):
 
-* the monitor experiment's pill -- READY / LOADING / NOT READY.  Clickable
-  when the host says so (:meth:`set_monitor_clickable`): a click emits
-  :attr:`MonitorStatePanel.monitor_clicked`, and the host (re)starts the
-  monitor.  A host that drives its own button passes it as
-  ``monitor_button``; the panel then places it and never writes to it;
-* chips: device-state trust (red while UNTRUSTED), the run fence (only while
-  a run holds it).  Every chip's tooltip has the whole story;
-* "Sequences" -- a dropdown (collapsed at start; :meth:`set_sequences_expanded`)
-  with a one-chip summary of the run loops beside it (kexp: the BEC TOF loop
-  and the Experiment loop).  Open, it shows the loops' cards under the bar,
-  Start / Stop / category / scan settings and output as on the Device Control
-  GUI's Sequences tab (:class:`~waxx.util.guis.sequences_panel.SequencesPanel`,
-  sending through the same requester; a person's Start carries ``owner``
-  "person");
-* "Warm start" -- the run queue's warm start (queue phase 2), from
-  ``status_json``'s ``run_queue.warm_ahead``; a click sends ``run_queue`` /
-  ``warm_ahead`` as a person, and the server stores it (it holds across its
-  restarts);
-* "Start liveOD" (only when the host gives the launcher, ``live_od_bat``) --
-  :class:`~waxx.util.guis.live_od_launch.LiveODButton`: off while a liveOD
+* one sentence: a dot and :func:`~waxx.util.guis.device_summary.live_control_text`
+  -- is live control (the monitor experiment) ready, and if not, which run has
+  the machine (a queue job: the queue's line below names it).  A normal run is
+  blue, never red;
+* "Start live control" -- :attr:`MonitorStatePanel.monitor_button`, only while
+  live control is off and no run is known to have the machine.  A click emits
+  :attr:`MonitorStatePanel.monitor_clicked` when the host says it may
+  (:meth:`set_monitor_clickable`), and the host (re)starts the monitor.  A host
+  that drives its own button passes it as ``monitor_button``; the panel then
+  places it and never writes to it;
+* "the device tabs may not match the hardware" -- only while the state is
+  untrusted and no run has the machine (a run's end state settles it);
+* "Loops" -- a dropdown (collapsed at start; :meth:`set_sequences_expanded`)
+  with a loop's name beside it while one is active or waiting for the queue
+  (kexp: the BEC TOF loop and the Experiment loop).  Open, it shows the loops'
+  cards under the bar: Start / Stop / category / scan settings and output
+  (:class:`~waxx.util.guis.sequences_panel.SequencesPanel`, sending through the
+  same requester; a person's Start carries ``owner`` "person").  This is the
+  only GUI with them;
+* "Start liveOD" (only when the host gives the launcher, ``live_od_bat``, and
+  liveOD can be started) --
+  :class:`~waxx.util.guis.live_od_launch.LiveODButton`: gone while a liveOD
   beacons, for 30 s after a launch, or when the host refuses this PC; each
-  press is sent to the server's ops journal (``live_od_launch``).
+  press is sent to the server's ops journal (``live_od_launch``);
+* ⋯ -- Start / Restart live control, and the run queue's warm start (queue
+  phase 2), from ``status_json``'s ``run_queue.warm_ahead``; a click sends
+  ``run_queue`` / ``warm_ahead`` as a person, and the server stores it (it holds
+  across its restarts).
 
 The SLM reinit lease and the server's host-side connections (kexp: the
 tweezer AWG) are not shown here (user, 2026-10-21): the Device Control GUI
-shows both (its SLM pill and the Composite tab's connection bar), and the
-journal below has their records.
+shows both (its "Connected devices" group), and the journal below has their
+records.
 
 The details (the arrow at the left, or :meth:`set_expanded`):
 
-* the monitor: sub-state, reason, since when, pid, its experiment file;
-* trust: why, since when;
-* the run fence: which run, from where, since when, for how long, and
-  whether it lapses (only while the monitor is READY);
+* live control: sub-state, reason, since when, pid, its experiment file;
+* the device tabs: why they may not match, since when;
+* a run that announced itself and has not ended: which, from where, since
+  when, and whether it is dropped by itself (only while the monitor is READY);
 * the last ops-journal records, from the server's ``get_journal`` request
   (the records the server keeps in memory since it started; at most
   :data:`JOURNAL_LINES`; the client never names a file).
 
 Requests: ``get_journal`` when the details open, every
 :data:`JOURNAL_POLL_MS` while they are shown, and shortly after a broadcast;
-the loops' own requests (start, stop, output) as the Sequences tab sends
-them; ``run_queue`` / ``warm_ahead`` on a click of Warm start;
+the loops' own requests (start, stop, output); ``run_queue`` / ``warm_ahead`` on
+a click of the warm start box;
 ``live_od_launch`` after a press of Start liveOD.  Nothing else -- the host
 feeds ``status_json``.  Messages for the person go out on
 :attr:`MonitorStatePanel.message` (the monitor panel shows them on the queue's
@@ -70,17 +77,18 @@ from typing import Any, Callable
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QCheckBox, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QFrame, QHBoxLayout, QLabel, QMenu, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from waxx.util.dashboard import theme
 from waxx.util.device_state.op_journal import describe_entry
 from waxx.util.device_state.run_queue_client import default_by
+from waxx.util.guis.device_summary import live_control_text, run_in_use
 from waxx.util.guis.qt_upkeep import set_style_if_changed
 from waxx.util.guis.request_runner import RequestRunner, is_unknown_request
 from waxx.util.guis.run_queue_panel import (
-    _PILL_BG, ERR_TEXT, OK_TEXT, WARN_TEXT, _clock, _dur, chip_css,
+    _PILL_BG, ERR_TEXT, OK_TEXT, WARN_TEXT, _clock, _dur,
 )
 
 #: Journal records asked for (the newest).
@@ -89,7 +97,7 @@ JOURNAL_LINES = 60
 JOURNAL_POLL_MS = 5000
 #: Delay between a broadcast and the journal request it causes (coalesced).
 JOURNAL_DEBOUNCE_MS = 1000
-#: The fence's "held N s" refresh.
+#: The "held N s" refresh of an announced run.
 TICK_MS = 1000
 #: The details' height cap (they scroll beyond it).
 DETAILS_MAX_HEIGHT = 380
@@ -97,7 +105,8 @@ DETAILS_MAX_HEIGHT = 380
 #: The Sequences area's height cap (it scrolls beyond it).
 SEQUENCES_MAX_HEIGHT = 420
 
-_MONITOR_LEVEL = {"READY": "on", "LOADING": "partial", "NOT_READY": "hazard"}
+#: :func:`live_control_text`'s level -> the dot's colour
+_DOT_COLOR = {"on": OK_TEXT, "run": "#8cc4ff", "partial": WARN_TEXT, "hazard": ERR_TEXT}
 _LOOP_LEVEL = {"running": "on", "starting": "partial", "stopping": "partial",
                "latched": "hazard", "failed": "hazard"}
 #: the summary chip shows the loop whose state ranks highest here
@@ -130,12 +139,6 @@ def _head(text: str) -> QLabel:
     return label
 
 
-def _chip(text: str = "") -> QLabel:
-    chip = QLabel(text)
-    chip.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-    return chip
-
-
 def monitor_text(state: dict) -> str:
     """"running since 14:03:11 (for 2.0 min), pid 1234"."""
     sub = str(state.get("sub_state") or "").replace("_", " ")
@@ -151,18 +154,19 @@ def monitor_text(state: dict) -> str:
 
 
 def fence_text(pending: dict | None, monitor_state: str, now: float | None = None) -> str:
-    """The run fence in one line ("No run fence." when there is none)."""
+    """A run that announced itself and has not ended, in one line ("" for
+    none).  The server cannot tell whether it has the machine yet: with the
+    monitor already stopped, nothing shows when a run takes the core."""
     if not isinstance(pending, dict):
-        return "No run fence: composite ops and the run queue are not held back by a run."
+        return ""
     now = time.time() if now is None else now
     since = pending.get("since")
-    held = f", held {_dur(now - float(since))}" if since else ""
+    held = f", {_dur(now - float(since))} ago" if since else ""
     who = f" from {pending['client']}" if pending.get("client") else ""
-    ready = ("the monitor is READY, so it lapses if the run never takes the core"
-             if monitor_state == "READY" else
-             f"the monitor is {monitor_state}, so it does not lapse by itself")
-    return (f"Run fence: run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}){who}"
-            f" since {_clock(since, True)}{held} -- {ready}.")
+    ready = ("dropped by itself if the run never starts" if monitor_state == "READY" else
+             "this stays until the run ends or someone unlocks the controls")
+    return (f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}){who} started "
+            f"at {_clock(since, True)}{held} and has not ended; controls are blocked -- {ready}.")
 
 
 def slm_text(slm: dict) -> str:
@@ -209,25 +213,31 @@ def loop_detail(info: dict) -> str:
     return tip.strip()
 
 
-def sequences_summary(loops: dict) -> tuple[str, str, str]:
-    """``(chip text, level, tooltip)`` for the run loops: the one loop that is
-    active (or failed) by name, else how many are, else "idle"."""
+def sequences_summary(loops: dict, resume: dict | None = None) -> tuple[str, str, str]:
+    """``(text, level, tooltip)`` for the run loops: the one loop that is
+    active (or failed) by name, else how many are, else the loop the queue
+    stopped and starts again (``resume``, its ``resume_loop``), else ""."""
     if not loops:
         return "", "off", "The server runs no loops."
     infos = [(key, info or {}) for key, info in loops.items()]
     ranked = sorted(infos, key=lambda ki: -_LOOP_RANK.get(str(ki[1].get("state")), 0))
     active = [ki for ki in ranked if _LOOP_RANK.get(str(ki[1].get("state")), 0)]
-    if not active:
-        text, level = "idle", "off"
-    elif len(active) == 1:
-        key, info = active[0]
-        text, level = loop_text(key, info), _LOOP_LEVEL.get(str(info.get("state")), "off")
-    else:
-        text = f"{len(active)} active"
-        level = _LOOP_LEVEL.get(str(active[0][1].get("state")), "off")
     tip = "\n\n".join(loop_text(k, i) + (f"\n{loop_detail(i)}" if loop_detail(i) else "")
                       for k, i in infos)
-    return text, level, tip + "\n\nStart / Stop: open Sequences (the arrow)."
+    text, level = "", "off"
+    if len(active) == 1:
+        key, info = active[0]
+        text = f"{info.get('title') or key} {info.get('state')}"
+        level = _LOOP_LEVEL.get(str(info.get("state")), "off")
+    elif active:
+        text = f"{len(active)} active"
+        level = _LOOP_LEVEL.get(str(active[0][1].get("state")), "off")
+    elif isinstance(resume, dict):
+        title = (loops.get(resume.get("key")) or {}).get("title") or resume.get("key")
+        text = f"{title} waiting for the queue"
+        tip += (f"\n\nThe queue stopped it for its jobs (since {_clock(resume.get('since'))}) "
+                "and starts it again when it has run out.")
+    return text, level, tip + "\n\nStart / Stop: open Loops (the arrow)."
 
 
 class MonitorStatePanel(QWidget):
@@ -236,15 +246,15 @@ class MonitorStatePanel(QWidget):
     ``requester``: ``request_dict -> reply_dict``; ``synchronous``: call it on
     the GUI thread (tests); ``runner``: an existing RequestRunner to share;
     ``by``: who is clicking (default ``user@host``); ``monitor_button``: a
-    button the host drives itself, shown in place of the panel's own monitor
-    pill; ``expanded``: open the details at start.
+    button the host drives itself, shown in place of the panel's own Start;
+    ``expanded``: open the details at start.
 
     Start liveOD (shown only with ``live_od_bat``, the launcher's path):
     ``live_od_start(bat)``, ``live_od_probe()`` and ``live_od_refusal()`` --
     see :class:`~waxx.util.guis.live_od_launch.LiveODButton` (defaults: the
     real start and beacon probe; tests pass fakes)."""
 
-    #: The monitor pill was clicked (the host starts / restarts the monitor).
+    #: Start / Restart live control was clicked (the host (re)starts the monitor).
     monitor_clicked = pyqtSignal()
     #: A message for the person (warm start, liveOD start).
     message = pyqtSignal(str)
@@ -286,23 +296,31 @@ class MonitorStatePanel(QWidget):
         self.toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.toggle.clicked.connect(lambda _=False: self.set_expanded(not self.expanded))
         row.addWidget(self.toggle)
-        title = QLabel("Monitor")
-        title.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 11px; font-weight: 600;")
-        row.addWidget(title)
+        self.dot = QLabel("●")
+        row.addWidget(self.dot)
+        self.headline = QLabel("")
+        self.headline.setStyleSheet(f"color: {theme.FG_STRONG}; font-size: 12px;"
+                                    " font-weight: 600;")
+        self.headline.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.headline)
         self._external_monitor = monitor_button is not None
-        self.monitor_pill = monitor_button or QPushButton("?")
-        self.monitor_pill.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.monitor_pill.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.monitor_button = monitor_button or QPushButton("?")
+        self.monitor_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.monitor_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         if not self._external_monitor:
-            self.monitor_pill.clicked.connect(lambda _=False: self.monitor_clicked.emit())
-        row.addWidget(self.monitor_pill)
-        self.trust_chip = _chip()
+            self.monitor_button.setStyleSheet(monitor_button_css("unknown"))
+            self.monitor_button.clicked.connect(lambda _=False: self.monitor_clicked.emit())
+        row.addWidget(self.monitor_button)
+        self.trust_chip = QLabel("The device tabs may not match the hardware")
+        self.trust_chip.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px;")
+        self.trust_chip.hide()
         row.addWidget(self.trust_chip)
-        self.fence_chip = _chip()
-        row.addWidget(self.fence_chip)
-        # Sequences: the run loops behind one dropdown, a summary chip beside it
+        row.addStretch(1)
+        # the run loops behind one dropdown, their summary beside it
+        self.sequences_chip = QLabel("")
+        row.addWidget(self.sequences_chip)
         self.sequences_toggle = QToolButton()
-        self.sequences_toggle.setText("Sequences")
+        self.sequences_toggle.setText("Loops")
         self.sequences_toggle.setAutoRaise(True)
         self.sequences_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.sequences_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -311,15 +329,6 @@ class MonitorStatePanel(QWidget):
         self.sequences_toggle.clicked.connect(
             lambda _=False: self.set_sequences_expanded(not self.sequences_expanded))
         row.addWidget(self.sequences_toggle)
-        self.sequences_chip = _chip()
-        row.addWidget(self.sequences_chip)
-        # warm start (the run queue's), a person's switch
-        self.warm_box = QCheckBox("Warm start")
-        self.warm_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.warm_box.setStyleSheet(f"QCheckBox {{ color: {theme.FG}; font-size: 11px; }}")
-        self.warm_box.clicked.connect(self.set_warm_ahead)
-        row.addWidget(self.warm_box)
-        row.addStretch(1)
         self.live_od_button = None
         if live_od_bat:
             from waxx.util.guis.live_od_launch import LiveODButton  # noqa: PLC0415
@@ -327,15 +336,17 @@ class MonitorStatePanel(QWidget):
                 live_od_bat, start=live_od_start, probe=live_od_probe, refusal=live_od_refusal,
                 record=self._journal_live_od_launch, say=self.message.emit, by=self.by)
             row.addWidget(self.live_od_button)
+            self.live_od_button.refresh()             # shown only when it can start one
+        row.addWidget(self._build_more_button())
         outer.addWidget(self.bar)
 
-        # -- Sequences (the run loops' cards; collapsed at start) ----------------------
+        # -- Loops (the run loops' cards; collapsed at start) ---------------------------
         self.sequences_area = QScrollArea()
         self.sequences_area.setWidgetResizable(True)
         self.sequences_area.setFrameShape(QFrame.Shape.NoFrame)
         self.sequences_area.setMaximumHeight(SEQUENCES_MAX_HEIGHT)
-        # the Sequences tab's loop cards; their requests go through this
-        # panel's runner (no discovery, no socket)
+        # the loop cards; their requests go through this panel's runner (no
+        # discovery, no socket)
         self.sequences = SequencesPanel(start_sender=False, show_hold=False, show_queue=False,
                                         runner=self.runner, by=self.by)
         self.sequences_area.setWidget(self.sequences)
@@ -354,34 +365,38 @@ class MonitorStatePanel(QWidget):
         box.setContentsMargins(8, 6, 8, 6)
         box.setSpacing(4)
 
+        heads: dict[str, QLabel] = {}
+
         def section(head: str) -> QVBoxLayout:
             line = QHBoxLayout()
             line.setSpacing(6)
-            line.addWidget(_head(head))
+            heads[head] = _head(head)
+            line.addWidget(heads[head])
             col = QVBoxLayout()
             col.setSpacing(2)
             line.addLayout(col, 1)
             box.addLayout(line)
             return col
 
-        sec = section("Monitor")
+        sec = section("Live control")
         self.monitor_line = _line()
         sec.addWidget(self.monitor_line)
         self.expt_line = _line(theme.FG_MUTED)
         sec.addWidget(self.expt_line)
 
-        sec = section("Trust")
+        sec = section("Device tabs")
         self.trust_banner = QLabel("")
         self.trust_banner.setWordWrap(True)
         sec.addWidget(self.trust_banner)
         self.trust_line = _line(theme.FG_MUTED)
         sec.addWidget(self.trust_line)
 
-        sec = section("Run fence")
+        sec = section("Run")
+        self.fence_head = heads["Run"]
         self.fence_line = _line()
         sec.addWidget(self.fence_line)
 
-        sec = section("Journal")
+        sec = section("Activity")
         head = QHBoxLayout()
         self.journal_note = _line(theme.FG_MUTED)
         head.addWidget(self.journal_note, 1)
@@ -417,6 +432,32 @@ class MonitorStatePanel(QWidget):
 
     # -- the bar's controls -------------------------------------------------------------
 
+    def _build_more_button(self) -> QToolButton:
+        """⋯: Start / Restart live control, and the warm start box."""
+        tool = QToolButton()
+        tool.setText("⋯")
+        tool.setAutoRaise(True)
+        tool.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tool.setToolTip("More")
+        tool.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tool.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        menu = QMenu(tool)
+        menu.setToolTipsVisible(True)
+        self.monitor_action = menu.addAction("Start live control")
+        self.monitor_action.triggered.connect(lambda _=False: self.monitor_clicked.emit())
+        self.monitor_action.setVisible(not self._external_monitor)
+        # warm start (the run queue's), a person's switch
+        self.warm_box = QCheckBox("Prepare the next run early (warm start)")
+        self.warm_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.warm_box.setStyleSheet(f"QCheckBox {{ color: {theme.FG}; padding: 4px 12px; }}")
+        self.warm_box.clicked.connect(self.set_warm_ahead)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(self.warm_box)
+        menu.addAction(action)
+        tool.setMenu(menu)
+        self.more_button = tool
+        return tool
+
     def set_expanded(self, expanded: bool) -> None:
         """Show or hide the details (the journal is asked for on opening)."""
         expanded = bool(expanded)
@@ -426,12 +467,12 @@ class MonitorStatePanel(QWidget):
         self.details.setVisible(expanded)
         self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
         self.toggle.setToolTip("Hide the details" if expanded else
-                               "Show the details: monitor, trust, fence, ops journal")
+                               "Show the details and the recent activity")
         if expanded and not self._shut:
             self.refresh_journal()
 
     def set_sequences_expanded(self, expanded: bool) -> None:
-        """Show or hide the run loops' cards (Sequences)."""
+        """Show or hide the run loops' cards (Loops)."""
         expanded = bool(expanded)
         if expanded == self.sequences_expanded:
             return
@@ -439,13 +480,12 @@ class MonitorStatePanel(QWidget):
         self.sequences_area.setVisible(expanded)
         self.sequences_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else
                                            Qt.ArrowType.RightArrow)
-        self.sequences_toggle.setToolTip("Hide the sequences" if expanded else
-                                         "Show the sequences: the run loops, Start / Stop, "
-                                         "their output")
+        self.sequences_toggle.setToolTip("Hide the loops" if expanded else
+                                         "Show the loops: Start / Stop, their output")
 
     def set_monitor_clickable(self, clickable: bool) -> None:
-        """Whether a click on the panel's own monitor pill does something (the
-        host listens to :attr:`monitor_clicked`)."""
+        """Whether the panel's own Start / Restart does something (the host
+        listens to :attr:`monitor_clicked`)."""
         self._monitor_clickable = bool(clickable)
         self._render_monitor()
 
@@ -510,67 +550,77 @@ class MonitorStatePanel(QWidget):
         self._render_loops()
         self._render_warm()
 
+    def run_text(self) -> str:
+        """The run the status shows using the machine, in words ("" for none)."""
+        s = self.state
+        return run_in_use(s.get("run_queue"), s.get("live_od"), s.get("run_pending"))
+
     def _render_monitor(self) -> None:
         s = self.state
         name = str(s.get("state_name") or "?") if self.reachable else ""
+        run = self.run_text() if self.reachable else ""
+        text, level = live_control_text(name, str(s.get("sub_state") or ""), run, self.reachable)
+        if isinstance((s.get("run_queue") or {}).get("current"), dict):
+            text = text.split(":", 1)[0]              # the queue's line below names the job
+        self.headline.setText(text)
+        set_style_if_changed(self.dot, f"color: {_DOT_COLOR[level]}; font-size: 12px;")
         if not self.reachable:
             self.monitor_line.setText("The monitor server is not answering.")
             self.expt_line.setText("")
         else:
             self.monitor_line.setText(monitor_text(s))
             self.expt_line.setText(f"monitor experiment: {s.get('expt_path') or '?'}")
+        tip = ["Live control is the monitor experiment."]
+        if self.reachable and monitor_text(s):
+            tip.append(monitor_text(s))
+        self.headline.setToolTip("\n".join(tip))
         if self._external_monitor:
             return                                    # the host drives its own button
+        button, action = self.monitor_button, self.monitor_action
         if not self.reachable:
-            self.monitor_pill.setText("?")
-            set_style_if_changed(self.monitor_pill, monitor_button_css("unknown"))
-            self.monitor_pill.setEnabled(False)
-            self.monitor_pill.setToolTip("The monitor server is not answering.")
+            button.setText("?")
+            button.setEnabled(False)
+            button.hide()
+            action.setEnabled(False)
+            button.setToolTip("The monitor server is not answering.")
             return
-        self.monitor_pill.setText(name.replace("_", " "))
-        set_style_if_changed(self.monitor_pill,
-                             monitor_button_css(_MONITOR_LEVEL.get(name, "unknown")))
         can = self._monitor_clickable and name in ("READY", "NOT_READY") and not self._monitor_busy
-        self.monitor_pill.setEnabled(can)
-        tip = [f"Monitor experiment: {name.replace('_', ' ')}"]
-        if monitor_text(s):
-            tip.append(monitor_text(s))
+        word = "Restart" if name == "READY" else "Start"
+        button.setText(f"{word} live control")
+        action.setText(f"{word} live control")
+        button.setEnabled(can)
+        action.setEnabled(can)
+        button.setVisible(name == "NOT_READY" and not run)
+        tip = []
         if self._monitor_busy:
             tip.append("A (re)start was sent; waiting for the server's answer.")
-        elif can:
-            tip.append("Click: restart it (asks first)" if name == "READY" else
-                       "Click: start it")
-        self.monitor_pill.setToolTip("\n".join(tip))
+        elif can and name == "READY":
+            tip.append("Asks first.")
+        button.setToolTip("\n".join(tip))
+        action.setToolTip("\n".join(tip))
 
     def _render_trust(self) -> None:
         trust = self.state.get("trust") if self.reachable else None
         chip = self.trust_chip
         if isinstance(trust, dict) and not trust.get("trusted", True):
-            self.trust_banner.setText("Device state UNTRUSTED: the device tabs may not match "
-                                      "the hardware.")
+            self.trust_banner.setText("The device tabs may not match the hardware.")
             self.trust_banner.setStyleSheet("QLabel { background: #c62828; color: white;"
                                             " border-radius: 6px; padding: 3px 8px;"
                                             " font-size: 11px; }")
             self.trust_banner.setToolTip(str(trust.get("reason") or ""))
             self.trust_line.setText(f"why: {trust.get('reason') or '?'} "
                                     f"(since {_clock(trust.get('since'), True)})")
-            chip.setText("state UNTRUSTED")
-            set_style_if_changed(chip, chip_css("hazard"))
-            chip.setToolTip("Device state UNTRUSTED: the device tabs may not match the "
-                            f"hardware.\nwhy: {trust.get('reason') or '?'}")
-            chip.show()
+            chip.setToolTip(f"why: {trust.get('reason') or '?'}")
+            # a run's end state settles it, so not while a run has the machine
+            chip.setVisible(not self.run_text())
         elif isinstance(trust, dict):
-            self.trust_banner.setText("Device state trusted.")
+            self.trust_banner.setText("No known mismatch with the hardware.")
             self.trust_banner.setStyleSheet(f"QLabel {{ color: {OK_TEXT}; font-size: 11px; }}")
             self.trust_banner.setToolTip("")
             self.trust_line.setText(f"{trust.get('reason') or ''}"
                                     + (f" (since {_clock(trust.get('since'), True)})"
                                        if trust.get("since") else ""))
-            chip.setText("state trusted")
-            set_style_if_changed(chip, chip_css("off"))
-            chip.setToolTip("Device state trusted." + (f"\n{trust['reason']}"
-                                                       if trust.get("reason") else ""))
-            chip.show()
+            chip.hide()
         else:
             self.trust_banner.setText("")
             self.trust_banner.setStyleSheet("")
@@ -579,35 +629,25 @@ class MonitorStatePanel(QWidget):
             chip.hide()
 
     def _render_fence(self) -> None:
-        if not self.reachable:
-            self.fence_line.setText("")
-            self.fence_chip.hide()
-            return
-        pending = self.state.get("run_pending")
+        pending = self.state.get("run_pending") if self.reachable else None
         text = fence_text(pending, str(self.state.get("state_name") or "?"))
         self.fence_line.setText(text)
-        set_style_if_changed(self.fence_line, f"color: {WARN_TEXT if pending else theme.FG_MUTED};"
-                                              " font-size: 11px;")
-        if isinstance(pending, dict):
-            self.fence_chip.setText(f"fence: run {pending.get('run_id')}")
-            set_style_if_changed(self.fence_chip, chip_css("partial"))
-            self.fence_chip.setToolTip(text)
-            self.fence_chip.show()
-        else:
-            self.fence_chip.hide()
+        set_style_if_changed(self.fence_line, f"color: {WARN_TEXT}; font-size: 11px;")
+        self.fence_line.setVisible(bool(text))
+        self.fence_head.setVisible(bool(text))
 
     def _render_loops(self) -> None:
         loops = self.state.get("run_loops") if self.reachable else None
         loops = loops if isinstance(loops, dict) else {}
-        text, level, tip = sequences_summary(loops)
+        rq = self.state.get("run_queue") if self.reachable else None
+        text, level, tip = sequences_summary(loops, rq.get("resume_loop")
+                                             if isinstance(rq, dict) else None)
         chip = self.sequences_chip
-        if not self.reachable or not loops:
-            chip.hide()
-        else:
-            chip.setText(text)
-            set_style_if_changed(chip, chip_css(level))
-            chip.setToolTip(tip)
-            chip.show()
+        chip.setText(text)
+        set_style_if_changed(chip, f"color: {ERR_TEXT if level == 'hazard' else theme.FG_MUTED};"
+                                   " font-size: 11px;")
+        chip.setToolTip(tip)
+        chip.setVisible(self.reachable and bool(text))
 
     def _render_warm(self) -> None:
         rq = self.state.get("run_queue") if self.reachable else None

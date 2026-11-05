@@ -9,8 +9,7 @@ reports the machine busy.  A person's own queued runs still go.
 It is set
 
 * by a request -- ``{"type": "run_queue", "action": "hold", "reason", "by"}``,
-  e.g. the Device Control GUI's "Hold -- a person has the machine" button on
-  the Sequences tab;
+  e.g. the Monitor panel's Hold button;
 * by the server itself when a person presses liveOD's Reset / Abort: liveOD
   counts every Abort by source (POLL ``reset_counts`` / ``reset_count`` +
   ``last_reset``) and a person's count going up sets the hold -- whatever run

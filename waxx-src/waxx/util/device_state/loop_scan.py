@@ -1,4 +1,4 @@
-"""Scan settings of a run loop, set from its card on the Sequences tab.
+"""Scan settings of a run loop, set from its card in the Monitor panel's Loops.
 
 A loop whose experiment scans one xvar (kexp: the BEC TOF loop, ``t_tof``) can
 offer its scan to be set from the GUI: a start value, an optional stop value,

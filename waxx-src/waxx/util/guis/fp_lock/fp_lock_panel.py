@@ -8,7 +8,9 @@ of buttons, and one plot showing the separation, the error, the output or the
 two peak positions (edge bands shaded).  Controls: lock on / off, reset
 setpoint (setp = the measured separation), clear integrator, a settings dialog
 (gains, window, peak finding), and a console for raw firmware commands (hidden
-until its button is pressed).  Every control that moves the laser asks first.
+until its button is pressed; Up recalls the commands sent).  Only reset setpoint
+and applying settings ask first; the override button forces the output to the
+voltage in the box beside it, and disables the lock while on.
 
 Construction never blocks: the client is discovered on a worker thread, polls
 and actions run off the GUI thread (SnapshotPoller, RequestRunner).
@@ -26,8 +28,9 @@ from typing import Any, Callable, Optional
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -41,6 +44,7 @@ __all__ = ["FPLockPanel", "SettingsDialog"]
 _LOG = logging.getLogger("waxx.fp_lock.panel")
 
 HISTORY_POINTS = 3000
+OUT_WARN_V = 8.0          # V: the "out" readout turns orange beyond this (the firmware rail)
 
 _PILL = {
     "LOCKED": ("#2e8b57", "LOCKED"),
@@ -53,12 +57,44 @@ _PILL = {
 _LEVEL_COLOR = {"error": "#b22222", "warn": "#b8860b", "info": "#555555"}
 _VAL_CSS = "font-family: Consolas, monospace; font-size: 11px;"
 _VAL_STYLE = "QLabel { " + _VAL_CSS + " }"
-_BTN_STYLE = "QPushButton { padding: 2px 6px; }"
+_BTN_STYLE = "QPushButton { padding: 1px 4px; font-size: 11px; }"
+_SPIN_STYLE = "QDoubleSpinBox { font-size: 11px; padding: 0px 2px; }"
+OVOLT_MAX_V = 10.0        # V: the firmware clamps the forced output to this (kDacMax)
 # plot views: combo label, the history keys drawn
 _VIEWS = {"sep": ("sep (ms)", ("sep",)),
           "err": ("err (ms)", ("err",)),
           "output": ("output (V)", ("feedback", "integ")),
           "peaks": ("peaks (ms)", ("tfirst", "t2"))}
+
+
+class _CommandLine(QLineEdit):
+    """Console input: Up / Down step back and forward through the commands sent."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history: list[str] = []
+        self._pos: Optional[int] = None      # index into history while stepping, else None
+
+    def remember(self, line: str) -> None:
+        if not self.history or self.history[-1] != line:
+            self.history.append(line)
+        self._pos = None
+
+    def keyPressEvent(self, e) -> None:
+        if e.key() == Qt.Key.Key_Up and self.history:
+            self._pos = len(self.history) - 1 if self._pos is None else max(0, self._pos - 1)
+            self.setText(self.history[self._pos])
+            return
+        if e.key() == Qt.Key.Key_Down and self._pos is not None:
+            self._pos += 1
+            if self._pos >= len(self.history):
+                self._pos = None
+                self.clear()
+            else:
+                self.setText(self.history[self._pos])
+            return
+        self._pos = None
+        super().keyPressEvent(e)
 
 
 def _ask(parent, title: str, text: str) -> bool:
@@ -148,7 +184,9 @@ class SettingsDialog(QDialog):
             self._edits[s.name] = w
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply
                                | QDialogButtonBox.StandardButton.Cancel, self)
-        box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        apply_btn = box.button(QDialogButtonBox.StandardButton.Apply)
+        apply_btn.setDefault(True)          # Enter in any field accepts
+        apply_btn.clicked.connect(self.accept)
         box.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
         note = QLabel("Only edited values are sent. Settings live on the board until it is "
@@ -206,7 +244,7 @@ class FPLockPanel(WidgetPanelBase):
         self._plots: dict = {}
         self._bands: list = []
 
-        self._view = "sep"
+        self._view = "peaks"
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 2, 4, 2)
@@ -230,6 +268,7 @@ class FPLockPanel(WidgetPanelBase):
             for key, (label, _) in _VIEWS.items():
                 self._view_box.addItem(label, key)
             self._view_box.addItem("no plot", "none")
+            self._view_box.setCurrentIndex(self._view_box.findData(self._view))
             self._view_box.setToolTip("what the plot shows (time axis: s, 0 = now)")
             self._view_box.currentIndexChanged.connect(
                 lambda _i: self._set_view(self._view_box.currentData()))
@@ -252,15 +291,11 @@ class FPLockPanel(WidgetPanelBase):
         cells = (("err", "err", "error = sep - setp"),
                  ("feedback", "out", "lock output"),
                  ("integ", "int", "integral term"),
-                 ("sats", "rails", "rail hits"),
+                 ("period", "per", "measured sweep period"),
                  ("tfirst", "pk1", "1st peak position in the sweep"),
                  ("t2", "pk2", "2nd peak position in the sweep"),
                  ("h1", "h1", "1st peak height"),
-                 ("h2", "h2", "2nd peak height"),
-                 ("period", "per", "measured sweep period"),
-                 ("bad", "bad", "bad sweeps in a row"),
-                 ("why", "skip", "skipped sweeps: no peak / one peak / outside window"),
-                 ("unlocks", "unl", "unlocks"))
+                 ("h2", "h2", "2nd peak height"))
         for i, (key, label, tip) in enumerate(cells):
             r, c = divmod(i, 4)
             name = QLabel(label, self)
@@ -278,16 +313,32 @@ class FPLockPanel(WidgetPanelBase):
         outer.addLayout(grid)
 
         buttons = QHBoxLayout()
-        buttons.setSpacing(3)
+        buttons.setSpacing(2)
+        buttons.setContentsMargins(0, 0, 0, 0)
         self._lock_btn = QPushButton("Lock …", self)
         self._lock_btn.clicked.connect(self._on_lock_clicked)
         self._reset_btn = QPushButton("Reset setp", self)
         self._reset_btn.setToolTip("setp = the separation the lock measures now (asks first)")
         self._reset_btn.clicked.connect(self._on_reset_setpoint)
         self._clear_btn = QPushButton("Clear int", self)
-        self._clear_btn.setToolTip("zero the integral and the output (0 V); the state is kept "
-                                   "(asks first)")
+        self._clear_btn.setToolTip("zero the integral and the output (0 V); the state is kept")
         self._clear_btn.clicked.connect(self._on_clear)
+        self._override_btn = QPushButton("Override", self)
+        self._override_btn.clicked.connect(self._on_override_clicked)
+        self._ovolt_spin = QDoubleSpinBox(self)
+        self._ovolt_spin.setRange(-OVOLT_MAX_V, OVOLT_MAX_V)
+        self._ovolt_spin.setDecimals(3)
+        self._ovolt_spin.setSingleStep(0.05)
+        self._ovolt_spin.setSuffix(" V")
+        self._ovolt_spin.setToolTip("the output while override is on (sent to the lock as ovolt)")
+        self._ovolt_spin.setFixedWidth(76)
+        self._ovolt_spin.setStyleSheet(_SPIN_STYLE)
+        # arrows and typing are sent after a short pause, so one click is one command
+        self._ovolt_timer = QTimer(self)
+        self._ovolt_timer.setSingleShot(True)
+        self._ovolt_timer.setInterval(400)
+        self._ovolt_timer.timeout.connect(self._send_ovolt)
+        self._ovolt_spin.valueChanged.connect(lambda _v: self._ovolt_timer.start())
         self._settings_btn = QPushButton("Settings…", self)
         self._settings_btn.setToolTip("gains, window, peak finding")
         self._settings_btn.clicked.connect(self._on_settings)
@@ -295,10 +346,16 @@ class FPLockPanel(WidgetPanelBase):
         self._console_btn.setCheckable(True)
         self._console_btn.setToolTip("raw firmware commands")
         self._console_btn.toggled.connect(self._on_console_toggled)
-        for b in (self._lock_btn, self._reset_btn, self._clear_btn, self._settings_btn,
-                  self._console_btn):
+        for b in (self._lock_btn, self._reset_btn, self._clear_btn, self._override_btn,
+                  self._settings_btn, self._console_btn):
             b.setStyleSheet(_BTN_STYLE)
-            buttons.addWidget(b)
+        buttons.addWidget(self._lock_btn)
+        buttons.addWidget(self._reset_btn)
+        buttons.addWidget(self._clear_btn)
+        buttons.addWidget(self._override_btn)
+        buttons.addWidget(self._ovolt_spin)
+        buttons.addWidget(self._settings_btn)
+        buttons.addWidget(self._console_btn)
         outer.addLayout(buttons)
 
         self._msg = QLabel("", self)
@@ -320,8 +377,8 @@ class FPLockPanel(WidgetPanelBase):
         self._console.setStyleSheet("QPlainTextEdit { font-family: Consolas, monospace;"
                                     " font-size: 11px; }")
         self._console.setMaximumHeight(140)
-        self._console_in = QLineEdit(self)
-        self._console_in.setPlaceholderText("command, e.g. help or tmin 1.5 (Enter sends)")
+        self._console_in = _CommandLine(self)
+        self._console_in.setPlaceholderText("command, e.g. help or tmin 1.5 (Enter sends, Up recalls)")
         self._console_in.returnPressed.connect(self._on_console_send)
         outer.addWidget(self._console)
         outer.addWidget(self._console_in)
@@ -404,27 +461,44 @@ class FPLockPanel(WidgetPanelBase):
         self._sep_big.setText(f"sep {_fmt(row.get('sep'), '.3f', 'ms')}  "
                               f"(setp {_fmt(settings.get('setp'), '.3f')})")
         v["err"].setText(_fmt(row.get("err"), "+.3f", "ms"))
-        v["feedback"].setText(_fmt(row.get("feedback"), "+.4f", "V"))
+        override_on = settings.get("override") == 1
+        out_v = settings.get("ovolt") if override_on else row.get("feedback")
+        v["feedback"].setText(_fmt(out_v, "+.4f", "V"))
+        self._tint(v["feedback"], isinstance(out_v, (int, float)) and abs(out_v) > OUT_WARN_V)
+        # the box follows the board, except while it is being edited or a value is pending
+        ovolt = settings.get("ovolt")
+        if (isinstance(ovolt, (int, float)) and not self._ovolt_timer.isActive()
+                and not self._ovolt_spin.hasFocus()):
+            self._ovolt_spin.blockSignals(True)
+            self._ovolt_spin.setValue(float(ovolt))
+            self._ovolt_spin.blockSignals(False)
         v["integ"].setText(_fmt(row.get("integ"), "+.4f", "V"))
         v["tfirst"].setText(_fmt(row.get("tfirst"), ".2f", "ms"))
         v["t2"].setText(_fmt(row.get("t2"), ".2f", "ms"))
         v["period"].setText(_fmt(row.get("period"), ".1f", "ms"))
         v["h1"].setText(_fmt(row.get("h1"), ".2f", "V"))
         v["h2"].setText(_fmt(row.get("h2"), ".2f", "V"))
-        v["bad"].setText(_fmt(row.get("bad"), "d"))
-        if "bad_none" in row:
-            v["why"].setText(f"{row['bad_none']}/{row['bad_one']}/{row['bad_win']}")
-        v["unlocks"].setText(_fmt(row.get("unlocks"), "d"))
-        v["sats"].setText(_fmt(row.get("sats"), "d"))
         edge = snap.get("edge") or {}
-        self._tint(v["tfirst"], "first_near_start" in codes)
-        self._tint(v["t2"], "second_near_end" in codes)
+        # orange when a peak sits within the edge margin of the sweep ends
+        margin, right = edge.get("margin_ms", 10.0), edge.get("right_edge_ms", 120.0)
+        tf, t2 = row.get("tfirst"), row.get("t2")
+        self._tint(v["tfirst"], isinstance(tf, (int, float)) and tf < margin)
+        self._tint(v["t2"], isinstance(t2, (int, float)) and t2 > right - margin)
 
         lock_on = settings.get("lock")
         self._lock_btn.setText("Lock ON" if lock_on == 1 else
                                ("Lock OFF" if lock_on == 0 else "Lock …"))
-        self._lock_btn.setToolTip("click to turn the lock off (asks first)" if lock_on == 1 else
+        self._lock_btn.setToolTip("click to turn the lock off" if lock_on == 1 else
                                   "click to turn the lock on")
+        self._override_btn.setText("Override ON" if override_on else "Override")
+        self._override_btn.setToolTip(
+            f"output forced to {_fmt(settings.get('ovolt'), '.3f', 'V')}; "
+            "click to stop overriding" if override_on else
+            f"force the output to {_fmt(settings.get('ovolt'), '.3f', 'V')} (the box beside it); "
+            "the lock is disabled while on")
+        set_style_if_changed(self._override_btn,
+                             "QPushButton { padding: 2px 6px; background-color: #b8860b; color: white;"
+                             " font-weight: 600; }" if override_on else _BTN_STYLE)
         set_style_if_changed(self._lock_btn,
                              "QPushButton { padding: 2px 6px; background-color: #2e8b57; color: white;"
                              " font-weight: 600; }" if lock_on == 1 else _BTN_STYLE)
@@ -554,9 +628,18 @@ class FPLockPanel(WidgetPanelBase):
                                     + (" color: #b8860b; font-weight: 700;" if on else "") + " }")
 
     def _set_controls_enabled(self, on: bool) -> None:
-        for b in (self._lock_btn, self._reset_btn, self._clear_btn, self._settings_btn,
-                  self._console_in):
+        override_on = ((self._snap.get("settings") or {}).get("override") == 1)
+        for b in (self._reset_btn, self._clear_btn, self._override_btn,
+                  self._ovolt_spin, self._settings_btn, self._console_in):
             b.setEnabled(bool(on))
+        # override takes the output, so the lock is disabled while it is on
+        self._lock_btn.setEnabled(bool(on) and not override_on)
+        self._lock_btn.setToolTip("disabled while override is on" if override_on else
+                                  self._lock_btn.toolTip())
+
+    def _send_ovolt(self) -> None:
+        value = self._ovolt_spin.value()
+        self._run(f"ovolt {value:g} V", lambda: self._client.set_value("ovolt", f"{value:g}"))
 
     def _say(self, text: str, error: bool = False) -> None:
         self._msg.setText(text)
@@ -591,10 +674,6 @@ class FPLockPanel(WidgetPanelBase):
     def _on_lock_clicked(self) -> None:
         on = (self._snap.get("settings") or {}).get("lock") == 1
         if on:
-            if not self._confirm("Turn the lock off?",
-                                 "The output goes to 0 V and the integral is cleared: the laser "
-                                 "moves to where 0 V puts it."):
-                return
             self._run("lock off", lambda: self._client.lock(False))
         else:
             self._run("lock on", lambda: self._client.lock(True))
@@ -612,11 +691,12 @@ class FPLockPanel(WidgetPanelBase):
                   lambda r: f"setpoint {_fmt(r.get('old'), '.3f')} → {_fmt(r.get('new'), '.3f')} ms")
 
     def _on_clear(self) -> None:
-        if not self._confirm("Clear the integrator?",
-                             "The integral and the output go to 0 V now (the laser moves); "
-                             "the lock state is kept."):
-            return
         self._run("clear integrator", lambda: self._client.clear())
+
+    def _on_override_clicked(self) -> None:
+        on = (self._snap.get("settings") or {}).get("override") == 1
+        self._run("override off" if on else "override on",
+                  lambda: self._client.set_value("override", "0" if on else "1"))
 
     def _on_settings(self) -> None:
         dlg = SettingsDialog(self._snap.get("settings") or {}, self._snap.get("missing_settings") or [],
@@ -650,6 +730,7 @@ class FPLockPanel(WidgetPanelBase):
         line = self._console_in.text().strip()
         if not line:
             return
+        self._console_in.remember(line)
         self._console_in.clear()
         self._console.appendPlainText(f"> {line}")
         self._run(f"'{line}'", lambda: self._client.raw(line),

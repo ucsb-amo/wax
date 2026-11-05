@@ -13,8 +13,8 @@ import threading
 import serial
 
 FLOAT_SETTINGS = {"setp": 10.0, "p1": 0.0, "i1": -0.01, "g1": 1.0, "win": 1.0, "vth": 4.0,
-                  "hys": 0.2, "tmin": 1.5}
-INT_SETTINGS = {"lock": 1, "hold": 1, "nbad": 5, "ngood": 10, "nmin": 3, "fmt": 1}
+                  "hys": 0.2, "tmin": 1.5, "ovolt": 0.0}
+INT_SETTINGS = {"lock": 1, "hold": 1, "nbad": 5, "ngood": 10, "nmin": 3, "fmt": 1, "override": 0}
 READ_ONLY = {"sep": 0.0, "integ": 0.0, "state": 1, "tfirst": 0.0, "h1": 0.0, "h2": 0.0,
              "bad": 0, "unlocks": 0, "sats": 0, "period": 120.0}
 

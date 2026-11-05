@@ -1,4 +1,6 @@
-"""Sequences tab of the Device Control GUI.
+"""The run loops' cards, in the Monitor panel's Loops dropdown
+(:mod:`waxx.util.guis.monitor_state_panel`; the Device Control GUI's Sequences
+tab until 2026-10-31).
 
 The experiments the monitor server runs itself, one card each: its run loops
 (:mod:`waxx.util.device_state.run_loop`; kexp: the BEC TOF loop) and its
@@ -7,7 +9,7 @@ Observe).  A card is one row -- Start / Stop (Run for the reset) on the left,
 the title, a state pill and what it is doing, and ▾ on the right, which opens
 the terminal output of its runs.  The server keeps the last lines
 (:class:`~waxx.util.device_state.output_log.OutputLog`); an open log asks for
-the new ones every second while this tab is visible, and nothing is polled
+the new ones every second while the cards are visible, and nothing is polled
 otherwise.
 
 A pick loop's card (kexp: "Experiment loop") opens a file dialog at Start; the
@@ -631,8 +633,8 @@ class HoldRow(QFrame):
 
 
 class SequencesPanel(QWidget):
-    """The Sequences tab: one :class:`SequenceCard` per run loop the monitor
-    server offers, then its reset experiment.
+    """One :class:`SequenceCard` per run loop the monitor server offers, then
+    its reset experiment.
 
     ``log_line(text)`` records a loop's end in the host GUI's changes log.
     The host GUI feeds in the server's state (:meth:`set_reachable`,

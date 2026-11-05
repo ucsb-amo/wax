@@ -17,39 +17,39 @@ MonitorClient-backed callable.
 
 What it shows:
 
-* a top strip: the queue's state pill (idle / running / launching / waiting /
-  paused / held), its text and counts; the alarm banner while ``alarm`` is set
-  (which job, why, how long); the person hold (since, by, owner, source,
-  reason) with Hold / Release; the pause of agent jobs and of all jobs with
-  Pause / Resume; the note that the queue will start a run loop it stopped
-  (``resume_loop``);
+* a top strip: what the queue is doing and how many jobs wait (the other
+  counts in the tooltip); the alarm banner while ``alarm`` is set (which job,
+  why, how long); the person hold (since, by, owner, source, reason) with
+  Hold / Release; the pause of agent jobs and of all jobs behind Pause;
 * the jobs, one row each, in the server's order (phase 1b: ended, the slot,
   then the queued jobs by ``position``; before it: the list's order):
   place (the server's 0-based ``position`` shown from 1; "slot" for the job
   in it), id, state ("(paused)" for a job paused alone), owner / submitter,
   label, class (``expt_class``; "[cal]" when it declares calibrations), file
-  (elided, full path in the tooltip), run id, priority (a placement hint
-  only; the rank is in its tooltip), due, after / chain, the estimate
+  (its name, red when it changed since submit; full path in the tooltip),
+  filepath (the full path), run id, priority (a placement hint only; the rank
+  is in its tooltip), due, after / chain, the estimate
   (``estimate`` = duration / eta_start / eta_end / basis, marked "est."), a
   source-changed warning, why it waits (``waiting``; derived from the job's
   fields for a server that does not send it), and when / by whom it was
   submitted.  Fields a server does not send are blank.
 
-Layout: one toolbar (the state pill and text, the counts, the filter -- a
+Layout: one toolbar (what the queue is doing, how many wait, the filter -- a
 dropdown: All; Last N, the default: the last N ended jobs (N from the spin
 box beside it, default :data:`DEFAULT_LAST_N`) and every job not ended;
-Pending, without the ended jobs --, Follow, Hold / Release, Pause / Resume
-agent and all jobs, Refresh); banners only while there is something to say
-(the alarm, the person hold, a pause, the loop the queue stopped); the table
-(rows tinted: saved green, failed red, the job in the slot blue and bold, an
-ended run that had no file -- ``save_data=False``, done / aborted /
-cancelled; a failed one stays red -- gray; less-used columns hidden until the
-header's right-click menu shows them; a column moves by dragging its
-header); a message line.  With Follow on (the default) the table scrolls to
-its bottom when a list brings a job the previous list did not have (a newly
-queued job).  Given a ``settings`` (a QSettings), the panel remembers the
-columns' order, widths and shown set, the filter, N and Follow, on every
-change (:func:`panel_settings`).
+Pending, without the ended jobs --, Hold / Release, Pause with agent and all
+jobs on its menu); banners only while there is something to say (the alarm,
+the person hold, a pause); the table (rows tinted: saved green, failed red,
+the job in the slot blue and bold, an ended run that had no file --
+``save_data=False``, done / aborted / cancelled; a failed one stays red --
+gray; less-used columns hidden until the header's right-click menu shows
+them; a column moves by dragging its header); a message line, only while
+there is a message.  The header's menu also holds Save as default columns,
+Default columns, Follow new jobs and Refresh list.  With Follow on (the
+default) the table scrolls to its bottom when a list brings a job the previous
+list did not have (a newly queued job).  Given a ``settings`` (a QSettings),
+the panel remembers the columns' order, widths and shown set, a saved default,
+the filter, N and Follow, on every change (:func:`panel_settings`).
 
 A job's actions are on its right-click menu (:meth:`RunQueuePanel.job_menu`;
 what each allows: :meth:`RunQueuePanel.action_state`).  With several rows
@@ -120,8 +120,8 @@ from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, Q
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QStyle, QTableView, QToolButton,
-    QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QTableView, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from waxx.util.dashboard import theme
@@ -160,9 +160,6 @@ ERR_TEXT = "#ff6b6b"
 
 _PILL_BG = {"on": theme.OK, "off": "#4d4d4d", "partial": "#8a6a12", "warn": "#8a6a12",
             "hazard": "#c62828", "unknown": "#454545"}
-#: queue state -> pill level
-_QUEUE_LEVEL = {"idle": "off", "running": "on", "launching": "partial", "waiting": "partial",
-                "paused": "warn", "held": "warn"}
 #: job state -> text colour of its state cell
 _STATE_COLOR = {"queued": theme.FG, "launching": WARN_TEXT, "running": OK_TEXT,
                 "ending": WARN_TEXT, "saved": OK_TEXT, "done": OK_TEXT, "failed": ERR_TEXT,
@@ -213,19 +210,6 @@ def _dur(seconds) -> str:
     return f"{h} h {rest // 60:02d} min"
 
 
-def _pill_css(level: str) -> str:
-    bg = _PILL_BG.get(level, "#454545")
-    return (f"QLabel {{ background: {bg}; color: white; border-radius: 9px;"
-            f" padding: 2px 10px; font-size: 12px; font-weight: 600; }}")
-
-
-def chip_css(level: str) -> str:
-    """A small pill for a one-line status bar."""
-    bg = _PILL_BG.get(level, "#454545")
-    return (f"QLabel {{ background: {bg}; color: white; border-radius: 8px;"
-            f" padding: 1px 8px; font-size: 11px; font-weight: 600; }}")
-
-
 def _banner_css(bg: str, fg: str = "white") -> str:
     return (f"QLabel {{ background: {bg}; color: {fg}; border-radius: 6px;"
             f" padding: 4px 8px; font-size: 12px; }}")
@@ -246,6 +230,11 @@ def _button(text: str) -> QPushButton:
 
 def job_name(job: dict) -> str:
     return f"job {job.get('id')} ({job.get('label') or '?'})"
+
+
+def file_name(path) -> str:
+    """The file's name alone, for a Windows or a POSIX path; "" for none."""
+    return PurePath(str(path or "").replace("\\", "/")).name
 
 
 def ran_without_file(job: dict) -> bool:
@@ -583,21 +572,25 @@ def derived_waiting(job: dict, info: dict, by_id: dict) -> str:
     return str(info.get("waiting") or "")
 
 
-#: (column key, header)
+#: (column key, header), the ones shown by default first, in the order shown
 COLUMNS = (
-    ("position", "#"), ("id", "id"), ("state", "state"), ("owner", "owner / submitter"),
-    ("label", "label"), ("expt_class", "class"), ("path", "file"), ("run_id", "run"),
-    ("priority", "prio"), ("due", "due"), ("after", "after / chain"), ("est", "est."),
-    ("source_changed", "source"), ("waiting", "waiting"), ("submitted", "submitted"),
+    ("position", "#"), ("state", "state"), ("file", "file"), ("label", "label"),
+    ("run_id", "run"), ("est", "est."), ("id", "id"), ("owner", "owner / submitter"),
+    ("expt_class", "class"), ("path", "filepath"), ("priority", "prio"), ("due", "due"),
+    ("after", "after / chain"), ("source_changed", "source"), ("waiting", "waiting"),
+    ("submitted", "submitted"),
 )
 COLUMN_KEYS = tuple(k for k, _ in COLUMNS)
 #: Columns hidden until someone shows them (right-click the header); the
-#: label's tooltip carries the file's path.
-DEFAULT_HIDDEN = ("expt_class", "path", "priority", "due", "after")
+#: file's and the label's tooltips carry the file's path.
+DEFAULT_HIDDEN = ("id", "owner", "expt_class", "path", "priority", "due", "after",
+                  "source_changed", "waiting", "submitted")
 #: Column widths (px) until someone resizes them; the last column stretches.
 DEFAULT_WIDTHS = {"position": 40, "id": 44, "state": 100, "owner": 120, "label": 160,
-                  "expt_class": 110, "path": 220, "run_id": 60, "priority": 50, "due": 60,
-                  "after": 100, "est": 150, "source_changed": 64, "waiting": 200}
+                  "expt_class": 110, "file": 220, "path": 320, "run_id": 60, "priority": 50,
+                  "due": 60, "after": 100, "est": 150, "source_changed": 64, "waiting": 200}
+#: Job states the counts' tooltip lists, in this order.
+COUNTED = ("queued", "launching", "running", "ending", "failed", "aborted", "saved", "done")
 #: The table's filters: every listed job; the last N ended ones and every one
 #: not ended; only those not ended.
 FILTERS = ("all", "last", "pending")
@@ -610,6 +603,8 @@ SETTINGS_ORG = "waxx"
 SETTINGS_APP = "run_queue_panel"
 #: How long after the last column change the layout is written.
 SAVE_DEBOUNCE_MS = 300
+#: The settings keys of the saved default columns: (layout, the columns it is for).
+_DEFAULT_LAYOUT = ("columns/default_state", "columns/default_keys")
 
 
 def panel_settings() -> QSettings:
@@ -731,7 +726,7 @@ class JobTableModel(QAbstractTableModel):
             return self.tooltip(job, key) or None
         state = str(job.get("state"))
         if role == Qt.ItemDataRole.ForegroundRole:
-            if key == "source_changed" and job.get("source_changed"):
+            if key in ("source_changed", "file") and job.get("source_changed"):
                 return QColor(ERR_TEXT)
             if key == "state":
                 return QColor(theme.FG_MUTED if gray_no_file(job)
@@ -806,6 +801,8 @@ class JobTableModel(QAbstractTableModel):
             if job.get("calibrates_declared"):
                 text += " [cal]" if text else "[cal]"
             return text
+        if key == "file":
+            return file_name(job.get("path"))
         if key == "path":
             return str(job.get("path") or "")
         if key == "run_id":
@@ -844,13 +841,15 @@ class JobTableModel(QAbstractTableModel):
         return ""
 
     def tooltip(self, job: dict, key: str) -> str:
-        if key == "path":
+        if key in ("file", "path"):
             sha = str(job.get("sha256") or "")
             lines = [str(job.get("path") or "")]
             if sha:
                 lines.append(f"sha256 at submit: {sha[:16]}...")
             if job.get("cwd"):
                 lines.append(f"working folder: {job['cwd']}")
+            if job.get("source_changed"):
+                lines.append(self.tooltip(job, "source_changed"))
             return "\n".join(lines)
         if key == "state":
             lines = []
@@ -1277,11 +1276,9 @@ class RunQueuePanel(QWidget):
         box.setContentsMargins(0, 4, 0, 0)
         box.setSpacing(4)
 
-        # the toolbar: the queue's state, the filter, hold / pause, refresh
+        # the toolbar: what the queue is doing, the filter, hold / pause
         top = QHBoxLayout()
         top.setSpacing(6)
-        self.pill = QLabel("?")
-        top.addWidget(self.pill)
         self.summary = QLabel("")
         self.summary.setStyleSheet(f"color: {theme.FG}; font-size: 12px;")
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1307,34 +1304,32 @@ class RunQueuePanel(QWidget):
                                   "not ended)")
         self.last_spin.valueChanged.connect(self.set_last_n)
         top.addWidget(self.last_spin)
-        self.follow_button = QToolButton()
-        self.follow_button.setText("Follow")
-        self.follow_button.setCheckable(True)
-        self.follow_button.setAutoRaise(True)
-        self.follow_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.follow_button.setChecked(self.follow_new)
-        self.follow_button.setToolTip("Scroll to the bottom of the table when a job is queued")
-        self.follow_button.toggled.connect(self.set_follow_new)
-        top.addWidget(self.follow_button)
         top.addSpacing(8)
         self.hold_button = _button("Hold...")
         self.hold_button.clicked.connect(lambda _=False: self.toggle_hold())
         top.addWidget(self.hold_button)
+        # Pause: agent jobs and all jobs, on one button's menu
+        self.pause_button = _button("Pause")
+        pause_menu = QMenu(self.pause_button)
         self.pause_buttons: dict[str, QPushButton] = {}
         for scope in ("agent", "all"):
             button = _button("")
-            button.clicked.connect(lambda _=False, s=scope: self.toggle_pause(s))
+            button.clicked.connect(lambda _=False, s=scope, m=pause_menu:
+                                   (m.close(), self.toggle_pause(s)))
+            action = QWidgetAction(pause_menu)
+            action.setDefaultWidget(button)
+            pause_menu.addAction(action)
             self.pause_buttons[scope] = button
-            top.addWidget(button)
-        self.refresh_button = QToolButton()
-        self.refresh_button.setIcon(self.style().standardIcon(
-            QStyle.StandardPixmap.SP_BrowserReload))
-        self.refresh_button.setToolTip("Ask the server for the list again")
-        self.refresh_button.setAutoRaise(True)
-        self.refresh_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.refresh_button.clicked.connect(lambda _=False: self.refresh_list())
-        top.addWidget(self.refresh_button)
+        self.pause_button.setMenu(pause_menu)
+        top.addWidget(self.pause_button)
         box.addLayout(top)
+
+        # on the header's menu (see header_menu)
+        self.follow_button = QAction("Follow new jobs", self)
+        self.follow_button.setCheckable(True)
+        self.follow_button.setChecked(self.follow_new)
+        self.follow_button.setToolTip("Scroll to the bottom of the table when a job is queued")
+        self.follow_button.toggled.connect(self.set_follow_new)
 
         # banners: only while there is something to say
         self.alarm = QLabel("")
@@ -1353,9 +1348,6 @@ class RunQueuePanel(QWidget):
             label.hide()
             self.pause_labels[scope] = label
             box.addWidget(label)
-        self.loop_note = _small("")
-        self.loop_note.hide()
-        box.addWidget(self.loop_note)
 
         # the jobs
         self.model = JobTableModel(self)
@@ -1390,7 +1382,8 @@ class RunQueuePanel(QWidget):
         header.sectionResized.connect(self._on_section_resized)
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         header.customContextMenuRequested.connect(self._header_menu)
-        header.setToolTip("Drag a header to move its column; right-click: show or hide columns")
+        header.setToolTip("Drag a header to move its column; right-click: columns, save them "
+                          "as the default, follow new jobs, refresh")
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.selectionModel().selectionChanged.connect(self._on_selection)
@@ -1412,6 +1405,7 @@ class RunQueuePanel(QWidget):
 
         self.message = _small("")
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.message.hide()
         box.addWidget(self.message)
 
         self._list_timer = QTimer(self)
@@ -1635,31 +1629,24 @@ class RunQueuePanel(QWidget):
 
     def _show_summary(self) -> None:
         if not self.reachable:
-            self.pill.setText("?")
-            set_style_if_changed(self.pill, _pill_css("unknown"))
             self.summary.setText("The monitor server is not answering.")
         elif not self.has_queue:
-            self.pill.setText("none")
-            set_style_if_changed(self.pill, _pill_css("unknown"))
             self.summary.setText("This monitor server has no run queue (older code).")
         else:
-            state = self.queue_state()
-            self.pill.setText(state)
-            set_style_if_changed(self.pill, _pill_css(_QUEUE_LEVEL.get(state, "unknown")))
             text = str(self.info.get("text") or "")
+            text = text[:1].upper() + text[1:]
             warm = self.info.get("warm")
             if isinstance(warm, dict):
                 text += f" -- next #{warm.get('job')} {warm.get('text') or warm.get('state')}"
             self.summary.setText(text)
         self.summary.setToolTip(self.summary.text())
         counts = self.info.get("counts") or {}
-        shown = [f"{counts[s]} {s}" for s in ("queued", "launching", "running", "ending",
-                                               "failed", "aborted", "saved", "done")
-                 if counts.get(s)]
+        shown = [f"{counts['queued']} queued"] if counts.get("queued") else []
         if self.not_listed:
             shown.append(f"{self.not_listed} more queued not listed" if self.not_listed > 0
                          else "more queued not listed")
         self.counts.setText(" | ".join(shown) if self.reachable and self.has_queue else "")
+        self.counts.setToolTip(" | ".join(f"{counts[s]} {s}" for s in COUNTED if counts.get(s)))
 
         alarm = self.info.get("alarm") if self.reachable else None
         warm_alarm = self.info.get("warm_alarm") if self.reachable else None
@@ -1711,16 +1698,6 @@ class RunQueuePanel(QWidget):
                 label.setText(f"{title}: not paused")
                 set_style_if_changed(label, f"color: {theme.FG_MUTED}; font-size: 11px;")
                 label.hide()
-
-        resume = self.info.get("resume_loop")
-        if isinstance(resume, dict) and self.reachable:
-            self.loop_note.setText(
-                f"The queue stopped the loop {resume.get('key')} for its jobs "
-                f"(since {_clock(resume.get('since'))}); it starts it again when it has run out"
-                + (f" ({resume['category']})." if resume.get("category") else "."))
-            self.loop_note.show()
-        else:
-            self.loop_note.hide()
 
     # -- selection and buttons ------------------------------------------------------------------
 
@@ -1870,17 +1847,22 @@ class RunQueuePanel(QWidget):
         paused = self.info.get("paused") or {}
         for scope, b in self.pause_buttons.items():
             on = isinstance(paused.get(scope), dict)
-            b.setText(("Resume " if on else "Pause ") + scope)
+            b.setText(("Resume " if on else "Pause ") + scope + " jobs")
             set_style_if_changed(b, theme.held_button_css() if on else "")
             b.setEnabled(live)
             b.setToolTip(why_not if not live else
                          (f"Let {scope} jobs launch again" if on else
                           f"Stop launching {scope} jobs (the running one goes on)"))
-        self.refresh_button.setEnabled(self.reachable)
+        any_paused = any(isinstance(p, dict) for p in paused.values())
+        self.pause_button.setText("Paused" if any_paused else "Pause")
+        set_style_if_changed(self.pause_button, theme.held_button_css() if any_paused else "")
+        self.pause_button.setEnabled(live)
+        self.pause_button.setToolTip(why_not or "Pause or resume agent jobs or all jobs")
 
     def say(self, text: str, color: str = theme.FG_MUTED) -> None:
         self._list_error_shown = False        # a newer message is not cleared by a list
         self.message.setText(text)
+        self.message.setVisible(bool(text))
         set_style_if_changed(self.message, f"color: {color}; font-size: 11px;")
 
     # -- actions ---------------------------------------------------------------------------------
@@ -2368,7 +2350,8 @@ class RunQueuePanel(QWidget):
         menu.exec(self.table.viewport().mapToGlobal(pos))
         delete_later(menu)
 
-    def _header_menu(self, pos) -> None:
+    def header_menu(self) -> QMenu:
+        """The header's right-click menu (separate for tests)."""
         menu = QMenu(self)
         for i, (key, title) in enumerate(COLUMNS):
             act = QAction(title, menu)
@@ -2377,7 +2360,18 @@ class RunQueuePanel(QWidget):
             act.toggled.connect(lambda on, c=i: self.set_column_shown(c, on))
             menu.addAction(act)
         menu.addSeparator()
+        save = menu.addAction("Save as default columns", self.save_default_columns)
+        save.setEnabled(self.settings is not None)
         menu.addAction("Default columns", self.default_columns)
+        if self._saved_default():
+            menu.addAction("Back to the built-in columns", self.forget_default_columns)
+        menu.addSeparator()
+        menu.addAction(self.follow_button)
+        menu.addAction("Refresh list", self.refresh_list)
+        return menu
+
+    def _header_menu(self, pos) -> None:
+        menu = self.header_menu()
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
         delete_later(menu)
 
@@ -2386,7 +2380,13 @@ class RunQueuePanel(QWidget):
         self._columns_changed()
 
     def default_columns(self) -> None:
-        """The columns as built: their order, widths and shown set."""
+        """The default order, widths and shown set: the saved default
+        (:meth:`save_default_columns`) when there is one, else as built."""
+        if not self._restore_layout(*_DEFAULT_LAYOUT):
+            self._built_in_columns()
+        self._columns_changed()
+
+    def _built_in_columns(self) -> None:
         header = self.table.horizontalHeader()
         for logical in range(len(COLUMNS)):
             header.moveSection(header.visualIndex(logical), logical)
@@ -2394,7 +2394,24 @@ class RunQueuePanel(QWidget):
             header.resizeSection(COLUMN_KEYS.index(key), width)
         for i, key in enumerate(COLUMN_KEYS):
             self.table.setColumnHidden(i, key in DEFAULT_HIDDEN)
-        self._columns_changed()
+
+    def save_default_columns(self) -> None:
+        """The columns as they are become this PC's default."""
+        state_key, keys_key = _DEFAULT_LAYOUT
+        self._put_settings({state_key: self.table.horizontalHeader().saveState(),
+                            keys_key: ",".join(COLUMN_KEYS)})
+        self.say("saved these columns as the default on this PC")
+
+    def forget_default_columns(self) -> None:
+        """Drop the saved default and go back to the columns as built."""
+        if self.settings is not None:
+            try:
+                for key in _DEFAULT_LAYOUT:
+                    self.settings.remove(key)
+                self.settings.sync()
+            except Exception:                         # noqa: BLE001
+                pass
+        self.default_columns()
 
     # -- remembered columns and filter (only with ``settings``) -------------------------------
 
@@ -2416,17 +2433,26 @@ class RunQueuePanel(QWidget):
         except Exception:                             # noqa: BLE001
             pass
 
-    def _restore_columns(self) -> None:
-        """The saved order, widths and shown set -- only when they were saved
+    def _saved_default(self) -> bool:
+        state_key, keys_key = _DEFAULT_LAYOUT
+        return bool(self._setting(state_key)) and self._setting(keys_key) == ",".join(COLUMN_KEYS)
+
+    def _restore_layout(self, state_key: str, keys_key: str) -> bool:
+        """A saved order, widths and shown set -- only when they were saved
         for this panel's columns (a version with other columns starts from
-        the defaults)."""
-        state = self._setting("columns/state")
-        if not state or self._setting("columns/keys") != ",".join(COLUMN_KEYS):
-            return
+        the defaults).  False when nothing was applied."""
+        state = self._setting(state_key)
+        if not state or self._setting(keys_key) != ",".join(COLUMN_KEYS):
+            return False
         try:
-            self.table.horizontalHeader().restoreState(QByteArray(state))
+            return bool(self.table.horizontalHeader().restoreState(QByteArray(state)))
         except Exception:                             # noqa: BLE001
-            pass
+            return False
+
+    def _restore_columns(self) -> None:
+        """The layout left last, else the saved default."""
+        if not self._restore_layout("columns/state", "columns/keys"):
+            self._restore_layout(*_DEFAULT_LAYOUT)
 
     def _on_section_resized(self, logical: int, _old: int, _new: int) -> None:
         # the stretched last column follows the window's width: not a choice
@@ -2560,7 +2586,7 @@ class QueueSummaryLine(QFrame):
 
 __all__ = ["COLUMNS", "DEFAULT_HIDDEN", "EditJobDialog", "FILTERS", "JobLogWindow",
            "JobTableModel", "QueueSummaryLine", "RunQueuePanel", "SourceWindow", "again_request",
-           "cancel_request", "chip_css", "derived_waiting", "edit_request", "find_editor",
+           "cancel_request", "derived_waiting", "edit_request", "file_name", "find_editor",
            "hold_request", "kq_commands", "list_request", "move_request", "not_carried_over",
            "order_jobs", "pause_request", "ran_without_file", "release_request",
            "resume_request", "tail_request"]

@@ -4,7 +4,7 @@ import threading
 from collections import deque
 from typing import Dict, Any
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
+    QApplication, QFrame, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QLabel, QDoubleSpinBox, QPushButton,
     QLineEdit, QMessageBox, QSizePolicy, QMenu, QListWidget, QComboBox,
     QScrollArea, QGraphicsOpacityEffect, QPlainTextEdit, QFileDialog
@@ -22,7 +22,7 @@ from waxx.util.comms_server.state_broadcast import StateListener
 from waxx.util.dashboard import theme
 from waxx.util.device_state.op_journal import describe_entry
 from waxx.util.guis.device_summary import (
-    MakeSafeDialog, MonitorNotice, SummaryStrip, reset_title)
+    MakeSafeDialog, MonitorNotice, SummaryStrip, live_control_text, reset_title, run_in_use)
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 from waxx.util.guis.slm_actions import (  # noqa: F401 (re-exported)
     SLM_LOG_MAX_LINES, SLM_LOG_POLL_MS, SlmActions, SlmLogWindow,
@@ -1631,9 +1631,8 @@ class DeviceStateGUI(QMainWindow):
     a short description of what it started) adds "Launch spot finder" to its
     menu.
 
-    The Sequences tab (:mod:`waxx.util.guis.sequences_panel`) is always
-    there: the experiments the monitor server runs itself (its run loops and
-    reset experiment), each with its terminal output.
+    The run loops and the queue are the Monitor panel's
+    (:mod:`waxx.util.guis.monitor_panel`), in the Server Dashboard.
 
     Starting and stopping the monitor *server* belongs to whatever runs it
     (the lab's dashboard puts Start / Stop / Restart on this panel's header).
@@ -1667,8 +1666,6 @@ class DeviceStateGUI(QMainWindow):
         self._telemetry = composite_telemetry
         self.composite_panel = None
         self._composite_scroll = None
-        self.sequences_panel = None
-        self._sequences_scroll = None
         self._trust: dict | None = None
         # The monitor server's reset experiment and its current/last run
         # (StateReset.info()); None when the server has none.
@@ -1954,19 +1951,6 @@ class DeviceStateGUI(QMainWindow):
             self._composite_scroll = composite_scroll
             self.tab_widget.addTab(composite_scroll, "Composite")
 
-        # Sequences tab: what the monitor server runs itself (run loops, the
-        # reset experiment).  Scrolls on its own for the same reason: an open
-        # log makes it tall.
-        from waxx.util.guis.sequences_panel import SequencesPanel  # noqa: PLC0415
-        self.sequences_panel = SequencesPanel(log_line=self._record_line)
-        self.sequences_panel.reset_requested.connect(self._reset_state)
-        sequences_scroll = QScrollArea()
-        sequences_scroll.setWidget(self.sequences_panel)
-        sequences_scroll.setWidgetResizable(True)
-        sequences_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._sequences_scroll = sequences_scroll
-        self.tab_widget.addTab(sequences_scroll, "Sequences")
-
         # Restore + persist the active tab.
         saved_tab = int(_setting("ui/active_tab", 0, int))
         if 0 <= saved_tab < self.tab_widget.count():
@@ -2014,10 +1998,10 @@ class DeviceStateGUI(QMainWindow):
         self.status_pill.clicked.connect(self.on_status_pill_clicked)
         self.status_pill.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.status_pill.customContextMenuRequested.connect(self._status_pill_menu)
-        self.status_pill.setToolTip("Click: start the monitor experiment when it is not "
-                                    "running (retry when the server is unreachable).\n"
-                                    "Right-click: start, restart or stop the monitor "
-                                    "experiment.")
+        self.status_pill.setToolTip("Live control is the monitor experiment.\n"
+                                    "Click: start it when it is off (retry when the server "
+                                    "is unreachable).\n"
+                                    "Right-click: start, restart or stop it.")
         self._style_pill(theme.OFF)
         row.addWidget(self.status_pill)
 
@@ -2034,11 +2018,24 @@ class DeviceStateGUI(QMainWindow):
         row.addWidget(self.monitor_notice)
         row.addStretch(1)
 
-        # The monitor server's connections (the Composite tab's connection
-        # bar, placed here once that tab is built).
+        # "Connected devices": what the bubbles are.  The monitor server's
+        # connections (the Composite tab's connection bar, placed here once
+        # that tab is built) and the SLM.
+        self.connected_devices = QFrame()
+        self.connected_devices.setObjectName("connected_devices")
+        self.connected_devices.setStyleSheet(
+            f"QFrame#connected_devices {{ background: {theme.BG_RAISED};"
+            f" border: 1px solid {theme.BORDER}; border-radius: 6px; }}")
+        group = QHBoxLayout(self.connected_devices)
+        group.setContentsMargins(8, 1, 6, 1)
+        group.setSpacing(6)
+        title = QLabel("Connected devices")
+        title.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 11px;")
+        group.addWidget(title)
         self._connections_slot = QHBoxLayout()
         self._connections_slot.setContentsMargins(0, 0, 0, 0)
-        row.addLayout(self._connections_slot)
+        group.addLayout(self._connections_slot)
+        row.addWidget(self.connected_devices)
         # The SLM's reinit (and the spot finder launcher), beside them.
         from waxx.util.guis.slm_pill import SlmPill  # noqa: PLC0415
         self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
@@ -2051,7 +2048,7 @@ class DeviceStateGUI(QMainWindow):
             launcher=(lambda: self._spot_finder_launcher())
             if self._spot_finder_launcher is not None else None,
             settings=_gui_settings)
-        row.addWidget(self.slm_pill)
+        group.addWidget(self.slm_pill)
 
         # The changes log lives in its own pop-out window (see
         # ChangesLogWindow) instead of a strip under the grids.
@@ -2095,11 +2092,11 @@ class DeviceStateGUI(QMainWindow):
         """The status pill's menu and {action: handler} (separate for tests)."""
         can_start, live = self._monitor_commands_allowed()
         menu = QMenu(self)
-        start = menu.addAction("Start monitor experiment")
+        start = menu.addAction("Start live control")
         start.setEnabled(can_start)
-        restart = menu.addAction("Restart monitor experiment…")
+        restart = menu.addAction("Restart live control…")
         restart.setEnabled(live)
-        stop = menu.addAction("Stop monitor experiment…")
+        stop = menu.addAction("Stop live control…")
         stop.setEnabled(live)
         menu.addSeparator()
         regen = menu.addAction("Regenerate state file…")
@@ -2198,29 +2195,35 @@ class DeviceStateGUI(QMainWindow):
             + f"\n\nBackup of the previous file:\n{backup}")
         self.request_state()
 
+    def _run_text(self) -> str:
+        """The run the status shows using the machine, in words ("" for none)."""
+        live_od = self._live_od_status()
+        text = run_in_use((self._monitor_status or {}).get("run_queue"), live_od,
+                          self._run_pending)
+        if text and live_od.get("run_in_progress") and live_od.get("n_shots_expected"):
+            text += f", shot {live_od.get('n_shots') or 0}/{live_od.get('n_shots_expected')}"
+        return text
+
     def _set_monitor_state(self, state: int) -> None:
         """Apply a monitor state (STATES.*) to the pill; track when it began."""
         self.connection_failed = False
         if state != self._monitor_state:
             self._monitor_state = state
             self._state_since = time.time()
-        if state == STATES.READY:
-            self.status_pill.setText("Monitor ready")
-            self._style_pill(theme.OK)
-        elif state == STATES.LOADING:
-            self.status_pill.setText("Monitor starting…")
-            self._style_pill(theme.WARN)
-        else:  # STATES.NOT_READY
-            self.status_pill.setText("Monitor not running")
-            self._style_pill(theme.ERR)
         status = self._monitor_status or {}
-        self.monitor_notice.set_monitor(state, True, str(status.get("sub_state") or ""),
-                                        str(status.get("reason") or "").strip())
+        sub_state = str(status.get("sub_state") or "")
+        run = self._run_text()
+        name = {STATES.READY: "READY", STATES.LOADING: "LOADING"}.get(state, "NOT_READY")
+        text, level = live_control_text(name, sub_state, run)
+        # a run is normal: never red.  The run itself goes beside the pill.
+        self.status_pill.setText(text.split(":", 1)[0])
+        self._style_pill({"on": theme.OK, "run": theme.HIGHLIGHT}.get(level, theme.WARN))
+        self.monitor_notice.set_monitor(state, True, sub_state,
+                                        str(status.get("reason") or "").strip(),
+                                        run_active=bool(run))
         self._refresh_status_buttons()
         if self.composite_panel is not None:
             self.composite_panel.set_monitor_state(state, reachable=True)
-        if self.sequences_panel is not None:
-            self.sequences_panel.set_reachable(True)
         self._refresh_summary()
 
     def _on_status_updated(self, status: int) -> None:
@@ -2243,15 +2246,6 @@ class DeviceStateGUI(QMainWindow):
             self._trust = detail.get("trust")
         if "reset" in detail:
             self._set_reset(detail.get("reset"))
-        if isinstance(detail.get("run_loops"), dict) and self.sequences_panel is not None:
-            self.sequences_panel.set_loops(detail["run_loops"])
-        if isinstance(detail.get("person_hold"), dict) and self.sequences_panel is not None:
-            self.sequences_panel.set_hold(detail["person_hold"])
-        if self.sequences_panel is not None:
-            # one line on the Sequences tab; the queue's own panel is the
-            # monitor server's (Server Dashboard)
-            rq = detail.get("run_queue")
-            self.sequences_panel.set_queue(rq if isinstance(rq, dict) else None)
         if "run_pending" in detail:
             self._run_pending = detail.get("run_pending")
         if self.slm_pill is not None:
@@ -2270,12 +2264,15 @@ class DeviceStateGUI(QMainWindow):
             self._state_since = since
         sub = str(detail.get("sub_state") or "")
         reason = str(detail.get("reason") or "").strip()
-        parts = []
-        text = reason or ("" if sub in _SUB_STATES_SAID
-                          else _SUB_STATE_TEXT.get(sub, sub.replace("_", " ")))
+        run = self._run_text()
+        parts = [run] if run else []
+        # what the pill and the notice say is not said again (the notice's
+        # tooltip has the reason)
+        text = "" if run or sub in _SUB_STATES_SAID else (
+            reason or _SUB_STATE_TEXT.get(sub, sub.replace("_", " ")))
         if text:
             parts.append(text)
-        if self._state_since:
+        if self._state_since and not run:
             parts.append(f"for {_fmt_duration(time.time() - self._state_since)}")
         self.status_detail_label.setText("  ·  ".join(parts))
         tip = []
@@ -2296,8 +2293,6 @@ class DeviceStateGUI(QMainWindow):
         self._refresh_status_buttons()
         if self.composite_panel is not None:
             self.composite_panel.set_monitor_state(None, reachable=False)
-        if self.sequences_panel is not None:
-            self.sequences_panel.set_reachable(False)
         if self.slm_pill is not None:
             self.slm_pill.set_reachable(False)
         self._refresh_summary()
@@ -2510,8 +2505,8 @@ class DeviceStateGUI(QMainWindow):
     def _refresh_summary(self) -> None:
         """Everything the strip above the tabs shows, from what this GUI knows."""
         samples = self._telemetry_samples
-        self.summary.set_trust(self._trust, self._reset)
-        self.summary.set_run(self._run_pending, self._live_od_status())
+        self.summary.set_trust(self._trust, self._reset, run_active=bool(self._run_text()))
+        self.summary.set_run(self._run_pending, (self._monitor_status or {}).get("run_queue"))
         state = samples.get("interlock/state")
         enabled = samples.get("interlock/magnets_enabled")
         fresh = state is not None and state.ok and state.age_s < 15.
@@ -2691,8 +2686,6 @@ class DeviceStateGUI(QMainWindow):
         """New reset info (status poll, snapshot, broadcast or reply): logs a
         line in the changes log when a reset starts or ends."""
         previous, self._reset = self._reset, reset
-        if self.sequences_panel is not None:
-            self.sequences_panel.set_reset(reset)
         if not reset:
             return
         key = (reset.get("state"), reset.get("started"))
@@ -2717,15 +2710,15 @@ class DeviceStateGUI(QMainWindow):
             return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Clear the run fence")
+        box.setWindowTitle("Unlock the controls")
         box.setText(
-            f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) announced "
-            "itself and has not taken the core.\n\n"
-            "Clear the fence only if that run is dead (it stopped before its kernel "
-            "started: a compile error, an exception, a closed console). If it is still "
-            "starting, a composite op sent now can be cut off half-way when it takes the "
-            "core.\n\nRecorded in the journal with this machine's name.")
-        yes = box.addButton("Clear the fence", QMessageBox.ButtonRole.AcceptRole)
+            f"Run {pending.get('run_id')} ({pending.get('expt') or 'experiment'}) started and "
+            "has not ended.\n\n"
+            "Unlock only if that run is dead (a compile error, an exception, a closed "
+            "console). If it is still going, this also gives its devices (e.g. the tweezer "
+            "AWG) back to the monitor server, and a control sent now can be cut off half-way."
+            "\n\nRecorded in the journal with this machine's name.")
+        yes = box.addButton("Unlock the controls", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         box.exec()
         clicked = box.clickedButton()
@@ -2993,12 +2986,6 @@ class DeviceStateGUI(QMainWindow):
                 panel.set_trust(self._trust)
         if "reset" in state:
             self._set_reset(state.get("reset"))
-        if isinstance(state.get("run_loops"), dict) and self.sequences_panel is not None:
-            self.sequences_panel.set_loops(state["run_loops"])
-        if isinstance(state.get("person_hold"), dict) and self.sequences_panel is not None:
-            self.sequences_panel.set_hold(state["person_hold"])
-        if isinstance(state.get("run_queue"), dict) and self.sequences_panel is not None:
-            self.sequences_panel.set_queue(state["run_queue"])
         if "run_pending" in state:
             self._run_pending = state.get("run_pending")
             if panel is not None:
@@ -3053,18 +3040,8 @@ class DeviceStateGUI(QMainWindow):
             if panel is not None:
                 panel.on_op_result(payload)
             return
-        if mtype == "run_loop":
-            if self.sequences_panel is not None:
-                self.sequences_panel.on_run_loop(payload.get("loop"))
-            return
-        if mtype == "person_hold":
-            if self.sequences_panel is not None:
-                self.sequences_panel.set_hold(payload.get("person_hold"))
-            return
-        if mtype == "run_queue":
-            if self.sequences_panel is not None and isinstance(payload.get("run_queue"), dict):
-                self.sequences_panel.set_queue(payload["run_queue"])
-            return
+        if mtype in ("run_loop", "person_hold", "run_queue"):
+            return                                    # the Monitor panel's
         if mtype == "state_reset":
             # an experiment's end state replaced the file: resync everything
             self.request_state()
@@ -3306,8 +3283,6 @@ class DeviceStateGUI(QMainWindow):
             self.slm_actions.shutdown()
         if self.composite_panel is not None:
             self.composite_panel.shutdown()
-        if self.sequences_panel is not None:
-            self.sequences_panel.shutdown()
         timer = getattr(self, "_telemetry_timer", None)
         if timer is not None:
             timer.stop()
