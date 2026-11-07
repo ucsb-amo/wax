@@ -15,6 +15,7 @@ tried again. Connect and reply timeouts are ``T_TIMEOUT`` (the python-vxi11
 defaults are an unbounded connect and a 10 s reply).
 """
 
+import re
 import socket
 import time
 
@@ -395,5 +396,386 @@ class SDG6000X_CH():
     def set_output(self,state=1,init=False):
         self.core.wait_until_mu(now_mu())
         self.set_output_rpc(state,init)
+        self.core.break_realtime()
+        delay(T_RPC_DELAY)
+
+
+# ---------------------------------------------------------------------------
+# FM channel: fixed carrier, sine FM from the internal source
+# ---------------------------------------------------------------------------
+# Ported from k-jam/jk/siglent_fm_control.ipynb (2026-11-05).
+
+
+# Seconds between a write and its read-back.
+T_FM_SETTLE = 0.05
+
+_FM_KEYS = ('frequency_carrier', 'amplitude_vpp', 'fm_deviation', 'fm_rate')
+
+
+def _num(s):
+    """'1000HZ' -> 1000.0, '0.5V' -> 0.5; non-numeric -> the string unchanged."""
+    m = re.match(r'^\s*([-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?)', s)
+    return float(m.group(1)) if m else s.strip()
+
+
+def _pairs(tokens):
+    return {tokens[i].strip().upper(): _num(tokens[i + 1])
+            for i in range(0, len(tokens) - 1, 2)}
+
+
+def _body(reply):
+    return reply.strip().strip('\x00').split(' ', 1)[-1]
+
+
+def parse_mdwv(reply):
+    """'C1:MDWV STATE,ON,FM,MDSP,SINE,SRC,INT,FRQ,100HZ,DEVI,1000HZ,CARR,WVTP,...'
+    -> {'STATE': 'ON', 'TYPE': 'FM', 'FM': {...}, 'CARR': {...}, 'raw': ...}"""
+    toks = [t.strip() for t in _body(reply).split(',')]
+    out = {'raw': reply.strip().strip('\x00')}
+    if 'CARR' in toks:
+        i = toks.index('CARR')
+        toks, carr = toks[:i], toks[i + 1:]
+        out['CARR'] = _pairs(carr)
+    if len(toks) >= 2 and toks[0].upper() == 'STATE':
+        out['STATE'] = toks[1].upper()
+        toks = toks[2:]
+    if toks and toks[0]:
+        out['TYPE'] = toks[0].upper()
+        out[out['TYPE']] = _pairs(toks[1:])
+    return out
+
+
+def parse_bswv(reply):
+    return _pairs([t.strip() for t in _body(reply).split(',')])
+
+
+def parse_outp(reply):
+    """'C1:OUTP ON,LOAD,50,PLRT,NOR' -> {'STATE': 'ON', 'LOAD': 50.0, 'PLRT': 'NOR'}"""
+    toks = [t.strip() for t in _body(reply).split(',')]
+    out = _pairs(toks[1:])
+    out['STATE'] = toks[0].upper() if toks else None
+    return out
+
+
+class SDG6000X_FM_CH():
+    """One SDG6000X channel used as a fixed-carrier FM source (sine FM,
+    internal modulation source).
+
+    Experiments set the carrier amplitude (Vpp), the FM deviation and the FM
+    rate (Hz). The carrier frequency is fixed at ``frequency_carrier``:
+    ``init()`` writes it only if the instrument reads something else, and
+    nothing else ever writes it.
+
+    Limits, enforced before anything is sent (``ValueError``, nothing
+    written; raised from a kernel this aborts the run):
+
+    - amplitude 0 .. ``max_amplitude_vpp``,
+    - FM deviation 0 .. ``max_fm_deviation``, FM rate 0 .. ``max_fm_rate``.
+
+    The amplitude is what the instrument is programmed to deliver into the
+    load set on the channel (``OUTP LOAD``); ``init()`` prints that load.
+
+    Behaviour of the instrument this class works around (SDG6022X, seen
+    2026-11-05): FM parameter writes are ignored while modulation is off, and
+    modulation comes on with the last-used type (AM came up). So FM values
+    set while FM is off are kept and written by ``fm_on()``, which switches
+    modulation on, selects FM (internal source, sine), writes deviation and
+    rate, and reads back; if the result is not FM at the requested values it
+    switches modulation off again and says so.
+
+    Every write is read back (the instrument clamps out-of-range values
+    silently). A setting that failed to write, could not be read back, or
+    reads back different from the request is printed loudly and kept
+    *stale*: it is written again at the next call. Communications failures
+    never raise (module policy above); they are printed.
+
+    Each call is a host RPC of a few tens of ms (write + ``T_FM_SETTLE`` +
+    read-back): not for time-critical parts of a sequence. Nothing resets the
+    instrument at the end of a run; it stays at the last values set.
+    """
+
+    def __init__(self, ch, ip,
+                 frequency_carrier,
+                 max_amplitude_vpp,
+                 fm_deviation=0.,
+                 fm_rate=0.,
+                 max_fm_deviation=10.e6,
+                 max_fm_rate=1.e6,
+                 core=Core):
+        if not max_amplitude_vpp > 0.:
+            raise ValueError(f"max_amplitude_vpp must be > 0, got {max_amplitude_vpp}")
+        self._instr = SDG6000X(ip)
+        self.ch = ch
+        self.frequency_carrier = frequency_carrier
+        self.max_amplitude_vpp = max_amplitude_vpp
+        self.max_fm_deviation = max_fm_deviation
+        self.max_fm_rate = max_fm_rate
+        self._check(dv, fm_deviation, fm_rate)
+        self._fm_deviation_default = fm_deviation
+        self._fm_rate_default = fm_rate
+
+        # Targets: the values last asked for. A key in self._stale is a target
+        # the hardware is not known to hold; it is written at the next chance.
+        self.amplitude_vpp = dv      # unknown until init() reads it or set() writes it
+        self.fm_deviation = fm_deviation
+        self.fm_rate = fm_rate
+        self.fm_state = -1           # -1 unknown, 0 FM off, 1 FM on
+        self._stale = {'fm_deviation', 'fm_rate'}
+
+        self.core = core
+
+    # ---- helpers -----------------------------------------------------------
+
+    @property
+    def _label(self) -> str:
+        return f"[siglent {self._instr.ip} ch{self.ch} FM]"
+
+    def _report_failure(self, what, e):
+        print(f"{self._label} *** {what} FAILED -- hardware NOT updated "
+              f"({type(e).__name__}: {e}) ***")
+
+    def _check(self, amplitude_vpp, fm_deviation, fm_rate) -> dict:
+        """The requested values (>= 0; a negative value means 'no change').
+        Raises ValueError, before anything is sent, on a value out of limits."""
+        req = {}
+        for key, v, hi, unit in (('amplitude_vpp', amplitude_vpp, self.max_amplitude_vpp, 'Vpp'),
+                                 ('fm_deviation', fm_deviation, self.max_fm_deviation, 'Hz'),
+                                 ('fm_rate', fm_rate, self.max_fm_rate, 'Hz')):
+            if v != v:
+                raise ValueError(f"{self._label} {key} is NaN; nothing sent.")
+            if v < 0.:
+                continue
+            if v > hi:
+                raise ValueError(f"{self._label} {key} {v} {unit} requested, above the "
+                                 f"limit {hi} {unit}; nothing sent.")
+            req[key] = float(v)
+        return req
+
+    def _command(self, key) -> str:
+        c = self.ch
+        if key == 'frequency_carrier':
+            return f"C{c}:BSWV FRQ,{self.frequency_carrier}"
+        if key == 'amplitude_vpp':
+            return f"C{c}:BSWV AMP,{self.amplitude_vpp}"
+        if key == 'fm_deviation':
+            return f"C{c}:MDWV FM,DEVI,{self.fm_deviation:.6f}"
+        if key == 'fm_rate':
+            return f"C{c}:MDWV FM,FRQ,{self.fm_rate:.6f}"
+        raise KeyError(key)
+
+    @staticmethod
+    def _matches(applied, target) -> bool:
+        return (isinstance(applied, float)
+                and abs(applied - target) <= 1e-6 * max(1., abs(target)))
+
+    def _problems(self, st) -> list:
+        """Reasons the read state is outside the channel's limits ([] = OK)."""
+        probs = []
+        f, a = st['frequency_carrier'], st['amplitude_vpp']
+        if not self._matches(f, self.frequency_carrier):
+            probs.append(f"carrier frequency reads {f!r} Hz, not {self.frequency_carrier:.0f} Hz")
+        if not isinstance(a, float) or a > self.max_amplitude_vpp:
+            probs.append(f"amplitude reads {a!r} Vpp, above the {self.max_amplitude_vpp} Vpp "
+                         f"limit (or unreadable)")
+        return probs
+
+    def _sync_fm_state(self, st):
+        self.fm_state = 1 if (st['mod_state'] == 'ON' and st['mod_type'] == 'FM') else 0
+
+    @staticmethod
+    def describe(st) -> str:
+        def f(x, scale, unit):
+            return f"{x / scale:.6g} {unit}" if isinstance(x, float) else repr(x)
+        return (f"output {st['output']} (load {st['load']}), "
+                f"carrier {f(st['frequency_carrier'], 1e6, 'MHz')}, "
+                f"{f(st['amplitude_vpp'], 1., 'Vpp')}, "
+                f"modulation {st['mod_state']} ({st['mod_type']}), "
+                f"deviation {f(st['fm_deviation'], 1e6, 'MHz')}, "
+                f"rate {f(st['fm_rate'], 1e3, 'kHz')}")
+
+    # ---- host side ---------------------------------------------------------
+
+    def read_state(self) -> dict:
+        """Read-only snapshot of the channel. Raises on a communications failure.
+        The instrument reports FM deviation/rate only while FM is on."""
+        mdwv = parse_mdwv(self._instr.ask(f"C{self.ch}:MDWV?"))
+        bswv = parse_bswv(self._instr.ask(f"C{self.ch}:BSWV?"))
+        outp = parse_outp(self._instr.ask(f"C{self.ch}:OUTP?"))
+        fm = mdwv.get('FM', {})
+        return dict(output=outp.get('STATE'), load=outp.get('LOAD'),
+                    mod_state=mdwv.get('STATE'), mod_type=mdwv.get('TYPE'),
+                    fm_deviation=fm.get('DEVI'), fm_rate=fm.get('FRQ'),
+                    fm_source=fm.get('SRC'), fm_shape=fm.get('MDSP'),
+                    frequency_carrier=bswv.get('FRQ'), amplitude_vpp=bswv.get('AMP'),
+                    raw_mdwv=mdwv['raw'])
+
+    def _verify(self, keys):
+        """Read back after writing ``keys``; clear those that match."""
+        time.sleep(T_FM_SETTLE)
+        try:
+            st = self.read_state()
+        except Exception as e:
+            print(f"{self._label} *** read-back after writing {', '.join(keys)} FAILED -- "
+                  f"the write was sent but is NOT verified ({type(e).__name__}: {e}) ***")
+            return None
+        self._sync_fm_state(st)
+        for k in keys:
+            target = getattr(self, k)
+            if self._matches(st[k], target):
+                self._stale.discard(k)
+            else:
+                print(f"{self._label} *** {k}: requested {target}, instrument reads "
+                      f"{st[k]!r} -- hardware does NOT hold the request ***")
+        for p in self._problems(st):
+            print(f"{self._label} *** {p} ***")
+        return st
+
+    def _flush(self):
+        """Write every stale target the instrument will accept now."""
+        pending = [k for k in _FM_KEYS if k in self._stale]
+        fm_pending = [k for k in pending if k.startswith('fm_')]
+        if fm_pending and self.fm_state == -1:
+            try:
+                self._sync_fm_state(self.read_state())
+            except Exception as e:
+                self._report_failure(f"set {', '.join(fm_pending)} (could not read whether FM is on)", e)
+        if self.fm_state != 1:
+            # The instrument ignores FM writes while FM is off; fm_on() writes them.
+            pending = [k for k in pending if not k.startswith('fm_')]
+        wrote = []
+        for k in pending:
+            try:
+                self._instr.write(self._command(k))
+            except Exception as e:
+                self._report_failure(f"set {k} = {getattr(self, k)}", e)
+            else:
+                wrote.append(k)
+        if wrote:
+            self._verify(wrote)
+
+    def set_rpc(self, amplitude_vpp=dv, fm_deviation=dv, fm_rate=dv):
+        req = self._check(amplitude_vpp, fm_deviation, fm_rate)   # raises; nothing sent
+        for k, v in req.items():
+            if v != getattr(self, k) or k in self._stale:
+                setattr(self, k, v)
+                self._stale.add(k)
+        self._flush()
+
+    def fm_on_rpc(self):
+        if self.fm_state == 1:
+            self._flush()            # already on: only changed values are written
+            return
+        c = self.ch
+        cmds = (f"C{c}:MDWV STATE,ON", f"C{c}:MDWV FM", f"C{c}:MDWV FM,SRC,INT",
+                f"C{c}:MDWV FM,MDSP,SINE",
+                self._command('fm_deviation'), self._command('fm_rate'))
+        self._stale.update(('fm_deviation', 'fm_rate'))
+        for cmd in cmds:
+            try:
+                self._instr.write(cmd)
+            except Exception as e:
+                self.fm_state = -1
+                self._report_failure(f"switch FM on ({cmd})", e)
+                return
+        st = self._verify(['fm_deviation', 'fm_rate'])
+        if st is None:
+            self.fm_state = -1
+            return
+        if self.fm_state == 1 and not ({'fm_deviation', 'fm_rate'} & self._stale):
+            return
+        print(f"{self._label} *** FM did not come up as requested; switching modulation "
+              f"OFF again. Read: {st['raw_mdwv']} ***")
+        try:
+            self._instr.write(f"C{c}:MDWV STATE,OFF")
+        except Exception as e:
+            self._report_failure("switch modulation off", e)
+        self.fm_state = -1
+
+    def fm_off_rpc(self):
+        if self.fm_state == 0:
+            return
+        try:
+            self._instr.write(f"C{self.ch}:MDWV STATE,OFF")
+        except Exception as e:
+            self.fm_state = -1
+            self._report_failure("switch FM off", e)
+            return
+        self._stale.update(('fm_deviation', 'fm_rate'))   # rewritten at the next fm_on()
+        st = self._verify([])
+        if st is not None and st['mod_state'] != 'OFF':
+            print(f"{self._label} *** modulation still reads {st['mod_state']} after OFF ***")
+            self.fm_state = -1
+
+    def init_rpc(self, fm_on=True):
+        """Read the channel; put the carrier at ``frequency_carrier``; bring an
+        amplitude above the limit down to the limit (otherwise keep it); FM
+        deviation and rate back to their defaults, FM on (or off). The channel
+        output is never switched."""
+        try:
+            st = self.read_state()
+        except Exception as e:
+            self.fm_state = -1
+            print(f"{self._label} *** init could not read the instrument -- nothing written "
+                  f"({type(e).__name__}: {e}) ***")
+            return
+        self._sync_fm_state(st)
+        print(f"{self._label} on init: {self.describe(st)}")
+        if st['output'] != 'ON':
+            print(f"{self._label} output is {st['output']}; init does not switch it.")
+        if st['mod_state'] == 'ON' and st['mod_type'] != 'FM':
+            print(f"{self._label} modulation is on as {st['mod_type']}, not FM.")
+
+        if not self._matches(st['frequency_carrier'], self.frequency_carrier):
+            print(f"{self._label} carrier reads {st['frequency_carrier']!r} Hz; "
+                  f"setting {self.frequency_carrier:.0f} Hz.")
+            self._stale.add('frequency_carrier')
+        a = st['amplitude_vpp']
+        if isinstance(a, float) and 0. <= a <= self.max_amplitude_vpp:
+            self.amplitude_vpp = a
+            self._stale.discard('amplitude_vpp')
+        else:
+            print(f"{self._label} *** amplitude reads {a!r} Vpp, outside 0-"
+                  f"{self.max_amplitude_vpp} Vpp; setting {self.max_amplitude_vpp} Vpp ***")
+            self.amplitude_vpp = self.max_amplitude_vpp
+            self._stale.add('amplitude_vpp')
+
+        self.fm_deviation = self._fm_deviation_default
+        self.fm_rate = self._fm_rate_default
+        self._stale.update(('fm_deviation', 'fm_rate'))
+        self._flush()                 # carrier, amplitude (and FM values if FM is on)
+        if fm_on:
+            self.fm_on_rpc()
+        else:
+            self.fm_off_rpc()
+
+    # ---- kernel side -------------------------------------------------------
+
+    @kernel
+    def init(self, fm_on=True):
+        self.core.wait_until_mu(now_mu())
+        self.init_rpc(fm_on)
+        self.core.break_realtime()
+        delay(T_RPC_DELAY)
+
+    @kernel
+    def set(self, amplitude_vpp=dv, fm_deviation=dv, fm_rate=dv):
+        """Amplitude (Vpp), FM deviation (Hz), FM rate (Hz); a negative value
+        (the default) leaves that setting unchanged."""
+        self.core.wait_until_mu(now_mu())
+        self.set_rpc(amplitude_vpp, fm_deviation, fm_rate)
+        self.core.break_realtime()
+        delay(T_RPC_DELAY)
+
+    @kernel
+    def fm_on(self):
+        self.core.wait_until_mu(now_mu())
+        self.fm_on_rpc()
+        self.core.break_realtime()
+        delay(T_RPC_DELAY)
+
+    @kernel
+    def fm_off(self):
+        self.core.wait_until_mu(now_mu())
+        self.fm_off_rpc()
         self.core.break_realtime()
         delay(T_RPC_DELAY)
