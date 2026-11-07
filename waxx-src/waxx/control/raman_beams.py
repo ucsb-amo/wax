@@ -10,6 +10,7 @@ from artiq.experiment import TArray, TFloat, TTuple, parallel, TInt64
 from artiq.language.core import now_mu, at_mu, kernel, portable, delay, parallel, delay_mu, sequential
 
 from waxx.control.artiq.DDS import DDS, T_AD9910_REGISTER_UPDATE_FROM_PHASE_ORIGIN_MU, T_AD9910_PIPELINE_LATENCY_MU
+from waxx.control.artiq.DAC_CH import DAC_CH
 from waxx.config.expt_params import ExptParams
 
 from waxx.util.artiq.async_print import aprint
@@ -865,7 +866,8 @@ class RamanBeamPair():
             self.frequency_transition = frequency_transition if frequency_transition >= 0. else self.frequency_transition
         if fraction_power_changed:
             self.fraction_power = fraction_power_raman if fraction_power_raman >= 0. else self.fraction_power
-            
+            self._write_power_setpoints()
+
         if phase_mode_changed:
             self.phase_mode = phase_mode if phase_mode >= 0 else self.phase_mode
         if phase_origin_changed:
@@ -883,8 +885,9 @@ class RamanBeamPair():
         if freq_changed or fraction_power_changed or phase_origin_changed or global_phase_changed or relative_phase_changed:
             self.state_splitting_to_ao_frequency(self.frequency_transition)
 
-            amp0 = np.sqrt(self.fraction_power) * self._amplitude_0
-            amp1 = np.sqrt(self.fraction_power) * self._amplitude_1
+            amplitude_scale = self._dds_amplitude_scale()
+            amp0 = amplitude_scale * self._amplitude_0
+            amp1 = amplitude_scale * self._amplitude_1
             self._asf0 = self._amp_to_asf(amp0)
             self._asf1 = self._amp_to_asf(amp1)
 
@@ -905,7 +908,19 @@ class RamanBeamPair():
 
         self.dds0.on()
         self.dds1.on()
-    
+
+    @portable(flags={"fast-math"})
+    def _dds_amplitude_scale(self) -> TFloat:
+        """The factor set() puts on both DDS amplitudes: sqrt(fraction_power),
+        so each beam's power is fraction_power times its default-amplitude power."""
+        return np.sqrt(self.fraction_power)
+
+    @kernel
+    def _write_power_setpoints(self):
+        """Called by set() when fraction_power changes. No power setpoints here;
+        RamanBeamsPID writes its PID setpoints."""
+        pass
+
     # @kernel(flags={"fast-math"})
     # def get_phase(self,
     #            t_mu=np.int64(-1),
@@ -1043,3 +1058,72 @@ class RamanBeamPair():
             self.set(frequency_transition=f0+i*df)
             delay(dt)
         self.off()
+
+
+class RamanBeamsPID(RamanBeamPair):
+    """A RamanBeamPair whose beam powers are set by intensity-stabilization PID
+    setpoints instead of by the DDS amplitudes.
+
+    Both DDSes stay at their channels' default amplitudes (the optimum RF drive).
+    fraction_power sets the two PID setpoint DACs:
+
+        v_pd0 = fraction_power * p.v_pd_dds0_balanced_max
+        v_pd1 = fraction_power * p.v_pd_dds1_balanced_max
+
+    v_pd_dds0_balanced_max / v_pd_dds1_balanced_max are the dds0 / dds1 PID
+    setpoints that give roughly maximum power with the two beams at equal power
+    at the atoms. Each beam's photodiode voltage is taken as proportional to its
+    power (linear, no dark offset), so fraction_power is the fraction of that
+    balanced power in each beam, the same meaning it has in RamanBeamPair (which
+    scales each DDS amplitude by sqrt(fraction_power)). A photodiode offset
+    would make the power fraction differ from fraction_power.
+
+    The setpoints are read from the params when they are written, so a value
+    set in prepare() applies. The DACs are written only when fraction_power
+    changes (or on init); a write is two DAC writes and one load on the
+    timeline. A setpoint above a DAC channel's max_v is replaced by 0 V
+    (DAC_CH.set), so fraction_power > 1 can put a beam at zero.
+    """
+
+    def __init__(self,
+                 dds0:DDS,
+                 dds1:DDS,
+                 dds_sw:DDS,
+                 dac_pid0:DAC_CH,
+                 dac_pid1:DAC_CH,
+                 params=ExptParams(),
+                 frequency_transition=0.,
+                 fraction_power=0.):
+        self.dac_pid0 = dac_pid0
+        self.dac_pid1 = dac_pid1
+        super().__init__(dds0=dds0,
+                         dds1=dds1,
+                         dds_sw=dds_sw,
+                         params=params,
+                         frequency_transition=frequency_transition,
+                         fraction_power=fraction_power)
+
+    @portable(flags={"fast-math"})
+    def _dds_amplitude_scale(self) -> TFloat:
+        """Both DDSes at their default amplitudes; the PID sets the power."""
+        return 1.
+
+    @portable(flags={"fast-math"})
+    def fraction_power_to_v_pd(self, fraction_power) -> TTuple([TFloat, TFloat]):
+        """The (dds0, dds1) PID setpoints (V) for fraction_power."""
+        return (fraction_power * self.p.v_pd_dds0_balanced_max,
+                fraction_power * self.p.v_pd_dds1_balanced_max)
+
+    @kernel
+    def _write_power_setpoints(self):
+        v0, v1 = self.fraction_power_to_v_pd(self.fraction_power)
+        self.dac_pid0.set(v=v0, load_dac=False)
+        self.dac_pid1.set(v=v1, load_dac=True)
+
+    @kernel
+    def set_power(self, fraction_power_raman=dv):
+        """Writes both PID setpoints for fraction_power_raman (unchanged if left
+        at the default), whether or not it changed. Does not touch the DDSes."""
+        if fraction_power_raman >= 0.:
+            self.fraction_power = fraction_power_raman
+        self._write_power_setpoints()
