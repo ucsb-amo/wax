@@ -289,6 +289,15 @@ class SDG6000X_CH():
                                                   or 'frequency' in self._stale)
             amp_changed = (amplitude >= 0.) and (amplitude != self._p.amplitude_vpp
                                                  or 'amplitude' in self._stale)
+        # Check the amplitude that would be written -- before anything is
+        # sent. (This used to check the previously cached value, so a request
+        # above the maximum was written and only the call after it raised.)
+        if amp_changed:
+            new_amp = amplitude if amplitude != dv else self._p.amplitude_vpp
+            if new_amp > self._p.max_amplitude_vpp:
+                raise ValueError(f"{self._label} amplitude {new_amp} Vpp requested, above "
+                                 f"the configured maximum {self._p.max_amplitude_vpp} Vpp; "
+                                 f"nothing sent.")
         if freq_changed:
             self._p.frequency = frequency if frequency!=dv else self._p.frequency
             if self._p.frequency > self._p.max_frequency:
@@ -305,9 +314,7 @@ class SDG6000X_CH():
             else:
                 self._stale.discard('frequency')
         if amp_changed:
-            if self._p.amplitude_vpp > self._p.max_amplitude_vpp:
-                raise ValueError("Amplitdue requested for this channel is beyond configured maximum.")
-            self._p.amplitude_vpp = amplitude if amplitude!=dv else self._p.amplitude_vpp
+            self._p.amplitude_vpp = new_amp
             try:
                 self._instr._set_amp_command(self.ch,self._p.amplitude_vpp)
             except Exception as e:
