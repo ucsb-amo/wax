@@ -612,7 +612,7 @@ def test_server_reports_writer_fault_at_shot_complete_and_poll(server):
 
 def _client(module, reply):
     c = module.LiveODClient.__new__(module.LiveODClient)
-    c._send_recv = lambda msg: dict(reply)
+    c._send_recv = lambda msg, rcvtimeo_ms=None: dict(reply)
     c._for_this_run = lambda msg: msg
     c.last_reset_requested = False
     c.last_adjust_values = {}

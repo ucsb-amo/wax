@@ -809,19 +809,27 @@ class Expt(Scanner, Dealer, Scribe):
             print(self._progress_line(n, N, now, xvar_values, stride=1))
             return
         try:
-            reset_requested = _client.shot_complete(
-                self._shot_complete_count,
-                self._N_shots_total,
-                xvar_values,
-                shot_conditions=self._shot_conditions(),
-            )
-        except TypeError:
-            # a client from before shot_conditions existed
-            reset_requested = _client.shot_complete(
-                self._shot_complete_count,
-                self._N_shots_total,
-                xvar_values,
-            )
+            try:
+                reset_requested = _client.shot_complete(
+                    self._shot_complete_count,
+                    self._N_shots_total,
+                    xvar_values,
+                    shot_conditions=self._shot_conditions(),
+                )
+            except TypeError:
+                # a client from before shot_conditions existed
+                reset_requested = _client.shot_complete(
+                    self._shot_complete_count,
+                    self._N_shots_total,
+                    xvar_values,
+                )
+        except ConnectionError as e:
+            # This is an RPC from the kernel: ARTIQ re-raises a host exception by
+            # its name from artiq.coredevice.exceptions, which has no
+            # ConnectionError -- the run then died on "AttributeError: ... no
+            # attribute 'ConnectionError'" and the monitor got no abort state
+            # (runs 92593, 92598, 2026-11-05). RuntimeError is one it knows.
+            raise RuntimeError(f"liveOD did not answer SHOT_COMPLETE for shot {n}/{N}: {e}") from e
         self._pending_adjust_values = getattr(_client, 'last_adjust_values', {})
         self._shot_complete_count += 1
         stride = self._progress_stride(N)

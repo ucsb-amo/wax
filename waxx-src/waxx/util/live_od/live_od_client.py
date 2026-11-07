@@ -48,6 +48,17 @@ from waxx.util.comms_server.hardware_id import resolve_scoped_server_id
 CAM_READY_SLICE_S = 0.5
 # PUT_DATA: one array of a few MB on the lab network; the reply is immediate
 PUT_DATA_TIMEOUT_MS = 10_000
+# SHOT_COMPLETE: how long the experiment waits for the reply before giving up on
+# liveOD. Not the 5 s default: liveOD's whole process can stall for as long as
+# another process on this PC reads a large run file from the data share (its
+# writer's first HDF5 writes of a run wait behind that read with the GIL held).
+# 2026-11-05: 4.55 s during run 92596 (211 MB read) and 12.07 s during 92598
+# (567 MB read; 92598 died on the 5 s timeout). The request is never sent
+# twice -- liveOD stamps each SHOT_COMPLETE it handles -- so a slow reply is
+# waited out on the same request; a reply slower than SLOW_SHOT_COMPLETE_S is
+# printed with its shot, since the next shot starts that much later.
+SHOT_COMPLETE_TIMEOUT_MS = 60_000
+SLOW_SHOT_COMPLETE_S = 5.0
 # a request this big is said out loud (see _send_recv)
 LARGE_MESSAGE_BYTES = 1 << 30
 # The asynchronous END_RUN save: polled this often; given up when its phase
@@ -625,6 +636,7 @@ class LiveODClient(NetClient):
         does not include ``reset_requested`` (older server builds that
         pre-date the field).
         """
+        t_asked = time.monotonic()
         reply = self._send_recv(self._for_this_run(
             {
                 "tag": "SHOT_COMPLETE",
@@ -633,7 +645,13 @@ class LiveODClient(NetClient):
                 "xvar_values": xvar_values,
                 "shot_conditions": dict(shot_conditions or {}),
             }
-        ))
+        ), rcvtimeo_ms=SHOT_COMPLETE_TIMEOUT_MS)
+        waited = time.monotonic() - t_asked
+        if waited > SLOW_SHOT_COMPLETE_S:
+            print(f"[LiveODClient] liveOD took {waited:.1f} s to answer SHOT_COMPLETE for "
+                  f"shot {shot_idx + 1}/{N_shots_total}; the next shot starts that much "
+                  f"later than usual (liveOD stalled: is another program reading a large "
+                  f"run file from the data drive?)")
         if reply.get("stale_run"):
             # liveOD has started another run since this one's INIT_RUN (or was
             # restarted since, and does not know it), and no longer records this
