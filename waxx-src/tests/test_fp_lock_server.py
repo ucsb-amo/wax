@@ -95,6 +95,10 @@ def test_warnings_state_link_and_order():
     assert _codes(_row(state=1)) == ["hold"]
     assert _codes(_row(state=0)) == ["off"]
     assert _codes(_row(saturated=1, state=1, tfirst=5.0)) == ["rail", "hold", "first_near_start"]
+    # override replaces the HOLD / OFF warning, whatever state the firmware reports
+    assert _codes(_row(state=1), override=True, ovolt=0.5) == ["override"]
+    assert _codes(_row(state=2), override=True) == ["override"]
+    assert _codes(_row(state=0), override=True) == ["override"]
     assert _codes(None, com_status="error") == ["com"]
     assert _codes(None, data_age_s=None) == ["no_data"]
     assert _codes(_row(), data_age_s=9.0)[0] == "stale"

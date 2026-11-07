@@ -30,6 +30,7 @@ class FakeQuarto:
         self.opened = 0
         self.port = None
         self.fail_open = False
+        self.override_holds = True      # False = older firmware: override leaves the state alone
 
     # the serial_factory the server takes
     def open(self, port, baud):
@@ -44,7 +45,11 @@ class FakeQuarto:
         v = self.values
         for k, val in kw.items():
             v[k] = val
-        row = [v["sep"], v["sep"] - v["setp"], kw.get("feedback", 0.0), v["state"], v["tfirst"],
+        feedback = kw.get("feedback", 0.0)
+        # the firmware since 2026-11-07: HOLD, output = ovolt (older: state unchanged)
+        if v.get("override") == 1 and self.override_holds:
+            v["state"], feedback = 1, v["ovolt"]
+        row = [v["sep"], v["sep"] - v["setp"], feedback, v["state"], v["tfirst"],
                v["h1"], v["h2"], v["bad"], v["unlocks"], v["sats"], kw.get("saturated", 0),
                kw.get("bad_none", 0), kw.get("bad_one", 0), kw.get("bad_win", 0),
                v.get("integ", 0.0), v.get("period", 120.0)]

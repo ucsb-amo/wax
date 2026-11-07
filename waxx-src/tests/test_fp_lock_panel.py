@@ -92,6 +92,22 @@ def test_display_states_warnings_and_separation_monitor(rig):
     assert len(panel._hist["sep"]) == 3                 # only the new row was added
 
 
+def test_plot_window(rig):
+    panel, dev, srv, poll, _, _ = rig
+    now = time.time()
+    for t in (now - 120, now - 30, now - 1):
+        panel._append_history({"t": t, "sep": 6.4, "err": 0.0, "feedback": 0.0, "integ": 0.0,
+                               "tfirst": 40.0, "t2": 46.4})
+    panel._redraw({}, None)
+    xs, _ = panel._plots["curves"]["sep"].getData()
+    assert len(xs) == 2 and min(xs) > -60                       # default window 60 s
+    assert panel._plots["plot"].vb.viewRange()[0] == pytest.approx([-60, 0])
+    panel._window_spin.setValue(300)
+    xs, _ = panel._plots["curves"]["sep"].getData()
+    assert len(xs) == 3
+    assert panel._plots["plot"].vb.viewRange()[0] == pytest.approx([-300, 0])
+
+
 def test_lock_toggle_does_not_ask(rig):
     panel, dev, srv, poll, answers, asked = rig
     poll()
@@ -132,6 +148,36 @@ def test_override_button_toggles_the_override_setting(rig):
     assert dev.values["override"] == 0
     poll()
     assert panel._override_btn.text() == "Override"
+
+
+def test_override_shows_hold(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    dev.emit_row(sep=6.40, state=2, tfirst=40.0, h1=9.0, h2=8.0)
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("state") == 2)
+    poll()
+    assert panel._pill.text() == "LOCKED"
+    panel._client.set_value("ovolt", "0.5")
+    panel._client.set_value("override", "1")
+    dev.emit_row(sep=6.40, state=2, tfirst=40.0, h1=9.0, h2=8.0)   # the firmware reports HOLD
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("state") == 1)
+    poll()
+    assert panel._pill.text() == "HOLD"
+    assert "override" in panel._warn.text() and "+0.500 V" in panel._warn.text()
+    panel._client.set_value("override", "0")
+    dev.emit_row(sep=6.40, state=2, tfirst=40.0, h1=9.0, h2=8.0)
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("state") == 2)
+    poll()
+    assert panel._pill.text() == "LOCKED"
+
+
+def test_override_shows_hold_with_older_firmware(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    dev.override_holds = False                           # older firmware: still reports LOCKED
+    panel._client.set_value("override", "1")
+    dev.emit_row(sep=6.40, state=2, tfirst=40.0, h1=9.0, h2=8.0)
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("state") == 2)
+    poll()
+    assert panel._pill.text() == "HOLD"
 
 
 def test_out_turns_orange_beyond_8_volts_under_override(rig):

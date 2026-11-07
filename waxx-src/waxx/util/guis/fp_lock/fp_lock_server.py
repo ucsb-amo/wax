@@ -393,7 +393,9 @@ class FPLockServer(NetServer):
             seq, text_seq = self._seq, self._text_seq
         com = self.link.snapshot()
         warnings = proto.compute_warnings(latest, edge=self.edge, com_status=com["status"],
-                                          data_age_s=age, stale_after_s=self.stale_after_s)
+                                          data_age_s=age, stale_after_s=self.stale_after_s,
+                                          override=settings.get("override") == 1,
+                                          ovolt=settings.get("ovolt"))
         return {
             "status": "ok",
             "ok": True,

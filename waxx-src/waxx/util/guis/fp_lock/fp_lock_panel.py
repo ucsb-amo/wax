@@ -5,12 +5,14 @@ against its setpoint, the plot picker), the server's warnings (first peak near
 the sweep start, second peak near the sweep end, HOLD, rail, no data, COM), a
 compact grid of the latest readings (names spelled out in tooltips), one row
 of buttons, and one plot showing the separation, the error, the output or the
-two peak positions (edge bands shaded).  Controls: lock on / off, reset
+two peak positions (edge bands shaded) over the last ``history_s`` seconds
+(60 by default; the box beside the plot picker changes it).  Controls: lock on / off, reset
 setpoint (setp = the measured separation), clear integrator, a settings dialog
 (gains, window, peak finding), and a console for raw firmware commands (hidden
 until its button is pressed; Up recalls the commands sent).  Only reset setpoint
-and applying settings ask first; the override button forces the output to the
-voltage in the box beside it, and disables the lock while on.
+and applying settings ask first; the override button sets the output to the
+voltage in the box beside it (the firmware holds its PI frozen) and disables the
+lock button while on; the state pill reads HOLD under override.
 
 Construction never blocks: the client is discovered on a worker thread, polls
 and actions run off the GUI thread (SnapshotPoller, RequestRunner).
@@ -30,7 +32,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
-    QVBoxLayout,
+    QSpinBox, QVBoxLayout,
     QWidget,
 )
 
@@ -43,7 +45,9 @@ __all__ = ["FPLockPanel", "SettingsDialog"]
 
 _LOG = logging.getLogger("waxx.fp_lock.panel")
 
-HISTORY_POINTS = 3000
+HISTORY_POINTS = 3000      # one row per ~1.2 s: about an hour
+HISTORY_S_DEFAULT = 60.0   # s: the plot shows the last this many seconds
+HISTORY_S_MAX = 3600
 OUT_WARN_V = 8.0          # V: the "out" readout turns orange beyond this (the firmware rail)
 
 _PILL = {
@@ -107,6 +111,20 @@ def _fmt(v, spec: str = ".3f", unit: str = "") -> str:
     if not isinstance(v, (int, float)) or (isinstance(v, float) and not math.isfinite(v)):
         return "--"
     return f"{v:{spec}}{(' ' + unit) if unit else ''}"
+
+
+def _window_spin(parent, seconds: float, on_change: Callable[[float], None]) -> QSpinBox:
+    """The plot's time-window box (s)."""
+    spin = QSpinBox(parent)
+    spin.setRange(5, HISTORY_S_MAX)
+    spin.setSingleStep(30)
+    spin.setValue(int(round(seconds)))
+    spin.setSuffix(" s")
+    spin.setToolTip("plot window: the last this many seconds")
+    spin.setFixedWidth(66)
+    spin.setStyleSheet("QSpinBox { font-size: 11px; padding: 0px 2px; }")
+    spin.valueChanged.connect(lambda v: on_change(float(v)))
+    return spin
 
 
 class _PollSource:
@@ -229,10 +247,12 @@ class FPLockPanel(WidgetPanelBase):
     def __init__(self, server_id: str, *, title: str = "FP lock",
                  client: Any = None, client_factory: Optional[Callable[[], Any]] = None,
                  confirm: Optional[Callable[[str, str], bool]] = None,
-                 synchronous: bool = False, plots: bool = True, parent: Optional[QWidget] = None):
+                 synchronous: bool = False, plots: bool = True,
+                 history_s: float = HISTORY_S_DEFAULT, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._server_id = server_id
         self._title = title
+        self._history_s = float(history_s)
         self._client = None
         self._poller = None
         self._source: Optional[_PollSource] = None
@@ -273,6 +293,8 @@ class FPLockPanel(WidgetPanelBase):
             self._view_box.currentIndexChanged.connect(
                 lambda _i: self._set_view(self._view_box.currentData()))
             top.addWidget(self._view_box, 0)
+            self._window_spin = _window_spin(self, self._history_s, self._set_history_s)
+            top.addWidget(self._window_spin, 0)
         outer.addLayout(top)
 
         self._warn = QLabel("", self)
@@ -441,6 +463,9 @@ class FPLockPanel(WidgetPanelBase):
             self._set_pill("NO LINK", f"COM {com.get('port', '?')}: {com.get('status', '?')}")
         elif codes & {"no_data", "stale"}:
             self._set_pill("NO DATA")
+        elif settings.get("override") == 1:
+            # override holds the output at ovolt: HOLD, whatever state older firmware reports
+            self._set_pill("HOLD")
         else:
             self._set_pill(row.get("state_name") or "CONNECTING")
         label = snap.get("label") or ""
@@ -522,8 +547,10 @@ class FPLockPanel(WidgetPanelBase):
             return
         import numpy as np  # noqa: PLC0415
         t = np.asarray(self._hist["t"]) - time.time()
+        keep = t >= -self._history_s
         for key, curve in self._plots["curves"].items():
-            curve.setData(t, np.asarray(self._hist[key], dtype=float), connect="finite")
+            curve.setData(t[keep], np.asarray(self._hist[key], dtype=float)[keep], connect="finite")
+        self._plots["plot"].setXRange(-self._history_s, 0, padding=0)
         self._setp_ok = isinstance(setp, (int, float)) and math.isfinite(setp)
         if self._setp_ok:
             self._plots["setp"].setValue(setp)
@@ -550,6 +577,8 @@ class FPLockPanel(WidgetPanelBase):
         lay.setToolTip("time axis: s, 0 = now")
         plot = lay.addPlot(row=0, col=0)
         plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.setXRange(-self._history_s, 0, padding=0)
+        plot.setMouseEnabled(x=False, y=True)
         plot.getAxis("left").setWidth(40)
         plot.getAxis("bottom").setHeight(18)
         font = self.font()
@@ -608,6 +637,11 @@ class FPLockPanel(WidgetPanelBase):
         else:
             plot.enableAutoRange(axis="y")
         self._plots["layout"].setVisible(view != "none")
+
+    def _set_history_s(self, seconds: float) -> None:
+        """Show the last ``seconds`` of history in the plot."""
+        self._history_s = float(seconds)
+        self._redraw((self._snap.get("edge") or {}), (self._snap.get("settings") or {}).get("setp"))
 
     def _set_pill(self, key: str, detail: str = "") -> None:
         # the pill stays short (a long detail would widen the dock); the detail

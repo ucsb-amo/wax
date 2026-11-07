@@ -47,7 +47,7 @@ class Setting:
 #: Every setting the panel shows and may change, in display order.
 SETTINGS: tuple[Setting, ...] = (
     Setting("lock", "switch", "", "1 = on; anything else = off (0 V, integral cleared)"),
-    Setting("override", "switch", "", "1 = force the output to ovolt (the lock keeps running, its output not sent); 0 = lock drives it"),
+    Setting("override", "switch", "", "1 = output set to ovolt, state HOLD, PI frozen (no integral windup); 0 = lock drives it, re-locking from HOLD with the integral cleared"),
     Setting("ovolt", "float", "V", "forced output while override = 1 (clamped to +/-10 V)"),
     Setting("hold", "switch", "", "1 = skip bad sweeps and pause in HOLD; 0 = use every pair"),
     Setting("setp", "float", "ms", "peak-separation setpoint"),
@@ -128,10 +128,15 @@ class EdgeConfig:
 
 
 def compute_warnings(row: Optional[dict], *, edge: EdgeConfig, com_status: str,
-                     data_age_s: Optional[float], stale_after_s: float) -> list[dict]:
+                     data_age_s: Optional[float], stale_after_s: float,
+                     override: bool = False, ovolt: Optional[float] = None) -> list[dict]:
     """The warnings for the current state, most serious first.
 
     Each is ``{"level": "error"|"warn"|"info", "code": str, "text": str}``.
+    ``override`` (the board's override setting) replaces the HOLD/OFF warning
+    with one naming the forced output: under override the output is ``ovolt``,
+    whatever the row's state says (firmware before 2026-11-07 still reports
+    LOCKED then).
     The peak-position warnings need a measured pair (``sep`` > 0); ``t2`` is
     ``tfirst + sep`` of the latest line (the firmware keeps ``sep`` of the last
     sweep that found a pair).
@@ -153,7 +158,10 @@ def compute_warnings(row: Optional[dict], *, edge: EdgeConfig, com_status: str,
     if row.get("saturated"):
         add("error", "rail", f"output at the rail ({row['feedback']:+.3f} V)")
     state = row.get("state")
-    if state == 1:
+    if override:
+        v = f"{ovolt:+.3f} V" if isinstance(ovolt, (int, float)) else "ovolt"
+        add("warn", "override", f"HOLD (override): output set to {v}, lock paused")
+    elif state == 1:
         add("warn", "hold", "HOLD: output frozen, waiting for good sweeps")
     elif state == 0:
         add("info", "off", "lock off (output 0 V)")
