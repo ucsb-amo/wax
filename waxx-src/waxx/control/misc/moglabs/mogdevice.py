@@ -84,8 +84,8 @@ class MOGDevice(object):
         if check:
             try:
                 self.info = self.ask("info")
-            except Exception:
-                raise RuntimeError("Device did not respond to query")
+            except Exception as e:
+                raise RuntimeError(f"Device did not respond to query: {e!r}") from e
 
     def connected(self):
         """

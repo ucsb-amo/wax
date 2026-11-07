@@ -4,7 +4,13 @@ import sys
 import time
 
 from waxx.util.artiq.async_print import aprint
-from waxx.util.link_latch import LinkLatch, T_LINK_RETRY
+from waxx.util.link_latch import LinkLatch, LinkDownError, T_LINK_RETRY
+
+
+def _why(e) -> str:
+    """The failure's own text for a message. Empty for the latch's skip
+    (LinkDownError): the latch printed the real cause once, at the trip."""
+    return '' if isinstance(e, LinkDownError) else f': {e!r}'
 
 class WavemeterController(MOGDevice):
     """MOGLabs FZW wavemeter over TCP.
@@ -75,8 +81,8 @@ class WavemeterController(MOGDevice):
         try:
             ch = int(self.ask('OPTSW,SET'))
             return ch
-        except:
-            aprint('Failed to read wavemeter channel')
+        except Exception as e:
+            aprint(f'Failed to read wavemeter channel{_why(e)}')
             return 0
 
     def set_channel(self, ch):
@@ -94,16 +100,16 @@ class WavemeterController(MOGDevice):
                     break
             else:
                 aprint(f'Failed to set channel to {ch}, got {last_ch}')
-        except:
-            aprint('Failed to set channel')
+        except Exception as e:
+            aprint(f'Failed to set channel{_why(e)}')
         
     def select_channel(self, ch):
         try:
             self._last_ch = int(self.ask('OPTSW,SEL'))
             if self._last_ch != ch:
                 self._select_channel(ch)
-        except:
-            aprint('Failed to communicate with wavemeter. Check connection and IP address.')
+        except Exception as e:
+            aprint(f'Failed to communicate with wavemeter. Check connection and IP address{_why(e)}')
 
     def _set_channel(self, ch):
         self.ask(f'OPTSW,SET,{ch}')
@@ -118,9 +124,9 @@ class WavemeterController(MOGDevice):
         try:
             self.set_channel(ch)
             f = float(self.ask('MEAS,FREQ').split(' ')[0]) * 1.e12
-        except:
+        except Exception as e:
             f = 0.0
-            aprint('Error getting frequency from wavemeter')
+            aprint(f'Error getting frequency from wavemeter{_why(e)}')
         return f
     
     def get_saturation(self, ch) -> float:
@@ -128,8 +134,8 @@ class WavemeterController(MOGDevice):
             self.set_channel(ch)
             sat = float(self.ask('MEAS,SAT'))
             return sat
-        except:
-            aprint(f'Failed to read wavemeter saturation level.')
+        except Exception as e:
+            aprint(f'Failed to read wavemeter saturation level{_why(e)}')
             return -1.
     
     def get_exposure(self, ch) -> float:
@@ -139,8 +145,8 @@ class WavemeterController(MOGDevice):
             if s[1] == 'ms':
                 exp *= 1.e-3
             return exp
-        except:
-            aprint(f'Failed to read wavemeter exposure time.')
+        except Exception as e:
+            aprint(f'Failed to read wavemeter exposure time{_why(e)}')
             return -1.
         
     def set_averaging_time(self, ch, t_s=0.):
@@ -148,14 +154,14 @@ class WavemeterController(MOGDevice):
             self.select_channel(ch)
             t_ms = 1e3 * t_s
             self.ask(f'MEAS,AVERAGE,{t_ms:1.0f}')
-        except:
-            aprint('failed to set averaging time')
+        except Exception as e:
+            aprint(f'failed to set averaging time{_why(e)}')
 
     def set_units(self):
         try:
             self.ask('MEAS,UNITS,THz')
-        except:
-            aprint('failed to set wavemeter units')
+        except Exception as e:
+            aprint(f'failed to set wavemeter units{_why(e)}')
 
 class WavemeterClient():
     def __init__(self,
