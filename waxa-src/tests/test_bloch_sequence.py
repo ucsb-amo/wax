@@ -65,6 +65,22 @@ def test_read_step_matches_kernel_algebra():
     np.testing.assert_allclose(b.vector, [C * nx, C * ny, h[2]], atol=1e-12)
 
 
+def test_vivid_color():
+    import colorsys
+    from matplotlib.colors import to_rgb
+    from waxa.plotting.bloch import vivid_color
+
+    np.testing.assert_allclose(vivid_color('#8fb4fe', 1.0)[:3], to_rgb('#8fb4fe'), atol=1e-12)
+    g = vivid_color('0.75', 2.0)
+    assert g[0] == pytest.approx(g[1]) == pytest.approx(g[2])   # grey stays grey
+    assert g[0] < 0.75                                          # pulled toward mid lightness
+    h0, l0, s0 = colorsys.rgb_to_hls(*to_rgb('#f4a582'))
+    h1, l1, s1 = colorsys.rgb_to_hls(*vivid_color('#f4a582', 1.8)[:3])
+    assert h1 == pytest.approx(h0) and l1 < l0 and s1 >= s0
+    with pytest.raises(ValueError):
+        vivid_color('r', 0.0)
+
+
 def test_history_and_step_path():
     b0 = BlochVector([0, 0, 1])
     b2 = b0.rotate_x(np.pi / 2).attenuate(0.5, 1.0)
@@ -95,3 +111,73 @@ def test_plot_bloch_sequence_panels_and_checks():
         plot_bloch_sequence(traces, stages=[("all", 4)], show=False)
     with pytest.raises(ValueError):
         plot_bloch_sequence([traces[0], BlochVector([0, 0, 1])], show=False)
+
+    # S_z labels on the read stage: header + one value per trace, from the stage's final vector
+    # by default ('end'), the incoming one with 'start'; A_z = 0.9 makes the two differ
+    zt = [_raman(BlochVector([0, 0, 1]), 2 * np.pi * f, Omega, 1.7e-6) for f in (-40e3, 40e3)]
+    zt = [b.rotate_z(0.9).attenuate(0.85, 0.9) for b in zt]
+    for at, idx in ((None, 3), ("end", 3), ("start", 1)):
+        kw = {} if at is None else {"sz_label_at": at}
+        fig, axes = plot_bloch_sequence(zt, stages=[("pulse", 1), ("read", 2)], overview=False,
+                                        sz_label_stages=[1], sz_label_fmt="{:+.4f}", show=False, **kw)
+        texts = [t.get_text() for t in axes[1].texts if t.get_position()[0] == 0.99]
+        assert texts == ["$S_z$"] + [f"{tr.history()[idx].vector[2]:+.4f}" for tr in zt]
+        assert not [t for t in axes[0].texts if t.get_position()[0] == 0.99]
+        plt.close(fig)
+    assert zt[0].history()[3].vector[2] == pytest.approx(0.9 * zt[0].history()[1].vector[2])
+    with pytest.raises(ValueError):
+        plot_bloch_sequence(traces, stages=stages, sz_label_stages=[1], sz_label_at="middle", show=False)
+
+    # opacity ramp: each pulse arc is a segment collection whose alpha rises from start to end
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    fig, axes = plot_bloch_sequence(traces[:1], stages=stages, overview=False,
+                                    path_alpha=(0.1, 1.0), show=False)
+    fig.canvas.draw()  # 3D collections hold their 2D segments only after a projection
+    # quiver arrows are Line3DCollections too (3 segments each); the ramp has one per path step
+    ramps = [c for c in axes[0].collections
+             if isinstance(c, Line3DCollection) and len(c.get_segments()) > 10]
+    assert len(ramps) == 1
+    a = ramps[0].get_edgecolor()[:, 3]
+    assert a[0] == pytest.approx(0.1, abs=0.02) and a[-1] == pytest.approx(1.0, abs=0.02)
+    assert np.all(np.diff(a) > 0)
+    plt.close(fig)
+
+
+def test_plot_bloch_sequence_into_subfigures():
+    Omega = 2 * np.pi * 135e3
+    traces = [_raman(BlochVector([0, 0, 1]), 2 * np.pi * f, Omega, 1.7e-6).rotate_z(0.9).attenuate(0.85)
+              for f in (-30e3, 30e3)]
+    fig = plt.figure(figsize=(6, 4), layout="constrained")
+    rows = fig.subfigures(2, 1)
+    for row, tr, lab in zip(rows, traces, ("-30", "+30")):
+        f2, axes = plot_bloch_sequence([tr], stages=[("pulse", 1), ("read", 2)], labels=[lab],
+                                       overview=False, ncols=2, title=f"row {lab}", fig=row, show=False)
+        assert f2 is row and len(axes) == 2
+        assert all(ax.get_figure(root=False) is row for ax in axes)
+        assert len(row.legends) == 1
+    assert len(fig.axes) == 4
+    fig.canvas.draw()
+    plt.close(fig)
+
+
+def test_sz_ring_and_projection():
+    Omega = 2 * np.pi * 135e3
+    tr = _raman(BlochVector([0, 0, 1]), 2 * np.pi * 30e3, Omega, 1.7e-6).rotate_z(0.9).attenuate(0.85)
+    stages = [("pulse", 1), ("read", 2)]
+    n_lines = {}
+    for ring in (False, True):
+        fig, axes = plot_bloch_sequence([tr], stages=stages, overview=False, sz_label_stages=[1],
+                                        sz_label_ring=ring, show=False)
+        assert all(ax._focal_length == np.inf for ax in axes)   # orthographic by default
+        n_lines[ring] = len(axes[1].lines)
+        if ring:
+            ring_line = [l for l in axes[1].lines if len(l.get_data_3d()[0]) == 121][0]
+            x, y, z = ring_line.get_data_3d()
+            v = tr.vector
+            np.testing.assert_allclose(np.hypot(x, y), np.hypot(v[0], v[1]), atol=1e-12)
+            np.testing.assert_allclose(z, v[2])
+        plt.close(fig)
+    assert n_lines[True] == n_lines[False] + 1
+    fig, axes = plot_bloch_sequence([tr], stages=stages, overview=False, proj_type="persp", show=False)
+    assert axes[0]._focal_length == 1
+    plt.close(fig)

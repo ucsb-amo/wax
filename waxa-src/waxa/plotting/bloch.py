@@ -613,6 +613,55 @@ def draw_bloch_sphere(
     ax.set_axis_off()
 
 
+def vivid_color(color: Any, amount: float = 1.6):
+    """A more vivid version of `color`: in HLS, lightness pulled toward 0.5 by `amount` and
+    saturation raised as s**(1/amount). amount 1 returns the colour unchanged; greys stay grey."""
+    import colorsys
+    from matplotlib.colors import to_rgba
+
+    amount = float(amount)
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    r, g, b, a = to_rgba(color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = 0.5 + (l - 0.5) / amount
+    s = s ** (1.0 / amount)
+    return (*colorsys.hls_to_rgb(h, l, s), a)
+
+
+def _draw_path_with_alpha_ramp(ax: plt.Axes, steps: Sequence[BlochVector], color: Any,
+                               path_alpha: Any, lw: float = 1.4):
+    """Draw the paths of `steps` (consecutive states) as one route whose opacity runs from
+    path_alpha[0] at its start to path_alpha[1] at its end, by arc length. A number = constant."""
+    from matplotlib.colors import to_rgba
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+    if np.ndim(path_alpha) == 0:
+        a0 = a1 = float(path_alpha)
+    else:
+        a0, a1 = (float(x) for x in path_alpha)
+    rgb = to_rgba(color)[:3]
+    paths = [b.step_path() for b in steps]
+    seg_len = [np.linalg.norm(np.diff(p, axis=0), axis=1) for p in paths]
+    total = float(sum(l.sum() for l in seg_len))
+    done = 0.0
+    for b, p, l in zip(steps, paths, seg_len):
+        if len(p) < 2:
+            continue
+        cum = done + np.concatenate([[0.0], np.cumsum(l)])
+        frac = 0.5 * (cum[:-1] + cum[1:]) / total if total > 0 else np.ones(len(l))
+        alphas = a0 + (a1 - a0) * np.clip(frac, 0.0, 1.0)
+        if b.last_rotation is not None and a0 != a1:
+            segs = np.stack([p[:-1], p[1:]], axis=1)
+            ax.add_collection3d(Line3DCollection(
+                segs, colors=[(*rgb, a) for a in alphas], linewidths=lw, capstyle="butt"))
+        else:
+            ls = "-" if b.last_rotation is not None else "--"
+            ax.plot(p[:, 0], p[:, 1], p[:, 2], color=rgb, lw=lw, linestyle=ls,
+                    alpha=float(np.mean(alphas)))
+        done += float(l.sum())
+
+
 def _draw_styled_sphere(ax: plt.Axes, s: dict, sphere_mesh: tuple[int, int] = (120, 60)):
     draw_bloch_sphere(
         ax,
@@ -641,8 +690,20 @@ def plot_bloch_sequence(
     title: Optional[str] = None,
     legend_title: Optional[str] = None,
     start_alpha: float = 0.25,
+    sz_label_stages: Sequence[int] = (),
+    sz_label_at: str = "end",
+    sz_label_fmt: str = "{:+.2f}",
+    sz_label_title: str = "$S_z$",
+    sz_label_fontsize: Any = 6.5,
+    sz_label_vibrancy: float = 1.6,
+    sz_label_colors: Optional[Sequence[Any]] = None,
+    sz_label_ring: bool = False,
+    sz_label_connector: bool = True,
+    path_alpha: Any = 0.9,
+    proj_type: str = "ortho",
     show: bool = True,
     style: Optional[dict] = None,
+    fig: Any = None,
 ):
     """One Bloch-sphere panel per stage of a pulse sequence, several traces at once.
 
@@ -667,6 +728,38 @@ def plot_bloch_sequence(
         are skipped: the z grid line already marks them).
     overview
         Add a last panel with every trace's whole path.
+    sz_label_stages
+        Indices (0-based) of the stages whose S_z to mark per trace, e.g. the reads: a dot on
+        the z axis at S_z with a dashed line from the vector tip, and a colour-coded column of
+        the values (in trace order) in the panel's top-right corner.
+    sz_label_at
+        "end" (default: the stage's final vector, which the marks are drawn from) or "start"
+        (the vector entering the stage). They differ in S_z only if the stage changes S_z,
+        e.g. a z attenuation.
+    sz_label_vibrancy
+        The S_z marks (values, dots, dashed lines) use `vivid_color(trace colour, this)`, so
+        pale trace colours stay legible as text; 1 = the trace colours as they are.
+    sz_label_colors
+        Explicit S_z mark colours, one per trace; overrides sz_label_vibrancy.
+    sz_label_ring
+        Also draw, per trace, a faint horizontal circle at height S_z through the vector tip,
+        so the level reads directly and the dashed connector is one of its radii.
+    sz_label_connector
+        Draw the dashed line from the vector tip to its dot on the z axis (default True). False
+        leaves just the dot and the value, for a less busy sphere.
+    proj_type
+        "ortho" (default) or "persp". Orthographic keeps horizontal lines (the S_z connectors)
+        from being bent further by perspective; a horizontal line still looks tilted when it
+        points toward or away from the viewer.
+    path_alpha
+        Opacity of the paths: a number (constant), or (start, end) for a ramp along each
+        stage's path by arc length (the overview ramps along the whole sequence), so the
+        direction of motion reads at a glance. Solid rotation arcs ramp segment by segment;
+        a dashed attenuation chord is one line at the opacity of its position.
+    fig
+        A Figure or SubFigure to draw into (e.g. one of `fig.subfigures(n, 1)`, to stack
+        several sequences as rows of one figure); default: a new constrained-layout figure.
+        The legend and title go on it.
 
     Each stage panel shows, per trace, the vector at the stage start (faint), the path
     through the stage (solid arc for a rotation, dashed chord for an attenuation) and
@@ -678,6 +771,8 @@ def plot_bloch_sequence(
     n_ops = len(chains[0]) - 1
     if any(len(c) - 1 != n_ops for c in chains):
         raise ValueError("Every trace must have the same number of operations")
+    if sz_label_at not in ("start", "end"):
+        raise ValueError("sz_label_at must be 'start' or 'end'")
     if stages is None:
         stages = [(f"step {i + 1}", 1) for i in range(n_ops)]
     if sum(int(n) for _, n in stages) != n_ops:
@@ -687,11 +782,16 @@ def plot_bloch_sequence(
         colors = [plt.cm.coolwarm(x) for x in np.linspace(0.0, 1.0, n_tr)] if n_tr > 1 else [s["state_vector_color"]]
     if labels is None:
         labels = [None] * n_tr
+    if sz_label_colors is None:
+        sz_label_colors = [vivid_color(c, sz_label_vibrancy) for c in colors]
+    elif len(sz_label_colors) != n_tr:
+        raise ValueError(f"sz_label_colors has {len(sz_label_colors)} colours for {n_tr} traces")
 
     n_panels = len(stages) + int(bool(overview))
     nrows = int(np.ceil(n_panels / ncols))
-    fig = plt.figure(figsize=(ncols * panel_size, nrows * panel_size + (0.5 if title else 0.0)),
-                     layout="constrained")
+    if fig is None:
+        fig = plt.figure(figsize=(ncols * panel_size, nrows * panel_size + (0.5 if title else 0.0)),
+                         layout="constrained")
     axes = []
     letters = "abcdefghijklmnopqrstuvwxyz"
     lw = s["state_vector_lw"]
@@ -699,6 +799,7 @@ def plot_bloch_sequence(
     def _new_ax(i, name):
         ax = fig.add_subplot(nrows, ncols, i + 1, projection="3d")
         ax.view_init(elev=elev, azim=azim)
+        ax.set_proj_type(proj_type)
         _draw_styled_sphere(ax, s, sphere_mesh)
         ax.set_box_aspect((1, 1, 1), zoom=zoom)  # 3D axes leave wide margins; zoom fills the panel
         ax.set_title(f"({letters[i % 26]}) {name}", loc="left", fontsize="small")
@@ -711,23 +812,36 @@ def plot_bloch_sequence(
         i1 = i0 + int(n)
         for chain, c in zip(chains, colors):
             BlochVector._draw_vector(ax, chain[i0].vector, color=c, alpha=start_alpha, lw=max(1.0, lw - 0.6))
+            _draw_path_with_alpha_ramp(ax, chain[i0 + 1:i1 + 1], c, path_alpha, lw=1.4)
             for k in range(i0 + 1, i1 + 1):
                 b = chain[k]
-                path = b.step_path()
-                ls = "-" if b.last_rotation is not None else "--"
-                ax.plot(path[:, 0], path[:, 1], path[:, 2], color=c, lw=1.4, alpha=0.9, linestyle=ls)
                 if show_axes and b.last_rotation is not None and abs(b.last_rotation.axis[2]) < 0.999:
                     a = b.last_rotation.axis
                     ax.plot([0.0, a[0]], [0.0, a[1]], [0.0, a[2]], color=c, lw=1.0, alpha=0.45,
                             linestyle=(0, (3, 2)))
             BlochVector._draw_vector(ax, chain[i1].vector, color=c, alpha=1.0, lw=lw)
+        if p in set(int(k) for k in sz_label_stages):
+            idx = i0 if sz_label_at == "start" else i1
+            ax.text2D(0.99, 0.99, sz_label_title, transform=ax.transAxes, ha="right", va="top",
+                      fontsize=sz_label_fontsize, color="0.3")
+            for j, (chain, c) in enumerate(zip(chains, sz_label_colors)):
+                v = chain[idx].vector
+                if sz_label_ring:
+                    r, phi = np.hypot(v[0], v[1]), np.linspace(0.0, 2 * np.pi, 121)
+                    ax.plot(r * np.cos(phi), r * np.sin(phi), np.full_like(phi, v[2]), color=c,
+                            lw=0.7, alpha=0.35)
+                if sz_label_connector:
+                    ax.plot([v[0], 0.0], [v[1], 0.0], [v[2], v[2]], color=c, lw=0.9, alpha=0.6,
+                            linestyle=(0, (2, 1.5)))
+                ax.scatter([0.0], [0.0], [v[2]], color=c, s=10, depthshade=False)
+                ax.text2D(0.99, 0.99 - 0.075 * (j + 1), sz_label_fmt.format(v[2]), transform=ax.transAxes,
+                          ha="right", va="top", fontsize=sz_label_fontsize, color=c)
         i0 = i1
 
     if overview:
         ax = _new_ax(len(stages), "whole sequence")
         for chain, c, lab in zip(chains, colors, labels):
-            path = np.vstack([b.step_path() for b in chain[1:]])
-            ax.plot(path[:, 0], path[:, 1], path[:, 2], color=c, lw=1.3, alpha=0.9, label=lab)
+            _draw_path_with_alpha_ramp(ax, chain[1:], c, path_alpha, lw=1.3)
             v0 = chain[0].vector
             ax.scatter([v0[0]], [v0[1]], [v0[2]], color="0.2", s=14, depthshade=False)
             BlochVector._draw_vector(ax, chain[-1].vector, color=c, alpha=1.0, lw=lw)
