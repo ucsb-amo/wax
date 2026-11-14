@@ -6,12 +6,15 @@ tests/conftest.py
 tests/fake_connection_driver.py
 tests/live_od_data_fakes.py
 tests/liveod_qt_helpers.py
+tests/scan_loop_harness.py
 tests/test_abort_state.py
 tests/test_ad9910_fast_init.py
 tests/test_adjust_panel.py
+tests/test_adjust_resolve.py
 tests/test_als_server_com.py
 tests/test_awg_agent_driver.py
 tests/test_bristol_average.py
+tests/test_bristol_csv_log.py
 tests/test_bristol_plot_popout.py
 tests/test_calibration_cli.py
 tests/test_calibration_emit.py
@@ -110,6 +113,7 @@ tests/test_person_hold.py
 tests/test_precilaser_server_com.py
 tests/test_push_data_client.py
 tests/test_queue_gate.py
+tests/test_raman_ao_mode.py
 tests/test_regenerate_state.py
 tests/test_request_lock.py
 tests/test_run_fields.py
@@ -123,7 +127,6 @@ tests/test_run_queue_server.py
 tests/test_run_queue_warm.py
 tests/test_save_trap_list_shared_refs.py
 tests/test_scan_safe_state_between_shots.py
-tests/test_scan_subscan_slot.py
 tests/test_scanner_derived.py
 tests/test_sdg6000x_link.py
 tests/test_sequences_panel.py
@@ -134,8 +137,6 @@ tests/test_slm_reinit.py
 tests/test_slm_supervision.py
 tests/test_slm_write_reuse.py
 tests/test_state_reset.py
-tests/test_subscan.py
-tests/test_subscan_review_fixes.py
 tests/test_supervise.py
 tests/test_supervisor_exit_restart.py
 tests/test_telemetry.py
@@ -162,7 +163,6 @@ waxx/base/expt.py
 waxx/base/monitor.py
 waxx/base/scanner.py
 waxx/base/shot_data_queue.py
-waxx/base/subscan.py
 waxx/calibration/__init__.py
 waxx/calibration/__main__.py
 waxx/calibration/_lock.py
@@ -370,6 +370,7 @@ waxx/util/guis/precilaser/precilaser_server.py
 waxx/util/guis/tpi/__init__.py
 waxx/util/guis/tpi/tpi_panel.py
 waxx/util/live_od/__init__.py
+waxx/util/live_od/adjust_rules.py
 waxx/util/live_od/camera_cli.py
 waxx/util/live_od/camera_connection_widget.py
 waxx/util/live_od/camera_mother.py
