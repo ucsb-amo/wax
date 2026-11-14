@@ -1608,8 +1608,8 @@ def test_default_is_mono8_whatever_the_camera_was_left_at():
 
 def test_unsupported_pixel_format_refused_before_the_camera_is_touched():
     stream = FakeStream()
-    with pytest.raises(ValueError, match="Mono10p"):
-        make_client(stream=stream, pixel_format="Mono10p")
+    with pytest.raises(ValueError, match="Mono16"):
+        make_client(stream=stream, pixel_format="Mono16")
     assert stream.set_calls == []
 
 

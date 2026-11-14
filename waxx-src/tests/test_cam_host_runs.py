@@ -512,5 +512,5 @@ def test_an_unsupported_pixel_format_refuses_the_run_before_anything_is_locked(m
     from waxx.util.live_od.camera_host import HostRefused
     host, fakes = make()
     with pytest.raises(HostRefused, match="pixel_format"):
-        host.begin_run("tok", "cam_b", True, camera_params=basler_params(pixel_format="Mono10p"))
+        host.begin_run("tok", "cam_b", True, camera_params=basler_params(pixel_format="Mono16"))
     assert host.worker("cam_b").locked_by is None and not host.has_run("tok")

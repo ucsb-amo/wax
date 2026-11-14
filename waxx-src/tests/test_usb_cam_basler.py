@@ -422,8 +422,8 @@ def test_a_frame_of_another_dtype_is_lost_not_stored(cam):
 
 def test_unsupported_pixel_format_is_refused_before_writing(cam):
     n = len(cam._fake["writes"])
-    with pytest.raises(ValueError, match="Mono10p"):
-        cam.set_pixel_format("Mono10p")
+    with pytest.raises(ValueError, match="Mono16"):
+        cam.set_pixel_format("Mono16")
     assert len(cam._fake["writes"]) == n and cam.frame_dtype() == np.uint8
 
 

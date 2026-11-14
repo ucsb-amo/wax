@@ -24,7 +24,7 @@ def test_baslerparams_12_bit_is_uint16(pf):
 
 
 def test_baslerparams_refuses_an_unsupported_format_before_a_run_id():
-    p = BaslerParams(pixel_format="Mono10p")
+    p = BaslerParams(pixel_format="Mono16")
     with pytest.raises(RunFieldRefused, match="pixel_format"):
         p.prepare_for_run()
 
@@ -127,9 +127,11 @@ def _init_msg(pf=None, dtype="uint8", shape=(9, 1200, 1920), ctype="basler", cap
     ("Mono8", "uint8", True),
     ("Mono12p", "uint16", True),
     ("Mono12", "uint16", True),
+    ("Mono10p", "uint16", True),      # 10-bit sensors (acA640-750um)
+    ("Mono10p", "uint8", False),
     ("Mono12p", "uint8", False),      # declared 8-bit, camera would give 12-bit
     ("Mono8", "uint16", False),
-    ("Mono10p", "uint16", False),     # no declared dtype for it
+    ("Mono16", "uint16", False),     # no declared dtype for it
 ])
 def test_init_run_pairs_pixel_format_and_declared_dtype(pf, dtype, ok):
     from waxx.util.live_od.live_od_server import _pixel_format_mismatch
