@@ -104,7 +104,8 @@ class Stand(SimpleNamespace):
 
 
 _METHODS = ("claim", "claim_hardware", "claim_after_start", "pre_init_run",
-            "_start_liveod_run", "_adopt_start_time", "_reserve_warm_run",
+            "_start_liveod_run", "_adopt_start_time", "_refuse_unapplied_pixel_format",
+            "_reserve_warm_run",
             "_release_reservation", "_liveod_has_reserve", "_restamp_run_time_now",
             "_expt_file_stem", "_serialize_init_payload", "_xvar_ranges",
             "_source_texts_for_end", "_source_files", "_read_source",
