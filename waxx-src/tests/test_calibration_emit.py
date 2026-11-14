@@ -69,6 +69,7 @@ TODAY = datetime.date.today().isoformat()
 class FakeRun:
     """Expt's real calibration / end methods on a bare object."""
     _expt_name_from_filepath = staticmethod(Expt._expt_name_from_filepath)
+    T_END_SLOW_S = Expt.T_END_SLOW_S       # end_wax's timing-line threshold
 
 
 for _name in ("calibrates", "emit_calibration", "_emit_calibrations", "end_wax",
