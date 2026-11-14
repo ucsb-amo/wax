@@ -91,14 +91,19 @@ class MetadataCache:
             self._folder_index[date_str] = entry
             self._dirty = True
 
+    @staticmethod
+    def _stat_matches(entry: dict, stat_result: os.stat_result) -> bool:
+        return (
+            entry.get("mtime_ns") == stat_result.st_mtime_ns
+            and entry.get("size") == stat_result.st_size
+        )
+
     def get(self, filepath: str, stat_result: os.stat_result) -> Optional[RunSummary]:
         with self._lock:
             entry = self._entries.get(filepath)
         if not entry:
             return None
-        if entry.get("mtime_ns") != stat_result.st_mtime_ns:
-            return None
-        if entry.get("size") != stat_result.st_size:
+        if not self._stat_matches(entry, stat_result):
             return None
         summary_payload = entry.get("summary")
         if not isinstance(summary_payload, dict):
@@ -119,6 +124,34 @@ class MetadataCache:
         with self._lock:
             self._entries[summary.filepath] = entry
             self._dirty = True
+
+    # ------------------------------------------------------------------
+    # Unfinished runs: files the scanner read and found not to be a completed
+    # run (scanned params still scalars).  The verdict is remembered against
+    # the file's mtime/size so an old aborted run is not re-opened over the
+    # network on every scan; any change to the file invalidates it.  These
+    # entries carry no "summary", so get() -- including an older browser's
+    # get() reading the same shared cache file -- returns None for them.
+    # ------------------------------------------------------------------
+
+    def put_incomplete(self, filepath: str, stat_result: os.stat_result):
+        if not self.cache_path:
+            return
+        entry = {
+            "mtime_ns": stat_result.st_mtime_ns,
+            "size": stat_result.st_size,
+            "incomplete": True,
+        }
+        with self._lock:
+            self._entries[filepath] = entry
+            self._dirty = True
+
+    def is_known_incomplete(self, filepath: str, stat_result: os.stat_result) -> bool:
+        with self._lock:
+            entry = self._entries.get(filepath)
+        if not entry or not entry.get("incomplete"):
+            return False
+        return self._stat_matches(entry, stat_result)
 
     def update_summary(self, summary: RunSummary):
         """Refresh the cached payload for a file whose stat did not change

@@ -45,6 +45,21 @@ FOLDER_INDEX_MUTABLE_DAYS = 2
 # The root directory listing (one entry per date folder) changes at most once
 # a day; re-reading it from the network on every lookup is wasted latency.
 ROOT_LISTING_TTL_S = 30.0
+
+# An unfinished run (scanned params still scalars) is remembered as such only
+# once its file has not been modified for this long, so a run that is still
+# being written -- or a read that raced the writer -- is always read again.
+# Any later change to the file's mtime or size invalidates the verdict.
+INCOMPLETE_CACHE_MIN_AGE_S = 3600.0
+
+# During a scan the (multi-MB, network-hosted) cache file is rewritten at most
+# this often; the scan always saves once more when it ends.
+SCAN_CACHE_SAVE_INTERVAL_S = 60.0
+
+# _read_summary_status() outcomes
+READ_OK = "ok"
+READ_INCOMPLETE = "incomplete"
+READ_ERROR = "error"
 _root_listing_cache: dict = {}  # data_dir -> (monotonic_time, [(date, path)])
 _root_listing_lock = threading.Lock()
 
@@ -636,6 +651,8 @@ class RunScanner:
             return bool(stop_requested is not None and stop_requested())
 
         uncached = []  # (filepath, stat_result) pairs not yet in cache
+        n_known_incomplete = 0
+        n_read_incomplete = 0
         try:
             # --- Fast pass: yield cached summaries immediately (preserves order) ---
             for folder in self._iter_date_folders():
@@ -657,15 +674,20 @@ class RunScanner:
                         yield cached_summary
                         continue
 
+                    if self._cache.is_known_incomplete(filepath, stat_result):
+                        n_known_incomplete += 1
+                        continue
+
                     uncached.append((filepath, stat_result))
 
             if not uncached:
                 return
 
             # --- Parallel pass: read uncached files with a thread pool ---
+            now = time.time()
             with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as executor:
                 future_to_stat = {
-                    executor.submit(self._read_summary, fp): (fp, sr)
+                    executor.submit(self._read_summary_status, fp): (fp, sr)
                     for fp, sr in uncached
                 }
                 for future in as_completed(future_to_stat):
@@ -675,14 +697,27 @@ class RunScanner:
                         break
                     fp, sr = future_to_stat[future]
                     try:
-                        summary = future.result()
+                        summary, status = future.result()
                     except Exception:
+                        continue
+                    if status == READ_INCOMPLETE:
+                        n_read_incomplete += 1
+                        # Open errors are never remembered (a lock or a share
+                        # hiccup is transient); an unfinished run is, once the
+                        # file has been quiet long enough.
+                        if now - sr.st_mtime >= INCOMPLETE_CACHE_MIN_AGE_S:
+                            self._cache.put_incomplete(fp, sr)
+                            self._cache.save_if_dirty(SCAN_CACHE_SAVE_INTERVAL_S)
                         continue
                     if summary is not None:
                         self._cache.put(summary, sr)
-                        self._cache.save_if_dirty()
+                        self._cache.save_if_dirty(SCAN_CACHE_SAVE_INTERVAL_S)
                         yield summary
         finally:
+            LOGGER.info(
+                "Scan %s..%s: read %s file(s); unfinished runs skipped from cache %s, read and unfinished %s",
+                self.date_from, self.date_to, len(uncached), n_known_incomplete, n_read_incomplete,
+            )
             self._cache.save()
 
     def _iter_date_folders(self):
@@ -703,6 +738,14 @@ class RunScanner:
         return files
 
     def _read_summary(self, filepath):
+        """RunSummary for a completed run, else None (unfinished or unreadable)."""
+        summary, _ = self._read_summary_status(filepath)
+        return summary
+
+    def _read_summary_status(self, filepath):
+        """(summary, status): (RunSummary, READ_OK), (None, READ_INCOMPLETE)
+        for a run whose scanned params are not arrays yet, or (None,
+        READ_ERROR) when the file could not be opened or read."""
         try:
             with h5py.File(filepath, "r") as f:
                 xvarnames = _attr_to_str_list(f.attrs.get("xvarnames"))
@@ -710,7 +753,7 @@ class RunScanner:
                 # Single-pass: validate completion and collect dims+details together.
                 xvar_result = self._read_and_validate_xvars(f, xvarnames)
                 if xvar_result is None:
-                    return None
+                    return None, READ_INCOMPLETE
                 xvardims, xvar_details = xvar_result
 
                 run_id = self._read_run_id(f, filepath)
@@ -762,9 +805,9 @@ class RunScanner:
                     has_lite=has_lite,
                     tags=tags,
                     comment=comment,
-                )
+                ), READ_OK
         except Exception:
-            return None
+            return None, READ_ERROR
 
     def _read_experiment_info(self, h5file):
         if "run_info" in h5file and "experiment_filepath" in h5file["run_info"]:
