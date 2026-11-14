@@ -150,6 +150,25 @@ def test_override_button_toggles_the_override_setting(rig):
     assert panel._override_btn.text() == "Override"
 
 
+def test_stale_pair_is_tinted_and_not_plotted(rig):
+    panel, dev, srv, poll, answers, asked = rig
+    dev.emit_row(sep=26.3, state=0, tfirst=29.8, h1=9.0, h2=7.0, nopair=0)
+    dev.emit_row(sep=26.3, state=0, tfirst=29.8, h1=9.0, h2=7.0, nopair=60)
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("nopair") == 60)
+    poll()
+    assert "#b8860b" in panel._vals["err"].styleSheet()
+    assert "#b8860b" in panel._vals["t2"].styleSheet()
+    assert "no pair for 60 sweeps" in panel._warn.text()
+    import math
+    assert not math.isnan(panel._hist["sep"][-2]) and math.isnan(panel._hist["sep"][-1])
+    assert math.isnan(panel._hist["t2"][-1]) and math.isnan(panel._hist["err"][-1])
+    assert not math.isnan(panel._hist["feedback"][-1])                 # not a pair value
+    dev.emit_row(sep=26.4, state=0, tfirst=29.8, h1=9.0, h2=7.0, nopair=0)
+    assert _until(lambda: (srv.snapshot()["latest"] or {}).get("nopair") == 0)
+    poll()
+    assert "#b8860b" not in panel._vals["err"].styleSheet()
+
+
 def test_override_shows_hold(rig):
     panel, dev, srv, poll, answers, asked = rig
     dev.emit_row(sep=6.40, state=2, tfirst=40.0, h1=9.0, h2=8.0)

@@ -5,8 +5,15 @@ qCommand sketch:
 
 * ``name`` reads a setting, ``name value`` sets it; both reply ``name is value``.
   An unknown name replies ``Unknown command: name``.
-* With ``fmt 0`` it prints one CSV line every ~10 sweeps (``CSV_FIELDS``; the
-  last two, ``integ`` and ``period``, only from firmware that has them).
+* With ``fmt 0`` it prints one CSV line every ~10 sweeps (``CSV_FIELDS``;
+  ``integ`` and ``period``, and after them ``nopair``, only from firmware that
+  has them).
+* From firmware with ``nopair`` (2026-11-08): ``sep``, ``tfirst``, ``h1``, ``h2``
+  all describe the last sweep that found a pair, ``nopair`` is how many sweeps
+  in a row have had none since, and ``err`` = ``sep - setp`` against the current
+  setpoint. Older firmware overwrote ``tfirst``/``h1`` with every sweep's first
+  peak and printed the ``err`` of the last pair, so ``t2 = tfirst + sep`` could
+  be a position no peak had and ``err`` could disagree with ``sep - setp``.
 
 Pure functions only: no I/O, no Qt.
 """
@@ -19,7 +26,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 __all__ = [
-    "CSV_FIELDS", "CSV_MIN_FIELDS", "STATE_NAMES", "Setting", "SETTINGS", "SETTABLE",
+    "CSV_FIELDS", "CSV_MIN_FIELDS", "STALE_NOPAIR", "pair_is_stale", "STATE_NAMES", "Setting", "SETTINGS", "SETTABLE",
     "parse_row", "parse_reply", "parse_unknown", "format_value", "EdgeConfig",
     "compute_warnings",
 ]
@@ -27,11 +34,23 @@ __all__ = [
 #: CSV columns, in the firmware's order (fmt 0).
 CSV_FIELDS = (
     "sep", "err", "feedback", "state", "tfirst", "h1", "h2", "bad", "unlocks", "sats",
-    "saturated", "bad_none", "bad_one", "bad_win", "integ", "period",
+    "saturated", "bad_none", "bad_one", "bad_win", "integ", "period", "nopair",
 )
-#: Firmware before integ/period printed 14 columns; older still, 11.
+#: Firmware before nopair printed 16 columns; before integ/period 14; older still, 11.
 CSV_MIN_FIELDS = 11
-_INT_FIELDS = {"state", "bad", "unlocks", "sats", "saturated", "bad_none", "bad_one", "bad_win"}
+_INT_FIELDS = {"state", "bad", "unlocks", "sats", "saturated", "bad_none", "bad_one", "bad_win",
+               "nopair"}
+#: A line is printed every ~10 sweeps: nopair >= this means no new pair since
+#: the previous line, so its sep / err / peak positions repeat an older sweep.
+STALE_NOPAIR = 10
+
+
+def pair_is_stale(row: Optional[dict]) -> bool:
+    """True when the row's pair values are from before the previous line
+    (``nopair >= STALE_NOPAIR``). Rows from firmware without ``nopair``: False
+    (unknown)."""
+    n = (row or {}).get("nopair")
+    return isinstance(n, int) and n >= STALE_NOPAIR
 
 STATE_NAMES = {0: "OFF", 1: "HOLD", 2: "LOCKED"}
 
@@ -47,7 +66,7 @@ class Setting:
 #: Every setting the panel shows and may change, in display order.
 SETTINGS: tuple[Setting, ...] = (
     Setting("lock", "switch", "", "1 = on; anything else = off (0 V, integral cleared)"),
-    Setting("override", "switch", "", "1 = output set to ovolt, state HOLD, PI frozen (no integral windup); 0 = lock drives it, re-locking from HOLD with the integral cleared"),
+    Setting("override", "switch", "", "1 = output set to ovolt, state HOLD, PI frozen (no integral windup); 0 = lock drives it, re-locking from HOLD after ngood good sweeps with the integral starting at ovolt (clamped to rail)"),
     Setting("ovolt", "float", "V", "forced output while override = 1 (clamped to +/-10 V)"),
     Setting("hold", "switch", "", "1 = skip bad sweeps and pause in HOLD; 0 = use every pair"),
     Setting("setp", "float", "ms", "peak-separation setpoint"),
@@ -166,7 +185,12 @@ def compute_warnings(row: Optional[dict], *, edge: EdgeConfig, com_status: str,
     elif state == 0:
         add("info", "off", "lock off (output 0 V)")
 
-    if row.get("sep", 0) > 0 and row.get("h1", 0) > 0:
+    if pair_is_stale(row):
+        # the peak positions are from an older sweep: no edge warnings on them
+        add("warn", "no_pair",
+            f"no pair for {row['nopair']} sweeps: sep, err and the peak "
+            "positions are from the last sweep that had one")
+    elif row.get("sep", 0) > 0 and row.get("h1", 0) > 0:
         m = edge.margin_ms
         tfirst, t2 = row["tfirst"], row["t2"]
         if tfirst < m:

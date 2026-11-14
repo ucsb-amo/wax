@@ -19,7 +19,8 @@ The lock is a qNimble Quarto running the fp_lock_core firmware (protocol in
   ``get_text``              console lines with ``seq`` > ``since``
   ``set`` name value        one setting from ``SETTINGS``; read back
   ``lock`` on               ``lock 1`` / ``lock 0``
-  ``reset_setpoint``        ``setp`` = the firmware's current ``sep``
+  ``reset_setpoint``        ``setp`` = the firmware's current ``sep``; refused when
+                            ``nopair`` > RESET_MAX_NOPAIR (that sep is old)
   ``clear``                 zero the integral and the output
   ``raw`` line              send one line, return what came back
   ``refresh_settings``      re-read every setting
@@ -62,6 +63,7 @@ TEXT_MAX = 400              # console lines kept
 QUERY_TIMEOUT_S = 1.0
 RAW_COLLECT_S = 0.4
 HOUSEKEEPING_S = 2.0        # log flush and CSV-mode check period
+RESET_MAX_NOPAIR = 2        # reset setp only from a pair at most this many sweeps old
 LOG_FLUSH_S = 10.0
 FMT_REASSERT_S = 10.0
 LOG_BUFFER_MAX = 20000
@@ -441,6 +443,14 @@ class FPLockServer(NetServer):
         return {"status": "ok", "name": name, "value": _to_float(reply)}
 
     def _reset_setpoint(self) -> dict:
+        # the firmware's sep is the last pair it found, however old: refuse an old one
+        try:
+            nopair = _to_float(self._query("nopair"))
+        except _CommandError:
+            nopair = None                       # firmware before nopair: age unknown
+        if nopair is not None and nopair > RESET_MAX_NOPAIR:
+            raise ValueError(f"no pair found for {nopair:.0f} sweeps: the lock's sep is from an "
+                             "older sweep, setpoint not changed")
         sep = _to_float(self._query("sep"))
         if sep is None or not math.isfinite(sep) or sep <= 0:
             raise ValueError(f"no measured separation to use (sep = {sep})")
@@ -589,16 +599,17 @@ class FPLockServer(NetServer):
             day = datetime.datetime.fromtimestamp(r["t"]).strftime("%Y-%m-%d")
             by_day.setdefault(day, []).append(r)
         fields = list(proto.CSV_FIELDS) + ["t2"]
+        header = "time_iso,unix_s," + ",".join(fields)
         try:
             os.makedirs(self.log_dir, exist_ok=True)
             for day, day_rows in by_day.items():
-                path = os.path.join(self.log_dir, f"{day}.csv")
+                path = _log_file_for(self.log_dir, day, header)
                 new = not os.path.exists(path)
                 # opened and closed each flush: a network share's stale handle
                 # never outlives one write
                 with open(path, "a", encoding="utf-8", newline="") as fh:
                     if new:
-                        fh.write("time_iso,unix_s," + ",".join(fields) + "\n")
+                        fh.write(header + "\n")
                     for r in day_rows:
                         iso = datetime.datetime.fromtimestamp(r["t"]).isoformat(timespec="milliseconds")
                         vals = ["" if r.get(f) is None else repr(r[f]) for f in fields]
@@ -618,6 +629,26 @@ class FPLockServer(NetServer):
                     self._log_dropped += len(rows) - max(keep, 0)
                     rows = rows[-max(keep, 0):] if keep > 0 else []
                 self._log_rows = rows + self._log_rows
+
+
+def _log_file_for(log_dir: str, day: str, header: str) -> str:
+    """The day's log file whose header is ``header``: ``<day>.csv``, or
+    ``<day>_2.csv``, ``<day>_3.csv``, ... when an earlier file of the day has
+    other columns (a server with a different column list wrote it). Rows never
+    go under a header that does not name their columns."""
+    n = 1
+    while True:
+        path = os.path.join(log_dir, f"{day}.csv" if n == 1 else f"{day}_{n}.csv")
+        if not os.path.exists(path):
+            return path
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\r\n")
+        except OSError:
+            first = None
+        if first == header:
+            return path
+        n += 1
 
 
 def _to_float(text: Optional[str]) -> Optional[float]:

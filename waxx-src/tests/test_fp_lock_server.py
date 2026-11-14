@@ -39,6 +39,10 @@ def test_parse_row_all_firmware_widths():
     assert r["sep"] == pytest.approx(6.41) and r["state"] == 2 and r["state_name"] == "LOCKED"
     assert r["t2"] == pytest.approx(18.91) and r["period"] == pytest.approx(120.004)
     assert r["bad_one"] == 2 and isinstance(r["bad_one"], int)
+    assert "nopair" not in r and not proto.pair_is_stale(r)
+    r17 = proto.parse_row(line16 + ", 12")
+    assert r17["nopair"] == 12 and isinstance(r17["nopair"], int) and proto.pair_is_stale(r17)
+    assert not proto.pair_is_stale(proto.parse_row(line16 + ", 9"))
     r14 = proto.parse_row(", ".join(line16.split(", ")[:14]))
     assert "integ" not in r14 and r14["bad_win"] == 0
     assert proto.parse_row(", ".join(line16.split(", ")[:11]))["saturated"] == 0
@@ -196,6 +200,57 @@ def test_reset_setpoint_refuses_without_a_measurement(make):
     dev.values["sep"] = 0.0
     reply = client.reset_setpoint()
     assert reply["status"] == "error" and dev.values["setp"] == 10.0
+
+
+def test_reset_setpoint_refuses_an_old_pair(make):
+    srv, dev, client = make()
+    _connected(srv, dev)
+    dev.values["sep"] = 26.3
+    dev.values["nopair"] = 60                 # the lock's sep is 60 sweeps old
+    reply = client.reset_setpoint()
+    assert reply["status"] == "error" and "60 sweeps" in reply["message"]
+    assert dev.values["setp"] == 10.0
+    dev.values["nopair"] = 1                  # a pair one sweep ago: fine
+    assert client.reset_setpoint()["status"] == "ok" and dev.values["setp"] == pytest.approx(26.3)
+
+
+def test_reset_setpoint_with_firmware_without_nopair(make):
+    srv, dev, client = make(fake_fp_lock.FakeQuarto(without=("nopair",)))
+    _connected(srv, dev)
+    dev.values["sep"] = 6.5
+    assert client.reset_setpoint()["status"] == "ok" and dev.values["setp"] == pytest.approx(6.5)
+
+
+def test_stale_pair_warning_and_row(make):
+    srv, dev, client = make()
+    _connected(srv, dev)
+    dev.emit_row(sep=26.3, state=0, tfirst=105.0, h1=9.0, h2=7.0, nopair=60)
+    assert _until(lambda: client.get_snapshot()["seq"] == 1)
+    snap = client.get_snapshot()
+    assert snap["latest"]["nopair"] == 60
+    codes = [w["code"] for w in snap["warnings"]]
+    assert "no_pair" in codes and "second_near_end" not in codes   # no edge warning on an old pair
+
+
+def test_log_starts_a_new_file_when_the_columns_change(make, tmp_path):
+    srv, dev, client = make()
+    _connected(srv, dev)
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    import datetime
+    day = datetime.datetime.now().strftime("%Y-%m-%d")
+    old = logs / f"{day}.csv"
+    old.write_text("time_iso,unix_s,sep,err\n2026-01-01T00:00:00.000,0.000,1.0,0.0\n")
+    dev.emit_row(sep=6.4, state=2, tfirst=40.0, h1=9.0, h2=8.0)
+    assert _until(lambda: client.get_snapshot()["seq"] == 1)
+    srv._flush_log(force=True)
+    assert old.read_text().splitlines()[0] == "time_iso,unix_s,sep,err"   # untouched
+    new = (logs / f"{day}_2.csv").read_text().splitlines()
+    assert new[0].endswith(",nopair,t2") and len(new) == 2
+    dev.emit_row(sep=6.5, state=2, tfirst=40.0, h1=9.0, h2=8.0)
+    assert _until(lambda: client.get_snapshot()["seq"] == 2)
+    srv._flush_log(force=True)
+    assert len((logs / f"{day}_2.csv").read_text().splitlines()) == 3     # same file again
 
 
 def test_firmware_without_hold_reports_it_missing(make):

@@ -49,6 +49,8 @@ HISTORY_POINTS = 3000      # one row per ~1.2 s: about an hour
 HISTORY_S_DEFAULT = 60.0   # s: the plot shows the last this many seconds
 HISTORY_S_MAX = 3600
 OUT_WARN_V = 8.0          # V: the "out" readout turns orange beyond this (the firmware rail)
+# values that come from the last pair: blanked in the plot, tinted, when the pair is stale
+_PAIR_KEYS = ("sep", "err", "tfirst", "t2")
 
 _PILL = {
     "LOCKED": ("#2e8b57", "LOCKED"),
@@ -507,8 +509,12 @@ class FPLockPanel(WidgetPanelBase):
         # orange when a peak sits within the edge margin of the sweep ends
         margin, right = edge.get("margin_ms", 10.0), edge.get("right_edge_ms", 120.0)
         tf, t2 = row.get("tfirst"), row.get("t2")
-        self._tint(v["tfirst"], isinstance(tf, (int, float)) and tf < margin)
-        self._tint(v["t2"], isinstance(t2, (int, float)) and t2 > right - margin)
+        stale = proto.pair_is_stale(row)   # no new pair since the previous line
+        self._tint(v["tfirst"], stale or (isinstance(tf, (int, float)) and tf < margin))
+        self._tint(v["t2"], stale or (isinstance(t2, (int, float)) and t2 > right - margin))
+        self._tint(v["err"], stale)
+        for k in ("h1", "h2"):
+            self._tint(v[k], stale)
 
         lock_on = settings.get("lock")
         self._lock_btn.setText("Lock ON" if lock_on == 1 else
@@ -538,8 +544,12 @@ class FPLockPanel(WidgetPanelBase):
     def _append_history(self, r: dict) -> None:
         h = self._hist
         h["t"].append(r.get("t", time.time()))
+        # a row with no new pair repeats an older sweep's pair: a gap, not a point
+        stale = proto.pair_is_stale(r)
         for k in ("sep", "err", "feedback", "integ", "tfirst", "t2"):
             val = r.get(k)
+            if stale and k in _PAIR_KEYS:
+                val = None
             h[k].append(float(val) if isinstance(val, (int, float)) else float("nan"))
 
     def _redraw(self, edge: dict, setp=None) -> None:

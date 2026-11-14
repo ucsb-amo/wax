@@ -16,7 +16,7 @@ FLOAT_SETTINGS = {"setp": 10.0, "p1": 0.0, "i1": -0.01, "g1": 1.0, "win": 1.0, "
                   "hys": 0.2, "tmin": 1.5, "ovolt": 0.0}
 INT_SETTINGS = {"lock": 1, "hold": 1, "nbad": 5, "ngood": 10, "nmin": 3, "fmt": 1, "override": 0}
 READ_ONLY = {"sep": 0.0, "integ": 0.0, "state": 1, "tfirst": 0.0, "h1": 0.0, "h2": 0.0,
-             "bad": 0, "unlocks": 0, "sats": 0, "period": 120.0}
+             "bad": 0, "unlocks": 0, "sats": 0, "period": 120.0, "nopair": 0}
 
 
 class FakeQuarto:
@@ -25,7 +25,7 @@ class FakeQuarto:
         self.values = {**FLOAT_SETTINGS, **INT_SETTINGS, **READ_ONLY}
         for name in without:
             self.values.pop(name, None)
-        self.ints = set(INT_SETTINGS) | {"state", "bad", "unlocks", "sats"}
+        self.ints = set(INT_SETTINGS) | {"state", "bad", "unlocks", "sats", "nopair"}
         self.received: list[str] = []
         self.opened = 0
         self.port = None
@@ -53,6 +53,8 @@ class FakeQuarto:
                v["h1"], v["h2"], v["bad"], v["unlocks"], v["sats"], kw.get("saturated", 0),
                kw.get("bad_none", 0), kw.get("bad_one", 0), kw.get("bad_win", 0),
                v.get("integ", 0.0), v.get("period", 120.0)]
+        if "nopair" in v:                # firmware since 2026-11-08
+            row.append(v["nopair"])
         if v.get("fmt", 1) == 0:
             line = ", ".join(f"{x:.3f}" if isinstance(x, float) else str(x) for x in row)
         elif v.get("fmt", 1) == 2:
