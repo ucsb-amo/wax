@@ -60,6 +60,7 @@ from waxx.control.cameras.camera_param_classes import CameraParams, img_types
 from waxx.control.cameras.camera_stream_client import (
     InactiveCameraStream, TriggeredCameraStreamClient)
 from waxx.control.cameras.exposure_delay import ExposureDelayCell, dummy_cell
+from waxx.util import console
 
 _SHOW = ('image', 'counts', None)
 SETTING_KEYS = ('exposure_time', 'gain', 'roi')
@@ -460,8 +461,14 @@ class diagnostic_frame:
         cams = [c for c in self.entries() if c.images]
         up = [c.key for c in cams if _connected(c.stream)]
         down = [c.key for c in cams if c.key not in up]
-        print("[diag cams] connected: " + (", ".join(up) or "none")
-              + (f" | NOT connected: {', '.join(down)}" if down else ""))
+        if down:
+            # a camera that takes nothing this run: always said, by name
+            print("[diag cams] connected: " + (", ".join(up) or "none")
+                  + f" | NOT connected: {', '.join(down)}")
+        else:
+            console.info(f"[diag cams] {len(up)}/{len(cams)} connected"
+                         + (f": {', '.join(up)}" if console.get_level() >= console.VERBOSE
+                            else ""))
 
     def streams(self):
         """{camera key: its stream} (bound cameras with images)."""

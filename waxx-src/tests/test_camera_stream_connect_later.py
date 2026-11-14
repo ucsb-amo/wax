@@ -257,11 +257,15 @@ def test_per_frame_rois_take_their_shapes_at_the_late_connect():
         cs.finish()
 
 
-def test_the_exposure_delay_is_provisional_before_the_compile_and_decided_at_the_claim(capsys):
+def test_the_exposure_delay_is_provisional_before_the_compile_and_decided_at_the_claim(
+        capsys, monkeypatch):
     """Built without a connection: the cell the kernel reads holds the camera
     server's last report (provisional) at construction; the claim reads the
     camera's own with this run's settings and decides that for the kernel,
-    without touching the cell (the kernel writes it at its start)."""
+    without touching the cell (the kernel writes it at its start). The claim's
+    line is VERBOSE (the run file records both values)."""
+    from waxx.util import console
+    monkeypatch.setattr(console, "_level", console.VERBOSE)
     fe = FakeExpt()
     stream = TrigFakeStream()
     stream.exposure_start_delay_s = 23.5e-6

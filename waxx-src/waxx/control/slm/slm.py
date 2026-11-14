@@ -172,9 +172,10 @@ class SLM:
         self._shown = None
         applied = self._write(command)
         if verbose:
-            console.info(label
-                         + ("" if applied is None
-                            else f", applied in {applied.get('t_apply_s', float('nan')):.3f} s"))
+            # the apply time is detail (VERBOSE); the mask itself is said always
+            t_apply = ("" if applied is None or console.get_level() < console.VERBOSE
+                       else f", applied in {applied.get('t_apply_s', float('nan')):.3f} s")
+            console.info(label + t_apply)
             console.info(f"[slm] sent: {command}", level=console.VERBOSE)
 
     # --- the kernel's writes: reuse a mask that is still shown ----------------------

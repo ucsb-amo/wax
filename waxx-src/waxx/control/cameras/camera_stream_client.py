@@ -1086,7 +1086,7 @@ class CameraStreamClient:
             self._write_provenance()
             print(f"[{self.label}] {late} frame outcome(s) came after the record "
                   f"was first written (the shot queue closed); record updated:")
-            self._report()
+            self._report(ok_level=console.NORMAL)
         except Exception as e:
             print(f"[{self.label}] WARNING: could not update the record ({e!r})")
 
@@ -1183,14 +1183,20 @@ class CameraStreamClient:
         except Exception as e:
             print(f"[{self.label}] WARNING: could not store provenance ({e!r})")
 
-    def _report(self):
+    def _report(self, ok_level=console.VERBOSE):
+        """The stream's tally at its end. Anything wrong prints at every
+        verbosity; the all-captured line goes at ``ok_level`` (VERBOSE: Expt
+        prints one line for all the streams from ``self.tally``)."""
         c = self.counts
         if c.get("wrong_mode_calls"):
             print(f"[{self.label}] !! {c['wrong_mode_calls']} call(s) to the other "
                   f"mode's kernel method (grab vs trigger) were ignored")
         self._report_clears()
         missing = self._n_missing()
-        if missing or c["rpc_errors"]:
+        complete = not (missing or c["rpc_errors"])
+        self.tally = {"ok": int(c["ok"]), "requested": int(c["requested"]),
+                      "discarded": 0, "complete": complete}
+        if not complete:
             lost = self._queue_losses()
             print(f"[{self.label}] !! {missing} of {self._n_slots()} requested shots "
                   f"have NO frame in '{self.key}' (in the file {c['ok']}, failed "
@@ -1199,8 +1205,8 @@ class CameraStreamClient:
                   + (f"; not delivered to liveOD: {lost}" if lost else "")
                   + f"); their {self.key}_meta seq is NaN")
         else:
-            print(f"[{self.label}] {c['ok']}/{c['requested']} frames captured "
-                  f"into '{self.key}'")
+            console.info(f"[{self.label}] {c['ok']}/{c['requested']} frames captured "
+                         f"into '{self.key}'", ok_level)
 
     def _report_clears(self):
         """A warm-up slot whose clear never reached the file may still hold
@@ -1730,7 +1736,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                          f"{self.exposure_delay_at_claim * 1e6:.2f} us at the claim "
                          f"({source}; {before * 1e6:.2f} us before the compile, "
                          f"{self.exposure_delay_before_claim_source}); the kernel takes "
-                         f"it at its start")
+                         f"it at its start", console.VERBOSE)
 
     def _exposure_delay_for_kernel(self):
         """For load_exposure_delays' RPC (exposure_delay.exposure_delays_for_kernel):
@@ -2140,7 +2146,8 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                 print(f"[{self.label}] WARNING: could not store provenance for "
                       f"'{k}' ({e!r})")
 
-    def _report(self):
+    def _report(self, ok_level=console.VERBOSE):
+        """As CameraStreamClient._report, for every key of the stream."""
         c = self.counts
         if c.get("wrong_mode_calls"):
             print(f"[{self.label}] !! {c['wrong_mode_calls']} call(s) to the other "
@@ -2148,7 +2155,11 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         keys = ", ".join(f"'{k}'" for k in self.keys)
         self._report_clears()
         missing = self._n_missing()
-        if missing or c["rpc_errors"] or c.get("gaps"):
+        complete = not (missing or c["rpc_errors"] or c.get("gaps"))
+        self.tally = {"ok": int(c["ok"]), "requested": int(c["requested"]),
+                      "discarded": int(c.get("sibling_frames_discarded", 0)),
+                      "complete": complete}
+        if not complete:
             lost = self._queue_losses()
             print(f"[{self.label}] !! {missing} of {self._n_slots()} requested frames "
                   f"are MISSING in {keys} (in the file {c['ok']}, failed {c['failed']}, "
@@ -2158,8 +2169,10 @@ class TriggeredCameraStreamClient(CameraStreamClient):
                   + "); their <key>_meta seq is NaN")
         else:
             discarded = c.get("sibling_frames_discarded", 0)
-            print(f"[{self.label}] {c['ok']}/{c['requested']} frames captured into {keys}"
-                  + (f" ({discarded} sibling-edge frames discarded)" if discarded else ""))
+            console.info(f"[{self.label}] {c['ok']}/{c['requested']} frames captured into "
+                         f"{keys}"
+                         + (f" ({discarded} sibling-edge frames discarded)" if discarded else ""),
+                         ok_level)
         self._report_operator()
 
     def _report_operator(self):

@@ -1035,5 +1035,8 @@ class Scanner():
 
         if self.setup_camera:
             msg += f" ({N_img} images)"
+        notes = getattr(self, "_scan_line_notes", None) or {}
+        if notes:
+            msg += " | " + " | ".join(str(v) for v in notes.values())
         console.info(msg)
         return N_img

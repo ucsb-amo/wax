@@ -157,6 +157,9 @@ class Expt(Scanner, Dealer, Scribe):
         if verbosity is not None:
             console.set_level(verbosity)
         self._verbosity = int(console.get_level())
+        # {name: text} a machine's Expt adds to the one "Scan:" line
+        # (Scanner.get_N_img) instead of printing a line of its own each
+        self._scan_line_notes = {}
 
         if absorption_image != None:
             print("Warning: The argument 'absorption_image' is depreciated -- change it out for 'imaging_type'")
@@ -1067,9 +1070,16 @@ class Expt(Scanner, Dealer, Scribe):
         # where the end of the run went (the save is liveOD's own figure)
         pushed = f", {self._n_pushed} arrays pushed during the run" if self._n_pushed else ""
         failed = f" ({self._n_push_failed} pushes failed)" if self._n_push_failed else ""
-        console.info(f"[end] streams closed {_t_streams:.1f} s | liveOD end_run "
+        # timings are detail; said at the default level when the end was slow,
+        # and always when a push failed
+        _slow = (_t_streams + _t_end_run + _t_monitor) > self.T_END_SLOW_S
+        _end_line = (f"[end] streams closed {_t_streams:.1f} s | liveOD end_run "
                      f"{_t_end_run:.1f} s (save {_t_save:.1f} s) | monitor {_t_monitor:.1f} s"
                      f"{pushed}{failed}")
+        if self._n_push_failed:
+            print(_end_line)
+        else:
+            console.info(_end_line, console.NORMAL if _slow else console.VERBOSE)
 
         # Declared calibrations: the run is saved and the monitor has its end
         # state, so this costs the machine nothing. Never raises.
@@ -1166,6 +1176,8 @@ class Expt(Scanner, Dealer, Scribe):
     PUT_DATA_SLICE_BYTES = 48 * 1024 * 1024
     # every auxiliary camera stream's finish() runs at once; this is the wait
     T_STREAM_FINISH_S = 90.
+    # end_wax's timing line goes to the default verbosity above this (s)
+    T_END_SLOW_S = 10.
     # the stream-only shot queue holds at most this much waiting for liveOD;
     # an item that would go over it is dropped (and counted)
     PUSH_QUEUE_MAX_BYTES = 50 * 1024 * 1024
@@ -1460,6 +1472,29 @@ class Expt(Scanner, Dealer, Scribe):
         if late:
             print(f"[end_wax] WARNING: still closing after {self.T_STREAM_FINISH_S:.0f} s, "
                   f"left to their exit cleanup: {late}")
+        self._camera_streams_summary([cs for cs, t in zip(streams, threads)
+                                      if not t.is_alive()])
+
+    @staticmethod
+    def _camera_streams_summary(streams):
+        """One line for every stream that finished and reported (each stream's
+        own all-captured line is VERBOSE; a stream with missing frames has
+        already printed its !! line, and this line points at it). Placeholder
+        and never-connected streams report no tally and are not counted: the
+        claim's [diag cams] line names a camera that did not connect."""
+        tallies = [t for t in (getattr(cs, "tally", None) for cs in streams) if t]
+        if not tallies:
+            return
+        ok = sum(t["ok"] for t in tallies)
+        req = sum(t["requested"] for t in tallies)
+        disc = sum(t["discarded"] for t in tallies)
+        bad = sum(1 for t in tallies if not t["complete"])
+        line = (f"[cams] {ok}/{req} frames captured in {len(tallies)} stream(s)"
+                + (f" ({disc} sibling-edge frames discarded)" if disc else ""))
+        if bad:
+            print(line + f" -- !! {bad} stream(s) with missing frames: see their !! lines")
+        else:
+            console.info(line)
 
     def _serialize_init_payload(self) -> dict:
         """Build the INIT_RUN payload from current experiment state."""
