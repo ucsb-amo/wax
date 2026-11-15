@@ -518,3 +518,15 @@ def test_no_frame_path_warning_in_a_clean_run(backend, caplog):
     fake.trigger(3)
     assert [f.hw_idx for f in be.retrieve(0.5)] == [0, 1, 2]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_conforms_to_the_beacon_backend_contract(monkeypatch, tmp_path):
+    """The one check every beacon CameraBackend passes (beacon.camera.conformance)."""
+    conformance = pytest.importorskip("beacon.camera.conformance")
+    monkeypatch.setenv(dl.ENV_LOCK_DIR, str(tmp_path / "locks"))
+    fake = fake_sdk2.FakeSDK2Lib()
+    fake_sdk2.install(monkeypatch, fake)
+    be = EMCCDBackend(refuse_combos=(DU897_VS,))
+    rep = conformance.check_backend(be, live=LIVE, run=RUN, trigger=fake.trigger)
+    assert "run_diagnostics" in rep["optional"]
+    assert rep["frame_shape"] == (512, 512) and rep["frame_dtype"] == "uint16"
