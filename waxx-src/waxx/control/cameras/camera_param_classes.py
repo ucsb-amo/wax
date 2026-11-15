@@ -301,17 +301,29 @@ class PCOParams(CameraParams):
 
     ``readout_rate`` is "slow" or "fast" (the camera's lowest / highest pixel
     clock).  Frames are 16-bit ("Mono16", uint16); the camera has no gain
-    stage (``gain`` 0).  ``trigger_source`` is its one trigger input.
+    stage (``gain`` 0).  ``trigger_source`` is its one trigger input, and
+    ``trigger_edge`` ("rising" | "falling") the edge on it that starts an
+    exposure.
+
+    ``exposure_time``: the camera exposes in whole sensor lines (pco.edge 5.5
+    at its slow clock: 27.5 us steps, at least one), and what it gave is in
+    every frame's record.  A camera in GLOBAL RESET shutter mode (the lab's
+    is, 2026-11-15) starts every row together but reads them out one after
+    another, and a row collects light until it is read: with steady light the
+    image hardly follows ``exposure_time`` (rows read later are brighter, by up
+    to the ~30 ms readout).  It needs a light pulse inside the exposure.
     """
     PIXEL_FORMAT = "Mono16"
     TRIGGER_SOURCE = "ExposureTrigger"
     READOUT_RATES = ("slow", "fast")
+    TRIGGER_EDGES = ("rising", "falling")
 
     # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
     def __init__(self, serial_number='',
                  exposure_time=1.e-3,
                  sensor_roi=(0, 2560, 0, 2160, 4, 4),
                  readout_rate="slow",
+                 trigger_edge="rising",
                  magnification=1.,
                  pixel_size_m=6.5e-6,
                  exposure_delay=0.,
@@ -331,6 +343,10 @@ class PCOParams(CameraParams):
             raise RunFieldRefused("readout_rate", readout_rate,
                                   f"must be one of {self.READOUT_RATES}", owner="PCOParams")
         self.readout_rate = str(readout_rate)
+        if str(trigger_edge) not in self.TRIGGER_EDGES:
+            raise RunFieldRefused("trigger_edge", trigger_edge,
+                                  f"must be one of {self.TRIGGER_EDGES}", owner="PCOParams")
+        self.trigger_edge = str(trigger_edge)
         try:
             self.sensor_roi = _as_roi(sensor_roi)
         except RunFieldRefused as e:
@@ -355,7 +371,8 @@ class PCOParams(CameraParams):
 
     def stream_settings(self):
         """The camera settings a stream sets beside exposure and gain."""
-        return {"sensor_roi": tuple(self.sensor_roi), "readout_rate": self.readout_rate}
+        return {"sensor_roi": tuple(self.sensor_roi), "readout_rate": self.readout_rate,
+                "trigger_edge": self.trigger_edge}
 
     def image_dtype(self):
         from beacon.camera.schema import camera_pixel_format_dtype

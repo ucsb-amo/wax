@@ -35,7 +35,10 @@ def test_pco_params_fields():
     assert p.sensor_roi == ROI_4x4 and p.resolution == (540, 640)     # (rows, cols)
     assert p.exposure_time == 2e-3 and p.gain == 0.0 and p.readout_rate == "slow"
     assert p.trigger_ttl == "pco_trigger" and p.trigger_ttl_ch == -1
-    assert p.stream_settings() == {"sensor_roi": ROI_4x4, "readout_rate": "slow"}
+    assert p.stream_settings() == {"sensor_roi": ROI_4x4, "readout_rate": "slow",
+                                   "trigger_edge": "rising"}
+    with pytest.raises(RunFieldRefused, match="PCOParams.trigger_edge"):
+        PCOParams(trigger_edge="both")
     assert PCOParams(sensor_roi=[640, 1920, 540, 1620, 2, 2]).resolution == (540, 640)
 
 
