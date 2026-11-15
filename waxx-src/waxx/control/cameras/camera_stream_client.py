@@ -34,6 +34,12 @@ at the end. Settings come from the camera's saved beacon-server defaults,
 with ``exposure_time`` / ``gain`` overrides; frames are cropped to the saved
 viewer ROI or a given ``roi`` (triggered: per frame, ``frame_rois``). The
 camera is back in free-run after every run.
+
+A camera that is not a Basler (a PCO sCMOS on the beacon PCO server: 16-bit
+"Mono16" frames, its readout set with ``settings={"sensor_roi": ...,
+"readout_rate": ...}``) has no saved-defaults store to read: give it
+``read_saved_defaults=False`` and its exposure (kexp's camera_stream does,
+from the camera's entry).
 """
 
 import atexit
@@ -145,11 +151,26 @@ def _differs(a, b, tol=1e-3):
         return True
     if isinstance(b, str):
         return str(a) != b
+    if isinstance(b, (list, tuple)):            # e.g. a sensor_roi
+        try:
+            return [int(v) for v in a] != [int(v) for v in b]
+        except (TypeError, ValueError):
+            return True
     try:
         a, b = float(a), float(b)
     except (TypeError, ValueError):
         return True
     return abs(a - b) > tol * max(abs(a), abs(b), 1e-12)
+
+
+def _stream_pixel_dtype(pixel_format):
+    """The numpy dtype name of a stream's frames in ``pixel_format``, for a
+    camera of any category (ValueError naming the supported formats)."""
+    from beacon.camera import schema
+    fn = getattr(schema, "camera_pixel_format_dtype", None)
+    if fn is None:              # a beacon before the PCO category: Basler formats only
+        fn = schema.pixel_format_dtype
+    return fn(pixel_format)
 
 
 def _values(readback):
@@ -305,7 +326,12 @@ class CameraStreamClient:
     three given the server's store is not read at all. ``pixel_format``
     ("Mono8": uint8 frames; "Mono12" / "Mono12p": uint16, 0..4095) is always
     set, never taken as the camera stands: it decides the stored dtype and
-    the scale of the counts. ``t_snap_lead`` fires
+    the scale of the counts ("Mono16": a PCO's uint16). ``settings`` are
+    further camera settings this run sets with them and puts back with them
+    (a PCO's ``sensor_roi`` / ``readout_rate``; a refused one fails the
+    setup). ``read_saved_defaults=False``: the camera has no saved-defaults
+    store (anything but a Basler); what is not given stays as the camera
+    stands, and nothing is cropped unless ``roi`` is given. ``t_snap_lead`` fires
     the snap early so the exposure, not the published frame, lands near the
     target (a snap takes ~0.15-0.4 s). A camera with no ROI stores its
     frames block-averaged ``no_roi_downsample`` x ``no_roi_downsample``
@@ -314,7 +340,7 @@ class CameraStreamClient:
 
     def __init__(self, expt, camera, key, *,
                  exposure_time=None, gain=None, roi=None, crop_to_saved_roi=True,
-                 pixel_format="Mono8",
+                 pixel_format="Mono8", settings=None, read_saved_defaults=True,
                  no_roi_downsample=1, frame_timeout_s=5.0, t_snap_lead=0.0,
                  t_late_tolerance=T_LATE_TOLERANCE_S, label=None,
                  live_od_client=None, directory=None, defer_register=False,
@@ -334,12 +360,20 @@ class CameraStreamClient:
         code still runs, its edges / snaps are counted and nothing is stored
         (``on_error`` is the caller's policy for that, kept here)."""
         from beacon.camera.directory import query_string
-        from beacon.camera.schema import pixel_format_dtype
 
         # before anything touches the camera: a format with no declared dtype
         # is refused here (ValueError naming the supported ones)
         self._pixel_format = str(pixel_format)
-        self._pixel_dtype = np.dtype(pixel_format_dtype(self._pixel_format))
+        self._pixel_dtype = np.dtype(_stream_pixel_dtype(self._pixel_format))
+        self._extra_settings = {str(k): (tuple(v) if isinstance(v, (list, tuple)) else v)
+                                for k, v in dict(settings or {}).items()}
+        clash = sorted(set(self._extra_settings)
+                       & {"exposure_time", "gain", "pixel_format", "trigger_mode",
+                          "trigger_source", "trigger_selector", "line_mode"})
+        if clash:
+            raise ValueError(f"camera stream '{key}': settings {clash} have their own "
+                             f"arguments (or are the stream's own)")
+        self._read_saved_defaults = bool(read_saved_defaults)
         self._pixel_readback = {}
         self._expt = expt
         self.core = expt.core
@@ -425,7 +459,8 @@ class CameraStreamClient:
                 fully_given = (self._exposure_override is not None
                                and self._gain_override is not None
                                and (self._roi_override or not self._crop_to_saved_roi))
-                self._defaults = {} if fully_given else self._read_server_defaults()
+                self._defaults = ({} if fully_given or not self._read_saved_defaults
+                                  else self._read_server_defaults())
             frame0 = self._setup_settings_and_probe()
         except BaseException:
             try:
@@ -742,7 +777,7 @@ class CameraStreamClient:
         self._stream.snap(timeout=self._frame_timeout_s)      # settles the profile
 
         current, rev = self._stream.get_settings()
-        wanted = {"pixel_format": self._pixel_format}
+        wanted = {"pixel_format": self._pixel_format, **self._extra_settings}
         exposure = (self._exposure_override if self._exposure_override is not None
                     else self._defaults.get("exposure_time"))
         gain = (self._gain_override if self._gain_override is not None
@@ -1161,6 +1196,9 @@ class CameraStreamClient:
             # camera's full-scale count as read back with the probe frame
             "pixel_format": self._pixel_format,
             "pixel_readback": dict(self._pixel_readback),
+            # further camera settings this run asked for (a PCO's readout)
+            "settings_asked": {k: (list(v) if isinstance(v, tuple) else v)
+                               for k, v in self._extra_settings.items()},
             "roi": self._roi,
             "downsample": self._downsample,
             "sensor_frame_shape": list(getattr(self, "_sensor_shape", ())),

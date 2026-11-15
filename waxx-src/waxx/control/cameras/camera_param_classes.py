@@ -8,8 +8,8 @@ class RunFieldRefused(ValueError):
     """A run-owned Andor field (trigger, frame transfer, sensor_roi) holds a
     value that is not accepted.  ``field``, ``value`` and ``reason`` say which,
     what and why; str() reads as one sentence naming all three."""
-    def __init__(self, field, value, reason):
-        super().__init__(f"AndorParams.{field} = {value!r} is refused: {reason}")
+    def __init__(self, field, value, reason, owner="AndorParams"):
+        super().__init__(f"{owner}.{field} = {value!r} is refused: {reason}")
         self.field = field
         self.value = value
         self.reason = reason
@@ -280,6 +280,95 @@ class BaslerParams(CameraParams):
             from waxx.util import console
             console.info(f"[camera] {name}: exposure delay {value * 1e6:.2f} us, {why} "
                          f"(configured {self.exposure_delay_configured * 1e6:.2f} us)")
+
+class PCOParams(CameraParams):
+    """A PCO sCMOS (pco.edge) served by the beacon PCO camera server
+    (``beacon.pco``, category "pco_sc2").
+
+    An auxiliary camera only: frames are taken with a camera stream
+    (kexp.control.cameras.camera_stream, free-run or triggered) or as a
+    diagnostic image.  It cannot be a run's acquisition camera -- liveOD has
+    no backend for it -- and ``prepare_for_run`` refuses that before the run
+    has an id.
+
+    ``sensor_roi`` is (hstart, hend, vstart, vend, hbin, vbin): unbinned
+    sensor pixels, 0-based, end-exclusive; the binning is done by the camera
+    (it sums the binned pixels' counts), and frames are
+    ((vend - vstart) / vbin, (hend - hstart) / hbin).  A stream's own ``roi``
+    is a crop of those frames, in frame (binned) pixels.  Over Camera Link the
+    server refuses frames wider than 640 pixels (beacon
+    ``CAMERA_LINK_MAX_OUTPUT_WIDTH``; wider ones arrive corrupted).
+
+    ``readout_rate`` is "slow" or "fast" (the camera's lowest / highest pixel
+    clock).  Frames are 16-bit ("Mono16", uint16); the camera has no gain
+    stage (``gain`` 0).  ``trigger_source`` is its one trigger input.
+    """
+    PIXEL_FORMAT = "Mono16"
+    TRIGGER_SOURCE = "ExposureTrigger"
+    READOUT_RATES = ("slow", "fast")
+
+    # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
+    def __init__(self, serial_number='',
+                 exposure_time=1.e-3,
+                 sensor_roi=(0, 2560, 0, 2160, 4, 4),
+                 readout_rate="slow",
+                 magnification=1.,
+                 pixel_size_m=6.5e-6,
+                 exposure_delay=0.,
+                 exposure_delay_from_camera=False,
+                 trigger_ttl="",
+                 key=""):
+        super().__init__()
+        self.key = key
+        self.camera_type = "pco"
+        self.serial_no = serial_number
+        self.pixel_format = self.PIXEL_FORMAT
+        self.trigger_source = self.TRIGGER_SOURCE
+        # The TTL line wired to the camera's exposure-trigger input: a
+        # ttl_frame attribute name or the TTL object (see _set_trigger_ttl).
+        _set_trigger_ttl(self, trigger_ttl)
+        if str(readout_rate) not in self.READOUT_RATES:
+            raise RunFieldRefused("readout_rate", readout_rate,
+                                  f"must be one of {self.READOUT_RATES}", owner="PCOParams")
+        self.readout_rate = str(readout_rate)
+        try:
+            self.sensor_roi = _as_roi(sensor_roi)
+        except RunFieldRefused as e:
+            raise RunFieldRefused("sensor_roi", sensor_roi, e.reason,
+                                  owner="PCOParams") from None
+        if min(self.sensor_roi[4:]) < 1 or self.sensor_roi[1] <= self.sensor_roi[0] \
+                or self.sensor_roi[3] <= self.sensor_roi[2]:
+            raise RunFieldRefused("sensor_roi", sensor_roi, "empty, or a binning below 1",
+                                  owner="PCOParams")
+        self.resolution = roi_resolution(self.sensor_roi)
+        self.exposure_time = float(exposure_time)
+        self.gain = 0.
+        self.pixel_size_m = pixel_size_m
+        self.magnification = magnification
+        # The lead a triggered stream gives the trigger edge.  The camera's
+        # own figure is used when exposure_delay_from_camera is set and its
+        # server reports one (``exposure_start_delay_s``).
+        self.exposure_delay_configured = float(exposure_delay)
+        self.exposure_delay_from_camera = bool(exposure_delay_from_camera)
+        self.exposure_delay = float(exposure_delay)
+        self.exposure_delay_source = "configured"
+
+    def stream_settings(self):
+        """The camera settings a stream sets beside exposure and gain."""
+        return {"sensor_roi": tuple(self.sensor_roi), "readout_rate": self.readout_rate}
+
+    def image_dtype(self):
+        from beacon.camera.schema import camera_pixel_format_dtype
+        return np.dtype(camera_pixel_format_dtype(self.pixel_format))
+
+    def prepare_for_run(self):
+        raise RunFieldRefused(
+            "camera_type", self.camera_type,
+            f"'{self.key or self.serial_no}' cannot be a run's acquisition camera (liveOD has "
+            f"no PCO backend); take its frames with a camera stream "
+            f"(kexp.control.cameras.camera_stream) or as a diagnostic image",
+            owner="PCOParams")
+
 
 class AndorParams(CameraParams):
     # Class constants, not instance attributes: the INIT_RUN payload (and so

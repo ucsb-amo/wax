@@ -1606,10 +1606,11 @@ def test_default_is_mono8_whatever_the_camera_was_left_at():
     assert stream._settings["pixel_format"] == "Mono12"
 
 
+# ("Mono16" is a PCO stream's format since the PCO category; a format no camera here gives)
 def test_unsupported_pixel_format_refused_before_the_camera_is_touched():
     stream = FakeStream()
-    with pytest.raises(ValueError, match="Mono16"):
-        make_client(stream=stream, pixel_format="Mono16")
+    with pytest.raises(ValueError, match="RGB8"):
+        make_client(stream=stream, pixel_format="RGB8")
     assert stream.set_calls == []
 
 
