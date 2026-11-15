@@ -24,9 +24,9 @@ from test_camera_stream_client import F, M, FakeExpt, FakeStream, FakeTTL, wait_
 
 S = "61000123"
 ROI_4x4 = (0, 2560, 0, 2160, 4, 4)
-# PCOParams' default: the centre 640 columns, full height, unbinned (a pco.edge
-# in global shutter mode does not bin)
-STRIP = (960, 1600, 0, 2160, 1, 1)
+# PCOParams' default: the full sensor, unbinned (a pco.edge in global shutter
+# mode does not bin, and gives clean full-width frames over Camera Link)
+STRIP = (0, 2560, 0, 2160, 1, 1)       # full frame
 
 
 # ---- the camera-table entry ------------------------------------------------
@@ -35,11 +35,11 @@ def test_pco_params_fields():
     p = PCOParams(serial_number=S, exposure_time=2e-3, trigger_ttl="pco_trigger")
     assert p.camera_type == "pco" and p.serial_no == S
     assert p.pixel_format == "Mono16" and p.trigger_source == "ExposureTrigger"
-    assert p.sensor_roi == (960, 1600, 0, 2160, 1, 1)                 # no binning
-    assert p.resolution == (2160, 640)                                 # (rows, cols)
+    assert p.sensor_roi == (0, 2560, 0, 2160, 1, 1)                   # no binning
+    assert p.resolution == (2160, 2560)                                # (rows, cols)
     assert p.exposure_time == 2e-3 and p.gain == 0.0 and p.readout_rate == "slow"
     assert p.trigger_ttl == "pco_trigger" and p.trigger_ttl_ch == -1
-    assert p.stream_settings() == {"sensor_roi": (960, 1600, 0, 2160, 1, 1),
+    assert p.stream_settings() == {"sensor_roi": (0, 2560, 0, 2160, 1, 1),
                                    "readout_rate": "slow", "trigger_edge": "rising"}
     with pytest.raises(RunFieldRefused, match="PCOParams.trigger_edge"):
         PCOParams(trigger_edge="both")
@@ -143,7 +143,8 @@ def pco_served(monkeypatch):
     from beacon.camera.stream import CameraStream
     monkeypatch.setattr(CameraServerCore, "DUPLICATE_WINDOW_S", 0.0)
 
-    cam = fake_pco.FakePCOCamera(S, interface="cl")
+    # as the lab's camera: Camera Link, global shutter (no width cap)
+    cam = fake_pco.FakePCOCamera(S, interface="cl", quirks={"shutter_mode": "global"})
     cid = f"pco_sc2:{S}"
     core = CameraServerCore("camera_server:pcotest", policy="on_demand",
                             bind_host="127.0.0.1", check_duplicate=False)
@@ -192,7 +193,7 @@ def test_free_run_stream_on_a_pco_end_to_end(pco_served):
     cs = CameraStreamClient(fe, S, "img_pco", _stream=stream, _server_defaults={},
                             crop_to_saved_roi=False, t_late_tolerance=2.0, **_entry_kw(p))
     try:
-        assert cs._frame_shape == (2160, 640) and cs._frame_dtype == np.uint16
+        assert cs._frame_shape == (2160, 2560) and cs._frame_dtype == np.uint16
         got = dict(core.worker(cid).settings)
         assert tuple(got["sensor_roi"]) == STRIP and got["exposure_time"] == 2e-3
         fe.data.init()
@@ -200,7 +201,7 @@ def test_free_run_stream_on_a_pco_end_to_end(pco_served):
         wait_drained(cs)
         assert cs.counts["ok"] == 1 and cs.counts["failed"] == 0, (cs.counts, cs.events)
         img = F(fe, "img_pco")[0]
-        assert img.shape == (2160, 640) and img.dtype == np.uint16
+        assert img.shape == (2160, 2560) and img.dtype == np.uint16
         # the fake camera's frames are zeros but a frame counter: the record says a frame came
         assert not np.isnan(M(fe, "img_pco", "seq")[0])
         assert M(fe, "img_pco", "exposure")[0] == pytest.approx(2e-3)
@@ -211,10 +212,22 @@ def test_free_run_stream_on_a_pco_end_to_end(pco_served):
     assert rec["settings_applied"]["sensor_roi"] == list(STRIP)
 
 
-def test_a_frame_wider_than_the_camera_link_cap_fails_the_setup(pco_served):
+def test_a_frame_wider_than_the_camera_link_cap_fails_the_setup(pco_served, monkeypatch):
+    # the cap belongs to the camera's shutter mode (beacon pco backend): none
+    # in global shutter, 640 px in global reset
+    from beacon.camera.stream import CameraStream
     cam, core, stream, cid = pco_served
+    monkeypatch.setitem(cam.quirks, "shutter_mode", "global_reset")
+    stream.close()                                      # caps are read at the next open
+    from test_camera_stream_client import wait_drained  # noqa: F401 (same helpers module)
+    import time as _t
+    deadline = _t.monotonic() + 5
+    while core.worker(cid).is_open and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    again = CameraStream(stream.entry, label="reset", directory=_NoOtherServer())
+    again.get_settings()                                # opens it, in global reset
     with pytest.raises(RuntimeError, match="640 px cap"):
-        CameraStreamClient(FakeExpt(), S, "img_pco", _stream=stream, _server_defaults={},
+        CameraStreamClient(FakeExpt(), S, "img_pco", _stream=again, _server_defaults={},
                            crop_to_saved_roi=False, pixel_format="Mono16",
                            read_saved_defaults=False, exposure_time=1e-3, gain=0.0,
                            settings={"sensor_roi": (0, 2560, 0, 2160, 1, 1)})
@@ -251,7 +264,7 @@ def test_triggered_stream_on_a_pco_end_to_end(pco_served):
         assert cs.counts["ok"] == 2 and cs.counts["failed"] == 0, (cs.counts, cs.events)
         for k in ("img_a", "img_b"):
             img = F(fe, k)[0]
-            assert img.shape == (2160, 640) and img.dtype == np.uint16
+            assert img.shape == (2160, 2560) and img.dtype == np.uint16
         assert not np.isnan(M(fe, "img_a", "seq")[0]) and not np.isnan(M(fe, "img_b", "seq")[0])
     finally:
         cs.finish()
