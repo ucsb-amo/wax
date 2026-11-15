@@ -35,11 +35,17 @@ with ``exposure_time`` / ``gain`` overrides; frames are cropped to the saved
 viewer ROI or a given ``roi`` (triggered: per frame, ``frame_rois``). The
 camera is back in free-run after every run.
 
-A camera that is not a Basler (a PCO sCMOS on the beacon PCO server: 16-bit
-"Mono16" frames, its readout set with ``settings={"sensor_roi": ...,
-"readout_rate": ...}``) has no saved-defaults store to read: give it
-``read_saved_defaults=False`` and its exposure (kexp's camera_stream does,
-from the camera's entry).
+Any kind of camera a beacon camera server serves streams the same way: the
+client asks the server what the camera is (DESCRIBE) and from then on speaks
+in the camera's own terms -- it sets the "free_run" / "triggered" mode the
+camera's category declares, and only settings the camera has (a camera
+without a gain stage is not sent a gain; one whose frames have one fixed
+format is not sent a pixel format).  Saved defaults come from the camera's
+own server (GET_DEFAULTS); a Basler on a server older than that is read from
+the beacon Basler server's store, as before.  Against a stand-in or a server
+too old to describe its modes, the client uses the Basler words it always
+used.  Settings beyond exposure and gain go in ``settings=`` (a PCO's
+``sensor_roi`` / ``readout_rate``).
 """
 
 import atexit
@@ -75,6 +81,11 @@ FRAME_SETTINGS_LEAD_S = 0.04
 FRAME_SETTING_KEYS = ("exposure_time", "gain")
 # settings a stream changes for itself and always puts back
 TRIGGER_KEYS = ("trigger_mode", "trigger_source")
+# what the modes are in a Basler's words: used when the camera's server does
+# not describe its modes (older than them, or a test's stand-in)
+LEGACY_MODES = {"free_run": {"trigger_mode": "Off"},
+                "triggered": {"trigger_mode": "On", "trigger_selector": "FrameStart",
+                              "line_mode": "Input"}}
 # finish() waits this long for the worker thread before closing the stream
 WORKER_JOIN_S = 6.0
 # finish() waits this long for the shot queue to deliver what is in it
@@ -414,6 +425,13 @@ class CameraStreamClient:
         self._downsample = 1
         self._sensor_shape = ()
         self._tagging = True        # off once the server turns out to keep no tags
+        # what the camera is, from its server's DESCRIBE (_learn_camera):
+        # the settings it has (None = not known: every setting is sent, as to
+        # a Basler) and its modes in its own words
+        self._cam_keys = None
+        self._modes = dict(LEGACY_MODES)
+        self._modes_from_camera = False
+        self._category = ""
 
         # connect-later state (see __init__'s docstring)
         self._directory = directory
@@ -732,8 +750,37 @@ class CameraStreamClient:
         return None, None
 
     def _read_server_defaults(self):
-        """The camera's saved defaults (SI) from the beacon Basler server on
-        its host -- the store the viewer's "save defaults" writes."""
+        """The camera's saved defaults (SI): exposure, gain, ... and the
+        viewer's ``roi`` -- what the Camera Viewer's Save wrote.  From the
+        camera's own server where it keeps them (any kind of camera); a
+        Basler on a server that does not, from the beacon Basler server on
+        its host; any other camera there has none ({} and a note)."""
+        get = getattr(self._stream, "get_defaults", None)
+        if get is not None:
+            from beacon.camera.stream import Unsupported
+            try:
+                rec = get()
+                out = dict(rec.get("settings") or {})
+                for k in ("roi", "norm_reference"):
+                    if (rec.get("viewer") or {}).get(k) is not None:
+                        out[k] = rec["viewer"][k]
+                return out
+            except Unsupported:
+                pass
+        entry = getattr(self._stream, "entry", None)
+        category = str(getattr(entry, "category", "") or "")
+        if category and category != "basler_usb":
+            self._note("no_saved_defaults", category=category,
+                       server_id=str(getattr(entry, "server_id", "")))
+            console.info(f"[{self.label}] {self.serial}: its server keeps no saved defaults; "
+                         f"what this run does not set stays as the camera stands",
+                         console.VERBOSE)
+            return {}
+        return self._read_basler_server_defaults()
+
+    def _read_basler_server_defaults(self):
+        """The saved defaults (SI) from the beacon Basler server on the
+        camera's host, over that server's older protocol."""
         from beacon.basler.camera_client import BaslerCameraClient, get_server_connection
         from beacon.camera.directory import LEGACY_PREFIX
         from beacon.camera.viewer.sources import defaults_to_si
@@ -766,26 +813,70 @@ class CameraStreamClient:
                                f"{server} failed: {(r or {}).get('error', 'no reply')}")
         return defaults_to_si(r.get("defaults"))
 
+    def _learn_camera(self):
+        """Ask the server what the camera is (class state: _cam_keys, _modes).
+        Never raises: a stream that cannot describe (a stand-in, an old
+        server) is driven in a Basler's words, as it always was."""
+        describe = getattr(self._stream, "describe", None)
+        if describe is None:
+            return
+        try:
+            d = describe() or {}
+            schema = d.get("schema") or {}
+            keys = {str(s.get("key")) for s in schema.get("settings") or ()}
+            modes = {str(name): dict(values)
+                     for name, values in dict(schema.get("modes") or {}).items()}
+        except Exception as e:
+            self._note("describe_failed", error=repr(e))
+            return
+        self._category = str(d.get("category") or schema.get("name") or "")
+        if not keys:
+            return
+        self._cam_keys = keys
+        if modes:
+            self._modes = modes
+            self._modes_from_camera = True
+
+    def _has(self, key):
+        """Does the camera have setting ``key`` (yes when not known)."""
+        return self._cam_keys is None or key in self._cam_keys
+
+    def _free_run_values(self):
+        return dict(self._modes.get("free_run") or LEGACY_MODES["free_run"])
+
     def _setup_settings_and_probe(self):
         """Put the camera in free-run, apply this run's exposure / gain, take
         a probe frame (the stored shape and dtype). Returns the probe frame."""
+        self._learn_camera()
         current, _ = self._stream.get_settings()
-        if str(current.get("trigger_mode", "Off")) != "Off":
+        free = {k: v for k, v in self._free_run_values().items()
+                if _differs(current.get(k, v), v)}
+        if free:
             # a stream that died without restoring left it waiting for edges
-            self._priors["trigger_mode"] = current["trigger_mode"]
-            self._stream.set(trigger_mode="Off")
+            for k in free:
+                if k in current:
+                    self._priors[k] = current[k]
+            self._stream.set(**free)
         self._stream.snap(timeout=self._frame_timeout_s)      # settles the profile
 
         current, rev = self._stream.get_settings()
-        wanted = {"pixel_format": self._pixel_format, **self._extra_settings}
+        wanted = dict(self._extra_settings)
+        if self._has("pixel_format"):
+            wanted["pixel_format"] = self._pixel_format
+        # (a camera whose frames have one format has no such setting: the
+        # probe frame's dtype is still checked against this run's format)
         exposure = (self._exposure_override if self._exposure_override is not None
                     else self._defaults.get("exposure_time"))
         gain = (self._gain_override if self._gain_override is not None
                 else self._defaults.get("gain"))
         if exposure is not None:
             wanted["exposure_time"] = float(exposure)
-        if gain is not None:
+        if gain is not None and self._has("gain"):
             wanted["gain"] = float(gain)
+        elif gain is not None and float(gain) != 0.0:
+            raise RuntimeError(f"[{self.label}] {self.serial} has no gain setting "
+                               f"({self._category or 'its category'}); this run asks for "
+                               f"gain {float(gain):g}")
         changed = {k: v for k, v in wanted.items() if _differs(current.get(k), v)}
         if changed:
             for k in changed:
@@ -1196,6 +1287,10 @@ class CameraStreamClient:
             # camera's full-scale count as read back with the probe frame
             "pixel_format": self._pixel_format,
             "pixel_readback": dict(self._pixel_readback),
+            # how the camera was driven: its category, and whether the mode
+            # values came from it (False: the Basler words, LEGACY_MODES)
+            "camera_category": self._category,
+            "modes_from_camera": self._modes_from_camera,
             # further camera settings this run asked for (a PCO's readout)
             "settings_asked": {k: (list(v) if isinstance(v, tuple) else v)
                                for k, v in self._extra_settings.items()},
@@ -1272,9 +1367,8 @@ class CameraStreamClient:
             except Exception:
                 pass
             current, rev = self._stream.get_settings()
-            restore = {}
-            if str(current.get("trigger_mode", "Off")) != "Off":
-                restore["trigger_mode"] = "Off"
+            restore = {k: v for k, v in self._free_run_values().items()
+                       if k == "trigger_mode" and _differs(current.get(k, v), v)}
             if "trigger_source" in self._priors:
                 restore["trigger_source"] = self._priors["trigger_source"]
             theirs = {k: v for k, v in self._priors.items() if k not in TRIGGER_KEYS}
@@ -1625,7 +1719,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         # what frames without their own get (also the base an override changes)
         current, _ = self._stream.get_settings()
         self._base_settings = {k: current[k] for k in FRAME_SETTING_KEYS
-                               if current.get(k) is not None}
+                               if current.get(k) is not None and self._has(k)}
         self._cur_settings = dict(self._base_settings)
         return frame0
 
@@ -1859,17 +1953,30 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self.exposure_delay_source = source
         self.exposure_delay_cell.value = float(value)
 
+    def _triggered_mode_value(self):
+        """``trigger_mode`` of a frame taken on an edge, in the camera's words."""
+        return str((self._modes.get("triggered") or LEGACY_MODES["triggered"])
+                   .get("trigger_mode", "On"))
+
     def _enter_triggered(self):
         """Live stream on, then trigger mode on our line (in that order:
         liveOD's host puts its free-run profile back on a START_LIVE), and
         confirm both from the server."""
+        triggered = self._modes.get("triggered")
+        if not triggered:
+            raise RuntimeError(f"[{self.label}] {self.serial} ({self._category or 'camera'}) "
+                               f"has no triggered mode for a stream: its category declares "
+                               f"only {sorted(self._modes)}")
         self._stream.start_live()
         self._live_started = True
         current, _ = self._stream.get_settings()
-        wanted = {"trigger_selector": "FrameStart", "trigger_source": self._trigger_source,
-                  "line_mode": "Input", "trigger_mode": "On"}
+        wanted = dict(triggered)
+        if self._has("trigger_source"):
+            # which input line the edge arrives on: the camera's wiring
+            wanted["trigger_source"] = self._trigger_source
+        self._triggered_values = dict(wanted)
         for k in TRIGGER_KEYS:
-            if k in current and _differs(current[k], wanted[k]):
+            if k in current and k in wanted and _differs(current[k], wanted[k]):
                 self._priors.setdefault(k, current[k])
         rb = self._stream.set(**wanted)
         if rb.get("errors"):
@@ -1879,8 +1986,9 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         self._applied = {**self._applied, **rb.get("readback", {})}
 
         settings, rev = self._stream.get_settings()
-        got = (str(settings.get("trigger_mode")), str(settings.get("trigger_source")))
-        if got != ("On", self._trigger_source) or rev != self._rev:
+        check = [k for k in TRIGGER_KEYS if k in wanted]
+        got = tuple(str(settings.get(k)) for k in check)
+        if got != tuple(str(wanted[k]) for k in check) or rev != self._rev:
             raise RuntimeError(f"[{self.label}] {self.serial} is not waiting for a "
                                f"trigger on {self._trigger_source}: server says "
                                f"{got}, settings_rev {rev} (ours {self._rev})")
@@ -2079,7 +2187,7 @@ class TriggeredCameraStreamClient(CameraStreamClient):
         settings = getattr(frame, "settings", None) or {}
         rev = getattr(frame, "settings_rev", None)
         gap = self._gap(frame)              # every received frame moves the baseline
-        if (str(settings.get("trigger_mode", "")) != "On"
+        if (str(settings.get("trigger_mode", "")) != self._triggered_mode_value()
                 or (self._rev is not None and rev is not None and rev < self._rev)):
             self._note("stale_frames", seq=int(frame.seq))       # from before trigger mode
             return

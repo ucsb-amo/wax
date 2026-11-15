@@ -340,19 +340,6 @@ class HostServerCore(CameraServerCore):
         self._run_before(req, self.before_live, "__live__", "before_live")
         return super()._h_start_live(req)
 
-    def _h_relinquish(self, req):
-        ids = req.header.get("camera_ids")
-        ids = [ids] if isinstance(ids, str) else (ids if isinstance(ids, list) else [])
-        for q in ids:
-            cam = self._lookup(q)
-            if cam is None:
-                continue
-            ok, reason = self.check_write(req.client_addr, cam.camera_id, ["relinquish"])
-            if not ok:
-                req.camera_id = cam.camera_id
-                return self._refused(cam.camera_id, ["relinquish"], reason)
-        return super()._h_relinquish(req)
-
 
 # ---------------------------------------------------------------------------
 # Backends

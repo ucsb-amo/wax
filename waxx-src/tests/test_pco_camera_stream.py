@@ -225,8 +225,13 @@ def test_triggered_stream_on_a_pco_end_to_end(pco_served):
         t_match_window=2.0, t_stray_grace=0.2, **_entry_kw(p))
     try:
         got = dict(core.worker(cid).settings)
-        assert got["trigger_mode"] == "On" and got["trigger_source"] == "ExposureTrigger"
-        assert cam.get_trigger_mode() == "ext"
+        # the camera's own "triggered" mode, and nothing it does not have: no
+        # trigger line to choose, no gain, no pixel format (the Basler words
+        # the client used to send every camera)
+        assert got["trigger_mode"] == "On" and cam.get_trigger_mode() == "ext"
+        assert cs._modes_from_camera and cs._category == "pco_sc2"
+        assert not {"trigger_source", "trigger_selector", "line_mode", "gain",
+                    "pixel_format"} & set(got)
         fe.data.init()
         for j in (0, 1):
             cs.announce_trigger_mu(0, j)
@@ -244,3 +249,48 @@ def test_triggered_stream_on_a_pco_end_to_end(pco_served):
     finally:
         cs.finish()
     assert dict(core.worker(cid).settings)["trigger_mode"] == "Off"     # back in free run
+    rec = json.loads(fe._extra_file_texts["camera_stream_img_a"])
+    assert rec["camera_category"] == "pco_sc2" and rec["modes_from_camera"] is True
+
+
+def test_a_gain_is_refused_for_a_camera_without_one(pco_served):
+    cam, core, stream, cid = pco_served
+    with pytest.raises(RuntimeError, match="has no gain setting"):
+        CameraStreamClient(FakeExpt(), S, "img_pco", _stream=stream, _server_defaults={},
+                           crop_to_saved_roi=False, pixel_format="Mono16",
+                           exposure_time=1e-3, gain=6.0)
+
+
+def test_a_camera_whose_category_has_no_triggered_mode_cannot_be_a_triggered_stream():
+    from test_camera_stream_client import TrigFakeStream
+
+    class FreeRunOnly(TrigFakeStream):
+        def describe(self):
+            return {"category": "andor_emccd",
+                    "schema": {"name": "andor_emccd",
+                               "settings": [{"key": "exposure_time"}, {"key": "gain"},
+                                            {"key": "trigger_mode"}],
+                               "modes": {"free_run": {"trigger_mode": "Off"}}}}
+    stream = FreeRunOnly()
+    with pytest.raises(RuntimeError, match="has no triggered mode"):
+        TriggeredCameraStreamClient(FakeExpt(), S, "img_test", ttl=FakeTTL(), _stream=stream,
+                                    _server_defaults={"exposure_time": 19e-6, "gain": 0.0})
+    assert stream.closed and not stream.live                 # put back, nothing left on
+
+
+def test_saved_defaults_come_from_the_cameras_own_server(pco_served, monkeypatch):
+    cam, core, stream, cid = pco_served
+    from beacon.camera.defaults import JsonDefaultsStore            # noqa: F401 (the store's home)
+    from beacon.camera.stream import Unsupported
+    # this test server keeps none: a camera that is not a Basler then has none, noted
+    with pytest.raises(Unsupported):
+        stream.get_defaults()
+    client = CameraStreamClient.__new__(CameraStreamClient)
+    client._stream, client.label, client.serial = stream, "t", S
+    client._lock, client.counts, client.events = __import__("threading").RLock(), {}, []
+    assert client._read_server_defaults() == {}
+    assert client.counts.get("no_saved_defaults") == 1
+    # a server that keeps them: its record, with the viewer's ROI as ``roi``
+    monkeypatch.setattr(stream, "get_defaults", lambda: {
+        "settings": {"exposure_time": 4e-3}, "viewer": {"roi": [1, 2, 30, 40]}, "keys": []})
+    assert client._read_server_defaults() == {"exposure_time": 4e-3, "roi": [1, 2, 30, 40]}
