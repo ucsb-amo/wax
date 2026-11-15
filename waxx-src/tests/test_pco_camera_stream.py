@@ -24,6 +24,9 @@ from test_camera_stream_client import F, M, FakeExpt, FakeStream, FakeTTL, wait_
 
 S = "61000123"
 ROI_4x4 = (0, 2560, 0, 2160, 4, 4)
+# PCOParams' default: the centre 640 columns, full height, unbinned (a pco.edge
+# in global shutter mode does not bin)
+STRIP = (960, 1600, 0, 2160, 1, 1)
 
 
 # ---- the camera-table entry ------------------------------------------------
@@ -32,11 +35,12 @@ def test_pco_params_fields():
     p = PCOParams(serial_number=S, exposure_time=2e-3, trigger_ttl="pco_trigger")
     assert p.camera_type == "pco" and p.serial_no == S
     assert p.pixel_format == "Mono16" and p.trigger_source == "ExposureTrigger"
-    assert p.sensor_roi == ROI_4x4 and p.resolution == (540, 640)     # (rows, cols)
+    assert p.sensor_roi == (960, 1600, 0, 2160, 1, 1)                 # no binning
+    assert p.resolution == (2160, 640)                                 # (rows, cols)
     assert p.exposure_time == 2e-3 and p.gain == 0.0 and p.readout_rate == "slow"
     assert p.trigger_ttl == "pco_trigger" and p.trigger_ttl_ch == -1
-    assert p.stream_settings() == {"sensor_roi": ROI_4x4, "readout_rate": "slow",
-                                   "trigger_edge": "rising"}
+    assert p.stream_settings() == {"sensor_roi": (960, 1600, 0, 2160, 1, 1),
+                                   "readout_rate": "slow", "trigger_edge": "rising"}
     with pytest.raises(RunFieldRefused, match="PCOParams.trigger_edge"):
         PCOParams(trigger_edge="both")
     assert PCOParams(sensor_roi=[640, 1920, 540, 1620, 2, 2]).resolution == (540, 640)
@@ -188,15 +192,15 @@ def test_free_run_stream_on_a_pco_end_to_end(pco_served):
     cs = CameraStreamClient(fe, S, "img_pco", _stream=stream, _server_defaults={},
                             crop_to_saved_roi=False, t_late_tolerance=2.0, **_entry_kw(p))
     try:
-        assert cs._frame_shape == (540, 640) and cs._frame_dtype == np.uint16
+        assert cs._frame_shape == (2160, 640) and cs._frame_dtype == np.uint16
         got = dict(core.worker(cid).settings)
-        assert tuple(got["sensor_roi"]) == ROI_4x4 and got["exposure_time"] == 2e-3
+        assert tuple(got["sensor_roi"]) == STRIP and got["exposure_time"] == 2e-3
         fe.data.init()
         cs.request_snap_mu(0, 0.0)
         wait_drained(cs)
         assert cs.counts["ok"] == 1 and cs.counts["failed"] == 0, (cs.counts, cs.events)
         img = F(fe, "img_pco")[0]
-        assert img.shape == (540, 640) and img.dtype == np.uint16
+        assert img.shape == (2160, 640) and img.dtype == np.uint16
         # the fake camera's frames are zeros but a frame counter: the record says a frame came
         assert not np.isnan(M(fe, "img_pco", "seq")[0])
         assert M(fe, "img_pco", "exposure")[0] == pytest.approx(2e-3)
@@ -204,7 +208,7 @@ def test_free_run_stream_on_a_pco_end_to_end(pco_served):
         cs.finish()
     rec = json.loads(fe._extra_file_texts["camera_stream_img_pco"])
     assert rec["pixel_format"] == "Mono16" and rec["frame_dtype"] == "uint16"
-    assert rec["settings_applied"]["sensor_roi"] == list(ROI_4x4)
+    assert rec["settings_applied"]["sensor_roi"] == list(STRIP)
 
 
 def test_a_frame_wider_than_the_camera_link_cap_fails_the_setup(pco_served):
@@ -247,7 +251,7 @@ def test_triggered_stream_on_a_pco_end_to_end(pco_served):
         assert cs.counts["ok"] == 2 and cs.counts["failed"] == 0, (cs.counts, cs.events)
         for k in ("img_a", "img_b"):
             img = F(fe, k)[0]
-            assert img.shape == (540, 640) and img.dtype == np.uint16
+            assert img.shape == (2160, 640) and img.dtype == np.uint16
         assert not np.isnan(M(fe, "img_a", "seq")[0]) and not np.isnan(M(fe, "img_b", "seq")[0])
     finally:
         cs.finish()

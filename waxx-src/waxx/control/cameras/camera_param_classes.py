@@ -297,7 +297,8 @@ class PCOParams(CameraParams):
     ((vend - vstart) / vbin, (hend - hstart) / hbin).  A stream's own ``roi``
     is a crop of those frames, in frame (binned) pixels.  Over Camera Link the
     server refuses frames wider than 640 pixels (beacon
-    ``CAMERA_LINK_MAX_OUTPUT_WIDTH``; wider ones arrive corrupted).
+    ``CAMERA_LINK_MAX_OUTPUT_WIDTH``; wider ones arrive corrupted).  In global
+    shutter mode the pco.edge does not bin (bin 1 only).
 
     ``readout_rate`` is "slow" or "fast" (the camera's lowest / highest pixel
     clock).  Frames are 16-bit ("Mono16", uint16); the camera has no gain
@@ -321,7 +322,7 @@ class PCOParams(CameraParams):
     # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
     def __init__(self, serial_number='',
                  exposure_time=1.e-3,
-                 sensor_roi=(0, 2560, 0, 2160, 4, 4),
+                 sensor_roi=(960, 1600, 0, 2160, 1, 1),
                  readout_rate="slow",
                  trigger_edge="rising",
                  magnification=1.,
