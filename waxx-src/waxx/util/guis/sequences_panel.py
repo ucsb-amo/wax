@@ -65,7 +65,7 @@ from PyQt6.QtWidgets import (
 
 from waxx.util.dashboard import theme
 from waxx.util.device_state import loop_scan
-from waxx.util.device_state.person_hold import describe as describe_hold
+from waxx.util.device_state.person_hold import LAPSE_CHOICES, describe as describe_hold
 from waxx.util.guis.composite_panel import (
     CARD_GAP, ERR_TEXT, OK_TEXT, WARN_TEXT, _OpSender, _card_css, _clock, _label_pill_css,
     _pill_button_css, _small,
@@ -735,8 +735,13 @@ class SequencesPanel(QWidget):
             reason = self.ask_hold_reason()
             if reason is None:
                 return False
+            expiry = self.ask_hold_lapse()
+            if expiry is None:
+                return False
             request = {"type": "run_queue", "action": "hold", "reason": reason, "owner": "person",
                        "by": self._hold_by()}
+            if expiry != {"mode": "policy"}:
+                request["expiry"] = expiry
 
         def done(reply):
             if reply.get("status") == "ok":
@@ -759,6 +764,17 @@ class SequencesPanel(QWidget):
         if not ok:
             return None
         return text.strip() or "a person has the machine"
+
+    def ask_hold_lapse(self):
+        """How the new hold ends (tests replace it): an expiry, or None
+        (cancelled)."""
+        labels = [label for label, _ in LAPSE_CHOICES]
+        text, ok = QInputDialog.getItem(self, HOLD_TEXT,
+                                        "When does the hold end if nobody releases it?",
+                                        labels, 0, False)
+        if not ok or text not in labels:
+            return None
+        return dict(LAPSE_CHOICES[labels.index(text)][1])
 
     def set_queue(self, info: dict | None) -> None:
         """The run queue's summary (``status_json`` ``run_queue``, or its

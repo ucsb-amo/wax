@@ -278,6 +278,7 @@ def test_the_window_feeds_its_panels_by_direct_calls(window, qapp):
     assert window.direct_request({"type": "run_queue", "action": "list"})["status"] == "ok"
     # a hold put on from the panel reaches the server, and its broadcast the panel
     qp.ask_text = lambda *a, **k: "aligning"
+    qp.ask_hold_lapse = lambda: {"mode": "policy"}
     qp.toggle_hold()
     assert window.udp_server.person_hold.info()["active"]
     assert window.udp_server.person_hold.info()["owner"] == "person"
@@ -341,6 +342,7 @@ def test_a_restarting_server_refusal_shows_in_the_panels(window, qapp, tmp_path)
     qp.refresh_list()
     window.udp_server._exiting = "server is restarting"
     qp.ask_text = lambda *a, **k: "mine"
+    qp.ask_hold_lapse = lambda: {"mode": "policy"}
     assert qp.toggle_hold()
     assert "server is restarting" in qp.message.text()
     assert not window.udp_server.person_hold.info()["active"]     # refused, not applied

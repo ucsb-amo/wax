@@ -382,7 +382,7 @@ class MonitorUDPServer(UdpServer):
 
     def __init__(self, config_file_path=None, journal_dir=None, reset_expt_path=None,
                  run_loops=(), connections=(), slm_reinit=None, state_generator=None,
-                 run_queue_dir=None, warm_ahead=None):
+                 run_queue_dir=None, warm_ahead=None, hold_policy=None):
         super().__init__(host="0.0.0.0", port=0, server_id=monitor_server_id())
         # The run queue's folder (its queue, journal, job logs, the person
         # hold) is on LOCAL disk: given, or run_queue.default_dir()
@@ -446,10 +446,15 @@ class MonitorUDPServer(UdpServer):
                                 journal=self.journal)
 
         # A person's hold on the machine (agents' runs wait while it is on),
-        # and the one liveOD link the server's own watch uses.
+        # and the one liveOD link the server's own watch uses.  hold_policy:
+        # the lab's ExpiryPolicy -- when a hold nobody touches lapses by
+        # itself (None: a hold lapses only at a time a person set).
         self.person_hold = PersonHold(
             os.path.join(run_queue_dir, "person_hold.json") if run_queue_dir else None,
-            journal=self.journal, on_change=self._on_person_hold_change)
+            journal=self.journal, on_change=self._on_person_hold_change, policy=hold_policy)
+        log.info("Person hold lapse rule: %s",
+                 hold_policy.text() if hold_policy is not None else
+                 "none (a hold lapses only at a time a person set)")
         self._live_od = _LiveOD()
         self._watch_stop = threading.Event()
         self._watch_thread = None
@@ -616,7 +621,41 @@ class MonitorUDPServer(UdpServer):
         with self._request_lock:
             return self._dispatch_structured(obj, mtype)
 
+    #: Requests that show a person at the machine: while a person hold is on,
+    #: each moves its lapse (PersonHold.touch) -- whether or not it is
+    #: refused.  Not counted: reads, the monitor experiment's own traffic
+    #: (poll, op_done, busy, register_ops, its "monitor write-back" batch), a
+    #: run's end / abort / withdraw, a launcher's heartbeat, a warm process's
+    #: poll, the hold requests themselves (PersonHold counts those), and any
+    #: request whose ``owner`` is "agent".  One without an owner counts as a
+    #: person's: a hold kept a little longer is the safe side.
+    _PERSON_TYPES = frozenset({"update", "update_batch", "op", "run_scene", "cancel_scene",
+                               "arm_watchdog", "extend_watchdog", "disarm_watchdog",
+                               "trust_ack", "clear_run_pending", "reset_state",
+                               "regenerate_state", "live_od_launch", "slm_reinit",
+                               "run_pending", "run_loop", "run_queue", "server"})
+
+    def _note_person_activity(self, mtype, obj: dict) -> None:
+        if mtype not in self._PERSON_TYPES or str(obj.get("owner") or "") == "agent":
+            return
+        action = obj.get("action")
+        if mtype == "update_batch" and str(obj.get("origin") or "").startswith("monitor"):
+            return
+        if (mtype == "run_loop" and action == "describe") or (
+                mtype == "slm_reinit" and action == "status"):
+            return
+        if mtype == "run_queue" and (action in self._QUEUE_READS
+                                     or action in ("warm", "launcher", "hold", "release")):
+            return
+        who = str(obj.get("operator") or obj.get("by") or obj.get("client") or "")
+        what = mtype + (f" {action}" if action else "")
+        try:
+            self.person_hold.touch(f"{what} from {who}" if who else what)
+        except Exception:                             # noqa: BLE001
+            log.exception("Person hold activity note failed")
+
     def _dispatch_structured(self, obj: dict, mtype):
+        self._note_person_activity(mtype, obj)
         if self.exiting and self._starts_work(mtype, obj):
             return json.dumps({"status": "error", "msg": self.exiting})
         if mtype == "get_state":
@@ -1896,10 +1935,13 @@ class MonitorServerGUI(QWidget):
                 connections=(),
                 slm_reinit=None,
                 state_generator=None,
-                queue_settings=None):
+                queue_settings=None,
+                hold_policy=None):
         super().__init__()
 
         self.config_file_path = config_file_path
+        # the person hold's lapse rule (person_hold.ExpiryPolicy; None: none)
+        self.hold_policy = hold_policy
         # a QSettings for the queue table's columns and filter; None: not remembered
         self.queue_settings = queue_settings
         self.journal_dir = journal_dir
@@ -2059,7 +2101,8 @@ class MonitorServerGUI(QWidget):
                                            run_loops=self.run_loops,
                                            connections=self.connection_defs,
                                            slm_reinit=self.slm_reinit_config,
-                                           state_generator=self.state_generator)
+                                           state_generator=self.state_generator,
+                                           hold_policy=self.hold_policy)
         self.udp_server.moveToThread(self.server_thread)
 
         self.udp_server.reset_signal.connect(self.restart_monitor)

@@ -285,8 +285,9 @@ class FakeServer:
         self.replaced.append((config, run_id, expt))
         return {"status": "ok", "version": self.version + 1}
 
-    def announce_run(self, run_id=None, expt="", client="", token=""):
+    def announce_run(self, run_id=None, expt="", client="", token="", owner=None):
         self.announced = token
+        self.announced_owner = owner
         return {"status": "ok"}
 
     def withdraw_run(self, token, run_id=None, timeout=2.0, took_core=None):

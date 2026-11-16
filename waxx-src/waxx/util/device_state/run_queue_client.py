@@ -382,9 +382,15 @@ class RunQueueClient:
         return self._ask("resume", {"scope": scope, "owner": self._owner(owner),
                                     "by": self.by}, retry=False)
 
-    def hold(self, reason: str = "", *, owner: str | None = None) -> dict:
-        return self._ask("hold", {"reason": reason, "owner": self._owner(owner),
-                                  "by": self.by}, retry=False)
+    def hold(self, reason: str = "", *, owner: str | None = None, expiry=None) -> dict:
+        """Put the person hold on.  ``expiry``: how it lapses ("policy",
+        "never", ``{"at": epoch}``, ``{"for_s": s}``; None: not sent -- the
+        server's rule).  On a hold that is on, a person's request counts as
+        activity and, with ``expiry``, changes how it lapses."""
+        fields = {"reason": reason, "owner": self._owner(owner), "by": self.by}
+        if expiry is not None:
+            fields["expiry"] = expiry
+        return self._ask("hold", fields, retry=False)
 
     def warm_ahead(self, on: bool | None = None, *, owner: str | None = None) -> dict:
         """Switch warm start on / off (None: report) -> ``{"warm_ahead", "was"}``."""

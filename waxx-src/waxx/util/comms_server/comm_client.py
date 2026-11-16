@@ -190,15 +190,20 @@ class MonitorClient(CommClient):
                               "expt": expt, "cause": cause, "trusted": bool(trusted),
                               "caveat": caveat})
 
-    def announce_run(self, run_id=None, expt="", client="", token="", timeout: float = 8.0):
+    def announce_run(self, run_id=None, expt="", client="", token="", timeout: float = 8.0,
+                     owner=None):
         """An experiment is about to take the core: fence composite ops.
         ``token`` names this announcement for :meth:`withdraw_run`.  The
         server releases the connections it holds (the tweezer AWG) before it
-        replies, which can take a few seconds -- hence the longer timeout."""
+        replies, which can take a few seconds -- hence the longer timeout.
+        ``owner`` ("person" | "agent"; None: not sent): an agent's run does
+        not count as a person's activity for the person hold."""
         import json  # noqa: PLC0415
-        reply = self.send_message(json.dumps({"type": "run_pending", "run_id": run_id,
-                                              "expt": expt, "client": client,
-                                              "token": token}), timeout=timeout)
+        obj = {"type": "run_pending", "run_id": run_id, "expt": expt, "client": client,
+               "token": token}
+        if owner:
+            obj["owner"] = owner
+        reply = self.send_message(json.dumps(obj), timeout=timeout)
         if reply is None:
             return None
         try:
