@@ -62,6 +62,9 @@ RECONNECT_AFTER = 15
 REQUEST_TIMEOUT_S = 5.0
 #: The environment variables this PC must have to run an experiment.
 NEEDED_ENV = ("kpy", "db")
+#: Windows variable names ignore case, and a dict copy of os.environ there has
+#: them upper-cased (%kpy% is "KPY"): the check above must ignore case too.
+_ENV_NAMES_IGNORE_CASE = os.name == "nt"
 #: Characters never allowed in a path or argument (the command is a cmd line).
 _SHELL_CHARS = set('&|<>^%"!')
 
@@ -281,7 +284,9 @@ class Launcher:
             return "refused", f"the path or an argument contains {' '.join(bad)} (not allowed)"
         if cwd and not os.path.isdir(cwd):
             return "refused", f"no such working folder on {self.host}: {cwd}"
-        missing = [v for v in NEEDED_ENV if not self._env.get(v)]
+        fold = str.upper if _ENV_NAMES_IGNORE_CASE else str
+        have = {fold(k) for k, val in self._env.items() if val}
+        missing = [v for v in NEEDED_ENV if fold(v) not in have]
         if missing:
             return "refused", (f"this PC ({self.host}) has no " + ", ".join(f"%{v}%" for v in missing)
                                + ": it cannot run experiments (run its setup, then submit again)")

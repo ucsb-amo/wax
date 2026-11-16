@@ -263,6 +263,19 @@ def test_a_pc_that_cannot_run_experiments_fails_the_job_with_the_reason(tmp_path
     assert pc.calls == []
 
 
+def test_upper_case_env_names_from_windows_os_environ_count(tmp_path, files, monkeypatch):
+    # dict(os.environ) on Windows has "KPY", "DB" (job 7186, 2026-11-15, was
+    # refused on kong for "no %kpy%, %db%" with both set)
+    monkeypatch.setattr(L, "_ENV_NAMES_IGNORE_CASE", True)
+    q = make_bq(tmp_path)
+    pc = PC()
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    la = launcher_for(reply, q, pc, tmp_path, env={k.upper(): v for k, v in ENV.items()})
+    assert until(lambda: state(q, jid) == "running", q, la), q.describe({"id": jid})
+    assert len(pc.calls) == 1
+
+
 # --- silence, kill, gone ----------------------------------------------------------------
 
 def test_a_silent_launcher_holds_the_slot_until_a_person_says_it_is_gone(tmp_path, files):
