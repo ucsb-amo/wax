@@ -68,6 +68,45 @@ def test_profiles_are_overlays_on_the_od_plot(viewer, app):
     assert not viewer._sumx_curve.isVisible()
 
 
+def test_raw_frames_are_the_same_way_up_as_the_od_image(viewer, app):
+    viewer.handle_plot_data(make_shot(cx=300, cy=100))
+    app.processEvents()
+    od_vb = viewer.od_plot.getViewBox()
+    for view in (viewer.img_atoms_view, viewer.img_light_view, viewer.img_dark_view):
+        vb = view.getView()
+        assert vb.yInverted() == od_vb.yInverted()
+        assert vb.xInverted() == od_vb.xInverted()
+    # the data is not touched: the frame on screen is the frame handed in (transposed for pyqtgraph)
+    atoms = make_shot(cx=300, cy=100)[0]
+    np.testing.assert_array_equal(viewer.img_atoms_view.imageItem.image, atoms.T)
+
+
+def test_markers_are_drawn_on_the_raw_frames_unless_switched_off(viewer, app):
+    from waxx.util.live_od.gui.markers import MarkerCopy
+    assert viewer.raw_markers_checkbox.isChecked()      # on by default
+    viewer.set_markers([{"x": 100.0, "y": 50.0, "shape": "o", "size": 10.0,
+                         "color": "#ff0000", "label": "a"}])
+    raw_boxes = [v.getView() for v in (viewer.img_atoms_view, viewer.img_light_view,
+                                       viewer.img_dark_view)]
+    copies = [c for _vb, c in viewer._raw_marker_items]
+    assert len(copies) == 3 and all(isinstance(c, MarkerCopy) for c in copies)
+    assert {id(vb) for vb, _c in viewer._raw_marker_items} == {id(vb) for vb in raw_boxes}
+    # copies follow the OD marker when it moves, and take no mouse buttons
+    viewer._marker_items[0].setPos(120.0, 60.0)
+    assert all((c.pos().x(), c.pos().y()) == (120.0, 60.0) for c in copies)
+    assert all(c.acceptedMouseButtons() == Qt.MouseButton.NoButton for c in copies)
+    # still one marker as far as the viewer (and the server) is concerned
+    assert len(viewer.get_markers()) == 1
+
+    viewer.raw_markers_checkbox.setChecked(False)
+    assert viewer._raw_marker_items == []
+    assert all(not any(isinstance(i, MarkerCopy) for i in vb.addedItems) for vb in raw_boxes)
+    viewer.raw_markers_checkbox.setChecked(True)
+    assert len(viewer._raw_marker_items) == 3
+    viewer.set_markers([])
+    assert viewer._raw_marker_items == []
+
+
 def test_crop_region_is_the_roi_and_else_the_view(viewer, app):
     viewer.handle_plot_data(make_shot())
     viewer.od_plot.getViewBox().setRange(xRange=(100, 300), yRange=(150, 250), padding=0)

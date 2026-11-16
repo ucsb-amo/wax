@@ -16,7 +16,8 @@ from waxx.util.live_od.gui import theme
 from waxx.util.live_od.gui.log_panel import LogPanel
 from waxx.util.live_od.log import get_logger
 from waxx.util.live_od.marker_store import clean_markers
-from waxx.util.live_od.gui.markers import MarkerItem, MarkerDialog, MarkerPanel, random_marker_color
+from waxx.util.live_od.gui.markers import (MarkerItem, MarkerCopy, MarkerDialog, MarkerPanel,
+                                           random_marker_color)
 from waxa.units import mult_for, unit_for_param
 
 logger = get_logger("viewer")
@@ -236,6 +237,7 @@ class LiveODViewer(QWidget):
         self._frames_seen = 0
         self._settings = None           # QSettings, if the window attached one
         self._marker_items = []         # MarkerItems on the OD image
+        self._raw_marker_items = []     # (ViewBox, MarkerCopy): their copies on the raw frames
         self._marker_panel = None       # MarkerPanel, made when first opened
         self._cmap_actions = []         # the colormap entries of every image's context menu
         self._last_right_click = None   # image coords of the last right-click, for "Add marker here"
@@ -319,6 +321,13 @@ class LiveODViewer(QWidget):
             "if there is no ROI; orange: the Gaussian fits (P)")
         self.profiles_checkbox.setChecked(True)
         self.profiles_checkbox.stateChanged.connect(lambda _: self._update_marginals())
+
+        self.raw_markers_checkbox = QCheckBox("Markers on raw frames")
+        self.raw_markers_checkbox.setToolTip(
+            "Draw the OD image's markers on the atoms, light and dark frames too "
+            "(for looking only: edit them on the OD image)")
+        self.raw_markers_checkbox.setChecked(True)
+        self.raw_markers_checkbox.toggled.connect(lambda _: self._sync_raw_markers())
 
         # (`um_checkbox`: it was a checkbox in the View menu before it was a button)
         self.um_checkbox = QPushButton("µm")
@@ -421,7 +430,7 @@ class LiveODViewer(QWidget):
         self.view_button.setText("View  ")    # room for the menu arrow
         self.view_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.view_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.view_button.setToolTip("Lock views, profiles (P), shot averaging, auto ROI, clear")
+        self.view_button.setToolTip("Lock views, profiles (P), markers on raw frames, shot averaging, auto ROI, clear")
         view_menu = QMenu(self.view_button)
         self.markers_button = QPushButton('Markers')
         self.markers_button.setToolTip(
@@ -432,6 +441,7 @@ class LiveODViewer(QWidget):
             "Markers are kept per camera by the liveOD server.")
         self.markers_button.clicked.connect(self.open_marker_panel)
         for widget in (self.lock_views_checkbox, self.profiles_checkbox,
+                       self.raw_markers_checkbox,
                        None, self.avg_spinner, self.auto_roi_row,
                        None, self.clear_button):
             if widget is None:
@@ -499,6 +509,10 @@ class LiveODViewer(QWidget):
                                   ('light', self.img_light_view, 'Light only'),
                                   ('dark', self.img_dark_view, 'Dark')):
             view.ui.histogram.hide(); view.ui.roiBtn.hide(); view.ui.menuBtn.hide()
+            # ImageView puts row 0 at the top; the OD plot puts it at the bottom (y up).
+            # Display only: the frames go to setImage unchanged, so the raw frames
+            # show the same way up as the OD image and a pixel is at the same (x, y).
+            view.getView().invertY(False)
             view.setMinimumHeight(60)
             self.set_pg_colormap(view, 'viridis')
             # title and max-count readout drawn in the corner of the frame itself
@@ -1224,7 +1238,23 @@ class LiveODViewer(QWidget):
             item.sigEditRequested.connect(self._open_marker_dialog)
             self.od_plot.addItem(item, ignoreBounds=True)
             self._marker_items.append(item)
+        self._sync_raw_markers()
         self.markers_updated.emit()
+
+    def _sync_raw_markers(self):
+        """Redraw the OD image's markers on the three raw frames (or take them off,
+        if the View menu says not to)."""
+        for view_box, copy in self._raw_marker_items:
+            view_box.removeItem(copy)
+        self._raw_marker_items = []
+        if not self.raw_markers_checkbox.isChecked():
+            return
+        for view in (self.img_atoms_view, self.img_light_view, self.img_dark_view):
+            view_box = view.getView()
+            for item in self._marker_items:
+                copy = MarkerCopy(item)
+                view_box.addItem(copy, ignoreBounds=True)
+                self._raw_marker_items.append((view_box, copy))
 
     def add_marker(self, pos=None, **fields):
         """A new marker at ``pos`` (image pixels); default: under the cursor, else
@@ -1276,6 +1306,9 @@ class LiveODViewer(QWidget):
         """Light one marker up (from the markers panel); None for none."""
         for i, item in enumerate(self._marker_items):
             item.set_highlighted(i == index)
+        n = len(self._marker_items)
+        for j, (_view_box, copy) in enumerate(self._raw_marker_items):
+            copy.set_highlighted(n > 0 and j % n == index)
 
     def _emit_markers(self):
         self.markers_updated.emit()
@@ -1688,6 +1721,7 @@ class LiveODViewer(QWidget):
                 self.top_splitter.setSizes([70, max(sizes[1] - 70, 1)])
             for key, checkbox in (("viewer/lock_views", self.lock_views_checkbox),
                                   ("viewer/profiles", self.profiles_checkbox),
+                                  ("viewer/raw_markers", self.raw_markers_checkbox),
                                   ("viewer/um_axes", self.um_checkbox)):
                 value = settings.value(key)
                 if value is not None:
@@ -1710,6 +1744,7 @@ class LiveODViewer(QWidget):
         settings.setValue("viewer/raw_splitter", self._raw_images_widget.saveState())
         settings.setValue("viewer/lock_views", self.lock_views_checkbox.isChecked())
         settings.setValue("viewer/profiles", self.profiles_checkbox.isChecked())
+        settings.setValue("viewer/raw_markers", self.raw_markers_checkbox.isChecked())
         settings.setValue("viewer/um_axes", self.um_checkbox.isChecked())
         settings.setValue("viewer/auto_roi_shots", self.auto_roi_spinner.value())
         settings.setValue("viewer/log_collapsed", self.output_window.is_collapsed())

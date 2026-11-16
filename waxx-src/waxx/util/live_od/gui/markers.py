@@ -192,6 +192,35 @@ class MarkerItem(pg.GraphicsObject):
             self.sigEditRequested.emit(self, ev.screenPos())
 
 
+class MarkerCopy(MarkerItem):
+    """A marker drawn again on a raw frame: same place, shape, size and colour, but
+    for looking only -- the mouse goes through it to the image. It follows its
+    marker on the OD image while that one is dragged."""
+
+    def __init__(self, source: MarkerItem):
+        super().__init__(source.to_dict())
+        self._source = source
+        self.setAcceptHoverEvents(False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        source.xChanged.connect(self._follow)
+        source.yChanged.connect(self._follow)
+
+    def _follow(self):
+        try:
+            self.setPos(self._source.pos())
+        except RuntimeError:        # the source was deleted first
+            pass
+
+    def hoverEvent(self, ev):
+        pass
+
+    def mouseDragEvent(self, ev):
+        ev.ignore()
+
+    def mouseClickEvent(self, ev):
+        ev.ignore()
+
+
 # ----------------------------------------------------------------------
 # Editing
 # ----------------------------------------------------------------------
