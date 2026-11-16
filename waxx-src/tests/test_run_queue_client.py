@@ -147,13 +147,20 @@ def test_every_action_sends_its_request(client, server, expts, monkeypatch):
     assert reply["ids"] == [1] and reply["jobs"][0]["owner"] == "agent"
     sent, attempts = server.requests[-1]
     assert attempts == 1                                       # a change is never re-sent
+    # this PC runs the job (2026-11-15): the file is read here, never by the server
     assert sent == {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
                     "argv": ["-a", "x=1"], "label": "r1", "owner": "agent", "priority": 3,
                     "after": [], "repeat": 1, "write_back": False, "allow_drift": False,
                     "host": socket.gethostname(), "by": "jp@kong",
+                    "run_host": socket.gethostname(),
+                    "sha256": local_sha256(str(expts / "rabi.py")), "expt_class": "",
+                    "calibrates_declared": [], "cold_why": "",
+                    # still sent for an older server, which runs its own copy
                     "client_sha256": local_sha256(str(expts / "rabi.py")),
-                    "client_host": socket.gethostname(), "client_code_root": r"C:\Users\jp\code"}
-    assert len(sent["client_sha256"]) == 64
+                    "client_host": socket.gethostname()}
+    assert len(sent["sha256"]) == 64
+    # the test queue starts its jobs itself (its jobs name no run_host): no launcher
+    assert reply["launcher"]["ok"] and "itself" in reply["launcher"]["msg"]
     token = reply["jobs"][0]["token"]
     assert client.list()["next"] == [1]
     assert client.describe(1, token)["job"]["label"] == "r1"
@@ -198,10 +205,11 @@ def test_a_relative_path_is_made_absolute_here(client, server, expts, monkeypatc
     assert server.requests[-1][0]["path"] == str(expts / "rabi.py")
 
 
-def test_a_refusal_raises_with_the_servers_message(client, expts):
-    with pytest.raises(RunQueueError, match="no such file") as info:
+def test_a_refusal_raises_with_the_servers_message(client, server, expts):
+    # a file this PC does not have is refused here, before anything is sent
+    with pytest.raises(RunQueueError, match="no such file on this PC") as info:
         client.submit(str(expts / "nothing.py"))
-    assert info.value.reply["status"] == "error"
+    assert info.value.reply is None and server.requests == []
     client.submit(str(expts / "rabi.py"))
     client.cancel(1)
     with pytest.raises(RunQueueError, match="already cancelled"):

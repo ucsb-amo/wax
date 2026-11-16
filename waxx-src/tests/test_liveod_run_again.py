@@ -84,6 +84,13 @@ class FakeClient:
         self.next_id += 1
         return {"status": "ok", "ids": [self.next_id], "jobs": []}
 
+    def again(self, job, first=False):
+        """RunQueueClient.again: the request it sends, recorded as (path, fields)."""
+        from waxx.util.device_state.run_queue_client import again_request
+        obj = again_request(job, "jp@kong (liveOD)", first=first)
+        return self.submit(obj.pop("path"), **{k: v for k, v in obj.items()
+                                               if k not in ("type", "action")})
+
 
 def _button(client, *, synchronous=True, log=None, start=True):
     from waxx.util.live_od.gui.run_again_button import RunAgainButton
@@ -116,10 +123,10 @@ def test_parse_queue_job():
 
 
 def test_the_request_is_the_queue_panels_run_again_next(expt_file):
-    """What goes on the wire through RunQueueClient.submit equals the panel's
-    again_request(first=True) on every field it sets."""
+    """What goes on the wire through RunQueueClient.again(first=True) is the
+    panel's again_request(first=True): the job runs again on the PC that ran
+    it (a record with no run_host ran here)."""
     from waxx.util.guis.run_queue_panel import again_request
-    from waxx.util.live_od.gui.run_again_button import again_kwargs
 
     sent = []
 
@@ -132,16 +139,15 @@ def test_the_request_is_the_queue_panels_run_again_next(expt_file):
             return {"run_queue": {}}
     rec = _record(expt_file)
     client = RunQueueClient(Transport(), by="jp@kong (liveOD)", owner="person")
-    client.submit(rec["path"], **again_kwargs(rec))
+    client.again(rec, first=True)
     import socket
-    panel = again_request(rec, "jp@kong (liveOD)", first=True,
-                          client_sha256=_sha(expt_file), client_host=socket.gethostname())
+    panel = again_request(rec, "jp@kong (liveOD)", first=True, host=socket.gethostname())
     got = sent[0]
     assert got["action"] == "insert" and got["at_index"] == 0 and got["owner"] == "person"
-    for key, value in panel.items():
-        assert got[key] == value, key
+    assert got == panel
+    assert got["run_host"] == socket.gethostname() and got["sha256"] == _sha(expt_file)
     # nothing the panel leaves behind is carried: no dependencies, chain, due, repeats
-    assert got["after"] == [] and got["repeat"] == 1
+    assert "after" not in got and "repeat" not in got
     assert "chain" not in got and "due" not in got
 
 
@@ -169,7 +175,7 @@ def test_enabled_for_a_queued_run_naming_the_file_and_job(app, expt_file):
     assert b.isEnabled()
     tip = b.toolTip()
     assert "job 41 (hf_bec)" in tip and str(expt_file) in tip and "run 86003" in tip
-    assert "on disk NOW" in tip and "CHANGED" not in tip
+    assert "runs again on this PC" in tip and "as it is NOW" in tip and "CHANGED" not in tip
     assert "NEXT job" in tip
     b.shutdown()
     assert not b.isEnabled()

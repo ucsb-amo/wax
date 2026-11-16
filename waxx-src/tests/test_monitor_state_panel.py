@@ -296,9 +296,13 @@ def test_queue_panel_against_the_real_queue(window, qapp, tmp_path):
         (tmp_path / f"{name}.py").write_text(f'"""{name}."""\nclass {name.upper()}: pass\n')
     ids = []
     for name in ("a", "b", "c"):
+        # as kq sends a submit since 2026-11-15: the job runs on its own PC (a
+        # made-up one here, so no launcher of this machine ever takes it)
         reply = window.direct_request({"type": "run_queue", "action": "submit",
                                        "path": str(tmp_path / f"{name}.py"), "by": "jp",
-                                       "owner": "person"})
+                                       "owner": "person", "run_host": "pc-under-test",
+                                       "sha256": "0" * 64, "expt_class": name.upper(),
+                                       "calibrates_declared": [], "cold_why": ""})
         assert reply["status"] == "ok", reply
         ids += reply["ids"]
     qp = window.queue_panel
@@ -357,7 +361,9 @@ def test_a_log_window_keeps_following_while_the_server_exits(window, qapp, tmp_p
     (tmp_path / "logjob.py").write_text('"""logjob."""\n')
     reply = window.direct_request({"type": "run_queue", "action": "submit",
                                    "path": str(tmp_path / "logjob.py"), "by": "jp",
-                                   "owner": "person"})
+                                   "owner": "person", "run_host": "pc-under-test",
+                                   "sha256": "0" * 64, "expt_class": "",
+                                   "calibrates_declared": [], "cold_why": ""})
     assert reply["status"] == "ok", reply
     job = reply["jobs"][0]
     window.udp_server._exiting = "server is restarting"

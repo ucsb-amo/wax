@@ -95,18 +95,46 @@ def safe_write(out, text: str) -> None:
 
 
 def local_sha256(path) -> str | None:
-    """SHA-256 of this machine's copy of ``path``; None when it cannot be read.
-    Sent with a submit: the server runs ITS copy at that path and refuses one
-    that differs (or, from another PC, one this client could not hash)."""
-    import hashlib  # noqa: PLC0415
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for block in iter(lambda: f.read(1 << 16), b""):
-                h.update(block)
-    except OSError:
-        return None
-    return h.hexdigest()
+    """SHA-256 of this machine's copy of ``path``; None when it cannot be read
+    (this PC runs its own jobs: the hash is the one the launch-time drift
+    check compares with)."""
+    from waxx.util.device_state.job_source import sha256_or_none  # noqa: PLC0415
+    return sha256_or_none(path)
+
+
+def again_request(job: dict, by: str, *, first: bool = False, host: str | None = None,
+                  owner: str = "person") -> dict:
+    """The request that runs ``job`` (a job record) again as a new job of a
+    person's, ON THE PC THAT RAN IT (``run_host``; a record from before
+    2026-11-15 has none: this PC): its argv, working folder, label, write-back
+    veto and drift setting.  Its dependencies, chain, due time and repeats
+    are NOT carried over (they named the old job's place).  ``first``:
+    ``insert`` at ``at_index`` 0 (the next job); otherwise ``submit`` (the
+    owner rule: ahead of agents' queued jobs).  When this PC (``host``) is
+    the run host, the file is read here (its hash, class, calibrations and
+    warm check, as a submit sends them); for another PC the request carries
+    ``again_of`` and no hash -- that PC's launcher reads the file when it
+    attaches, and the job waits until then."""
+    host = host or socket.gethostname()
+    run_host = str(job.get("run_host") or "").strip() or host
+    obj = {"type": "run_queue", "action": "insert" if first else "submit",
+           "path": job.get("path"), "argv": [str(a) for a in (job.get("argv") or [])],
+           "cwd": job.get("cwd") or None, "label": job.get("label") or None,
+           "owner": owner, "by": by, "allow_drift": bool(job.get("allow_drift")),
+           "run_host": run_host, "again_of": job.get("id"), "host": host,
+           # a monitor server from before 2026-11-15 runs ITS copy: it refuses
+           # one this PC could not hash, or that differs (a newer one ignores it)
+           "client_host": host}
+    if run_host.lower() == host.lower() and job.get("path"):
+        from waxx.util.device_state.job_source import source_info  # noqa: PLC0415
+        info = source_info(str(job["path"]))
+        if info["sha256"] is not None:
+            obj.update(info, client_sha256=info["sha256"])
+    if job.get("write_back") is False:
+        obj["write_back"] = False
+    if first:
+        obj["at_index"] = 0
+    return {k: v for k, v in obj.items() if v is not None}
 
 
 def connect_monitor(discovery_timeout: float = 3.0):
@@ -181,32 +209,47 @@ class RunQueueClient:
                stop_on_failure: bool | None = None, write_back: bool | None = None,
                allow_drift: bool = False, at_end: bool = False,
                at_index: int | None = None, before_id: int | None = None,
-               after_id: int | None = None, cold: bool = False) -> dict:
-        """Queue ``path`` (absolute on the server's machine; a relative path is
-        made absolute here).  Placement: by default the server's owner rule (a
-        person's job ahead of every queued agent job); ``at_end`` opts out;
-        ``at_index`` (0-based among the queued jobs) / ``before_id`` /
-        ``after_id`` place it there (the ``insert`` action; give at most one).
-        ``priority`` (None: not sent) is only a placement hint within the
-        owner's block.  ``write_back`` may only be None or False (a veto).
-        ``agent_label`` comes from ``WAXX_AGENT_LABEL`` when set; ``host`` is
-        this machine's name.  ``client_sha256`` (this machine's hash of the
-        file, when readable) and ``client_host`` let the server refuse a path
-        whose copy on its machine -- the one that runs -- differs.  ``cwd`` is
-        made absolute here.  ``cold``: never warm-launched (queue phase 2; an
-        older server ignores it).  -> ``{"status": "ok", "ids": [...], "jobs":
-        [...]}``."""
+               after_id: int | None = None, cold: bool = False,
+               start_launcher: bool = True) -> dict:
+        """Queue ``path`` -- a file on THIS PC, which runs the job (a relative
+        path is made absolute here).  Placement: by default the server's
+        owner rule (a person's job ahead of every queued agent job);
+        ``at_end`` opts out; ``at_index`` (0-based among the queued jobs) /
+        ``before_id`` / ``after_id`` place it there (the ``insert`` action;
+        give at most one).  ``priority`` (None: not sent) is only a placement
+        hint within the owner's block.  ``write_back`` may only be None or
+        False (a veto).  ``agent_label`` comes from ``WAXX_AGENT_LABEL`` when
+        set; ``host`` and ``run_host`` are this machine's name.  The file's
+        hash, experiment class, declared calibrations and warm check are read
+        here (:func:`~waxx.util.device_state.job_source.source_info`): the
+        server never opens it.  ``cwd`` is made absolute here.  ``cold``:
+        never warm-launched.  ``start_launcher``: start ``kq launch`` for the
+        new jobs on this PC (:func:`~waxx.util.device_state.launcher.
+        start_detached`; the reply's ``launcher`` says how it went) -- without
+        a launcher the jobs wait.  -> ``{"status": "ok", "ids": [...], "jobs":
+        [...], "launcher": {...}}``.  RunQueueError before anything is sent
+        when the file is not there or not a .py file."""
         position = {"at_index": None if at_index is None else int(at_index),
                     "before_id": None if before_id is None else int(before_id),
                     "after_id": None if after_id is None else int(after_id)}
         action = "insert" if any(v is not None for v in position.values()) else "submit"
         path = os.path.abspath(str(path))
-        return self._ask(action, dict({
+        if not os.path.isfile(path):
+            raise RunQueueError(f"no such file on this PC ({socket.gethostname()}): {path}")
+        if not path.lower().endswith(".py"):
+            raise RunQueueError(f"not a Python file: {path}")
+        from waxx.util.device_state.job_source import source_info  # noqa: PLC0415
+        info = source_info(path)
+        if info["sha256"] is None:
+            raise RunQueueError(f"the file cannot be read on this PC: {path}")
+        reply = self._ask(action, dict({
             "path": path, "argv": [str(a) for a in argv],
-            # the file that runs is the server's copy: it must match this one
-            "client_sha256": local_sha256(path), "client_host": socket.gethostname(),
-            # a path under this PC's %code% runs from the server's %code%
-            "client_code_root": os.environ.get("code") or None,
+            # this PC runs the job, from this copy (its launcher checks the hash
+            # again before it starts it)
+            "run_host": socket.gethostname(), **info,
+            # for a monitor server from before 2026-11-15 (it runs ITS copy and
+            # must refuse one that differs); a newer server ignores them
+            "client_sha256": info["sha256"], "client_host": socket.gethostname(),
             "cwd": None if cwd is None else os.path.abspath(str(cwd)),
             "label": label, "owner": self._owner(owner),
             "priority": None if priority is None else int(priority),
@@ -216,6 +259,46 @@ class RunQueueClient:
             "at_end": True if at_end else None, "cold": True if cold else None,
             "agent_label": os.environ.get(AGENT_LABEL_ENV, "").strip() or None,
             "host": socket.gethostname(), "by": self.by}, **position), retry=False)
+        if start_launcher:
+            reply["launcher"] = self.start_launcher(reply)
+        return reply
+
+    def start_launcher(self, reply: dict) -> dict:
+        """Start ``kq launch`` on this PC for the jobs of a submit's
+        ``reply`` -> ``{"ok", "pid"?, "msg"?}`` (never raises: a launcher that
+        could not start leaves the jobs waiting, and ``msg`` says how to start
+        one by hand)."""
+        jobs = [j for j in (reply.get("jobs") or []) if j.get("id") and j.get("token")]
+        if not jobs:
+            return {"ok": False, "msg": "no job to launch"}
+        if any(not j.get("run_host") for j in jobs):
+            # a monitor server from before 2026-11-15: it starts its jobs itself
+            return {"ok": True, "msg": "the monitor server starts the jobs itself"}
+        pairs = [(int(j["id"]), str(j["token"])) for j in jobs]
+        try:
+            from waxx.util.device_state.launcher import start_detached  # noqa: PLC0415
+            return {"ok": True, "pid": start_detached(pairs)}
+        except Exception as exc:                      # noqa: BLE001
+            return {"ok": False, "msg": (f"could not start the jobs' launcher on this PC "
+                                         f"({exc!r}); the jobs wait until one runs: kq launch "
+                                         + " ".join(f"{i}:{t}" for i, t in pairs))}
+
+    def again(self, job: dict, *, first: bool = False) -> dict:
+        """Run ``job`` (a job record) again, on the PC that ran it: a new
+        job with its file, arguments, folder, label, write-back veto and drift
+        setting (not its dependencies, chain, due time or repeats); ``first``:
+        as the next job.  On THAT PC's launcher: started here when this is
+        the PC, else by the server (its own jobs) or that PC's Run Queue
+        panel.  -> the submit's reply (``launcher``: how this PC's start
+        went, when it is the PC)."""
+        obj = again_request(job, self.by, first=first, host=socket.gethostname())
+        obj.pop("type", None)
+        action = obj.pop("action")
+        reply = self._ask(action, obj, retry=False)
+        here = str(obj.get("run_host") or "").lower() == socket.gethostname().lower()
+        if here:
+            reply["launcher"] = self.start_launcher(reply)
+        return reply
 
     def move(self, job_id: int, *, to_index: int | None = None, before_id: int | None = None,
              after_id: int | None = None, token: str | None = None,
@@ -254,14 +337,19 @@ class RunQueueClient:
                                     "queued_only": True if queued_only else None,
                                     "by": self.by}, retry=False)
 
-    def kill(self, job_id: int, *, token: str | None = None, owner: str | None = None) -> dict:
+    def kill(self, job_id: int, *, token: str | None = None, owner: str | None = None,
+             gone: bool = False) -> dict:
         """Force-kill a launching or running job's processes: for when
-        liveOD's Abort cannot reach the run.  Only a person may (``owner``,
-        default this client's; the server refuses an agent).  No cleanup
-        runs; liveOD keeps the run's file as it was.  -> ``{"job",
-        "results", "note"}``; RunQueueError when something is still alive."""
+        liveOD's Abort cannot reach the run.  A person may (``owner``,
+        default this client's), an agent only its own stuck job.  No cleanup
+        runs; liveOD keeps the run's file as it was.  With launchers the
+        kill is an order to the job's launcher: the reply has ``pending``
+        and the result lands in the job's ``kill`` record (``describe``).
+        ``gone`` (a person, the launcher silent): nothing is killed; the job
+        ends.  -> ``{"job", "results", "note", "pending"}``."""
         return self._ask("kill", {"id": int(job_id), "token": token,
-                                  "owner": self._owner(owner), "by": self.by}, retry=False)
+                                  "owner": self._owner(owner), "by": self.by,
+                                  "gone": True if gone else None}, retry=False)
 
     def list(self, states: Iterable[str] | None = None, limit: int | None = None) -> dict:
         """-> ``{"jobs": [...] in the server's order (ended by id, the slot,

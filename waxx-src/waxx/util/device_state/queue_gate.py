@@ -73,6 +73,10 @@ ROOTS_ENV = "WAXX_RUN_QUEUE_ROOTS"
 EXIT_WARM_ABORTED = 78
 #: Seconds between GO polls.
 POLL_S = 0.2
+#: While it waits for GO, a warm process re-stats its manifest this often
+#: (the queue's server used to, from its own disk: since 2026-11-15 the files
+#: are on the job's own PC, which may not be the server's).
+MANIFEST_CHECK_S = 2.0
 #: With no answer from the queue for this long, the warm process exits as
 #: aborted (the queue re-adopts a warm process after its own restart well
 #: within this).
@@ -510,6 +514,8 @@ def ensure_go() -> None:
         hello()
     need_ready = not _state["ready_sent"]
     manifest = None
+    now_s = _monotonic
+    last_check = float("-inf")
     last_answer = _monotonic()
     said_waiting = ""
     while True:
@@ -526,6 +532,16 @@ def ensure_go() -> None:
                                 f"{changed}")
             reply = _ask("ready", manifest)
         else:
+            if manifest is None:
+                manifest = build_manifest()           # (ready was sent by an earlier call)
+            if now_s() - last_check >= MANIFEST_CHECK_S:
+                # the files are on THIS PC (since 2026-11-15 the queue's server
+                # may be another): re-stat the manifest on every check, before
+                # GO, so a stale process stands down while it has claimed nothing
+                last_check = now_s()
+                changed = changed_since_load(manifest)
+                if changed:
+                    _stand_down(f"a file changed on disk while it waited for GO: {changed}")
             reply = _ask("poll")
         now = _monotonic()
         if not reply or reply.get("status") != "ok":

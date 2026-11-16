@@ -934,21 +934,67 @@ def test_run_again_resubmits_the_same_file_as_a_person(panel, server, tmp_path):
     assert "dependencies (after 3)" in text and "chain (c1)" in text   # not carried over
     req = server.of("submit")[-1]
     host = socket.gethostname()
+    # the job ran here (a record with no run_host: from before 2026-11-15), so
+    # it runs here again: the file is read on this PC, as a submit reads it
     assert req == {"type": "run_queue", "action": "submit", "path": str(path),
                    "argv": ["n=3", "-c", "X y"], "cwd": str(tmp_path), "label": "expt_5",
                    "owner": "person", "by": "jp@test", "allow_drift": False,
-                   "client_sha256": local_sha256(str(path)), "client_host": host,
-                   "host": host, "write_back": False}
+                   "run_host": host, "again_of": 5, "host": host, "write_back": False,
+                   "sha256": local_sha256(str(path)), "expt_class": "",
+                   "calibrates_declared": [], "cold_why": "",
+                   "client_host": host, "client_sha256": local_sha256(str(path))}
     assert "queued as job 11" in panel.message.text()
-    # next: insert at 0; a changed file is said so
+    # next: insert at 0; a changed file is said so; the new job's launcher is
+    # started on this PC (the job runs here)
+    started = []
+    panel.start_launcher_fn = started.append
     path.write_text("x = 2\n")
-    server.answers["insert"] = {"status": "ok", "ids": [12]}
+    server.answers["insert"] = {"status": "ok", "ids": [12],
+                                "jobs": [{"id": 12, "token": "t12", "run_host": host}]}
     assert panel.run_again(first=True)
     assert "job 5 (expt_5): its file has CHANGED" in panel.message.text()
     assert "queued as job 12" in panel.message.text()
     req = server.of("insert")[-1]
-    assert req["at_index"] == 0 and req["client_sha256"] == local_sha256(str(path))
+    assert req["at_index"] == 0 and req["sha256"] == local_sha256(str(path))
+    assert started == [[(12, "t12")]]
     assert panel.confirms == []
+
+
+def test_run_again_of_another_pcs_job_runs_there(panel, server, tmp_path):
+    jobs = _phase1_jobs()
+    jobs[4].update(path=r"C:\Users\other\code\expt_5.py", run_host="pc-elsewhere")
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    panel.select_job(5)
+    started = []
+    panel.start_launcher_fn = started.append
+    server.answers["submit"] = {"status": "ok", "ids": [11],
+                                "jobs": [{"id": 11, "token": "t11",
+                                          "run_host": "pc-elsewhere"}]}
+    assert panel.run_again()
+    req = server.of("submit")[-1]
+    # no hash from here: that PC's launcher reads its own file when it attaches
+    assert req["run_host"] == "pc-elsewhere" and req["again_of"] == 5
+    assert "sha256" not in req and req["host"] == socket.gethostname()
+    assert "client_sha256" not in req                      # an older server refuses it
+    assert req["client_host"] == socket.gethostname()
+    assert started == []                                   # never another PC's launcher
+    assert "runs on pc-elsewhere" in panel.message.text()
+
+
+def test_the_panel_starts_a_launcher_only_for_this_pcs_launcherless_jobs(panel, server):
+    host = socket.gethostname()
+    jobs = _phase1_jobs()
+    jobs[2].update(run_host=host, launcher=None)                     # queued, none attached
+    jobs[3].update(run_host=host, launcher={"attached": True})       # has one
+    jobs[4].update(run_host="pc-elsewhere", launcher=None)           # another PC's
+    started = []
+    panel.start_launcher_fn = started.append
+    server.answers["list"] = _list_reply(jobs)
+    panel.refresh_list()
+    assert started == [[(jobs[2]["id"], jobs[2]["token"])]]
+    panel.refresh_list()                                             # not again at once
+    assert len(started) == 1
 
 
 def test_run_again_refused_shows_why(panel, server):
@@ -1056,8 +1102,9 @@ def test_again_request_drops_the_old_jobs_place():
                argv=["a=1"])
     req = rqp.again_request(job, "jp@test")
     for key in ("after", "chain", "due", "paused", "repeat", "at_index", "write_back",
-                "client_sha256", "client_host"):
+                "client_sha256"):                      # (no hash: this PC has no such file)
         assert key not in req, key
+    assert req["client_host"] == socket.gethostname()  # for an older server's check
     assert rqp.again_request(job, "x", first=True)["action"] == "insert"
     words = " ".join(rqp.not_carried_over(job))
     assert "after 3" in words and "c1" in words and "one of 3" in words and "pause" in words

@@ -36,6 +36,26 @@ def _queue_gate_never_reaches_the_real_queue(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_job_launcher_is_ever_started(monkeypatch, tmp_path):
+    """A job launcher (``kq launch``) started for real would find the LIVE
+    monitor server by discovery on kong and start experiments.  Starting one
+    fails the test; the launchers' folder is the test's own; a Launcher made
+    without a transport fails at its first request instead of discovering."""
+    from waxx.util.device_state import launcher
+
+    def no_real_launcher(*args, **kwargs):
+        pytest.fail("a test started a real job launcher (kq launch); give the queue / client "
+                    "a start_launcher stand-in")
+    monkeypatch.setattr(launcher, "start_detached", no_real_launcher)
+    monkeypatch.setenv(launcher.DIR_ENV, str(tmp_path / "launchers"))
+
+    def no_real_connect():
+        pytest.fail("a test's Launcher reached for the real monitor server; give it a "
+                    "transport")
+    monkeypatch.setattr(launcher, "_connect", no_real_connect)
+
+
+@pytest.fixture(autouse=True)
 def _no_beacon_is_ever_broadcast(monkeypatch):
     """kong runs the real servers: a test server that beaconed its id (pdxc,
     precilaser, ...) could take requests meant for the real one.  No test

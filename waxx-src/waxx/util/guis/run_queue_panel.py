@@ -128,6 +128,7 @@ from waxx.util.dashboard import theme
 from waxx.util.device_state.person_hold import describe as describe_hold
 from waxx.util.device_state.run_queue_client import (
     ENDED, IN_SLOT, SUCCEEDED, default_by, local_sha256)
+from waxx.util.device_state.run_queue_client import again_request as _again_request
 from waxx.util.guis.request_runner import RequestRunner, is_unknown_request
 from waxx.util.guis.qt_upkeep import delete_later, set_style_if_changed
 
@@ -339,24 +340,10 @@ def release_request(by: str) -> dict:
 
 
 def again_request(job: dict, by: str, *, first: bool = False,
-                  client_sha256: str | None = None, client_host: str | None = None) -> dict:
-    """The same file again as a new job of a person's: its argv, working
-    folder, label, write-back veto and drift setting.  Its dependencies,
-    chain, due time and repeats are NOT carried over (they named the old
-    job's place).  ``first``: ``insert`` at ``at_index`` 0 (the next job);
-    otherwise ``submit`` (the owner rule: ahead of agents' queued jobs).
-    ``client_sha256`` / ``client_host`` let the server refuse a file whose copy
-    on its machine differs from this PC's (as kq sends them)."""
-    obj = {"type": "run_queue", "action": "insert" if first else "submit",
-           "path": job.get("path"), "argv": [str(a) for a in (job.get("argv") or [])],
-           "cwd": job.get("cwd") or None, "label": job.get("label") or None,
-           "owner": OWNER, "by": by, "allow_drift": bool(job.get("allow_drift")),
-           "client_sha256": client_sha256, "client_host": client_host, "host": client_host}
-    if job.get("write_back") is False:
-        obj["write_back"] = False
-    if first:
-        obj["at_index"] = 0
-    return {k: v for k, v in obj.items() if v is not None}
+                  host: str | None = None) -> dict:
+    """The same file again as a new job of a person's, on the PC that ran it
+    (:func:`~waxx.util.device_state.run_queue_client.again_request`)."""
+    return _again_request(job, by, first=first, host=host, owner=OWNER)
 
 
 def not_carried_over(job: dict) -> list[str]:
@@ -1543,6 +1530,7 @@ class RunQueuePanel(QWidget):
                 self.set_info(info, ask_list=False)
                 self._summary_sig = self._signature(self.info)
             self.model.set_jobs(reply.get("jobs"), self.info, reply.get("next"))
+            self._start_own_launchers(reply.get("jobs") or [])
             self._reselect()
             listed = {(j.get("id"), j.get("token")) for j in self.model._all}
             if (self.follow_new and self._known_jobs is not None
@@ -2117,9 +2105,11 @@ class RunQueuePanel(QWidget):
         :func:`again_request`.  ``job``: one job, a list of them, or None for
         the selected ones (:meth:`batch_jobs`).  Several go in in table
         order; ``first``: as the next jobs (inserted last first, so they run
-        in table order).  The message line says when this PC's copy of a file
-        differs from what the job ran or cannot be read, and what is not
-        carried over."""
+        in table order).  Each runs on the PC that ran it (``run_host``): this
+        PC's launcher is started here; another PC's job is started by that
+        PC (its panel, or the monitor server for its own jobs).  The message
+        line says when this PC's copy of a file differs from what the job ran
+        or cannot be read, where each runs, and what is not carried over."""
         if isinstance(job, list):
             jobs = job
         else:
@@ -2130,18 +2120,21 @@ class RunQueuePanel(QWidget):
         host = socket.gethostname()
         notes, requests = [], []
         for j in jobs:
-            sha = local_sha256(str(j.get("path")))
-            if sha is None:
-                notes.append(f"{job_name(j)}: this PC cannot read its file (the queue refuses "
-                             "it unless this PC is the queue machine)")
-            elif j.get("sha256") and sha != j.get("sha256"):
-                notes.append(f"{job_name(j)}: its file has CHANGED since it was submitted "
-                             "(the current version runs)")
+            run_host = str(j.get("run_host") or "") or host
+            if run_host.lower() != host.lower():
+                notes.append(f"{job_name(j)}: runs on {run_host} (that PC starts it; it waits "
+                             f"until {run_host}'s launcher attaches)")
+            else:
+                sha = local_sha256(str(j.get("path")))
+                if sha is None:
+                    notes.append(f"{job_name(j)}: this PC cannot read its file: it is refused")
+                elif j.get("sha256") and sha != j.get("sha256"):
+                    notes.append(f"{job_name(j)}: its file has CHANGED since it was submitted "
+                                 "(the current version runs)")
             dropped = not_carried_over(j)
             if dropped:
                 notes.append(f"{job_name(j)}: not carried over: " + "; ".join(dropped))
-            requests.append((j, again_request(j, self.by, first=first, client_sha256=sha,
-                                              client_host=host)))
+            requests.append((j, again_request(j, self.by, first=first, host=host)))
         if first:
             requests.reverse()
         n = len(jobs)
@@ -2149,6 +2142,11 @@ class RunQueuePanel(QWidget):
                 + (" next" if first else ""))
 
         def report(results: list) -> str:
+            mine = [j for _, reply in results if reply.get("status") == "ok"
+                    for j in (reply.get("jobs") or [])
+                    if str(j.get("run_host") or "").lower() == host.lower()]
+            if mine:
+                self.start_launchers(mine)
             ids = [i for _, reply in results if reply.get("status") == "ok"
                    for i in (reply.get("ids") or [])]
             if first:
@@ -2160,6 +2158,59 @@ class RunQueuePanel(QWidget):
             return text
         self._send_batch(requests, what, notes=notes, report=report)
         return True
+
+    #: A job of this PC's with no launcher gets one started by this panel at
+    #: most this often (ms).
+    LAUNCHER_START_EVERY_MS = 60_000
+
+    def start_launchers(self, jobs: list, *, why: str = "") -> int:
+        """Start ``kq launch`` on this PC for ``jobs`` (records of this PC's
+        jobs) -- at most once per job every :data:`LAUNCHER_START_EVERY_MS`;
+        two launchers for one job never both run it (the second leaves it to
+        the first).  -> how many were handed to a new launcher."""
+        started = getattr(self, "_launcher_started", None)
+        if started is None:
+            started = self._launcher_started = {}
+        now = time.monotonic() * 1000.0
+        pairs = []
+        for j in jobs:
+            jid, token = j.get("id"), j.get("token")
+            if not jid or not token:
+                continue
+            if now - started.get(jid, float("-inf")) < self.LAUNCHER_START_EVERY_MS:
+                continue
+            started[jid] = now
+            pairs.append((int(jid), str(token)))
+        if not pairs:
+            return 0
+        try:
+            from waxx.util.device_state.launcher import start_detached  # noqa: PLC0415
+            (getattr(self, "start_launcher_fn", None) or start_detached)(pairs)
+        except Exception as exc:                      # noqa: BLE001
+            self.say("could not start this PC's launcher for job(s) "
+                     + ", ".join(str(p[0]) for p in pairs) + f": {exc!r} (start one by hand: "
+                     "kq launch " + " ".join(f"{i}:{t}" for i, t in pairs) + ")", ERR_TEXT)
+            return 0
+        if why:
+            self.say("started this PC's launcher for job(s) "
+                     + ", ".join(str(p[0]) for p in pairs) + f" ({why})", theme.FG_MUTED)
+        return len(pairs)
+
+    def _start_own_launchers(self, jobs: list) -> None:
+        """This PC's queued or running jobs whose launcher is not attached
+        (a run-again asked from another PC, a launcher that died): start one
+        here.  Only jobs that name this PC; never another PC's."""
+        host = socket.gethostname().lower()
+        now = time.time()
+        want = [j for j in jobs if isinstance(j, dict)
+                and str(j.get("run_host") or "").lower() == host
+                and j.get("state") not in ENDED
+                and not ((j.get("launcher") or {}).get("attached"))
+                # (its submitter's own launcher comes within seconds)
+                and (j.get("launcher") is not None
+                     or now - float(j.get("submitted_at") or 0.0) >= 15.0)]
+        if want:
+            self.start_launchers(want, why="no launcher was attached")
 
     def _send_batch(self, requests: list, what: str, *, on_unknown: str | None = None,
                     notes: list | None = None, report=None) -> None:
@@ -2217,8 +2268,9 @@ class RunQueuePanel(QWidget):
             return ""
         path = str(job["path"])
         if not os.path.isfile(path):
-            self.say(f"{path} cannot be read from this PC (the file that runs is the queue "
-                     "machine's copy).", WARN_TEXT)
+            where = str(job.get("run_host") or "") or "the PC that runs it"
+            self.say(f"{path} cannot be read from this PC (the file that runs is {where}'s "
+                     "copy).", WARN_TEXT)
             return ""
         editor = find_editor()
         if editor is None:

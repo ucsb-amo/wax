@@ -349,6 +349,38 @@ def test_ready_stands_down_when_a_loaded_file_changed(monkeypatch, tmp_path, cap
     assert not qg.go_passed()
 
 
+def test_a_file_changed_while_waiting_for_go_stands_down_before_go(monkeypatch, tmp_path,
+                                                                   capsys, fresh):
+    """Since 2026-11-15 the queue's server may be another PC: the warm
+    process re-stats its own manifest while it waits, and stands down (exit
+    78, nothing claimed) once a loaded file changes -- before any GO."""
+    warm(monkeypatch)
+    monkeypatch.setenv(qg.ROOTS_ENV, str(tmp_path))
+    data = tmp_path / "params.json"
+    data.write_text("{}")
+    script = Script({"status": "ok", "go": False, "why": "#3 is running"})
+    qg.set_transport(script)
+    qg.hello("rabi")
+    with open(data) as f:                                 # read during prepare
+        f.read()
+    real_ask = qg._ask
+    polls = []
+
+    def ask(stage, manifest=None):
+        if stage == "poll":
+            polls.append(1)
+            if len(polls) == 3:
+                data.write_text('{"edited": "while it waited"}')
+        return real_ask(stage, manifest)
+    monkeypatch.setattr(qg, "_ask", ask)
+    with pytest.raises(SystemExit) as e:
+        qg.ensure_go()
+    assert e.value.code == qg.EXIT_WARM_ABORTED
+    assert "a file changed on disk while it waited for GO" in capsys.readouterr().out
+    assert not qg.go_passed()
+    assert all(not o.get("go") for o in script.sent)
+
+
 def test_the_hook_goes_in_at_import_in_a_warm_process_and_the_variable_stays(tmp_path):
     """A fresh interpreter, warm: importing waxx installs the hook and stats
     the modules already loaded (the residual window); the variable is still

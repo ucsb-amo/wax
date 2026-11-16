@@ -476,7 +476,11 @@ class MonitorUDPServer(UdpServer):
             monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
             loops=self.loops, start_monitor=self.start_monitor_signal.emit,
             hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change,
-            warm_ahead=warm_ahead)
+            warm_ahead=warm_ahead,
+            # each job runs on the PC that submitted it (`kq launch` there;
+            # user, 2026-11-15): this server orders, gates and gives GO, and
+            # never starts a job's process itself
+            launchers=True)
 
         # Host-side connections (the tweezer AWG), held here between runs.
         # Bad definitions cost the connections, never the server.
@@ -1202,8 +1206,10 @@ class MonitorUDPServer(UdpServer):
         if mtype == "run_queue":
             # "warm": a warm process's poll -- answered while exiting (the
             # queue gives no GO then: stop_launching), so it keeps waiting
-            # for the restarted server instead of counting refusals
-            return action not in self._QUEUE_READS and action != "warm"
+            # for the restarted server instead of counting refusals;
+            # "launcher": a job launcher's heartbeat (it reports the jobs'
+            # processes and their output: never refused)
+            return action not in self._QUEUE_READS and action not in ("warm", "launcher")
         if mtype == "slm_reinit":
             return action != "status"
         return False
@@ -1213,7 +1219,8 @@ class MonitorUDPServer(UdpServer):
                       "cancel": "cancel", "kill": "kill", "list": "list",
                       "describe": "describe", "tail": "tail", "pause": "pause",
                       "resume": "resume", "hold": "hold_request", "release": "release_request",
-                      "warm": "warm_request", "warm_ahead": "set_warm_ahead"}
+                      "warm": "warm_request", "warm_ahead": "set_warm_ahead",
+                      "launcher": "launcher_request"}
 
     def _reply_run_queue(self, obj: dict) -> dict:
         """``{"type": "run_queue", "action": ...}`` -- see

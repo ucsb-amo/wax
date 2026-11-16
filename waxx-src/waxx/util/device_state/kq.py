@@ -1,10 +1,15 @@
 """kq -- the run queue's command line (:mod:`waxx.util.device_state.run_queue`).
 
-The run queue lives in the monitor server, which launches every job itself
-(``artiq_run``, detached, its output in a log file on the server's machine).
-``kq`` submits jobs, follows their output and asks the queue about its state;
-it never runs, stops or kills an experiment itself, and it never falls back to
-a direct run when no queue answers.
+The run queue lives in the monitor server, which decides the order, the gate
+and GO.  **The PC that submits a job runs it** (since 2026-11-15): ``kq run``
+/ ``submit`` / ``insert`` read the file here (its hash, class, declared
+calibrations and warm check), submit it, and start the jobs' *launcher* --
+``kq launch``, a hidden process on this PC (:mod:`~waxx.util.device_state.
+launcher`) that starts ``artiq_run`` from THIS PC's copy when the queue says
+so, follows it, sends its output to the server and kills it only on the
+queue's order.  A closed terminal leaves the run and its launcher going.
+``kq`` itself never runs or stops an experiment, and it never falls back to a
+direct run when no queue answers.
 
 Commands::
 
@@ -23,9 +28,15 @@ Commands::
     kq show <id> [--json]                     one job, why it waits, its last lines
     kq tail <id> [-f]                         its log so far; -f follows to the end
     kq cancel <id> [--yes]                    cancel (a running job: liveOD's Abort)
-    kq kill <id> [--yes]                      force-kill a running job (a person; an agent
+    kq kill <id> [--yes] [--gone]             force-kill a running job (a person; an agent
                                               only its own stuck job; no cleanup; liveOD
-                                              keeps its file)
+                                              keeps its file): an order to the job's
+                                              launcher, whose result kq waits for.
+                                              --gone (a person, launcher silent): nothing
+                                              is killed; frees the slot of a job whose PC
+                                              is off or runs nothing of it any more
+    kq launch <id>:<token> ...                be the launcher of these jobs on this PC
+                                              (kq run / submit start one by themselves)
     kq pause [--all] [--reason R]             stop launching agent (or all) jobs
     kq resume [--all]                         lift that pause
     kq hold [reason]                          a person's hold: agents' jobs wait
@@ -523,7 +534,16 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
                                      "agent only its own stuck job; no cleanup runs)")
     sp.add_argument("id", type=int)
     sp.add_argument("--yes", action="store_true", help="kill without asking")
+    sp.add_argument("--gone", action="store_true",
+                    help="its launcher is silent and nothing of it runs on its PC any more "
+                         "(checked by a person): free the slot without killing anything")
+    sp.add_argument("--wait", type=float, default=20.0, metavar="S",
+                    help="seconds to wait for the launcher's kill result (default 20)")
     sp.add_argument("--token")
+
+    sp = sub.add_parser("launch", help="be the launcher of these jobs on this PC (kq run / "
+                                       "submit start one by themselves)")
+    sp.add_argument("jobs", nargs="+", metavar="ID:TOKEN")
 
     sp = sub.add_parser("pause", help="stop launching agent jobs (--all: every job)")
     sp.add_argument("--all", action="store_true")
@@ -611,6 +631,9 @@ def _cmd_run(ctx: _Ctx, args, expt_argv: list[str]) -> int:
         ctx.warn("kq: the queue accepted the request but returned no job")
         return EXIT_REFUSED
     first = jobs[0] if jobs else {"id": ids[0]}
+    launcher = reply.get("launcher") or {}
+    if launcher and not launcher.get("ok"):
+        ctx.warn(f"[kq] {launcher.get('msg')}")
     many = (f"jobs {ids[0]}-{ids[-1]} (chain {first.get('chain')})" if len(ids) > 1
             else f"job {ids[0]}")
     due_text = f", due {_when(due)}" if due else ""
@@ -1123,15 +1146,53 @@ def _cmd_kill(ctx: _Ctx, args) -> int:
             ctx.warn(f"kq: force-killing {_job_word(job)} ({run}) skips all of its cleanup "
                      "(the hardware stays as the run left it). Pass --yes to do that.")
             return EXIT_REFUSED
-        if not ctx.ask(f"[kq] force-kill {_job_word(job)} ({run})? no cleanup runs: coils, "
-                       "AOMs and shutters stay as the run left them; liveOD keeps its file "
-                       "as it was [y/N] "):
+        if args.gone:
+            question = (f"[kq] declare {_job_word(job)} ({run}) gone? nothing is killed: only "
+                        f"say yes once you have checked that nothing of it runs on "
+                        f"{job.get('run_host') or 'its PC'} [y/N] ")
+        else:
+            question = (f"[kq] force-kill {_job_word(job)} ({run})? no cleanup runs: coils, "
+                        "AOMs and shutters stay as the run left them; liveOD keeps its file "
+                        "as it was [y/N] ")
+        if not ctx.ask(question):
             ctx.say("[kq] nothing killed")
             return EXIT_OK
-    reply = ctx.client.kill(args.id, token=args.token, owner=owner)
-    ctx.say(f"[kq] {_job_word(reply.get('job') or job)}: {reply.get('note')}; it ends at the "
-            f"queue's next check (kq show {args.id})")
-    return EXIT_OK
+    reply = ctx.client.kill(args.id, token=args.token, owner=owner, gone=args.gone)
+    name = _job_word(reply.get("job") or job)
+    if not reply.get("pending"):
+        ctx.say(f"[kq] {name}: {reply.get('note')}; it ends at the queue's next check "
+                f"(kq show {args.id})")
+        return EXIT_OK
+    # the kill is an order to the job's launcher, on its PC: wait for its answer
+    ctx.say(f"[kq] {name}: {reply.get('note')}")
+    deadline = time.monotonic() + max(0.0, float(args.wait))
+    while True:
+        try:
+            now_job = ctx.client.describe(args.id, args.token)["job"]
+        except RunQueueError as exc:
+            if exc.reply is not None:
+                raise
+            now_job = None
+        k = (now_job or {}).get("kill") or {}
+        if now_job is not None and (now_job.get("state") in ENDED or not k.get("pending")):
+            ok = any(r.get("ok") or r.get("gone") for r in (k.get("results") or []))
+            ctx.say(f"[kq] {name}: {k.get('note') or now_job.get('reason') or now_job['state']}"
+                    + ("" if now_job.get("state") in ENDED else
+                       f"; it ends at the queue's next check (kq show {args.id})"))
+            return EXIT_OK if ok or now_job.get("state") in ENDED else EXIT_REFUSED
+        if time.monotonic() >= deadline:
+            ctx.warn(f"kq: {name}: no answer from its launcher on "
+                     f"{(now_job or job).get('run_host') or 'its PC'} within {args.wait:.0f} s; "
+                     "the kill goes when it answers (kq show " + str(args.id) + "). If that PC is "
+                     f"off or runs nothing of it: kq kill {args.id} --gone")
+            return EXIT_REFUSED
+        time.sleep(0.5)
+
+
+def _cmd_launch(ctx: _Ctx, args) -> int:
+    from waxx.util.device_state.launcher import main as launch_main  # noqa: PLC0415
+    code = launch_main(list(args.jobs))
+    return EXIT_OK if code == 0 else EXIT_USAGE if code == 2 else EXIT_FAILED
 
 
 def _cmd_pause(ctx: _Ctx, args) -> int:
@@ -1227,7 +1288,7 @@ def _cmd_status(ctx: _Ctx, args) -> int:
 
 
 _COMMANDS = {"list": _cmd_list, "show": _cmd_show, "tail": _cmd_tail, "cancel": _cmd_cancel,
-             "kill": _cmd_kill,
+             "kill": _cmd_kill, "launch": _cmd_launch,
              "move": _cmd_move, "edit": _cmd_edit,
              "pause": _cmd_pause, "resume": _cmd_resume, "hold": _cmd_hold,
              "release": _cmd_release, "warm": _cmd_warm, "status": _cmd_status}

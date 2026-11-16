@@ -55,6 +55,14 @@ def server(qapp, monkeypatch, tmp_path, expts):
     s.live = Live()
     s._live_od = s.live                               # the queue calls it late
     s.spawner = Spawner()
+    # the server builds its queue with launchers (jobs run on the PC that
+    # submitted them; test_launcher_bridge.py covers that path, and
+    # test_the_server_routes_launcher_heartbeats below the server's part of
+    # it): these tests are about the queue's interplay with the server's loops,
+    # reset and monitor, so its jobs run through the local fake spawn instead
+    assert s.run_queue.launchers is not None
+    s.run_queue.launchers = None
+    s.run_queue._set_priority = lambda pid, started: True
     s.run_queue._spawn = s.spawner                    # never the real detached launcher
     s.run_queue._adopt = lambda pid, started: None    # never a real process
     s.run_queue.poll_every_s, s.run_queue._gap_s, s.run_queue._outcome_wait_s = 0., 0., 0.
@@ -93,7 +101,7 @@ def test_the_request_contract(server, expts, tmp_path):
             "rank", "expt_class",
             "calibrates_declared", "submitter", "paused", "paused_by", "paused_since",
             "no_file", "cold", "cold_why", "warm", "warm_started_at",
-            "warm_attempts"} == set(j)
+            "warm_attempts", "run_host"} == set(j)
     # the edit, move and insert actions answer through the server
     assert server.ask({"type": "run_queue", "action": "edit", "id": 1, "owner": "agent",
                        "fields": {"label": "rabi2"}})["job"]["label"] == "rabi2"
@@ -114,10 +122,12 @@ def test_the_request_contract(server, expts, tmp_path):
                        "by": "jp"})["run_queue"]["paused"]["agent"]["by"] == "jp"
     assert server.ask({"type": "run_queue", "action": "resume", "scope": "agent",
                        "by": "jp", "owner": "person"})["status"] == "ok"
-    # kill answers through the server (an agent's is refused before anything is killed)
+    # kill answers through the server (an agent's is refused before anything is
+    # killed: since 2026-10-30 an agent may kill only its own job whose run is
+    # stuck -- this test still said "only a person", and failed before 11-15)
     agent_kill = server.ask({"type": "run_queue", "action": "kill", "id": 1, "by": "a",
                              "owner": "agent"})
-    assert agent_kill["status"] == "error" and "only a person" in agent_kill["msg"]
+    assert agent_kill["status"] == "error" and "only when its run is stuck" in agent_kill["msg"]
     no_owner = server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp"})
     assert no_owner["status"] == "error" and "owner is required" in no_owner["msg"]
     assert server.ask({"type": "run_queue", "action": "cancel", "id": 1, "by": "jp",
@@ -134,6 +144,18 @@ def test_the_request_contract(server, expts, tmp_path):
         assert kind in kinds
     lines = (tmp_path / "run_queue_default" / "journal.jsonl").read_text().splitlines()
     assert json.loads(lines[0])["kind"] == "run_queue_submit"
+
+
+def test_the_server_routes_launcher_heartbeats_and_answers_them_while_restarting(server):
+    # the server built its queue with launchers (the fixture turned them off
+    # for the other tests here, after checking): a heartbeat reaches the
+    # queue's launcher_request, and is never refused as "work" while the
+    # server exits (a launcher reports the jobs' processes and their output)
+    assert server._QUEUE_ACTIONS["launcher"] == "launcher_request"
+    assert not server._starts_work("run_queue", {"action": "launcher"})
+    reply = server.ask({"type": "run_queue", "action": "launcher",
+                        "launcher": {"id": "x", "host": "pc-a"}, "jobs": []})
+    assert reply["status"] == "error" and "starts its jobs itself" in reply["msg"]
 
 
 def test_tail_and_a_queued_only_cancel_through_the_server(server, expts):

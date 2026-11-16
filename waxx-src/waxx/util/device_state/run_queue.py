@@ -1,5 +1,22 @@
-"""The K-machine run queue: experiment jobs, one at a time, run by the monitor
-server (run-queue plan, phase 1).
+"""The K-machine run queue: experiment jobs, one at a time, ordered and gated
+by the monitor server (run-queue plan, phase 1).
+
+**Where a job runs (since 2026-11-15, user: "the submitting computer should
+run the job itself").**  The monitor server builds its queue with
+``launchers=True``: each job runs on the PC that submitted it (``run_host``),
+started, followed and killed there by that PC's ``kq launch``
+(:mod:`~waxx.util.device_state.launcher`), and the queue reaches its
+processes only through :mod:`~waxx.util.device_state.launcher_bridge` --
+whose ``spawn`` / handles / kill / priority stand in for the local ones below,
+so everything described here (the order, the gate, GO, warm start, the
+outcome) holds as written, except: the server never opens a job's file (the
+submitting PC sends its hash, class, calibrations and warm check, and the
+launcher re-checks the file at launch); a queued job is eligible only while
+its launcher is attached; a silent launcher's job keeps the slot (never "its
+process is gone") until it reports or a person declares it gone (``kill``
+with ``gone``); a kill is an order to the launcher.  Without ``launchers``
+(library use, the older tests) the queue starts its jobs on this machine as
+described below.
 
 The queue generalises the server's run loop (:mod:`~waxx.util.device_state.run_loop`)
 from "one file back to back" to "these jobs, in this order": it reuses the
@@ -184,7 +201,6 @@ Machine-agnostic: nothing here knows the K machine.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -291,8 +307,7 @@ WARM_SPEC_FIELDS = ("argv", "after", "due", "paused", "write_back", "cold")
 #: Names that make a job cold when its prepare / build / __init__ calls them
 #: (hardware or shared lab state touched before GO).  ``RunQueue(
 #: warm_deny_names=)`` replaces them.
-WARM_DENY_NAMES = ("_announce_to_monitor", "announce_run", "withdraw_run", "picomotor",
-                   "stage_dev", "objective_stage")
+from waxx.util.device_state.job_source import WARM_DENY_NAMES  # noqa: E402
 
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -379,91 +394,11 @@ def _clock_text(t) -> str:
         return "?"
 
 
-def describe_source(path) -> tuple[str, list]:
-    """``(expt_class, calibrates_declared)`` from an experiment file's source,
-    read with :mod:`ast` (never imported): the single public class that
-    subclasses ``EnvExperiment`` or defines ``scan_kernel`` ("" when there is
-    none or more than one), and the first argument of every
-    ``self.calibrates('<key>', ...)`` call with a string key, in order, once
-    each.  ("", []) when the file cannot be read or parsed."""
-    try:
-        return _read_source(path)
-    except Exception as exc:                          # noqa: BLE001
-        # a pathological file (RecursionError / MemoryError from ast, ...):
-        # the listing goes without; the job is submitted all the same
-        log.warning("Run queue: could not read %s's class and calibrations (%r); listed "
-                    "without them.", path, exc)
-        return "", []
 
-
-def _read_source(path) -> tuple[str, list]:
-    import ast  # noqa: PLC0415
-    try:
-        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError, ValueError):
-        return "", []
-    classes = []
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
-            continue
-        bases = [ast.unparse(b).split(".")[-1] for b in node.bases]
-        scan = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and n.name == "scan_kernel" for n in node.body)
-        if "EnvExperiment" in bases or scan:
-            classes.append(node.name)
-    keys: list = []
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "calibrates" and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self" and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str) and node.args[0].value not in keys):
-            keys.append(node.args[0].value)
-    return (classes[0] if len(classes) == 1 else ""), keys
-
-
-#: The methods whose calls decide a job's warm eligibility (they run before GO).
-_PRE_GO_METHODS = ("prepare", "build", "__init__", "finish_prepare")
-
-
-def cold_reason(path, deny_names=WARM_DENY_NAMES) -> str:
-    """Why a job of this experiment file must never warm-launch ("" when it
-    may), read with :mod:`ast` (never imported): a class body that sets
-    ``warm_launch = False``, or a call in ``prepare`` / ``build`` /
-    ``__init__`` / ``finish_prepare`` whose dotted name contains one of
-    ``deny_names`` (hardware or shared lab state touched before GO).  A file
-    that cannot be read or parsed is cold (nothing shows it is safe)."""
-    import ast  # noqa: PLC0415
-    try:
-        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
-    except Exception as exc:                          # noqa: BLE001
-        return f"its source could not be read for the warm check ({type(exc).__name__})"
-    deny = [d.lower() for d in deny_names if d]
-    try:
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            for item in node.body:
-                if (isinstance(item, (ast.Assign, ast.AnnAssign))
-                        and isinstance(getattr(item, "value", None), ast.Constant)
-                        and item.value.value is False
-                        and any(isinstance(t, ast.Name) and t.id == "warm_launch"
-                                for t in (item.targets if isinstance(item, ast.Assign)
-                                          else [item.target]))):
-                    return f"class {node.name} sets warm_launch = False"
-                if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                        and item.name in _PRE_GO_METHODS):
-                    for sub in ast.walk(item):
-                        if not isinstance(sub, ast.Call):
-                            continue
-                        name = ast.unparse(sub.func).lower()
-                        hit = next((d for d in deny if d in name), None)
-                        if hit:
-                            return (f"{node.name}.{item.name} calls {ast.unparse(sub.func)} "
-                                    f"(touches the lab before GO)")
-    except Exception as exc:                          # noqa: BLE001
-        return f"its source could not be checked for warm start ({type(exc).__name__})"
-    return ""
+# describe_source / cold_reason / file_sha256 live in job_source (import-light:
+# the submitting PC and its launcher compute them; kept importable from here)
+from waxx.util.device_state.job_source import (  # noqa: E402,F401
+    _PRE_GO_METHODS, _read_source, cold_reason, describe_source, file_sha256)
 
 
 def _since_text(t) -> str:
@@ -475,14 +410,6 @@ def _since_text(t) -> str:
         return time.strftime("%b %d %H:%M", time.localtime(t))
     except (TypeError, ValueError, OverflowError, OSError):
         return "?"
-
-
-def file_sha256(path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 16), b""):
-            h.update(block)
-    return h.hexdigest()
 
 
 def _close(proc) -> None:
@@ -532,6 +459,24 @@ def _parse_queue_job(text) -> tuple[int | None, str]:
 
 def _quote(arg: str) -> str:
     return f'"{arg}"' if (" " in arg or "\t" in arg) else arg
+
+
+def _looks_absolute(text: str) -> bool:
+    """An absolute path on some PC, judged from its text alone (never this
+    machine's file system): ``C:\\...`` / ``C:/...``, a UNC path, or ``/...``."""
+    return (bool(re.match(r"^[A-Za-z]:[\\/]", text)) or text.startswith(("\\\\", "//"))
+            or text.startswith("/"))
+
+
+def _parent_text(text: str) -> str:
+    """The folder of a path on another PC, from its text."""
+    cut = max(text.rfind("\\"), text.rfind("/"))
+    return text[:cut] if cut > 2 else text[:cut + 1]
+
+
+def _stem_text(text: str) -> str:
+    name = text[max(text.rfind("\\"), text.rfind("/")) + 1:]
+    return name[:-3] if name.lower().endswith(".py") else name
 
 
 @dataclass
@@ -613,6 +558,10 @@ class Job:
     #: job's run in progress with run id 0, its last_outcome named it, or the
     #: run's output says "Acquisition for run 0 aborted".  Whatever it ended as
     no_file: bool = False
+    #: the PC that runs it -- the one that submitted it, or the one a run-again
+    #: named (``kq launch`` there starts its process; ``path`` is a path on
+    #: that PC).  "" for a queue that starts its jobs itself (launchers off).
+    run_host: str = ""
 
     @property
     def name(self) -> str:
@@ -737,7 +686,7 @@ class RunQueue:
                  alarm_s: float = ALARM_S, outcome_wait_s: float = 0.5,
                  client_name: str | None = None, warm_ahead: bool | None = False,
                  set_priority=None, warm_deny_names=WARM_DENY_NAMES,
-                 code_root: str | None = None):
+                 launchers: bool = False, start_launcher=None):
         self.directory = directory
         #: warm start (see the module docstring).  A bool: that value (the
         #: class's default, off, for library use and tests).  None -- what the
@@ -792,12 +741,10 @@ class RunQueue:
         self._adopt = adopt
         self._kill = kill
         self._exclude = {self._norm(p) for p in exclude if p}
-        #: the folders a job's file must be inside (default_roots())
+        #: the folders a job's file must be inside (default_roots()) -- only
+        #: when this queue starts its jobs itself (launchers off): with
+        #: launchers the file is on the job's own PC, which checks it
         self.roots = list(roots) if roots is not None else default_roots()
-        #: this machine's workspace (%code%): a submitter's path under ITS
-        #: %code% (``client_code_root``) that does not exist here is looked up
-        #: at the same place under this one
-        self.code_root = code_root if code_root is not None else os.environ.get("code") or ""
         self._clock = clock
         self.poll_every_s = float(poll_every_s)
         self._gap_s = float(gap_s)
@@ -872,6 +819,17 @@ class RunQueue:
         self._warm_alarm: dict | None = None
         #: (job, token) pairs whose abort reply was logged
         self._warm_abort_logged: set = set()
+        #: the jobs' launchers (launcher_bridge): each job runs on the PC that
+        #: submitted it (user, 2026-11-15) -- what the monitor server uses.
+        #: None: this queue starts its jobs itself with spawn / adopt / kill
+        #: (library use and the older tests' fakes)
+        self.launchers = None
+        if launchers:
+            from waxx.util.device_state.launcher_bridge import LauncherBridge  # noqa: PLC0415
+            self.launchers = LauncherBridge(self, start_launcher=start_launcher,
+                                            host=self._host)
+            self._spawn = self.launchers.spawn
+            self._set_priority = self.launchers.set_priority
         self._load()
         if self._warm_start_note is not None:
             stored, on = self._warm_start_note
@@ -906,9 +864,10 @@ class RunQueue:
     def submit(self, obj: Mapping) -> dict:
         """``{"path", "argv", "cwd", "label", "owner", "priority", "due",
         "after", "repeat", "chain", "stop_on_failure", "write_back",
-        "allow_drift", "by", "client_sha256"?, "client_host"?}`` -> ``{"status":
-        "ok", "jobs": [...], "ids": [...]}``.  The submitter's own copy must
-        match this machine's (:meth:`_check_client_copy`)."""
+        "allow_drift", "by", and -- for a job that runs on its own PC -- "run_host",
+        "sha256", "expt_class", "calibrates_declared", "cold_why", "again_of"?}``
+        -> ``{"status": "ok", "jobs": [...], "ids": [...]}``.  With launchers
+        the file is never opened here (:meth:`_new_remote_jobs`)."""
         try:
             jobs, clamped = self._new_jobs(obj)
         except QueueError as exc:
@@ -943,10 +902,12 @@ class RunQueue:
         bad = sorted(_SHELL_CHARS & set(text))
         if bad:
             raise QueueError(f"the file's path contains {' '.join(bad)} (not allowed): {text}")
+        if self.launchers is not None:
+            return self._new_remote_jobs(obj, text)
         path = Path(text)
         if not path.is_absolute():
             raise QueueError(f"the path must be absolute (the server's machine): {text}")
-        path = self._mapped_path(path.resolve(), obj)
+        path = path.resolve()
         bad = sorted(_SHELL_CHARS & set(str(path)))
         if bad:
             # a link resolving to such a path: the command line would carry it
@@ -959,11 +920,6 @@ class RunQueue:
         if path.suffix.lower() != ".py":
             raise QueueError(f"not a Python file: {path}")
         if not path.is_file():
-            host = str(obj.get("client_host") or "").strip()
-            if host and host.lower() != str(self._host).lower():
-                raise QueueError(f"no such file on {self._host}: {path} (the file that runs is "
-                                 f"{self._host}'s copy: put it in the workspace on both PCs, "
-                                 f"or copy it to {self._host} and submit that path)")
             raise QueueError(f"no such file on the monitor server's machine: {path}")
         if self._norm(path) in self._exclude:
             raise QueueError(f"{path.name} is the monitor's own experiment: the monitor server "
@@ -972,6 +928,58 @@ class RunQueue:
         cwd = str(obj.get("cwd") or path.parent)
         if not Path(cwd).is_dir():
             raise QueueError(f"no such working folder on the monitor server's machine: {cwd}")
+        sha = file_sha256(path)
+        expt_class, calibrates = describe_source(path)
+        return self._make_jobs(obj, path=str(path), stem=path.stem, argv=argv, cwd=cwd,
+                               sha=sha, expt_class=expt_class, calibrates=calibrates,
+                               cold_why=cold_reason(path, self._warm_deny), run_host="")
+
+    #: The fields a submit must carry when the job runs on its own PC (a kq
+    #: from before 2026-11-15 sends none of them: refused, never guessed --
+    #: a missing calibrates_declared would read as "calibrates nothing" and
+    #: let a warm start go ahead behind a calibrating job).
+    REMOTE_SUBMIT_FIELDS = ("run_host", "expt_class", "calibrates_declared", "cold_why")
+
+    def _new_remote_jobs(self, obj: Mapping, text: str) -> tuple[list[Job], bool]:
+        """A submit for a job that runs on its own PC (``run_host``): the
+        path, folder and file are that PC's and are never opened here; the
+        submitting PC sends its hash, class, declared calibrations and warm
+        check (:func:`~waxx.util.device_state.job_source.source_info`), and
+        the job's launcher checks the file again before it starts it.  A
+        run-again for another PC (``again_of``) carries no hash: the job's
+        launcher sends it when it attaches (until then the job waits)."""
+        run_host = str(obj.get("run_host") or "").strip()
+        again = obj.get("again_of") is not None
+        missing = [k for k in self.REMOTE_SUBMIT_FIELDS
+                   if obj.get(k) is None and not (again and k != "run_host")]
+        if missing:
+            raise QueueError("this kq is older than the run queue: the job's own PC runs it now "
+                             f"(missing {', '.join(missing)}); update this PC (uv sync) and "
+                             "submit again")
+        sha = str(obj.get("sha256") or "").strip().lower() or None
+        if sha is None and not again:
+            raise QueueError(f"the file could not be read on {run_host}: {text}")
+        if not _looks_absolute(text):
+            raise QueueError(f"the path must be absolute (on {run_host}): {text}")
+        if not text.lower().endswith(".py"):
+            raise QueueError(f"not a Python file: {text}")
+        calibrates = obj.get("calibrates_declared") or []
+        if not isinstance(calibrates, (list, tuple)):
+            raise QueueError("calibrates_declared must be a list of keys")
+        argv = _checked_argv(obj.get("argv"))
+        cwd = str(obj.get("cwd") or _parent_text(text))
+        bad = sorted(_SHELL_CHARS & set(cwd))
+        if bad:
+            raise QueueError(f"the working folder contains {' '.join(bad)} (not allowed): {cwd}")
+        return self._make_jobs(obj, path=text, stem=_stem_text(text), argv=argv, cwd=cwd,
+                               sha=sha or "", expt_class=str(obj.get("expt_class") or ""),
+                               calibrates=[str(k) for k in calibrates],
+                               cold_why=str(obj.get("cold_why") or ""), run_host=run_host)
+
+    def _make_jobs(self, obj: Mapping, *, path: str, stem: str, argv: list, cwd: str, sha: str,
+                   expt_class: str, calibrates: list, cold_why: str,
+                   run_host: str) -> tuple[list[Job], bool]:
+        """The submit's jobs from its checked file fields and its options."""
         owner = str(obj.get("owner") or "person")
         if owner not in OWNERS:
             raise QueueError(f"owner must be one of {', '.join(OWNERS)}, not {owner!r}")
@@ -992,7 +1000,7 @@ class RunQueue:
         chain = obj.get("chain")
         chain = str(chain).strip() if chain not in (None, "") else None
         write_back = _checked_write_back(obj.get("write_back"))
-        label = _LABEL_RE.sub("_", str(obj.get("label") or path.stem)).strip("_") or path.stem
+        label = _LABEL_RE.sub("_", str(obj.get("label") or stem)).strip("_") or stem
         label = label[:60]
         by = str(obj.get("by") or obj.get("operator") or obj.get("client") or "")
         if owner == "agent":
@@ -1000,13 +1008,9 @@ class RunQueue:
                 f"agent@{obj.get('host') or obj.get('client') or '?'}"
         else:
             submitter = by or "?"
-        sha = file_sha256(path)
-        self._check_client_copy(obj, path, sha)
-        expt_class, calibrates = describe_source(path)
         cold = obj.get("cold")
         if cold not in (None, True, False):
             raise QueueError(f"cold must be true or false, not {cold!r}")
-        cold_why = cold_reason(path, self._warm_deny)
         # TODO(INIT_RUN): the live list of calibrated keys, sent by the
         # experiment at prepare, overrides calibrates_declared once known.
         with self._lock:
@@ -1031,59 +1035,11 @@ class RunQueue:
                           repeat_of=repeat, submitted_at=now, submitted_by=by,
                           rank=ranks[i], expt_class=expt_class,
                           calibrates_declared=list(calibrates), submitter=submitter,
-                          cold=bool(cold), cold_why=cold_why)
+                          cold=bool(cold), cold_why=cold_why, run_host=run_host)
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
         return jobs, clamped
-
-    def _mapped_path(self, path: Path, obj: Mapping) -> Path:
-        """``path`` as given when it exists here; else, when it lies under the
-        submitter's workspace (``client_code_root``, its %code%), the same
-        place under this machine's (:attr:`code_root`).  The submitter's copy
-        is still checked against the one that runs (:meth:`_check_client_copy`).
-        Without a usable ``client_code_root`` (an older client, %code% unset
-        there), the longest tail of ``path`` that starts with a top-level
-        folder of this workspace (``k-exp\\...``) is taken -- only when the
-        submitter's ``client_sha256`` matches the file there."""
-        if path.exists() or not self.code_root:
-            return path
-        mine = Path(self.code_root)
-        theirs = str(obj.get("client_code_root") or "").strip()
-        if theirs:
-            try:
-                return (mine / path.relative_to(Path(theirs).resolve())).resolve()
-            except ValueError:
-                pass
-        sha = str(obj.get("client_sha256") or "").lower()
-        if not sha:
-            return path
-        parts = path.parts
-        for i in range(1, len(parts) - 1):
-            if not (mine / parts[i]).is_dir():
-                continue
-            candidate = mine.joinpath(*parts[i:]).resolve()
-            if candidate.is_file() and file_sha256(candidate) == sha:
-                return candidate
-        return path
-
-    def _check_client_copy(self, obj: Mapping, path: Path, sha: str) -> None:
-        """The file that runs is this machine's copy, so it must be the one
-        the submitter means: a ``client_sha256`` (the client's hash of its own
-        file at that path) must equal this machine's; a client on another host
-        (``client_host``) that could not hash its file is refused, since
-        nothing shows the two copies agree.  A request without either (an
-        older client) is taken as before."""
-        theirs = obj.get("client_sha256")
-        if theirs:
-            if str(theirs).lower() != sha:
-                raise QueueError(f"your copy differs from {self._host}'s: {path} (the file "
-                                 f"that runs is {self._host}'s; it must match yours)")
-            return
-        host = str(obj.get("client_host") or "").strip()
-        if host and host.lower() != str(self._host).lower():
-            raise QueueError(f"{path}: the file that runs is {self._host}'s, and your copy on "
-                             f"{host} could not be read to check that it matches")
 
     # -- the order ---------------------------------------------------------------------
 
@@ -1313,7 +1269,11 @@ class RunQueue:
                         waiting=self._why_waiting(job, now, order), source_changed=None,
                         estimate=estimate)
             if job.state == "queued":
-                pending.append((view, self._stat_key(job.path), job.sha256))
+                if self.launchers is not None:
+                    # the file is on the job's own PC: its launcher says
+                    view["source_changed"] = self.launchers.source_changed(job.id)
+                else:
+                    pending.append((view, self._stat_key(job.path), job.sha256))
                 estimate["eta_start"] = start_of.get(job.id)
                 if estimate["eta_start"] is not None and dur is not None:
                     estimate["eta_end"] = estimate["eta_start"] + dur
@@ -1602,6 +1562,8 @@ class RunQueue:
             refusal = self._agent_kill_refusal(asked)      # outside the lock: it polls liveOD
             if refusal:
                 return {"status": "error", "msg": refusal}
+        if self.launchers is not None:
+            return self._kill_remote(obj, by, as_owner)
         with self._lock:
             try:
                 job = self._find(obj)
@@ -1679,6 +1641,65 @@ class RunQueue:
         if alive_left:
             reply["msg"] = f"{job.name}: {note}"
         return reply
+
+    def _kill_remote(self, obj: Mapping, by: str, as_owner: str) -> dict:
+        """:meth:`kill` with launchers: the job's process is on its own PC, so
+        the kill is an ORDER to its launcher (this server answers one request
+        at a time and never waits for a launcher inside one): the reply has
+        ``pending``, and the launcher's result lands in the job's ``kill``
+        record (``pending`` false, ``results``, ``note``) -- ``kq kill`` waits
+        for it.  ``gone`` (a person only, and only while the launcher is
+        silent): nothing is killed; the person says nothing of the job runs
+        on its PC any more, and the job ends at the next tick."""
+        gone = bool(obj.get("gone"))
+        with self._lock:
+            try:
+                job = self._find(obj)
+            except QueueError as exc:
+                return {"status": "error", "msg": str(exc)}
+            if job.state not in ("launching", "running"):
+                return {"status": "error", "state": job.state,
+                        "msg": (f"{job.name} is queued: remove it instead" if job.state == "queued"
+                                else f"{job.name} is {job.state}: its process has exited"
+                                if job.state == "ending" else
+                                f"{job.name} is already {job.state}")}
+            host = job.run_host or "its PC"
+            silent = self.launchers.silent_for(job.id)
+            quiet = silent is None or silent > self.launchers.silent_s
+            if gone:
+                if as_owner != "person":
+                    return {"status": "error", "msg": "only a person may declare a job gone (it "
+                                                      "frees the slot without killing anything)"}
+                if not quiet:
+                    return {"status": "error",
+                            "msg": f"{job.name}'s launcher on {host} answers (heard from "
+                                   f"{silent:.0f} s ago): kill it with kq kill {job.id}, not "
+                                   "--gone"}
+                note = (f"declared gone by {by}: its launcher on {host} "
+                        + ("never attached" if silent is None else f"silent {silent:.0f} s")
+                        + "; nothing was killed -- whatever of it ran there is assumed ended")
+                job.kill = {"by": by, "at": self._clock(), "results": [], "note": note,
+                            "pending": False, "gone": True}
+                self.launchers.declare_gone(job.id)
+            else:
+                w = job.warm or {}
+                key = str(w["token"]) if w.get("go") and w.get("token") else "cold"
+                self.launchers.kill_order(job.id, key)
+                note = (f"kill sent to its launcher on {host}" + (
+                    "" if not quiet else
+                    f" -- which is silent ({'never attached' if silent is None else f'{silent:.0f} s'}):"
+                    " it is killed when the launcher answers; if that PC is off or nothing of it "
+                    f"runs there, a person can free the slot with kq kill {job.id} --gone"))
+                job.kill = {"by": by, "at": self._clock(), "results": [], "note": note,
+                            "pending": True}
+        log.warning("Run queue: FORCE KILL of %s (run %s) asked by %s: %s.", job.name,
+                    job.run_id if job.run_id is not None else "none", by, note)
+        self._record("run_queue_kill", job=job.id, by=by, run_id=job.run_id, results=[],
+                     note=note, gone=gone, host=job.run_host)
+        self._save()
+        self._notify()
+        return {"status": "ok", "job": self._public(job), "results": [], "pending": not gone,
+                "note": note, "gone": gone, "silent": quiet}
 
     def list(self, obj: Mapping | None = None) -> dict:
         """``{"states"?: [...], "limit"?: n}`` -> the jobs: the ended ones (by
@@ -2070,6 +2091,15 @@ class RunQueue:
             return f"agent jobs paused by {p.get('by')} since {_since_text(p.get('since'))}"
         if job.owner == "agent" and self.hold.active and not ignore_hold:
             return f"held: {self.hold.info().get('reason')}"
+        if self.launchers is not None:
+            if not job.run_host:
+                return "it names no PC to run on (submitted before 2026-11-15): cancel it"
+            if not self.launchers.attached(job):
+                silent = self.launchers.silent_for(job.id)
+                return (f"waiting for {job.run_host}'s launcher"
+                        + ("" if silent is None else f" (silent {silent:.0f} s)"))
+            if not job.sha256:
+                return f"waiting for {job.run_host}'s launcher to read the file"
         return ""
 
     def _dep_state(self, job_id: int) -> str:
@@ -2144,6 +2174,8 @@ class RunQueue:
             if cur is not None:
                 self._follow(cur)
             self._settle(now)
+            if self.launchers is not None:
+                self.launchers.tick()
             self._warm_tick(self._clock())
             if self._current is None:
                 self._schedule(self._clock())
@@ -2282,6 +2314,12 @@ class RunQueue:
         busy = self._server_busy() if self._server_busy is not None else ""
         if busy:
             return busy
+        if self.launchers is not None:
+            if self.launchers.in_grace():
+                return "the monitor server has just started: the jobs' launchers attach first"
+            block = self.launchers.gate_block()
+            if block:
+                return block
         loop = self._active_loop()
         if loop is not None:
             info = loop.info()
@@ -2329,6 +2367,8 @@ class RunQueue:
         :func:`_warm_public`)."""
         d = job.to_dict()
         d["warm"] = _warm_public(job.warm, self._clock() if now is None else now)
+        if self.launchers is not None:
+            d["launcher"] = self.launchers.public(job)
         return d
 
     def _warm_summary(self, now: float) -> dict | None:
@@ -2371,25 +2411,32 @@ class RunQueue:
             return "reserve" in f
         return False
 
-    def _job_env(self, job: Job, warm_token: str | None = None) -> dict:
-        """A launch's environment.  ``WAXX_QUEUE_WARM`` only on a warm
-        launch (never inherited from the server's own environment)."""
+    def _job_env_vars(self, job: Job, warm_token: str | None = None) -> dict:
+        """The variables the queue sets for a launch, on top of the
+        environment of whoever starts the process (None: removed).
+        ``WAXX_QUEUE_WARM`` only on a warm launch (never inherited)."""
         # unbuffered: output reaches the log as printed; UTF-8: the log is read
         # as UTF-8, and a console code page cannot fail a print of "µs" or "─"
-        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-        env[run_gate.LAUNCHER_ENV] = LAUNCHER
-        env[JOB_ENV] = job.queue_job
-        env[OWNER_ENV] = job.owner
-        if job.write_back is False:
-            env[NO_WRITE_BACK_ENV] = "1"
-        else:
-            env.pop(NO_WRITE_BACK_ENV, None)
-        env.pop(WARM_ENV, None)
-        if warm_token:
-            env[WARM_ENV] = warm_token
+        return {"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+                run_gate.LAUNCHER_ENV: LAUNCHER, JOB_ENV: job.queue_job, OWNER_ENV: job.owner,
+                NO_WRITE_BACK_ENV: "1" if job.write_back is False else None,
+                WARM_ENV: warm_token or None}
+
+    def _job_env(self, job: Job, warm_token: str | None = None) -> dict:
+        """A launch's environment: this process's, with :meth:`_job_env_vars`."""
+        env = dict(os.environ)
+        for k, v in self._job_env_vars(job, warm_token).items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
         return env
 
     def _command(self, job: Job) -> str:
+        if self.launchers is not None:
+            # what the job's launcher runs, on its own PC (for the records)
+            return (f"[on {job.run_host or '?'}] artiq_run {_quote(job.path)}"
+                    + "".join(" " + _quote(a) for a in job.argv))
         command = ar_command(_quote(job.path))
         if job.argv:
             command += " " + " ".join(_quote(a) for a in job.argv)
@@ -2475,6 +2522,24 @@ class RunQueue:
         a pid whose recorded creation time still matches (Windows reuses
         pids).  Tried once per warm launch.  True when nothing of it is left
         alive; False leaves the alarm to the caller."""
+        if self.launchers is not None:
+            with self._lock:
+                w = job.warm
+                if (w is None or w.get("state") != "aborting" or w.get("kill_tried")
+                        or w.get("go") or not w.get("token")):
+                    return False
+                w["kill_tried"] = self._clock()
+                w["kill_note"] = f"kill order sent to its launcher on {job.run_host or '?'}"
+            self.launchers.kill_order(job.id, str(w["token"]))
+            log.warning("Run queue: %s's discarded warm process had not exited %.0f s after it "
+                        "was told to (%s); never given GO: its launcher on %s is told to kill "
+                        "it.", job.name, waited, w.get("why"), job.run_host or "?")
+            self._record("run_queue_warm_killed", job=job.id, attempt=w.get("attempt"),
+                         waited_s=round(waited, 1), why=w.get("why"), results=[],
+                         note=w["kill_note"], stopped=False)
+            self._save()
+            self._notify()
+            return True                               # its exit is seen at a later tick
         with self._lock:
             w = job.warm
             if w is None or w.get("state") != "aborting" or w.get("kill_tried"):
@@ -2565,6 +2630,13 @@ class RunQueue:
                 return ""
             manifest = list(w.get("manifest") or ())
             sha, path = w.get("sha256"), job.path
+        if self.launchers is not None:
+            # the files are on the job's own PC: the warm process re-stats its
+            # manifest itself before GO (queue_gate.ensure_go), and its
+            # launcher says whether the experiment file changed
+            if self.launchers.source_changed(job.id) and not job.allow_drift:
+                return "its experiment file changed since its warm launch"
+            return ""
         for entry in manifest:
             try:
                 p, mtime, size = str(entry[0]), int(entry[1]), int(entry[2])
@@ -2586,10 +2658,26 @@ class RunQueue:
             return "its experiment file changed since its warm launch"
         return ""
 
-    def _adopt_warm(self, w: Mapping):
+    def _adopt_job(self, job: Job, pid, started, key: str | None = None):
+        """The job's process to follow again (a restart, the orphan path):
+        with launchers, always the launcher's handle on its child ``key``
+        (default: the one the job's state names) -- a process this server
+        cannot see is never taken for gone; else adopted by pid AND creation
+        time, or None."""
+        if self.launchers is not None:
+            if key is None:
+                w = job.warm or {}
+                key = str(w["token"]) if w.get("go") and w.get("token") else "cold"
+            return self.launchers.proc(job.id, key)
+        return self._adopt(pid, started)
+
+    def _adopt_warm(self, w: Mapping, job: Job | None = None):
         """A watch on a warm process from its record -- the launched shell,
         else the experiment's python -- by pid AND creation time (a pid with
-        no recorded creation time is never taken: Windows reuses pids)."""
+        no recorded creation time is never taken: Windows reuses pids).  With
+        launchers: the job's launcher's handle on it."""
+        if self.launchers is not None and job is not None and w.get("token"):
+            return self.launchers.proc(job.id, str(w["token"]))
         for pid_key, started_key in (("cmd_pid", "cmd_started"), ("py_pid", "py_started")):
             pid, started = w.get(pid_key), w.get(started_key)
             if not pid or started is None:
@@ -2606,6 +2694,12 @@ class RunQueue:
         """None while the job's warm process lives (or may: its launch is
         still being answered); its exit code once it is gone (-1: unknown)."""
         proc = self._warm_procs.get(job.id)
+        token = str((job.warm or {}).get("token") or "")
+        if self.launchers is not None and token and getattr(proc, "key", None) != token:
+            # never "gone" by a timeout: only the launcher's report ends it
+            # (and never a handle left from an earlier warm attempt)
+            proc = self.launchers.proc(job.id, token)
+            self._warm_procs[job.id] = proc
         if proc is None:
             sp = self._warm_spawn
             if sp is not None and sp["job"] == job.id:
@@ -2698,12 +2792,17 @@ class RunQueue:
                     or self._warm_skip.get(cand.id) == cur.id):
                 return
             path = cand.path
-        try:
-            sha = file_sha256(path)
-        except OSError:
-            return
-        if sha != cand.sha256 and not cand.allow_drift:
-            return                                    # skipped at its cold launch, as today
+        if self.launchers is not None:
+            sha = cand.sha256                         # its launcher checks the file itself
+            if self.launchers.source_changed(cand.id) and not cand.allow_drift:
+                return                                # skipped at its cold launch
+        else:
+            try:
+                sha = file_sha256(path)
+            except OSError:
+                return
+            if sha != cand.sha256 and not cand.allow_drift:
+                return                                # skipped at its cold launch, as today
         self._warm_launch(cand, cur, sha, now)
 
     def _warm_launch(self, job: Job, cur: Job, sha: str, now: float) -> None:
@@ -2881,7 +2980,7 @@ class RunQueue:
         if proc is None:
             with self._lock:
                 w = dict(job.warm or {})
-            proc = self._adopt_warm(w)
+            proc = self._adopt_warm(w, job)
             if proc is None:
                 self._discard_warm(job, "its process cannot be followed (no watch, no pid with "
                                         "a creation time)")
@@ -3087,6 +3186,17 @@ class RunQueue:
             self.flush_journal()
         return reply
 
+    def launcher_request(self, obj: Mapping) -> dict:
+        """A job launcher's heartbeat (``kq launch`` on the job's own PC):
+        :meth:`LauncherBridge.request
+        <waxx.util.device_state.launcher_bridge.LauncherBridge.request>`.
+        Short: memory, queue.json and the jobs' logs only, never liveOD."""
+        if self.launchers is None:
+            return {"status": "error",
+                    "msg": "unknown run_queue action 'launcher': this queue starts its jobs "
+                           "itself"}
+        return self.launchers.request(obj)
+
     def _warm_why(self, job: Job, now: float) -> str:
         """Why a ready warm process waits (under the lock; memory only)."""
         cur = self._jobs.get(self._current) if self._current is not None else None
@@ -3112,12 +3222,17 @@ class RunQueue:
         for in liveOD instead (:meth:`_follow_orphan`)."""
         # (a job with a warm launch never comes here: _schedule hands it to
         # _go_or_wait -- never a second, cold process for one job)
-        try:
-            sha = file_sha256(job.path)
-        except OSError as exc:
-            sha, unreadable = None, exc
+        if self.launchers is not None:
+            # the file is on the job's own PC: its launcher checks it before it
+            # starts it (skipped there when it changed since submit)
+            sha, unreadable = job.sha256, None
         else:
-            unreadable = None
+            try:
+                sha = file_sha256(job.path)
+            except OSError as exc:
+                sha, unreadable = None, exc
+            else:
+                unreadable = None
         with self._lock:
             if job.state != "queued":                  # cancelled meanwhile
                 return False
@@ -3227,6 +3342,8 @@ class RunQueue:
                 sp["warned"] = True
                 log.warning("Run queue: %s: its launch has not finished after %.0f s; the slot "
                             "stays taken (the job is looked for in liveOD).", job.name, waited)
+            if self.launchers is not None and waited <= LAUNCH_TIMEOUT_S + ORPHAN_WAIT_S:
+                return                    # the bridge's wait ends within SPAWN_WAIT_S
             if waited <= LAUNCH_TIMEOUT_S + ORPHAN_WAIT_S:
                 self._follow_orphan(job, keep_waiting=True)
                 return
@@ -3283,12 +3400,26 @@ class RunQueue:
         self._notify()
 
     def _launch_failed(self, job: Job, exc) -> None:
-        log.error("Run queue: could not start %s: %r", job.name, exc)
-        for line in environment_report():
-            log.error("  %s", line)
+        from waxx.util.device_state.launcher_bridge import SkippedAtLaunch  # noqa: PLC0415
+        skipped = isinstance(exc, SkippedAtLaunch)
+        remote = self.launchers is not None
+        (log.warning if skipped else log.error)(
+            "Run queue: %s %s: %s", job.name,
+            "skipped at launch" if skipped else "could not start", exc if remote else repr(exc))
+        if not remote:
+            for line in environment_report():
+                log.error("  %s", line)
         with self._lock:
             if job.state == "launching":
-                self._end(job, "failed", f"could not start: {exc!r}")
+                where = f" on {job.run_host}" if remote else ""
+                if skipped:
+                    self._end(job, "skipped", f"{exc}{where}")
+                elif job.kill is not None:
+                    self._end(job, "cancelled", f"killed by {job.kill.get('by')} before it "
+                                                f"started{where}", stop_chain=True)
+                else:
+                    self._end(job, "failed", f"could not start{where}: "
+                                             f"{exc if remote else repr(exc)}")
             self._current = None
             self._procs.pop(job.id, None)
             self._last_end_t = self._clock()
@@ -3301,13 +3432,30 @@ class RunQueue:
         launched again.  Its run is looked for in liveOD (launcher "kq",
         queue_job = "<id>:<token>"): a run in progress is adopted (its experiment's
         pid), a recorded outcome judges it; after :data:`ORPHAN_WAIT_S` with
-        neither it ends failed ("server stopped while launching -- check")."""
+        neither it ends failed ("server stopped while launching -- check").
+
+        With launchers it is followed through its launcher at once and never
+        ended for silence: the launcher reports a child it started, or starts
+        it (the job's launching state is the order; it never starts one
+        twice), or says why not -- and a silent launcher holds the slot
+        (the alarm says so) until it reports or a person declares it gone."""
+        if self.launchers is not None:
+            proc = self._adopt_job(job, None, None)
+            if keep_waiting:
+                self._abandon_spawn()
+            log.warning("Run queue: %s was launching with no answer from its launch; followed "
+                        "through its launcher on %s.", job.name, job.run_host or "?")
+            self._record("run_queue_adopted", job=job.id, via="launcher", host=job.run_host)
+            with self._lock:
+                job.adopted = True
+            self._launched(job, proc)
+            return
         poll = self._last_poll
         if self._is_job_run(job, poll) and poll.get("run_in_progress"):
             proc = None
             try:
                 # its creation time too (F3): a reused pid is not adopted
-                proc = self._adopt(poll.get("client_pid"), poll.get("client_started"))
+                proc = self._adopt_job(job, poll.get("client_pid"), poll.get("client_started"))
             except Exception:                         # noqa: BLE001
                 proc = None
             if proc is not None:
@@ -3474,8 +3622,25 @@ class RunQueue:
             # (never after a kill: an Abort would discard the file liveOD keeps)
             self._send_abort(job)
         proc = self._procs.get(job.id)
+        if proc is None and self.launchers is not None and job.kill is None:
+            # a job with launchers always has its launcher's handle: never
+            # "no handle, so gone"
+            proc = self._adopt_job(job, None, None)
+            self._procs[job.id] = proc
         code = proc.poll() if proc is not None else -1
         if code is None:
+            return
+        not_started = getattr(proc, "not_started", None)
+        if not_started and job.run_id is None:
+            # its launcher never started it (after the launch's wait gave up)
+            from waxx.util.device_state.launcher_bridge import (  # noqa: PLC0415
+                NotStarted, SkippedAtLaunch)
+            state, why = not_started
+            with self._lock:
+                job.state = "launching"               # as if the launch had just answered
+            self._launch_failed(job, SkippedAtLaunch(why) if state == "skipped"
+                                else NotStarted(why))
+            _close(proc)
             return
         go = (job.warm or {}).get("go")
         if go and not go.get("delivered"):
@@ -3805,6 +3970,15 @@ class RunQueue:
     def _alarm_tick(self, now: float) -> None:
         with self._lock:
             cur = self._jobs.get(self._current) if self._current is not None else None
+        if (self.launchers is not None and cur is not None and cur.state in IN_SLOT
+                and not self.launchers.in_grace() and not self.launchers.attached(cur)):
+            silent = self.launchers.silent_for(cur.id)
+            waited = (silent if silent is not None
+                      else now - float(cur.launched_at or now))
+            self._raise_alarm(now, cur, waited, self.launchers.silent_text(cur))
+            return
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
             stuck = (cur is not None and cur.state == "launching"
                      and now - float(cur.launched_at or now) > SPAWN_WARN_S)
         if stuck:
@@ -3979,12 +4153,19 @@ class RunQueue:
                 continue
             proc = None
             try:
-                proc = self._adopt(job.pid, job.pid_started)
+                proc = self._adopt_job(job, job.pid, job.pid_started)
             except Exception:                         # noqa: BLE001
                 proc = None
             job.state = "running"
             self._procs[job.id] = proc
-            if proc is not None:
+            if proc is not None and self.launchers is not None:
+                job.adopted = True
+                log.warning("Run queue: %s (run %s) was running when the server stopped: "
+                            "followed again through its launcher on %s (its end comes from "
+                            "the launcher's report).", job.name, job.run_id, job.run_host or "?")
+                self._record("run_queue_adopted", job=job.id, pid=job.pid, run_id=job.run_id,
+                             via="launcher", host=job.run_host)
+            elif proc is not None:
                 job.adopted = True
                 log.warning("Run queue: %s (pid %s, run %s) was running when the server "
                             "stopped and still is: followed again.", job.name, job.pid,
@@ -4021,7 +4202,7 @@ class RunQueue:
                 self._go_saved.add(job.id)            # on disk, by definition
                 if job.state != "launching":
                     continue                          # running: adopted by job.pid below
-                proc = self._adopt_warm(w)
+                proc = self._adopt_warm(w, job)
                 if proc is not None:
                     job.state = "running"
                     job.pid = int(proc.pid)
@@ -4048,7 +4229,7 @@ class RunQueue:
                 if w.get("state") != "aborting":
                     w.update(state="aborting", why=f"{job.name} is {job.state}", aborted_at=now)
             w["adopt_from"] = now
-            proc = self._adopt_warm(w)
+            proc = self._adopt_warm(w, job)
             if proc is not None:
                 self._warm_procs[job.id] = proc
                 log.warning("Run queue: %s's warm process (%s) is alive after the restart: "

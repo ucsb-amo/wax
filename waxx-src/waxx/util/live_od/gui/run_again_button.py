@@ -75,7 +75,8 @@ def again_kwargs(job: dict) -> dict:
     file again as the next job -- the fields the queue panel's
     :func:`~waxx.util.guis.run_queue_panel.again_request` carries (``first``):
     argv, working folder, label, write-back veto, drift; at index 0; owner
-    person."""
+    person.  (The button itself now uses :meth:`RunQueueClient.again`, which
+    runs the job on the PC that ran it; kept for callers.)"""
     kw: dict[str, Any] = {
         "argv": [str(a) for a in (job.get("argv") or [])],
         "cwd": job.get("cwd") or None,
@@ -220,7 +221,10 @@ class RunAgainButton(QPushButton):
                 out["record_error"] = getattr(exc, "msg", None) or str(exc)
             except Exception as exc:                  # noqa: BLE001
                 out["record_error"] = f"the request failed: {exc}"
-        if path:
+        import socket  # noqa: PLC0415
+        run_host = str((out.get("record") or {}).get("run_host") or "")
+        if path and (not run_host or run_host.lower() == socket.gethostname().lower()):
+            # (another PC's file is that PC's to check: its launcher does)
             out["sha"] = local_sha256(str(path))
         return out
 
@@ -355,14 +359,14 @@ class RunAgainButton(QPushButton):
             lines.append(f"Experiment class: {rec['expt_class']}")
         if rec.get("argv"):
             lines.append("Arguments: " + " ".join(map(str, rec["argv"])))
-        notes = ["The file runs as it is on disk NOW (the queue checks its SHA-256 as for "
-                 "any submission)."]
+        where = str(rec.get("run_host") or "") or "this PC"
+        notes = [f"It runs again on {where}, the PC that ran it, from that PC's file as it is "
+                 "NOW (its launcher checks the SHA-256 as for any submission)."]
         if self.file_changed():
             notes.append(f"It has CHANGED since job {self.job_ref[0]} was submitted: the "
                          "current version runs, not the one that ran.")
-        elif self.file_unreadable():
-            notes.append("This PC cannot read the file: the queue refuses it unless this PC "
-                         "is the queue machine.")
+        elif self.file_unreadable() and where == "this PC":
+            notes.append("This PC cannot read the file: it is refused.")
         dropped = not_carried_over(rec)
         if dropped:
             notes.append("Not carried over: " + "; ".join(dropped) + ".")
@@ -399,11 +403,16 @@ class RunAgainButton(QPushButton):
 
     @staticmethod
     def _submit(client, job: dict) -> dict:
-        """On the worker: ``{"ok", "reply" | "msg", "sha"}``."""
+        """On the worker: ``{"ok", "reply" | "msg", "sha"}``.  The job runs
+        again on the PC that ran it (:meth:`RunQueueClient.again`); ``sha``
+        is this PC's hash of the file only when this PC is that PC."""
+        import socket  # noqa: PLC0415
         path = str(job.get("path"))
-        sha = local_sha256(path)
+        here = (str(job.get("run_host") or "") or socket.gethostname()).lower() == \
+            socket.gethostname().lower()
+        sha = local_sha256(path) if here else None
         try:
-            reply = client.submit(path, **again_kwargs(job))
+            reply = client.again(job, first=True)
             return {"ok": True, "reply": dict(reply or {}), "sha": sha}
         except (NoRunQueue, RunQueueError) as exc:
             return {"ok": False, "msg": getattr(exc, "msg", None) or str(exc), "sha": sha}
