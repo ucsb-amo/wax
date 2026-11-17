@@ -294,6 +294,18 @@ def test_parallel_write_waits_for_the_timeline_only_after_light_and_marks_the_ch
     assert "delay(" not in par                                # nothing on the timeline
 
 
+def test_the_runs_first_parallel_write_is_blocking():
+    """An experiment that writes the SLM itself has its mask set on its first
+    write: that one goes the blocking way, the ones after it in parallel."""
+    body = _body(slm_mod.SLM.write_phase_mask_kernel)
+    i_first = body.index("if parallel and not self._first_parallel_write_done:")
+    i_mark = body.index("self._first_parallel_write_done = True")
+    i_block = body.index("parallel = False")
+    i_par = body.index("if parallel:")
+    assert i_first < i_mark < i_par and i_first < i_block < i_par
+    assert slm_mod.SLM()._first_parallel_write_done is False
+
+
 def test_first_use_checks_on_the_spot_only_with_slack():
     body = _body(slm_mod.SLM.ensure_mask_settled)
     assert "self._light_this_shot = True" in body

@@ -92,6 +92,10 @@ class SLM:
         self._use_pending = False
         self._t_use_mu = np.int64(-1)
         self._light_this_shot = False
+        # Whether this run has asked for a parallel write yet: the first one
+        # is done blocking (write_phase_mask_kernel), so an experiment that
+        # sets the SLM itself has its mask set before its first shot goes on.
+        self._first_parallel_write_done = False
 
     def _command(self, dimension, phase, x_center, y_center, mask_type, initialize):
         """The pattern command for these arguments (defaults from the params),
@@ -597,7 +601,15 @@ class SLM:
             was already used in this shot, the timeline is waited for first,
             so no earlier light sees the new mask. False: the old blocking
             write, then SLM_RPC_DELAY on the timeline (setup at run start).
+            The run's first parallel=True write is done as parallel=False:
+            an experiment that writes the SLM itself has its mask set on its
+            first write (in its first shot, which waits for it), and only
+            the writes after it go in parallel.
         """
+        if parallel and not self._first_parallel_write_done:
+            # set on the experiment's first write: blocking, like the setup
+            self._first_parallel_write_done = True
+            parallel = False
         if parallel:
             if self._light_this_shot:
                 self.core.wait_until_mu(now_mu())
@@ -640,7 +652,8 @@ class SLM:
     @kernel
     def write_phase_mask_async(self, dimension=dv, phase=dv, x_center=di, y_center=di,
                                mask_type='spot', initialize=False, verbose=True):
-        """write_phase_mask_kernel(..., parallel=True), by name."""
+        """write_phase_mask_kernel(..., parallel=True), by name (the run's
+        first is blocking: see there)."""
         self.write_phase_mask_kernel(dimension, phase, x_center, y_center, mask_type,
                                      initialize, verbose, True, True)
 
