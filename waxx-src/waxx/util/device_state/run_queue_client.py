@@ -275,9 +275,14 @@ class RunQueueClient:
             # a monitor server from before 2026-11-15: it starts its jobs itself
             return {"ok": True, "msg": "the monitor server starts the jobs itself"}
         pairs = [(int(j["id"]), str(j["token"])) for j in jobs]
+        # the server's address as this client found it: the launcher's first
+        # connection goes there (no beacon wait)
+        server = getattr(self.transport, "server_address", None)
+        if not (isinstance(server, tuple) and len(server) == 2):
+            server = None
         try:
             from waxx.util.device_state.launcher import start_detached  # noqa: PLC0415
-            return {"ok": True, "pid": start_detached(pairs)}
+            return {"ok": True, "pid": start_detached(pairs, server=server)}
         except Exception as exc:                      # noqa: BLE001
             return {"ok": False, "msg": (f"could not start the jobs' launcher on this PC "
                                          f"({exc!r}); the jobs wait until one runs: kq launch "

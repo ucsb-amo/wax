@@ -60,6 +60,10 @@ RETRY_S = 2.0
 #: A new connection to the monitor server after this many silent tries.
 RECONNECT_AFTER = 15
 REQUEST_TIMEOUT_S = 5.0
+#: With no child running and no output unsent, a heartbeat asks the server to
+#: hold its reply up to this long for an order (``wait_s``; the server caps it
+#: below REQUEST_TIMEOUT_S): the launch starts the moment the queue gives it.
+HOLD_S = 2.5
 #: The environment variables this PC must have to run an experiment.
 NEEDED_ENV = ("kpy", "db")
 #: Windows variable names ignore case, and a dict copy of os.environ there has
@@ -163,6 +167,8 @@ class Launcher:
         self._sha_cache: dict = {}
         self.next_beat_s = BEAT_S
         self.silent_tries = 0
+        #: a child was started in this heartbeat: report it at once
+        self._started_now = False
         for jid, token in pairs:
             self._take(int(jid), str(token))
 
@@ -346,6 +352,7 @@ class Launcher:
                                 "warm": key != "cold"}
         self._watches[(job["id"], key)] = watch
         self._save(job)
+        self._started_now = True
         log.info("kq launch: job %s started (%s, pid %s).", job["id"],
                  "warm" if key != "cold" else "cold", watch.pid)
 
@@ -443,9 +450,14 @@ class Launcher:
             jobs.append({"id": jid, "token": job["token"], "children": children,
                          "kills": dict(job["kills"]), "log": self._log_entry(job),
                          "info": self._info(job)})
-        return {"type": "run_queue", "action": "launcher",
-                "launcher": {"id": self.lid, "host": self.host, "pid": self.pid,
-                             "started": self.started}, "jobs": jobs}
+        out = {"type": "run_queue", "action": "launcher",
+               "launcher": {"id": self.lid, "host": self.host, "pid": self.pid,
+                            "started": self.started}, "jobs": jobs}
+        if not any(self._alive(j) or self._log_behind(j) for j in self.jobs.values()):
+            # nothing to follow here: the server may hold the reply until an
+            # order comes (a server from before 2026-11-16 ignores it)
+            out["wait_s"] = HOLD_S
+        return out
 
     def apply(self, reply: dict) -> None:
         try:
@@ -506,6 +518,7 @@ class Launcher:
                 self.transport, self.silent_tries = None, 0
             return RETRY_S
         self.silent_tries = 0
+        self._started_now = False
         if reply.get("status") != "ok":
             msg = str(reply.get("msg") or reply)
             if "unknown run_queue action" in msg:
@@ -518,6 +531,8 @@ class Launcher:
                 log.warning("kq launch: the server refused the heartbeat: %s", msg)
             return RETRY_S
         self.apply(reply)
+        if self._started_now:
+            return BEAT_MIN_S                         # its pid goes to the server now
         return self.next_beat_s
 
     def run(self) -> int:
@@ -538,6 +553,29 @@ def _connect():
     return connect_monitor(3.0)
 
 
+def parse_server(text: str) -> tuple[str, int]:
+    """``"192.168.1.76:5000"`` -> ``("192.168.1.76", 5000)`` (ValueError otherwise)."""
+    host, _, port = str(text).rpartition(":")
+    if not host or not port:
+        raise ValueError(f"not <host>:<port>: {text!r}")
+    return host, int(port)
+
+
+def connect_first_at(server: tuple[str, int] | None):
+    """A connect callable for :class:`Launcher`: the first connection goes to
+    ``server`` (the address the submitting ``kq`` found: no beacon wait), every
+    later one -- after the server stayed silent -- by discovery."""
+    first = [server]
+
+    def connect():
+        addr, first[0] = first[0], None
+        if addr is not None:
+            from waxx.util.comms_server.comm_client import MonitorClient  # noqa: PLC0415
+            return MonitorClient.at(*addr)
+        return _connect()
+    return connect
+
+
 def _default_command(order: dict) -> str:
     from waxx.util.device_state.monitor_manager import ar_command  # noqa: PLC0415
     command = ar_command(_quote(str(order["path"])))
@@ -547,10 +585,13 @@ def _default_command(order: dict) -> str:
     return command
 
 
-def start_detached(pairs, *, directory: str | None = None, launch=None) -> int:
+def start_detached(pairs, *, directory: str | None = None, launch=None,
+                   server: tuple[str, int] | None = None) -> int:
     """Start a launcher for ``pairs`` (``[(id, token), ...]``) on this PC,
     outside the caller's process tree (a closed terminal or a dashboard's
-    ``taskkill /T`` leaves it running), with no window.  -> its pid."""
+    ``taskkill /T`` leaves it running), with no window.  ``server``: the
+    monitor server's ``(host, port)`` the caller found (the launcher's first
+    connection goes there, without discovery).  -> its pid."""
     from waxx.util.device_state import detached  # noqa: PLC0415
     pairs = [(int(j), str(t)) for j, t in pairs]
     if not pairs:
@@ -562,6 +603,9 @@ def start_detached(pairs, *, directory: str | None = None, launch=None) -> int:
         exe = exe[:-len("pythonw.exe")] + "python.exe"
     command = (f"{_quote(exe)} -m waxx.util.device_state.launcher "
                + " ".join(f"{j}:{t}" for j, t in pairs))
+    if server is not None:
+        host, port = server
+        command += f" --server {host}:{int(port)}"
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
     env.pop("WAXX_QUEUE_WARM", None)
     log_path = os.path.join(directory, f"launcher_{pairs[0][0]}.log")
@@ -578,15 +622,23 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     words = list(sys.argv[1:] if argv is None else argv)
+    server = None
     try:
+        if "--server" in words:
+            i = words.index("--server")
+            if i + 1 >= len(words):
+                raise ValueError("--server needs <host>:<port>")
+            server = parse_server(words[i + 1])
+            del words[i:i + 2]
         pairs = parse_pairs(words)
     except ValueError as exc:
-        print(f"kq launch: {exc} (usage: kq launch <id>:<token> ...)", file=sys.stderr)
+        print(f"kq launch: {exc} (usage: kq launch <id>:<token> ... [--server <host>:<port>])",
+              file=sys.stderr)
         return 2
     if not pairs:
         print("kq launch: no job given (usage: kq launch <id>:<token> ...)", file=sys.stderr)
         return 2
-    launcher = Launcher(pairs, connect=_connect)
+    launcher = Launcher(pairs, connect=connect_first_at(server))
     if not launcher.jobs:
         print("kq launch: every job given has a launcher on this PC already", file=sys.stderr)
         return 0

@@ -187,7 +187,7 @@ def _rpc_bursts(times, max_gap_s=0.005, min_rpcs=50):
 _HOST_STEPS = [
     ("waxx.base.monitor", "Monitor", "init_monitor", "monitor.init_monitor"),
     ("waxx.base.scanner", "Scanner", "init_xvars", "init_xvars"),
-    ("waxx.base.scanner", "Scanner", "generate_assignment_kernels",
+    ("waxx.base.scanner_parts.param_sync", "ParamSync", "generate_assignment_kernels",
      "generate_assignment_kernels"),
     ("waxx.base.expt", "Expt", "end_wax", "end_wax"),
     ("waxx.base.expt", "Expt", "_finish_camera_streams", "camera streams finish"),

@@ -676,6 +676,7 @@ class RunQueue:
                  fence: Callable[[], dict | None] | None = None,
                  monitor_state: Callable[[], object] | None = None,
                  server_busy: Callable[[], str] | None = None,
+                 cut_monitor_start: Callable[..., bool] | None = None,
                  loops: Mapping | None = None,
                  start_monitor: Callable[[str], None] | None = None,
                  hold: PersonHold | None = None, journal=None,
@@ -721,6 +722,12 @@ class RunQueue:
         self._fence = fence
         self._monitor_state = monitor_state
         self._server_busy = server_busy
+        #: cut_monitor_start(why, check_only=False) -> bool: True when the
+        #: server's only reason to be busy is a monitor that is still starting
+        #: (and, unless check_only, it has been asked to stop it: the job
+        #: launches once the monitor's process is gone -- never while it could
+        #: still connect to the core after the job)
+        self._cut_monitor_start = cut_monitor_start
         self._loops = loops if loops is not None else {}
         self._start_monitor = start_monitor
         self.hold = hold if hold is not None else PersonHold(
@@ -757,6 +764,8 @@ class RunQueue:
 
         self._lock = threading.RLock()
         self._tick_lock = threading.Lock()
+        #: set by poke(): the watch thread ticks at once (wait_for_poke)
+        self._poked = threading.Event()
         self._abort_lock = threading.Lock()
         #: queue.json snapshots: the last numbered, the last written (_save)
         self._save_lock = threading.Lock()
@@ -2337,7 +2346,35 @@ class RunQueue:
                     + "): launches wait until it can be")
         busy = self._server_busy() if self._server_busy is not None else ""
         if busy:
-            return busy
+            if not self._monitor_cuttable():
+                return busy
+            # a monitor that is still starting: stopped for the job, but only
+            # once nothing else holds the launch back (never stopped for a job
+            # that could not go anyway)
+            why = self._gate_after_server()
+            if why:
+                return why
+            try:
+                self._cut_monitor_start("the run queue has a job to launch")
+            except Exception:                         # noqa: BLE001
+                log.exception("Run queue: could not ask for the starting monitor to stop")
+                return busy
+            self._owe_monitor = True             # back when the queue runs out, whatever happens
+            self._gate_kind = "live"
+            return busy + ": it is being stopped for the next job"
+        return self._gate_after_server()
+
+    def _monitor_cuttable(self) -> bool:
+        if self._cut_monitor_start is None:
+            return False
+        try:
+            return bool(self._cut_monitor_start("", check_only=True))
+        except Exception:                             # noqa: BLE001
+            log.exception("Run queue: the monitor-start check failed")
+            return False
+
+    def _gate_after_server(self) -> str:
+        """The rest of :meth:`_gate`, after the server's own business."""
         if self.launchers is not None:
             if self.launchers.in_grace():
                 return "the monitor server has just started: the jobs' launchers attach first"
@@ -3220,6 +3257,15 @@ class RunQueue:
                     "msg": "unknown run_queue action 'launcher': this queue starts its jobs "
                            "itself"}
         return self.launchers.request(obj)
+
+    def launcher_hold(self, obj: Mapping, reply: dict) -> dict:
+        """A heartbeat's reply, held for its job's order when the launcher
+        asked (:meth:`LauncherBridge.hold_for_orders
+        <waxx.util.device_state.launcher_bridge.LauncherBridge.hold_for_orders>`).
+        The server calls it outside its request lock."""
+        if self.launchers is None or not isinstance(reply, dict):
+            return reply
+        return self.launchers.hold_for_orders(obj, reply)
 
     def _warm_why(self, job: Job, now: float) -> str:
         """Why a ready warm process waits (under the lock; memory only)."""
@@ -4302,7 +4348,22 @@ class RunQueue:
                 except Exception:                     # noqa: BLE001
                     log.exception("Could not journal %s", kind)
 
+    def poke(self) -> None:
+        """Run the next tick now (the watch thread waits in
+        :meth:`wait_for_poke`), e.g. a launcher just attached."""
+        self._poked.set()
+
+    def wait_for_poke(self, timeout: float) -> bool:
+        """The watch thread's wait between ticks: ``timeout`` s, or less when
+        :meth:`poke` is called.  -> True when poked."""
+        poked = self._poked.wait(timeout)
+        self._poked.clear()
+        return poked
+
     def _notify(self) -> None:
+        bridge = getattr(self, "launchers", None)
+        if bridge is not None:
+            bridge.wake()                         # held heartbeats look for their orders
         self.flush_journal()
         if self._on_change is None:
             return

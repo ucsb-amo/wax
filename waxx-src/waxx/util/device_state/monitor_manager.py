@@ -125,6 +125,8 @@ class MonitorManager(QThread):
         self._proc = None
         self._proc_lock = threading.Lock()
         self._stop_requested = False
+        #: (kind, reason) a requested stop is recorded as (None: stopped on request)
+        self._stop_as: tuple[str, str] | None = None
         # Last failure, kept so a GUI can show it (tooltip/status) without
         # having to scrape the terminal.
         self.last_error: str | None = None
@@ -224,6 +226,7 @@ class MonitorManager(QThread):
 
     def run(self):
         self._stop_requested = False
+        self._stop_as = None
         try:
             self.run_expt()
         except Exception:
@@ -298,8 +301,9 @@ class MonitorManager(QThread):
         output = "\n".join(tail)
 
         if self._stop_requested:
-            log.info("Monitor experiment stopped on request (exit code %s).", returncode)
-            self._ended("stopped_on_request", "stopped on request")
+            kind, reason = self._stop_as or ("stopped_on_request", "stopped on request")
+            log.info("Monitor experiment stopped (%s; exit code %s).", reason, returncode)
+            self._ended(kind, reason)
             return
 
         if _matches(output, _INTERRUPTED_SIGNATURES):
@@ -358,8 +362,9 @@ class MonitorManager(QThread):
     # Stop
     # ------------------------------------------------------------------
 
-    def stop(self, timeout_ms=1500):
-        """Gracefully stop the monitor experiment.
+    def stop(self, timeout_ms=1500, *, kind: str | None = None, reason: str = ""):
+        """Gracefully stop the monitor experiment.  ``kind`` / ``reason``: how
+        the stop is recorded (``last_stop_kind``; default "stopped_on_request").
 
         Kills the spawned child process tree (``artiq_run`` + its descendants) so the
         blocking read of the child's output returns and ``run()`` exits on its
@@ -368,6 +373,7 @@ class MonitorManager(QThread):
         subprocess.
         """
         self._stop_requested = True
+        self._stop_as = (kind, reason or kind) if kind else None
         with self._proc_lock:
             proc = self._proc
         if proc is not None:
