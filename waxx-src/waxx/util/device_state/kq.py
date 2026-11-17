@@ -585,6 +585,8 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp = sub.add_parser("launch", help="be the launcher of these jobs on this PC (kq run / "
                                        "submit start one by themselves)")
     sp.add_argument("jobs", nargs="+", metavar="ID:TOKEN")
+    sp.add_argument("--server", metavar="HOST:PORT",
+                    help="the monitor server's address (else found by discovery)")
 
     sp = sub.add_parser("pause", help="stop launching agent jobs (--all: every job)")
     sp.add_argument("--all", action="store_true")
@@ -1241,7 +1243,7 @@ def _cmd_kill(ctx: _Ctx, args) -> int:
 
 def _cmd_launch(ctx: _Ctx, args) -> int:
     from waxx.util.device_state.launcher import main as launch_main  # noqa: PLC0415
-    code = launch_main(list(args.jobs))
+    code = launch_main(list(args.jobs) + (["--server", args.server] if args.server else []))
     return EXIT_OK if code == 0 else EXIT_USAGE if code == 2 else EXIT_FAILED
 
 

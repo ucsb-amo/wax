@@ -70,6 +70,17 @@ SPAWN_WAIT_S = 30.0
 #: Heartbeat intervals the server asks for.
 FAST_BEAT_S = 1.0
 SLOW_BEAT_S = 5.0
+#: A launcher with nothing running may ask (``wait_s``) for its heartbeat's
+#: reply to be held until one of its jobs near the front has an order: the
+#: order then goes out the moment the queue gives it, not at the next beat.
+#: Held at most this long (below the launcher's request timeout), and never
+#: under the server's request lock (:meth:`LauncherBridge.hold_for_orders`).
+HOLD_MAX_S = 2.5
+#: A held heartbeat checks for its order at least this often (and at every
+#: change of the queue).
+HOLD_CHECK_S = 0.25
+#: The next beat after a hold that gave no order (the launcher asks again).
+AFTER_HOLD_BEAT_S = 0.2
 #: The server starts a launcher for one of its own host's jobs at most this often,
 SELF_START_EVERY_S = 60.0
 #: and only for a job that has had no launcher this long since its submit (the
@@ -225,6 +236,17 @@ class LauncherBridge:
         self.zombies: dict = {}
         self._self_started: dict = {}
         self._cond = threading.Condition()
+        #: bumped (under _cond) at every change a held heartbeat may wait for
+        self._wake_seq = 0
+        #: (under the queue's lock, during a heartbeat) the tick should run now
+        self._poke = False
+
+    def wake(self) -> None:
+        """Something in the queue changed: held heartbeats look for their
+        orders again, and a launch's wait for its report re-checks."""
+        with self._cond:
+            self._wake_seq += 1
+            self._cond.notify_all()
 
     # -- the queue's callables -----------------------------------------------------------
 
@@ -246,6 +268,10 @@ class LauncherBridge:
         key = env.get(WARM_ENV) or COLD
         deadline = self._wait_clock() + self.spawn_wait_s
         with self._cond:
+            # the job's state is saved (launching / warm): a held heartbeat of
+            # its launcher takes the order now
+            self._wake_seq += 1
+            self._cond.notify_all()
             while True:
                 if jid in self.gone:
                     raise NotStarted("declared gone by a person while it was launching")
@@ -291,6 +317,8 @@ class LauncherBridge:
         with self._cond:
             self._kill_seq += 1
             self.kills[(int(job_id), str(key))] = self._kill_seq
+            self._wake_seq += 1
+            self._cond.notify_all()
             return self._kill_seq
 
     def declare_gone(self, job_id: int) -> None:
@@ -298,6 +326,7 @@ class LauncherBridge:
         silent): its RemoteProc polls -1 and the queue ends it."""
         with self._cond:
             self.gone.add(int(job_id))
+            self._wake_seq += 1
             self._cond.notify_all()
 
     # -- what the queue asks -----------------------------------------------------------
@@ -359,9 +388,11 @@ class LauncherBridge:
             return {"status": "error", "msg": "a launcher must name its id and host"}
         reports = obj.get("jobs") if isinstance(obj.get("jobs"), list) else []
         out, fast, changed = {}, False, False
+        want_hold = _num(obj.get("wait_s")) > 0
         now = self._clock()
         q = self.q
         with q._lock:
+            self._poke = False
             head = [j.id for j in q._queued_in_order()[:2]]
             for rep in reports:
                 if not isinstance(rep, dict):
@@ -371,18 +402,97 @@ class LauncherBridge:
                 except (TypeError, ValueError):
                     continue
                 reply, c, f = self._one(jid, rep, lid, host, me, now, head)
+                if want_hold and self._may_hold(jid, reply, head):
+                    reply["_hold"] = True
                 out[str(jid)] = reply
                 changed |= c
                 fast |= f
+            poke, self._poke = self._poke, False
         with self._cond:
+            self._wake_seq += 1
             self._cond.notify_all()
         if changed:
             q._save()
             q._notify()
         else:
             q.flush_journal()
+        if poke:
+            # a launcher attached or a child changed: the queue's tick runs
+            # now (its job may launch, or its end be taken), not at its next
+            # turn
+            q.poke()
         return {"status": "ok", "jobs": out, "next_beat_s": FAST_BEAT_S if fast else SLOW_BEAT_S,
                 "server_time": now}
+
+    def _may_hold(self, jid: int, reply: dict, head: list) -> bool:
+        """(Under the queue's lock.)  The job's heartbeat may be held for its
+        order: no order, drop, refusal or kill in this reply, and the job is
+        near the front of the queue or launching (an order may come any
+        moment)."""
+        if any(k in reply for k in ("order", "drop", "refused", "kill", "priority")):
+            return False
+        job = self.q._jobs.get(jid)
+        if job is None or jid in self.gone:
+            return False
+        return job.state == "launching" or (job.state == "queued" and jid in head)
+
+    def hold_for_orders(self, obj, reply: dict) -> dict:
+        """Called with a heartbeat's reply OUTSIDE the server's request lock:
+        when the launcher asked (``wait_s``) and a job of it may get an order
+        soon (:meth:`_may_hold`), wait -- up to ``min(wait_s, HOLD_MAX_S)``,
+        looking at every change of the queue and every :data:`HOLD_CHECK_S`
+        -- and add the order to the reply as soon as there is one.  The
+        order is the same one the next heartbeat would get (:meth:`_order`:
+        from the queue's saved state, never started twice); the launcher
+        ignores one it has started already."""
+        jobs = reply.get("jobs") if isinstance(reply, dict) else None
+        if not isinstance(jobs, dict):
+            return reply
+        held = [int(k) for k, r in jobs.items() if isinstance(r, dict) and r.pop("_hold", False)]
+        wait = min(_num(obj.get("wait_s")), HOLD_MAX_S)
+        if not held or wait <= 0 or reply.get("status") != "ok":
+            return reply
+        me = obj.get("launcher") if isinstance(obj.get("launcher"), dict) else {}
+        lid = str(me.get("id") or "")
+        deadline = self._wait_clock() + wait
+        found: dict = {}
+        while True:
+            with self._cond:
+                seq = self._wake_seq
+            found, stop = self._held_orders(held, lid)
+            left = deadline - self._wait_clock()
+            if found or stop or left <= 0:
+                break
+            with self._cond:
+                if self._wake_seq == seq:
+                    self._cond.wait(min(HOLD_CHECK_S, left))
+        for jid, order in found.items():
+            jobs[str(jid)]["order"] = order
+        reply["next_beat_s"] = FAST_BEAT_S if (found or stop) else AFTER_HOLD_BEAT_S
+        return reply
+
+    def _held_orders(self, held: list, lid: str) -> tuple[dict, bool]:
+        """-> ({job id: order}, stop): the orders the held jobs have now;
+        ``stop`` when the hold should end without one (the job ended, left
+        the front, got a kill order, or another launcher took it)."""
+        found, stop = {}, False
+        with self.q._lock:
+            head = [j.id for j in self.q._queued_in_order()[:2]]
+            for jid in held:
+                job = self.q._jobs.get(jid)
+                s = self.sessions.get(jid)
+                if job is None or s is None or s.lid != lid or jid in self.gone:
+                    stop = True
+                    continue
+                if any(j == jid for j, _ in self.kills):
+                    stop = True
+                    continue
+                order = self._order(job, s)
+                if order is not None:
+                    found[jid] = order
+                elif not (job.state == "launching" or (job.state == "queued" and jid in head)):
+                    stop = True
+        return found, stop
 
     def _one(self, jid: int, rep: dict, lid: str, host: str, me: dict, now: float,
              head: list) -> tuple[dict, bool, bool]:
@@ -413,6 +523,7 @@ class LauncherBridge:
             if old is not None:
                 s.children, s.log_ack = old.children, old.log_ack
             self.sessions[jid] = s
+            self._poke = True
             q._record("run_queue_launcher_attached", job=jid, host=host, pid=me.get("pid"))
             log.info("Run queue: %s: launcher attached (pid %s on %s).", job.name,
                      me.get("pid"), host)
@@ -482,6 +593,7 @@ class LauncherBridge:
             if state in RUNNING_STATES:
                 alive.append((key, c))
             if state != old.get("state"):
+                self._poke = True
                 self.q._record("run_queue_launcher_child", job=job.id, key=_key_text(key),
                                state=state, pid=c.get("pid"), code=c.get("code"),
                                why=c.get("why"), host=s.host)
@@ -659,6 +771,13 @@ class LauncherBridge:
 def _ended():
     from waxx.util.device_state.run_queue import ENDED  # noqa: PLC0415
     return ENDED
+
+
+def _num(v) -> float:
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _key_text(key: str) -> str:
