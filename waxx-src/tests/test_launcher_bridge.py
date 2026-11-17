@@ -17,6 +17,9 @@ from waxx.util.device_state import launcher as L
 from waxx.util.device_state import run_queue as rq
 from waxx.util.device_state.run_queue import RunQueue
 
+#: the real launcher start (conftest replaces L.start_detached in every test)
+_START_DETACHED = L.start_detached
+
 HOST = "pc-a"
 ENV = {"kpy": r"C:\venv\activate.bat", "db": r"C:\db\device_db.py"}
 
@@ -565,3 +568,137 @@ def test_a_warm_process_that_stood_down_is_acknowledged_and_warmed_again(tmp_pat
     reported = lb.report()["jobs"][0]["children"]
     assert first not in reported and second in reported        # the first one acknowledged
     assert "cold" not in reported
+
+
+# --- faster hand-off (2026-11-16): held heartbeats, pokes, the server's address ---------
+
+def test_a_held_heartbeat_gets_its_order_the_moment_the_job_launches(tmp_path, files):
+    import threading
+    from waxx.util.device_state import launcher_bridge as LB
+    q = make_bq(tmp_path)
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    pc = PC()
+    la = launcher_for(reply, q, pc, tmp_path)
+    q._server_busy = lambda: "busy for the test"            # no launch yet
+    la.step()                                               # attached
+    beat = la.report()
+    assert beat["wait_s"] == L.HOLD_S                       # nothing running: may be held
+    first = q.launcher_request(beat)
+    assert first["jobs"][str(jid)].get("_hold") is True and "order" not in first["jobs"][str(jid)]
+    out = {}
+
+    def held():
+        t0 = time.monotonic()
+        out["reply"] = q.launcher_hold(beat, first)
+        out["s"] = time.monotonic() - t0
+    t = threading.Thread(target=held)
+    t.start()
+    time.sleep(0.3)
+    q._server_busy = lambda: ""
+    q.tick()                                                # launching: the order is due now
+    t.join(5)
+    r = out["reply"]
+    assert r["jobs"][str(jid)]["order"]["key"] == LB.COLD
+    assert "_hold" not in r["jobs"][str(jid)]
+    assert 0.25 <= out["s"] < 1.5 and r["next_beat_s"] == LB.FAST_BEAT_S
+
+
+def test_a_held_heartbeat_with_no_order_ends_after_its_wait(tmp_path, files):
+    from waxx.util.device_state import launcher_bridge as LB
+    q = make_bq(tmp_path, server_busy=lambda: "busy for the test")
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    la = launcher_for(reply, q, PC(), tmp_path)
+    la.step()
+    beat = dict(la.report(), wait_s=0.3)
+    first = q.launcher_request(beat)
+    t0 = time.monotonic()
+    r = q.launcher_hold(beat, first)
+    assert 0.25 <= time.monotonic() - t0 < 1.0
+    assert "order" not in r["jobs"][str(jid)] and r["next_beat_s"] == LB.AFTER_HOLD_BEAT_S
+    # asked for more than the cap: held at most HOLD_MAX_S
+    assert LB.HOLD_MAX_S < L.REQUEST_TIMEOUT_S
+
+
+def test_a_job_not_near_the_front_is_never_held(tmp_path, files):
+    q = make_bq(tmp_path, server_busy=lambda: "busy for the test")
+    replies = [submit(q, files / "rabi.py") for _ in range(3)]
+    third = replies[2]["ids"][0]
+    la = launcher_for(replies[2], q, PC(), tmp_path)
+    la.step()
+    first = q.launcher_request(la.report())
+    assert "_hold" not in first["jobs"][str(third)]          # third in line: beats as before
+
+
+def test_a_launcher_asks_for_a_hold_only_with_nothing_running_and_reports_a_start_at_once(
+        tmp_path, files):
+    q = make_bq(tmp_path)
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    pc = PC()
+    la = launcher_for(reply, q, pc, tmp_path)
+    assert la.step() > L.BEAT_MIN_S                          # attached, nothing started
+    q.tick()                                                  # launching
+    assert state(q, jid) == "launching"
+    assert la.step() == L.BEAT_MIN_S                          # started it: report it at once
+    assert "wait_s" not in la.report()                        # a child runs: never held
+    assert until(lambda: state(q, jid) == "running", q, la)
+
+
+def test_a_launcher_attaching_or_a_child_changing_pokes_the_queue(tmp_path, files):
+    q = make_bq(tmp_path)
+    reply = submit(q, files / "rabi.py")
+    pc = PC()
+    la = launcher_for(reply, q, pc, tmp_path)
+    q._poked.clear()
+    la.step()
+    assert q.wait_for_poke(0.0)                               # attached: tick now
+    la.step()
+    assert not q.wait_for_poke(0.0)                           # nothing new: no poke
+    q.tick()
+    la.step()                                                 # gets the order, starts it
+    la.step()                                                 # reports it: a child changed
+    assert q.wait_for_poke(0.0)
+
+
+def test_the_launcher_takes_the_servers_address_from_kq(monkeypatch, tmp_path):
+    from waxx.util.comms_server import comm_client
+    assert L.parse_server("192.168.1.76:5123") == ("192.168.1.76", 5123)
+    with pytest.raises(ValueError):
+        L.parse_server("no-port")
+    launched = []
+
+    class Watch:
+        pid = 1
+
+        def close(self):
+            pass
+    # the real start_detached (conftest stands it in), with a fake process start
+    _START_DETACHED([(5, "ab")], directory=str(tmp_path), server=("10.0.0.2", 77),
+                    launch=lambda command, **kw: (launched.append(command), Watch())[1])
+    assert launched[0].endswith("5:ab --server 10.0.0.2:77")
+    # the first connection goes to that address, without discovery; later ones discover
+    monkeypatch.setattr(comm_client.NetClient, "__init__",
+                        lambda *a, **k: pytest.fail("discovery"))
+    discovered = []
+    monkeypatch.setattr(L, "_connect", lambda: discovered.append(1) or "by discovery")
+    connect = L.connect_first_at(("10.0.0.2", 77))
+    c = connect()
+    assert isinstance(c, comm_client.MonitorClient) and c.server_address == ("10.0.0.2", 77)
+    assert connect() == "by discovery" and discovered == [1]
+    assert L.connect_first_at(None)() == "by discovery"
+
+
+
+
+def test_kq_hands_its_server_address_to_the_launcher(monkeypatch):
+    from waxx.util.device_state.run_queue_client import RunQueueClient
+    seen = []
+    monkeypatch.setattr(L, "start_detached", lambda pairs, **kw: seen.append(kw) or 42)
+
+    class T:
+        server_address = ("10.0.0.2", 77)
+    client = RunQueueClient(T())
+    r = client.start_launcher({"jobs": [{"id": 3, "token": "t", "run_host": "pc-a"}]})
+    assert r == {"ok": True, "pid": 42} and seen == [{"server": ("10.0.0.2", 77)}]

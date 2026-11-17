@@ -158,6 +158,34 @@ def test_the_server_routes_launcher_heartbeats_and_answers_them_while_restarting
     assert reply["status"] == "error" and "starts its jobs itself" in reply["msg"]
 
 
+def test_a_held_launcher_heartbeat_is_held_outside_the_request_lock(server, monkeypatch):
+    """The hold for an order happens after the request lock is released: a
+    submit (or any request that takes the lock) is answered meanwhile."""
+    seen = {}
+
+    def hold(obj, reply):
+        got = []
+
+        def other_request():
+            ok = server._request_lock.acquire(timeout=1)
+            got.append(ok)
+            if ok:
+                server._request_lock.release()
+        t = threading.Thread(target=other_request)
+        t.start()
+        t.join(2)
+        seen["free"] = got == [True]
+        reply["held"] = True
+        return reply
+    monkeypatch.setattr(server.run_queue, "launcher_request",
+                        lambda obj: {"status": "ok", "jobs": {}, "next_beat_s": 1.0})
+    monkeypatch.setattr(server.run_queue, "launcher_hold", hold)
+    beat = {"type": "run_queue", "action": "launcher", "launcher": {"id": "x", "host": "pc-a"},
+            "jobs": []}
+    assert "held" not in server.ask(beat)                     # no wait_s: never held
+    assert server.ask(dict(beat, wait_s=2.5))["held"] and seen["free"]
+
+
 def test_tail_and_a_queued_only_cancel_through_the_server(server, expts):
     def ask(**kw):
         return server.ask(dict({"type": "run_queue"}, **kw))
@@ -204,15 +232,113 @@ def test_the_watch_runs_the_job_and_asks_for_the_monitor_when_out_of_jobs(server
 
 
 def test_the_queue_waits_for_a_state_reset_and_a_starting_monitor(server, expts):
+    """A starting monitor is asked to stop for the job, and the job waits
+    until the monitor has left LOADING (its process gone)."""
     from waxx.util.comms_server.comm_server import STATES
+    cuts = []
+    server.cut_monitor_signal.connect(cuts.append)
     server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
     server.status.state = STATES.LOADING
     server.watch_tick()
+    server.watch_tick()                               # asked once, not every tick
     assert server.spawner.calls == []
-    assert server.run_queue.info()["waiting"] == "the monitor is starting"
-    server.status.state = STATES.READY
+    assert server.run_queue.info()["waiting"] == ("the monitor is starting: it is being "
+                                                  "stopped for the next job")
+    assert cuts == ["the run queue has a job to launch"]
+    assert [r["kind"] for r in server.journal.tail(50)].count("monitor_start_cut") == 1
+    server.status.state = STATES.NOT_READY            # the owner saw its thread end
     server.watch_tick()
     assert len(server.spawner.calls) == 1
+
+
+def test_a_starting_monitor_is_never_stopped_during_a_state_reset(server, expts, monkeypatch):
+    from waxx.util.comms_server.comm_server import STATES
+    from waxx.util.device_state.state_reset import StateReset
+    cuts = []
+    server.cut_monitor_signal.connect(cuts.append)
+    monkeypatch.setattr(StateReset, "running", property(lambda self: True))
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.status.state = STATES.LOADING
+    server.watch_tick()
+    assert cuts == [] and server.spawner.calls == []
+    assert server.run_queue.info()["waiting"] == "a state reset is running"
+
+
+def test_a_starting_monitor_is_not_stopped_for_a_job_that_could_not_launch(server, expts):
+    """Anything else holding the launch back (here liveOD down) comes first:
+    the monitor goes on starting."""
+    from waxx.util.comms_server.comm_server import STATES
+    cuts = []
+    server.cut_monitor_signal.connect(cuts.append)
+    server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.status.state = STATES.LOADING
+    server.live.down = True
+    server.watch_tick()
+    assert cuts == [] and server.spawner.calls == []
+    assert "liveOD is not reachable" in server.run_queue.info()["waiting"]
+
+
+def test_a_monitor_stopped_for_a_job_that_then_never_ran_comes_back(server, expts, qapp):
+    from PyQt6.QtWidgets import QApplication
+    from waxx.util.comms_server.comm_server import STATES
+    reply = server.ask({"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py")})
+    server.status.state = STATES.LOADING
+    server.watch_tick()                               # the monitor is told to stop
+    assert server.ask({"type": "run_queue", "action": "cancel", "id": reply["ids"][0],
+                       "by": "jp", "owner": "person"})["job"]["state"] == "cancelled"
+    server.status.state = STATES.NOT_READY
+    server.watch_tick()
+    QApplication.processEvents()
+    assert server.spawner.calls == []
+    assert server.monitor_starts == ["the run queue has no job to run"]
+
+
+class _Manager:
+    def __init__(self, running=True):
+        self.running, self.stops = running, []
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self, timeout_ms=1500, **kw):
+        self.stops.append(kw)
+
+
+class _Owner:
+    def __init__(self, state, running=True):
+        from waxx.util.guis.monitor_server_gui import MonitorStatus
+        self.status = MonitorStatus()
+        self.status.state = state
+        self.monitor_manager = _Manager(running)
+
+
+def test_the_owner_stops_only_a_monitor_that_is_still_starting():
+    from waxx.util.comms_server.comm_server import STATES
+    from waxx.util.guis.monitor_server_gui import cut_monitor_start
+    starting = _Owner(STATES.LOADING)
+    cut_monitor_start(starting, "the run queue has a job to launch")
+    assert starting.monitor_manager.stops == [
+        {"kind": "interrupted_by_run",
+         "reason": "stopped while starting: the run queue has a job to launch"}]
+    for owner in (_Owner(STATES.READY), _Owner(STATES.LOADING, running=False),
+                  _Owner(STATES.NOT_READY, running=False)):
+        cut_monitor_start(owner, "x")
+        assert owner.monitor_manager.stops == []
+
+
+def test_a_stop_with_a_kind_is_recorded_as_that_kind(qapp, tmp_path):
+    from waxx.util.device_state.monitor_manager import MonitorManager
+    m = MonitorManager(str(tmp_path / "monitor.py"))
+    ended = []
+    m.monitor_stopped.connect(ended.append)
+    m._stop_requested = True
+    m._stop_as = ("interrupted_by_run", "stopped while starting: a job")
+    m._report_exit(1, "cmd", str(tmp_path / "monitor.py"), [])
+    assert m.last_stop_kind == "interrupted_by_run"
+    assert m.last_stop_reason == "stopped while starting: a job"
+    m._stop_as = None
+    m._report_exit(1, "cmd", str(tmp_path / "monitor.py"), [])
+    assert m.last_stop_kind == "stopped_on_request"
 
 
 def test_a_reset_on_a_persons_run_holds_but_not_on_an_agents_queued_run(server, expts):

@@ -70,6 +70,27 @@ class MonitorClient(CommClient):
             discovery_timeout=discovery_timeout,
         )
 
+    @classmethod
+    def at(cls, host: str, port: int) -> "MonitorClient":
+        """The monitor server at ``host:port`` -- an address another client
+        found by discovery moments ago (``kq`` hands it to the launcher it
+        starts) -- without waiting for a beacon.  A failed try rediscovers as
+        usual (the server's id is resolved then)."""
+        self = cls.__new__(cls)
+        self._waxx_server_id = None
+        self.host, self.port = str(host), int(port)
+        self.reconnect_generation = 0
+        self.server_address = (self.host, self.port)
+        return self
+
+    def _rediscover(self, timeout: float = 2.0) -> bool:
+        if getattr(self, "_waxx_server_id", None) is None:
+            try:
+                self._waxx_server_id = resolve_scoped_server_id(MONITOR_BASE_ID)
+            except Exception:                         # noqa: BLE001
+                return False
+        return super()._rediscover(timeout=timeout)
+
     def send_end(self):
         self.send_message("run complete")
 

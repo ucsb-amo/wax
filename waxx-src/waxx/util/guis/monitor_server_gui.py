@@ -163,6 +163,27 @@ class MonitorStatus:
 Status = MonitorStatus
 
 
+def cut_monitor_start(owner, why: str) -> None:
+    """For the monitor's owner (this module's window, the headless server):
+    stop a monitor that is still starting, because the run queue has a job
+    to launch.  Its process tree is killed and the stop is recorded as
+    ``interrupted_by_run`` (device state untrusted until the job's end state,
+    connections released, as when a run takes the core from a running
+    monitor).  The status is NOT set here: the owner's 8 Hz check keeps it
+    LOADING while the manager thread lives -- the run queue launches only
+    once it does not -- and NOT_READY with this stop's kind after.  Nothing
+    is done once the monitor is READY (the job then takes the core from it,
+    the ordinary way) or not running."""
+    manager = owner.monitor_manager
+    if owner.status.state != STATES.LOADING or not manager.isRunning():
+        log.info("Monitor start cut not needed (%s): the monitor is %s.", why,
+                 "running" if manager.isRunning() else "not running")
+        return
+    log.warning("Monitor start cut short: %s.", why)
+    manager.stop(kind="interrupted_by_run",
+                 reason=f"stopped while starting: {why}")
+
+
 class MonitorUDPServer(UdpServer):
     """TCP responder + sole writer of the device-state JSON.
 
@@ -352,6 +373,10 @@ class MonitorUDPServer(UdpServer):
     #: A run loop ended: start the monitor unless it is running (the owner
     #: decides; the argument says why).
     start_monitor_signal = pyqtSignal(str)
+    #: The run queue has a job to launch while the monitor is still starting:
+    #: the owner stops the monitor (the argument says why).  The job launches
+    #: once the monitor's process is gone (the state leaves LOADING only then).
+    cut_monitor_signal = pyqtSignal(str)
     #: Every payload this server broadcasts (from whichever thread sent it),
     #: for the server's own window: its Queue and State tabs follow the
     #: broadcasts without listening on the network.
@@ -479,7 +504,7 @@ class MonitorUDPServer(UdpServer):
             run_exited=lambda run_id, why: self._live_od.run_exited(run_id, why),
             live_od_reset=lambda **kw: self._live_od.reset(**kw), fence=self._current_run_pending,
             monitor_state=lambda: self.status.state, server_busy=self._queue_busy,
-            loops=self.loops, start_monitor=self.start_monitor_signal.emit,
+            cut_monitor_start=self._cut_monitor_start, loops=self.loops, start_monitor=self.start_monitor_signal.emit,
             hold=self.person_hold, journal=self.journal, on_change=self._on_queue_change,
             warm_ahead=warm_ahead,
             # each job runs on the PC that submitted it (`kq launch` there;
@@ -627,7 +652,26 @@ class MonitorUDPServer(UdpServer):
         if self._reads_only(mtype, obj):
             return self._dispatch_structured(obj, mtype)
         with self._request_lock:
-            return self._dispatch_structured(obj, mtype)
+            text = self._dispatch_structured(obj, mtype)
+        if mtype == "run_queue" and obj.get("action") == "launcher" and obj.get("wait_s"):
+            # a launcher with nothing running asked for its reply to be held
+            # until its job's order comes: held here, outside the request
+            # lock, so no other request waits behind it
+            text = self._hold_launcher_reply(obj, text)
+        return text
+
+    def _hold_launcher_reply(self, obj: dict, text: str) -> str:
+        try:
+            reply = json.loads(text)
+        except (TypeError, ValueError):
+            return text
+        if not isinstance(reply, dict) or reply.get("status") != "ok":
+            return text
+        try:
+            return json.dumps(self.run_queue.launcher_hold(obj, reply))
+        except Exception:                             # noqa: BLE001
+            log.exception("Run queue: holding a launcher's heartbeat failed")
+            return text
 
     #: Requests that show a person at the machine: while a person hold is on,
     #: each moves its lapse (PersonHold.touch) -- whether or not it is
@@ -1314,6 +1358,30 @@ class MonitorUDPServer(UdpServer):
             return "the monitor is starting"
         return ""
 
+    #: A cut of a starting monitor is asked again at most this often while it
+    #: is still exiting (the owner's stop is idempotent).
+    CUT_MONITOR_EVERY_S = 2.0
+
+    def _cut_monitor_start(self, why: str, check_only: bool = False) -> bool:
+        """The run queue's hook: True when the only thing of this server's
+        holding the machine is a monitor that is still starting -- and, unless
+        ``check_only``, the owner is asked to stop it (``cut_monitor_signal``).
+        Its process tree is killed; the state stays LOADING until the manager
+        thread has ended, which it does only once the monitor's output pipe
+        has closed (no process of it is left to connect to the core after the
+        job).  Never during a state reset."""
+        if self.reset.running or self.status.state != STATES.LOADING:
+            return False
+        if not check_only:
+            now = time.monotonic()
+            if now - getattr(self, "_cut_asked_at", float("-inf")) >= self.CUT_MONITOR_EVERY_S:
+                self._cut_asked_at = now
+                log.info("Run queue: %s while the monitor is starting -- stopping the monitor.",
+                         why)
+                self.journal.record("monitor_start_cut", why=why)
+                self.cut_monitor_signal.emit(why)
+        return True
+
     def _on_queue_change(self, info) -> None:
         self._broadcaster.send({"type": "run_queue", "run_queue": info})
 
@@ -1327,7 +1395,12 @@ class MonitorUDPServer(UdpServer):
         self.run_queue.tick()
 
     def _watch_loop(self) -> None:
-        while not self._watch_stop.wait(self.WATCH_S):
+        # every WATCH_S, or at once when the queue is poked (a launcher
+        # attached, a job's process started or ended)
+        while not self._watch_stop.is_set():
+            self.run_queue.wait_for_poke(self.WATCH_S)
+            if self._watch_stop.is_set():
+                break
             try:
                 self.watch_tick()
             except Exception:
@@ -1895,6 +1968,7 @@ class MonitorUDPServer(UdpServer):
     def stop(self):
         self._runner_stop.set()
         self._watch_stop.set()
+        self.run_queue.poke()                         # out of its wait at once
         if self.slm_reinit is not None:
             self.slm_reinit.stop()
         # Close the connections (bounded) while this process is still here;
@@ -2116,6 +2190,7 @@ class MonitorServerGUI(QWidget):
         self.udp_server.reset_signal.connect(self.restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
         self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
+        self.udp_server.cut_monitor_signal.connect(self._cut_monitor_start)
         self.udp_server.server_exit_signal.connect(self._server_exit)
         self.server_thread.started.connect(self.udp_server.run)
         self.udp_server.message_received.connect(self.handle_message)
@@ -2169,6 +2244,11 @@ class MonitorServerGUI(QWidget):
             log.info("Stop requested; the monitor experiment is not running.")
         self.set_status(STATES.NOT_READY, "stopped_on_request",
                         "stopped by a client request")
+
+    def _cut_monitor_start(self, why: str) -> None:
+        """The run queue has a job to launch while the monitor is starting:
+        stop it (see :func:`cut_monitor_start`)."""
+        cut_monitor_start(self, why)
 
     def _start_monitor_unless_running(self, why: str) -> None:
         """A run loop ended: bring the monitor back -- unless it already is

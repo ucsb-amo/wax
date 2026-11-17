@@ -22,7 +22,8 @@ import logging
 from PyQt6.QtCore import QObject, QTimer, QCoreApplication
 
 from waxx.util.device_state.monitor_manager import MonitorManager
-from waxx.util.guis.monitor_server_gui import MonitorUDPServer, MonitorStatus, _state_name
+from waxx.util.guis.monitor_server_gui import (MonitorUDPServer, MonitorStatus, _state_name,
+                                               cut_monitor_start)
 from waxx.util.comms_server.comm_server import STATES
 from waxx.util.comms_server.hardware_id import monitor_server_id
 from beacon.discovery.client import discover
@@ -128,6 +129,7 @@ class HeadlessMonitorServer(QObject):
         self.udp_server.reset_signal.connect(self._restart_monitor)
         self.udp_server.stop_signal.connect(self._stop_monitor)
         self.udp_server.start_monitor_signal.connect(self._start_monitor_unless_running)
+        self.udp_server.cut_monitor_signal.connect(self._cut_monitor_start)
         self.udp_server.server_exit_signal.connect(self._server_exit)
         self.udp_server.message_received.connect(self._handle_message)
         self.server_thread.started.connect(self.udp_server.run)
@@ -186,6 +188,11 @@ class HeadlessMonitorServer(QObject):
             log.info("Stop requested; the monitor experiment is not running.")
         self._set_status(STATES.NOT_READY, "stopped_on_request",
                          "stopped by a client request")
+
+    def _cut_monitor_start(self, why: str) -> None:
+        """The run queue has a job to launch while the monitor is starting:
+        stop it (:func:`~waxx.util.guis.monitor_server_gui.cut_monitor_start`)."""
+        cut_monitor_start(self, why)
 
     def _start_monitor_unless_running(self, why: str) -> None:
         """A run loop ended: bring the monitor back -- unless it already is
