@@ -51,9 +51,12 @@ class HeadlessMonitorServer(QObject):
 
     def __init__(self, monitor_expt_path: str, config_file_path: str | None = None,
                  journal_dir: str | None = None, reset_expt_path: str | None = None,
-                 run_loops=(), connections=(), slm_reinit=None, state_generator=None):
+                 run_loops=(), connections=(), slm_reinit=None, state_generator=None,
+                 hold_policy=None):
         super().__init__()
         self.config_file_path = config_file_path
+        #: the person hold's lapse rule (person_hold.ExpiryPolicy; None: none)
+        self.hold_policy = hold_policy
         self.journal_dir = journal_dir
         self.reset_expt_path = reset_expt_path
         self.run_loops = tuple(run_loops or ())
@@ -108,7 +111,8 @@ class HeadlessMonitorServer(QObject):
                                            run_loops=self.run_loops,
                                            connections=self.connection_defs,
                                            slm_reinit=self.slm_reinit_config,
-                                           state_generator=self.state_generator)
+                                           state_generator=self.state_generator,
+                                           hold_policy=self.hold_policy)
         log.info("ops journal: %s", self.journal_dir or "in memory only (no directory given)")
         for spec in self.run_loops:
             log.info("run loop '%s': %s", spec.title,
@@ -264,7 +268,8 @@ class HeadlessMonitorServer(QObject):
 
 def run(monitor_expt_path: str, config_file_path: str | None = None,
         journal_dir: str | None = None, reset_expt_path: str | None = None,
-        run_loops=(), connections=(), slm_reinit=None, state_generator=None) -> int:
+        run_loops=(), connections=(), slm_reinit=None, state_generator=None,
+        hold_policy=None) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
@@ -290,7 +295,8 @@ def run(monitor_expt_path: str, config_file_path: str | None = None,
                                        journal_dir=journal_dir,
                                        reset_expt_path=reset_expt_path,
                                        run_loops=run_loops, connections=connections,
-                                       slm_reinit=slm_reinit, state_generator=state_generator)
+                                       slm_reinit=slm_reinit, state_generator=state_generator,
+                                       hold_policy=hold_policy)
     except Exception:
         log.exception("Monitor server failed to start")
         return 1

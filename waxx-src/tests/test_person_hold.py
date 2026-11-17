@@ -2,13 +2,15 @@
 requests on the monitor server, the gates that report it, and its row on the
 Sequences tab.  liveOD's POLL replies are dicts; nothing goes on the network;
 files live under tmp_path."""
+import datetime
 import json
 import os
 
 import pytest
 
 from waxx.util.device_state import run_gate
-from waxx.util.device_state.person_hold import PersonHold, describe
+from waxx.util.device_state.person_hold import (
+    ExpiryPolicy, PersonHold, describe, lapse_text, parse_expiry)
 
 
 class Journal:
@@ -240,9 +242,13 @@ def test_the_hold_row_puts_the_hold_on_and_releases_it(qapp, monkeypatch):
         panel.ask_hold_reason = lambda: None                   # cancelled: nothing sent
         assert panel.toggle_hold() is False and panel._sender.requests == []
         panel.ask_hold_reason = lambda: "aligning"
+        panel.ask_hold_lapse = lambda: None                    # cancelled at the 2nd question
+        assert panel.toggle_hold() is False and panel._sender.requests == []
+        panel.ask_hold_lapse = lambda: {"mode": "policy"}
         assert panel.toggle_hold()
         req = panel._sender.requests[-1]
         assert req["type"] == "run_queue" and req["action"] == "hold"
+        assert "expiry" not in req                             # the default: the server's rule
         assert req["reason"] == "aligning" and req["by"] == "Device Control GUI on test-pc"
         panel._sender.requested.emit(req["req"], {"status": "ok", "person_hold": HELD})
         assert row.button.text() == sp.RELEASE_TEXT and row.pill.text() == "HELD"
@@ -365,3 +371,264 @@ def test_a_hold_ends_a_loop_saying_so_and_starts_the_monitor(tmp_path):
     assert len(started) == 1                                  # as for a Stop
     assert loop.start()["msg"].startswith("person hold since")
     assert gate is not None
+
+
+# --- the hold lapses by itself (2026-11-16) ------------------------------------------------------
+#
+# Times are local wall-clock times (datetime(...).timestamp()), so the tests
+# hold in any timezone.  2026-11-18 is a Wednesday, 11-20 a Friday, 11-21 a
+# Saturday.
+
+def _t(day, hour, minute=0):
+    return datetime.datetime(2026, 11, day, hour, minute).timestamp()
+
+
+LAB = ExpiryPolicy(idle_s={"live_od_reset": 3600.0}, quiet_idle_s=3600.0,
+                   quiet_start_h=19.0, quiet_end_h=7.0, quiet_weekends=True)
+
+
+def test_quiet_hours_and_the_next_quiet_start():
+    assert not LAB.is_quiet(_t(18, 10)) and LAB.is_quiet(_t(18, 19)) and LAB.is_quiet(_t(19, 6))
+    assert not LAB.is_quiet(_t(19, 7)) and LAB.is_quiet(_t(21, 12))         # Saturday noon
+    assert LAB.next_quiet(_t(18, 10)) == _t(18, 19)
+    assert LAB.next_quiet(_t(18, 20)) == _t(18, 20)                         # already quiet
+    weekends_only = ExpiryPolicy(quiet_idle_s=60.0, quiet_weekends=True)
+    assert weekends_only.next_quiet(_t(18, 10)) == _t(21, 0)                # Saturday 00:00
+    assert ExpiryPolicy(quiet_idle_s=60.0).next_quiet(_t(18, 10)) is None   # no quiet hours
+
+
+@pytest.mark.parametrize("source, last, lapses", [
+    ("request", _t(18, 10), _t(18, 19)),            # day: at the evening's start
+    ("request", _t(18, 18, 30), _t(18, 19, 30)),    # active late: an hour after
+    ("request", _t(18, 20), _t(18, 21)),            # in the evening: an hour after
+    ("request", _t(21, 10), _t(21, 11)),            # Saturday: an hour after
+    ("live_od_reset", _t(18, 10), _t(18, 11)),      # a Reset: an hour after, any time
+    ("unreadable_file", _t(18, 20), None),          # never
+])
+def test_the_policys_lapse_time(source, last, lapses):
+    assert LAB.lapses_at(source, last) == lapses
+
+
+def test_without_a_policy_a_hold_never_lapses_and_reads_as_before():
+    clock = Clock(_t(18, 10))
+    hold = PersonHold(clock=clock)
+    hold.hold("aligning", "jp")
+    info = hold.info()
+    assert info["expiry"] == {"mode": "policy"} and info["lapses_at"] is None
+    assert lapse_text(info) == "" and " -- " not in hold.text()
+    clock.t += 10 * 86400
+    assert not hold.tick() and hold.active
+
+
+def test_a_reset_hold_lapses_after_an_idle_hour_and_says_so(caplog):
+    clock, journal, seen = Clock(_t(18, 10)), Journal(), []
+    hold = PersonHold(clock=clock, policy=LAB, journal=journal, on_change=seen.append)
+    hold.observe_poll(_counted())
+    assert hold.observe_poll(_counted(person=1, last={"source": "person", "run_id": 7}))
+    assert hold.info()["lapses_at"] == _t(18, 11)
+    assert lapse_text(hold.info(), now=_t(18, 10)) == "lapses at 11:00 unless a person is active"
+    clock.t = _t(18, 10, 59)
+    assert not hold.tick() and hold.active
+    clock.t = _t(18, 11) + 1
+    with caplog.at_level("WARNING", logger="waxx.util.device_state.person_hold"):
+        assert hold.tick()
+    assert not hold.active and not hold.tick()
+    kind, fields = journal.entries[-1]
+    assert kind == "run_queue_hold_lapsed" and fields["source"] == "live_od_reset"
+    assert fields["last_activity"] == _t(18, 10) and "no person activity since" in fields["rule"]
+    assert seen[-1]["active"] is False
+    assert any("PERSON HOLD LAPSED" in r.getMessage() for r in caplog.records)
+
+
+def test_person_activity_moves_the_lapse_and_an_agents_does_not():
+    clock = Clock(_t(18, 10))
+    hold = PersonHold(clock=clock, policy=LAB)
+    hold.hold("aligning", "jp")
+    assert hold.info()["lapses_at"] == _t(18, 19)
+    clock.t = _t(18, 18, 30)
+    assert not hold.touch("an agent's queue request", owner="agent")
+    assert hold.info()["lapses_at"] == _t(18, 19)
+    assert hold.touch("update from Device Control GUI")
+    info = hold.info()
+    assert info["lapses_at"] == _t(18, 19, 30) and info["activity"].startswith("update from")
+    clock.t = _t(18, 19, 1)
+    assert not hold.tick()                         # 19:00 passed, but it moved
+    clock.t = _t(18, 19, 31)
+    assert hold.tick() and not hold.active
+    assert not hold.touch("too late")              # no hold: nothing to move
+
+
+def test_a_reset_while_held_counts_as_activity():
+    clock = Clock(_t(18, 10))
+    hold = PersonHold(clock=clock, policy=LAB)
+    hold.observe_poll(_counted())
+    hold.observe_poll(_counted(person=1, last={"source": "person"}))
+    clock.t = _t(18, 10, 45)
+    assert not hold.observe_poll(_counted(person=2, last={"source": "person"}))
+    assert hold.info()["lapses_at"] == _t(18, 11, 45)
+    assert hold.info()["activity"] == "a Reset in liveOD"
+
+
+def test_never_and_a_set_time():
+    clock, journal = Clock(_t(18, 10)), Journal()
+    hold = PersonHold(clock=clock, policy=LAB, journal=journal)
+    hold.hold("on the table", "jp", expiry="never")
+    assert hold.info()["lapses_at"] is None and hold.text().endswith("never lapses by itself")
+    clock.t += 5 * 86400
+    assert not hold.tick() and hold.active
+    hold.release("jp")
+    clock.t = _t(18, 10)
+    hold.hold("short job", "jp", expiry={"for_s": 7200})
+    assert hold.info()["expiry"] == {"mode": "at", "at": _t(18, 12)}
+    assert lapse_text(hold.info(), now=_t(18, 10)) == "lapses at 12:00"
+    clock.t = _t(18, 11, 59)
+    hold.touch("activity does not move a set time")
+    assert hold.info()["lapses_at"] == _t(18, 12)
+    clock.t = _t(18, 12)
+    assert hold.tick()
+    assert "the time it was set to end" in journal.entries[-1][1]["rule"]
+
+
+def test_a_persons_hold_request_while_held_extends_or_changes_it_and_an_agents_does_not():
+    clock, journal = Clock(_t(18, 10)), Journal()
+    hold = PersonHold(clock=clock, policy=LAB, journal=journal)
+    hold.hold("aligning", "jp")
+    clock.t = _t(18, 19, 30)
+    again = hold.hold("x", "agent-7", owner="agent", expiry="never")
+    assert again["already"] and hold.info()["expiry"] == {"mode": "policy"}
+    assert hold.info()["lapses_at"] == _t(18, 19)                  # not moved by an agent
+    again = hold.hold("x", "jp")                                   # a person: activity
+    assert again["already"] and again["person_hold"]["lapses_at"] == _t(18, 20, 30)
+    assert again["person_hold"]["reason"] == "aligning"
+    hold.hold("", "jp", expiry="never")
+    assert hold.info()["expiry"] == {"mode": "never"} and hold.info()["lapses_at"] is None
+    assert journal.kinds[-1] == "run_queue_hold_changed"
+    assert hold.hold("", "jp", expiry={"for_s": -5})["status"] == "error"
+
+
+def test_a_person_busy_on_the_machine_keeps_the_hold_and_a_failing_check_too(caplog):
+    clock = Clock(_t(18, 20))
+    busy = {"text": "a person's job 3 (rabi) is running"}
+    hold = PersonHold(clock=clock, policy=LAB, busy=lambda: busy["text"])
+    hold.hold("mine", "jp")
+    clock.t = _t(18, 23)
+    assert not hold.tick() and hold.active
+    assert hold.info()["activity"] == busy["text"] and hold.info()["lapses_at"] == _t(19, 0)
+    busy["text"] = ""
+    clock.t = _t(19, 0, 1)
+    assert hold.tick()                                 # an hour after the job ended
+    hold.hold("again", "jp")
+
+    def broken():
+        raise RuntimeError("queue lock")
+    hold.set_busy_check(broken)
+    clock.t += 3 * 3600
+    with caplog.at_level("ERROR", logger="waxx.util.device_state.person_hold"):
+        assert not hold.tick() and not hold.tick()
+    assert hold.active
+    assert len([r for r in caplog.records if "busy check failed" in r.getMessage()]) == 1
+
+
+def test_lapse_state_survives_a_restart_and_a_passed_time_lapses_at_once(tmp_path):
+    path = str(tmp_path / "person_hold.json")
+    clock, journal = Clock(_t(18, 20)), Journal()
+    hold = PersonHold(path, clock=clock, policy=LAB)
+    hold.hold("aligning", "jp")
+    with open(path, encoding="utf-8") as f:
+        stored = json.load(f)
+    assert stored["expiry"] == {"mode": "policy"} and stored["last_activity"] == _t(18, 20)
+    clock.t = _t(18, 23)                                         # server down meanwhile
+    reborn = PersonHold(path, clock=clock, policy=LAB, journal=journal)
+    assert reborn.active and reborn.info()["lapses_at"] == _t(18, 21)
+    assert reborn.tick() and journal.kinds == ["run_queue_hold_lapsed"]
+    assert not PersonHold(path, clock=clock, policy=LAB).active
+
+
+def test_an_older_hold_file_counts_its_idle_time_from_the_restart(tmp_path):
+    path = tmp_path / "person_hold.json"
+    path.write_text(json.dumps({"active": True, "since": _t(16, 9), "by": "jp",
+                                "reason": "old", "source": "request", "owner": "person"}))
+    clock = Clock(_t(18, 20))
+    hold = PersonHold(str(path), clock=clock, policy=LAB)
+    info = hold.info()
+    assert info["expiry"] == {"mode": "policy"} and info["last_activity"] == _t(18, 20)
+    assert info["lapses_at"] == _t(18, 21) and "server started" in info["activity"]
+
+
+def test_an_unreadable_hold_file_never_lapses(tmp_path):
+    path = tmp_path / "person_hold.json"
+    path.write_text("{not json")
+    clock = Clock(_t(18, 20))
+    hold = PersonHold(str(path), clock=clock, policy=LAB)
+    assert hold.info()["source"] == "unreadable_file" and hold.info()["lapses_at"] is None
+    clock.t += 3 * 86400
+    assert not hold.tick() and hold.active
+
+
+@pytest.mark.parametrize("value, why", [
+    ({"at": _t(18, 9)}, "already passed"),
+    ({"at": _t(18, 10) + 8 * 86400}, "more than 7 days"),
+    ({"for_s": 0}, "above 0"),
+    ({"mode": "soon"}, "mode must be"),
+    (42, "must be 'policy'"),
+])
+def test_bad_expiry_is_refused(value, why):
+    parsed, refusal = parse_expiry(value, _t(18, 10))
+    assert parsed is None and why in refusal
+
+
+def test_the_server_counts_a_persons_requests_and_not_the_monitors_or_an_agents(server):
+    server.person_hold.policy = LAB
+    reply = server.ask({"type": "run_queue", "action": "hold", "reason": "aligning",
+                        "by": "jp@kong", "expiry": "never"})
+    assert reply["person_hold"]["expiry"] == {"mode": "never"}
+    assert reply["person_hold"]["activity"] == "the hold was put on"
+    server.ask({"type": "update_batch", "origin": "monitor write-back", "updates": []})
+    server.ask({"type": "run_queue", "action": "list"})
+    server.ask({"type": "run_pending", "run_id": 5, "expt": "x", "token": "t",
+                "owner": "agent"})
+    assert server.person_hold.info()["activity"] == "the hold was put on"
+    server.ask({"type": "trust_ack", "operator": "jp"})
+    assert server.person_hold.info()["activity"] == "trust_ack from jp"
+    assert json.loads(server.generate_reply("status_json"))["person_hold"]["activity"] \
+        == "trust_ack from jp"
+    assert server.ask({"type": "run_queue", "action": "hold", "by": "jp",
+                       "expiry": {"for_s": 0}})["status"] == "error"
+
+
+def test_the_queue_reports_a_persons_job_as_busy(server, tmp_path):
+    rq = server.run_queue
+    (tmp_path / "a.py").write_text('"""a."""\nclass A: pass\n')
+    reply = server.ask({"type": "run_queue", "action": "submit", "path": str(tmp_path / "a.py"),
+                        "by": "jp", "owner": "person", "run_host": "pc-under-test",
+                        "sha256": "0" * 64, "expt_class": "A", "calibrates_declared": [],
+                        "cold_why": ""})
+    assert reply["status"] == "ok", reply
+    job = rq._jobs[reply["ids"][0]]
+    assert rq._person_busy() == ""                     # waiting for its PC: not about to run
+    rq._current, job.state = job.id, "running"
+    assert rq._person_busy() == f"a person's {job.name} is running"
+    job.owner = "agent"
+    assert rq._person_busy() == ""
+    rq._current = None
+
+
+def test_kq_hold_options():
+    from types import SimpleNamespace
+    from waxx.util.device_state import kq
+    assert kq.parse_duration("2h") == 7200 and kq.parse_duration("90m") == 5400
+    assert kq.parse_duration("1h30m") == 5400 and kq.parse_duration("45") == 2700
+    for bad in ("soon", "0", "-1h"):
+        with pytest.raises(ValueError):
+            kq.parse_duration(bad)
+
+    def ns(**k):
+        return SimpleNamespace(**{"never": False, "policy": False, "for_": None, "until": None,
+                                  **k})
+    assert kq.hold_expiry(ns()) is None
+    assert kq.hold_expiry(ns(never=True)) == "never"
+    assert kq.hold_expiry(ns(for_="2h")) == {"for_s": 7200.0}
+    assert kq.hold_expiry(ns(until="12:00"), now=_t(18, 10)) == {"at": _t(18, 12)}
+    held = {"active": True, "since": _t(18, 10), "by": "jp", "reason": "x",
+            "expiry": {"mode": "never"}, "lapses_at": None}
+    assert kq._hold_text(held).endswith(" -- never lapses by itself")

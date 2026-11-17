@@ -70,18 +70,20 @@ DEFAULT_THRESHOLD_FRAC = 0.3    # mask cut, as a fraction of the smoothed max
 DEFAULT_COMPONENT_FRAC = 0.3    # keep components peaking this high, vs the map max
 DEFAULT_MARGIN_FRAC = 0.5       # box padding, as a fraction of the box extent
 DEFAULT_CONSERVATIVENESS = 0.5  # one knob for the three above; 0.5 is the defaults
-# Where the boxing parameters land at the two ends of the conservativeness
-# scale. 0 is tight: a high mask cut hugs the dense core and the padding is
-# slim. 1 is generous: the cut drops to the cloud's wings, faint secondary
-# positions are kept, and the padding grows to a full cloud's width. The
-# midpoint reproduces the DEFAULT_* values exactly, so an existing caller that
-# never touches the knob sees no change.
-CONSERVATIVE_RANGE = {
-    'threshold_frac': (0.6, DEFAULT_THRESHOLD_FRAC, 0.1),
-    'component_frac': (0.6, DEFAULT_COMPONENT_FRAC, 0.1),
-    'margin_frac': (0.2, DEFAULT_MARGIN_FRAC, 1.0),
-}
 DEFAULT_MARGIN_MIN = 6          # px, floor on the padding
+# Where the boxing parameters land at the two ends of the conservativeness
+# scale. 0 is tight: a high mask cut hugs the dense core (0.8 of the peak is
+# ~0.67 sigma of a Gaussian cloud) and the padding is all but gone, its pixel
+# floor included. 1 is generous: the cut drops to the cloud's wings, faint
+# secondary positions are kept, and the padding grows to a full cloud's width.
+# The midpoint reproduces the DEFAULT_* values exactly, so an existing caller
+# that never touches the knob sees no change.
+CONSERVATIVE_RANGE = {
+    'threshold_frac': (0.8, DEFAULT_THRESHOLD_FRAC, 0.1),
+    'component_frac': (0.8, DEFAULT_COMPONENT_FRAC, 0.1),
+    'margin_frac': (0.05, DEFAULT_MARGIN_FRAC, 1.0),
+    'margin_min': (2., DEFAULT_MARGIN_MIN, DEFAULT_MARGIN_MIN),
+}
 DEFAULT_MIN_CONFIDENCE = 0.02   # below this the box captured next to nothing
 DEFAULT_MIN_DETECTED_FRAC = 0.05  # shots that must hold a cloud for a real run
 DEFAULT_MAX_AREA_FRAC = 0.10    # a fragmented box larger than this is noise
@@ -193,7 +195,8 @@ def conservative_params(conservativeness=DEFAULT_CONSERVATIVENESS):
     the ends in CONSERVATIVE_RANGE. Values outside [0, 1] are clipped.
 
     Returns:
-        dict: threshold_frac, component_frac and margin_frac.
+        dict: threshold_frac, component_frac, margin_frac and margin_min
+        (whole pixels).
     """
     c = float(np.clip(conservativeness, 0., 1.))
     out = {}
@@ -202,6 +205,7 @@ def conservative_params(conservativeness=DEFAULT_CONSERVATIVENESS):
             out[name] = lo + (mid - lo) * (c / 0.5)
         else:
             out[name] = mid + (hi - mid) * ((c - 0.5) / 0.5)
+    out['margin_min'] = int(round(out['margin_min']))
     return out
 
 
@@ -609,7 +613,7 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
                 conservativeness=DEFAULT_CONSERVATIVENESS,
                 threshold_frac=None,
                 component_frac=None,
-                margin_frac=None, margin_min=DEFAULT_MARGIN_MIN,
+                margin_frac=None, margin_min=None,
                 min_confidence=DEFAULT_MIN_CONFIDENCE,
                 min_detected_frac=DEFAULT_MIN_DETECTED_FRAC,
                 max_area_frac=DEFAULT_MAX_AREA_FRAC,
@@ -647,7 +651,8 @@ def suggest_roi(atoms=None, light=None, images=None, n_pwa_per_shot=1,
             it from conservativeness.
         margin_frac (float or None): padding as a fraction of the largest
             component's extent. None derives it from conservativeness.
-        margin_min (int): minimum padding in pixels.
+        margin_min (int or None): minimum padding in pixels. None derives it
+            from conservativeness (DEFAULT_MARGIN_MIN from the midpoint up).
         min_confidence (float): confidence below which valid is False.
         min_detected_frac (float): fraction of shots that must hold a cloud.
             The primary signal/noise gate. A shot counts when its strongest
@@ -791,12 +796,12 @@ def _box_from_grid(grid, conservativeness, explicit, score_full=None):
     threshold_frac = params['threshold_frac']
     component_frac = params['component_frac']
     margin_frac = params['margin_frac']
+    margin_min = int(params['margin_min'])
 
     def _gate(name, default):
         value = explicit.get(name)
         return default if value is None else value
 
-    margin_min = _gate('margin_min', DEFAULT_MARGIN_MIN)
     min_confidence = _gate('min_confidence', DEFAULT_MIN_CONFIDENCE)
     min_detected_frac = _gate('min_detected_frac', DEFAULT_MIN_DETECTED_FRAC)
     max_area_frac = _gate('max_area_frac', DEFAULT_MAX_AREA_FRAC)

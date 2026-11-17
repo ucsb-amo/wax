@@ -39,7 +39,12 @@ Commands::
                                               (kq run / submit start one by themselves)
     kq pause [--all] [--reason R]             stop launching agent (or all) jobs
     kq resume [--all]                         lift that pause
-    kq hold [reason]                          a person's hold: agents' jobs wait
+    kq hold [reason] [--for 2h | --until HH:MM | --never | --policy]
+                                              a person's hold: agents' jobs wait.  It
+                                              lapses by the lab's rule once nobody has
+                                              been active (default), at a set time, or
+                                              never.  On a hold that is on: counts as
+                                              activity and changes how it lapses
     kq release                                lift the person's hold
     kq warm [on|off]                          warm start (queue phase 2): show / switch (stored)
     kq status [--json]                        the queue's state (not occupancy)
@@ -135,6 +140,7 @@ import signal
 import sys
 import time
 
+from waxx.util.device_state.person_hold import lapse_text
 from waxx.util.device_state.run_queue_client import (
     ENDED, IN_SLOT, STATES, SUCCEEDED, NoRunQueue, RunQueueClient, RunQueueError,
     owner_from_env, safe_write)
@@ -266,9 +272,11 @@ def _hold_text(hold: dict | None) -> str:
     extra = [f"owner {hold['owner']}" if hold.get("owner") else "",
              f"source {hold['source']}" if hold.get("source") else ""]
     extra = ", ".join(e for e in extra if e)
+    tail = lapse_text(hold)
     return (f"person hold since {_when(hold.get('since'))} by {hold.get('by') or '?'}"
             + (f" ({extra})" if extra else "")
-            + (f": {hold.get('reason')}" if hold.get("reason") else ""))
+            + (f": {hold.get('reason')}" if hold.get("reason") else "")
+            + (f" -- {tail}" if tail else ""))
 
 
 def _alarm_text(alarm: dict | None) -> str:
@@ -377,6 +385,39 @@ def parse_at(text: str, now: float | None = None) -> float:
     if value > now + MAX_AHEAD_S:
         raise ValueError(f"--at {text}: more than a year ahead")
     return value
+
+
+_DURATION = re.compile(r"^\s*(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m(?:in)?)?\s*$",
+                       re.IGNORECASE)
+
+
+def parse_duration(text: str) -> float:
+    """``2h``, ``90m``, ``1h30m`` or a bare number of minutes -> seconds."""
+    text = str(text).strip()
+    try:
+        minutes = float(text)
+    except ValueError:
+        m = _DURATION.match(text)
+        if not m or not (m.group(1) or m.group(2)):
+            raise ValueError(f"--for takes a duration such as 2h, 90m or 1h30m, not {text!r}") \
+                from None
+        minutes = float(m.group(1) or 0) * 60.0 + float(m.group(2) or 0)
+    if not minutes > 0:
+        raise ValueError(f"--for {text}: must be more than 0")
+    return minutes * 60.0
+
+
+def hold_expiry(args, now: float | None = None):
+    """``kq hold``'s options -> the request's ``expiry`` (None: not given)."""
+    if getattr(args, "never", False):
+        return "never"
+    if getattr(args, "policy", False):
+        return "policy"
+    if getattr(args, "for_", None):
+        return {"for_s": parse_duration(args.for_)}
+    if getattr(args, "until", None):
+        return {"at": parse_at(args.until, now)}
+    return None
 
 
 # -- the parser -------------------------------------------------------------------------
@@ -553,8 +594,17 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     sp.add_argument("--all", action="store_true")
     sp.add_argument("--agent", action="store_true", help="as an agent")
 
-    sp = sub.add_parser("hold", help="a person's hold: agents' jobs wait")
+    sp = sub.add_parser("hold", help="a person's hold: agents' jobs wait (on a hold that is "
+                                     "on: counts as activity, changes how it lapses)")
     sp.add_argument("reason", nargs="*")
+    lapse = sp.add_mutually_exclusive_group()
+    lapse.add_argument("--for", dest="for_", metavar="DURATION",
+                       help="lapse after this long (2h, 90m, 1h30m)")
+    lapse.add_argument("--until", metavar="HH:MM", help="lapse at this time (the next one)")
+    lapse.add_argument("--never", action="store_true",
+                       help="never lapse by itself (hands-on work; release it when done)")
+    lapse.add_argument("--policy", action="store_true",
+                       help="lapse by the lab's rule once nobody has been active (the default)")
     sp.add_argument("--agent", action="store_true", help="as an agent")
     sp = sub.add_parser("release", help="lift the person's hold")
     sp.add_argument("--agent", action="store_true", help="as an agent")
@@ -1212,12 +1262,19 @@ def _cmd_resume(ctx: _Ctx, args) -> int:
 
 
 def _cmd_hold(ctx: _Ctx, args) -> int:
-    reply = ctx.client.hold(" ".join(args.reason), owner=_owner(args))
+    try:
+        expiry = hold_expiry(args)
+    except ValueError as exc:
+        ctx.warn(f"kq: {exc}")
+        return EXIT_USAGE
+    reply = ctx.client.hold(" ".join(args.reason), owner=_owner(args), expiry=expiry)
     h = _hold_text(reply.get("person_hold"))
     if reply.get("already"):
         ctx.say(f"[kq] a hold was already on: {h}")
     else:
-        ctx.say(f"[kq] {h}; agents' jobs wait until kq release")
+        lapses = (reply.get("person_hold") or {}).get("lapses_at") is not None
+        ctx.say(f"[kq] {h}; agents' jobs wait until kq release"
+                + (" or it lapses" if lapses else ""))
     return EXIT_OK
 
 

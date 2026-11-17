@@ -726,6 +726,9 @@ class RunQueue:
         self.hold = hold if hold is not None else PersonHold(
             os.path.join(directory, "person_hold.json") if directory else None,
             journal=journal)
+        # a person's job in the slot or about to launch keeps the hold from
+        # lapsing (and counts as activity)
+        self.hold.set_busy_check(self._person_busy)
         self._journal = journal
         self._on_change = on_change
         if spawn is None:
@@ -1864,16 +1867,36 @@ class RunQueue:
         return {"status": "ok", "run_queue": self.info()}
 
     def hold_request(self, obj: Mapping) -> dict:
-        """``{"reason", "by", "owner"}`` (``owner`` "person" when absent;
-        stored -- an agent may not release a person's hold)."""
+        """``{"reason", "by", "owner", "expiry"}`` (``owner`` "person" when
+        absent; stored -- an agent may not release a person's hold;
+        ``expiry``: how the hold lapses, see
+        :func:`~waxx.util.device_state.person_hold.parse_expiry` -- absent:
+        by the server's policy).  While a hold is on, a person's hold request
+        counts as activity and, with ``expiry``, changes how it lapses."""
         owner = str(obj.get("owner") or "person")
         if owner not in OWNERS:
             return {"status": "error", "msg": f"owner must be one of {', '.join(OWNERS)}"}
         reply = self.hold.hold(str(obj.get("reason") or ""),
                                str(obj.get("by") or obj.get("operator") or obj.get("client")
-                                   or ""), owner=owner)
+                                   or ""), owner=owner, expiry=obj.get("expiry"))
         self._notify()
         return reply
+
+    def _person_busy(self) -> str:
+        """Why a person is busy on the machine through the queue ("" when
+        not): a person's job in the slot, or a person's queued job eligible to
+        launch now.  One paused, due later or waiting for its PC does not
+        count.  The person hold does not lapse while this says something."""
+        now = self._clock()
+        with self._lock:
+            cur = self._jobs.get(self._current) if self._current is not None else None
+            if cur is not None and cur.owner == "person":
+                return f"a person's {cur.name} is {cur.state}"
+            for job in self._jobs.values():
+                if (job.state == "queued" and job.owner == "person"
+                        and not self._blocked_by(job, now)):
+                    return f"a person's {job.name} is about to launch"
+        return ""
 
     def set_warm_ahead(self, obj: Mapping) -> dict:
         """``{"on": bool | None, "by", "owner"}``: switch warm start on or
@@ -2167,7 +2190,8 @@ class RunQueue:
             now = self._clock()
             if self._last_poll_t is None or now - self._last_poll_t >= self.poll_every_s:
                 self._poll_now()
-            self.hold.tick()
+            if self.hold.tick():
+                self._notify()                   # it lapsed: the jobs' "held" text goes
             if self._current is None:
                 self._take_leftover()
             cur = self._jobs.get(self._current) if self._current is not None else None

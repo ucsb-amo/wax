@@ -119,6 +119,8 @@ def panel(qapp, server):
         p.confirms.append((title, text, yes, no)) or p.confirm_answer)
     p.text_answer = "mine"
     p.ask_text = lambda title, prompt, default="": p.text_answer
+    p.lapse_answer = {"mode": "policy"}
+    p.ask_hold_lapse = lambda: p.lapse_answer
     p.edit_answer = None
     p.ask_edit = lambda job: p.edit_answer
     p.set_state(_status())
@@ -388,6 +390,13 @@ def test_hold_release_pause_resume_send_exact_requests(panel, server):
     panel.toggle_hold()
     assert server.requests[-1] == {"type": "run_queue", "action": "release",
                                    "owner": "person", "by": "jp@test"}
+    panel.hold = {}
+    panel.lapse_answer = {"mode": "never"}                       # hands-on work
+    panel.toggle_hold()
+    assert server.requests[-1]["expiry"] == {"mode": "never"}
+    n = len(server.requests)
+    panel.lapse_answer = None                                    # the lapse question cancelled
+    assert panel.toggle_hold() is False and len(server.requests) == n
     panel.text_answer = ""
     panel.toggle_pause("agent")
     assert server.requests[-1] == {"type": "run_queue", "action": "pause", "scope": "agent",

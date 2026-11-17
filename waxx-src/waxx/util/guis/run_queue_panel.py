@@ -125,7 +125,7 @@ from PyQt6.QtWidgets import (
 )
 
 from waxx.util.dashboard import theme
-from waxx.util.device_state.person_hold import describe as describe_hold
+from waxx.util.device_state.person_hold import LAPSE_CHOICES, describe as describe_hold
 from waxx.util.device_state.run_queue_client import (
     ENDED, IN_SLOT, SUCCEEDED, default_by, local_sha256)
 from waxx.util.device_state.run_queue_client import again_request as _again_request
@@ -331,8 +331,14 @@ def resume_request(scope: str, by: str) -> dict:
     return {"type": "run_queue", "action": "resume", "scope": scope, "owner": OWNER, "by": by}
 
 
-def hold_request(reason: str, by: str) -> dict:
-    return {"type": "run_queue", "action": "hold", "reason": reason, "owner": OWNER, "by": by}
+def hold_request(reason: str, by: str, expiry=None) -> dict:
+    """``expiry``: how the hold lapses (None or the default "policy": not sent
+    -- the server's rule)."""
+    request = {"type": "run_queue", "action": "hold", "reason": reason, "owner": OWNER,
+               "by": by}
+    if expiry and expiry not in ("policy", {"mode": "policy"}):
+        request["expiry"] = expiry
+    return request
 
 
 def release_request(by: str) -> dict:
@@ -2012,10 +2018,24 @@ class RunQueuePanel(QWidget):
                                    "machine):", "a person has the machine")
             if reason is None:
                 return False
-            request = hold_request(reason or "a person has the machine", self.by)
+            expiry = self.ask_hold_lapse()
+            if expiry is None:
+                return False
+            request = hold_request(reason or "a person has the machine", self.by, expiry)
             what = "hold"
         self.runner.send(request, self._done(what))
         return True
+
+    def ask_hold_lapse(self):
+        """How the new hold ends (tests replace it): an expiry, or None
+        (cancelled)."""
+        labels = [label for label, _ in LAPSE_CHOICES]
+        text, ok = QInputDialog.getItem(self, "Hold: how it ends",
+                                        "When does the hold end if nobody releases it?",
+                                        labels, 0, False)
+        if not ok or text not in labels:
+            return None
+        return dict(LAPSE_CHOICES[labels.index(text)][1])
 
     def toggle_pause(self, scope: str) -> bool:
         paused = (self.info.get("paused") or {}).get(scope)

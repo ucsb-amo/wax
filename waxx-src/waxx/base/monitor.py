@@ -279,8 +279,13 @@ class Monitor:
         except Exception:
             host = ""
         token = uuid.uuid4().hex
+        try:
+            from waxx.util.device_state.run_queue_client import owner_from_env  # noqa: PLC0415
+            owner = owner_from_env()
+        except Exception:                             # noqa: BLE001
+            owner = None
         reply = self._monitor_client.announce_run(run_id=run_id, expt=expt, client=host,
-                                                  token=token)
+                                                  token=token, owner=owner)
         if reply is None or reply.get("status") != "ok":
             print("[Monitor] note: could not tell the monitor server this run is starting "
                   "(server unreachable); composite ops are not fenced for it.")

@@ -155,6 +155,7 @@ def test_writes_once_reads_retried(panel, factory):
     panel.poll_status(force=True)
     client = factory.made[0]
     panel.queue_panel.ask_text = lambda *a, **k: "mine"
+    panel.queue_panel.ask_hold_lapse = lambda: {"mode": "policy"}
     panel.queue_panel.toggle_hold()
     panel.queue_panel.refresh_list()
     by_action = {obj.get("action"): attempts for obj, attempts in client.requests}

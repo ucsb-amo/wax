@@ -65,7 +65,8 @@ States (:class:`GateState`):
 ``held``           a person has put a hold on the machine at the monitor
                    server (its ``status_json`` ``person_hold``; see
                    :mod:`~waxx.util.device_state.person_hold`).  Not waivable:
-                   an agent waits until a person releases it.  Reported by
+                   an agent waits until a person releases it or the server
+                   lets it lapse by its rule (journaled).  Reported by
                    :func:`loops_verdict` / :func:`assess`, never by
                    :func:`classify` (liveOD knows nothing of it).
 
