@@ -514,6 +514,13 @@ class MonitorUDPServer(UdpServer):
         if m in ('status', 'status_json'):
             # Polled continuously; never logged, never forwarded.
             return
+        # Connections are served on threads of their own (UdpServer): the
+        # check-then-act below (the queue busy? a run pending?) runs under the
+        # same lock as every structured request that may change something.
+        with self._request_lock:
+            self._plain_command(m, message)
+
+    def _plain_command(self, m: str, message: str) -> None:
         if (m == 'reset' or "run complete" in m) and self.exiting:
             log.warning("%r ignored: %s.", m, self.exiting)
             self.journal.record("message", text=m, ignored=self.exiting)
@@ -596,10 +603,11 @@ class MonitorUDPServer(UdpServer):
         return False
 
     def _handle_structured(self, raw):
-        """One structured request.  Since the server's own window answers its
-        panels' requests on a worker thread (MonitorServerGUI.direct_request)
-        while the TCP responder answers network clients, two requests can now
-        arrive at once; the handlers' check-then-act steps (one loop at a
+        """One structured request.  The server's own window answers its
+        panels' requests on a worker thread (MonitorServerGUI.direct_request),
+        and the TCP responder serves each network connection on a thread of
+        its own (UdpServer, since 2026-11-16), so requests arrive at once;
+        the handlers' check-then-act steps (one loop at a
         time, a restart refused while ..., a reset refused while ...) assumed
         one caller.  Every structured request that may change something
         therefore runs under one server-level lock (``_request_lock``, an
@@ -608,9 +616,9 @@ class MonitorUDPServer(UdpServer):
 
         The lock is held across a ``server`` request's wait for a loop to
         stop (up to LOOP_STOP_WAIT_S): releasing it there would let a loop be
-        started under the restart.  Network clients lose nothing by it (the
-        TCP accept loop is single-threaded and was already busy for that
-        wait); the window's panels keep their status_json and reads."""
+        started under the restart.  Only requests that take the lock wait
+        meanwhile; status_json and the reads are answered throughout (the
+        window's panels and every network client)."""
         try:
             obj = json.loads(raw)
         except Exception:
