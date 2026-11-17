@@ -55,6 +55,14 @@ LOG_CHUNK = 32 * 1024
 #: Heartbeat interval before the server has said, and its bounds.
 BEAT_S = 1.0
 BEAT_MIN_S, BEAT_MAX_S = 0.2, 10.0
+#: While a child runs, it is looked at this often between heartbeats: its exit
+#: goes to the server at once, not at the next beat (an Abort's end is seen
+#: up to a beat sooner).
+CHILD_POLL_S = 0.2
+#: After a child ends, heartbeats come every BEAT_MIN_S until the server has
+#: taken its end (its output first, then the exit) -- for at most this long,
+#: so a server that never acknowledges is not asked five times a second.
+FAST_AFTER_END_S = 10.0
 #: The wait between tries while the server does not answer.
 RETRY_S = 2.0
 #: A new connection to the monitor server after this many silent tries.
@@ -169,6 +177,9 @@ class Launcher:
         self.silent_tries = 0
         #: a child was started in this heartbeat: report it at once
         self._started_now = False
+        #: until when (self._clock) an ended child's end, not yet taken by the
+        #: server, makes the heartbeats fast (FAST_AFTER_END_S)
+        self._fast_until = 0.0
         for jid, token in pairs:
             self._take(int(jid), str(token))
 
@@ -268,6 +279,7 @@ class Launcher:
                 if code is not None:
                     c.update(state="exited", code=int(code), ended=time.time())
                     changed = True
+                    self._fast_until = self._clock() + FAST_AFTER_END_S
                     try:
                         watch.close()
                     except Exception:                 # noqa: BLE001
@@ -533,7 +545,44 @@ class Launcher:
         self.apply(reply)
         if self._started_now:
             return BEAT_MIN_S                         # its pid goes to the server now
+        if self._end_untaken():
+            return BEAT_MIN_S                         # its output, then its exit, go now
         return self.next_beat_s
+
+    def _end_untaken(self) -> bool:
+        """A child exited (within FAST_AFTER_END_S) and the server has not
+        acknowledged it yet: report() still holds its end back while its
+        output is unsent, or the server has not taken it."""
+        if self._clock() >= self._fast_until:
+            return False
+        return any(c.get("state") == "exited" and key not in job["acked"]
+                   for job in self.jobs.values() for key, c in job["children"].items())
+
+    def _child_ended(self) -> bool:
+        """A child this launcher watches has exited (looked at, not recorded:
+        the next step's _poll_children records it)."""
+        for watch in list(self._watches.values()):
+            try:
+                if watch.poll() is not None:
+                    return True
+            except Exception:                         # noqa: BLE001
+                continue        # never a reason to beat early: the beat looks at it as before
+        return False
+
+    def _wait(self, seconds: float) -> None:
+        """Until the next heartbeat: ``seconds``, or less when a running child
+        exits meanwhile (looked at every CHILD_POLL_S)."""
+        end = self._clock() + max(0.0, float(seconds))
+        while True:
+            left = end - self._clock()
+            if left <= 0:
+                return
+            if not self._watches:
+                self._sleep(left)
+                return
+            self._sleep(min(CHILD_POLL_S, left))
+            if self._child_ended():
+                return
 
     def run(self) -> int:
         """Heartbeat until no job is left."""
@@ -541,7 +590,7 @@ class Launcher:
             while self.jobs:
                 wait = self.step()
                 if self.jobs:
-                    self._sleep(wait)
+                    self._wait(wait)
         finally:
             for jid in list(self._locks):
                 self._locks.pop(jid).release()

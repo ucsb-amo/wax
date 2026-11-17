@@ -702,3 +702,104 @@ def test_kq_hands_its_server_address_to_the_launcher(monkeypatch):
     client = RunQueueClient(T())
     r = client.start_launcher({"jobs": [{"id": 3, "token": "t", "run_host": "pc-a"}]})
     assert r == {"ok": True, "pid": 42} and seen == [{"server": ("10.0.0.2", 77)}]
+
+
+# --- an ended child is reported at once (2026-11-17: Abort latency) -----------------------
+
+class FakeTime:
+    """The launcher's clock and sleep: a sleep moves the clock; ``on_sleep(n)``
+    runs after the n-th sleep (1-based)."""
+
+    def __init__(self, on_sleep=None):
+        self.t, self.slept, self.on_sleep = 0.0, [], on_sleep
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.t += s
+        if self.on_sleep is not None:
+            self.on_sleep(len(self.slept))
+
+
+def test_a_launcher_wakes_for_a_child_that_exits_between_beats(tmp_path, files):
+    q = make_bq(tmp_path)
+    pc = PC()
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    la = launcher_for(reply, q, pc, tmp_path)
+    child = start_running(q, la, jid, pc)
+    ft = FakeTime(on_sleep=lambda n: setattr(child, "code", 0) if n == 2 else None)
+    la._clock, la._sleep = ft.clock, ft.sleep
+    la._wait(5.0)
+    assert ft.slept == [L.CHILD_POLL_S] * 2                   # woke at its exit, not after 5 s
+
+
+def test_a_launcher_with_no_child_running_sleeps_the_whole_beat_at_once(tmp_path, files):
+    q = make_bq(tmp_path)
+    la = launcher_for(submit(q, files / "rabi.py"), q, PC(), tmp_path)
+    ft = FakeTime()
+    la._clock, la._sleep = ft.clock, ft.sleep
+    la._wait(1.0)
+    assert ft.slept == [1.0]
+
+
+def test_a_child_whose_watch_fails_never_makes_the_launcher_beat_early(tmp_path, files):
+    class Broken:
+        pid = 1
+
+        def poll(self):
+            raise OSError("handle gone")
+    q = make_bq(tmp_path)
+    la = launcher_for(submit(q, files / "rabi.py"), q, PC(), tmp_path)
+    la._watches[(1, "cold")] = Broken()
+    ft = FakeTime()
+    la._clock, la._sleep = ft.clock, ft.sleep
+    la._wait(1.0)
+    assert abs(sum(ft.slept) - 1.0) < 1e-9                    # the whole beat, in looks
+
+
+def test_an_ended_child_beats_fast_until_the_server_took_its_output_and_exit(tmp_path, files):
+    q = make_bq(tmp_path)
+    pc = PC()
+    reply = submit(q, files / "rabi.py")
+    jid, token = reply["ids"][0], reply["jobs"][0]["token"]
+    la = launcher_for(reply, q, pc, tmp_path)
+    child = start_running(q, la, jid, pc)
+    ft = FakeTime()
+    la._clock = ft.clock
+    child.write("Acquisition for run 101 aborted.", "the last line")
+    q.live.end_run(101, "aborted")
+    child.code = 1
+    beats = []
+    for _ in range(20):
+        if not la.jobs:
+            break
+        beats.append(la.step())
+        q.tick()
+    assert la.jobs == {}                                      # taken and forgotten
+    assert beats[0] == L.BEAT_MIN_S                           # its output went at once
+    assert state(q, jid) not in ("running", "launching")
+    # the end was judged from the whole log: its last line is the run's last line
+    assert q.tail({"id": jid, "token": token, "offset": 0})["lines"][-1] == "the last line"
+    assert q.describe({"id": jid})["tail"][-1] == "the last line"
+
+
+def test_fast_beats_after_an_end_stop_after_their_limit(tmp_path, files):
+    q = make_bq(tmp_path)
+    pc = PC()
+    reply = submit(q, files / "rabi.py")
+    jid = reply["ids"][0]
+    la = launcher_for(reply, q, pc, tmp_path)
+    child = start_running(q, la, jid, pc)
+    ft = FakeTime()
+    la._clock = ft.clock
+    child.write("the last line")
+    child.code = 0
+    q.live.end_run(101, "saved")
+    la.transport.down = True              # a server that never takes the end
+    la.step()                              # records the exit; nothing reaches the server
+    assert la._end_untaken()
+    ft.t += L.FAST_AFTER_END_S + 0.1
+    assert not la._end_untaken()           # back to the server's own beat
