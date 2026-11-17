@@ -300,36 +300,26 @@ class Scanner(AdjustPanel, ParamSync, ShotGrid, AbortState, ExposureDelays):
         try:
             self.pre_scan()
         except:
-            self.core.break_realtime()
-            self.cleanup_abort_kernel()
+            self._safe_state()
             raise
 
         scanning = True
-        aborted_bool = False
-        abort_what = ""
+        stop_after_shot = False     # this shot is the run's last
+        failed_on = ""              # the exception that made it the last
 
         while scanning:
 
-            # ---- between two shots ------------------------------------------
+            # ---- between two shots: this shot's params into the kernel ------
             # No delay and no sync here: the RPCs below run at kernel-CPU time
             # whatever the timeline cursor says.
             try:
-                aborted_bool = self._check_for_abort_signal()
-            except:
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
-                raise
-
-            try:
+                stop_after_shot = self._check_for_abort_signal()
                 self.update_params_from_xvars()
-
                 self.write_host_params_to_kernel()
                 self.core.break_realtime()
-
                 self.init_scan_kernel()
             except:
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
+                self._safe_state()
                 raise
 
             self.core.break_realtime()
@@ -339,56 +329,45 @@ class Scanner(AdjustPanel, ParamSync, ShotGrid, AbortState, ExposureDelays):
             # re-raised with a bare `raise`: an exception cannot be passed to
             # an RPC and is freed when its except block ends, so this is the
             # only way to keep its traceback.
-            cleaned = False
             self.shot_completed = False
             try:
                 self.scan_kernel()
                 self.shot_completed = True
             except RTIOUnderflow:
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("RTIOUnderflow"):
+                if not self._clean_up_failed_shot("RTIOUnderflow"):
                     raise
-                # save_on_underflow: finish the run with the shots taken
-                aborted_bool = True
-                abort_what = "RTIOUnderflow"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "RTIOUnderflow"
             except TriggerTimeout:
                 # A gated wait (line trigger, OPX hand-back) closed with no
-                # edge, so the shot cannot continue. Same exit as an underflow.
+                # edge, so the shot cannot continue.
                 aprint("[scan] shot aborted: a triggered wait saw no edge "
                        "(TriggerTimeout, see the line above). Cleaning up and "
                        "ending the run.")
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("TriggerTimeout"):
+                if not self._clean_up_failed_shot("TriggerTimeout"):
                     raise
-                aborted_bool = True
-                abort_what = "TriggerTimeout"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "TriggerTimeout"
             except RTIOOverflow:
                 # An input FIFO overflowed inside a gated wait (a bouncing or
-                # free-running line on a TTLInOut). Same exit as above.
+                # free-running line on a TTLInOut).
                 aprint("[scan] shot aborted: an RTIO input FIFO overflowed "
                        "(RTIOOverflow) -- a TTL input is toggling far faster "
                        "than expected. Cleaning up and ending the run.")
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("RTIOOverflow"):
+                if not self._clean_up_failed_shot("RTIOOverflow"):
                     raise
-                aborted_bool = True
-                abort_what = "RTIOOverflow"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "RTIOOverflow"
             except:
                 # Anything else (a ValueError from a DAC/DDS value, a lost
-                # DRTIO link, an exception from an RPC): the safe state, then
-                # the exception ends the run. The failed shot is not recorded.
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
+                # DRTIO link, an exception from an RPC). The failed shot is
+                # not recorded.
+                self._safe_state()
                 raise
 
-            # ---- cleanup of a shot that returned ----------------------------
-            if not cleaned:
+            # ---- cleanup of a shot that returned (a failed one had its
+            # cleanup in its handler) -----------------------------------------
+            if self.shot_completed:
                 self._cleanup_or_safe_state()
 
             self.core.break_realtime()
@@ -399,13 +378,20 @@ class Scanner(AdjustPanel, ParamSync, ShotGrid, AbortState, ExposureDelays):
 
             self.core.break_realtime()
 
-            if aborted_bool:
+            if stop_after_shot:
                 scanning = False
 
-        if aborted_bool:
-            self._send_abort_to_server(abort_what)
+        if stop_after_shot:
+            self._send_abort_to_server(failed_on)
 
         self.post_scan()
+
+    @kernel
+    def _safe_state(self):
+        """The machine's safe state, from wherever the timeline was left.
+        Called in an except block, just before its bare ``raise``."""
+        self.core.break_realtime()
+        self.cleanup_abort_kernel()
 
     @kernel
     def _cleanup_or_safe_state(self):
@@ -416,9 +402,19 @@ class Scanner(AdjustPanel, ParamSync, ShotGrid, AbortState, ExposureDelays):
         try:
             self.cleanup_scan_kernel()
         except:
-            self.core.break_realtime()
-            self.cleanup_abort_kernel()
+            self._safe_state()
             raise
+
+    @kernel
+    def _clean_up_failed_shot(self, what) -> TBool:
+        """A shot ended on ``what`` (RTIOUnderflow, RTIOOverflow or
+        TriggerTimeout): run its cleanup, then ask the host what to do with
+        the run (_abort_shot). False: the run is aborted and the handler
+        re-raises the exception. True (save_on_underflow): the run ends
+        normally after this shot and saves the shots taken."""
+        self.core.break_realtime()
+        self._cleanup_or_safe_state()
+        return self._abort_shot(what)
 
     def update_params_from_xvars(self):
         """Before each shot, on the host: this shot's value of every xvar goes
