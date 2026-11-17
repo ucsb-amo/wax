@@ -130,14 +130,14 @@ def test_sweep_without_an_end_goes_to_the_default_and_without_one_refuses(monkey
         _rf().sweep_to_rpc(dv, 1.e6, t_step=0.)
 
 
-def test_sweep_to_defaults_match_the_siglent_and_reset_goes_home(monkeypatch):
+def test_sweep_to_steps_and_reset_goes_home(monkeypatch):
     sleeps = []
     monkeypatch.setattr(rfc.time, "sleep", sleeps.append)
     rf = _rf(frequency=101.e6)
     rf._device.frequency = 100.e6
     rf.sweep_to_rpc(90.e6, reset=True)          # reset wins: to the default
     assert [c[1] for c in rf._device.calls] == [100.5e6, 101.e6]
-    assert sleeps == [0.1]
+    assert sleeps == [rfc.T_SWEEP_STEP]
 
 
 def test_sweep_from_outside_the_limits_is_refused_with_the_reason(monkeypatch):

@@ -11,7 +11,8 @@ frame.  In an experiment::
     rf.on()
 
 ``sweep_to`` is the Siglent's (``ry_980.sweep_to`` / ``SDG6000X_CH.sweep``):
-same arguments, same 0.5 MHz steps 0.1 s apart, starting from the frequency
+same arguments and 0.5 MHz steps, ``T_SWEEP_STEP`` (50 ms) apart -- the Siglent
+waits 0.1 s -- starting from the frequency
 the device reports, so an ``xvar`` scan of the end frequency moves the laser
 in small steps between shots, never in one jump.
 
