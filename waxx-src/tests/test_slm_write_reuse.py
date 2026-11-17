@@ -343,7 +343,7 @@ def test_the_kernel_check_changes_nothing_on_the_timeline():
 
 def test_shot_completed_is_set_only_by_a_normal_return():
     from waxx.base.scanner import Scanner
-    src = inspect.getsource(Scanner._scan)
+    src = inspect.getsource(Scanner._run_shot)
     i_false = src.index("self.shot_completed = False")
     i_call = src.index("self.scan_kernel()")
     i_true = src.index("self.shot_completed = True")
