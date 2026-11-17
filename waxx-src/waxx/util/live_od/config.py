@@ -79,6 +79,10 @@ class LiveODConfig:
     use_camera_host: bool = False
     # Camera keys the host opens as soon as it starts (host mode only).
     camera_host_claim_on_start: tuple = ()
+    # Address prefixes (e.g. "192.168.1.") of other PCs that may SNAP liveOD's
+    # cameras (host mode only). Empty: only this PC may. Never names, relinquish
+    # or anything else; a run's lock and a run's stream still refuse them.
+    camera_host_snap_from: tuple = ()
     # Lab rules on top of a camera category's own, {category name: (schema.Constraint, ...)},
     # e.g. a readout-clock combination a sensor cannot read out. Passed explicitly
     # (and logged when the host starts), never registered as an import side effect.

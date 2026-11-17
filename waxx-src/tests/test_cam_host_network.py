@@ -7,7 +7,8 @@
   RETURN when liveOD lets the camera go, a clear refusal naming whoever
   holds it;
 * who may write (T3): live settings and live-stream requests from any PC,
-  snaps, names and relinquish only from this PC; never a persisted field, an
+  snaps, names and relinquish only from this PC (snaps also from the
+  ``camera_host_snap_from`` prefixes); never a persisted field, an
   owner-only one or the EM-gain unlock; nothing while a run holds the camera;
 * a remote SNAP after a run gets the live profile back first;
 * live requests: liveOD's (start_stream / stop_stream) and a program's
@@ -180,6 +181,24 @@ def test_remote_writes_settings_and_live_only_persist_and_owner_rules(env):
         ok, why = wp(addr, CID, ["gain", "exposure_time"])
         assert not ok and "persist is on for cam_b" in why and "['gain']" in why
         assert wp(addr, CID, ["exposure_time"]) == (True, "")
+
+
+def test_snap_from_listed_prefixes_only_and_nothing_else_extra(env):
+    from waxx.util.live_od.config import LiveODConfig
+    cfg = LiveODConfig(camera_params_list=[BASLER], camera_host_snap_from=("10.255.",))
+    host = h.make_host(cfg, Fakes(), keeper=h.keeper_for(lambda cid: []))
+    host.start()
+    env["hosts"].append(host)
+    wp = host._write_policy
+    lab, other = "10.255.255.1", "10.254.0.1"
+    assert wp(lab, CID, ["snap"]) == (True, "")
+    assert wp("::ffff:" + lab, CID, ["snap"]) == (True, "")
+    for key in ("name", "relinquish", "return"):              # still this PC only
+        ok, why = wp(lab, CID, [key])
+        assert not ok and "is not this PC" in why and key in why, key
+    ok, why = wp(other, CID, ["snap"])
+    assert not ok and "is not this PC" in why
+    assert not wp("", CID, ["snap"])[0]
 
 
 def test_a_persisted_field_is_refused_over_the_wire(env):
