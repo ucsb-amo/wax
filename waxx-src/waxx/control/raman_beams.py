@@ -1067,16 +1067,20 @@ class RamanBeamsPID(RamanBeamPair):
     Both DDSes stay at their channels' default amplitudes (the optimum RF drive).
     fraction_power sets the two PID setpoint DACs:
 
-        v_pd0 = fraction_power * p.v_pd_dds0_balanced_max
-        v_pd1 = fraction_power * p.v_pd_dds1_balanced_max
+        v_pd0 = p.v_pd_dds0_dark + fraction_power * (p.v_pd_dds0_balanced_max - p.v_pd_dds0_dark)
+        v_pd1 = p.v_pd_dds1_dark + fraction_power * (p.v_pd_dds1_balanced_max - p.v_pd_dds1_dark)
 
     v_pd_dds0_balanced_max / v_pd_dds1_balanced_max are the dds0 / dds1 PID
-    setpoints that give roughly maximum power with the two beams at equal power
-    at the atoms. Each beam's photodiode voltage is taken as proportional to its
-    power (linear, no dark offset), so fraction_power is the fraction of that
-    balanced power in each beam, the same meaning it has in RamanBeamPair (which
-    scales each DDS amplitude by sqrt(fraction_power)). A photodiode offset
-    would make the power fraction differ from fraction_power.
+    setpoints at which the power is maximized per channel, as well as
+    balanced at the atoms (measured immediately before the cell).
+
+    v_pd_dds0_dark / v_pd_dds1_dark are the photodiode readings with no light.
+    Each photodiode's reading above its dark reading is taken as proportional
+    to its beam's power, so fraction_power is the fraction of the
+    fraction_power = 1 power in each beam, the same meaning it has in
+    RamanBeamPair (which scales each DDS amplitude by sqrt(fraction_power)).
+    fraction_power = 0 is the dark reading, not 0 V, so the loop is not asked
+    for less light than none.
 
     The setpoints are read from the params when they are written, so a value
     set in prepare() applies. The DACs are written only when fraction_power
@@ -1111,8 +1115,10 @@ class RamanBeamsPID(RamanBeamPair):
     @portable(flags={"fast-math"})
     def fraction_power_to_v_pd(self, fraction_power) -> TTuple([TFloat, TFloat]):
         """The (dds0, dds1) PID setpoints (V) for fraction_power."""
-        return (fraction_power * self.p.v_pd_dds0_balanced_max,
-                fraction_power * self.p.v_pd_dds1_balanced_max)
+        v0_dark = self.p.v_pd_dds0_dark
+        v1_dark = self.p.v_pd_dds1_dark
+        return (v0_dark + fraction_power * (self.p.v_pd_dds0_balanced_max - v0_dark),
+                v1_dark + fraction_power * (self.p.v_pd_dds1_balanced_max - v1_dark))
 
     @kernel
     def _write_power_setpoints(self):

@@ -1,6 +1,6 @@
 """FPLockServer: owns the lock's serial port and serves it over TCP.
 
-The lock is a qNimble Quarto running the fp_lock_core firmware (protocol in
+The lock is a qNimble Quarto running the pid_frequency_stabilize_Raman_v2 firmware (protocol in
 :mod:`fp_lock_protocol`).  The server
 
 * opens the port through a :class:`ComLink` (after binding and beaconing; a
