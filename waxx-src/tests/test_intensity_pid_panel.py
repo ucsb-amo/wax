@@ -173,6 +173,32 @@ def test_plot_window(rig):
     assert panel._plots["plot"].vb.viewRange()[0] == pytest.approx([-300, 0])
 
 
+def test_plot_bands(rig):
+    """Loop 1 fills the upper band, loop 2 the lower, a quarter of the height
+    apart; a flat trace still spans 0.1 V; a wide one spans its own range."""
+    from waxx.util.guis.intensity_pid.intensity_pid_panel import _BAND_GAP, _BANDS
+
+    panel, *_ = rig
+    now = time.time()
+    for i, t in enumerate((now - 3, now - 2, now - 1)):
+        panel._append_history({"t": t, "meas1": 0.5, "set1": 0.5,
+                               "meas2": 1.0 + 0.2 * i, "set2": 1.1})
+    panel._redraw()
+
+    def frac(vb, y):
+        y0, y1 = vb.viewRange()[1]
+        return (y - y0) / (y1 - y0)
+
+    vb1, vb2 = panel._plots["plot"].vb, panel._plots["right_vb"]
+    y0, y1 = vb1.viewRange()[1]
+    f_lo, f_hi = _BANDS[1]
+    assert (y1 - y0) * (f_hi - f_lo) == pytest.approx(0.1)      # flat loop 1: 0.1 V band
+    assert frac(vb1, 0.5) == pytest.approx(0.5 * (f_lo + f_hi))  # centred in its band
+    assert frac(vb2, 1.0) == pytest.approx(_BANDS[2][0])         # loop 2 fills its band
+    assert frac(vb2, 1.4) == pytest.approx(_BANDS[2][1])
+    assert _BANDS[1][0] - _BANDS[2][1] == pytest.approx(_BAND_GAP)
+
+
 def test_no_link_disables_controls(rig):
     panel, dev, srv, poll, *_ = rig
     srv.link.disconnect(hold=True)

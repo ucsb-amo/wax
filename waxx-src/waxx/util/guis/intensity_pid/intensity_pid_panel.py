@@ -4,7 +4,8 @@ Laid out for a small dock: a header (state pill; Hold / Release, Clear,
 Settings…), a grid of the measured and set voltages of both loops with their
 difference and the output, a grey line with the gains and the line rate, the
 server's warnings, and one plot of measured (solid) and set (dashed) for both
-loops, loop 1 on the left axis and loop 2 on the right, 100 ms means, over the
+loops, loop 1 on the left axis (upper band) and loop 2 on the right (lower band,
+a quarter of the plot height below; each band spans at least 0.1 V), 100 ms means, over the
 last ``history_s`` seconds (60 by default; the box in the header changes it).  Settings… edits p1 i1 p2 i2 (asks before sending); the server
 remembers them and re-applies them if the board resets.
 
@@ -59,6 +60,25 @@ _BTN_STYLE = "QPushButton { padding: 2px 8px; font-size: 11px; }"
 _HELD_BTN_STYLE = ("QPushButton { padding: 2px 8px; font-size: 11px; background-color: #b8860b;"
                    " color: white; font-weight: 600; }")
 _LOOP_COLORS = ("#1f77b4", "#d2691e")    # loop 1 left axis, loop 2 right axis
+# y layout of the twin axes, as fractions of the plot height from the bottom: loop 1's lines
+# fill the upper band, loop 2's the lower, a quarter of the height apart (top margin for the legend)
+PLOT_MIN_SPAN_V = 0.025       # a band shows at least this many volts (flat lines stay flat)
+_BAND_GAP = 0.05
+_BAND_MARGIN_TOP, _BAND_MARGIN_BOTTOM = 0.05, 0.05
+_BAND_H = (1.0 - _BAND_GAP - _BAND_MARGIN_TOP - _BAND_MARGIN_BOTTOM) / 2
+_BANDS = {1: (_BAND_MARGIN_BOTTOM + _BAND_H + _BAND_GAP, 1.0 - _BAND_MARGIN_TOP),
+          2: (_BAND_MARGIN_BOTTOM, _BAND_MARGIN_BOTTOM + _BAND_H)}
+
+
+def band_y_range(lo: float, hi: float, band: tuple[float, float],
+                 min_span: float = PLOT_MIN_SPAN_V) -> tuple[float, float]:
+    """The view y range that puts data in [lo, hi] (widened about its middle to at
+    least ``min_span``) into ``band`` (fractions of the plot height from the bottom)."""
+    mid, span = 0.5 * (lo + hi), max(hi - lo, min_span)
+    f_lo, f_hi = band
+    height = span / (f_hi - f_lo)
+    y0 = (mid - 0.5 * span) - f_lo * height
+    return y0, y0 + height
 
 
 def _ask(parent, title: str, text: str) -> bool:
@@ -485,12 +505,21 @@ class IntensityPIDPanel(WidgetPanelBase):
         import numpy as np  # noqa: PLC0415
         t = np.asarray(self._hist["t"]) - time.time()
         keep = t >= -self._history_s
+        shown = {}
         for key, curve in self._plots["curves"].items():
-            curve.setData(t[keep], np.asarray(self._hist[key], dtype=float)[keep], connect="finite")
+            shown[key] = np.asarray(self._hist[key], dtype=float)[keep]
+            curve.setData(t[keep], shown[key], connect="finite")
+        for loop, vb in ((1, self._plots["plot"].vb), (2, self._plots["right_vb"])):
+            y = np.concatenate((shown[f"meas{loop}"], shown[f"set{loop}"]))
+            y = y[np.isfinite(y)]
+            if y.size:
+                vb.setYRange(*band_y_range(float(y.min()), float(y.max()), _BANDS[loop]), padding=0)
 
     def _init_plots(self) -> None:
         """One plot: loop 1 on the left axis, loop 2 on the right (its own
-        view box); solid = meas, dashed = set, one colour per loop."""
+        view box); solid = meas, dashed = set, one colour per loop.  ``_redraw``
+        sets both y ranges (loop 1 upper band, loop 2 lower band, ``_BANDS``), so
+        the mouse does not zoom y."""
         try:
             import pyqtgraph as pg  # noqa: PLC0415
         except Exception:
@@ -507,11 +536,11 @@ class IntensityPIDPanel(WidgetPanelBase):
         plot = lay.addPlot(row=0, col=0)
         plot.showGrid(x=True, y=True, alpha=0.25)
         plot.setMenuEnabled(False)
-        plot.setMouseEnabled(x=False, y=True)
+        plot.setMouseEnabled(x=False, y=False)
         plot.setXRange(-self._history_s, 0, padding=0)
         plot.showAxis("right")
         right_vb = pg.ViewBox()
-        right_vb.setMouseEnabled(x=False, y=True)
+        right_vb.setMouseEnabled(x=False, y=False)
         plot.scene().addItem(right_vb)
         plot.getAxis("right").linkToView(right_vb)
         right_vb.setXLink(plot)
