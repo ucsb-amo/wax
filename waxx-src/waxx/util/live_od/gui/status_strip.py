@@ -13,6 +13,19 @@ camera instead.
 The strip's minimum width never changes. Every piece is either a fixed width or
 elides its text, so a run starting (long experiment name, badge appearing) cannot
 push the window wider. What is cut off is in the tooltip.
+
+Narrow windows: the window lays ``second_line`` out under its status row
+(``place_second_line``). Whenever the strip is narrower than its one-line width,
+the camera button, the progress bar and the timing move to that second line, and
+they come back when the strip is wide enough again:
+
+    [Running] 80545 · hf_tweezer_bec          [Run again]  [HELD · Release] [Abort]
+    [andor ▾]  [====> 37/120]  Δt 8.2s · ETA 14:32
+
+Every piece is a fixed width, so which layout shows depends on the strip's width
+alone (the window's width less its fixed neighbours), never on a run starting.
+The strip's minimum width is its first line's, which is what lets the window be
+made narrower than the one-line layout.
 """
 
 import time
