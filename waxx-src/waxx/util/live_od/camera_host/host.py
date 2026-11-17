@@ -55,7 +55,11 @@ on, a remote write of a persisted field is refused.
 Viewer) may change live settings and ask for the live stream (START_LIVE, of
 a camera liveOD has open: it never opens one) -- never while a run holds the
 camera: the worker's run lock refuses both from INIT_RUN until the run ends.
-Only programs on this PC may snap, rename or relinquish.  Owner-only fields
+Only programs on this PC may snap, rename or relinquish -- except that a PC
+whose address starts with one of ``LiveODConfig.camera_host_snap_from`` (the
+lab subnet, say) may snap too: the worker still refuses a snap while a run
+holds the camera, and the core while a run's stream holds it (only that
+stream may).  Owner-only fields
 and persisted ones are refused to everyone, and so is ``em_gain_unlocked``:
 the live EM-gain cap is lifted only in liveOD's own settings.  Attaching
 starts nothing (policy "persistent": it never touches the device).
@@ -435,6 +439,9 @@ class CameraHost:
         self._heartbeat_s = float(heartbeat_s)
         self._claim_on_start = tuple(_s(k) for k in
                                      (getattr(config, "camera_host_claim_on_start", ()) or ()))
+        self._snap_from = tuple(p for p in (_s(p).strip() for p in
+                                            (getattr(config, "camera_host_snap_from", ()) or ()))
+                                if p)
         self.specs = camera_specs(getattr(config, "camera_params_list", ()))
         self._by_key = {s.key: s for s in self.specs}
         self._by_cid = {s.camera_id: s for s in self.specs if s.camera_id}
@@ -793,6 +800,14 @@ class CameraHost:
             return False
         return a in (self._local or set()) or a.startswith("127.")
 
+    def _may_snap(self, addr: str) -> bool:
+        """A program on another PC whose address starts with one of
+        ``LiveODConfig.camera_host_snap_from`` may SNAP (nothing else extra)."""
+        a = _s(addr).strip()
+        if a.startswith("::ffff:"):
+            a = a[len("::ffff:"):]
+        return bool(a) and any(a.startswith(p) for p in self._snap_from)
+
     def _write_policy(self, client_addr: str, camera_id: str, keys) -> tuple:
         """The core's ``write_policy`` (module docstring, "Remote clients").
         A run's hold is not checked here: the worker's run lock refuses live
@@ -805,8 +820,10 @@ class CameraHost:
         spec = self._by_cid.get(camera_id)
         cat = spec.category if spec is not None else None
         if not self._is_local(client_addr):
+            snap_ok = self._may_snap(client_addr)
             other = sorted(k for k in keys
-                           if k != LIVE_KEY and not (cat is not None and cat.has(k)))
+                           if k != LIVE_KEY and not (snap_ok and k == "snap")
+                           and not (cat is not None and cat.has(k)))
             if other:
                 return False, (f"{client_addr or 'an unknown address'} is not this PC: "
                                f"programs on other PCs may change the live settings of "
