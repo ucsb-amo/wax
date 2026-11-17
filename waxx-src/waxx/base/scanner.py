@@ -1,3 +1,65 @@
+"""The scan: run one shot for every value of the scanned parameters.
+
+What an experiment does with it
+-------------------------------
+In ``prepare()``::
+
+    self.xvar('t_tof', np.linspace(1.e-3, 20.e-3, 10))    # scan a param
+    self.adjust('i_mot', min_val=0., max_val=80.)         # optional: live knob in liveOD
+    self.finish_prepare(shuffle=True)                     # builds the scan (init_xvars)
+
+and in the kernel, ``self.scan()`` runs the shots. The experiment writes
+``scan_kernel`` (one shot); the machine's base class (kexp.Base) fills in the
+other hooks. In order::
+
+    scan()
+      pre_scan()                    once: warm-up shots
+      for each point of the scan:
+          <next point's params copied into the kernel>
+          init_scan_kernel()        per-shot setup
+          scan_kernel()             THE SHOT
+          cleanup_scan_kernel()     per-shot cleanup, data write
+      post_scan()                   once
+
+Several xvars scan like nested for loops, the last one declared innermost.
+
+When something goes wrong
+-------------------------
+==================================  ====================  ============================
+what happened                       what runs             then
+==================================  ====================  ============================
+scan_kernel returned                cleanup_scan_kernel   next shot
+RTIOUnderflow, RTIOOverflow or      cleanup_scan_kernel   the run ends [1]
+TriggerTimeout in scan_kernel
+any other exception in scan_kernel  cleanup_abort_kernel  the run ends, exception
+                                                          re-raised; the shot is not
+                                                          recorded
+an exception in pre_scan, or        cleanup_abort_kernel  the run ends, exception
+between two shots (liveOD Abort,                          re-raised
+the param update, init_scan_kernel)
+an exception in                     cleanup_abort_kernel  the run ends, exception
+cleanup_scan_kernel itself                                re-raised
+==================================  ====================  ============================
+
+[1] The original exception is re-raised, so the host prints its traceback
+(for an underflow: channel, timestamp, kernel line). With
+``run_info.save_on_underflow`` (and save_data) the run instead ends normally
+and saves the shots taken.
+
+``cleanup_abort_kernel`` is the machine's safe state (kexp: coils off, high
+power beams off) with no data write. Between two shots the machine may be
+left running on purpose (kexp's MOT pre-load), which is why every exit above
+reaches one of the two cleanups.
+
+Whenever an exception leaves ``scan()``, the kernel first tells the host what
+it left every channel at (scanner_parts/abort_state.py).
+
+Where the rest is
+-----------------
+The plumbing is in ``waxx/base/scanner_parts/`` (see its ``__init__``): the
+Adjust panel, the host-to-kernel param copy, shot counting, the abort-state
+report and the camera exposure delays. ``Scanner`` inherits all of it.
+"""
 from artiq.experiment import *
 import numpy as np
 
@@ -5,89 +67,25 @@ from waxa.base import xvar
 from waxa.data import RunInfo
 from waxa.dummy.camera_params import CameraParams
 
-from artiq.language.core import kernel_from_string, now_mu, delay
 from artiq.experiment import RTIOUnderflow
 from artiq.coredevice.exceptions import RTIOOverflow, RTIODestinationUnreachable
 
 from waxx.control.exceptions import TriggerTimeout
 from waxx.util.artiq.async_print import aprint
-from waxx.util import console
 
-RPC_DELAY = 10.e-3
+from waxx.base.scanner_parts import (AdjustPanel, ParamSync, ShotGrid, AbortState,
+                                     ExposureDelays)
+# these names are imported from here by other modules
+from waxx.base.scanner_parts import AdjustSpec, WRITE_FAILURES, SNAPSHOT_PARAMS
 
-dv = -100.
-dvlist = np.array([])
-
-# Exceptions a channel write can raise itself.  A run that ends on one may
-# leave that one channel's cached value and the hardware apart (DAC_CH.set
-# caches before it writes, the ramps only after the last point), so the state
-# it reports is flagged as not trusted (see Expt._report_abort_state).
-WRITE_FAILURES = ("RTIOUnderflow", "RTIODestinationUnreachable", "ValueError")
-
-# Feature flag (2026-10-23): every scan-loop cleanup (normal path, the
-# RTIOUnderflow / TriggerTimeout / RTIOOverflow handlers) and
-# the steps between shots run cleanup_abort_kernel before an exception goes on
-# (_cleanup_or_safe_state). kexp's MOT pre-load, which keeps the MOT on between
-# shots, refuses to run on a scanner without it.
+# Feature flag: every exit of the scan loop reaches cleanup_scan_kernel or
+# cleanup_abort_kernel (the table above). kexp's MOT pre-load, which keeps the
+# MOT on between shots, refuses to run on a scanner without it.
 SAFE_STATE_ON_EVERY_CLEANUP_FAILURE = True
 
-# Parameters of the channel-snapshot kernel (Monitor._build_snapshot_kernel).
-SNAPSHOT_PARAMS = ["expt", "f", "a", "v", "s", "dv", "ts"]
 
-class AdjustSpec:
-    """Descriptor for a parameter that can be adjusted live between shots.
+class Scanner(AdjustPanel, ParamSync, ShotGrid, AbortState, ExposureDelays):
 
-    ``current_val`` is the value the run starts with (the param's value at
-    finish_prepare); ``locked`` is '' for a live row, else why the row is
-    read-only (``LOCK_SAVE_DATA``, ``LOCK_DERIVED``): the host never applies a
-    panel value to a locked key, and liveOD refuses to change one."""
-    LOCK_SAVE_DATA = "save_data"
-    LOCK_DERIVED = "derived"
-
-    def __init__(self, key, min_val, max_val, step, dtype=float, current_val=None,
-                 unit='', locked=''):
-        self.key = key
-        self.min_val = float(min_val)
-        self.max_val = float(max_val)
-        self.step = float(step)
-        self.dtype = dtype          # float or int
-        self.unit = unit or ''      # display unit only; values stay SI everywhere
-        self.locked = locked or ''
-        raw_current = current_val if current_val is not None else min_val
-        self.current_val = self.coerce(raw_current)
-
-    def coerce(self, value, like=None):
-        """Casts a value to this spec's dtype.
-
-        The liveOD server ships all adjust values as floats over JSON. A param
-        registered as an int must stay an int on the host, or the kernel-side
-        RPC (fetch_int32/fetch_int64) fails with a type mismatch.
-
-        Args:
-            value: the value to cast.
-            like: optional current param value whose numpy int type is preserved.
-        """
-        if self.dtype == int:
-            out = int(round(float(value)))
-            if isinstance(like, np.integer):
-                return type(like)(out)
-            return out
-        return float(value)
-
-    def to_dict(self) -> dict:
-        return {
-            'key':         self.key,
-            'min_val':     self.min_val,
-            'max_val':     self.max_val,
-            'step':        self.step,
-            'dtype':       'int' if self.dtype == int else 'float',
-            'current_val': self.current_val,
-            'unit':        self.unit,
-            'locked':      self.locked,
-        }
-
-
-class Scanner():
     def __init__(self):
 
         from waxx.config.expt_params import ExptParams
@@ -98,39 +96,10 @@ class Scanner():
         self.xvarnames = []
         self.scan_xvars = []
         self.Nvars = 0
-        self.__dict__.setdefault("_adjust_requests", [])  # adjust() calls, resolved at finish_prepare
-        self._adjust_specs = []         # the resolved specs (_resolve_adjust_specs)
-        self._pending_adjust_values = {}
-        self._adjust_applied = set()    # keys a panel value currently overrides
-
         self.update_nvars()
 
         from waxx.control.artiq.dummy_core import DummyCore
         self.core = DummyCore()
-
-        self._xvar_writer_floats = []
-        self._xvar_writer_int32s = []
-        self._xvar_writer_int64s = []
-        self._xvar_writer_arrays = []
-
-        self._param_keylist_floats = []
-        self._param_keylist_int32s = []
-        self._param_keylist_int64s = []
-        self._param_keylist_arrays = []
-
-        self._dummy_array = np.zeros(10000,dtype=float)
-        self._N = 0
-
-        # Where scan() copies every channel's kernel-side state when an
-        # exception ends it.  A no-op until Expt.finish_prepare_wax hands over
-        # the monitor's snapshot kernel and arrays.
-        self._abort_snapshot_kernels = [kernel_from_string(SNAPSHOT_PARAMS, "pass")]
-        self._abort_snap_dds_f = np.zeros(1)
-        self._abort_snap_dds_a = np.zeros(1)
-        self._abort_snap_dds_v = np.zeros(1)
-        self._abort_snap_dds_sw = np.zeros(1, dtype=np.int32)
-        self._abort_snap_dac_v = np.zeros(1)
-        self._abort_snap_ttl_s = np.zeros(1, dtype=np.int32)
 
         # True while cleanup_scan_kernel runs after a scan_kernel that
         # returned normally; False after one that raised. After an exception
@@ -139,20 +108,15 @@ class Scanner():
         # so a cleanup may skip work only when this is True.
         self.shot_completed = False
 
-        # Triggered camera streams' exposure delays, decided at the run's
-        # claim and written into the kernel at its start (load_exposure_delays;
-        # waxx.control.cameras.exposure_delay). The list always holds a spare
-        # cell, so it is never empty for the compiler.
-        from waxx.control.cameras.exposure_delay import init_cells
-        init_cells(self)
-        self._exposure_delays_loaded = False
+        # the plumbing's state (scanner_parts)
+        self._init_adjust()
+        self._init_param_sync()
+        self._init_abort_state()
+        self._init_exposure_delays()
 
-    def logspace(self,start,end,n):
-        return np.logspace(np.log10(start),np.log10(end),int(n))
-    
-    def powspace(self,start,end,n,power=3):
-        u = np.linspace(0, 1, n)
-        return (start + (end - start) * (1 - (1 - u) ** power))
+    # =========================================================================
+    # Declaring the scan (in prepare)
+    # =========================================================================
 
     def xvar(self,key,values):
         """Adds an xvar to the experiment.
@@ -173,7 +137,7 @@ class Scanner():
 
     def new_param_check(self,xvar):
         self.param_police(xvar)
-        
+
         params_keylist = list(self.params.__dict__.keys())
         if xvar.key not in params_keylist:
             # set value to a single value (vs list), it will be overwritten per shot in scan
@@ -184,372 +148,129 @@ class Scanner():
         if any([fc in xvar.key for fc in forbidden_chars]):
             raise ValueError("Key contains forbidden characters.")
 
-    def adjust(self, param_key, min_val=None, max_val=None, step=None, dtype=None,
-               default_val=None, unit=None):
-        """Register a parameter for live adjustment between shots via the liveOD Adjust panel.
-
-        Only records the request. Everything is settled at finish_prepare
-        (``_resolve_adjust_specs``), after all of prepare() has run, so an
-        override of the param anywhere in prepare() -- before or after this
-        line -- is what the run starts with. Until a value is changed in the
-        panel the param is never touched: a run nobody adjusts runs exactly as
-        it would without its adjust() lines.
-
-        Args:
-            param_key (str): ExptParams attribute to adjust.
-            min_val (float, optional): Minimum of the panel's range. Defaults to
-                the start value - 50%. Lowered to the start value if the start
-                value is below it (with a note); the param is never moved.
-            max_val (float, optional): Maximum of the panel's range. Defaults to
-                the start value + 50%; raised to the start value likewise.
-                A start value of 0 needs both limits given.
-            step (float, optional): Spinbox step size. Defaults to (max-min)/50.
-                For dtype=int the minimum effective step is 1.
-            dtype (type): float or int. Defaults to the type of the start value.
-            default_val (optional): The start value for a param that does not
-                exist in ExptParams. A param that exists (in ExptParams or set
-                in prepare()) keeps its own value: default_val loses, with a
-                note when they differ. Without either, min_val is used.
-            unit (str, optional): Unit the Adjust panel shows this param in
-                ('µs', 'MHz', 'V', ...). Defaults to the unit comment on the
-                param's line in ExptParams, else a guess from its name and the
-                size of its start value. Display only: the value stays SI
-                here, over the wire, and in ExptParams.
-
-        A key that is also an xvar is dropped (the xvar wins). A key that
-        params.compute_derived() or compute_new_derived() recomputes every shot
-        is shown read-only, since a panel value would be overwritten. With
-        save_data=True every row is read-only and no panel value is applied.
-        """
-        requests = self.__dict__.setdefault('_adjust_requests', [])
-        if any(r['key'] == param_key for r in requests):
-            raise ValueError(f"adjust key {param_key!r} already registered.")
-        requests.append(dict(key=param_key, min_val=min_val, max_val=max_val, step=step,
-                             dtype=dtype, default_val=default_val, unit=unit))
-
-    def _resolve_adjust_specs(self, save_data=False):
-        """finish_prepare: turns the adjust() requests into the run's specs.
-
-        Start value = the param's value now (prepare() is over), else
-        default_val, else min_val. Limits that exclude it are moved out to it
-        (printed); the param is not moved. An xvar of the same key wins. A key
-        the per-shot derived recompute overwrites is locked ``derived``;
-        ``save_data`` locks every spec."""
-        self._adjust_specs = []
-        self._adjust_applied = set()
-        self._pending_adjust_values = {}
-        p = vars(self.params)
-        for r in self.__dict__.get('_adjust_requests', []):
-            key = r['key']
-            if key in self.xvarnames:
-                print(f"[adjust] {key!r} is also an xvar: the xvar wins, no adjust row.")
-                continue
-            param_exists = key in p
-            default_val = r['default_val']
-            if param_exists:
-                start = p[key]
-                if default_val is not None and not np.isclose(float(default_val), float(start)):
-                    print(f"[adjust] {key}: default_val={default_val!r} ignored, the param "
-                          f"is already {start!r} (the param's value wins).")
-            elif default_val is not None:
-                start = default_val
-            elif r['min_val'] is not None:
-                start = r['min_val']
-            else:
-                raise ValueError(f"adjust param {key!r} does not exist: give default_val "
-                                 f"(or min_val) for its start value.")
-            dtype = r['dtype']
-            if dtype is None:
-                dtype = int if isinstance(start, (int, np.integer)) else float
-            start_f = float(start)
-            min_val, max_val = r['min_val'], r['max_val']
-            if min_val is None or max_val is None:
-                if start_f == 0.:
-                    raise ValueError(f"adjust param {key!r} starts at 0: give both min_val "
-                                     f"and max_val (the default range is the start value ±50%).")
-                half = 0.5 * abs(start_f)
-                if min_val is None:
-                    min_val = start_f - half
-                    if dtype == int:
-                        min_val = np.floor(min_val)
-                if max_val is None:
-                    max_val = start_f + half
-                    if dtype == int:
-                        max_val = np.ceil(max_val)
-            min_val, max_val = float(min_val), float(max_val)
-            if min_val > max_val:
-                raise ValueError(f"adjust param {key!r}: min_val {min_val} > max_val {max_val}.")
-            if start_f < min_val:
-                print(f"[adjust] {key} = {start!r} < min {min_val!r}; min lowered to {start!r}.")
-                min_val = start_f
-            if start_f > max_val:
-                print(f"[adjust] {key} = {start!r} > max {max_val!r}; max raised to {start!r}.")
-                max_val = start_f
-            step = r['step']
-            if step is None:
-                raw = (max_val - min_val) / 50.0
-                step = max(1, round(raw)) if dtype == int else raw
-            elif dtype == int:
-                step = max(1, int(step))
-            unit = r['unit']
-            if unit is None:
-                unit = self._detect_adjust_unit(key, start_f, min_val, max_val, dtype)
-            spec = AdjustSpec(key, min_val, max_val, step, dtype, start, unit)
-            if not param_exists:
-                # coerce keeps an int an int (the kernel writer is chosen by type)
-                p[key] = spec.coerce(start)
-            self._adjust_specs.append(spec)
-        for spec in self._adjust_specs:
-            if save_data:
-                spec.locked = AdjustSpec.LOCK_SAVE_DATA
-            elif self._adjust_key_is_derived(spec):
-                spec.locked = AdjustSpec.LOCK_DERIVED
-                print(f"[adjust] WARNING: p.{spec.key} is recomputed every shot by "
-                      f"compute_derived() / compute_new_derived(); a value set in the Adjust "
-                      f"panel would be overwritten, so its row is read-only. Adjust the "
-                      f"params it is derived from instead.")
-        if save_data and self._adjust_specs:
-            print(f"[adjust] save_data=True: the Adjust panel is read-only for this run "
-                  f"({len(self._adjust_specs)} param(s)); no panel value is applied.")
-
-    def _adjust_key_is_derived(self, spec):
-        """True when the per-shot recompute (params.compute_derived() then
-        compute_new_derived()) overwrites ``spec.key``: set the key to another
-        value, recompute, and see if it survives. Done on the real params
-        (self.p and the device objects hold references to them, so a copy
-        would not be what compute_new_derived writes), and every param is put
-        back afterwards: arrays in place, so a reference to one stays valid.
-        A failure to check returns False (the row stays live) with a note."""
-        import copy
-        d = vars(self.params)
-        try:
-            snapshot = copy.deepcopy(d)
-        except Exception as exc:
-            print(f"[adjust] could not check whether {spec.key!r} is a derived param "
-                  f"(params not copyable: {exc!r}); its row stays adjustable.")
-            return False
-        try:
-            v0 = d[spec.key]
-            if spec.dtype == int:
-                trial = spec.coerce(float(v0) + 7, like=v0)
-            else:
-                trial = spec.coerce(float(v0) * 1.37 + 1.e-3 * (1 + abs(float(v0))))
-            d[spec.key] = trial
-            self.params.compute_derived()
-            self.compute_new_derived()
-            after = d.get(spec.key)
-            return not np.isclose(float(after), float(trial), rtol=1e-12, atol=0.)
-        except Exception as exc:
-            print(f"[adjust] could not check whether {spec.key!r} is a derived param "
-                  f"({exc!r}); its row stays adjustable.")
-            return False
-        finally:
-            for k in list(d):
-                if k not in snapshot:
-                    del d[k]
-            for k, v in snapshot.items():
-                cur = d.get(k)
-                if (isinstance(cur, np.ndarray) and isinstance(v, np.ndarray)
-                        and cur.shape == v.shape and cur.dtype == v.dtype):
-                    cur[...] = v
-                else:
-                    d[k] = v
-            try:
-                # experiment state compute_new_derived keeps outside the params
-                # goes back to what the real values give
-                self.compute_new_derived()
-            except Exception:
-                pass
-
-    def _detect_adjust_unit(self, param_key, current_val, min_val, max_val, dtype):
-        """Display unit for an adjust param: the ExptParams comment, else the name.
-
-        Sized by the default value rather than the range, so a t_tof that starts
-        at 20 us shows in us even though it can be adjusted up into the ms.
-        Ints are counts (shot numbers, indices) and stay unitless. A failure
-        here must never stop an experiment from being built, so it falls back to
-        no unit.
-        """
-        if dtype == int:
-            return ''
-        try:
-            from waxa.units import unit_for_param
-            return unit_for_param(param_key, [current_val, min_val, max_val],
-                                  params_obj=self.params)
-        except Exception as exc:
-            print(f"[adjust] unit detection failed for {param_key!r}: {exc}")
-            return ''
-
-    def apply_pending_adjust_values(self):
-        """Apply GUI-side adjust values to host params. Overridden in Expt."""
-        pass
-
-    def compute_new_derived(self):
-        """Per-experiment derived-parameter hook, run on the host every shot
-        (from update_params_from_xvars) right after params.compute_derived().
-
-        Override this *as a method* in an experiment class to recompute
-        experiment-local derived quantities from the current shot's xvar
-        values. It must be host-only (an RPC from the scan loop) -- no @kernel.
-
-        Historically this was shadowed by an instance attribute assigned in
-        __init__, which silently disabled method overrides; only the
-        ``self.compute_new_derived = self.my_func`` assignment form worked.
-        Both forms work now.
-        """
-        pass
-
     def update_nvars(self):
         """Updates the number of xvars to be scanned.
         """
         self.Nvars = len(self.scan_xvars)
 
+    def logspace(self,start,end,n):
+        return np.logspace(np.log10(start),np.log10(end),int(n))
+
+    def powspace(self,start,end,n,power=3):
+        u = np.linspace(0, 1, n)
+        return (start + (end - start) * (1 - (1 - u) ** power))
+
+    # self.adjust(...) is in scanner_parts/adjust.py
+
+    def init_xvars(self, shuffle=True, N_repeats=[]):
+        """finish_prepare: builds the scan from the xvars declared in prepare.
+
+        Adds the repeats, shuffles the order of the points, counts the shots
+        and images, computes the derived params, and builds the kernels that
+        copy the params into the kernel before each shot. A run with no xvar
+        gets a one-point scan of a param named "dummy".
+        """
+        from waxa import img_types
+        if self.run_info.imaging_type == img_types.ABSORPTION:
+            if self.params.N_pwa_per_shot > 1:
+                print("You indicated more than one PWA per shot, but the analysis is set to absorption imaging. Setting # PWA to 1.")
+            self.params.N_pwa_per_shot = 1
+
+        if not self.xvarnames:
+            self.xvar("dummy",[0])
+        if self.xvarnames and not self.scan_xvars:
+            for key in self.xvarnames:
+                self.xvar(key,vars(self.params)[key])
+        self.plug_in_xvars()
+
+        self.repeat_xvars(N_repeats=N_repeats)
+
+        if shuffle:
+            self.shuffle_xvars()
+
+        self.params.N_img = self.get_N_img()
+        self.prepare_image_array()
+
+        self.params.compute_derived()
+        self.compute_new_derived()
+
+        self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
+        if hasattr(self,'scope_data'):
+            self.scope_data.xvardims = self.xvardims
+
+        self.generate_assignment_kernels()
+
+    # =========================================================================
+    # The hooks: what an experiment or a machine's base class fills in
+    # =========================================================================
+
     @kernel
     def scan_kernel(self):
-        """The kernel function to be scanned in the experiment. Usually
-        overloaded in kexp.Base.
-        
-        It should correspond to a single "shot" (single set of images to
-        generate one OD).
+        """One shot. Written per experiment.
 
-        The scan kernel should accept no arguments. 
-        
-        Any parameters being scanned should be referenced in the scan kernel as
-        an attribute of the experiment parameters attribute of the experiment
-        class.
+        It should correspond to a single "shot" (single set of images to
+        generate one OD) and accept no arguments. A scanned parameter is read
+        as ``self.p.<key>``: it holds this shot's value.
         """
         pass
 
     @kernel
     def pre_scan(self):
-        """This method is run in scan before the scan loop.
-        Usually overloaded in kexp.Base.
-        """        
+        """Run once, before the first shot (kexp.Base: the warm-up shots)."""
         pass
 
     @kernel
     def init_scan_kernel(self):
-        """This method is run between each shot just before scan_kernel.
-        Usually overloaded in kexp.Base.
-        """
+        """Run before every shot, after its params are in the kernel
+        (kexp.Base)."""
         pass
 
     @kernel
     def cleanup_scan_kernel(self):
-        """This method is run just after each scan_kernel completes.
-        Usually overloaded in kexp.Base.
-        """
+        """Run after every shot that returned, and after one that ended on
+        RTIOUnderflow, RTIOOverflow or TriggerTimeout (kexp.Base: hardware
+        off, the shot's data write). ``self.shot_completed`` says which."""
+        pass
+
+    @kernel
+    def cleanup_abort_kernel(self):
+        """The machine's safe state, run before any other exception ends the
+        run (the table at the top of this file). No data write, no shot
+        notification. Overload per machine (kexp.Base)."""
         pass
 
     @kernel
     def post_scan(self):
-        """This method is run just after the whole scan completes.
-        Usually overloaded in kexp.Base.
+        """Run once, after the last shot (kexp.Base)."""
+
+    def compute_new_derived(self):
+        """Per-experiment derived params, recomputed on the host before every
+        shot, right after params.compute_derived().
+
+        Override it as a method in the experiment class (or assign
+        ``self.compute_new_derived = self.my_func``) to recompute the
+        experiment's own derived quantities from this shot's xvar values.
+        Host only: no @kernel.
         """
-
-    @kernel
-    def _cleanup_or_safe_state(self):
-        """cleanup_scan_kernel, and if IT raises, the machine's safe state
-        (cleanup_abort_kernel) before the exception goes on. Used after every
-        shot: the normal path and the RTIOUnderflow / TriggerTimeout /
-        RTIOOverflow handlers (2026-10-23). A cleanup that raised before its
-        coil reset (kexp: a wrong image count after an underflow before the
-        first frame) used to end the run with no cleanup at all. If it raises
-        inside a handler, the cleanup's exception is the one re-raised."""
-        try:
-            self.cleanup_scan_kernel()
-        except:
-            self.core.break_realtime()
-            self.cleanup_abort_kernel()
-            raise
-
-    @kernel
-    def load_exposure_delays(self):
-        """Write the exposure delays the run's claim decided for its triggered
-        camera streams into the kernel's cells (waxx.control.cameras
-        .exposure_delay): ONE synchronous RPC, then a store per cell. The
-        trigger() kernels read the cells, so from here on every edge leads by
-        the delay the camera reported at the claim, with this run's settings
-        -- for a warm-launched run too, whose kernel was compiled before the
-        claim. Called first thing by kexp's init_kernel and by scan(); does
-        nothing once a kernel has loaded the claim's values (a call before
-        the claim loads what there is and stays armed). Emits no RTIO event
-        and moves no cursor; the RPC's wall time (~ms) comes out of the slack,
-        so call it where none is needed: kexp's init_kernel calls it before
-        its core.reset(); in scan() the next RTIO event comes after a
-        break_realtime (pre_scan's warm-ups, or the shot loop's)."""
-        if not self._exposure_delays_loaded:
-            d = self._exposure_delays_at_claim()
-            n = len(self._exposure_delay_cells)
-            for i in range(n):
-                self._exposure_delay_cells[i].value = d[i]
-            self._exposure_delays_loaded = d[n] > 0.5
-
-    def _exposure_delays_at_claim(self) -> TArray(TFloat):
-        """RPC target of load_exposure_delays: one float per cell, then 1.0
-        when they are all final (see exposure_delays_for_kernel). Never
-        raises; then the run's records are refreshed (exposure_delays_loaded)."""
-        from waxx.control.cameras.exposure_delay import exposure_delays_for_kernel, cells
-        try:
-            d = exposure_delays_for_kernel(self)
-        except Exception as e:                      # belt and braces: never into the kernel
-            c = cells(self)
-            print(f"[exposure delay] !! could not collect the claim's exposure delays "
-                  f"({e!r}); the kernel keeps its compiled values")
-            d = np.array([float(x.value) for x in c] + [0.], dtype=np.float64)
-        try:
-            self.exposure_delays_loaded()
-        except Exception as e:
-            print(f"[exposure delay] WARNING: refreshing the run's records failed ({e!r})")
-        return d
-
-    def exposure_delays_loaded(self):
-        """Machine hook: the kernel just took the claim's exposure delays
-        (kexp.Base: rewrites the run's diagnostic_images record). Host side,
-        inside a sync RPC: keep it short; must not raise."""
         pass
+
+    # =========================================================================
+    # The scan
+    # =========================================================================
 
     @kernel
     def scan(self, raise_underflow=False):
-        """
-        Runs the scan_kernel function for each value of the xvars specified.
+        """Runs scan_kernel once for every point of the scan. See the top of
+        this file for the order of the hooks and what each kind of failure
+        does.
 
-        The xvars are scanned as if looping over nested for loops, with the last
-        xvar as the innermost loop.
-
-        On each step of the scan, the host ExptParams is updated with the next
-        values of the xvars and derived parameters are recomputed. Then, the
-        updated host ExptParams values are written into the corresponding kernel
-        ExptParams.
-
-        A shot that raises RTIOUnderflow, RTIOOverflow or TriggerTimeout is
-        cleaned up (cleanup_scan_kernel) and the run is aborted; the original
-        exception is then re-raised, so the host prints its core-device
-        traceback (for an underflow: channel, timestamp, kernel line).  With
-        run_info.save_on_underflow the run instead ends normally and saves the
-        shots taken (no traceback).  Any other exception out of scan_kernel
-        runs cleanup_abort_kernel (the machine's safe state, no data write)
-        and is re-raised.  So does any exception out of pre_scan (the
-        warm-up shots), out of cleanup_scan_kernel after a shot that returned
-        normally, and out of the steps between two shots (the abort check,
-        the parameter update, init_scan_kernel) -- since 2026-10-23.
-
-        raise_underflow: ignored since 2026-09-27 (it used to re-raise without
-        cleanup to get the traceback, which the default now gives).
-
-        An exception that ends the scan (the liveOD Abort button, an error in
-        a shot or a hook) first hands the kernel's channel
-        state to the host, which sends it to the monitor server as the run's
-        end state, then leaves the kernel unchanged.  ARTIQ writes kernel
-        attributes back to the host only when a kernel returns, so without
-        this nothing on the host knows what an aborted run left the hardware
-        at.  The handlers bind no names (the compiler gives a local one type).
-
-        First, the triggered camera streams' exposure delays decided at the
-        claim go into the kernel (load_exposure_delays; nothing when the
-        kernel already loaded them, e.g. in kexp's init_kernel).
+        raise_underflow: ignored (the traceback it asked for is now always
+        printed).
         """
         self.load_exposure_delays()
+        # An exception that ends the scan first hands the kernel's channel
+        # state to the host. The handlers bind no names (the compiler gives a
+        # local one type), hence one clause per exception the report names.
         try:
             self._scan(raise_underflow)
         except RTIOUnderflow:
@@ -569,200 +290,136 @@ class Scanner():
             raise
 
     @kernel
-    def _hand_over_abort_state(self, what):
-        # Events already on the timeline play out whether or not anyone
-        # waits; waiting makes the snapshot what the hardware is at.
-        self.core.wait_until_mu(now_mu())
-        self._abort_snapshot_kernels[0](self, self._abort_snap_dds_f,
-                                        self._abort_snap_dds_a, self._abort_snap_dds_v,
-                                        self._abort_snap_dds_sw, self._abort_snap_dac_v,
-                                        self._abort_snap_ttl_s)
-        self._report_abort_state(what, self._abort_snap_dds_f, self._abort_snap_dds_a,
-                                 self._abort_snap_dds_v, self._abort_snap_dds_sw,
-                                 self._abort_snap_dac_v, self._abort_snap_ttl_s)
-
-    def _report_abort_state(self, what, dds_f, dds_a, dds_v, dds_sw, dac_v, ttl_s):
-        """RPC from scan()'s exception handler.  Overridden in Expt."""
-        pass
-
-    def _note_raise_underflow_ignored(self):
-        print("[scan] scan(raise_underflow=True) is no longer needed and is ignored: "
-              "an aborted shot is always cleaned up, and the original exception is "
-              "re-raised with its traceback (2026-09-27).")
-
-    # _abort_shot(what) -> bool, the RPC the scan-loop handlers call after
-    # cleanup, is defined in waxa Scribe (no stub here: Scanner precedes
-    # Scribe in Expt's MRO and would shadow it).
-
-    @kernel
-    def cleanup_abort_kernel(self):
-        """Run by the scan loop when scan_kernel raises anything other than
-        RTIOUnderflow, RTIOOverflow or TriggerTimeout, before the exception is
-        re-raised: put the hardware in a safe state.  No data write, no shot
-        notification.  Overload per machine (kexp.Base)."""
-        pass
-
-    @kernel
     def _scan(self, raise_underflow):
-        """The scan loop itself (see scan)."""
+        """The shot loop (see scan)."""
 
         if raise_underflow:
             self._note_raise_underflow_ignored()
 
-        # pre_scan runs the warm-up shots (kexp.Base), full sequences that
-        # can fail like any shot. A failure there gets the same exit as the
-        # "anything else" case below: the machine's safe state, then the
-        # original exception with its traceback. No data write or shot
-        # notification exists for a warm-up shot, so there is nothing else
-        # to clean up.
+        # The warm-up shots are full sequences and can fail like any shot.
         try:
             self.pre_scan()
         except:
-            self.core.break_realtime()
-            self.cleanup_abort_kernel()
+            self._safe_state()
             raise
 
         scanning = True
-        aborted_bool = False
-        abort_what = ""
+        stop_after_shot = False     # this shot is the run's last
+        failed_on = ""              # the exception that made it the last
 
         while scanning:
 
-            # No sync here: RPCs execute at kernel-CPU time regardless of the
-            # timeline cursor (the previous shot's events were already drained
-            # by the wait inside put_shot_data). There is no recovery delay
-            # between shots any more (t_recover, 100 ms, removed 2026-10-21 at
-            # the user's request: it guarded scope reads, which cannot
-            # outlast the next shot's re-arm -- both are blocking RPCs on this
-            # kernel's thread).
-            # Between two shots the machine may be left running on purpose
-            # (kexp's MOT pre-load keeps the MOT coil and beams on from the
-            # previous shot's cleanup to this shot's MOT). Anything that
-            # raises here -- the liveOD Abort, a host-side parameter error,
-            # an exception in init_scan_kernel -- therefore first puts the
-            # machine in its safe state (cleanup_abort_kernel), as an
-            # exception inside a shot does, then ends the run (2026-10-23).
+            # ---- between two shots: this shot's params into the kernel ------
+            # No delay and no sync here: the RPCs below run at kernel-CPU time
+            # whatever the timeline cursor says.
             try:
-                aborted_bool = self._check_for_abort_signal()
-            except:
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
-                raise
-
-            try:
+                stop_after_shot = self._check_for_abort_signal()
                 self.update_params_from_xvars()
-
                 self.write_host_params_to_kernel()
                 self.core.break_realtime()
-
-                # overloaded in kexp.Base
                 self.init_scan_kernel()
             except:
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
+                self._safe_state()
                 raise
 
             self.core.break_realtime()
 
-            # overloaded by user per experiment.
-            #
+            # ---- the shot ----------------------------------------------------
             # A shot that raises is cleaned up INSIDE its handler and then
-            # re-raised with a bare `raise`, which resumes the original
-            # exception: the host prints its own message (for an underflow,
-            # the channel and timestamp) and the kernel stack down to the
-            # line that failed.  An exception cannot be passed to an RPC, and
-            # a caught one is freed when its except block ends, so this is
-            # the only place the traceback can be kept.  The handlers bind no
-            # names (the compiler gives a local one type).
-            cleaned = False
+            # re-raised with a bare `raise`: an exception cannot be passed to
+            # an RPC and is freed when its except block ends, so this is the
+            # only way to keep its traceback.
             self.shot_completed = False
             try:
                 self.scan_kernel()
                 self.shot_completed = True
             except RTIOUnderflow:
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("RTIOUnderflow"):
+                if not self._clean_up_failed_shot("RTIOUnderflow"):
                     raise
-                # save_on_underflow: finish the run with the shots taken
-                aborted_bool = True
-                abort_what = "RTIOUnderflow"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "RTIOUnderflow"
             except TriggerTimeout:
                 # A gated wait (line trigger, OPX hand-back) closed with no
-                # edge, so the shot cannot continue. Same exit as an underflow.
+                # edge, so the shot cannot continue.
                 aprint("[scan] shot aborted: a triggered wait saw no edge "
                        "(TriggerTimeout, see the line above). Cleaning up and "
                        "ending the run.")
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("TriggerTimeout"):
+                if not self._clean_up_failed_shot("TriggerTimeout"):
                     raise
-                aborted_bool = True
-                abort_what = "TriggerTimeout"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "TriggerTimeout"
             except RTIOOverflow:
                 # An input FIFO overflowed inside a gated wait (a bouncing or
-                # free-running line on a TTLInOut). Same exit as above.
+                # free-running line on a TTLInOut).
                 aprint("[scan] shot aborted: an RTIO input FIFO overflowed "
                        "(RTIOOverflow) -- a TTL input is toggling far faster "
                        "than expected. Cleaning up and ending the run.")
-                self.core.break_realtime()
-                self._cleanup_or_safe_state()
-                if not self._abort_shot("RTIOOverflow"):
+                if not self._clean_up_failed_shot("RTIOOverflow"):
                     raise
-                aborted_bool = True
-                abort_what = "RTIOOverflow"
-                cleaned = True
+                stop_after_shot = True
+                failed_on = "RTIOOverflow"
             except:
                 # Anything else (a ValueError from a DAC/DDS value, a lost
-                # DRTIO link, an exception from an RPC): put the hardware in
-                # its safe state, then let the exception end the run as
-                # before.  cleanup_abort_kernel is the machine's safety part
-                # of cleanup (kexp: coils off and discharged, 1064 beams off,
-                # raman shutter closed) without the shot's data write, so the
-                # failed shot is not recorded as a shot.
-                self.core.break_realtime()
-                self.cleanup_abort_kernel()
+                # DRTIO link, an exception from an RPC). The failed shot is
+                # not recorded.
+                self._safe_state()
                 raise
 
-            # overloaded in kexp.Base. An exception out of the cleanup
-            # itself (kexp: a wrong image count, the raman DDS restore, the
-            # SLM first-use check, the liveOD Abort in the shot-complete
-            # RPC) used to end the run with no further cleanup, so a step
-            # that raised before the coil reset left a coil at its last
-            # current (kexp HF: the outer coil at 182 A, PID on; reviewer B,
-            # 2026-10-23). It now runs the safe state first, as the shot's
-            # own handler does.
-            if not cleaned:
+            # ---- cleanup of a shot that returned (a failed one had its
+            # cleanup in its handler) -----------------------------------------
+            if self.shot_completed:
                 self._cleanup_or_safe_state()
 
             self.core.break_realtime()
 
+            # ---- step to the next point -------------------------------------
             scanning = self.step_scan()
             self.update_scan_xvar_counters()
 
             self.core.break_realtime()
 
-            if aborted_bool:
+            if stop_after_shot:
                 scanning = False
 
-        if aborted_bool:
-            self._send_abort_to_server(abort_what)
+        if stop_after_shot:
+            self._send_abort_to_server(failed_on)
 
         self.post_scan()
 
     @kernel
-    def update_scan_xvar_counters(self):
-        for xvar in self.scan_xvars:
-            xvar.counter = self.return_scan_xvar_counter(xvar.position)
+    def _safe_state(self):
+        """The machine's safe state, from wherever the timeline was left.
+        Called in an except block, just before its bare ``raise``."""
+        self.core.break_realtime()
+        self.cleanup_abort_kernel()
 
-    def return_scan_xvar_counter(self, idx) -> TInt32:
-        return self.scan_xvars[idx].counter
+    @kernel
+    def _cleanup_or_safe_state(self):
+        """cleanup_scan_kernel, and if IT raises (kexp: a wrong image count,
+        the liveOD Abort in the shot-complete RPC), the machine's safe state
+        before the exception goes on: a cleanup that raised before its coil
+        reset must not leave a coil on."""
+        try:
+            self.cleanup_scan_kernel()
+        except:
+            self._safe_state()
+            raise
+
+    @kernel
+    def _clean_up_failed_shot(self, what) -> TBool:
+        """A shot ended on ``what`` (RTIOUnderflow, RTIOOverflow or
+        TriggerTimeout): run its cleanup, then ask the host what to do with
+        the run (_abort_shot). False: the run is aborted and the handler
+        re-raises the exception. True (save_on_underflow): the run ends
+        normally after this shot and saves the shots taken."""
+        self.core.break_realtime()
+        self._cleanup_or_safe_state()
+        return self._abort_shot(what)
 
     def update_params_from_xvars(self):
-        """Updates the host ExptParams attributes and recomputes derived
-        parameters according to the current values of the scanned xvars.
+        """Before each shot, on the host: this shot's value of every xvar goes
+        into the params, then the Adjust panel's values, then the derived
+        params are recomputed.
 
         Does not update the values of the kernel ExptParams -- to do so, use
         write_host_params_to_kernel().
@@ -777,266 +434,16 @@ class Scanner():
         self.params.compute_derived()
         self.compute_new_derived()
 
-    @kernel
-    def write_host_params_to_kernel(self):
-        """Loops over all experiment params, and assigns the values of the
-        kernel ExptParam attributes to those of the of the host ExptParam
-        attributes.
+    def _note_raise_underflow_ignored(self):
+        print("[scan] scan(raise_underflow=True) is no longer needed and is ignored: "
+              "an aborted shot is always cleaned up, and the original exception is "
+              "re-raised with its traceback (2026-09-27).")
 
-        Must have run generate_assignment_kernels() in build first.
-        """
-        int32val = np.int32(1)
-        int64val = np.int64(1)
-        floatval = 0.1
-        # self._dummy_array[:] = 0.
-        arrval = np.array([1.])
-
-        for idx in range(len(self._param_keylist_int32s)):
-            int32val = self.fetch_int32(idx)
-            self._xvar_writer_int32s[idx](self,int32val)
-
-        for idx in range(len(self._param_keylist_int64s)):
-            int64val = self.fetch_int64(idx)
-            self._xvar_writer_int64s[idx](self,int64val)
-
-        for idx in range(len(self._param_keylist_floats)):
-            floatval = self.fetch_float(idx)
-            self._xvar_writer_floats[idx](self,floatval)
-
-        for idx in range(len(self._param_keylist_arrays)):
-            N, self._dummy_array = self.fetch_array(idx)
-            self._xvar_writer_arrays[idx](self,self._dummy_array[0:N])
-            
-    def fetch_float(self,i) -> TFloat:
-        """Returns the value of the ith experiment parameter with datatype
-        float.
-
-        Args:
-            i (int): index of the ith float experiment paramter in the list
-            self._param_keylist_floats.
-
-        Returns:
-            TFloat: The value of the ith float ExptParam attribute.
-        """        
-        return vars(self.params)[self._param_keylist_floats[i]]
-    
-    def fetch_array(self,i) -> TTuple([TInt32,TArray(TFloat)]):
-        """Returns the value of the ith experiment parameter with datatype
-        ndarray.
-
-        Args:
-            i (int): index of the ith ndarray experiment paramter in the list
-            self._param_keylist_arrays.
-
-        Returns:
-            TFloat: The value of the ith ndarray ExptParam attribute.
-            TInt: length of the array
-        """
-        N = len(vars(self.params)[self._param_keylist_arrays[i]])
-        self._dummy_array[0:N] = vars(self.params)[self._param_keylist_arrays[i]]
-        return (N, self._dummy_array)
-    
-    def fetch_int64(self,i) -> TInt64:
-        """Returns the value of the ith experiment parameter with datatype
-        int64.
-
-        Args:
-            i (int): index of the ith ndarray experiment paramter in the list
-            self._param_keylist_int64s.
-
-        Returns:
-            TFloat: The value of the ith int64 ExptParam attribute.
-        """      
-        return int(round(vars(self.params)[self._param_keylist_int64s[i]]))
-    
-    def fetch_int32(self,i) -> TInt32:
-        """Returns the value of the ith experiment parameter with datatype
-        int32.
-
-        Args:
-            i (int): index of the ith ndarray experiment paramter in the list
-            self._param_keylist_int32s.
-
-        Returns:
-            TFloat: The value of the ith int32 ExptParam attribute.
-        """     
-        return int(round(vars(self.params)[self._param_keylist_int32s[i]]))
-
-    def generate_assignment_kernels(self):
-        """Generates a list of kernel functions for each param datatype (int32,
-        int64, ndarray, and float ) -- one for each ExptParam attribute. These
-        can be called in the kernel to update the kernel experiment params with
-        values from the host ExptParams returned by an RPC (the "fetch" functions).
-        """
-
-        keylist = list(self.params.__dict__.keys())
-        for key in keylist:
-            bodycode = f"self.params.{key} = value"
-            dtype = str(type(vars(self.params)[key]))
-
-            if 'int' in dtype:
-                if 'numpy.int64' in dtype:
-                    self._param_keylist_int64s.append(key)
-                    self._xvar_writer_int64s.append( kernel_from_string(["self","value"],bodycode) )
-                else:
-                    self._param_keylist_int32s.append(key)
-                    self._xvar_writer_int32s.append( kernel_from_string(["self","value"],bodycode) )
-            elif 'float' in dtype:
-                self._param_keylist_floats.append(key)
-                self._xvar_writer_floats.append( kernel_from_string(["self","value"],bodycode) )
-            elif 'ndarray' in dtype:
-                self._param_keylist_arrays.append(key)
-                self._xvar_writer_arrays.append( kernel_from_string(["self","value"],bodycode) )
-
-    def step_scan(self,idx=0) -> TBool:
-        '''
-        Advances the counters of the xvars to the next step in the scan.
-
-        Advances counters as if the xvars were looped over in nested for loops,
-        with the last xvar being the innermost loop.
-        '''
-        out = True
-        xvars = list(reversed(self.scan_xvars))
-        last_xvar_idx = self.Nvars - 1
-        last_xval_idx = xvars[idx].values.shape[0] - 1
-        if idx < self.Nvars:
-            if xvars[idx].counter == last_xval_idx:
-                if idx != last_xvar_idx:
-                    xvars[idx].counter = 0
-                    out = self.step_scan(idx+1)
-                else:
-                    out = False
-            else:
-                xvars[idx].counter += 1
-        return out
-
-    def cleanup_scanned(self):
-        """
-        Sets the parameters in ExptParams to the lists that were used to take
-        the data. 
-        
-        These are put in in the order the data was taken -- no unshuffling is
-        done. 
-        
-        This is good for recordkeeping, and ensures backward compatability with
-        analysis code.
-        """
-        for xvar in self.scan_xvars:
-            vars(self.params)[xvar.key] = xvar.values
-        try:
-            self.params.compute_derived()
-            self.compute_new_derived()
-        except Exception as e:
-            print(e)
-            print('Derived parameters were not updated.')
+    # _check_for_abort_signal, _abort_shot(what) -> bool and
+    # _send_abort_to_server, the RPCs the loop calls, are defined in waxa
+    # Scribe (no stubs here: Scanner precedes Scribe in Expt's MRO and would
+    # shadow them).
 
     def cleanup_image_count(self):
         # dummy, overloaded by kexp.image.cleanup_image_count
         pass
-
-    def init_xvars(self, shuffle=True, N_repeats=[]):
-        from waxa import img_types
-        if self.run_info.imaging_type == img_types.ABSORPTION:
-            if self.params.N_pwa_per_shot > 1:
-                print("You indicated more than one PWA per shot, but the analysis is set to absorption imaging. Setting # PWA to 1.")
-            self.params.N_pwa_per_shot = 1
-
-        if not self.xvarnames:
-            self.xvar("dummy",[0])
-        if self.xvarnames and not self.scan_xvars:
-            for key in self.xvarnames:
-                self.xvar(key,vars(self.params)[key])
-        self.plug_in_xvars()
-
-        self.repeat_xvars(N_repeats=N_repeats)
-        
-        if shuffle:
-            self.shuffle_xvars()
-        
-        self.params.N_img = self.get_N_img()
-        self.prepare_image_array()
-
-        self.params.compute_derived()
-        self.compute_new_derived()
-
-        self.xvardims = [len(xvar.values) for xvar in self.scan_xvars]
-        if hasattr(self,'scope_data'):
-            self.scope_data.xvardims = self.xvardims
-
-        self.generate_assignment_kernels()
-
-    def prepare_image_array(self):
-        # Check and normalise the run-owned camera fields first (AndorParams:
-        # trigger, frame transfer, sensor_roi -> resolution).  This runs inside
-        # init_xvars, i.e. in finish_prepare before INIT_RUN, so a refused
-        # value raises here without reserving a run id.  getattr: a bare
-        # CameraParams placeholder may not have the method.
-        prepare_for_run = getattr(self.camera_params, "prepare_for_run", None)
-        if callable(prepare_for_run):
-            prepare_for_run()
-        if self.run_info.save_data:
-            # The frames' dtype, declared to liveOD at INIT_RUN (images_dtype):
-            # a camera that knows it says so (BaslerParams: uint8 for Mono8,
-            # uint16 for Mono12 / Mono12p); otherwise by camera type.
-            image_dtype = getattr(self.camera_params, "image_dtype", None)
-            if callable(image_dtype):
-                dtype = image_dtype()
-            elif self.camera_params.camera_type == 'andor':
-                dtype = np.uint16
-            else:
-                dtype = np.uint8
-            # Only the shape and dtype are used (the INIT_RUN declaration);
-            # liveOD writes the frames.  A zero-memory, read-only view of one
-            # zero, not N_img full frames held for the whole run.
-            shape = (self.params.N_img,) + tuple(self.camera_params.resolution)
-            self.images = np.broadcast_to(np.zeros((), dtype=dtype), shape)
-            self.image_timestamps = np.zeros((self.params.N_img,))
-        else:
-            self.images = np.array([0])
-            self.image_timestamps = np.array([0])
-
-    def get_N_img(self):
-        """
-        Computes the number of images to be taken during the sequence from the
-        length of the specified xvars, stores in self.params.N_img. For
-        absorption imaging, 3 images per shot. For fluorescence imaging,
-        variable pwa images (ExptParams.N_pwa_per_shot, default = 1), then 1
-        each pwoa and dark images.
-        """                
-        N_img = 1
-        parts = []
-
-        for xvar in self.scan_xvars:
-            N_img = N_img * xvar.values.shape[0]
-            parts.append(f"{xvar.values.shape[0]} x {xvar.key}")
-        self.params.N_shots_with_repeats = N_img
-
-        # ASCII only: ExptBuilder pipes this through cp1252 on Windows.
-        msg = f"Scan: {', '.join(parts)} -> {N_img} shots"
-
-        ### I have no idea what this is for. ###
-        if isinstance(self.params.N_repeats,list):
-            if len(self.params.N_repeats) == 1:
-                N_repeats = self.params.N_repeats[0]
-            else:
-                N_repeats = np.prod(self.params.N_repeats)
-        else:
-            N_repeats = 1
-        self.params.N_shots = int(N_img / N_repeats)
-        ###
-
-        from waxa import img_types
-        if self.run_info.imaging_type == img_types.ABSORPTION:
-            images_per_shot = 3
-        else:
-            images_per_shot = self.params.N_pwa_per_shot + 2
-
-        N_img = images_per_shot * N_img # 3 images per value of independent variable (xvar)
-
-        if self.setup_camera:
-            msg += f" ({N_img} images)"
-        notes = getattr(self, "_scan_line_notes", None) or {}
-        if notes:
-            msg += " | " + " | ".join(str(v) for v in notes.values())
-        console.info(msg)
-        return N_img
