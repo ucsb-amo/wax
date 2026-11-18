@@ -22,7 +22,12 @@ read, unless ``--force``.  A person at the dashboard's PC can still press
 graceful stop (COM ports may stay held until Windows releases them): only for a
 dashboard whose window no longer answers.
 
-Agents (``WAXX_OWNER=agent``) may list but not close or kill.
+Agents (``WAXX_OWNER=agent``) may list but not close or kill.  Like kq's
+owner, that rule is advisory: the dashboard believes what the request says
+(there is no authentication).
+
+``kill`` is accepted while a close is under way (a stuck close is what it is
+for), and kdash reports success only once the dashboard stops answering.
 
 Targets are host names (case-insensitive), IP addresses or full beacon ids
 (``dashboard:<kind>:<host>:<pid>``).  Every target must match a dashboard, or
@@ -42,6 +47,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
@@ -60,6 +66,9 @@ CONNECT_TIMEOUT_S = 3.0
 #: Time to the first reply line of a close (the server dashboard's busy check
 #: asks liveOD and the monitor server first).
 FIRST_REPLY_TIMEOUT_S = 25.0
+#: How long after "killing" the dashboard's port may still answer (its
+#: watchdog ends it within 10 s).
+KILL_CONFIRM_S = 15.0
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_DECLINED = 0, 1, 2, 3
 
@@ -164,7 +173,8 @@ def match(dashes: list[Dashboard], targets: list[str], kind: Optional[str]
     unmatched = []
     for t in targets:
         tl = t.strip().lower()
-        hits = [d for d in pool if tl in (d.host.lower(), d.ip, d.sid.lower())]
+        hits = [d for d in pool if tl in (d.host.lower(), d.host.lower().split(".")[0],
+                                          d.ip, d.sid.lower())]
         if not hits:
             unmatched.append(t)
         for d in hits:
@@ -237,11 +247,18 @@ def describe_event(msg: dict) -> str:
         return f"COM server(s) FORCE-KILLED (ports may stay held): {', '.join(msg.get('servers') or [])}"
     if ev == "servers_stopped":
         hk = msg.get("hard_killed") or []
-        return ("servers stopped" + (f"; hard-killed: {', '.join(hk)}" if hk else " cleanly"))
+        alive = msg.get("still_running") or []
+        text = "servers stopped" + (f"; hard-killed: {', '.join(hk)}" if hk else " cleanly")
+        if alive:
+            text += f"; STILL RUNNING after the kills: {', '.join(alive)}"
+        return text
     if ev == "done":
         res = msg.get("result")
         if res == "closed":
             return "CLOSED"
+        if res == "closed_with_survivors":
+            return ("CLOSED, BUT these servers were still running after it: "
+                    f"{', '.join(msg.get('still_running') or [])} -- stop them at that PC")
         detail = msg.get("detail") or ""
         extra = msg.get("still_running")
         text = f"{str(res).upper()}: {detail}"
@@ -259,31 +276,50 @@ def run_on(d: Dashboard, req: dict, emit: Callable[[Dashboard, str], None],
            wait_s: float) -> bool:
     """Send a close/kill to one dashboard and relay its progress; True when it
     reported success."""
-    ok = False
+    killing = False
     try:
         for msg in request_lines(d.ip, d.port, req, first_timeout=FIRST_REPLY_TIMEOUT_S,
                                  idle_timeout=wait_s):
             if msg.get("ok") is False:
                 emit(d, f"REFUSED: {msg.get('refused') or msg.get('error') or msg}")
                 return False
+            if msg.get("event") == "heartbeat":
+                continue
             emit(d, describe_event(msg))
             if msg.get("event") == "done":
                 return msg.get("result") == "closed"
             if msg.get("event") == "killing":
-                ok = True
+                killing = True
+                break
     except socket.timeout:
-        emit(d, f"no word from the dashboard for {wait_s:.0f} s; it may still be closing "
-                "(check with kdash list)")
+        emit(d, f"no word from the dashboard for {wait_s:.0f} s (it sends a heartbeat every "
+                "few seconds while closing): it may be frozen; check with kdash list")
         return False
     except (OSError, ValueError) as exc:
-        if ok:
-            return True                      # the kill took the connection with it
-        emit(d, f"FAILED: {exc}")
+        if not killing:
+            emit(d, f"FAILED: {exc} (if it closed a moment ago, kdash list will not show it)")
+            return False
+    if killing:
+        if confirm_gone(d):
+            emit(d, "KILLED: its control port no longer answers")
+            return True
+        emit(d, f"STILL ANSWERING {KILL_CONFIRM_S:.0f} s after the kill: it did not die")
         return False
-    if ok:
-        return True
     emit(d, "the connection ended before the dashboard reported its result "
             "(check with kdash list)")
+    return False
+
+
+def confirm_gone(d: Dashboard, seconds: float = None, poll_s: float = 0.5) -> bool:
+    """True once the dashboard's control port stops answering ``status``."""
+    seconds = KILL_CONFIRM_S if seconds is None else seconds
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            request_one(d.ip, d.port, {"action": "status"}, timeout=2.0)
+        except (OSError, ValueError):
+            return True
+        time.sleep(poll_s)
     return False
 
 
@@ -333,8 +369,9 @@ def _parser() -> argparse.ArgumentParser:
         pc.add_argument("--force", action="store_true",
                         help="even while a run holds the machine (server dashboards)")
         pc.add_argument("--yes", "-y", action="store_true", help="do not ask to confirm")
-        pc.add_argument("--wait", type=float, default=120.0,
-                        help="longest silence from a dashboard before giving up on it (s)")
+        pc.add_argument("--wait", type=float, default=30.0,
+                        help="longest silence from a dashboard before giving up on it (s); "
+                             "a closing dashboard sends a heartbeat every 5 s")
         if name == "close":
             pc.add_argument("--all", action="store_true", help="every dashboard on the network")
             pc.add_argument("--com-timeout", type=float, default=DEFAULT_COM_TIMEOUT_S,
@@ -407,12 +444,9 @@ def main(argv: Optional[list[str]] = None, *, out=None, inp=None,
            "force": bool(args.force)}
     if args.cmd == "close":
         req["com_timeout_s"] = float(args.com_timeout)
-    # The COM wait sends nothing until it ends: never give up inside it.
-    wait_s = max(5.0, float(args.wait))
-    if args.cmd == "close":
-        lo, hi = COM_TIMEOUT_RANGE_S
-        wait_s = max(wait_s, min(max(float(args.com_timeout), lo), hi) + 60.0)
-    ok = run_all(chosen, req, out, wait_s=wait_s)
+    # A closing dashboard sends a heartbeat every few seconds: --wait is the
+    # longest silence, not the longest close.
+    ok = run_all(chosen, req, out, wait_s=max(5.0, float(args.wait)))
     return EXIT_OK if ok else EXIT_FAILED
 
 

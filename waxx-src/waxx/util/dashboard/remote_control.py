@@ -35,7 +35,15 @@ Rules (checked here, in the dashboard, not only by the client):
 * ``busy_check`` (the server dashboard passes "is a run going?") refuses a
   close or kill while it returns a reason, unless ``force`` is set; a check
   that raises counts as busy;
-* a second close while one is under way is refused.
+* a second close while one is under way (or while the window is being
+  closed at its own PC) is refused; a kill is not (it is for a stuck close).
+
+These rules are ADVISORY, not security: ``owner`` and ``force`` are whatever
+the request says (as kq's ``WAXX_OWNER`` is), and there is no authentication.
+Anyone on the network the port listens on can close a dashboard -- which is
+why it listens only on the address the beacon advertises (the lab adapter
+first), never on every adapter, and stays shut when that address cannot be
+bound.
 
 Every request that changes something is logged at WARNING by the dashboard
 (its log file and Log panel), with who asked and from which address.
@@ -61,12 +69,17 @@ PROTOCOL = 1
 BEACON_PREFIX = "dashboard:"
 #: Longest request line accepted.
 MAX_REQUEST_BYTES = 64 * 1024
-#: How long a request may take to arrive once connected.
+#: How long a request may take to arrive once connected (in all).
 REQUEST_READ_TIMEOUT_S = 10.0
+#: Connections served at once; more are answered "too many" and closed.
+MAX_CONNECTIONS = 16
 #: How long the control thread waits for the window (GUI thread) to take a close.
 ACK_TIMEOUT_S = 5.0
 #: Longest a close stream is kept open waiting for the window to finish.
 CLOSE_STREAM_MAX_S = 900.0
+#: A close stream with nothing to say sends a heartbeat this often, so the
+#: client can tell a long COM wait from a dead dashboard.
+HEARTBEAT_S = 5.0
 #: COM servers' time to exit on a remote close before they are force-killed.
 DEFAULT_COM_TIMEOUT_S = 30.0
 #: Bounds on what a client may ask for.
@@ -156,10 +169,19 @@ def _send(sock: socket.socket, obj: dict) -> None:
 
 
 def _read_request(sock: socket.socket) -> dict:
-    sock.settimeout(REQUEST_READ_TIMEOUT_S)
+    """One request line, within :data:`REQUEST_READ_TIMEOUT_S` in all (a client
+    sending a byte at a time does not hold the thread longer)."""
+    deadline = time.monotonic() + REQUEST_READ_TIMEOUT_S
     buf = bytearray()
     while b"\n" not in buf:
-        chunk = sock.recv(4096)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ValueError(f"no complete request within {REQUEST_READ_TIMEOUT_S:g} s")
+        sock.settimeout(left)
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            raise ValueError(f"no complete request within {REQUEST_READ_TIMEOUT_S:g} s") from None
         if not chunk:
             break
         buf.extend(chunk)
@@ -180,6 +202,25 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         ctl = self.server.controller
         sock = self.request
+        if not ctl._slots.acquire(blocking=False):
+            # Read what the client sent first (briefly): closing with it
+            # unread resets the connection and the client never sees why.
+            try:
+                sock.settimeout(0.5)
+                sock.recv(MAX_REQUEST_BYTES)
+            except OSError:
+                pass
+            try:
+                _send(sock, {"ok": False, "error": "too many connections; try again"})
+            except OSError:
+                pass
+            return
+        try:
+            self._handle(ctl, sock)
+        finally:
+            ctl._slots.release()
+
+    def _handle(self, ctl, sock) -> None:
         peer = self.client_address[0] if self.client_address else "?"
         try:
             req = _read_request(sock)
@@ -240,6 +281,7 @@ class DashboardControlServer:
         self._beacon = None
         self._lock = threading.Lock()
         self._busy = False     # a close/kill is under way
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
     @property
     def beacon_id(self) -> str:
@@ -252,14 +294,9 @@ class DashboardControlServer:
     def start(self) -> None:
         if self._server is not None:
             return
-        try:
-            srv = _TCPServer((self._bind_host, self._port), _Handler)
-        except OSError as exc:
-            if self._bind_host in ("0.0.0.0", ""):
-                raise
-            _LOG.warning("remote control: cannot bind %s (%s); listening on all addresses",
-                         self._bind_host, exc)
-            srv = _TCPServer(("0.0.0.0", self._port), _Handler)
+        # No fallback to all addresses: a port that cannot open where asked
+        # stays shut (fail closed) rather than listening on every adapter.
+        srv = _TCPServer((self._bind_host, self._port), _Handler)
         srv.controller = self
         self._server = srv
         self._thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.25},
@@ -267,13 +304,17 @@ class DashboardControlServer:
         self._thread.start()
         port = srv.server_address[1]
         if self._advertise:
-            from beacon.discovery.server import NetServer  # noqa: PLC0415
-            beacon = NetServer()
-            NetServer.__init__(beacon, self.beacon_id, port,
-                               beacon_extra={"kind": self.kind, "host": self.host,
-                                             "pid": self.pid, "proto": PROTOCOL})
-            beacon._start_beacon()
-            self._beacon = beacon
+            try:
+                from beacon.discovery.server import NetServer  # noqa: PLC0415
+                beacon = NetServer()
+                NetServer.__init__(beacon, self.beacon_id, port,
+                                   beacon_extra={"kind": self.kind, "host": self.host,
+                                                 "pid": self.pid, "proto": PROTOCOL})
+                beacon._start_beacon()
+                self._beacon = beacon
+            except Exception:
+                self.stop()             # never a port nobody knows about
+                raise
         _LOG.info("remote control on port %d as %s%s", port, self.beacon_id,
                   "" if self._advertise else " (not advertised)")
 
@@ -293,8 +334,9 @@ class DashboardControlServer:
                 pass
 
     def clear_closing(self) -> None:
-        """The window stayed open (a person pressed Cancel close): accept a
-        new close request again."""
+        """The window stayed open (Cancel close pressed, the close failed):
+        accept a new close request again.  The window calls this on every
+        path where it does not close; the lock is only ever held briefly."""
         with self._lock:
             self._busy = False
 
@@ -309,19 +351,15 @@ class DashboardControlServer:
         info.setdefault("closing", self._busy)
         return info
 
-    def _refusal(self, req: dict) -> Optional[str]:
-        if str(req.get("owner") or "").strip().lower() == "agent":
-            return "an agent may not close or kill a dashboard; ask a person"
-        if self._busy:
-            return "this dashboard is already closing"
-        if self._busy_check is not None and not req.get("force"):
-            try:
-                reason = self._busy_check()
-            except Exception as exc:                      # noqa: BLE001
-                reason = f"could not check whether the machine is busy ({exc})"
-            if reason:
-                return f"{reason} -- --force closes it anyway"
-        return None
+    def _machine_refusal(self, req: dict) -> Optional[str]:
+        """The busy check (may take seconds: never called under the lock)."""
+        if self._busy_check is None or req.get("force"):
+            return None
+        try:
+            reason = self._busy_check()
+        except Exception as exc:                          # noqa: BLE001
+            reason = f"could not check whether the machine is busy ({exc})"
+        return f"{reason} -- --force closes it anyway" if reason else None
 
     def _dispatch(self, req: dict, sock: socket.socket) -> None:
         action = req.get("action")
@@ -332,18 +370,29 @@ class DashboardControlServer:
             _send(sock, {"ok": False, "error": f"unknown action {action!r}"})
             return
         who = f"{req.get('by') or '?'} ({req.get('owner') or '?'}) from {req.get('_peer')}"
-        with self._lock:
-            refusal = self._refusal(req)
-            if refusal is None:
-                self._busy = True
+        refusal = None
+        if str(req.get("owner") or "").strip().lower() == "agent":
+            refusal = "an agent may not close or kill a dashboard; ask a person"
+        elif action == "close" and self._busy:
+            refusal = "this dashboard is already closing"
+        else:
+            refusal = self._machine_refusal(req)
+        if refusal is None and action == "close":
+            with self._lock:                 # re-checked: the busy check took time
+                if self._busy:
+                    refusal = "this dashboard is already closing"
+                else:
+                    self._busy = True
         if refusal is not None:
             _LOG.warning("remote %s by %s REFUSED: %s", action, who, refusal)
             _send(sock, {"ok": False, "refused": refusal})
             return
         if action == "kill":
-            _LOG.critical("remote KILL by %s (force=%s): killing this dashboard's process "
-                          "tree, servers included, with no graceful stop",
-                          who, bool(req.get("force")))
+            # Allowed while a close is under way: kill is for a close (or a
+            # window) that is stuck.  Nothing here may block before on_kill
+            # (no logging: a frozen GUI thread may hold a handler's lock);
+            # on_kill arms its own watchdog first and logs after.
+            req["_who"] = who
             try:
                 _send(sock, {"ok": True, "event": "killing", "pid": self.pid})
                 sock.shutdown(socket.SHUT_RDWR)
@@ -373,20 +422,24 @@ class DashboardControlServer:
         except OSError:
             progress.mark_flushed(client_gone=True)
             return
+        # The window clears _busy itself on every path where it stays open
+        # (clear_closing); nothing here does, so a client hanging up or this
+        # stream's deadline never leaves the dashboard refusing every close.
         deadline = time.monotonic() + CLOSE_STREAM_MAX_S
+        last_sent = time.monotonic()
         while time.monotonic() < deadline:
             msg = progress.next(timeout=0.5)
             if msg is None:
-                continue
+                if time.monotonic() - last_sent < HEARTBEAT_S:
+                    continue
+                msg = {"event": "heartbeat", "t": time.time()}
             try:
                 _send(sock, msg)
+                last_sent = time.monotonic()
             except OSError:
                 progress.mark_flushed(client_gone=True)
                 return
             if msg.get("event") == "done":
-                if msg.get("result") != "closed":
-                    with self._lock:
-                        self._busy = False       # the window stayed open
                 progress.mark_flushed()
                 return
         progress.mark_flushed(client_gone=True)

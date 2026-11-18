@@ -180,19 +180,150 @@ def test_window_refusal_frees_the_server_for_the_next_close():
         srv.stop()
 
 
-def test_cancelled_close_frees_the_server():
+def test_only_the_window_frees_the_server_after_an_accepted_close():
+    """A client hanging up, a cancelled close, the stream ending: none of them
+    frees the server by itself; the window's clear_closing does."""
+    holder = {}
+
     def on_close(progress):
         threading.Thread(target=lambda: progress.finish("cancelled", detail="pressed"),
                          daemon=True).start()
         return None
     srv, _ = _server(on_close=on_close)
+    holder["srv"] = srv
     try:
-        lines = _ask(srv, {"action": "close", "owner": "person"})
-        assert lines[-1]["result"] == "cancelled"
-        [st] = _ask(srv, {"action": "status"})
-        assert st["closing"] is False
+        assert _ask(srv, {"action": "close", "owner": "person"})[-1]["result"] == "cancelled"
+        [r] = _ask(srv, {"action": "close", "owner": "person"})
+        assert "already closing" in r["refused"]
+        srv.clear_closing()                  # what the window does when it stays open
+        assert _ask(srv, {"action": "close", "owner": "person"})[-1]["result"] == "cancelled"
     finally:
         srv.stop()
+
+
+def test_kill_allowed_while_a_close_is_stuck():
+    def on_close(progress):
+        return None                          # accepted, never finishes
+    srv, calls = _server(on_close=on_close)
+    try:
+        ip, port = srv.address
+        s = socket.create_connection((ip, port), timeout=5)
+        s.sendall(b'{"action": "close", "owner": "person"}\n')
+        s.recv(100)
+        [r] = _ask(srv, {"action": "kill", "owner": "person"})
+        assert r["event"] == "killing" and _wait(lambda: len(calls.kills) == 1)
+        s.close()
+    finally:
+        srv.stop()
+
+
+def test_heartbeats_while_closing_and_kdash_skips_them(monkeypatch):
+    monkeypatch.delenv("WAXX_OWNER", raising=False)
+    monkeypatch.setattr(rc, "HEARTBEAT_S", 0.2)
+
+    def on_close(progress):
+        threading.Thread(target=lambda: (time.sleep(1.2), progress.finish("closed")),
+                         daemon=True).start()
+        return None
+    srv, _ = _server(on_close=on_close)
+    try:
+        lines = _ask(srv, {"action": "close", "owner": "person"})
+        assert sum(m.get("event") == "heartbeat" for m in lines) >= 2
+        srv.clear_closing()
+        out = io.StringIO()
+        # heartbeats, not lines with news, are what keep a short --wait alive
+        assert kdash.main(["close", "testhost", "-y", "--wait", "5"], out=out,
+                          discover=lambda: [_dash(srv)]) == 0, out.getvalue()
+        assert "heartbeat" not in out.getvalue()
+    finally:
+        srv.stop()
+
+
+def test_busy_check_runs_outside_the_lock():
+    started = threading.Event()
+
+    def slow():
+        started.set()
+        time.sleep(1.5)
+        return None
+    srv, _ = _server(busy=slow)
+    try:
+        t = threading.Thread(target=_ask, args=(srv, {"action": "close", "owner": "person"}),
+                             daemon=True)
+        t.start()
+        assert started.wait(5)
+        t0 = time.monotonic()
+        srv.clear_closing()                  # the GUI thread's call: must not wait 1.5 s
+        assert time.monotonic() - t0 < 0.2
+        [st] = _ask(srv, {"action": "status"})
+        assert st["ok"]
+        t.join(10)
+    finally:
+        srv.stop()
+
+
+def test_slow_trickle_client_cut_off_and_connection_cap(monkeypatch):
+    monkeypatch.setattr(rc, "REQUEST_READ_TIMEOUT_S", 0.6)
+    srv, _ = _server()
+    try:
+        ip, port = srv.address
+        s = socket.create_connection((ip, port), timeout=5)
+        t0 = time.monotonic()
+        reply = b""
+        s.settimeout(0.1)
+        for _ in range(40):                  # one byte every 0.1 s, no newline
+            try:
+                s.sendall(b" ")
+                reply = s.recv(1000)          # read before the next byte: once the
+            except socket.timeout:            # server closes, a send would reset
+                continue                      # the connection and drop its reply
+            except OSError:
+                break
+            if reply:
+                break
+        s.close()
+        assert b"within" in reply and time.monotonic() - t0 < 4
+    finally:
+        srv.stop()
+
+    monkeypatch.setattr(rc, "MAX_CONNECTIONS", 2)
+    monkeypatch.setattr(rc, "REQUEST_READ_TIMEOUT_S", 3.0)
+    srv, _ = _server()
+    try:
+        ip, port = srv.address
+        hogs = [socket.create_connection((ip, port), timeout=5) for _ in range(2)]
+        time.sleep(0.3)
+        [r] = _ask(srv, None, raw=b'{"action": "status"}\n')
+        assert "too many" in r["error"]
+        for h in hogs:
+            h.close()
+        assert _wait(lambda: _ask(srv, {"action": "status"})[0].get("ok") is True, 5)
+    finally:
+        srv.stop()
+
+
+def test_bind_failure_does_not_fall_back_to_all_addresses():
+    srv = rc.DashboardControlServer("client", info=dict, on_close=lambda p: None,
+                                    on_kill=lambda r: None, bind_host="203.0.113.7",
+                                    advertise=False)
+    with pytest.raises(OSError):
+        srv.start()
+    assert srv.address is None
+
+
+def test_beacon_failure_closes_the_port(monkeypatch):
+    import beacon.discovery.server as bds
+
+    def boom(self):
+        raise RuntimeError("no beacon")
+    # the beacon thread never starts: nothing is sent
+    monkeypatch.setattr(bds.NetServer, "_start_beacon", boom)
+    srv = rc.DashboardControlServer("client", info=dict, on_close=lambda p: None,
+                                    on_kill=lambda r: None, bind_host="127.0.0.1",
+                                    advertise=True)
+    with pytest.raises(RuntimeError):
+        srv.start()
+    assert srv.address is None and srv._beacon is None
 
 
 def test_kill_replies_then_kills():
@@ -546,6 +677,78 @@ def test_window_frozen_gui_refuses_and_late_close_is_dropped(qapp, window_factor
     assert st["closing"] is False
 
 
+def _spawn_child(tmp_path, mode=""):
+    import subprocess
+    import sys
+    child = os.path.join(os.path.dirname(__file__), "remote_close_child.py")
+    proc = subprocess.Popen([sys.executable, child, str(tmp_path), mode],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines = []
+    port = None
+    end = time.monotonic() + 60
+    while time.monotonic() < end and port is None:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        lines.append(line.rstrip())
+        if line.startswith("PORT "):
+            port = int(line.split()[1])
+    if port is None:
+        proc.kill()
+        pytest.fail("child dashboard did not start:\n" + "\n".join(lines))
+    return proc, port, lines
+
+
+def _finish_child(proc, lines, timeout=30):
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except Exception:
+        proc.kill()
+        out, _ = proc.communicate()
+        pytest.fail("child dashboard did not exit after the remote close:\n"
+                    + "\n".join(lines) + out)
+    return lines + out.splitlines()
+
+
+@pytest.mark.parametrize("mode", ["", "modal"])
+def test_remote_close_ends_the_process(tmp_path, mode):
+    """A real process: after "done closed" it exits with code 0, even with a
+    modal dialog's event loop open when the close arrived."""
+    proc, port, lines = _spawn_child(tmp_path, mode)
+    if mode == "modal":
+        while "MODAL" not in lines:
+            lines.append(proc.stdout.readline().rstrip())
+        time.sleep(0.3)
+    got = list(kdash.request_lines("127.0.0.1", port, {"action": "close", "owner": "person",
+                                                       "by": "test"},
+                                   first_timeout=20, idle_timeout=20))
+    assert got[0]["event"] == "accepted" and got[-1]["result"] == "closed", got
+    all_lines = _finish_child(proc, lines)
+    assert proc.returncode == 0, all_lines
+    assert "EXIT 0" in all_lines
+
+
+def test_two_simultaneous_closes_of_a_process_one_accepted(tmp_path):
+    """Two closes at once on a real process: one is accepted, the other refused."""
+    proc, port, lines = _spawn_child(tmp_path)
+    results = []
+
+    def one():
+        results.append(list(kdash.request_lines(
+            "127.0.0.1", port, {"action": "close", "owner": "person"},
+            first_timeout=20, idle_timeout=20)))
+    ts = [threading.Thread(target=one) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(40)
+    finals = [str(r[-1].get("result") or r[-1].get("refused")) for r in results]
+    assert len(finals) == 2 and finals.count("closed") == 1, results
+    assert any("already closing" in f for f in finals), results
+    _finish_child(proc, lines)
+    assert proc.returncode == 0
+
+
 def test_window_cancel_at_pc_keeps_it_open(qapp, window_factory, monkeypatch):
     from waxx.util.dashboard import com_shutdown_dialog as csd
     stuck_com = _FakeSup("lock", exits_on_request=False)
@@ -570,3 +773,73 @@ def test_window_cancel_at_pc_keeps_it_open(qapp, window_factory, monkeypatch):
     t, out = _close_in_thread(win, {"action": "close", "owner": "person", "com_timeout_s": 1})
     assert _pump(qapp, lambda: not t.is_alive(), seconds=15)
     assert out["lines"][-1]["result"] == "closed"
+
+
+def test_window_close_that_raises_stays_open_and_can_close_again(qapp, window_factory,
+                                                                  monkeypatch):
+    from waxx.util.dashboard import dashboard_window as dw
+    win = window_factory({"plain": _FakeSup("plain")})
+    real = dw.shutdown_all
+    calls = {"n": 0}
+
+    def flaky(sups, grace_ms):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("taskkill missing")
+        return real(sups, grace_ms=grace_ms)
+    monkeypatch.setattr(dw, "shutdown_all", flaky)
+    t, out = _close_in_thread(win, {"action": "close", "owner": "person"})
+    assert _pump(qapp, lambda: not t.is_alive(), seconds=15)
+    last = out["lines"][-1]
+    assert last["result"] == "error" and "taskkill missing" in last["detail"]
+    assert win.isVisible() and win._control is not None
+    assert win._remote_close is None and win._closing_now is False
+    t, out = _close_in_thread(win, {"action": "close", "owner": "person"})
+    assert _pump(qapp, lambda: not t.is_alive(), seconds=15)
+    assert out["lines"][-1]["result"] == "closed"
+
+
+def test_window_refuses_remote_close_while_closing_locally(qapp, window_factory):
+    win = window_factory()
+    win._closing_now = True                  # the X was pressed; its COM dialog is up
+    t, out = _close_in_thread(win, {"action": "close", "owner": "person"})
+    assert _pump(qapp, lambda: not t.is_alive(), seconds=10)
+    assert "own PC" in out["lines"][0]["refused"]
+    assert win._remote_close is None
+    win._closing_now = False
+    [st] = _ask(win._control, {"action": "status"})
+    assert st["closing"] is False
+
+
+def test_window_reports_servers_that_survive_the_kills(qapp, window_factory):
+    immortal = _FakeSup("immortal", exits_on_request=False)
+    immortal.force_kill = lambda wait_ms=200: None       # the kill does not take
+    win = window_factory({"immortal": immortal})
+    t, out = _close_in_thread(win, {"action": "close", "owner": "person"})
+    assert _pump(qapp, lambda: not t.is_alive(), seconds=20)
+    last = out["lines"][-1]
+    assert last["result"] == "closed_with_survivors" and last["still_running"] == ["immortal"]
+    assert "STILL RUNNING" in kdash.describe_event(
+        [m for m in out["lines"] if m.get("event") == "servers_stopped"][0])
+
+
+@pytest.mark.parametrize("mode", ["", "frozen_log"])
+def test_kdash_kill_ends_a_real_process(tmp_path, monkeypatch, mode):
+    """kdash kill on a real window process; "frozen_log": its GUI thread holds
+    the log handler's lock, so only the kill watchdog can end it."""
+    monkeypatch.delenv("WAXX_OWNER", raising=False)
+    proc, port, lines = _spawn_child(tmp_path, mode)
+    if mode:
+        while "FROZEN" not in lines:
+            lines.append(proc.stdout.readline().rstrip())
+    d = kdash.Dashboard("dashboard:client:childhost:1", "client", "childhost", 1,
+                        "127.0.0.1", port)
+    out = io.StringIO()
+    t0 = time.monotonic()
+    assert kdash.main(["kill", "childhost", "-y"], out=out, discover=lambda: [d]) == 0, \
+        out.getvalue()
+    assert "KILLED" in out.getvalue()
+    _finish_child(proc, lines, timeout=20)
+    assert proc.returncode == 1
+    if mode:
+        assert time.monotonic() - t0 < 20

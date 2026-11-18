@@ -308,6 +308,8 @@ class DashboardMainWindow(QMainWindow):
     _remote_close_posted = pyqtSignal(object)
     #: How long a remote close waits for the GUI thread to take it (s).
     REMOTE_ACK_TIMEOUT_S = 5.0
+    #: A remote kill ends the process within this, whatever blocks (s).
+    KILL_WATCHDOG_S = 10.0     # past taskkill's own 5 s limit
 
     def __init__(
         self,
@@ -368,6 +370,7 @@ class DashboardMainWindow(QMainWindow):
         # control thread reads (swapped whole on the GUI thread).
         self._control = None
         self._remote_close = None
+        self._closing_now = False      # closeEvent is running (local or remote)
         self._started_at = time.time()
         self._remote_snapshot: dict = {"title": title, "servers": {}, "closing": False}
         self._remote_close_posted.connect(self._on_remote_close_posted,
@@ -477,17 +480,25 @@ class DashboardMainWindow(QMainWindow):
         """Open this dashboard's control port and advertise it
         (:mod:`waxx.util.dashboard.remote_control`) so ``kdash`` on any PC
         can list it and close it.  ``busy_check()`` -> None or the reason a
-        close must be refused now (overridden by ``--force``).  Never raises:
-        a dashboard that cannot open the port runs without it (logged), and
-        returns False."""
+        close must be refused now (overridden by ``--force``).  ``bind_host``
+        None: the address the beacon advertises (the lab adapter first), so
+        the port is never open on another network.  Never raises: a dashboard
+        that cannot open the port runs without it (logged), and returns False."""
         if self._control is not None:
             return True
         try:
             from waxx.util.dashboard.remote_control import DashboardControlServer  # noqa: PLC0415
+            if bind_host is None:
+                from beacon.discovery.server import NetServer  # noqa: PLC0415
+                bind_host = NetServer._get_local_ip()
+                if not bind_host:
+                    _LOG.warning("remote control off: this PC has no network address to "
+                                 "listen on; close this dashboard from its own window")
+                    return False
             ctl = DashboardControlServer(
                 self._kind, info=self._remote_info, on_close=self._post_remote_close,
                 on_kill=self._kill_own_tree, busy_check=busy_check,
-                bind_host=bind_host or "0.0.0.0", advertise=advertise)
+                bind_host=bind_host, advertise=advertise)
             ctl.start()
         except Exception:
             _LOG.exception("remote control could not start; this dashboard can only be "
@@ -539,6 +550,9 @@ class DashboardMainWindow(QMainWindow):
                 return
             if self._remote_close is not None:
                 slot["refusal"] = "this dashboard is already closing"
+            elif self._closing_now:
+                slot["refusal"] = ("this dashboard is being closed at its own PC (its COM "
+                                   "dialog may be open there)")
             else:
                 self._remote_close = slot["progress"]
             slot["taken"].set()
@@ -556,6 +570,11 @@ class DashboardMainWindow(QMainWindow):
         servers), no graceful stop -- ``kdash kill`` for a frozen window.
         The children's trees first (``taskkill /T`` on this pid would count
         the taskkill process itself as a child), then this process."""
+        # Whatever blocks below (a log handler's lock held by the frozen GUI
+        # thread, a slow taskkill), the process ends within this.
+        watchdog = threading.Timer(self.KILL_WATCHDOG_S, os._exit, (1,))
+        watchdog.daemon = True
+        watchdog.start()
         from waxx.util.dashboard.server_supervisor import _kill_pid_trees  # noqa: PLC0415
         try:
             import psutil  # noqa: PLC0415
@@ -567,16 +586,14 @@ class DashboardMainWindow(QMainWindow):
                     children.append(int(sup.pid()))
                 except Exception:
                     pass
-        _LOG.critical("remote kill: killing child process trees %s, then this dashboard",
-                      children)
         try:
+            _LOG.critical("remote KILL by %s (force=%s): killing child process trees %s, "
+                          "then this dashboard, with no graceful stop",
+                          request.get("_who", "?"), bool(request.get("force")), children)
             if children:
                 _kill_pid_trees(children)
         finally:
-            try:
-                logging.shutdown()
-            finally:
-                os._exit(1)
+            os._exit(1)
 
     def attach_log_panel(self, log_panel) -> None:
         """Feed every registered supervisor's output into *log_panel*."""
@@ -1892,13 +1909,28 @@ class DashboardMainWindow(QMainWindow):
 
     def closeEvent(self, ev):  # noqa: N802 - Qt-style
         remote = self._remote_close
+        self._closing_now = True
         try:
             self._close_event(ev, remote)
-        except BaseException as exc:
-            # The requester hears it before PyQt's handler takes the process.
+        except Exception as exc:
+            # Never out of a Qt virtual (PyQt6 can abort the process): log it,
+            # keep the window open, tell the requester.
+            _LOG.exception("close failed; the dashboard stays open")
+            ev.ignore()
+            self._layout_ready = True
             if remote is not None:
-                remote.finish("error", detail=f"{type(exc).__name__}: {exc}")
-            raise
+                remote.finish("error", detail=f"the close failed ({type(exc).__name__}: "
+                              f"{exc}); the dashboard stays open, some servers may be "
+                              "stopped")
+        if ev.isAccepted():
+            return
+        # The window stays open (Cancel close, or the close failed): a new
+        # close, remote or local, may start again.
+        self._closing_now = False
+        self._remote_close = None
+        if self._control is not None:
+            self._control.clear_closing()
+        self._update_remote_snapshot()
 
     def _close_event(self, ev, remote) -> None:
         # A remote close (kdash) reports each step to its requester.
@@ -1967,10 +1999,6 @@ class DashboardMainWindow(QMainWindow):
                     ev.ignore()
                     if remote is not None:
                         _LOG.warning("remote close by %s cancelled at this PC", remote.by)
-                        self._remote_close = None
-                        if self._control is not None:
-                            self._control.clear_closing()
-                        self._update_remote_snapshot()
                         remote.finish("cancelled", detail="a person at the dashboard's PC "
                                       "pressed Cancel close; servers already stopped stay "
                                       "stopped",
@@ -1986,7 +2014,11 @@ class DashboardMainWindow(QMainWindow):
         killed = shutdown_all([s for _, s in sups], grace_ms=grace)
         if killed:
             _LOG.warning("hard-killed at close: %s", killed)
-        report("servers_stopped", hard_killed=list(killed))
+        # shutdown_all lists what it tried to kill, not what died: look again.
+        survivors = [sid for sid, s in sups if _sup_alive(s)]
+        if survivors:
+            _LOG.error("still running after the close's kills: %s", survivors)
+        report("servers_stopped", hard_killed=list(killed), still_running=survivors)
 
         # Phase 4: popped-out windows, links, panel bodies.
         for pid, win in list(self._popped.items()):
@@ -2018,7 +2050,9 @@ class DashboardMainWindow(QMainWindow):
         # Phase 5: the remote requester hears the result, then the control
         # port and its beacon go.
         if remote is not None:
-            remote.finish("closed", hard_killed=list(killed), com_forced=com_forced)
+            remote.finish("closed" if not survivors else "closed_with_survivors",
+                          hard_killed=list(killed), com_forced=com_forced,
+                          still_running=survivors)
         ctl, self._control = self._control, None
         if ctl is not None:
             try:
