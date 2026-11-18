@@ -547,6 +547,32 @@ def test_a_run_without_a_file_is_done_only_on_its_own_record(q, expts):
     assert not j["no_file"]                               # nothing said it was this job's
 
 
+def test_a_run_without_live_od_that_prints_its_end_line_is_done(q, expts):
+    """suppress_live_od=True: liveOD never hears of the run; its own end line
+    (Expt._run_done_printout) says it ran to its end."""
+    a = submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("run complete at 2026-11-17 14:08:17  (mot_observe) -- without liveOD: "
+               "nothing was saved", "Done!")
+    proc.code = 0
+    q.tick()
+    j = job(q, a)
+    assert j["state"] == "done" and j["run_id"] is None and j["exit_code"] == 0
+    assert "without liveOD" in j["reason"] and j["no_file"]
+
+
+def test_a_run_without_live_od_that_fails_is_still_failed(q, expts):
+    a = submit(q, expts)
+    q.tick()
+    proc = q.spawner.procs[-1]
+    proc.write("run complete at 2026-11-17 14:08:17  (mot_observe) -- without liveOD: "
+               "nothing was saved", "Traceback (most recent call last):", "ValueError: x")
+    proc.code = 1
+    q.tick()
+    assert job(q, a)["state"] == "failed"
+
+
 def test_a_run_without_a_file_that_exits_nonzero_failed(q, expts):
     a = submit(q, expts)
     q.tick()

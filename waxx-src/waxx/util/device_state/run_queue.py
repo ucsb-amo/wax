@@ -1970,12 +1970,18 @@ class RunQueue:
         return before, True, ""
 
     def release_request(self, obj: Mapping) -> dict:
-        """``{"by", "owner"}``; ``owner`` -- who asks -- is required."""
+        """``{"by", "owner", ["instructed_by", "hold_since"]}``; ``owner`` --
+        who asks -- is required.  An agent releasing a person's hold names the
+        person who told it to (``instructed_by``) and the hold's start as
+        ``kq status`` shows it (``hold_since``): see
+        :meth:`~waxx.util.device_state.person_hold.PersonHold.release`."""
         as_owner, refusal = requester_owner(obj)
         if refusal:
             return {"status": "error", "msg": refusal}
         reply = self.hold.release(str(obj.get("by") or obj.get("operator")
-                                      or obj.get("client") or ""), owner=as_owner)
+                                      or obj.get("client") or ""), owner=as_owner,
+                                  instructed_by=str(obj.get("instructed_by") or ""),
+                                  hold_since=str(obj.get("hold_since") or ""))
         self._notify()
         return reply
 

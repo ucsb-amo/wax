@@ -86,6 +86,11 @@ POLL_S = 0.5
 
 RUN_ID_RE = re.compile(r"Run ID:\s*(\d+)")
 ABORTED_RE = re.compile(r"Acquisition for run (\d+) aborted")
+#: The end-of-run line of a run that had no liveOD run at all
+#: (``suppress_live_od=True``; ``Expt._run_done_printout``): liveOD has no
+#: record of it, so this line is the only sign that it ran to its end.
+NO_LIVE_OD_RE = re.compile(r"^run complete at .* -- without liveOD: nothing was saved",
+                           re.MULTILINE)
 
 _TAIL_LINES = 25
 _TAIL_SHOWN = 8
@@ -850,8 +855,8 @@ class RunVerdict:
     process (the monitor must not be started then); ``show_tail`` False when
     the last lines say nothing more (an Abort); ``outcome`` liveOD's record;
     ``aborted`` True for an Abort in liveOD; ``nothing_written`` True when
-    the run ran to its end with ``save_data=False`` (``saved`` is True then:
-    the run succeeded, and there is no file)."""
+    the run ran to its end with ``save_data=False`` or without liveOD
+    (``saved`` is True then: the run succeeded, and there is no file)."""
 
     saved: bool
     why: str = ""
@@ -874,7 +879,10 @@ def judge_run(code, tail, run_id, expt: str,
     had no file (``save_data=False``: liveOD gives it run id 0 and it prints
     no "Run ID:" line), as the caller identified it; None otherwise.  Exit
     code 0 (or unknown) and liveOD's outcome "nothing_written" is a run that
-    went to its end.  Shared by the run loop and the run queue."""
+    went to its end; so is exit code 0 (or unknown), no run id, no liveOD
+    record and the run's own "without liveOD" end line (:data:`NO_LIVE_OD_RE`,
+    a ``suppress_live_od=True`` run).  Shared by the run loop and the run
+    queue."""
     tail = list(tail or ())
     name = f"run {run_id}" if run_id is not None else "the run (it never got a run id)"
     text = "\n".join(tail)
@@ -891,6 +899,11 @@ def judge_run(code, tail, run_id, expt: str,
             and unsaved.get("outcome") == "nothing_written"):
         return RunVerdict(True, "ran to the end with save_data=False: nothing was written",
                           outcome=unsaved, nothing_written=True)
+    if (code in (0, None) and run_id is None and unsaved is None
+            and NO_LIVE_OD_RE.search(text)):
+        # no liveOD run at all (suppress_live_od): its own end-of-run line
+        return RunVerdict(True, "ran to the end without liveOD (suppress_live_od): "
+                          "nothing was written", nothing_written=True)
     m = ABORTED_RE.search(text)
     if m:
         if m.group(1) == "0":

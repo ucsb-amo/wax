@@ -65,6 +65,35 @@ def test_release_without_a_hold_is_refused():
     assert reply["status"] == "error" and "no person hold" in reply["msg"]
 
 
+def test_an_agent_releases_a_persons_hold_only_the_one_a_person_told_it_to():
+    import time as _time
+    clock = Clock()
+    journal = Journal()
+    hold = PersonHold(clock=clock, journal=journal)
+    hold.hold("aligning", "jp")
+    since = _time.strftime("%H:%M:%S", _time.localtime(clock.t))
+    refused = hold.release("bot", owner="agent")                         # nobody told it
+    assert refused["status"] == "error" and "unless a person told it" in refused["msg"]
+    refused = hold.release("bot", owner="agent", instructed_by="jp")     # which hold?
+    assert refused["status"] == "error" and "ask again" in refused["msg"]
+    assert hold.active
+    ok = hold.release("bot", owner="agent", instructed_by="jp", hold_since=since)
+    assert ok["status"] == "ok" and not hold.active
+    assert journal.entries[-1] == ("run_queue_release",
+                                   {"by": "bot", "owner": "agent", "held_since": clock.t,
+                                    "held_by": "jp", "reason": "aligning",
+                                    "instructed_by": "jp"})
+    # the instruction was for that hold: a later hold is not covered by it
+    clock.t += 60
+    hold.hold("aligning again", "jp")
+    again = hold.release("bot", owner="agent", instructed_by="jp", hold_since=since)
+    assert again["status"] == "error" and hold.active
+    # an earlier day's hold is named as kq status shows it, "MM-DD HH:MM"
+    day = _time.strftime("%m-%d %H:%M", _time.localtime(clock.t))
+    assert hold.release("bot", owner="agent", instructed_by="jp",
+                        hold_since=day)["status"] == "ok"
+
+
 def test_a_reminder_every_half_hour_while_held(caplog):
     clock = Clock()
     hold = PersonHold(clock=clock)

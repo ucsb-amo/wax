@@ -90,6 +90,17 @@ def _clock_text(t) -> str:
         return "?"
 
 
+def _since_forms(t) -> set[str]:
+    """The ways ``kq status`` and :func:`describe` print a hold's start
+    (local time): "HH:MM:SS", and "MM-DD HH:MM" for one from an earlier day
+    (plus "MM-DD HH:MM:SS").  Empty when ``t`` is not a time."""
+    try:
+        lt = time.localtime(float(t))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return set()
+    return {time.strftime(f, lt) for f in ("%H:%M:%S", "%m-%d %H:%M", "%m-%d %H:%M:%S")}
+
+
 def _when_text(t, now: float | None = None) -> str:
     """"21:30" today, "Tue 07:00" another day."""
     try:
@@ -397,25 +408,43 @@ class PersonHold:
         self._notify()
         return {"status": "ok", "person_hold": info}
 
-    def release(self, by: str = "", owner: str = "person") -> dict:
+    def release(self, by: str = "", owner: str = "person", *, instructed_by: str = "",
+                hold_since: str = "") -> dict:
         """Lift the hold (``owner``: who asks).  An agent may not lift a
         person's hold (one a person put on, liveOD's Reset set, or the server
-        set on an unreadable file)."""
+        set on an unreadable file) -- unless a person directly told it to
+        release this one hold: ``instructed_by`` names that person and
+        ``hold_since`` is the hold's start as ``kq status`` shows it
+        ("HH:MM:SS", local time).  The permission covers that one hold: once it
+        is released no later hold has the same start, so the instruction cannot
+        be used again."""
         by = str(by or "").strip() or "?"
+        instructed_by = str(instructed_by or "").strip()
+        hold_since = str(hold_since or "").strip()
         with self._lock:
             if not self._s["active"]:
                 return {"status": "error", "msg": "no person hold is on"}
             if owner == "agent" and self._s.get("owner", "person") != "agent":
-                return {"status": "error",
-                        "msg": f"the hold is a person's ({describe(self._s)}): an agent may not "
-                               "release it"}
+                if not instructed_by:
+                    return {"status": "error",
+                            "msg": f"the hold is a person's ({describe(self._s)}): an agent may "
+                                   "not release it unless a person told it to (instructed_by)"}
+                since = _clock_text(self._s.get("since"))
+                if hold_since not in _since_forms(self._s.get("since")):
+                    return {"status": "error",
+                            "msg": f"the hold on now started at {since}, not "
+                                   f"{hold_since or '(none given)'}: a person's instruction "
+                                   "covers only the hold they meant -- ask again"}
             held = self._copy()
             self._s = dict(_OFF)
             self._last_reminder = None
             info = self._copy()
-        log.warning("Person hold released by %s (it was %s).", by, describe(held))
+        told = (f", as {instructed_by} told it" if owner == "agent" and instructed_by
+                else "")
+        log.warning("Person hold released by %s%s (it was %s).", by, told, describe(held))
+        extra = {"instructed_by": instructed_by} if owner == "agent" and instructed_by else {}
         self._record("run_queue_release", by=by, owner=owner, held_since=held["since"],
-                     held_by=held["by"], reason=held["reason"])
+                     held_by=held["by"], reason=held["reason"], **extra)
         self._save()
         self._notify()
         return {"status": "ok", "person_hold": info, "released": held}

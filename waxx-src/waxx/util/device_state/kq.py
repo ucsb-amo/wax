@@ -45,7 +45,10 @@ Commands::
                                               been active (default), at a set time, or
                                               never.  On a hold that is on: counts as
                                               activity and changes how it lapses
-    kq release                                lift the person's hold
+    kq release [--instructed-by WHO --hold-since TIME]
+                                              lift the person's hold (an agent: only
+                                              the one hold a person told it to, by
+                                              who and the start kq status shows)
     kq warm [on|off]                          warm start (queue phase 2): show / switch (stored)
     kq status [--json]                        the queue's state (not occupancy)
 
@@ -93,7 +96,11 @@ Owner: kq acts for a person unless the environment has ``WAXX_OWNER=agent``
 agent's jobs carry ``WAXX_AGENT_LABEL`` as their submitter when it is set.
 Every request that changes something carries the owner: an agent cannot
 cancel, move or edit a person's job, release a person's hold or resume a
-person's pause (the server's refusal is printed as it words it).  ``by`` is
+person's pause (the server's refusal is printed as it words it).  The one
+exception: a person who directly tells an agent to release the hold on now --
+``kq release --instructed-by WHO --hold-since TIME`` (TIME as ``kq status``
+shows the hold's start).  That covers that one hold only; the server journals
+who told it (``instructed_by``).  ``by`` is
 ``user@host``.
 
 ``kq list`` shows each job's position, submitter, experiment class, an
@@ -608,8 +615,14 @@ def build_parser(out=None, err=None) -> argparse.ArgumentParser:
     lapse.add_argument("--policy", action="store_true",
                        help="lapse by the lab's rule once nobody has been active (the default)")
     sp.add_argument("--agent", action="store_true", help="as an agent")
-    sp = sub.add_parser("release", help="lift the person's hold")
+    sp = sub.add_parser("release", help="lift the person's hold (an agent: only when a person "
+                                        "told it to, with --instructed-by and --hold-since)")
     sp.add_argument("--agent", action="store_true", help="as an agent")
+    sp.add_argument("--instructed-by", metavar="WHO", default="",
+                    help="an agent: the person who directly told it to release this hold")
+    sp.add_argument("--hold-since", metavar="TIME", default="",
+                    help="an agent: the hold's start as kq status shows it (HH:MM:SS, or "
+                         "MM-DD HH:MM); the release is refused if the hold on now differs")
 
     sp = sub.add_parser("warm", help="warm start (queue phase 2): show, or switch on / off "
                                      "(stored: it holds across server restarts)")
@@ -1281,8 +1294,10 @@ def _cmd_hold(ctx: _Ctx, args) -> int:
 
 
 def _cmd_release(ctx: _Ctx, args) -> int:
-    reply = ctx.client.release(owner=_owner(args))
-    ctx.say(f"[kq] released ({_hold_text(reply.get('released')) or 'the hold'})")
+    reply = ctx.client.release(owner=_owner(args), instructed_by=args.instructed_by,
+                               hold_since=args.hold_since)
+    told = f", as {args.instructed_by} told it" if args.instructed_by else ""
+    ctx.say(f"[kq] released ({_hold_text(reply.get('released')) or 'the hold'}){told}")
     return EXIT_OK
 
 

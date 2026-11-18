@@ -402,9 +402,17 @@ class RunQueueClient:
         return self._ask("warm_ahead", {"on": on, "owner": self._owner(owner), "by": self.by},
                          retry=on is None)
 
-    def release(self, *, owner: str | None = None) -> dict:
-        return self._ask("release", {"owner": self._owner(owner), "by": self.by},
-                         retry=False)
+    def release(self, *, owner: str | None = None, instructed_by: str = "",
+                hold_since: str = "") -> dict:
+        """Lift the person hold.  An agent lifting a person's hold passes
+        ``instructed_by`` (the person who told it to) and ``hold_since`` (the
+        hold's start as ``kq status`` shows it); the server refuses otherwise."""
+        fields = {"owner": self._owner(owner), "by": self.by}
+        if instructed_by:
+            fields["instructed_by"] = instructed_by
+        if hold_since:
+            fields["hold_since"] = hold_since
+        return self._ask("release", fields, retry=False)
 
     def status(self) -> dict:
         """The server's ``status_json`` (``run_queue``, ``person_hold``, the

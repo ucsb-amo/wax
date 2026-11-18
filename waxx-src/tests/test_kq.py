@@ -561,6 +561,19 @@ def test_an_agent_cannot_release_a_persons_hold_or_resume_a_persons_pause(server
     assert kq(server, "resume", "--all").code == 0 and kq(server, "release").code == 0
 
 
+def test_an_agent_releases_a_persons_hold_when_a_person_told_it_to(server, q, monkeypatch):
+    import time as _time
+    kq(server, "hold", "mine")
+    since = _time.strftime("%H:%M:%S", _time.localtime(q.hold.info()["since"]))
+    monkeypatch.setenv("WAXX_OWNER", "agent")
+    r = kq(server, "release", "--instructed-by", "jp", "--hold-since", "00:00:00")
+    assert r.code == 6 and "ask again" in r.err and q.hold.info()["active"]
+    r = kq(server, "release", "--instructed-by", "jp", "--hold-since", since)
+    assert r.code == 0 and "as jp told it" in r.out and not q.hold.info()["active"]
+    req = sent(server, "release")[-1]
+    assert req["owner"] == "agent" and req["instructed_by"] == "jp" and req["hold_since"] == since
+
+
 def test_tail_follow_reports_an_abort_someone_else_asked_for(server, q, expts):
     kq(server, "submit", str(expts / "rabi.py"))
     steps = run_steps(q, outcome="discarded", code=1)

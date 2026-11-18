@@ -1103,7 +1103,15 @@ class Expt(Scanner, Dealer, Scribe):
             print(f'run id {rid} ended at {dt} after {n} of {N} shots{name_str}')
         else:
             shots = f', {n} shots' if n else ''
-            console.info(f'run id {rid} complete at {dt}{shots}{name_str}')
+            if getattr(self, 'live_od_client', None) is None:
+                # no liveOD run (suppress_live_od, or no connection with
+                # setup_camera=False): liveOD has no record of it, so this
+                # line is how the run queue and the run loop know it ran to
+                # its end (run_loop.NO_LIVE_OD_RE). Printed at every verbosity.
+                print(f'run complete at {dt}{shots}{name_str} -- without liveOD: '
+                      'nothing was saved')
+            else:
+                console.info(f'run id {rid} complete at {dt}{shots}{name_str}')
 
     @staticmethod
     def _expt_name_from_filepath(expt_filepath):
