@@ -147,6 +147,34 @@ class Relay_Controller:
 		data = self.add_checksum(data)
 		return data
 
+	#: time.monotonic() by which this contact must be done, or None. Every send
+	#: and recv on a socket bus gets the time left as its timeout, so one contact
+	#: (connect + all its commands) never takes longer than its budget.
+	deadline = None
+
+	def _time_left(self):
+		if self.deadline is None:
+			return None
+		left = self.deadline - time.monotonic()
+		if left <= 0:
+			raise socket.timeout("relay contact deadline passed")
+		return left
+
+	def _recv_exact(self, n):
+		"""Read exactly n bytes from the socket. A short reply is an error,
+		never a partial packet (a later read would then get the rest)."""
+		buf = b""
+		while len(buf) < n:
+			left = self._time_left()
+			if left is not None:
+				self.combus.settimeout(left)
+			chunk = self.combus.recv(n - len(buf))
+			if not chunk:
+				raise ConnectionError(
+					"relay closed the connection after %d of %d reply bytes" % (len(buf), n))
+			buf += chunk
+		return buf
+
 	def send_command(self, command, bytes_back):
 # 		The following line is causing problems and has been commented out until further study.
 # 		command = self.convert_data(command)
@@ -154,10 +182,11 @@ class Relay_Controller:
 			self.combus.write(command)
 			return self.combus.read(bytes_back)
 		else:
-			# print command
-			# print bytearray(command)
-			self.combus.send(bytearray(command))
-			return self.combus.recv(bytes_back)
+			left = self._time_left()
+			if left is not None:
+				self.combus.settimeout(left)
+			self.combus.sendall(bytearray(command))
+			return self._recv_exact(bytes_back)
 
 	def process_control_command_return(self, data):
 		# print(data).encode('hex');
@@ -289,14 +318,26 @@ class EthernetRelay():
 		self.__socket = None
 		self.__board = None
 
-	def connect(self, retries=None, backoff=None, timeout=None):
+	@property
+	def board(self):
+		"""The open connection's command set (``Relay_Controller``), or None.
+		Subclasses use this, not ``self.__board``: the name-mangled attribute
+		only resolves in a subclass that happens to share this class's name."""
+		return self.__board
+
+	def connect(self, retries=None, backoff=None, timeout=None, deadline_s=None):
 		# timeout also bounds every recv on this connection (socket-level).
+		# deadline_s: one budget for the whole contact (connect and every
+		# command until close); only meaningful with retries=0.
 		if retries is None:
 			retries = self.CONNECT_RETRIES
 		if backoff is None:
 			backoff = self.CONNECT_BACKOFF_S
 		if timeout is None:
 			timeout = self.CONNECT_TIMEOUT_S
+		deadline = None if deadline_s is None else time.monotonic() + float(deadline_s)
+		if deadline_s is not None:
+			timeout = min(timeout, float(deadline_s))
 
 		for attempt in range(1, retries + 2):
 			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -326,6 +367,7 @@ class EthernetRelay():
 				raise
 			self.__socket = sock
 			self.__board = Relay_Controller(self.__socket)
+			self.__board.deadline = deadline
 			if attempt > 1:
 				logger.info(
 					"Relay connect succeeded on attempt %d to %s",
