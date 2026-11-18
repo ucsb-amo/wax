@@ -29,6 +29,9 @@ Features
 * Close: graceful shutdown requests fan out to every server, COM servers
   are watched in a modal until their ports are released, survivors are
   hard-killed with a single taskkill.
+* Remote close (:meth:`DashboardMainWindow.enable_remote_control`, the
+  ``kdash`` CLI): the same close, asked for from another PC
+  (:mod:`remote_control`).
 
 The window is intentionally permissive: no panel construction is allowed to
 block startup.  All errors land in their panel's ErrorBodyWidget plus the
@@ -40,7 +43,9 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import platform
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -299,6 +304,11 @@ class DashboardMainWindow(QMainWindow):
     #: Delay between two body realizations at startup (ms).
     REALIZE_STAGGER_MS = 30
 
+    #: A remote close handed from the control thread to the GUI thread.
+    _remote_close_posted = pyqtSignal(object)
+    #: How long a remote close waits for the GUI thread to take it (s).
+    REMOTE_ACK_TIMEOUT_S = 5.0
+
     def __init__(
         self,
         kind: str,
@@ -352,6 +362,16 @@ class DashboardMainWindow(QMainWindow):
         self._autostart_ids: list[str] = []
         self._log_panel = None
         self._panel_actions: dict[str, QAction] = {}
+
+        # Remote control (enable_remote_control): the control port, the remote
+        # close under way (its CloseProgress), and the status snapshot the
+        # control thread reads (swapped whole on the GUI thread).
+        self._control = None
+        self._remote_close = None
+        self._started_at = time.time()
+        self._remote_snapshot: dict = {"title": title, "servers": {}, "closing": False}
+        self._remote_close_posted.connect(self._on_remote_close_posted,
+                                          Qt.ConnectionType.QueuedConnection)
 
         # Pop-out bookkeeping.
         self._popped: dict[str, PanelWindow] = {}
@@ -447,6 +467,116 @@ class DashboardMainWindow(QMainWindow):
 
     def set_autostart(self, ids: Iterable[str]) -> None:
         self._autostart_ids = list(ids)
+
+    # ------------------------------------------------------------------
+    # Remote control (kdash)
+    # ------------------------------------------------------------------
+
+    def enable_remote_control(self, *, busy_check=None, bind_host: Optional[str] = None,
+                              advertise: bool = True) -> bool:
+        """Open this dashboard's control port and advertise it
+        (:mod:`waxx.util.dashboard.remote_control`) so ``kdash`` on any PC
+        can list it and close it.  ``busy_check()`` -> None or the reason a
+        close must be refused now (overridden by ``--force``).  Never raises:
+        a dashboard that cannot open the port runs without it (logged), and
+        returns False."""
+        if self._control is not None:
+            return True
+        try:
+            from waxx.util.dashboard.remote_control import DashboardControlServer  # noqa: PLC0415
+            ctl = DashboardControlServer(
+                self._kind, info=self._remote_info, on_close=self._post_remote_close,
+                on_kill=self._kill_own_tree, busy_check=busy_check,
+                bind_host=bind_host or "0.0.0.0", advertise=advertise)
+            ctl.start()
+        except Exception:
+            _LOG.exception("remote control could not start; this dashboard can only be "
+                           "closed from its own window")
+            return False
+        self._control = ctl
+        self._update_remote_snapshot()
+        return True
+
+    def _update_remote_snapshot(self) -> None:
+        """GUI thread: the status the control thread reports (a new dict each
+        time, so a reader never sees one half-written)."""
+        servers = {}
+        for sid, sup in self._supervisors.items():
+            servers[sid] = getattr(getattr(sup, "state", None), "name", "?")
+        self._remote_snapshot = {"title": self.windowTitle(), "servers": servers,
+                                 "closing": self._remote_close is not None,
+                                 "started": self._started_at}
+
+    def _remote_info(self) -> dict:
+        """Control thread: the latest snapshot."""
+        snap = dict(self._remote_snapshot)
+        snap["uptime_s"] = round(time.time() - self._started_at, 1)
+        return snap
+
+    def _post_remote_close(self, progress) -> Optional[str]:
+        """Control thread: hand a remote close to the GUI thread and wait for
+        it to be taken.  A frozen GUI thread is reported, and a close it takes
+        up late is dropped (the requester was already told it failed)."""
+        slot = {"lock": threading.Lock(), "taken": threading.Event(),
+                "expired": False, "refusal": None, "progress": progress}
+        self._remote_close_posted.emit(slot)
+        t = float(self.REMOTE_ACK_TIMEOUT_S)
+        if slot["taken"].wait(t):
+            return slot["refusal"]
+        with slot["lock"]:
+            if slot["taken"].is_set():
+                return slot["refusal"]
+            slot["expired"] = True
+        return (f"the dashboard window did not answer within {t:g} s (its GUI is frozen?); "
+                "`kdash kill` stops it hard")
+
+    def _on_remote_close_posted(self, slot: dict) -> None:
+        """GUI thread: take a remote close (or refuse it) and start closing."""
+        with slot["lock"]:
+            if slot["expired"]:
+                _LOG.warning("remote close from %s arrived after its requester gave up; "
+                             "ignored", slot["progress"].by)
+                return
+            if self._remote_close is not None:
+                slot["refusal"] = "this dashboard is already closing"
+            else:
+                self._remote_close = slot["progress"]
+            slot["taken"].set()
+        if slot["refusal"] is None:
+            self._update_remote_snapshot()
+            try:
+                self.statusBar().showMessage(
+                    f"Closing: asked for remotely by {slot['progress'].by}", 0)
+            except Exception:
+                pass
+            QTimer.singleShot(0, self.close)
+
+    def _kill_own_tree(self, request: dict) -> None:
+        """Control thread: hard-kill this process and every child (its
+        servers), no graceful stop -- ``kdash kill`` for a frozen window.
+        The children's trees first (``taskkill /T`` on this pid would count
+        the taskkill process itself as a child), then this process."""
+        from waxx.util.dashboard.server_supervisor import _kill_pid_trees  # noqa: PLC0415
+        try:
+            import psutil  # noqa: PLC0415
+            children = [c.pid for c in psutil.Process().children(recursive=False)]
+        except Exception:
+            children = []
+            for sup in list(self._supervisors.values()):
+                try:
+                    children.append(int(sup.pid()))
+                except Exception:
+                    pass
+        _LOG.critical("remote kill: killing child process trees %s, then this dashboard",
+                      children)
+        try:
+            if children:
+                _kill_pid_trees(children)
+        finally:
+            try:
+                logging.shutdown()
+            finally:
+                os._exit(1)
 
     def attach_log_panel(self, log_panel) -> None:
         """Feed every registered supervisor's output into *log_panel*."""
@@ -1045,6 +1175,7 @@ class DashboardMainWindow(QMainWindow):
         self._servers_menu.exec(self._counts_btn.mapToGlobal(self._counts_btn.rect().topLeft()))
 
     def _refresh_counts(self) -> None:
+        self._update_remote_snapshot()
         if not self._supervisors:
             self._counts_btn.setVisible(False)
             return
@@ -1760,12 +1891,32 @@ class DashboardMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, ev):  # noqa: N802 - Qt-style
+        remote = self._remote_close
+        try:
+            self._close_event(ev, remote)
+        except BaseException as exc:
+            # The requester hears it before PyQt's handler takes the process.
+            if remote is not None:
+                remote.finish("error", detail=f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _close_event(self, ev, remote) -> None:
+        # A remote close (kdash) reports each step to its requester.
+
+        def report(event: str, **fields) -> None:
+            if remote is not None:
+                try:
+                    remote.report(event, **fields)
+                except Exception:
+                    pass
+
         # Persist layout (including which panels are popped out) first.
         self._layout_ready = False
         self._save_layout()
 
         # Phase 1: ask every server to shut down cleanly, all at once.
         sups = list(self._supervisors.items())
+        report("stopping", servers=[sid for sid, s in sups if _sup_alive(s)])
         for sid, sup in sups:
             try:
                 sup.suppress_restart()
@@ -1792,28 +1943,50 @@ class DashboardMainWindow(QMainWindow):
             if pnl is not None and pnl.header().com_button() is not None:
                 com_port = pnl.header().com_button()._label
             com_entries.append((self._supervisor_labels.get(sid, sid), com_port, sup))
+        com_forced: list[str] = []
         if com_entries:
+            report("com_wait", servers=[label for label, _c, _s in com_entries],
+                   timeout_s=(remote.com_timeout_s if remote is not None else None))
             try:
                 from waxx.util.dashboard.com_shutdown_dialog import (  # noqa: PLC0415
                     ComShutdownDialog,
                     RESULT_USER_CANCELLED,
                 )
-                dlg = ComShutdownDialog(com_entries, parent=self)
+                if remote is not None:
+                    dlg = ComShutdownDialog(
+                        com_entries, parent=self, auto_force_after_s=remote.com_timeout_s,
+                        note=f"Remote close asked for by {remote.by}.")
+                else:
+                    dlg = ComShutdownDialog(com_entries, parent=self)
                 dlg.exec()
+                com_forced = dlg.forced_labels()
                 if dlg.result_reason() == RESULT_USER_CANCELLED:
                     # Keep the dashboard open.  Servers that already honoured
                     # the shutdown request are stopped; restart from the headers.
                     self._layout_ready = True
                     ev.ignore()
+                    if remote is not None:
+                        _LOG.warning("remote close by %s cancelled at this PC", remote.by)
+                        self._remote_close = None
+                        if self._control is not None:
+                            self._control.clear_closing()
+                        self._update_remote_snapshot()
+                        remote.finish("cancelled", detail="a person at the dashboard's PC "
+                                      "pressed Cancel close; servers already stopped stay "
+                                      "stopped",
+                                      still_running=[sid for sid, s in sups if _sup_alive(s)])
                     return
             except Exception:
                 _LOG.exception("ComShutdownDialog failed; falling back to fast shutdown")
+            if com_forced:
+                report("com_forced", servers=com_forced)
 
         # Phase 3: bounded collective wait, then one taskkill for survivors.
         grace = max([1500] + [int(getattr(s, "graceful_stop_timeout_s", 1.5) * 1000) for _, s in sups])
         killed = shutdown_all([s for _, s in sups], grace_ms=grace)
         if killed:
             _LOG.warning("hard-killed at close: %s", killed)
+        report("servers_stopped", hard_killed=list(killed))
 
         # Phase 4: popped-out windows, links, panel bodies.
         for pid, win in list(self._popped.items()):
@@ -1841,7 +2014,34 @@ class DashboardMainWindow(QMainWindow):
             self._settings.sync()
         except Exception:
             pass
+
+        # Phase 5: the remote requester hears the result, then the control
+        # port and its beacon go.
+        if remote is not None:
+            remote.finish("closed", hard_killed=list(killed), com_forced=com_forced)
+        ctl, self._control = self._control, None
+        if ctl is not None:
+            try:
+                ctl.stop()
+            except Exception:
+                _LOG.exception("remote control stop failed")
         super().closeEvent(ev)
+        if remote is not None:
+            self._exit_app_after_remote_close()
+
+    def _exit_app_after_remote_close(self) -> None:
+        """Leave every event loop, a modal one left open included (a
+        QMessageBox someone had up when the close arrived)."""
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, lambda: app.exit(0))
+
+
+def _sup_alive(sup) -> bool:
+    try:
+        return bool(sup.is_running())
+    except Exception:
+        return False
 
 
 __all__ = ["DashboardMainWindow", "PanelPlacement", "dashboard_icon"]

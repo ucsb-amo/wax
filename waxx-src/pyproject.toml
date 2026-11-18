@@ -18,6 +18,8 @@ license = {text = "MIT"}
 kcal = "waxx.calibration.cli:main"
 # run-queue client (waxx.util.device_state.kq); `ar` points here once flipped
 kq = "waxx.util.device_state.kq:main"
+# list / close the dashboards on the lab network (waxx.util.dashboard.kdash)
+kdash = "waxx.util.dashboard.kdash:main"
 
 [project.urls]
 Homepage = "https://github.com/ucsb-amo/wax-ucsb/waxx"
