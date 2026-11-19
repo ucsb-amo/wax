@@ -223,10 +223,12 @@ _qt_handler = None
 _buffer = None
 
 # The camera host's workers and the camera drivers under them log on their own
-# loggers (beacon.camera.*, waxx.control.cameras.*), which reach no file unless
-# routed: their INFO and above go to live_od.log too (frame-path stalls, backlog
-# bursts, ops run on a camera mid-run, run summaries; 2026-10-22).
-CAMERA_LOGGERS = ("beacon.camera", "waxx.control.cameras")
+# loggers (beacon.camera.*, beacon.drivers.*, waxx.control.cameras.*), which
+# reach no file unless routed: their INFO and above go to live_od.log too
+# (frame-path stalls, backlog bursts, ops run on a camera mid-run, run
+# summaries; 2026-10-22).  beacon.drivers: the Basler and Andor backends and
+# the Andor driver (moved from waxx.control.cameras, 2026-11-18).
+CAMERA_LOGGERS = ("beacon.camera", "beacon.drivers", "waxx.control.cameras")
 
 
 def route_camera_loggers(handler, level=logging.INFO) -> None:

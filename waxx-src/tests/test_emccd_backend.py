@@ -234,9 +234,15 @@ def _refused(be, fake, values, purpose, field, words):
     ("live", dict(trigger_mode="ext"), "trigger_mode", "live streaming accepts only"),
     ("run", dict(sensor_roi=(0, 256, 0, 512, 1, 1)), "sensor_roi", "only the full frame"),
     ("live", dict(sensor_roi=(0, 512, 0, 512, 2, 2)), "sensor_roi", "binning 2x2"),
-    ("run", dict(gain=301), "gain", "never above 300"),
+    ("run", dict(gain=301), "gain", "self._extreme_emccd_gain = True"),
+    ("run", dict(gain=301, extreme_emccd_gain=False), "gain", "self._extreme_emccd_gain = True"),
+    ("run", dict(gain=1001, extreme_emccd_gain=True), "gain", "never above 1000"),
+    ("run", dict(gain=500, extreme_emccd_gain=True, em_advanced=0), "em_advanced", "pinned to 1"),
+    ("run", dict(extreme_emccd_gain="yes"), "extreme_emccd_gain", "not True or False"),
     ("live", dict(gain=101), "gain", "above the live cap 100"),
     ("live", dict(gain=301, em_gain_unlocked=True), "gain", "never above 300"),
+    ("live", dict(gain=301, em_gain_unlocked=True, extreme_emccd_gain=True), "gain",
+     "never above 300"),
     ("run", dict(vs_speed=0, vs_amp=0), "vs_speed, vs_amp", "run 80708"),
     ("live", dict(vs_speed=0, vs_amp=0), "vs_speed, vs_amp", "transfers no charge"),
     ("live", dict(shutter="auto"), "shutter", "never 'auto'"),
@@ -266,6 +272,21 @@ def test_unlock_lifts_the_live_cap(backend):
     be, fake = backend
     be.apply(dict(LIVE, gain=250, em_gain_unlocked=True), "live")
     assert fake.hw["em_gain"] == 250
+
+
+def test_extreme_gain_run_uses_advanced_mode_and_the_next_apply_leaves_it(backend):
+    be, fake = backend
+    rb = be.apply(dict(RUN, gain=800, extreme_emccd_gain=True), "run")
+    assert fake.hw["em_advanced"] == 1 and fake.hw["em_gain"] == 800
+    assert rb["gain"] == Readback(800, "hw") and rb["em_advanced"] == Readback(1, "hw")
+    be.apply(RUN, "run")                                      # 300, no opt-in
+    assert fake.hw["em_advanced"] == 0 and fake.hw["em_gain"] == 300
+    be.apply(dict(RUN, gain=800, extreme_emccd_gain=True), "run")
+    be.apply(LIVE, "live")
+    assert fake.hw["em_advanced"] == 0 and fake.hw["em_gain"] == 50
+    # the opt-in alone changes nothing at or below 300
+    be.apply(dict(RUN, extreme_emccd_gain=True), "run")
+    assert fake.hw["em_advanced"] == 0
 
 
 def test_status_keys_and_owner_settings(backend):

@@ -3,55 +3,12 @@ import numpy as np
 from waxa.config.img_types import img_types
 from waxa.dummy.camera_params import CameraParams
 
-
-class RunFieldRefused(ValueError):
-    """A run-owned Andor field (trigger, frame transfer, sensor_roi) holds a
-    value that is not accepted.  ``field``, ``value`` and ``reason`` say which,
-    what and why; str() reads as one sentence naming all three."""
-    def __init__(self, field, value, reason, owner="AndorParams"):
-        super().__init__(f"{owner}.{field} = {value!r} is refused: {reason}")
-        self.field = field
-        self.value = value
-        self.reason = reason
-
-
-def _as_str(field, value):
-    if isinstance(value, bytes):
-        value = value.decode()
-    if isinstance(value, np.ndarray) and value.ndim == 0:
-        value = value.item()
-    if isinstance(value, bytes):
-        value = value.decode()
-    if not isinstance(value, str):
-        raise RunFieldRefused(field, value, "must be a string")
-    return str(value)
-
-
-def _as_int(field, value):
-    if isinstance(value, np.ndarray) and value.ndim == 0:
-        value = value.item()
-    if isinstance(value, (bool, np.bool_)):
-        return int(value)
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)) and float(value).is_integer():
-        return int(value)
-    raise RunFieldRefused(field, value, "must be an integer (and never None)")
-
-
-def _as_roi(value):
-    if isinstance(value, (bytes, str)) or value is None:
-        raise RunFieldRefused("sensor_roi", value,
-                              "must be 6 integers (hstart, hend, vstart, vend, hbin, vbin)")
-    try:
-        items = list(np.asarray(value).ravel()) if isinstance(value, np.ndarray) else list(value)
-    except TypeError:
-        raise RunFieldRefused("sensor_roi", value,
-                              "must be 6 integers (hstart, hend, vstart, vend, hbin, vbin)") from None
-    if len(items) != 6:
-        raise RunFieldRefused("sensor_roi", value,
-                              "must be 6 integers (hstart, hend, vstart, vend, hbin, vbin)")
-    return tuple(_as_int("sensor_roi", v) for v in items)
+# The Andor's run-field rules live with its driver in beacon; these names are
+# kept here for everything that imports them from this module.
+from beacon.drivers.andor import params as _andor
+from beacon.drivers.andor.params import (RunFieldRefused, _as_str, _as_int, _as_roi,
+                                         full_frame_roi, roi_resolution,
+                                         check_andor_run_fields)
 
 
 def _set_trigger_ttl(params, trigger_ttl):
@@ -80,66 +37,6 @@ def _set_trigger_ttl(params, trigger_ttl):
     params.trigger_ttl = str(name)
     params.trigger_ttl_ch = int(ch)
     params._trigger_ttl = trigger_ttl
-
-
-def full_frame_roi(detector_shape):
-    """The sensor_roi of the whole sensor at bin 1; detector_shape is (rows, cols)."""
-    rows, cols = detector_shape
-    return (0, int(cols), 0, int(rows), 1, 1)
-
-
-def roi_resolution(sensor_roi):
-    """(rows, cols) of the image a sensor_roi reads out."""
-    hstart, hend, vstart, vend, hbin, vbin = sensor_roi
-    return ((vend - vstart) // vbin, (hend - hstart) // hbin)
-
-
-def check_andor_run_fields(trigger_mode, frame_transfer, sensor_roi,
-                           purpose="run", detector_shape=None):
-    """Normalise and check the run-owned Andor fields.
-
-    Returns (trigger_mode: str, frame_transfer: int, sensor_roi: tuple of 6 int).
-    Raises RunFieldRefused (a ValueError) naming the field, the value and the
-    rule.  ``purpose`` "run" accepts only an external trigger; "live" only
-    internal or software.  Frame transfer is refused for both, and so is any
-    sensor_roi other than the full frame at bin 1 (this build).
-    """
-    shape = AndorParams.DETECTOR_SHAPE if detector_shape is None else detector_shape
-    trigger_mode = _as_str("trigger_mode", trigger_mode)
-    frame_transfer = _as_int("frame_transfer", frame_transfer)
-    sensor_roi = _as_roi(sensor_roi)
-
-    if purpose == "run":
-        if trigger_mode not in AndorParams.RUN_TRIGGER_MODES:
-            raise RunFieldRefused("trigger_mode", trigger_mode,
-                f"runs accept only {AndorParams.RUN_TRIGGER_MODES} (one frame per TTL edge); "
-                f"ext_start free-runs after the first edge, ext_exp exposes while the TTL "
-                f"is high, and the other modes are unsupported")
-    elif purpose == "live":
-        if trigger_mode not in AndorParams.LIVE_TRIGGER_MODES:
-            raise RunFieldRefused("trigger_mode", trigger_mode,
-                f"live streaming accepts only {AndorParams.LIVE_TRIGGER_MODES}")
-    else:
-        raise ValueError(f"purpose {purpose!r} is not 'run' or 'live'")
-
-    if frame_transfer not in AndorParams.RUN_FRAME_TRANSFER:
-        raise RunFieldRefused("frame_transfer", frame_transfer,
-            "frame transfer is never used: with an external trigger the exposure "
-            "becomes the time between triggers, so the recorded exposure_time "
-            "would be false (Andor SDK2 manual p.55)")
-
-    full = full_frame_roi(shape)
-    hbin, vbin = sensor_roi[4], sensor_roi[5]
-    if (hbin, vbin) != (1, 1):
-        raise RunFieldRefused("sensor_roi", sensor_roi,
-            f"binning {hbin}x{vbin} is not accepted, only bin 1 "
-            f"(binning scales the atom number by the bin factor); "
-            f"the only accepted value is {full}")
-    if sensor_roi != full and not AndorParams.ALLOW_SENSOR_CROP:
-        raise RunFieldRefused("sensor_roi", sensor_roi,
-            f"only the full frame {full} is accepted in this build "
-            f"(a crop moves every analysis ROI)")
-    return trigger_mode, frame_transfer, sensor_roi
 
 
 class BaslerParams(CameraParams):
@@ -393,14 +290,16 @@ class AndorParams(CameraParams):
     # Class constants, not instance attributes: the INIT_RUN payload (and so
     # camera_params/ in the file) is built from vars(camera_params), so these
     # are never recorded as if they were settings of the run.
-    DETECTOR_SHAPE = (512, 512)            # (rows, cols), DU897
-    RUN_TRIGGER_MODES = ("ext",)
-    LIVE_TRIGGER_MODES = ("int", "software")
-    RUN_FRAME_TRANSFER = (0,)
-    ALLOW_SENSOR_CROP = False
+    # The rules themselves are beacon.drivers.andor.params (check_andor_run_fields).
+    DETECTOR_SHAPE = _andor.DETECTOR_SHAPE            # (rows, cols), DU897
+    RUN_TRIGGER_MODES = _andor.RUN_TRIGGER_MODES
+    LIVE_TRIGGER_MODES = _andor.LIVE_TRIGGER_MODES
+    RUN_FRAME_TRANSFER = _andor.RUN_FRAME_TRANSFER
+    ALLOW_SENSOR_CROP = _andor.ALLOW_SENSOR_CROP
 
     # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
     def __init__(self,
+                 serial_number='',
                  exposure_time_fluor = 25.e-6, amp_fluorescence=0.54, em_gain_fluor = 10.,
                  exposure_time_abs = 10.e-6, amp_absorption=0.1, em_gain_abs = 300.,
                  exposure_time_dispersive=100.e-6, amp_dispersive = 0.106, em_gain_dispersive = 300.,
@@ -414,6 +313,13 @@ class AndorParams(CameraParams):
         super().__init__()
         self.key = key
         self.camera_type = "andor"
+        # The serial the Andor SDK reports (GetCameraSerialNumber), as a
+        # string.  It names the camera on the network (camera id
+        # "andor_emccd:<serial>", the same in liveOD's camera host, the Andor
+        # camera server and the SLM spot finder, so each can borrow it from
+        # the other), and the backend refuses to open a camera that reports
+        # another.  '' = not checked, camera id "andor_emccd:<key>".
+        self.serial_no = str(serial_number or "")
         # The TTL line wired to this camera's trigger input: a ttl_frame
         # attribute name or the TTL object (see _set_trigger_ttl).
         _set_trigger_ttl(self, trigger_ttl)

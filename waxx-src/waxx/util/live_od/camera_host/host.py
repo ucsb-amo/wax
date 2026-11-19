@@ -16,7 +16,8 @@ the cameras in ``LiveODConfig.camera_host_claim_on_start``.
     begin_run(token, key, capture_images, camera_params)  INIT_RUN, before the
         run file is reserved: validate the run profile, borrow the camera from
         the server that has it (a Basler from the beacon server, the Andor from
-        the SLM spot finder; bounded), lock the camera with the token
+        the Andor camera server or the SLM spot finder; bounded), lock the
+        camera with the token
     note_run_id(token, run_id)                            once the id is known
     arm_run(token, camera_params, n_img) -> Future[ArmResult]
         the first WAIT_CAM_READY: apply the full run profile, start the
@@ -350,23 +351,19 @@ class HostServerCore(CameraServerCore):
 # ---------------------------------------------------------------------------
 
 def refuse_combos_from(constraints) -> tuple:
-    """``EMCCDBackend(refuse_combos=...)`` from schema Constraints whose every
-    condition is an equality (e.g. the DU897's vs_speed == 0 and vs_amp == 0)."""
-    out = []
-    for c in constraints or ():
-        if getattr(c, "level", "") != "refuse":
-            continue
-        conds = tuple(getattr(c, "when", ()) or ())
-        if conds and all(len(w) == 3 and w[1] == "==" for w in conds):
-            out.append((tuple((k, v) for k, _, v in conds), c.reason))
-    return tuple(out)
+    """``beacon.drivers.andor.backend.refuse_combos_from`` (kept under this name)."""
+    from beacon.drivers.andor.backend import refuse_combos_from as _convert
+    return _convert(constraints)
 
 
 def default_backend_factory(spec: CameraSpec, constraints=(), live_em_gain_cap=ANDOR_LIVE_EM_GAIN_CAP):
     """The backend for ``spec``, built on its worker thread at first open."""
     if spec.camera_type == "andor":
-        from waxx.control.cameras.emccd_backend import EMCCDBackend
-        return EMCCDBackend(serial=None, refuse_combos=refuse_combos_from(constraints),
+        # serial: the camera_params' serial_no, checked at open (a camera that
+        # reports another is refused); none given, none checked
+        from beacon.drivers.andor.backend import EMCCDBackend
+        return EMCCDBackend(serial=spec.serial or None,
+                            refuse_combos=refuse_combos_from(constraints),
                             live_em_gain_cap=live_em_gain_cap)
     if spec.camera_type == "basler":
         from beacon.camera.basler_backend import BaslerBackend
@@ -384,6 +381,9 @@ def camera_specs(params_list) -> list:
             serial = _s(getattr(p, "serial_no", ""))
             cat, cid = BASLER_USB, f"{BASLER_USB.name}:{serial}"
         elif ctype == "andor":
+            # andor_emccd:<serial> -- the id the Andor camera server
+            # (beacon.andor) and the SLM spot finder serve it under, so liveOD
+            # borrows it from whichever has it; no serial: andor_emccd:<key>
             serial = _s(getattr(p, "serial_no", "") or getattr(p, "serial", "") or "")
             cat, cid = ANDOR_EMCCD, f"{ANDOR_EMCCD.name}:{serial or key}"
         else:

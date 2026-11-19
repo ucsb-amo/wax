@@ -20,6 +20,9 @@ CAMERA_GRAB_TIMEOUT_PER_WARMUP_SHOT = 10.
 CAMERA_GRAB_TIMEOUT_BASLER_INIT = 20.
 CAMERA_GRAB_TIMEOUT_BASLER_RUN = 8.
 
+# = beacon.drivers.andor.params.GRAB_TIMEOUT_S, what the Andor driver waits per
+# frame (not imported: this module stays light for the experiment process;
+# tests/test_camera_server_du897.py checks the two agree)
 CAMERA_GRAB_TIMEOUT_ANDOR = 60.
 
 # scribe timeouts
