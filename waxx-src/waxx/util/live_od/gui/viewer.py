@@ -36,6 +36,13 @@ HISTORY_MAX_BYTES = 256e6       # a 2 MP Basler shot is ~30 MB of arrays
 SATURATION_LEVELS = (255, 1023, 4095, 16383, 65535)
 SATURATION_MIN_PIXELS = 5
 AUTO_ROI_DEFAULT_SHOTS = 10
+# What the big image can show, chosen in its bottom-right corner: (name, the raw
+# frame's slot in the strip above -- where the OD goes instead -- , tooltip).
+MAIN_IMAGES = (("OD", None, "optical density"),
+               ("PWA", "atoms", "atoms + light frame"),
+               ("PWOA", "light", "light-only frame"),
+               ("Dark", "dark", "dark frame"))
+_MAIN_IMAGE_SLOT = {name: slot for name, slot, _desc in MAIN_IMAGES}
 
 
 class SuppressPrints:
@@ -242,6 +249,8 @@ class LiveODViewer(QWidget):
         self._cmap_actions = []         # the colormap entries of every image's context menu
         self._last_right_click = None   # image coords of the last right-click, for "Add marker here"
         self._last_cursor = None        # image coords under the mouse, for the M key
+        self._main_image = "OD"         # what the big image shows (a MAIN_IMAGES name)
+        self._frames = {}               # the shown shot's raw frames: slot -> array
         self.init_ui()
 
     # ------------------------------------------------------------------
@@ -317,8 +326,8 @@ class LiveODViewer(QWidget):
 
         self.profiles_checkbox = QCheckBox("Profiles")
         self.profiles_checkbox.setToolTip(
-            "sumOD along x (bottom edge) and y (left edge) over the ROI, or over the view "
-            "if there is no ROI; orange: the Gaussian fits (P)")
+            "Sum of the big image along x (bottom edge) and y (left edge) over the ROI, or "
+            "over the view if there is no ROI; orange: the Gaussian fits, shown with the OD (P)")
         self.profiles_checkbox.setChecked(True)
         self.profiles_checkbox.stateChanged.connect(lambda _: self._update_marginals())
 
@@ -586,7 +595,35 @@ class LiveODViewer(QWidget):
             _label_value("ΣOD", "8.88e8"), _label_value("σ", "888.8 × 888.8 µm"),
             _label_value("center", "8888, 8888 µm"))))
         self.cursor_label.fix_width_for(" &nbsp;&nbsp; ".join((
-            _label_value("x, y", "8888, 8888 µm"), _label_value("OD", "−8.88"))))
+            _label_value("x, y", "8888, 8888 µm"), _label_value("PWOA", "65535"))))
+        # which image the big plot shows: bottom right, the cursor readout above it
+        self.image_select = QToolButton(self.od_plot)
+        self.image_select.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.image_select.setFocusPolicy(Qt.FocusPolicy.NoFocus)    # keep Space / arrows for the viewer
+        self.image_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.image_select.setToolTip(
+            "The image shown here: OD, PWA (atoms + light), PWOA (light only) or Dark. The "
+            "cursor readout, colour bar, profiles and ROI work on it; the OD takes its "
+            "place in the row of frames above.")
+        self.image_select.setStyleSheet(
+            "QToolButton { background-color: rgba(0, 0, 0, 170); color: #ffffff; "
+            "font-weight: bold; font-size: 10pt; padding: 3px 8px; border: none; "
+            "border-radius: 4px; } QToolButton::menu-indicator { image: none; width: 0px; }")
+        image_menu = QMenu(self.image_select)
+        self._main_image_actions = {}
+        for name, _slot, desc in MAIN_IMAGES:
+            action = image_menu.addAction(f"{name} — {desc}")
+            action.setCheckable(True)
+            action.setChecked(name == self._main_image)
+            action.triggered.connect(lambda _checked, n=name: self.set_main_image(n))
+            self._main_image_actions[name] = action
+        self.image_select.setMenu(image_menu)
+        self.image_select.setText("PWOA ▾")     # sized once for the widest name
+        self.image_select.setFixedWidth(self.image_select.sizeHint().width())
+        self.image_select.setText(f"{self._main_image} ▾")
+        # a raw frame's max and SATURATED, while it is the big image (its place in the
+        # row above shows the OD then): left of the selector
+        self.frame_label = _OverlayLabel(self.od_plot)
         # which units the axes, readouts and ROI are in: bottom left. Click it to
         # switch, as the toolbar's µm button does.
         self.units_label = _OverlayLabel(self.od_plot, clickable=True)
@@ -702,9 +739,14 @@ class LiveODViewer(QWidget):
             if od_max - od_min < OD_STEP:
                 od_min, od_max = lo_lim, hi_lim
         self._show_od_levels(od_min, od_max)
-        self.od_colorbar.blockSignals(True)
-        self.od_colorbar.setLevels((od_min, od_max))    # also sets the image's levels
-        self.od_colorbar.blockSignals(False)
+        slot = self._main_slot()
+        if slot is None:
+            self.od_colorbar.blockSignals(True)
+            self.od_colorbar.setLevels((od_min, od_max))    # also sets the image's levels
+            self.od_colorbar.blockSignals(False)
+        elif self._displayed_od is not None:
+            # the colour bar is the raw frame's: the OD is in the row above
+            self._strip_views()[slot].setLevels(od_min, od_max)
         self._save_od_levels()
 
     def set_od_limits(self, lo_lim, hi_lim):
@@ -718,9 +760,7 @@ class LiveODViewer(QWidget):
             spinner.blockSignals(True)
             spinner.setRange(lo_lim, hi_lim)
             spinner.blockSignals(False)
-        # ColorBarItem takes its limits only at construction; these are the attributes
-        # its drag handler and setLevels clip against
-        self.od_colorbar.lo_lim, self.od_colorbar.hi_lim = lo_lim, hi_lim
+        self._configure_colorbar()
         self.set_od_levels(self._od_min, self._od_max)
         if self._settings is not None:
             self._settings.setValue("viewer/od_limits", [lo_lim, hi_lim])
@@ -740,9 +780,25 @@ class LiveODViewer(QWidget):
         # so only follow it. Do NOT call od_colorbar.setLevels here: that also resets
         # the level the drag is measured from, so every mouse move would add the
         # handle's whole displacement again and the level runs away.
-        self._show_od_levels(*(float(v) for v in self.od_colorbar.levels()))
+        levels = tuple(float(v) for v in self.od_colorbar.levels())
+        slot = self._main_slot()
+        if slot is None:
+            self._show_od_levels(*levels)
+            return
+        # a raw frame is the big image: the bar sets that frame's levels, which atoms
+        # and light share, until the next series takes them afresh
+        key = self._raw_levels_key(slot)
+        if key not in self._first_image_minmax:
+            return
+        self._first_image_minmax[key] = levels
+        if key == 'atoms_light':
+            other = 'light' if slot == 'atoms' else 'atoms'
+            if self._frames.get(other) is not None:
+                self._strip_views()[other].setLevels(*levels)
 
     def _on_colorbar_drag_finished(self, *_):
+        if self._main_slot() is not None:
+            return      # raw levels are not remembered: each series starts afresh
         # pyqtgraph reports a release twice (snapping the handles back counts as one)
         levels = (self._od_min, self._od_max)
         if levels != getattr(self, '_od_levels_at_last_release', None):
@@ -772,6 +828,8 @@ class LiveODViewer(QWidget):
         self.od_img_item.clear()
         self._last_od = None
         self._displayed_od = None
+        self._frames = {}
+        self.frame_label.show_text("")
         self._last_sumodx = None
         self._last_sumody = None
         self._last_od_shape = None
@@ -858,35 +916,33 @@ class LiveODViewer(QWidget):
                 float(min(np.min(atoms), np.min(light))), float(max(np.max(atoms), np.max(light))))
             self._first_image_minmax['dark'] = (float(np.min(dark)), float(np.max(dark)))
             self._autoscale_ready = True
-        atoms_levels = self._first_image_minmax['atoms_light']
-        dark_levels = self._first_image_minmax['dark']
-        self.img_atoms_view.setImage(atoms.T, autoLevels=False, levels=atoms_levels)
-        self.img_light_view.setImage(light.T, autoLevels=False, levels=atoms_levels)
-        self.img_dark_view.setImage(dark.T, autoLevels=False, levels=dark_levels)
+        self._frames = {'atoms': atoms, 'light': light, 'dark': dark}
         self._last_atoms = atoms
         self._last_light = light
         self._last_dark = dark
-        for name, img in (('atoms', atoms), ('light', light), ('dark', dark)):
-            self._set_raw_label(name, img)
+        # setImage resets each view; _draw_strip puts it back where the user had it
+        self._draw_strip()
 
         if is_first:
             shape = atoms.T.shape
             for v in views:
                 v.getView().setRange(xRange=[0, shape[0]], yRange=[0, shape[1]], padding=0)
             self._first_image_received = 1
-        else:
-            # setImage resets the view; put it back where the user had it
-            for v, (x_range, y_range) in zip(views, self._last_view_ranges):
-                v.getView().setRange(xRange=x_range, yRange=y_range, padding=0)
+
+    @staticmethod
+    def _raw_notes(name, img):
+        """['max 4095', 'SATURATED'] for a raw frame: what its label says after its title."""
+        if img is None or not np.size(img):
+            return []
+        peak = np.max(img)
+        notes = [f"max {peak:.0f}"]
+        if name != 'dark' and int(peak) in SATURATION_LEVELS \
+                and np.count_nonzero(img == peak) >= SATURATION_MIN_PIXELS:
+            notes.append('<span style="color:#ff5252; font-weight:bold">SATURATED</span>')
+        return notes
 
     def _set_raw_label(self, name, img=None):
-        text = self._raw_titles[name]
-        if img is not None and np.size(img):
-            peak = np.max(img)
-            text += f" · max {peak:.0f}"
-            if name != 'dark' and int(peak) in SATURATION_LEVELS \
-                    and np.count_nonzero(img == peak) >= SATURATION_MIN_PIXELS:
-                text += ' · <span style="color:#ff5252; font-weight:bold">SATURATED</span>'
+        text = " · ".join([self._raw_titles[name]] + self._raw_notes(name, img))
         self._raw_labels[name].setText(text, color='#dddddd', size='8pt')
 
     def plot_od(self, od, sumodx, sumody, min_od=None, max_od=None):
@@ -896,13 +952,121 @@ class LiveODViewer(QWidget):
             self.od_plot.setYRange(0, od.shape[0], padding=0)
         if min_od is None or max_od is None:
             min_od, max_od = self._od_min, self._od_max
-        self.od_img_item.setImage(od.T, autoLevels=False, levels=(min_od, max_od))
         self._last_od_shape = od.shape
         self._last_od = od
         self._displayed_od = od
         self._last_sumodx = sumodx
         self._last_sumody = sumody
+        self._draw_main(od_levels=(min_od, max_od))
+        if self._main_slot() is not None:
+            self._draw_strip((self._main_slot(),))     # the OD's place in the row above
         self._update_marginals()
+
+    # ------------------------------------------------------------------
+    # Which image is the big one (OD, PWA, PWOA, Dark)
+    # ------------------------------------------------------------------
+
+    def _main_slot(self):
+        """The strip slot ('atoms', 'light', 'dark') of the raw frame on the big
+        image -- where the OD goes instead; None while the big image is the OD."""
+        return _MAIN_IMAGE_SLOT[self._main_image]
+
+    def _main_array(self):
+        """The 2D array on the big image: what the cursor readout, profiles and
+        crop bounds are taken from. None before the first shot."""
+        slot = self._main_slot()
+        return self._displayed_od if slot is None else self._frames.get(slot)
+
+    @staticmethod
+    def _raw_levels_key(slot):
+        return 'dark' if slot == 'dark' else 'atoms_light'
+
+    def _strip_views(self):
+        return {'atoms': self.img_atoms_view, 'light': self.img_light_view,
+                'dark': self.img_dark_view}
+
+    def set_main_image(self, name):
+        """Show ``name`` ('OD', 'PWA', 'PWOA' or 'Dark') on the big image. The OD
+        takes the chosen frame's place in the row above, so all four stay on screen.
+        Display only."""
+        if name not in _MAIN_IMAGE_SLOT:
+            raise ValueError(f"unknown image {name!r}: one of {list(_MAIN_IMAGE_SLOT)}")
+        for action_name, action in self._main_image_actions.items():
+            action.setChecked(action_name == name)
+        if name == self._main_image:
+            return
+        self._main_image = name
+        self.image_select.setText(f"{name} ▾")
+        self._configure_colorbar()
+        self._draw_main()
+        self._draw_strip()
+        self._update_marginals()
+        self.cursor_label.show_text("")     # its value was the other image's
+        self._place_overlays()
+
+    def _configure_colorbar(self):
+        """The colour bar belongs to the big image: OD limits and 0.1 steps for the
+        OD; whole counts and no limits for a raw frame."""
+        bar = self.od_colorbar
+        if self._main_slot() is None:
+            bar.rounding = OD_STEP
+            # ColorBarItem takes its limits only at construction; these are the
+            # attributes its drag handler and setLevels clip against
+            bar.lo_lim, bar.hi_lim = self._od_limits
+            bar.blockSignals(True)
+            bar.setLevels((self._od_min, self._od_max))
+            bar.blockSignals(False)
+        else:
+            bar.rounding = 1.0
+            bar.lo_lim = bar.hi_lim = None
+
+    def _draw_main(self, od_levels=None):
+        """Put the selected image on the big plot."""
+        img = self._main_array()
+        slot = self._main_slot()
+        if img is None:
+            self.od_img_item.clear()
+        elif slot is None:
+            levels = od_levels if od_levels is not None else (self._od_min, self._od_max)
+            self.od_img_item.setImage(np.asarray(img).T, autoLevels=False, levels=levels)
+        else:
+            lo, hi = self._first_image_minmax.get(self._raw_levels_key(slot),
+                                                  (float(np.min(img)), float(np.max(img))))
+            hi = max(hi, lo + 1.0)      # a flat frame (a dark one) still needs a span
+            self.od_img_item.setImage(np.asarray(img).T, autoLevels=False, levels=(lo, hi))
+            self.od_colorbar.blockSignals(True)
+            self.od_colorbar.setLevels((lo, hi))
+            self.od_colorbar.blockSignals(False)
+        notes = self._raw_notes(slot, img) if slot is not None else []
+        self.frame_label.show_text(" · ".join(notes))
+        self._place_overlays()
+
+    def _draw_strip(self, slots=('atoms', 'light', 'dark')):
+        """Put up each strip slot's raw frame -- or the OD, in the slot of the frame
+        that is on the big image -- keeping each view's pan and zoom."""
+        main_slot = self._main_slot()
+        views = self._strip_views()
+        was_syncing, self._syncing_image_views = self._syncing_image_views, True
+        try:
+            for slot in slots:
+                view = views[slot]
+                if slot == main_slot:
+                    img, levels = self._displayed_od, (self._od_min, self._od_max)
+                else:
+                    img = self._frames.get(slot)
+                    levels = self._first_image_minmax.get(self._raw_levels_key(slot))
+                x_range, y_range = view.getView().viewRange()
+                if img is None:
+                    view.clear()
+                else:
+                    view.setImage(np.asarray(img).T, autoLevels=levels is None, levels=levels)
+                    view.getView().setRange(xRange=x_range, yRange=y_range, padding=0)
+                if slot == main_slot:
+                    self._raw_labels[slot].setText("OD", color='#dddddd', size='8pt')
+                else:
+                    self._set_raw_label(slot, img)
+        finally:
+            self._syncing_image_views = was_syncing
 
     def reset_zoom(self):
         shape = self._last_od_shape if self._last_od_shape is not None else (512, 512)
@@ -947,7 +1111,9 @@ class LiveODViewer(QWidget):
         self._update_marginals()
 
     def _update_marginals(self):
-        od = self._displayed_od
+        """The profiles of the big image (sumOD, or summed counts of a raw frame);
+        the fits only with the OD, which is what they were fitted to."""
+        od = self._main_array()
         show = od is not None and self.profiles_checkbox.isChecked()
         if show:
             x0, x1, y0, y1 = self.get_crop_bounds(od.shape)
@@ -957,7 +1123,8 @@ class LiveODViewer(QWidget):
         if not show:
             return
 
-        crop = np.nan_to_num(od[y0:y1, x0:x1], nan=0.0, posinf=0.0, neginf=0.0)
+        crop = np.nan_to_num(np.asarray(od[y0:y1, x0:x1], dtype=float),
+                             nan=0.0, posinf=0.0, neginf=0.0)
         sum_x, sum_y = crop.sum(axis=0), crop.sum(axis=1)
         vb = self.od_plot.getViewBox()
         (vx0, vx1), (vy0, vy1) = vb.viewRange()
@@ -984,7 +1151,7 @@ class LiveODViewer(QWidget):
         self._sumy_base.setData(np.full(rows.size, x_base), rows)
 
         fit = self._fit
-        fit_matches = (fit is not None
+        fit_matches = (fit is not None and self._main_slot() is None
                        and tuple(fit.get('crop_origin_px', ())) == (x0, y0)
                        and tuple(fit.get('crop_shape_px', ())) == (x1 - x0, y1 - y0))
         for axis, curve_item, pixels in (('x', self._fitx_curve, cols), ('y', self._fity_curve, rows)):
@@ -1200,17 +1367,25 @@ class LiveODViewer(QWidget):
 
     def _place_overlays(self):
         """Keep the overlays in the corners of the image area (inside the axes, left
-        of the colour bar): per-shot numbers top right, cursor bottom right, units
+        of the colour bar): per-shot numbers top right, the image selector bottom
+        right with the cursor above it and a raw frame's max to its left, units
         bottom left, xvars top left."""
         rect = self.od_plot.mapFromScene(self.od_plot.getViewBox().sceneBoundingRect()).boundingRect()
         margin = 6
         for label, at_top, at_right in ((self.readout_label, True, True),
-                                        (self.cursor_label, False, True),
                                         (self.units_label, False, False),
                                         (self.xvar_label, True, False)):
             x = rect.right() - label.width() - margin if at_right else rect.left() + margin
             y = rect.top() + margin if at_top else rect.bottom() - label.height() - margin
             label.move(int(max(rect.left(), x)), int(y))
+        select = self.image_select
+        sx = rect.right() - select.width() - margin
+        sy = rect.bottom() - select.height() - margin
+        select.move(int(max(rect.left(), sx)), int(sy))
+        self.cursor_label.move(int(max(rect.left(), rect.right() - self.cursor_label.width() - margin)),
+                               int(sy - self.cursor_label.height() - 4))
+        self.frame_label.move(int(max(rect.left(), sx - self.frame_label.width() - 4)),
+                              int(sy + (select.height() - self.frame_label.height()) / 2))
 
     # ------------------------------------------------------------------
     # Markers (pins). The viewer only draws and edits them: the window hands it the
@@ -1385,7 +1560,7 @@ class LiveODViewer(QWidget):
     def _on_mouse_moved(self, event):
         pos = event[0]
         vb = self.od_plot.getViewBox()
-        od = self._displayed_od
+        od = self._main_array()     # the image on screen, whichever it is
         if od is None or not vb.sceneBoundingRect().contains(pos):
             self.cursor_label.show_text("")
             return
@@ -1398,8 +1573,10 @@ class LiveODViewer(QWidget):
         self._last_cursor = (point.x(), point.y())
         unit, scale = self._length_unit()
         where = f"{col * scale:.0f}, {row * scale:.0f} {unit}"
+        value = od[row, col]
+        value = f"{value:.2f}" if self._main_slot() is None else _format_number(float(value), digits=5)
         self.cursor_label.show_text(" &nbsp;&nbsp; ".join((
-            _label_value("x, y", where), _label_value("OD", f"{od[row, col]:.2f}"))))
+            _label_value("x, y", where), _label_value(self._main_image, value))))
         self._place_overlays()
 
     # ------------------------------------------------------------------

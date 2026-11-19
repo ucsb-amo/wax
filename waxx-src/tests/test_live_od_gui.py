@@ -1223,6 +1223,69 @@ def test_raw_levels_come_from_the_first_shot_of_a_series(viewer, app):
     assert tuple(viewer.img_light_view.imageItem.levels)[1] == 1500.0
 
 
+def test_the_big_image_can_be_a_raw_frame_with_the_od_in_its_place(viewer, app):
+    from PyQt6.QtCore import QPointF
+    atoms, light, dark, od, sx, sy = make_shot(cx=300, cy=180)
+    viewer.handle_plot_data((atoms, light, dark, od, sx, sy))
+    app.processEvents()
+    assert viewer.image_select.text().startswith("OD")
+    np.testing.assert_array_equal(viewer.od_img_item.image, od.T)
+
+    [a for t, a in viewer._main_image_actions.items() if t == "PWA"][0].trigger()     # the dropdown
+    app.processEvents()
+    assert viewer.image_select.text().startswith("PWA")
+    np.testing.assert_array_equal(viewer.od_img_item.image, atoms.T)            # big image: the frame
+    np.testing.assert_array_equal(viewer.img_atoms_view.imageItem.image, od.T)  # its slot: the OD
+    np.testing.assert_array_equal(viewer.img_light_view.imageItem.image, light.T)
+    shared = (float(min(atoms.min(), light.min())), 3000.0)
+    assert tuple(viewer.od_colorbar.levels()) == shared       # the bar is the frame's
+    assert tuple(viewer.od_img_item.levels) == shared
+    # the OD scale still sets the OD, now in the row above, and leaves the bar alone
+    viewer.set_od_levels(0.0, 1.5)
+    assert tuple(viewer.img_atoms_view.imageItem.levels) == (0.0, 1.5)
+    assert tuple(viewer.od_colorbar.levels()) == shared
+    # cursor readout: the frame's counts
+    viewer._on_mouse_moved((viewer.od_plot.getViewBox().mapViewToScene(QPointF(300.5, 180.5)),))
+    assert "PWA" in viewer.cursor_label.text() and f"{atoms[180, 300]:.0f}" in viewer.cursor_label.text()
+    # profiles: the frame's counts summed over the crop (the cloud is a dip); no OD fits
+    viewer.on_shot_scalars({"shot_idx": None})
+    cols, heights = viewer._sumx_curve.getData()
+    assert viewer._sumx_curve.isVisible() and cols[np.argmin(heights)] == pytest.approx(300.5, abs=1)
+    assert not viewer._fitx_curve.isVisible()
+
+    # the next shot goes where the selection says
+    atoms2, light2, dark2, od2, sx2, sy2 = make_shot(cx=200, cy=100)
+    viewer.handle_plot_data((atoms2, light2, dark2, od2, sx2, sy2))
+    np.testing.assert_array_equal(viewer.od_img_item.image, atoms2.T)
+    np.testing.assert_array_equal(viewer.img_atoms_view.imageItem.image, od2.T)
+
+    viewer.set_main_image("Dark")
+    np.testing.assert_array_equal(viewer.od_img_item.image, dark2.T)
+    np.testing.assert_array_equal(viewer.img_atoms_view.imageItem.image, atoms2.T)   # back in place
+    np.testing.assert_array_equal(viewer.img_dark_view.imageItem.image, od2.T)
+    lo, hi = viewer.od_colorbar.levels()
+    assert lo == 100.0 and hi > lo                            # a flat dark frame still gets a span
+
+    viewer.set_main_image("OD")
+    np.testing.assert_array_equal(viewer.od_img_item.image, od2.T)
+    np.testing.assert_array_equal(viewer.img_dark_view.imageItem.image, dark2.T)
+    assert tuple(viewer.od_colorbar.levels()) == (0.0, 1.5)
+    assert (viewer.od_colorbar.lo_lim, viewer.od_colorbar.hi_lim) == viewer._od_limits
+    assert [t for t, a in viewer._main_image_actions.items() if a.isChecked()] == ["OD"]
+    with pytest.raises(ValueError):
+        viewer.set_main_image("OD2")
+
+
+def test_saturation_stays_on_screen_when_the_frame_is_the_big_image(viewer, app):
+    atoms, light, dark, od, sx, sy = make_shot(peak_light=4095)
+    viewer.handle_plot_data((atoms, light, dark, od, sx, sy))
+    viewer.set_main_image("PWOA")
+    assert "SATURATED" in viewer.frame_label.text() and viewer.frame_label.isVisibleTo(viewer)
+    viewer.set_main_image("OD")
+    assert viewer.frame_label.isHidden()
+    assert "SATURATED" in viewer._raw_labels['light'].text
+
+
 def test_colorbar_does_not_waste_the_right_hand_edge(viewer, app):
     assert viewer.od_colorbar.axis.width() <= 30         # pyqtgraph's default is 45
     app.processEvents()
