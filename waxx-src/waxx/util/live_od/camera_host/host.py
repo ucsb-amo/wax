@@ -83,6 +83,7 @@ from beacon.camera.schema import (ANDOR_EMCCD, ANDOR_LIVE_EM_GAIN_CAP, BASLER_US
                                   RunProfileError, build_live_profile, build_run_profile,
                                   check_constraints, normalize_value, refusals, to_wire)
 from beacon.camera.worker import LockedError
+from beacon.drivers.andor.category import ANDOR_EM_GAIN_MAX
 
 from waxx.util.live_od.camera_host.sinks import RunSink
 from waxx.util.live_od.log import VERBOSE
@@ -290,6 +291,8 @@ class _Run:
     clamps: dict = field(default_factory=dict)
     sink: Optional[RunSink] = None
     handle: Any = None
+    # EM gain above 300 already set back to 300 (a dead experiment, or the end)
+    extreme_undone: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1151,7 +1154,9 @@ class CameraHost:
     def end_run(self, token: str, reason: str = "END_RUN") -> RunSummary:
         """The run's hold on its camera ends: disarm (whatever is still in the
         camera is read), unlock.  The camera stays idle at the run's settings
-        (no stream resumes).  An unknown token: an empty summary."""
+        (no stream resumes), except an Andor EM gain above 300, which is set back
+        to 300 with advanced mode off first (_undo_extreme_em_gain).  An unknown
+        token: an empty summary."""
         token = str(token)
         with self._lock:
             run = self._runs.pop(token, None)
@@ -1178,6 +1183,8 @@ class CameraHost:
                 # read after the disarm, which keeps the fault (and catches one in
                 # the drain); the unlock reopens the camera
                 run_fault = str(ws["error"] or "driver error")
+            else:
+                self._undo_extreme_em_gain(run, w, token, reason, errors)
             try:
                 w.call("unlock", END_RUN_OP_S, token=token)
             except Exception as exc:
@@ -1214,6 +1221,66 @@ class CameraHost:
                               f"the camera stays idle at the run's settings")
         self._bump()
         return summary
+
+    def _undo_extreme_em_gain(self, run: _Run, w, token: str, reason: str, errors: list) -> None:
+        """A run that asked for EM gain above 300 (EM advanced mode, the
+        experiment's ``_extreme_emccd_gain``): its own profile again at gain 300,
+        advanced mode off, before the lock goes, however the run ended (END_RUN,
+        ABORT_RUN, superseded, reset).  Only once it was armed: before that the
+        camera never had the gain.  A run that faulted needs none of this: the
+        unlock reopens the camera, and an open sets advanced mode off."""
+        asked = self._extreme_gain_asked(run)
+        if asked is None:
+            return
+        run.extreme_undone = True        # one attempt per run; a failure is logged loudly
+        safe = dict(run.plan.profile, gain=ANDOR_EM_GAIN_MAX, extreme_emccd_gain=False)
+        try:
+            rb = plain_readback(w.call("apply", END_RUN_OP_S, values=safe, purpose="run",
+                                       token=token))
+        except Exception as exc:
+            errors.append(f"EM gain back to {ANDOR_EM_GAIN_MAX}: {type(exc).__name__}: {exc}")
+            logger.error(f"camera host: run {run.run_id} on {run.key} ({reason}): could NOT set "
+                         f"the EM gain back to {ANDOR_EM_GAIN_MAX} after EM gain {asked} "
+                         f"(advanced mode may still be on): {type(exc).__name__}: {exc}")
+            return
+        logger.warning(f"camera host: run {run.run_id} on {run.key} ended ({reason}): EM gain "
+                       f"set back from {asked} to {rb.get('gain')!r}, EM advanced mode "
+                       f"{rb.get('em_advanced')!r} (off)")
+
+    @staticmethod
+    def _extreme_gain_asked(run: _Run) -> Optional[int]:
+        """The EM gain above 300 this run armed the Andor with and that is not
+        set back yet; None otherwise."""
+        plan = run.plan
+        if (plan is None or run.arm_future is None or run.extreme_undone or not run.locked
+                or getattr(run.category, "name", "") != ANDOR_EMCCD.name):
+            return None
+        try:
+            asked = int(plan.profile.get("gain", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return asked if asked > ANDOR_EM_GAIN_MAX else None
+
+    def extreme_gain_pending(self, token: str) -> bool:
+        """The run holds the Andor at an EM gain above 300 not set back yet
+        (cheap: no camera call)."""
+        run = self._run_of(str(token))
+        return run is not None and self._extreme_gain_asked(run) is not None
+
+    def undo_extreme_em_gain(self, token: str, reason: str) -> bool:
+        """Set the run's Andor back to EM gain 300, advanced mode off, now,
+        while the run stays open (liveOD, when the run's experiment process is
+        gone without a word: its run is closed later, by a Reset or the next
+        run, and must not sit at the high gain until then). The camera's run
+        acquisition stops (the apply is a full state). True when it was done."""
+        run = self._run_of(str(token))
+        if run is None or self._core is None or self._extreme_gain_asked(run) is None:
+            return False
+        errors: list = []
+        self._undo_extreme_em_gain(run, self._core.worker(run.camera_id), str(token), reason,
+                                   errors)
+        self._bump()
+        return not errors
 
     def abort_run(self, token: str) -> RunSummary:
         return self.end_run(token, "ABORT_RUN")

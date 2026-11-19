@@ -258,6 +258,37 @@ def test_the_check_runs_before_init_run():
     assert "self.prepare_image_array()" in inspect.getsource(Scanner.init_xvars)
 
 
+# -- extreme EM gain opt-in ----------------------------------------------------------
+def _opt_in(camera_params, extreme):
+    from types import SimpleNamespace
+    from waxx.base.expt import Expt
+    fake = SimpleNamespace(camera_params=camera_params, _extreme_emccd_gain=extreme)
+    Expt._apply_extreme_emccd_gain(fake)
+    return camera_params
+
+
+def test_extreme_emccd_gain_defaults_off_and_is_recorded(monkeypatch):
+    from waxx.base.expt import Expt
+    monkeypatch.setenv("WAXX_OWNER", "person")
+    assert Expt._extreme_emccd_gain is False
+    assert payload_view(AndorParams())["extreme_emccd_gain"] is False   # in camera_params/
+    p = AndorParams()
+    p.extreme_emccd_gain = True                     # set by hand: the experiment's flag wins
+    assert _opt_in(p, False).extreme_emccd_gain is False
+    assert payload_view(_opt_in(AndorParams(), True))["extreme_emccd_gain"] is True
+    b = _opt_in(BaslerParams(), True)               # other cameras: untouched
+    assert "extreme_emccd_gain" not in vars(b)
+    with pytest.raises(TypeError, match="True or False"):
+        _opt_in(AndorParams(), "yes")
+
+
+def test_an_agents_run_never_opts_in(monkeypatch):
+    monkeypatch.setenv("WAXX_OWNER", "agent")
+    with pytest.raises(RuntimeError, match="agents never use EM gain above 300"):
+        _opt_in(AndorParams(), True)
+    assert _opt_in(AndorParams(), False).extreme_emccd_gain is False    # off: fine
+
+
 # -- kexp's camera table -----------------------------------------------------------
 def _load_kexp_camera_id():
     # by path, so the test does not import the kexp package (artiq, ...)

@@ -948,6 +948,10 @@ class LiveODServer(QThread, NetServer):
                 except Exception:
                     logger.exception("closing a run whose experiment is gone failed")
                 try:
+                    self._check_dead_client_em_gain()
+                except Exception:
+                    logger.exception("setting the EM gain back after a dead experiment failed")
+                try:
                     # a pickled dict, plus raw buffers for PUT_DATA (one frame
                     # per array, never copied through pickle)
                     frames = socket.recv_multipart()
@@ -2322,6 +2326,35 @@ class LiveODServer(QThread, NetServer):
         # the aborted run's token is retired: a late message from its experiment
         # (a hung process, not a dead one) gets "superseded" instead of acting here
         self._adopt_run_token(uuid.uuid4().hex)
+
+    #: How often the server loop asks whether a high-EM-gain run's process is gone.
+    DEAD_CLIENT_EM_GAIN_CHECK_S = 2.0
+
+    def _check_dead_client_em_gain(self, now=None):
+        """Server thread: the run in progress holds the Andor at an EM gain
+        above 300 (its experiment set ``_extreme_emccd_gain``) and its process
+        is known to be gone (client_known_dead: a pid on this machine) without
+        END_RUN or RUN_EXITED (killed, crashed): the camera is set back to 300,
+        advanced mode off, at once. Nothing else changes: the run stays open
+        and its file as it is, for a Reset or the next run to close as usual.
+        At most every DEAD_CLIENT_EM_GAIN_CHECK_S; costs nothing on a run at
+        300 or below. A client on another machine is never known dead: its gain
+        goes back to 300 when its run is closed."""
+        host, token = self._camera_host, self._host_run_token
+        if host is None or not token or not self._run_in_progress:
+            return
+        now = time.monotonic() if now is None else float(now)
+        if now - getattr(self, "_dead_em_gain_checked_at", -1e9) < self.DEAD_CLIENT_EM_GAIN_CHECK_S:
+            return
+        self._dead_em_gain_checked_at = now
+        pending = getattr(host, "extreme_gain_pending", None)
+        if pending is None or not pending(token) or not self.client_known_dead():
+            return
+        run_id = self._current_run_id
+        logger.warning(f"Run {run_id}: its experiment's process is gone (no END_RUN) while the "
+                       f"Andor is at EM gain above 300 (advanced mode): setting it back to 300 "
+                       f"now. The run stays open (Reset closes it; its file is kept).")
+        host.undo_extreme_em_gain(token, "the experiment's process is gone")
 
     def _check_exited_run(self, now=None):
         """Server thread: close the run whose experiment exited with frames still

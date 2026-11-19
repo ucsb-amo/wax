@@ -354,6 +354,11 @@ class AndorParams(CameraParams):
         self.trigger_mode = trigger_mode
         self.frame_transfer = frame_transfer
         self.sensor_roi = sensor_roi
+        # EM gain above 300 (EM advanced mode) is refused unless this is True.
+        # Not set here or in kexp.config.camera_id: Expt.finish_prepare_wax
+        # copies the experiment's own `self._extreme_emccd_gain` (default
+        # False) into it for every run, so camera_params/ records the opt-in.
+        self.extreme_emccd_gain = False
         # DO NOT ASSIGN DEFAULT PARAMETERS HERE -- INSTEAD ASSIGN THEM IN kexp.config.camera_id!
         self.__em_gain_fluor = em_gain_fluor
         self.__em_gain_abs = em_gain_abs

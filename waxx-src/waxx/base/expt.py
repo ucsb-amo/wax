@@ -143,6 +143,14 @@ def _queue_restart_monitor(restart_monitor):
 
 
 class Expt(Scanner, Dealer, Scribe):
+    # Set `self._extreme_emccd_gain = True` in an experiment (before
+    # finish_prepare) to allow an Andor EM gain above 300 for its run: EM
+    # advanced mode, up to 1000, where bright light can permanently damage the
+    # EMCCD. Without it liveOD refuses such a run at INIT_RUN and says why in
+    # its terminal. Copied into camera_params.extreme_emccd_gain (and so into
+    # camera_params/ in the file) by finish_prepare_wax.
+    _extreme_emccd_gain = False
+
     def __init__(self,
                  setup_camera=True,
                  save_data=True,
@@ -268,6 +276,31 @@ class Expt(Scanner, Dealer, Scribe):
         except Exception as e:
             print(f"[queue] note: could not say hello to the run queue ({e!r})")
 
+    def _apply_extreme_emccd_gain(self):
+        """Copy the experiment's ``_extreme_emccd_gain`` (bool) into an Andor's
+        camera_params, for every run: the request liveOD checks, and what
+        camera_params/ in the file records. Any other camera: nothing."""
+        cp = self.camera_params
+        if getattr(cp, 'camera_type', None) != 'andor':
+            return
+        extreme = self._extreme_emccd_gain
+        if not isinstance(extreme, (bool, np.bool_)):
+            raise TypeError(f"self._extreme_emccd_gain must be True or False, "
+                            f"not {extreme!r}")
+        if extreme and os.environ.get("WAXX_OWNER", "").strip().lower() == "agent":
+            # Lab rule (.claude/lab-rules.md): an agent never runs extreme EM
+            # gain. An agent's run has WAXX_OWNER=agent (its shell, and the
+            # queue's launch of its job); refused before INIT_RUN.
+            raise RuntimeError(
+                "self._extreme_emccd_gain = True is refused for an agent's run "
+                "(WAXX_OWNER=agent): agents never use EM gain above 300. Only a person "
+                "may run it, from their own session.")
+        cp.extreme_emccd_gain = bool(extreme)
+        if cp.extreme_emccd_gain:
+            print(f"!! self._extreme_emccd_gain = True: EM gain above 300 allowed for this "
+                  f"run (requested {getattr(cp, 'gain', '?')}); EM advanced mode, where "
+                  f"bright light can permanently damage the EMCCD.")
+
     def finish_prepare_wax(self,shuffle=True,N_repeats=[]):
         """
         To be called at the end of prepare. 
@@ -294,6 +327,7 @@ class Expt(Scanner, Dealer, Scribe):
             self.monitor.init_monitor()
             self._adopt_monitor_snapshot()
 
+        self._apply_extreme_emccd_gain()
         self.init_xvars(shuffle,N_repeats)
 
         # the Adjust panel's specs, from the params as prepare() left them
