@@ -17,7 +17,10 @@ The dialog:
 
 The dialog blocks indefinitely by default — the user explicitly drives any
 escalation.  This mirrors the lab requirement: never give up on a clean COM
-release without user consent.
+release without user consent.  The one exception is a remote close
+(``kdash close``): the person who sent it consented, nobody may be at this PC
+to press a button, so ``auto_force_after_s`` force-kills what is left after
+that long (shown counting down; "Cancel close" still works until then).
 """
 
 from __future__ import annotations
@@ -60,7 +63,8 @@ class ComShutdownDialog(QDialog):
     POLL_INTERVAL_MS = 200
     LOG_TAIL_LINES = 200
 
-    def __init__(self, supervisors: Iterable[tuple[str, str, object]], parent=None):
+    def __init__(self, supervisors: Iterable[tuple[str, str, object]], parent=None, *,
+                 auto_force_after_s: float | None = None, note: str = ""):
         """
         Parameters
         ----------
@@ -69,8 +73,17 @@ class ComShutdownDialog(QDialog):
             COM-managing server still alive at close.  ``supervisor`` must
             expose ``is_running()``, ``force_kill()``, and a ``log_line``
             Qt signal that emits ``str``.
+        auto_force_after_s:
+            None (default): wait for the user.  A number: force-kill the
+            remaining servers after that many seconds (remote close).
+        note:
+            An extra line at the top (who asked for a remote close).
         """
         super().__init__(parent)
+        self._auto_force_after_s = (None if auto_force_after_s is None
+                                    else max(0.0, float(auto_force_after_s)))
+        self._note = str(note or "")
+        self._forced_labels: list[str] = []
         self.setWindowTitle("Closing COM devices…")
         self.setModal(True)
         self.setMinimumWidth(560)
@@ -106,6 +119,10 @@ class ComShutdownDialog(QDialog):
         """One of ``RESULT_*`` constants once :meth:`exec` returns."""
         return self._result
 
+    def forced_labels(self) -> list[str]:
+        """Labels of the servers this dialog force-killed."""
+        return list(self._forced_labels)
+
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
@@ -122,6 +139,14 @@ class ComShutdownDialog(QDialog):
         )
         header.setWordWrap(True)
         root.addWidget(header)
+        if self._note:
+            note = QLabel(self._note)
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {theme.WARN}; font-weight: 600;")
+            root.addWidget(note)
+        self._countdown = QLabel("")
+        self._countdown.setVisible(self._auto_force_after_s is not None)
+        root.addWidget(self._countdown)
 
         grid_host = QVBoxLayout()
         grid = QGridLayout()
@@ -210,6 +235,15 @@ class ComShutdownDialog(QDialog):
             self._poll_timer.stop()
             self._result = RESULT_ALL_CLOSED
             self.accept()
+            return
+        if self._auto_force_after_s is not None:
+            left = self._auto_force_after_s - elapsed_total
+            if left <= 0:
+                _LOG.warning("remote close: COM servers still running after %.0f s; "
+                             "force-killing them", self._auto_force_after_s)
+                self._on_force_kill()
+            else:
+                self._countdown.setText(f"Remaining servers are force-killed in {left:.0f} s.")
 
     def _on_log_line(self, line: str) -> None:
         try:
@@ -222,10 +256,11 @@ class ComShutdownDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _on_force_kill(self) -> None:
-        for idx, (_label, _com, sup) in enumerate(self._sups):
+        for idx, (label, _com, sup) in enumerate(self._sups):
             try:
                 if sup.is_running():
                     sup.force_kill(wait_ms=200)
+                    self._forced_labels.append(label)
                     self._final_status[idx] = _STATUS_FORCED
                     status_lbl = self._status_labels.get(idx)
                     if status_lbl is not None:
