@@ -13,10 +13,11 @@ directly (found by its beacon), not through the monitor server:
   move to where the server already has the stage is sent with ``force=True``
   ("drive in again"), for when it was moved by hand.
 
-Moves are refused while the host says a run is using the machine (a run sets
-the stage itself in ``Base.__init__``; moving it under a run would block the
-camera or the APD mid-run).  When the host cannot tell (monitor server
-unreachable) the confirmation says so.
+Moves are allowed while a run is using the machine.  A run sets the stage
+itself in ``Base.__init__``, so moving it under a run can block that run's
+camera or APD mid-run: the confirmation names the run and says so, and the
+log line records it.  When the host cannot tell (monitor server unreachable)
+the confirmation says that instead.
 
 All network I/O runs on daemon threads; results come back to the GUI thread
 through queued signals.
@@ -220,9 +221,6 @@ class ApdStagePill(QPushButton):
             return False, "the PDXC server is not reachable"
         if self.com_status != "connected":
             return False, f"the PDXC server's COM port is {self.com_status}"
-        run = self._run_text()
-        if run:
-            return False, f"{run} is using the machine (a run sets the stage itself)"
         return True, ""
 
     def confirm(self, title: str, text: str, verb: str) -> bool:
@@ -250,16 +248,21 @@ class ApdStagePill(QPushButton):
         if force:
             parts.append(f"The PDXC server already has it {state}; this drives the full throw "
                          "again (for a stage moved by hand).")
-        if self._run_text() is None:
+        run = self._run_text()
+        if run is None:
             parts.append("The monitor server is not reachable, so this window cannot tell "
                          "whether a run is using the machine. Moving the stage under a run "
                          "blocks its camera or its APD.")
+        elif run:
+            parts.append(f"{run} is using the machine. The run set the stage itself; moving "
+                         "it now can block the run's camera or its APD for the rest of the run.")
         parts.append("A full throw takes several seconds.")
         verb = f"Move {state}"
         if not self.confirm(f"APD stage {state}?", "\n\n".join(parts), verb):
             return False
         self._moving = state
-        self._record(f"[apd stage] moving {state}" + (" (full throw again)" if force else ""))
+        self._record(f"[apd stage] moving {state}" + (" (full throw again)" if force else "")
+                     + (f" during {run}" if run else ""))
         self.refresh()
 
         def work():

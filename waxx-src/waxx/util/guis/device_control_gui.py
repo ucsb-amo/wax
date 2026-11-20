@@ -2041,8 +2041,8 @@ class DeviceStateGUI(QMainWindow):
         self._connections_slot.setContentsMargins(0, 0, 0, 0)
         group.addLayout(self._connections_slot)
         row.addWidget(self.connected_devices)
-        # The APD pickoff stage (PDXC server, asked directly).  Moves are off
-        # while a run uses the machine; None = cannot tell (server unreachable).
+        # The APD pickoff stage (PDXC server, asked directly).  Moves stay on
+        # during a run (the confirmation names it); None = cannot tell.
         if self._apd_stage:
             from waxx.util.guis.apd_stage_pill import ApdStagePill  # noqa: PLC0415
             self.apd_stage_pill = ApdStagePill(

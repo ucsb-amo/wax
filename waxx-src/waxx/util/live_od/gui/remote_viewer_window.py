@@ -861,22 +861,10 @@ class RemoteViewerWindow(QWidget):
         (a Reset while the run is being saved, or naming another run; any
         other request the server answered ``ok: False`` with an error, such as
         a camera action during a run) or that it closed a run whose process is
-        gone, keeping its file; "" for any other reply."""
-        if not isinstance(reply, dict):
-            return ""
-        if not (reply.get('ignored') or reply.get('saving') or reply.get('refused')
-                or reply.get('kept')):
-            if reply.get('ok', True) is False and reply.get('error'):
-                return f"{label} refused: {reply['error']}"
-            return ""
-        if reply.get('kept') and reply.get('message'):
-            return str(reply['message'])
-        text = str(reply.get('message') or reply.get('error') or '')
-        if not text:
-            what = "ignored" if reply.get('ignored') else "refused"
-            run = f"run {reply['run_id']} " if reply.get('run_id') else "the run "
-            text = f"{label} {what}: {run}is being saved (it is complete)"
-        return text
+        gone, keeping its file; "" for any other reply.  (Shared with the
+        monitor panel's Abort: ``waxx.util.guis.live_od_abort``.)"""
+        from waxx.util.guis.live_od_abort import reply_notice_text  # noqa: PLC0415
+        return reply_notice_text(label, reply)
 
     def _show_reply(self, label: str, reply: dict):
         """Called on the request's (worker) thread: such a reply is shown on

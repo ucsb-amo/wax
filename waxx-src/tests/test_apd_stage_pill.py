@@ -88,14 +88,20 @@ def test_com_not_connected(qapp):
     assert not pill.move_allowed()[0]
 
 
-def test_refused_during_a_run(qapp):
-    pill = _pill(qapp, FakeClient(), run_text=lambda: "run 91234 (hf_bec)")
-    allowed, why = pill.move_allowed()
-    assert not allowed and "run 91234" in why
+def test_allowed_during_a_run_with_warning(qapp):
+    client, lines, asked = FakeClient(position="out"), [], []
+    pill = _pill(qapp, client, run_text=lambda: "run 91234 (hf_bec)", lines=lines)
+    assert pill.move_allowed() == (True, "")
     menu = pill.build_menu()
     enabled = {a.objectName(): a.isEnabled() for a in menu.actions() if a.objectName()}
-    assert enabled["apd_stage_move_in"] is False
-    assert enabled["apd_stage_move_out"] is False
+    assert enabled["apd_stage_move_in"] is True
+    assert enabled["apd_stage_move_out"] is True
+    pill.confirm = lambda title, text, verb: asked.append(text) or True
+    assert pill.request_move("in")
+    assert "run 91234 (hf_bec) is using the machine" in asked[0]
+    assert _wait(qapp, lambda: pill._moving is None)
+    assert client.moves == [("in", False)]
+    assert lines[0] == "[apd stage] moving in during run 91234 (hf_bec)"
 
 
 def test_move_in(qapp):

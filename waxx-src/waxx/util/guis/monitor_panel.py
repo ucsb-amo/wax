@@ -12,8 +12,9 @@ embedded from it.  :class:`MonitorServerPanel` shows the same from any PC:
   machine, Start while it is off (Start / Restart also on its ⋯: the server's
   ``reset``, through :class:`MonitorControl`), the run loops under a "Loops"
   dropdown, the queue's warm start on its ⋯, and (when the lab gives its
-  launcher) Start liveOD while none runs; its arrow opens the details and the
-  ops journal;
+  launcher) Start liveOD while none runs, and Abort (liveOD's, sent to
+  liveOD; red while a run holds the machine); its arrow opens the details and
+  the ops journal;
 * the queue -- :class:`~waxx.util.guis.run_queue_panel.RunQueuePanel`: its
   toolbar (filter, hold, pause), the jobs, each job's right-click menu.
 
@@ -50,6 +51,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QMessageBox, QVBoxLayout
 
 from waxx.util.dashboard.embed_helpers import WidgetPanelBase
+from waxx.util.guis.live_od_abort import LiveODAbortButton
 from waxx.util.guis.monitor_state_panel import MonitorStatePanel
 from waxx.util.guis.qt_upkeep import delete_later
 from waxx.util.guis.request_runner import RequestRunner
@@ -250,7 +252,12 @@ class MonitorServerPanel(WidgetPanelBase):
     ``live_od_bat``: the lab's liveOD launcher (kexp passes
     ``_bat/live_od.bat``): the bar then has Start liveOD
     (:class:`~waxx.util.guis.live_od_launch.LiveODButton`); ``live_od_start``,
-    ``live_od_probe``, ``live_od_refusal`` go to it (tests pass fakes)."""
+    ``live_od_probe``, ``live_od_refusal`` go to it (tests pass fakes).
+
+    The bar ends in Abort (:class:`~waxx.util.guis.live_od_abort.LiveODAbortButton`):
+    liveOD's Abort, sent to liveOD; ``live_od_abort_client()`` makes its liveOD
+    client (tests pass a fake; default: a LiveODClient by discovery, at the
+    first click)."""
 
     #: How often status_json is asked for while the panel is visible.
     STATUS_POLL_MS = 1000
@@ -259,7 +266,7 @@ class MonitorServerPanel(WidgetPanelBase):
                  listener_factory: Callable[[], Any] | None | str = "default",
                  synchronous: bool = False, by: str | None = None, settings=None,
                  live_od_bat: str | None = None, live_od_start=None, live_od_probe=None,
-                 live_od_refusal=None):
+                 live_od_refusal=None, live_od_abort_client=None):
         super().__init__(parent)
         self.link = link or MonitorLink()
         # "default": a StateListener, imported at first show (importing the
@@ -277,6 +284,14 @@ class MonitorServerPanel(WidgetPanelBase):
         self.queue_panel = RunQueuePanel(runner=self.runner, by=by, settings=settings)
         self.state_panel.message.connect(self.queue_panel.say)
         self.monitor_control = MonitorControl(self)
+        # Abort, as in liveOD's window (sent to liveOD), at the bar's right end,
+        # apart from its neighbours: a slip must not abort a run
+        self.abort_button = LiveODAbortButton(say=self.queue_panel.say,
+                                              client_factory=live_od_abort_client,
+                                              synchronous=synchronous)
+        bar_row = self.state_panel.bar.layout()
+        bar_row.addSpacing(8)
+        bar_row.addWidget(self.abort_button)
         box = QVBoxLayout(self)
         box.setContentsMargins(4, 4, 4, 4)
         box.setSpacing(2)
@@ -315,6 +330,7 @@ class MonitorServerPanel(WidgetPanelBase):
         self.queue_panel.set_state(status)
         self.state_panel.set_state(status)
         self.monitor_control.set_state(status)
+        self.abort_button.set_state(status)
 
     def on_broadcast(self, payload) -> None:
         """A broadcast to the bar and the queue; a no-op once cleaned up (a listener's
@@ -357,6 +373,7 @@ class MonitorServerPanel(WidgetPanelBase):
             self.listener = None
         self.queue_panel.shutdown()
         self.state_panel.shutdown()
+        self.abort_button.shutdown()
         self.runner.shutdown()
 
     def closeEvent(self, event):                                # noqa: N802
