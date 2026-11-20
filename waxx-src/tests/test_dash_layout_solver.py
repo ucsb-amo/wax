@@ -285,3 +285,100 @@ def test_window_auto_arrange_applies_solution(qapp, ini, monkeypatch):
     win._layout_ready = False
     win.hide()
     win.deleteLater()
+
+
+def test_min_pad_keeps_headroom_on_every_minimum():
+    """Two docks whose minimums fill the region exactly: fine without headroom,
+    one goes behind a tab with it."""
+    panels = [ls.PanelInfo("a", min_size=(500, 300), tier="frequent"),
+              ls.PanelInfo("b", min_size=(500, 300), tier="frequent")]
+    tight = ls.solve(panels, 1000 + ls.SEP, 300, max_evals=3000)
+    assert tight.fits and not tight.hidden()
+    padded = ls.solve(panels, 1000 + ls.SEP, 300, max_evals=3000, min_pad=12)
+    assert not (padded.fits and not padded.hidden())
+
+
+def test_auto_arrange_brings_a_grown_window_back_to_the_screen(qapp, ini, monkeypatch):
+    """A placement whose minimum sizes exceed the screen makes Qt grow the
+    window past it.  Auto-arrange solves for the screen, not for the grown
+    window, uses the sizes Qt measures when a body needs more than its hint,
+    and leaves a window that fits and whose minimum size fits."""
+    from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+    from waxx.util.dashboard import dashboard_window as dw
+    from waxx.util.dashboard.panel_container import ClientPanel
+
+    screen = (1000, 700)
+    monkeypatch.setattr(dw.DashboardMainWindow, "_screen_client_limit", lambda self: screen)
+    monkeypatch.setattr(dw.QMessageBox, "warning", lambda *a, **k: None)
+
+    def body(w, h):
+        def make():
+            outer = QWidget()
+            lay = QVBoxLayout(outer)
+            lab = QLabel("x")
+            lab.setMinimumSize(w, h)
+            lay.addWidget(lab)
+            return outer
+        return make
+
+    # six docks in one column, each needing 260 px: far taller than the screen;
+    # the hints understate what the bodies need (200 px)
+    ids = [f"p{i}" for i in range(6)]
+    panels = [dw.PanelPlacement(ClientPanel(pid, pid, body(300, 260)), area="right") for pid in ids]
+    win = dw.DashboardMainWindow("client", "Test dashboard", panels, host_ip="test")
+    win.set_auto_layout_hints({pid: {"tier": "status", "min": (300, 200)} for pid in ids})
+    win.resize(*screen)
+    win.show()
+    _pump(qapp, lambda: win._layout_ready)
+    _pump(qapp, rounds=20)
+    assert win.height() > screen[1]                  # grown by the minimum sizes
+
+    win._auto_arrange_now()
+    _pump(qapp, lambda: win._auto_target is None, rounds=400)
+    _pump(qapp, rounds=20)
+
+    assert win._auto_target is None                  # finished
+    assert (win.width(), win.height()) == screen
+    need = win.minimumSizeHint()
+    assert need.width() <= screen[0] and need.height() <= screen[1]
+    assert not any(win.panel(pid).isHidden() for pid in ids)
+    win._layout_ready = False
+    win.hide()
+    win.deleteLater()
+
+
+def _stack_of(sol, pid):
+    return next(s.members for s in sol.slots if pid in s.members)
+
+
+def test_always_stack_rule_holds_with_room_to_spare():
+    panels = [ls.PanelInfo(p, min_size=(300, 200), tier=t)
+              for p, t in (("a", "frequent"), ("b", "rare"), ("c", "status"), ("d", "status"))]
+    free = ls.solve(panels, 4000, 2000, max_evals=4000)
+    assert not free.hidden()                                   # room for all: nothing stacked
+    sol = ls.solve(panels, 4000, 2000, max_evals=4000, stacks=[ls.StackRule(("b", "a"))])
+    assert _stack_of(sol, "a") == ["b", "a"]                   # the rule's order beats the tiers
+    assert sol.hidden() == [("a", "b")]
+    assert sol.terms["hidden"] == 0 and sol.terms["split"] == 0
+
+
+def test_cramped_stack_rules_are_used_in_order_and_only_when_needed():
+    panels = [ls.PanelInfo(p, min_size=(400, 300), tier="status") for p in "abcd"]
+    rules = [ls.StackRule(("a", "b"), "cramped"), ls.StackRule(("c", "d"), "cramped")]
+    roomy = ls.solve(panels, 4000, 300, max_evals=4000, stacks=rules)
+    assert not roomy.hidden()
+    # room for three docks in a row: the first rule's stack is the one used
+    three = ls.solve(panels, 3 * 400 + 2 * ls.SEP, 300 + ls.TAB_BAR_H, max_evals=6000, stacks=rules)
+    assert three.fits and three.hidden() == [("b", "a")]
+    two = ls.solve(panels, 2 * 400 + ls.SEP, 300 + ls.TAB_BAR_H, max_evals=6000, stacks=rules)
+    assert two.fits and sorted(two.hidden()) == [("b", "a"), ("d", "c")]
+
+
+def test_stack_rules_skip_panels_not_shown_and_reject_bad_tables():
+    panels = [ls.PanelInfo(p, min_size=(300, 200)) for p in "ab"]
+    sol = ls.solve(panels, 2000, 1000, max_evals=2000, stacks=[ls.StackRule(("zz", "b", "a"))])
+    assert _stack_of(sol, "a") == ["b", "a"]
+    assert ls.stacks_from_table([{"stack": ["a", "b"]}, {"stack": ["c", "d"], "when": "cramped"}]) == [
+        ls.StackRule(("a", "b"), "always"), ls.StackRule(("c", "d"), "cramped")]
+    with pytest.raises(ValueError):
+        ls.stacks_from_table([{"stack": ["a", "b"], "when": "sometimes"}])
