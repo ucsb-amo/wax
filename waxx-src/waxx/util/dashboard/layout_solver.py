@@ -32,6 +32,25 @@ one kind share a stack.  A layout whose minimum sizes do not fit the display
 costs more than any layout that fits; among those that do not fit, less
 overflow is cheaper.
 
+The minimum sizes are what Qt will hold the docks to: a layout whose minimums
+add up to more than the region makes Qt grow the window past it, and the
+window then cannot be made smaller.  The sizes the solver is given are partly
+estimates (a body not built yet), so the caller may ask for headroom on every
+dock's minimum (``min_pad``); a layout that fits with the headroom still fits
+when a panel turns out to need a little more.
+
+Stack rules
+-----------
+A :class:`StackRule` names panels that belong in one tab stack, raised panel
+first.  ``when="always"``: they share a stack whenever they are shown, at no
+cost (a layout that splits them pays :data:`STACK_SPLIT`).  ``when="cramped"``:
+a stack to fall back on when room runs out; it costs :data:`STACK_STEP` x its
+position among the cramped rules, so earlier rules are used first, and all of
+them before the solver stacks panels no rule names (which costs the hidden
+panels' tiers).  A stack follows a rule when all its members are in the rule's
+list -- a rule also covers any part of its list -- so a fallback that enlarges
+an earlier stack lists that stack's panels again.
+
 The solver is an iterated local search from several starting layouts: hill
 climbing over single moves (one panel to another slot or to a new slot in any
 area, a whole slot to another area, two slots merged), then a few random
@@ -78,6 +97,10 @@ OVERFLOW_BASE = 1000.0
 #: Window chrome subtracted from a display size to get the dock region:
 #: taskbar, title bar, menu bar, toolbar, status bar (Windows 10, 100 % scale).
 DEFAULT_CHROME = (16, 40 + 31 + 22 + 32 + 24)
+#: Cost of a stack that follows the n-th "cramped" stack rule: n x this.
+STACK_STEP = 0.5
+#: Cost of an "always" stack rule whose panels are not all in one stack.
+STACK_SPLIT = 25.0
 #: Kicks in a row that find nothing better before the search stops.
 ILS_PATIENCE = 150
 
@@ -105,6 +128,14 @@ class PanelInfo:
     @property
     def pref(self) -> tuple[int, int]:
         return (max(self.pref_size[0], self.min_size[0]), max(self.pref_size[1], self.min_size[1]))
+
+
+@dataclass(frozen=True)
+class StackRule:
+    """Panels that belong in one tab stack (see the module docstring)."""
+
+    members: tuple[str, ...]                 # raised panel first
+    when: str = "always"                     # "always" | "cramped"
 
 
 @dataclass
@@ -279,10 +310,12 @@ def _distribute(total: float, mins: Sequence[float], wants: Sequence[float], wei
 
 
 class _Problem:
-    def __init__(self, panels: Sequence[PanelInfo], width: int, height: int):
+    def __init__(self, panels: Sequence[PanelInfo], width: int, height: int, min_pad: int = 0,
+                 stacks: Sequence[StackRule] = ()):
         self.panels = list(panels)
         self.W = int(width)
         self.H = int(height)
+        self.pad = max(0, int(min_pad))
         self.n = len(self.panels)
         self.minw = [p.min_size[0] for p in self.panels]
         self.minh = [p.min_size[1] for p in self.panels]
@@ -296,10 +329,39 @@ class _Problem:
         self.max_evals = 30000
         self.deadline = float("inf")
         self._cache: dict = {}
+        # Stack rules over the panels present: (members, position of each, cost, always).
+        ids = {p.id: i for i, p in enumerate(self.panels)}
+        self.rules: list[tuple[frozenset, dict, float, bool]] = []
+        n_cramped = 0
+        for rule in stacks:
+            order = [ids[m] for m in dict.fromkeys(rule.members) if m in ids]
+            always = rule.when != "cramped"
+            if not always:
+                n_cramped += 1
+            if len(order) > 1:
+                self.rules.append((frozenset(order), {i: k for k, i in enumerate(order)},
+                                   0.0 if always else STACK_STEP * n_cramped, always))
+        self.rules.sort(key=lambda r: r[2])
+        self._rule_cache: dict = {}
+
+    def rule_for(self, members: Iterable[int]):
+        """The cheapest stack rule whose list holds all of *members*, or None."""
+        key = frozenset(members)
+        try:
+            return self._rule_cache[key]
+        except KeyError:
+            rule = next((r for r in self.rules if key <= r[0]), None)
+            self._rule_cache[key] = rule
+            return rule
 
     # A state is a tuple of slots; a slot is (area, members), members sorted
-    # raised first (heaviest, then declaration order).
+    # raised first: in a stack rule's order when the slot follows one, else
+    # heaviest first, then declaration order.
     def norm_slot(self, area: str, members: Iterable[int]) -> tuple:
+        members = tuple(members)
+        rule = self.rule_for(members) if self.rules and len(members) > 1 else None
+        if rule is not None:
+            return (area, tuple(sorted(members, key=rule[1].__getitem__)))
         return (area, tuple(sorted(members, key=lambda i: (-self.wt[i], i))))
 
     def norm(self, slots: Iterable[tuple]) -> tuple:
@@ -317,8 +379,8 @@ class _Problem:
 
         def dims(members):
             r = members[0]
-            mw = max(self.minw[i] for i in members)
-            mh = max(self.minh[i] for i in members)
+            mw = max(self.minw[i] for i in members) + self.pad
+            mh = max(self.minh[i] for i in members) + self.pad
             pw, ph = max(self.prefw[r], mw), max(self.prefh[r], mh)
             if len(members) > 1:
                 mh += TAB_BAR_H
@@ -408,7 +470,7 @@ class _Problem:
     def terms(self, state: tuple) -> dict[str, float]:
         _rects, (ow, oh), sat = self.geometry(state)
         roomy = self._roomy
-        hidden = shortfall = stacks = tidy = 0.0
+        hidden = shortfall = stacks = tidy = grouped = 0.0
         fam_areas: dict[str, set] = {}
         for area, members in state:
             r = members[0]
@@ -416,6 +478,10 @@ class _Problem:
             tidy += COMFORT * self.sw[r] * (1.0 - roomy[r])
             if self.fam[r]:
                 fam_areas.setdefault(self.fam[r], set()).add(area)
+            rule = self.rule_for(members) if self.rules and len(members) > 1 else None
+            if rule is not None:
+                grouped += rule[2]      # a stack that was asked for: no hide cost
+                continue
             for i in members[1:]:
                 hidden += self.wt[i]
             if len(members) > 1:
@@ -424,8 +490,13 @@ class _Problem:
                 stacks += FAMILY_MIX * (len(fams) - 1)
                 stacks += CROWDED_TAB * max(0, len(members) - MAX_EASY_TABS)
         tidy += COHESION * sum(len(a) - 1 for a in fam_areas.values())
+        split = 0.0
+        for rset, _pos, _cost, always in self.rules:
+            if always and sum(1 for _a, members in state if not rset.isdisjoint(members)) > 1:
+                split += STACK_SPLIT
         overflow = (OVERFLOW_BASE + ow + oh) if (ow or oh) else 0.0
-        return {"hidden": hidden, "shortfall": shortfall, "stacks": stacks, "tidy": tidy, "overflow": overflow}
+        return {"hidden": hidden, "shortfall": shortfall, "stacks": stacks, "grouped": grouped,
+                "split": split, "tidy": tidy, "overflow": overflow}
 
     # --- moves ------------------------------------------------------------
 
@@ -541,6 +612,19 @@ class _Problem:
         for members in fam_slots.values():
             slots.append(self.norm_slot(self._pick_area(members[0], ("right", "left")), members))
         out.append(self.norm(slots))
+        # the "always" stack rules in place, the rest on their own
+        if self.rules:
+            slots, seen = [], set()
+            for rset, _pos, _cost, always in self.rules:
+                members = [i for i in rset if i not in seen]
+                if always and len(members) > 1:
+                    seen.update(members)
+                    area = shape_area(self.norm_slot("right", members)[1][0])
+                    if not all(area in self.allowed[i] for i in members):
+                        area = self._pick_area(members[0], ("right",))
+                    slots.append(self.norm_slot(area, members))
+            slots += [self.norm_slot(shape_area(i), (i,)) for i in range(self.n) if i not in seen]
+            out.append(self.norm(slots))
         # random
         for _ in range(4):
             slots = []
@@ -563,6 +647,8 @@ def solve(
     max_evals: int = 30000,
     time_budget_s: float = 10.0,
     seed: int = 0,
+    min_pad: int = 0,
+    stacks: Sequence[StackRule] = (),
 ) -> LayoutSolution:
     """Arrange *panels* in a dock region *width* x *height* px.
 
@@ -570,12 +656,15 @@ def solve(
     (e.g. the dashboard's default placement); the solver also starts from its
     own guesses.  The search stops after *max_evals* distinct layouts (the
     result is then deterministic for a given *seed*) or *time_budget_s*,
-    whichever comes first.
+    whichever comes first.  *min_pad*: headroom (px) kept on every dock's
+    minimum width and height, so a layout that "fits" is not packed to the
+    last pixel of the minimums.  *stacks*: :class:`StackRule` s, in order of
+    preference (a rule skips the panels it names that are not in *panels*).
     """
     if not panels:
         return LayoutSolution(width, height, [], 0.0, {}, (0, 0), {})
     t0 = time.monotonic()
-    prob = _Problem(panels, width, height)
+    prob = _Problem(panels, width, height, min_pad=min_pad, stacks=stacks)
     prob.max_evals = max(1, int(max_evals))
     prob.deadline = t0 + max(0.05, time_budget_s)
     rng = random.Random(seed)
@@ -633,6 +722,17 @@ def panels_from_hints(ids: Iterable[str], hints: dict[str, dict], labels: Option
     return out
 
 
+def stacks_from_table(table: Optional[Iterable[dict]]) -> list[StackRule]:
+    """Build :class:`StackRule` s from ``[{"stack": [ids, raised first], "when": "always" | "cramped"}, ...]``."""
+    out = []
+    for row in table or ():
+        when = str(row.get("when", "always")).lower()
+        if when not in ("always", "cramped"):
+            raise ValueError(f"stack rule {row!r}: 'when' must be 'always' or 'cramped'")
+        out.append(StackRule(tuple(row.get("stack", ())), when))
+    return out
+
+
 def _parse_size(text: str) -> tuple[int, int]:
     w, h = text.lower().replace(" ", "").split("x")
     return int(w), int(h)
@@ -640,19 +740,21 @@ def _parse_size(text: str) -> tuple[int, int]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Preview the dashboard auto-arrange for a display size.")
-    ap.add_argument("--layout-module", required=True, help="module with <KIND>_PLACEMENT and AUTO_LAYOUT_HINTS")
+    ap.add_argument("--layout-module", required=True, help="module with <KIND>_PLACEMENT, AUTO_LAYOUT_HINTS and AUTO_LAYOUT_STACKS")
     ap.add_argument("--kind", default="server", choices=("server", "client"))
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--display", help="display resolution WxH (window chrome is subtracted)")
     g.add_argument("--region", help="dock region WxH (no chrome subtracted)")
     ap.add_argument("--cols", type=int, default=110)
     ap.add_argument("--evals", type=int, default=30000, help="layouts to try")
+    ap.add_argument("--min-pad", type=int, default=0, help="headroom on every dock's minimum size (px)")
     args = ap.parse_args(argv)
     mod = importlib.import_module(args.layout_module)
     ids = list(getattr(mod, f"{args.kind.upper()}_PLACEMENT", {}))
     hints = getattr(mod, "AUTO_LAYOUT_HINTS", {})
     w, h = region_for_display(*_parse_size(args.display)) if args.display else _parse_size(args.region)
-    sol = solve(panels_from_hints(ids, hints), w, h, max_evals=args.evals)
+    stacks = stacks_from_table(getattr(mod, "AUTO_LAYOUT_STACKS", ()))
+    sol = solve(panels_from_hints(ids, hints), w, h, max_evals=args.evals, min_pad=args.min_pad, stacks=stacks)
     print(sol.render_ascii(args.cols))
     print()
     print(sol.report())
@@ -664,6 +766,6 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "AREAS", "TIERS", "PanelInfo", "SolvedSlot", "LayoutSolution",
-    "solve", "region_for_display", "panels_from_hints", "DEFAULT_CHROME",
+    "AREAS", "TIERS", "PanelInfo", "StackRule", "SolvedSlot", "LayoutSolution",
+    "solve", "region_for_display", "panels_from_hints", "stacks_from_table", "DEFAULT_CHROME",
 ]

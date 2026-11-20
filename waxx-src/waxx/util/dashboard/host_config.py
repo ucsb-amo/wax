@@ -156,6 +156,20 @@ def load_auto_layout_hints() -> dict:
     return dict(getattr(mod, "AUTO_LAYOUT_HINTS", {}) or {})
 
 
+def load_auto_layout_stacks() -> list:
+    """Return the layout module's ``AUTO_LAYOUT_STACKS`` (``[{"stack": [panel
+    ids, raised first], "when": "always" | "cramped"}, ...]``, see
+    :mod:`layout_solver`); ``[]`` if none."""
+    if not _LAYOUT_MODULE:
+        return []
+    try:
+        mod = importlib.import_module(_LAYOUT_MODULE)
+    except Exception as exc:
+        _LOG.debug("layout module %s not importable: %r", _LAYOUT_MODULE, exc)
+        return []
+    return list(getattr(mod, "AUTO_LAYOUT_STACKS", ()) or ())
+
+
 __all__ = [
     "configure",
     "resolve_host_ip",
@@ -163,4 +177,5 @@ __all__ = [
     "load_autostart_set",
     "load_layout_overrides",
     "load_auto_layout_hints",
+    "load_auto_layout_stacks",
 ]

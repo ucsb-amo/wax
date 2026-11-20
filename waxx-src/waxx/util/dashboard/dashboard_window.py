@@ -377,7 +377,14 @@ class DashboardMainWindow(QMainWindow):
         self._reapply_state: Optional[QByteArray] = None
         self._press_state: Optional[bytes] = None
         self._auto_hints: dict = {}
+        self._auto_stacks: list = []
         self._auto_report = ""
+        self._auto_summary = ""
+        # An auto-arrange in progress: the window size it solves for, the
+        # solves it may still make, and whether its dock sizes are applied.
+        self._auto_target: Optional[tuple[int, int]] = None
+        self._auto_passes_left = 0
+        self._auto_sized = False
         # Docks shown / hidden / moved: re-decide the central widget's height
         # policy once the burst of signals is over.
         self._center_policy_timer = QTimer(self)
@@ -574,11 +581,29 @@ class DashboardMainWindow(QMainWindow):
     #: Search budget of one auto-arrange (layouts tried, seconds).
     AUTO_ARRANGE_EVALS = 20000
     AUTO_ARRANGE_MAX_S = 3.0
+    #: Headroom (px) the solver keeps on every dock's minimum width and height.
+    #: Qt never lets a dock go below its minimum: a layout packed to the last
+    #: pixel grows the window as soon as one body needs a little more.
+    AUTO_ARRANGE_PAD = 12
+    #: Solves per auto-arrange.  The first uses the size hints for bodies not
+    #: built yet; if Qt then needs more than the target, one more uses what it
+    #: measured.
+    AUTO_ARRANGE_PASSES = 2
 
-    def set_auto_layout_hints(self, hints: Optional[dict]) -> None:
+    def set_auto_layout_hints(self, hints: Optional[dict], stacks: Optional[Iterable[dict]] = None) -> None:
         """Per-panel ``{tier, family, min, pref, areas}`` for Layout -> Auto-arrange
-        (see :mod:`layout_solver`).  Panels without an entry count as "status"."""
+        (see :mod:`layout_solver`).  Panels without an entry count as "status".
+
+        *stacks*: which panels share a tab stack, ``[{"stack": [panel ids,
+        raised first], "when": "always" | "cramped"}, ...]`` in order of
+        preference; a bad table is logged and ignored.
+        """
         self._auto_hints = dict(hints or {})
+        try:
+            self._auto_stacks = layout_solver.stacks_from_table(stacks)
+        except Exception:
+            _LOG.exception("auto-arrange: bad stack rules; none are used")
+            self._auto_stacks = []
 
     def _dock_region_size(self) -> tuple[int, int]:
         """The width x height the dock areas share: the window less its menu
@@ -597,6 +622,44 @@ class DashboardMainWindow(QMainWindow):
         if sb is not None and sb.isVisible():
             h -= sb.height()
         return max(1, w), max(1, h)
+
+    def _screen_client_limit(self) -> tuple[int, int]:
+        """The largest client size this window can have and still be wholly on
+        its screen (the available area less the window frame)."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return _QWIDGETSIZE_MAX, _QWIDGETSIZE_MAX
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        fw = max(0, frame.width() - self.width())
+        fh = max(0, frame.height() - self.height())
+        if self.isMaximized():
+            # a maximized window's borders hang off the screen; only the title bar counts
+            fh, fw = max(0, fh - fw), 0
+        return max(1, avail.width() - fw), max(1, avail.height() - fh)
+
+    def _auto_target_size(self) -> tuple[int, int]:
+        """The window (client) size auto-arrange solves for: this window's,
+        capped to the screen.
+
+        The cap matters: a layout whose minimum sizes exceed the screen has
+        already made Qt grow the window past it, and a layout solved for that
+        grown size could not be shrunk back either.
+        """
+        lw, lh = self._screen_client_limit()
+        return min(self.width(), lw), min(self.height(), lh)
+
+    def _fit_window(self, width: int, height: int) -> bool:
+        """Bring a window grown past (*width*, *height*) back to it; True if it changed."""
+        if self.width() <= width and self.height() <= height:
+            return False
+        if self.isMaximized():
+            # Grown past the screen while maximized: maximize again at the new minimum.
+            self.showNormal()
+            self.showMaximized()
+        else:
+            self.resize(min(self.width(), width), min(self.height(), height))
+        return True
 
     def _auto_panels(self) -> list[layout_solver.PanelInfo]:
         """The panels docked and shown (popped-out and closed ones are left
@@ -648,6 +711,7 @@ class DashboardMainWindow(QMainWindow):
             return layout_solver.solve(
                 panels, width, height, initial=self._declared_slots({p.id for p in panels}),
                 max_evals=self.AUTO_ARRANGE_EVALS, time_budget_s=self.AUTO_ARRANGE_MAX_S,
+                min_pad=self.AUTO_ARRANGE_PAD, stacks=self._auto_stacks,
             )
         finally:
             QApplication.restoreOverrideCursor()
@@ -661,23 +725,62 @@ class DashboardMainWindow(QMainWindow):
             return
         self._auto_arrange_now()
 
-    def _auto_arrange_now(self) -> None:
-        w, h = self._dock_region_size()
+    def _auto_arrange_now(self, passes: Optional[int] = None,
+                          target: Optional[tuple[int, int]] = None) -> None:
+        """Solve for *target* (window client size; default: this window capped
+        to its screen) and apply.  Once the docks are sized and their bodies
+        built, :meth:`_auto_check_fit` compares what Qt needs with the target
+        and, while *passes* are left, solves again with the measured sizes."""
+        passes = self.AUTO_ARRANGE_PASSES if passes is None else passes
+        tw, th = target if target is not None else self._auto_target_size()
+        rw, rh = self._dock_region_size()
+        # the dock region of a window of the target size (same chrome as now)
+        w, h = max(1, tw - (self.width() - rw)), max(1, th - (self.height() - rh))
         sol = self._solve_layout(w, h)
         if sol is None:
+            self._auto_target = None
             return
         self._auto_report = sol.render_ascii(100) + "\n\n" + sol.report()
-        _LOG.info("auto-arrange for %dx%d:\n%s", w, h, self._auto_report)
+        _LOG.info("auto-arrange for %dx%d (window %dx%d, now %dx%d):\n%s",
+                  w, h, tw, th, self.width(), self.height(), self._auto_report)
+        self._auto_target = (tw, th)
+        self._auto_passes_left = max(0, passes - 1) if sol.fits else 0
+        self._auto_summary = sol.summary()
         self._apply_solution(sol)
-        if sol.fits:
-            self.statusBar().showMessage(
-                f"Auto-arranged — {sol.summary()}.  Layout ▸ Save as new layout… keeps it.", 15000)
-        else:
+        if not sol.fits:
             QMessageBox.warning(
                 self, "Auto-arrange",
                 "The shown panels do not fit this window even with every stack used:\n\n"
                 f"{sol.summary()}\n\nClose a panel or pop one out, or use a larger window, "
                 "then auto-arrange again.  (Layout ▸ Auto-arrange ▸ Last report shows the details.)")
+
+    def _auto_check_fit(self) -> None:
+        """After an auto-arrange is on screen with its bodies built: does Qt's
+        minimum size for the window fit the target?  If not (a body needs more
+        than its hint said), solve once more with the measured sizes; then say
+        how it ended, and bring a window that was grown back to the target."""
+        if self._auto_target is None or not self._auto_sized or self._realize_queue:
+            return
+        tw, th = self._auto_target
+        need = self.minimumSizeHint()
+        over = need.width() > tw or need.height() > th
+        if over and self._auto_passes_left > 0:
+            _LOG.info("auto-arrange: Qt needs %dx%d for this layout, the target is %dx%d; "
+                      "solving again with the measured panel sizes", need.width(), need.height(), tw, th)
+            self._auto_arrange_now(passes=self._auto_passes_left, target=(tw, th))
+            return
+        self._auto_target = None
+        if over:
+            _LOG.warning("auto-arrange: the layout needs %dx%d, more than the target %dx%d",
+                         need.width(), need.height(), tw, th)
+            self.statusBar().showMessage(
+                f"Auto-arranged, but the panels need at least {need.width()}x{need.height()} px and the "
+                f"window has {tw}x{th}: close a panel or pop one out, then auto-arrange again.", 20000)
+            return
+        self._applying_until = time.monotonic() + 1.0
+        self._fit_window(tw, th)
+        self.statusBar().showMessage(
+            f"Auto-arranged — {self._auto_summary}.  Layout ▸ Save as new layout… keeps it.", 15000)
 
     def _apply_solution(self, sol: layout_solver.LayoutSolution) -> None:
         """Put a solver layout on screen: re-dock the panels it names, then size the docks."""
@@ -688,6 +791,7 @@ class DashboardMainWindow(QMainWindow):
             for pid, cfg in plan.items() if pid in self._placement_of
         ]
         self._applying_until = time.monotonic() + 1.5
+        self._auto_sized = False
         for pl in placements:
             try:
                 pl.panel.setFloating(False)
@@ -713,9 +817,21 @@ class DashboardMainWindow(QMainWindow):
 
     def _resize_to_solution(self, sol: layout_solver.LayoutSolution) -> None:
         """Every slot's size in one resizeDocks call per orientation (separate
-        calls per area undo each other; checked offscreen, worst slot ~16 px off)."""
+        calls per area undo each other; checked offscreen, worst slot ~16 px off).
+
+        The window is brought back to the target size first: the layout it
+        had may have grown it, and the dock sizes are for the target.
+        """
         self._applying_until = time.monotonic() + 1.0
         self._update_center_policy()
+        if self._auto_target is not None and self._fit_window(*self._auto_target):
+            # let the new window size land, then size the docks in it
+            QTimer.singleShot(50, lambda s=sol: self._size_docks_to_solution(s))
+            return
+        self._size_docks_to_solution(sol)
+
+    def _size_docks_to_solution(self, sol: layout_solver.LayoutSolution) -> None:
+        self._applying_until = time.monotonic() + 1.0
         docks = [self._by_id[s.raised] for s in sol.slots]
         try:
             self.resizeDocks(docks, [max(1, s.content_h) for s in sol.slots], Qt.Orientation.Vertical)
@@ -726,6 +842,9 @@ class DashboardMainWindow(QMainWindow):
         if self._realize_queue:
             self._reapply_state = self.saveState()
         self._mark_layout_dirty()
+        # Checked now, or by _realize_next once the queued bodies exist.
+        self._auto_sized = True
+        QTimer.singleShot(0, self._auto_check_fit)
 
     def _preview_auto_layout(self) -> None:
         """Layout -> Auto-arrange -> Preview for a display size: solve, show, apply nothing."""
@@ -1576,11 +1695,13 @@ class DashboardMainWindow(QMainWindow):
         if not self._realize_queue:
             if self._startup_realization:
                 self._finish_startup_realization()
-            elif self._reapply_state is not None:
-                # A layout applied while these bodies were placeholders.
-                state, self._reapply_state = self._reapply_state, None
-                self._applying_until = time.monotonic() + 1.0
-                self._guarded_restore(None, state)
+            else:
+                if self._reapply_state is not None:
+                    # A layout applied while these bodies were placeholders.
+                    state, self._reapply_state = self._reapply_state, None
+                    self._applying_until = time.monotonic() + 1.0
+                    self._guarded_restore(None, state)
+                self._auto_check_fit()
             return
         panel = self._realize_queue.popleft()
         self._realize_done += 1
