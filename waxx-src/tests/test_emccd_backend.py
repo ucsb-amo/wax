@@ -551,3 +551,72 @@ def test_conforms_to_the_beacon_backend_contract(monkeypatch, tmp_path):
     rep = conformance.check_backend(be, live=LIVE, run=RUN, trigger=fake.trigger)
     assert "run_diagnostics" in rep["optional"]
     assert rep["frame_shape"] == (512, 512) and rep["frame_dtype"] == "uint16"
+
+
+# -- parking: the shutter of an idle camera -------------------------------------------------------
+@pytest.fixture
+def sleeps(monkeypatch):
+    """The backend's waits for the shutter to open (recorded, not slept)."""
+    import beacon.drivers.andor.backend as be_mod
+    out = []
+    monkeypatch.setattr(be_mod.time, "sleep", out.append)
+    return out
+
+
+def test_park_closes_the_shutter_and_a_start_opens_it_before_acquiring(backend, sleeps):
+    import beacon.drivers.andor.backend as be_mod
+    be, fake = backend
+    be.apply(dict(LIVE, shutter="open"), "live")
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "open" and not be.parked
+    assert be.park() is True and be.parked
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "closed"
+    assert be.read_settings()["shutter"] == Readback("closed", "commanded")
+    sleeps.clear()
+    start = len(fake.log)
+    be.start_acquisition("live")
+    names = [n for n, _ in fake.log[start:]]
+    assert names.index("SetShutterEx") < names.index("StartAcquisition")
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "open" and not be.parked
+    # waited for it to open: the fake's 27 ms minimum opening time is under the floor
+    assert sleeps == [be_mod.SHUTTER_OPEN_WAIT_MIN_S] == [be.shutter_open_wait_s()]
+    be.stop_acquisition()
+
+
+def test_a_start_after_park_restores_a_closed_profile_shutter_without_waiting(backend, sleeps):
+    be, fake = backend
+    be.apply(LIVE, "live")                                      # LIVE: shutter "closed"
+    assert be.park() is True
+    sleeps.clear()
+    be.start_acquisition("snap")
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "closed" and sleeps == []
+    be.retrieve(1.0)
+
+
+def test_an_apply_unparks_with_its_own_shutter(backend, sleeps):
+    be, fake = backend
+    be.apply(LIVE, "live")
+    be.park()
+    sleeps.clear()
+    be.apply(RUN, "run")                                        # a run arms: shutter open
+    assert not be.parked and SHUTTER_MODE[fake.hw["shutter"][1]] == "open"
+    assert sleeps == [be.shutter_open_wait_s()]
+    sleeps.clear()
+    be.apply(RUN, "run")                                        # open already: no wait
+    assert sleeps == []
+
+
+def test_no_park_while_acquiring(backend):
+    be, fake = backend
+    be.apply(dict(LIVE, shutter="open"), "live")
+    be.start_acquisition("live")
+    start = len(fake.log)
+    assert be.park() is False and not be.parked
+    assert [n for n, _ in fake.log[start:] if n.startswith("SetShutter")] == []
+    be.stop_acquisition()
+
+
+def test_no_park_without_shutter_control(make_backend):
+    be, fake = make_backend(sdk_kwargs=dict(has_shutter=False))
+    be.apply(LIVE, "live")
+    assert be.park() is False and not be.parked
+    assert fake.calls("SetShutter") == [] and fake.calls("SetShutterEx") == []

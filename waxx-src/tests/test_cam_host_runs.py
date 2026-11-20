@@ -165,6 +165,25 @@ def test_warmup_extra_lengthens_only_the_first_frame_wait(make):
     host.end_run("tok")
 
 
+def test_an_early_arm_starts_the_first_frame_clock_at_ready(make):
+    host, fakes = make()
+    host.begin_run("tok", "cam_b", True, camera_params=basler_params())
+    host.note_run_id("tok", 7)
+    host.defer_first_frame_clock("tok")                       # armed at INIT_RUN
+    host.arm_run("tok", basler_params(), 2).result(5)
+    handle = host.attach_run("tok")
+    handle.first_timeout_s = handle.next_timeout_s = 0.3
+    t, q, out = grab_in_thread(handle, 2)
+    time.sleep(0.6)                                           # the experiment still compiling
+    assert t.is_alive() and out["exc"] is None
+    t_ready = time.monotonic()
+    host.start_first_frame_clock("tok")                       # WAIT_CAM_READY answered
+    t.join(5)
+    assert time.monotonic() - t_ready >= 0.25
+    assert isinstance(out["exc"], TimeoutError) and "got 0/2" in str(out["exc"])
+    host.end_run("tok")
+
+
 def test_a_free_running_camera_is_refused_at_the_arm(make):
     from beacon.camera.worker import ArmError
     from waxx.util.live_od.camera_host import HostNanny

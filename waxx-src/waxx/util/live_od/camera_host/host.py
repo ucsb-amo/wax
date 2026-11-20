@@ -25,7 +25,10 @@ the cameras in ``LiveODConfig.camera_host_claim_on_start``.
     attach_run(token) -> HostCameraHandle                 the camera thread's "camera"
     end_run(token, reason) -> RunSummary                  END_RUN / ABORT_RUN /
         a superseding INIT_RUN: disarm and unlock; the camera stays idle at the
-        run's settings (Q5) -- no stream resumes
+        run's settings (Q5) -- no stream resumes -- and its worker parks it
+        once idle ``PARK_AFTER_S`` (beacon.camera.worker: the Andor's shutter
+        closes; a live stream started later opens it first).  So does a stream
+        stopped because no requester is left.
     operator_release(key)                                 the operator ends a hold
 
 A RESET keeps the lock (T10): the kernel may still be triggering.
@@ -291,6 +294,10 @@ class _Run:
     clamps: dict = field(default_factory=dict)
     sink: Optional[RunSink] = None
     handle: Any = None
+    # the first frame's timeout runs from the experiment's camera-ready answer,
+    # not from the arm, when the arm was started early (at INIT_RUN)
+    first_frame_clock_deferred: bool = False
+    t_ready_mono: Optional[float] = None
     # EM gain above 300 already set back to 300 (a dead experiment, or the end)
     extreme_undone: bool = False
 
@@ -883,6 +890,23 @@ class CameraHost:
         with self._lock:
             run = self._runs.get(token)
             return run.arm_future if run is not None else None
+
+    def defer_first_frame_clock(self, token: str) -> None:
+        """The run's camera is armed ahead of the experiment (at INIT_RUN, during
+        the compile): its camera thread's first-frame timeout does not run until
+        start_first_frame_clock."""
+        with self._lock:
+            run = self._runs.get(token)
+            if run is not None:
+                run.first_frame_clock_deferred = True
+
+    def start_first_frame_clock(self, token: str) -> None:
+        """The experiment was told the camera is ready (WAIT_CAM_READY): from now
+        on it may trigger, and the first frame's timeout runs."""
+        with self._lock:
+            run = self._runs.get(token)
+            if run is not None and run.t_ready_mono is None:
+                run.t_ready_mono = time.monotonic()
 
     def run_armed(self, token: str) -> bool:
         with self._lock:

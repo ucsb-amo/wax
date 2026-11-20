@@ -321,7 +321,7 @@ class LiveODServer(QThread, NetServer):
         self._camera_host = None
         self._host_run_token = ""       # the run whose camera lock the host holds
         self._host_run_start = None     # what begin_run found (profile, persist overrides)
-        self._host_arm_future = None    # started by the run's first WAIT_CAM_READY
+        self._host_arm_future = None    # started at INIT_RUN (or the first WAIT_CAM_READY)
         self._host_camera_params = {}
         self._host_n_img = 0
         # the token of each camera run whose camera thread the window has not yet
@@ -709,8 +709,10 @@ class LiveODServer(QThread, NetServer):
 
     def set_camera_host(self, host):
         """Run cameras through ``host`` (a CameraHost) from now on: INIT_RUN locks
-        the run's camera, the first WAIT_CAM_READY arms it, END_RUN / ABORT_RUN /
-        a superseding INIT_RUN release it, CAMERA_CONTROL goes to the host."""
+        the run's camera and starts its arm (while the experiment compiles; the
+        first WAIT_CAM_READY starts it if that failed to), WAIT_CAM_READY answers
+        once the arm is done, END_RUN / ABORT_RUN / a superseding INIT_RUN release
+        it, CAMERA_CONTROL goes to the host."""
         self._camera_host = host
 
     @property
@@ -833,8 +835,9 @@ class LiveODServer(QThread, NetServer):
             self._spawn_tokens.append(self._run_token)
 
     def _host_start_arm(self):
-        """WAIT_CAM_READY in host mode: the run's first one arms its camera.
-        Returns the error text of an arm that failed, else None."""
+        """Host mode: arm the run's camera, once per run -- at INIT_RUN, or at the
+        first WAIT_CAM_READY if INIT_RUN did not. Returns the error text of an arm
+        that failed, else None."""
         host = self._camera_host
         if host is None or not self._host_run_token:
             return None
@@ -842,6 +845,24 @@ class LiveODServer(QThread, NetServer):
             self._host_arm_future = host.arm_run(self._host_run_token, self._host_camera_params,
                                                  self._host_n_img)
         return self._host_arm_error()
+
+    def _host_arm_early(self):
+        """INIT_RUN in host mode: start the camera's arm now, so it runs while the
+        experiment compiles its kernel instead of after it. Nothing else moves
+        earlier: WAIT_CAM_READY still answers only once the arm is done, so no
+        shot is triggered before the camera is armed; and the camera thread's
+        first-frame timeout starts at that answer (start_first_frame_clock), not
+        at the arm, so the compile does not eat into it. A failure here is left
+        for WAIT_CAM_READY to report (or to retry, if no arm was started)."""
+        host = self._camera_host
+        if host is None or not self._host_run_token:
+            return
+        try:
+            host.defer_first_frame_clock(self._host_run_token)
+            self._host_start_arm()
+        except Exception as exc:
+            logger.warning(f"camera host: the arm at INIT_RUN did not start ({exc}); "
+                           f"WAIT_CAM_READY will start it")
 
     def _host_arm_error(self):
         fut = self._host_arm_future
@@ -1472,6 +1493,8 @@ class LiveODServer(QThread, NetServer):
 
         # host mode: the lock takes the run's name; Persist is announced on its log
         self._host_after_reserve(run_id)
+        if capture_images:
+            self._host_arm_early()
 
         adjust_specs = list(msg.get('adjust_specs', []))
         with self._adjust_lock:
@@ -1876,9 +1899,9 @@ class LiveODServer(QThread, NetServer):
             remaining = deadline - time.time()
             ready = self._cam_ready_event.wait(timeout=max(0.0, remaining))
         else:
-            # host mode: the run's first WAIT_CAM_READY arms its camera; an arm
-            # that failed is reported at once, without timed_out, so the
-            # experiment stops
+            # host mode: the arm started at INIT_RUN (or starts here, if it did
+            # not); wait for it. An arm that failed is reported at once, without
+            # timed_out, so the experiment stops
             arm_error = self._host_start_arm()
             ready = False if arm_error else self._wait_cam_ready_event(deadline)
             if not ready and not arm_error:
@@ -1895,6 +1918,11 @@ class LiveODServer(QThread, NetServer):
         if self._t_ready_mono is None:
             # no shot can trigger the camera before the experiment has this reply
             self._t_ready_mono = time.monotonic()
+            if host is not None and self._host_run_token:
+                try:
+                    host.start_first_frame_clock(self._host_run_token)
+                except Exception as exc:
+                    logger.warning(f"camera host: first-frame clock not started ({exc})")
         reply = {"ok": True, "ready": True, "reset_requested": self._reset_requested}
         overrides = self.camera_overrides_record()
         if overrides:

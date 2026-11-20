@@ -7,6 +7,7 @@ in tmp_path.
 """
 import sys
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -77,6 +78,29 @@ def test_a_run_on_the_emccd_backend(host):
     assert [fake_sdk2.FakeSDK2Lib.decode(img) for img, _, _ in frames] == [(acq_gen, i) for i in range(3)]
     s = host.end_run("tok")
     assert s.delivered == 3 and s.lost_idx == ()
+
+
+def test_the_shutter_closes_after_a_run_and_when_nobody_streams(host):
+    """Parking (beacon.camera.worker): the camera idle -- no run, no live stream --
+    for park_after_s closes the shutter; a live stream opens it again first."""
+    from beacon.camera.worker import PARK_AFTER_S
+    host, fake = host
+    w = host.worker("cam_a")
+    host.begin_run("tok", "cam_a", True, camera_params=andor_params(gain=300))
+    host.arm_run("tok", andor_params(gain=300), 1).result(15)
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "open"
+    host.end_run("tok")
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "open"         # not at once ...
+    wait_for(lambda: SHUTTER_MODE[fake.hw["shutter"][1]] == "closed",
+             timeout=PARK_AFTER_S + 3.0)                         # ... once idle that long
+    assert w.snapshot()["parked"] and w.state == "idle"
+    host.start_stream("cam_a").result(15)
+    assert w.state == "streaming" and SHUTTER_MODE[fake.hw["shutter"][1]] == "open"
+    time.sleep(PARK_AFTER_S + 0.5)
+    assert SHUTTER_MODE[fake.hw["shutter"][1]] == "open"         # streaming: never parked
+    host.stop_stream("cam_a").result(15)
+    wait_for(lambda: SHUTTER_MODE[fake.hw["shutter"][1]] == "closed",
+             timeout=PARK_AFTER_S + 3.0)
 
 
 @pytest.mark.parametrize("how", ["abort", "end", "superseded"])

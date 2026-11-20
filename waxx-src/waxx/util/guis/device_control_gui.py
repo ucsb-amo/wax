@@ -1629,7 +1629,9 @@ class DeviceStateGUI(QMainWindow):
     monitor server's SLM reinit and asks for one now; ``spot_finder_launcher``
     (a callable that starts the lab's SLM spot finder on this PC and returns
     a short description of what it started) adds "Launch spot finder" to its
-    menu.
+    menu.  ``apd_stage=True`` adds the APD stage pill
+    (:mod:`waxx.util.guis.apd_stage_pill`): the PDXC pickoff stage's position,
+    from the PDXC server directly, with Move in / Move out.
 
     The run loops and the queue are the Monitor panel's
     (:mod:`waxx.util.guis.monitor_panel`), in the Server Dashboard.
@@ -1649,12 +1651,15 @@ class DeviceStateGUI(QMainWindow):
                   composite_scenes=None,
                   composite_telemetry=None,
                   composite_connections=None,
-                  spot_finder_launcher=None):
+                  spot_finder_launcher=None,
+                  apd_stage=False):
         super().__init__()
         self.config_data = {}
         self.device_widgets = {}
         self._spot_finder_launcher = spot_finder_launcher
+        self._apd_stage = bool(apd_stage)
         self.slm_pill = None
+        self.apd_stage_pill = None
 
         self.dds_frame_obj = dds_frame
         self.dac_frame_obj = dac_frame
@@ -2036,6 +2041,15 @@ class DeviceStateGUI(QMainWindow):
         self._connections_slot.setContentsMargins(0, 0, 0, 0)
         group.addLayout(self._connections_slot)
         row.addWidget(self.connected_devices)
+        # The APD pickoff stage (PDXC server, asked directly).  Moves are off
+        # while a run uses the machine; None = cannot tell (server unreachable).
+        if self._apd_stage:
+            from waxx.util.guis.apd_stage_pill import ApdStagePill  # noqa: PLC0415
+            self.apd_stage_pill = ApdStagePill(
+                run_text=lambda: (None if self.connection_failed
+                                  or self._monitor_status is None else self._run_text()),
+                record=self._record_line)
+            group.addWidget(self.apd_stage_pill)
         # The SLM's reinit (and the spot finder launcher), beside them.
         from waxx.util.guis.slm_pill import SlmPill  # noqa: PLC0415
         self.slm_pill = SlmPill(can_launch=self._spot_finder_launcher is not None)
@@ -3281,6 +3295,8 @@ class DeviceStateGUI(QMainWindow):
             win.close()
         if self.slm_actions is not None:
             self.slm_actions.shutdown()
+        if self.apd_stage_pill is not None:
+            self.apd_stage_pill.shutdown()
         if self.composite_panel is not None:
             self.composite_panel.shutdown()
         timer = getattr(self, "_telemetry_timer", None)

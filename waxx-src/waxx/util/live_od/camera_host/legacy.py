@@ -8,9 +8,9 @@ host mode its nanny is a ``HostNanny`` for the one run, and its "camera" a
 ``HostCameraHandle`` on that run:
 
 * ``persistent_get_camera`` attaches to the run and waits, in 0.1 s slices and
-  honouring the thread's own stop, for the arm that the server's first
-  WAIT_CAM_READY started; an arm that failed gives a ``DummyCamera``, so the
-  thread ends "camera not ready" as it always has;
+  honouring the thread's own stop, for the arm that the server started at
+  INIT_RUN (or at the first WAIT_CAM_READY); an arm that failed gives a
+  ``DummyCamera``, so the thread ends "camera not ready" as it always has;
 * ``update_params`` applies nothing (the arm applied the whole run profile)
   and reports the camera's clamps for the run's overrides record;
 * ``start_grab`` calls ``on_armed`` once (the acquisition is already running),
@@ -109,7 +109,9 @@ class HostCameraHandle:
     def start_grab(self, N_img, output_queue: Queue = None, check_interrupt_method=None,
                    on_armed=None, first_frame_extra_s=0.):
         """The first frame is waited for ``first_timeout_s + first_frame_extra_s``
-        (the run's warm-up shots, see CameraBaby), each later one ``next_timeout_s``."""
+        (the run's warm-up shots, see CameraBaby), each later one ``next_timeout_s``.
+        For a run armed at INIT_RUN the first wait counts from the experiment's
+        camera-ready answer (CameraHost.start_first_frame_clock), not from here."""
         n = int(N_img)
         extra_s = max(0., float(first_frame_extra_s or 0.))
         run = self._run
@@ -187,6 +189,11 @@ class HostCameraHandle:
                 raise FrameLostError(
                     f"{key}: the acquisition ended with frame(s) {missing} of {n} missing "
                     f"(reported lost by the camera; got {got})", lost=missing)
+            if (got == 0 and getattr(run, "first_frame_clock_deferred", False)
+                    and getattr(run, "t_ready_mono", None) is None):
+                # armed at INIT_RUN, the experiment still compiling: nothing can
+                # trigger yet, so the first frame's timeout has not started
+                deadline = time.monotonic() + timeout
             if time.monotonic() > deadline:
                 parts = (f" ({self.first_timeout_s:.0f} s + {extra_s:.0f} s for warm-up shots)"
                          if got == 0 and extra_s else "")

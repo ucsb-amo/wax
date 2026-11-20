@@ -225,6 +225,24 @@ def test_a_camera_fault_during_the_run_makes_it_incomplete(served, app):
 # INIT_RUN / WAIT_CAM_READY
 # ----------------------------------------------------------------------
 
+def test_init_run_starts_the_arm_and_ready_waits_for_it(served):
+    srv, host, fakes, saver, _ = served
+    host.request("cam_b", "open").result(5)
+    fb = fakes["cam_b"]
+    fb.hang["apply"] = 0.6                                    # a slow arm
+    t0 = time.monotonic()
+    token = srv._handle_init_run(init_msg())["run_token"]
+    assert time.monotonic() - t0 < 0.5                        # INIT_RUN does not wait for it
+    assert srv._host_arm_future is not None                   # but started it
+    baby, handler, statuses = spawn(served, token)
+    r = srv._handle_wait_cam_ready({"run_token": token, "timeout": 0.1})
+    assert r["ready"] is False and r.get("timed_out")         # no "ready" while arming
+    r = wait_ready(srv, token)
+    assert r["ok"] and r["ready"]
+    assert fb.acquisitions[-1] == ("run", 3)
+    assert host._run_of(token).t_ready_mono is not None       # the first-frame clock runs
+
+
 def test_an_arm_that_fails_fails_fast(served):
     srv, host, fakes, saver, _ = served
     fakes.per_key["cam_b"] = {"run_free_runs": True, "cycle_s": 0.005}
