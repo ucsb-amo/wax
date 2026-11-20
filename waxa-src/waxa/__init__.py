@@ -4,6 +4,8 @@
 # BrokenProcessPool errors.  Python 3.7+ module __getattr__ defers these
 # until the name is first accessed.
 
+import sys
+import types
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .atomdata import atomdata
@@ -33,3 +35,21 @@ def __getattr__(name):
         globals()[name] = val
         return val
     raise AttributeError(f"module 'waxa' has no attribute {name!r}")
+
+
+class _Waxa(types.ModuleType):
+    """``atomdata`` is both a submodule and the class this package exposes.
+
+    Importing the submodule (AtomdataVault does) sets ``waxa.atomdata`` to the
+    module, so ``__getattr__`` above never fires and ``from waxa import atomdata``
+    returns the module. Keep the class. ``from waxa.atomdata import x`` is
+    unaffected: it goes through ``sys.modules``.
+    """
+
+    def __setattr__(self, name, value):
+        if name == 'atomdata' and isinstance(value, types.ModuleType):
+            value = value.atomdata
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _Waxa
