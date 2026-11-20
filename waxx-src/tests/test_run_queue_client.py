@@ -149,7 +149,7 @@ def test_every_action_sends_its_request(client, server, expts, monkeypatch):
     assert attempts == 1                                       # a change is never re-sent
     # this PC runs the job (2026-11-15): the file is read here, never by the server
     assert sent == {"type": "run_queue", "action": "submit", "path": str(expts / "rabi.py"),
-                    "argv": ["-a", "x=1"], "label": "r1", "owner": "agent", "priority": 3,
+                    "suppress_live_od": False, "argv": ["-a", "x=1"], "label": "r1", "owner": "agent", "priority": 3,
                     "after": [], "repeat": 1, "write_back": False, "allow_drift": False,
                     "host": socket.gethostname(), "by": "jp@kong",
                     "run_host": socket.gethostname(),

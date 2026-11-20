@@ -426,6 +426,42 @@ def classify(poll: dict | None, fence: dict | None, *, now: float | None = None,
     return st
 
 
+def classify_without_live_od(fence: dict | None, *, now: float | None = None,
+                             monitor_state=None) -> GateState:
+    """The gate's verdict for a run that never talks to liveOD
+    (``suppress_live_od=True``) while liveOD is not reachable: the monitor
+    server's run fence alone.  Every run announces itself there in its claim,
+    suppressed ones too, and keeps the fence until its end state arrives -- so
+    a run in progress (or one whose liveOD went down under it) holds the gate.
+
+    Without liveOD a fence cannot be shown to be left over (``classify`` drops
+    one whose run liveOD saw end): it stands until it lapses as usual
+    (:data:`FENCE_TTL_S` with the monitor READY).  A fence older than that with
+    the monitor not READY is ``unknown`` (blocked: the alarm's clock runs), a
+    younger one ``live``."""
+    now = time.time() if now is None else float(now)
+    if not fence:
+        return GateState("free", None, "liveOD is not reachable, but this job does not use it "
+                         "(suppress_live_od) and no run is announced to the monitor server")
+    since = _num(fence.get("since"))
+    age = None if since is None else now - since
+    ready = _monitor_ready(monitor_state)
+    fid = fence.get("run_id")
+    name = f"run {fid} ({fence.get('expt') or 'experiment'})"
+    if age is not None and age >= FENCE_TTL_S and ready:
+        return GateState("free", fid, f"liveOD is not reachable (this job does not use it); "
+                         f"{name}'s fence on the monitor server is {age:.0f} s old (over "
+                         f"{FENCE_TTL_S:.0f} s, monitor READY) -- not counted")
+    held = "" if age is None else f" {age:.0f} s ago"
+    if age is not None and age >= FENCE_TTL_S:
+        return GateState("unknown", fid,
+                         f"{name} announced itself to the monitor server{held} and liveOD is "
+                         "not reachable to show whether it ended -- a person must look (the "
+                         "fence lifts with its end state)")
+    return GateState("live", fid, f"{name} announced itself to the monitor server{held} "
+                     "(liveOD is not reachable; this job does not use it)")
+
+
 def _by_timing(poll: dict, rid, client: dict, detail: dict) -> GateState:
     """A run in progress whose process is alive or cannot be checked: live or
     wedged, by how long ago it last did something."""

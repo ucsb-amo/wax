@@ -561,6 +561,7 @@ class LauncherBridge:
             job.expt_class = str(info.get("expt_class") or "")
             job.calibrates_declared = [str(k) for k in (info.get("calibrates_declared") or [])]
             job.cold_why = str(info.get("cold_why") or "")
+            job.suppress_live_od = info.get("suppress_live_od") is True
             self.q._record("run_queue_source_from_launcher", job=job.id, sha256=job.sha256,
                            expt_class=job.expt_class, calibrates=job.calibrates_declared,
                            cold_why=job.cold_why)

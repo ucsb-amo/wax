@@ -11,7 +11,9 @@ so ``kq`` can use it without the server's modules.
 * :func:`describe_source` -- the experiment class and the keys of its
   ``self.calibrates('<key>', ...)`` calls.
 * :func:`cold_reason` -- why the job must never warm-launch.
-* :func:`source_info` -- all three as the submit / attach fields.
+* :func:`reads_suppress_live_od` -- the experiment never talks to liveOD
+  (``suppress_live_od=True``): the queue may launch it while liveOD is down.
+* :func:`source_info` -- all of these as the submit / attach fields.
 
 Machine-agnostic: nothing here knows the K machine.
 """
@@ -133,10 +135,51 @@ def cold_reason(path, deny_names=WARM_DENY_NAMES) -> str:
     return ""
 
 
+#: The keyword that turns liveOD off for a run (kexp ``Base.__init__``; the
+#: experiment then never builds a liveOD client and saves nothing).
+SUPPRESS_KEYWORD = "suppress_live_od"
+
+
+def reads_suppress_live_od(path, expt_class: str | None = None) -> bool:
+    """True when the experiment never talks to liveOD, read with :mod:`ast`
+    (never imported): its experiment class (``expt_class``, else the one
+    :func:`describe_source` finds) has a call with ``suppress_live_od=True``
+    in its body, and nothing in the file passes ``suppress_live_od`` any other
+    value (a variable, False, ``**kwargs`` cannot be read here).  False when
+    unsure -- no clear class, the keyword only outside that class (a parent
+    class elsewhere), a file that cannot be read: the queue then treats the
+    job as one that needs liveOD, as before."""
+    import ast  # noqa: PLC0415
+    try:
+        if expt_class is None:
+            expt_class, _ = describe_source(path)
+        if not expt_class:
+            return False
+        tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != SUPPRESS_KEYWORD:
+                    continue
+                if not (isinstance(kw.value, ast.Constant) and kw.value.value is True):
+                    return False               # any other value anywhere: unsure
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == expt_class:
+                found = any(isinstance(sub, ast.Call)
+                            and any(kw.arg == SUPPRESS_KEYWORD for kw in sub.keywords)
+                            for sub in ast.walk(node))
+        return found
+    except Exception:                                 # noqa: BLE001
+        return False
+
+
 def source_info(path, deny_names=WARM_DENY_NAMES) -> dict:
-    """``{"sha256", "expt_class", "calibrates_declared", "cold_why"}`` for the
-    file at ``path`` on this PC (``sha256`` None when it cannot be read): the
-    fields a submit and a launcher's attach carry."""
+    """``{"sha256", "expt_class", "calibrates_declared", "cold_why",
+    "suppress_live_od"}`` for the file at ``path`` on this PC (``sha256`` None when it
+    cannot be read): the fields a submit and a launcher's attach carry."""
     expt_class, calibrates = describe_source(path)
     return {"sha256": sha256_or_none(path), "expt_class": expt_class,
-            "calibrates_declared": list(calibrates), "cold_why": cold_reason(path, deny_names)}
+            "calibrates_declared": list(calibrates), "cold_why": cold_reason(path, deny_names),
+            "suppress_live_od": reads_suppress_live_od(path, expt_class)}

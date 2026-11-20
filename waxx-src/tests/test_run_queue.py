@@ -448,6 +448,77 @@ def test_the_gate_waits_for_someone_elses_run_and_server_busy(q, expts):
     assert job(q, a)["state"] == "running"
 
 
+_SUPPRESSED_SRC = '''from artiq.experiment import EnvExperiment
+class tool(EnvExperiment):
+    def prepare(self):
+        Base.__init__(self, setup_camera=False, suppress_live_od=True)
+'''
+
+
+def test_reads_suppress_live_od_from_source(tmp_path):
+    from waxx.util.device_state.job_source import reads_suppress_live_od, source_info
+    f = tmp_path / "tool.py"
+    f.write_text(_SUPPRESSED_SRC)
+    assert reads_suppress_live_od(f) and source_info(f)["suppress_live_od"] is True
+    # unsure -> False: another value anywhere, a variable, no clear class,
+    # the keyword only outside the experiment class, not set at all
+    for src in (_SUPPRESSED_SRC + "x = f(suppress_live_od=False)\n",
+                _SUPPRESSED_SRC.replace("=True", "=flag"),
+                _SUPPRESSED_SRC + "class other(EnvExperiment): pass\n",
+                "def helper():\n    g(suppress_live_od=True)\n"
+                "class tool(EnvExperiment):\n    def prepare(self): Base.__init__(self)\n",
+                _SUPPRESSED_SRC.replace(", suppress_live_od=True", ""),
+                "this is not python ("):
+        f.write_text(src)
+        assert reads_suppress_live_od(f) is False, src
+    assert reads_suppress_live_od(tmp_path / "missing.py") is False
+
+
+def test_classify_without_live_od_is_the_fence_alone():
+    from waxx.util.device_state.run_gate import FENCE_TTL_S, classify_without_live_od
+    assert classify_without_live_od(None).state == "free"
+    young = {"run_id": 7, "expt": "x", "since": 1000.0}
+    assert classify_without_live_od(young, now=1010.0, monitor_state=2).state == "live"
+    old = 1000.0 + FENCE_TTL_S + 1
+    assert classify_without_live_od(young, now=old, monitor_state=0).state == "free"
+    v = classify_without_live_od(young, now=old, monitor_state=2)
+    assert v.state == "unknown" and v.blocks and not v.waivable
+
+
+def test_liveod_down_launches_only_a_suppress_live_od_job(q, expts):
+    (expts / "tool.py").write_text(_SUPPRESSED_SRC)
+    a = submit(q, expts, "rabi")                       # needs liveOD
+    t = submit(q, expts, "tool", at_end=True)
+    assert job(q, a)["suppress_live_od"] is False and job(q, t)["suppress_live_od"] is True
+    q.live.down = True
+    q.tick()
+    assert q.spawner.calls == [] and "liveOD is not reachable" in q.info()["waiting"]
+    q.cancel({"id": a, "by": "test", "owner": "person"})
+    q.tick()
+    assert job(q, t)["state"] == "running"
+
+
+def test_liveod_down_suppressed_job_waits_on_a_fence_and_never_hands_over(q, expts):
+    (expts / "tool.py").write_text(_SUPPRESSED_SRC)
+    t = submit(q, expts, "tool")
+    a = submit(q, expts, "rabi")
+    q.live.down = True
+    fence = {"run_id": 0, "expt": "direct_tool", "since": q.clock()}
+    q._fence = lambda: fence
+    q.tick()
+    assert q.spawner.calls == [] and "announced itself" in q.info()["waiting"]
+    q._fence = lambda: None
+    q.tick()
+    assert job(q, t)["state"] == "running"
+    proc = q.spawner.procs[-1]
+    proc.write("run complete at 12:00:00 -- without liveOD: nothing was saved")
+    proc.code = 0
+    q.tick()
+    q.tick()
+    assert job(q, t)["state"] == "done", job(q, t)       # ran to its end, nothing saved
+    assert job(q, a)["state"] == "queued" and len(q.spawner.calls) == 1
+
+
 def test_a_foreign_fence_waits_but_the_queues_own_ended_runs_fence_does_not(q, expts):
     submit(q, expts)
     b = submit(q, expts, "tof")
@@ -2242,8 +2313,8 @@ def test_a_pause_or_edit_between_the_gate_and_the_launch_keeps_the_job_queued(q,
     a = submit(q, expts)
     real_gate = q._gate
 
-    def gate_then_change():
-        why = real_gate()                                # liveOD polled outside the lock...
+    def gate_then_change(head=None):
+        why = real_gate(head)                            # liveOD polled outside the lock...
         change(q, a)                                     # ...and a request lands meanwhile
         return why
     q._gate = gate_then_change
@@ -2255,8 +2326,8 @@ def test_a_hold_between_the_gate_and_the_launch_keeps_an_agents_job_queued(q, ex
     a = submit(q, expts, owner="agent")
     real_gate = q._gate
 
-    def gate_then_hold():
-        why = real_gate()
+    def gate_then_hold(head=None):
+        why = real_gate(head)
         q.hold_request({"reason": "mine", "by": "jp"})
         return why
     q._gate = gate_then_hold

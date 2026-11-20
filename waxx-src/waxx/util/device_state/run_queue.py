@@ -398,7 +398,8 @@ def _clock_text(t) -> str:
 # describe_source / cold_reason / file_sha256 live in job_source (import-light:
 # the submitting PC and its launcher compute them; kept importable from here)
 from waxx.util.device_state.job_source import (  # noqa: E402,F401
-    _PRE_GO_METHODS, _read_source, cold_reason, describe_source, file_sha256)
+    _PRE_GO_METHODS, _read_source, cold_reason, describe_source, file_sha256,
+    reads_suppress_live_od)
 
 
 def _since_text(t) -> str:
@@ -547,6 +548,10 @@ class Job:
     cold: bool = False
     #: never warm-launched, from its source at submit (cold_reason): why
     cold_why: str = ""
+    #: its experiment passes ``suppress_live_od=True`` (read from its source
+    #: at submit, job_source.reads_suppress_live_od): it never talks to
+    #: liveOD, so it may launch while liveOD is not reachable (RunQueue._gate)
+    suppress_live_od: bool = False
     #: the warm launch while the job is queued (see the module docstring), or
     #: None; kept on the job once GO was given
     warm: dict | None = None
@@ -795,6 +800,8 @@ class RunQueue:
         self._log_partial: dict[int, str] = {}
         self._tails: dict[int, deque] = {}
         self._last_poll: dict | None = None
+        #: the last gate passed with liveOD unreachable (a suppress_live_od job)
+        self._gate_live_od_down = False
         self._last_poll_t: float | None = None
         self._last_end_t: float | None = None
         self._waiting = ""
@@ -944,7 +951,8 @@ class RunQueue:
         expt_class, calibrates = describe_source(path)
         return self._make_jobs(obj, path=str(path), stem=path.stem, argv=argv, cwd=cwd,
                                sha=sha, expt_class=expt_class, calibrates=calibrates,
-                               cold_why=cold_reason(path, self._warm_deny), run_host="")
+                               cold_why=cold_reason(path, self._warm_deny), run_host="",
+                               suppress_live_od=reads_suppress_live_od(path, expt_class))
 
     #: The fields a submit must carry when the job runs on its own PC (a kq
     #: from before 2026-11-15 sends none of them: refused, never guessed --
@@ -986,11 +994,14 @@ class RunQueue:
         return self._make_jobs(obj, path=text, stem=_stem_text(text), argv=argv, cwd=cwd,
                                sha=sha or "", expt_class=str(obj.get("expt_class") or ""),
                                calibrates=[str(k) for k in calibrates],
-                               cold_why=str(obj.get("cold_why") or ""), run_host=run_host)
+                               cold_why=str(obj.get("cold_why") or ""), run_host=run_host,
+                               # optional: a kq that does not send it -> False
+                               # (the job waits for liveOD, as before)
+                               suppress_live_od=obj.get("suppress_live_od") is True)
 
     def _make_jobs(self, obj: Mapping, *, path: str, stem: str, argv: list, cwd: str, sha: str,
                    expt_class: str, calibrates: list, cold_why: str,
-                   run_host: str) -> tuple[list[Job], bool]:
+                   run_host: str, suppress_live_od: bool = False) -> tuple[list[Job], bool]:
         """The submit's jobs from its checked file fields and its options."""
         owner = str(obj.get("owner") or "person")
         if owner not in OWNERS:
@@ -1047,7 +1058,8 @@ class RunQueue:
                           repeat_of=repeat, submitted_at=now, submitted_by=by,
                           rank=ranks[i], expt_class=expt_class,
                           calibrates_declared=list(calibrates), submitter=submitter,
-                          cold=bool(cold), cold_why=cold_why, run_host=run_host)
+                          cold=bool(cold), cold_why=cold_why, run_host=run_host,
+                          suppress_live_od=bool(suppress_live_od))
                 self._next_id += 1
                 self._jobs[job.id] = job
                 jobs.append(job)
@@ -2303,14 +2315,19 @@ class RunQueue:
             if head.warm is not None:
                 self._go_or_wait(head, self._clock())
                 return
-            why = self._gate()
+            why = self._gate(head)
             if why:
                 if why != self._waiting:
                     log.info("Run queue: %s waits: %s", head.name, why)
                 self._waiting = why
                 return
             self._waiting = ""
+            live_od_down = self._gate_live_od_down
             for job in order:
+                if live_od_down and not job.suppress_live_od:
+                    # the gate passed for a job that does not use liveOD; this
+                    # one does: it waits for the next tick's gate
+                    return
                 if job.warm is not None:
                     # its warm process decides (never a second, cold one)
                     self._go_or_wait(job, self._clock())
@@ -2336,14 +2353,20 @@ class RunQueue:
         return (isinstance(fid, int) and not isinstance(fid, bool) and fid > 0
                 and fid == last)
 
-    def _gate(self) -> str:
-        """Why the next job may not launch now ("" when it may).  Sets
+    def _gate(self, job: Job | None = None) -> str:
+        """Why the next job (``job``) may not launch now ("" when it may).  Sets
         ``_gate_kind``: "free", "live" (someone's run is legitimately using
         the machine: a run in progress or announced, a loop finishing its run
         after a stop) or "blocked" (anything else -- wedged, an Abort pending,
         liveOD unreachable or unknown, the server busy, a loop that does not
-        stop): only "blocked" runs the alarm's clock."""
+        stop): only "blocked" runs the alarm's clock.  liveOD unreachable
+        blocks every job except one whose experiment suppresses liveOD
+        (``job.suppress_live_od``): that one is judged on the run fence alone
+        (:func:`run_gate.classify_without_live_od`); ``_gate_live_od_down`` says
+        which, so a skip at launch never hands the machine to a job that needs
+        liveOD."""
         self._gate_kind = "blocked"
+        self._gate_live_od_down = False
         if self._stop_launching:
             return self._stop_launching
         if self._clock() < self._launch_blocked_until:
@@ -2357,7 +2380,7 @@ class RunQueue:
             # a monitor that is still starting: stopped for the job, but only
             # once nothing else holds the launch back (never stopped for a job
             # that could not go anyway)
-            why = self._gate_after_server()
+            why = self._gate_after_server(job)
             if why:
                 return why
             try:
@@ -2368,7 +2391,7 @@ class RunQueue:
             self._owe_monitor = True             # back when the queue runs out, whatever happens
             self._gate_kind = "live"
             return busy + ": it is being stopped for the next job"
-        return self._gate_after_server()
+        return self._gate_after_server(job)
 
     def _monitor_cuttable(self) -> bool:
         if self._cut_monitor_start is None:
@@ -2379,7 +2402,7 @@ class RunQueue:
             log.exception("Run queue: the monitor-start check failed")
             return False
 
-    def _gate_after_server(self) -> str:
+    def _gate_after_server(self, job: Job | None = None) -> str:
         """The rest of :meth:`_gate`, after the server's own business."""
         if self.launchers is not None:
             if self.launchers.in_grace():
@@ -2403,12 +2426,22 @@ class RunQueue:
                         "job waits behind it")
             return f"{loop.spec.title} is running and has not been asked to stop"
         poll = self._poll_now()
-        if poll is None:
+        if poll is None and not (job is not None and job.suppress_live_od):
             return "liveOD is not reachable -- a run could not save"
         fence = self._fence() if self._fence is not None else None
         if fence and self._own_ended_fence(fence):
             fence = None                  # the fence of the queue's own job that just ended
         monitor = self._monitor_state() if self._monitor_state is not None else None
+        if poll is None:
+            # a suppress_live_od job: the fence alone (never waivable)
+            self._gate_live_od_down = True
+            verdict = run_gate.classify_without_live_od(fence, monitor_state=monitor)
+            if verdict.state == "free":
+                self._gate_kind = "free"
+                return ""
+            if verdict.state == "live":
+                self._gate_kind = "live"
+            return verdict.reason
         verdict = run_gate.classify(poll, fence, monitor_state=monitor)
         if verdict.state == "free":
             self._gate_kind = "free"
@@ -3022,7 +3055,7 @@ class RunQueue:
             self._gate_kind = "live"
             self._set_waiting(f"#{job.id} is {_warm_text(w, now)}: GO once it is ready", job)
             return
-        why = self._gate()
+        why = self._gate(job)
         if why:
             self._set_waiting(why, job)
             return

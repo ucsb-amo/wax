@@ -950,7 +950,7 @@ def test_run_again_resubmits_the_same_file_as_a_person(panel, server, tmp_path):
                    "owner": "person", "by": "jp@test", "allow_drift": False,
                    "run_host": host, "again_of": 5, "host": host, "write_back": False,
                    "sha256": local_sha256(str(path)), "expt_class": "",
-                   "calibrates_declared": [], "cold_why": "",
+                   "calibrates_declared": [], "cold_why": "", "suppress_live_od": False,
                    "client_host": host, "client_sha256": local_sha256(str(path))}
     assert "queued as job 11" in panel.message.text()
     # next: insert at 0; a changed file is said so; the new job's launcher is
