@@ -93,7 +93,8 @@ def mixOD_grid(ad,
                 xvar1unit='',
                 max_od=0.,
                 figsize=[],
-                aspect='auto'):
+                aspect='auto',
+                lines=False):
 
     # Assuming you have already loaded your 'ad' object
     if not xvar0format:
@@ -138,6 +139,13 @@ def mixOD_grid(ad,
         plt.figure(figsize=(10, 8))
     plt.imshow(full_image,vmin=0.,vmax=max_od)
     plt.title(f"Run ID: {ad.run_info.run_id} (max_od = {max_od:.3g})")
+
+    # Separator lines between grid cells, if requested
+    if lines:
+        for pos in np.arange(px, grid_rows * px, px) - 0.5:
+            plt.axhline(pos, color='white', linewidth=1)
+        for pos in np.arange(py, grid_cols * py, py) - 0.5:
+            plt.axvline(pos, color='white', linewidth=1)
 
     xv0str = ''
     xv1str = ''

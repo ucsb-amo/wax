@@ -17,7 +17,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QDialog, QVBoxLayout, QHBoxLayout,
         QWidget, QLabel, QComboBox, QSizePolicy, QFrame, QPushButton,
-        QMessageBox, QSlider,
+        QMessageBox, QSlider, QToolButton, QMenu,
     )
     from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence, QFont, QIcon
     from PyQt6.QtCore import Qt, QRect, QPoint, QTimer, QCoreApplication, QThread
@@ -888,6 +888,7 @@ class _RoiImageWidget(QWidget):
 
     def resizeEvent(self, event):
         self._dialog.on_canvas_resized()
+        self._dialog.place_image_select()
         self.update()
 
 
@@ -1193,6 +1194,60 @@ class _RoiSelectorDialog(QDialog):
         layout.addWidget(self.image_widget)
 
         self.image_widget.setStyleSheet("border: 1px solid #2f3447; border-radius: 8px;")
+        self._build_image_select()
+
+    def _build_image_select(self):
+        """Which image the canvas shows, bottom right over it -- the liveOD
+        viewer's selector: a button that drops down a checkable list."""
+        self.image_select = QToolButton(self.image_widget)
+        self.image_select.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.image_select.setFocusPolicy(Qt.FocusPolicy.NoFocus)    # keep the arrows for the canvas
+        self.image_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip = "The image shown here: OD or PWA (atoms + light). The ROI is the same box on either."
+        if 'PWA' not in self.creator.display_kinds_available:
+            tip += " PWA needs the raw frames, which were not passed in with these ODs."
+        self.image_select.setToolTip(tip)
+        self.image_select.setStyleSheet(
+            "QToolButton { background-color: rgba(0, 0, 0, 170); color: #ffffff; "
+            "font-weight: bold; font-size: 10pt; padding: 3px 8px; border: none; "
+            "border-radius: 4px; } QToolButton::menu-indicator { image: none; width: 0px; }")
+        menu = QMenu(self.image_select)
+        self._display_kind_actions = {}
+        for name, desc in DISPLAY_IMAGES:
+            action = menu.addAction(f"{name} — {desc}")
+            action.setCheckable(True)
+            action.setChecked(name == self.creator.display_kind)
+            action.setEnabled(name in self.creator.display_kinds_available)
+            action.triggered.connect(lambda _checked, n=name: self._set_display_kind(n))
+            self._display_kind_actions[name] = action
+        self.image_select.setMenu(menu)
+        self.image_select.setText("PWA ▾")     # sized once for the widest name
+        self.image_select.setFixedWidth(self.image_select.sizeHint().width())
+        self.image_select.setText(f"{self.creator.display_kind} ▾")
+        self.place_image_select()
+
+    def place_image_select(self):
+        button = getattr(self, 'image_select', None)
+        if button is None:
+            return
+        margin = 6
+        button.adjustSize()
+        button.move(self.image_widget.width() - button.width() - margin,
+                    self.image_widget.height() - button.height() - margin)
+        button.raise_()
+
+    def _set_display_kind(self, kind):
+        """Show the OD or the PWA frame. Display only: the ROI, zoom and shot
+        index carry over; the brightness starts fresh, since the two have
+        nothing in common in scale."""
+        for name, action in self._display_kind_actions.items():
+            action.setChecked(name == kind)
+        if kind != self.creator.display_kind:
+            self.creator.set_display_kind(kind)
+            self.image_select.setText(f"{kind} ▾")
+            self.creator.cmap_juice_factor = 1.0
+            self._change_image()
+        self._focus_image_canvas()
 
     def _make_toolbar_button(self, text, callback, accent=False, mini=False):
         btn = QPushButton(text)
@@ -1238,6 +1293,7 @@ class _RoiSelectorDialog(QDialog):
             "<div style='margin:0 0 0.2em 0;'>MMB release: Zoom in to selected region</div>"
             "<div style='margin:0 0 0.2em 0;'>RMB: Zoom out if zoomed, otherwise clear ROI</div>"
             "<div style='margin:0 0 0.2em 0;'>Mouse wheel: Zoom out to full scale</div>"
+            "<div style='margin:0 0 0.2em 0;'>Bottom-right button: Show the OD or the PWA (atoms + light)</div>"
             "</td>"
             "<td style='vertical-align:top;padding-left:18px;'>"
             "<div style='margin:0 0 8px 0;'><b>Keyboard Controls</b></div>"
@@ -1711,8 +1767,11 @@ class _RoiSelectorDialog(QDialog):
     # ── Toolbar button actions ────────────────────────────────────────────
 
     def _adjust_colormap(self, make_brighter):
-        step = 0.001 if self.creator.analysis_type == img_types.DISPERSIVE else 0.2
-        max_joos = 0.0005 if self.creator.analysis_type == img_types.DISPERSIVE else 0.05
+        # The fine steps are for a dispersive OD; its atom frame is ordinary counts.
+        fine = (self.creator.analysis_type == img_types.DISPERSIVE
+                and self.creator.display_kind == 'OD')
+        step = 0.001 if fine else 0.2
+        max_joos = 0.0005 if fine else 0.05
         if make_brighter:
             self.creator.cmap_juice_factor = max(
                 self.creator.cmap_juice_factor - step, max_joos
@@ -1789,7 +1848,7 @@ class _RoiSelectorDialog(QDialog):
     # ── Image switching ───────────────────────────────────────────────────
 
     def _change_image(self):
-        self.original_image = self.creator.get_od(self.img_index)
+        self.original_image = self.creator.get_frame(self.img_index)
         self.display_image = self.creator._extract_display_image(
             self.original_image, self.zoom_region
         )
@@ -1841,6 +1900,10 @@ class _RoiSelectorDialog(QDialog):
 # what a single worker can stay in front of at key-repeat speed.
 _OD_CACHE_SIZE = 12
 _OD_PREFETCH_OFFSETS = (1, 2, 3, -1)
+# What the canvas can show, chosen in its bottom-right corner as in the liveOD
+# viewer: (name, tooltip). Display only -- the ROI is the same box either way.
+DISPLAY_IMAGES = (("OD", "optical density"),
+                  ("PWA", "atoms + light frame"))
 
 
 class roi_creator():
@@ -1902,7 +1965,17 @@ class roi_creator():
             except Exception:
                 self.analysis_type = img_types.ABSORPTION
 
-        self.image = self.get_od(0)
+        # What the canvas shows: the OD, or the raw atoms + light frame (PWA).
+        # The PWA needs the raw stack; precomputed ODs come without one (and
+        # may be repeat-averaged, so they would not line up with raw frames).
+        self.display_kinds_available = (
+            ('OD', 'PWA') if self.images is not None else ('OD',))
+        # A dispersive OD is a weak signal on a large background; the atom
+        # frame is easier to frame the cloud on.
+        self.display_kind = (
+            'PWA' if (self.analysis_type == img_types.DISPERSIVE
+                      and 'PWA' in self.display_kinds_available) else 'OD')
+        self.image = self.get_frame(0)
 
         self.drawing = False
         self.start_x, self.start_y = -1, -1
@@ -2032,62 +2105,86 @@ class roi_creator():
                 normalized_image = np.clip(scaled, 0, 255).astype(np.uint8)
         return cv2.applyColorMap(normalized_image, cv2.COLORMAP_VIRIDIS)
 
+    def set_display_kind(self, kind):
+        """Shows ``kind`` ('OD' or 'PWA') from now on. Display only."""
+        if kind not in self.display_kinds_available:
+            raise ValueError(f"cannot show {kind!r}: one of "
+                             f"{list(self.display_kinds_available)}")
+        self.display_kind = kind
+
     def get_od(self, idx):
-        """Returns the idx'th OD for display in the ROI selection GUI.
+        """Returns the idx'th OD, whatever the canvas is showing."""
+        return self.get_frame(idx, 'OD')
+
+    def get_frame(self, idx, kind=None):
+        """Returns the idx'th image for display in the ROI selection GUI.
 
         Args:
-            idx (int): the index of the OD to display
+            idx (int): the shot index.
+            kind (str or None): 'OD' or 'PWA' (the raw atoms + light frame);
+                None for the one the canvas is showing (display_kind).
 
         Returns:
-            np.ndarray: the OD to display.
+            np.ndarray: the image to display.
         """
+        if kind is None:
+            kind = self.display_kind
         if self._score_map is not None and idx == self.N_img:
             # One frame past the last shot: the auto-detection score map, so the
             # suggestion is inspectable rather than magic.
             return self._score_map
-        if self._precomputed_ods is not None:
+        if kind == 'OD' and self._precomputed_ods is not None:
             # Already decoded by the caller; indexing is free, so no cache.
             return self._precomputed_ods[idx]
 
+        key = (kind, idx)
         with self._od_lock:
-            od = self._od_cache.get(idx)
-            future = self._od_pending.get(idx)
-        if od is not None:
-            return od
+            frame = self._od_cache.get(key)
+            future = self._od_pending.get(key)
+        if frame is not None:
+            return frame
         if future is not None:
             # The worker is on it (or has just finished): waiting on it is
             # never slower than decoding the same frame again here.
             try:
-                od = future.result()
+                frame = future.result()
             except Exception:
-                od = None
-        if od is None:
-            od = self._compute_od(idx)
-            self._remember_od(idx, od)
-        return od
+                frame = None
+        if frame is None:
+            frame = self._compute_frame(idx, kind)
+            self._remember_frame(key, frame)
+        return frame
 
-    def _compute_od(self, idx):
-        """Decodes frame `idx` from the raw image stack. Pure; no cache."""
+    def _compute_frame(self, idx, kind):
+        """Reads (PWA) or decodes (OD) frame `idx` from the raw image stack.
+        Pure; no cache."""
         pwa = self.images[3 * idx]
+        if kind == 'PWA':
+            # float32 for display: cv2's area resize takes no int32 frames.
+            return np.asarray(pwa, dtype=np.float32)
         pwoa = self.images[3 * idx + 1]
         dark = self.images[3 * idx + 2]
         return compute_OD(pwa, pwoa, dark, self.analysis_type)
 
-    def _remember_od(self, idx, od):
+    def _compute_od(self, idx):
+        """Decodes OD `idx` from the raw image stack. Pure; no cache."""
+        return self._compute_frame(idx, 'OD')
+
+    def _remember_frame(self, key, frame):
         with self._od_lock:
-            self._od_cache.pop(idx, None)
-            self._od_cache[idx] = od
+            self._od_cache.pop(key, None)
+            self._od_cache[key] = frame
             while len(self._od_cache) > _OD_CACHE_SIZE:
                 self._od_cache.pop(next(iter(self._od_cache)))
 
-    def _prefetch_one(self, idx):
+    def _prefetch_one(self, key):
         try:
-            od = self._compute_od(idx)
-            self._remember_od(idx, od)
-            return od
+            frame = self._compute_frame(key[1], key[0])
+            self._remember_frame(key, frame)
+            return frame
         finally:
             with self._od_lock:
-                self._od_pending.pop(idx, None)
+                self._od_pending.pop(key, None)
 
     def prefetch_ods(self, idx, direction=1):
         """Queues the frames the user is scrolling towards on the worker.
@@ -2100,26 +2197,29 @@ class roi_creator():
         user has already passed. A no-op when the ODs were handed in
         precomputed, since there is then nothing to decode.
         """
-        if self._precomputed_ods is not None or self.N_img <= 1:
+        kind = self.display_kind
+        if self.images is None or self.N_img <= 1:
+            return
+        if kind == 'OD' and self._precomputed_ods is not None:
             return
         wanted = []
         for offset in _OD_PREFETCH_OFFSETS:
             j = (idx + direction * offset) % self.N_display
-            if j < self.N_img and j != idx and j not in wanted:
-                wanted.append(j)
+            if j < self.N_img and j != idx and (kind, j) not in wanted:
+                wanted.append((kind, j))
         with self._od_lock:
             if self._od_pool is None:
                 self._od_pool = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="waxa-roi-od")
-            for j, future in list(self._od_pending.items()):
-                if j not in wanted and future.cancel():
-                    self._od_pending.pop(j, None)
-            for j in wanted:
-                if j in self._od_cache or j in self._od_pending:
+            for key, future in list(self._od_pending.items()):
+                if key not in wanted and future.cancel():
+                    self._od_pending.pop(key, None)
+            for key in wanted:
+                if key in self._od_cache or key in self._od_pending:
                     continue
                 # Registered under the lock, so the worker's own pop in
                 # _prefetch_one cannot run before the entry exists.
-                self._od_pending[j] = self._od_pool.submit(self._prefetch_one, j)
+                self._od_pending[key] = self._od_pool.submit(self._prefetch_one, key)
 
     def close(self):
         """Stops the prefetch worker and closes the h5 file, in that order.
