@@ -1,3 +1,4 @@
 [console_scripts]
 kcal = waxx.calibration.cli:main
+kdash = waxx.util.dashboard.kdash:main
 kq = waxx.util.device_state.kq:main

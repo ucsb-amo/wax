@@ -2118,7 +2118,7 @@ class atomdata_base():
         ad_out._analysis_tags.repeats_reassigned = self._analysis_tags.repeats_reassigned
 
     def _reduce_repeat_ndarray(self, arr: np.ndarray, xvar_idx: int, n_repeats: int, reducer: str):
-        arr = np.asarray(arr)
+        arr = self._group_repeats(np.asarray(arr), xvar_idx, n_repeats)
         split_shape = (*arr.shape[0:xvar_idx], -1, n_repeats, *arr.shape[(xvar_idx+1):])
         reshaped = arr.reshape(split_shape)
         if reducer == 'mean':
@@ -2186,6 +2186,7 @@ class atomdata_base():
             idx[xvar_idx] = slice(0, None, n_repeats)
             mean_val = arr[tuple(idx)]
             return mean_val, np.broadcast_to(np.zeros((), dtype=np.float64), mean_val.shape)
+        arr = self._group_repeats(arr, xvar_idx, n_repeats)
         split_shape = (*arr.shape[0:xvar_idx], -1, n_repeats, *arr.shape[(xvar_idx+1):])
         reshaped = arr.reshape(split_shape)
         mean_val = np.mean(reshaped, axis=xvar_idx+1, dtype=np.float64)
@@ -2333,7 +2334,13 @@ class atomdata_base():
         try:
             xvar_idx, n_repeats = self._get_repeat_axis_info()
             _ = self._get_unique_repeated_xvar(xvar_idx, n_repeats)
-        except Exception:
+        except Exception as e:
+            if any(np.unique(np.asarray(x)).size < np.size(x) for x in self.xvars):
+                warnings.warn(
+                    f"Repeated xvar values found but not averaged ({e}): ad.avg is "
+                    f"the shots unaveraged and ad.std / ad.sem are zero.",
+                    stacklevel=2,
+                )
             self.avg = _RepeatPassthroughAtomdataProxy(self)
             zero_proxy = _RepeatZeroAtomdataProxy(self)
             self.std = zero_proxy
@@ -2366,15 +2373,45 @@ class atomdata_base():
             raise ValueError(f'Found repeated values on multiple xvar axes: {repeat_axes}.')
         return repeat_axes[0], repeat_counts[0]
 
-    def _get_unique_repeated_xvar(self, xvar_idx, n_repeats):
+    def _repeat_group_order(self, xvar_idx, n_repeats):
+        """The shot order along `xvar_idx` that puts each value's repeats next
+        to each other, or None when they already are.
+
+        They are for N_repeats (np.repeat) and for every shuffle=True run (the
+        values are sorted before the shuffle). They are not when the xvar itself
+        interleaves its repeats, e.g. np.tile(values, N) with shuffle=False
+        (#209). Groups come in order of first appearance, and the shots within
+        a group in the order they were taken.
+        """
         values = np.asarray(self.xvars[xvar_idx])
         if values.size % n_repeats != 0:
             raise ValueError('Repeated xvar length must be divisible by the repeat count.')
         reshaped = values.reshape(-1, n_repeats)
-        unique_values = reshaped[:, 0]
-        if not np.all(reshaped == unique_values[:, None]):
-            raise ValueError('Repeated xvar values must be grouped consecutively to reassign repeats.')
-        return unique_values
+        if np.all(reshaped == reshaped[:, :1]):
+            return None
+        _, first, inverse, counts = np.unique(values, return_index=True,
+                                              return_inverse=True, return_counts=True)
+        if not np.all(counts == n_repeats):
+            raise ValueError('Number of repeats per value of an xvar must be the same for all values.')
+        rank_by_first_shot = np.argsort(np.argsort(first))
+        return np.argsort(rank_by_first_shot[np.ravel(inverse)], kind='stable')
+
+    def _group_repeats(self, arr, xvar_idx, n_repeats):
+        """arr with its repeats along `xvar_idx` made consecutive (see
+        _repeat_group_order); arr itself when they already are."""
+        order = self._repeat_group_order(xvar_idx, n_repeats)
+        if order is None:
+            return arr
+        return np.take(arr, order, axis=xvar_idx)
+
+    def _get_unique_repeated_xvar(self, xvar_idx, n_repeats, require_consecutive=False):
+        values = np.asarray(self.xvars[xvar_idx])
+        order = self._repeat_group_order(xvar_idx, n_repeats)
+        if order is not None:
+            if require_consecutive:
+                raise ValueError('Repeated xvar values must be grouped consecutively to reassign repeats.')
+            values = values[order]
+        return values.reshape(-1, n_repeats)[:, 0]
 
     def _resolve_repeat_axis(self, xvar_idx=None):
         """Resolves the axis over which repeats should be reduced.
@@ -2558,6 +2595,9 @@ class atomdata_base():
         source_xvar_idx, n_repeats = self._get_repeat_axis_info()
         if source_xvar_idx == xvar_idx:
             return
+        # before anything is reshaped: interleaved repeats would be regrouped wrongly
+        unique_source_values = self._get_unique_repeated_xvar(
+            source_xvar_idx, n_repeats, require_consecutive=True)
 
         old_xvardims = np.array(self.xvardims, dtype=int)
         if getattr(self, '_has_images', True):
@@ -2602,7 +2642,7 @@ class atomdata_base():
                                 old_xvardims
                             )
 
-        self.xvars[source_xvar_idx] = self._get_unique_repeated_xvar(source_xvar_idx, n_repeats)
+        self.xvars[source_xvar_idx] = unique_source_values
         self.xvars[xvar_idx] = np.repeat(np.asarray(self.xvars[xvar_idx]), n_repeats)
         self.xvardims = np.array([len(x) for x in self.xvars], dtype=int)
         self.Nvars = len(self.xvars)

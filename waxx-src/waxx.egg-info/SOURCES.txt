@@ -6,12 +6,14 @@ tests/conftest.py
 tests/fake_connection_driver.py
 tests/live_od_data_fakes.py
 tests/liveod_qt_helpers.py
+tests/remote_close_child.py
 tests/scan_loop_harness.py
 tests/test_abort_state.py
 tests/test_ad9910_fast_init.py
 tests/test_adjust_panel.py
 tests/test_adjust_resolve.py
 tests/test_als_server_com.py
+tests/test_apd_stage_pill.py
 tests/test_awg_agent_driver.py
 tests/test_bristol_average.py
 tests/test_bristol_csv_log.py
@@ -35,6 +37,7 @@ tests/test_cam_host_network.py
 tests/test_cam_host_runs.py
 tests/test_cam_host_takeover.py
 tests/test_cam_host_window.py
+tests/test_camera_server_du897.py
 tests/test_camera_stream_client.py
 tests/test_camera_stream_connect_later.py
 tests/test_camera_stream_operator_override.py
@@ -52,6 +55,7 @@ tests/test_dash_layouts.py
 tests/test_dash_overview_rows.py
 tests/test_dash_panel_drag.py
 tests/test_dashboard_com_pill.py
+tests/test_dashboard_remote_close.py
 tests/test_device_control_gui.py
 tests/test_device_lock.py
 tests/test_emccd_backend.py
@@ -74,6 +78,7 @@ tests/test_intensity_pid_server.py
 tests/test_kq.py
 tests/test_launcher_bridge.py
 tests/test_link_latch.py
+tests/test_live_od_abort.py
 tests/test_live_od_camera_release.py
 tests/test_live_od_config.py
 tests/test_live_od_data.py
@@ -81,6 +86,7 @@ tests/test_live_od_gui.py
 tests/test_live_od_run_log.py
 tests/test_liveod_abort_reply.py
 tests/test_liveod_client_identity.py
+tests/test_liveod_dead_client_em_gain.py
 tests/test_liveod_lrs_backlog.py
 tests/test_liveod_push_roundtrip.py
 tests/test_liveod_put_data.py
@@ -292,6 +298,7 @@ waxx/util/dashboard/embed_helpers.py
 waxx/util/dashboard/exit_codes.py
 waxx/util/dashboard/generic_status_panel.py
 waxx/util/dashboard/host_config.py
+waxx/util/dashboard/kdash.py
 waxx/util/dashboard/layout_picker.py
 waxx/util/dashboard/layout_solver.py
 waxx/util/dashboard/layout_store.py
@@ -303,6 +310,7 @@ waxx/util/dashboard/panel_header.py
 waxx/util/dashboard/panel_spec.py
 waxx/util/dashboard/panel_window.py
 waxx/util/dashboard/placeholder_body.py
+waxx/util/dashboard/remote_control.py
 waxx/util/dashboard/restyle.py
 waxx/util/dashboard/running_servers_panel.py
 waxx/util/dashboard/serial_helper.py
@@ -342,10 +350,12 @@ waxx/util/device_state/state_file_io.py
 waxx/util/device_state/state_reset.py
 waxx/util/device_state/telemetry.py
 waxx/util/device_state/update_state_file.py
+waxx/util/guis/apd_stage_pill.py
 waxx/util/guis/card_layout.py
 waxx/util/guis/composite_panel.py
 waxx/util/guis/device_control_gui.py
 waxx/util/guis/device_summary.py
+waxx/util/guis/live_od_abort.py
 waxx/util/guis/live_od_launch.py
 waxx/util/guis/monitor_panel.py
 waxx/util/guis/monitor_server_gui.py
@@ -390,6 +400,8 @@ waxx/util/guis/keysight/keysight_client_gui.py
 waxx/util/guis/keysight/keysight_server.py
 waxx/util/guis/pdxc/__init__.py
 waxx/util/guis/pdxc/pdxc_client_gui.py
+waxx/util/guis/powermeter/__init__.py
+waxx/util/guis/powermeter/powermeter_panel.py
 waxx/util/guis/precilaser/__init__.py
 waxx/util/guis/precilaser/precilaser_control_gui.py
 waxx/util/guis/precilaser/precilaser_controller.py
