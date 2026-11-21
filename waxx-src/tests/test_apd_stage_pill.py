@@ -3,7 +3,7 @@ PDXC server's snapshot, when it allows a move, and that a move calls
 ``move_to`` (with ``force`` when the server already has it there).
 
 Offscreen Qt and a fake PDXC client: nothing reaches the network (this
-machine may run the real PDXC server), and the confirmation is stubbed.
+machine may run the real PDXC server).  A move asks no confirmation.
 """
 import os
 import time
@@ -56,7 +56,6 @@ def _pill(qapp, client, run_text=None, lines=None):
     pill = asp.ApdStagePill(run_text=run_text,
                             record=(lines.append if lines is not None else None),
                             client_factory=lambda: client, poll_ms=0)
-    pill.confirm = lambda *a, **k: True
     pill.poll()
     assert _wait(qapp, lambda: pill.polled_at is not None)
     return pill
@@ -88,17 +87,15 @@ def test_com_not_connected(qapp):
     assert not pill.move_allowed()[0]
 
 
-def test_allowed_during_a_run_with_warning(qapp):
-    client, lines, asked = FakeClient(position="out"), [], []
+def test_allowed_during_a_run_and_logged(qapp):
+    client, lines = FakeClient(position="out"), []
     pill = _pill(qapp, client, run_text=lambda: "run 91234 (hf_bec)", lines=lines)
     assert pill.move_allowed() == (True, "")
     menu = pill.build_menu()
     enabled = {a.objectName(): a.isEnabled() for a in menu.actions() if a.objectName()}
     assert enabled["apd_stage_move_in"] is True
     assert enabled["apd_stage_move_out"] is True
-    pill.confirm = lambda title, text, verb: asked.append(text) or True
     assert pill.request_move("in")
-    assert "run 91234 (hf_bec) is using the machine" in asked[0]
     assert _wait(qapp, lambda: pill._moving is None)
     assert client.moves == [("in", False)]
     assert lines[0] == "[apd stage] moving in during run 91234 (hf_bec)"
@@ -123,12 +120,25 @@ def test_move_to_current_position_forces(qapp):
     assert client.moves == [("out", True)]
 
 
-def test_cancelled_confirmation_sends_nothing(qapp):
+def test_move_opens_no_dialog(qapp, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+    opened = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: opened.append(self) or 0)
     client = FakeClient(position="out")
     pill = _pill(qapp, client)
-    pill.confirm = lambda *a, **k: False
-    assert not pill.request_move("in")
-    assert client.moves == []
+    assert not hasattr(pill, "confirm")
+    assert pill.request_move("in")
+    assert _wait(qapp, lambda: pill._moving is None)
+    assert client.moves == [("in", False)]
+    assert opened == []
+
+
+def test_unknown_run_state_is_logged(qapp):
+    client, lines = FakeClient(position="out"), []
+    pill = _pill(qapp, client, run_text=lambda: None, lines=lines)
+    assert pill.request_move("in")
+    assert _wait(qapp, lambda: pill._moving is None)
+    assert lines[0] == "[apd stage] moving in (run state unknown: monitor server unreachable)"
 
 
 def test_device_control_gui_hosts_the_pill(qapp, monkeypatch):

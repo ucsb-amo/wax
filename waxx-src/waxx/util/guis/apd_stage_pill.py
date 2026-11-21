@@ -9,15 +9,14 @@ directly (found by its beacon), not through the monitor server:
   and whether the server and its COM port are up, polled every few seconds
   while the pill is visible;
 * its menu (left or right click) has **Move in** and **Move out** -- a full
-  throw to the end stop (``PDXC_Client.move_to``), after a confirmation.  A
-  move to where the server already has the stage is sent with ``force=True``
-  ("drive in again"), for when it was moved by hand.
+  throw to the end stop (``PDXC_Client.move_to``), sent at once with no
+  confirmation dialog.  A move to where the server already has the stage is
+  sent with ``force=True`` ("drive in again"), for when it was moved by hand.
 
 Moves are allowed while a run is using the machine.  A run sets the stage
 itself in ``Base.__init__``, so moving it under a run can block that run's
-camera or APD mid-run: the confirmation names the run and says so, and the
-log line records it.  When the host cannot tell (monitor server unreachable)
-the confirmation says that instead.
+camera or APD mid-run: the log line names the run (or says the run state is
+unknown when the monitor server is unreachable).
 
 All network I/O runs on daemon threads; results come back to the GUI thread
 through queued signals.
@@ -75,8 +74,6 @@ class ApdStagePill(QPushButton):
       when the host cannot tell).  Default: always "".
     * ``record(line)``: where a move's request and outcome are logged.
     * ``client_factory()``: builds a ``PDXC_Client`` (tests pass a fake).
-    * ``confirm(title, text, verb) -> bool``: asks before a move (tests
-      replace it).
     """
 
     def __init__(self, run_text: Callable[[], str | None] | None = None,
@@ -223,46 +220,19 @@ class ApdStagePill(QPushButton):
             return False, f"the PDXC server's COM port is {self.com_status}"
         return True, ""
 
-    def confirm(self, title: str, text: str, verb: str) -> bool:
-        box = QMessageBox(self.window())
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(title)
-        box.setText(text)
-        yes = box.addButton(verb, QMessageBox.ButtonRole.AcceptRole)
-        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        delete_later(box)
-        return clicked is yes
-
     def request_move(self, state: str) -> bool:
-        """Confirm, then drive the stage to ``state`` on a thread.  Returns
+        """Drive the stage to ``state`` on a thread, no confirmation.  Returns
         whether the move was sent."""
         allowed, why = self.move_allowed()
         if not allowed:
             QMessageBox.warning(self.window(), "APD stage", f"Not moved: {why}.")
             return False
         force = self.position == state
-        parts = [f"Drive the APD stage {state.upper()}: {_WHAT[state]}."]
-        if force:
-            parts.append(f"The PDXC server already has it {state}; this drives the full throw "
-                         "again (for a stage moved by hand).")
         run = self._run_text()
-        if run is None:
-            parts.append("The monitor server is not reachable, so this window cannot tell "
-                         "whether a run is using the machine. Moving the stage under a run "
-                         "blocks its camera or its APD.")
-        elif run:
-            parts.append(f"{run} is using the machine. The run set the stage itself; moving "
-                         "it now can block the run's camera or its APD for the rest of the run.")
-        parts.append("A full throw takes several seconds.")
-        verb = f"Move {state}"
-        if not self.confirm(f"APD stage {state}?", "\n\n".join(parts), verb):
-            return False
         self._moving = state
         self._record(f"[apd stage] moving {state}" + (" (full throw again)" if force else "")
-                     + (f" during {run}" if run else ""))
+                     + (f" during {run}" if run else "")
+                     + (" (run state unknown: monitor server unreachable)" if run is None else ""))
         self.refresh()
 
         def work():
@@ -298,7 +268,7 @@ class ApdStagePill(QPushButton):
         allowed, why = self.move_allowed()
         for state in (POSITION_IN, POSITION_OUT):
             again = " again" if self.position == state else ""
-            act = menu.addAction(f"Move {state}{again} ({_WHAT[state]})…")
+            act = menu.addAction(f"Move {state}{again} ({_WHAT[state]})")
             act.setObjectName(f"apd_stage_move_{state}")
             act.setEnabled(allowed)
             act.triggered.connect(lambda _=False, s=state: self.request_move(s))
