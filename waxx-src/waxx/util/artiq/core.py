@@ -11,7 +11,10 @@ compile and the first byte sent to the core device:
 
 * **Armed** iff the process was warm-launched (``queue_gate.is_warm()``, which reads and
   pops ``WAXX_QUEUE_WARM``) when the Core was constructed. Unarmed, every method is
-  upstream's: ``run`` hands straight to ``super().run``.
+  upstream's: ``run`` hands straight to ``super().run`` -- except while ``claim_overlap``
+  has something for it (a cold queue launch with ``WAXX_CLAIM_OVERLAP`` on): then the
+  first kernel goes through :meth:`Core._run_beside_claim`, upstream's ``run`` with the
+  experiment's claim on a thread beside the compile and a wait for it before the upload.
 * **One-shot.** Only the first kernel waits. GO and the claim are process-wide
   (``queue_gate``), so a second Core in the same process (``TTLPulser`` builds its own)
   never waits twice and never claims twice; after GO every kernel runs as upstream.
@@ -56,7 +59,7 @@ from artiq.coredevice.comm_kernel import CommKernel
 from artiq.coredevice.core import Core as _ArtiqCore
 from artiq.language.core import rpc
 
-from waxx.util.device_state import queue_gate
+from waxx.util.device_state import claim_overlap, queue_gate
 
 
 _contact_lock = threading.Lock()
@@ -110,6 +113,8 @@ class Core(_ArtiqCore):
 
     def run(self, function, args, kwargs):
         if not self.queue_gate_armed:
+            if claim_overlap.active():
+                return self._run_beside_claim(function, args, kwargs)
             return super().run(function, args, kwargs)
         if queue_gate.go_passed():
             # Safety net: a claim registered after GO (the first kernel ran before
@@ -126,6 +131,30 @@ class Core(_ArtiqCore):
         embedding_map, kernel_library, symbolizer, demangler, subkernel_arg_types = \
             self.compile(function, args, kwargs, set_result)
         self._wait_for_go()
+        self.compile_and_upload_subkernels(embedding_map, args, subkernel_arg_types)
+        self._run_compiled(kernel_library, embedding_map, symbolizer, demangler)
+        return result
+
+    def _run_beside_claim(self, function, args, kwargs):
+        """Upstream Core.run with the experiment's claim on a thread beside the compile
+        (a cold queue launch with the overlap on; see ``claim_overlap``). Nothing goes to
+        the core device until the claim -- and any step started early, such as the APD
+        stage's throw -- has finished; what the claim raised is raised here. A compile
+        that raises (a compile error, Ctrl-C) stops the claim before its liveOD start
+        and waits for its thread before the error goes on."""
+        result = None
+        @rpc(flags={"async"})
+        def set_result(new_result):
+            nonlocal result
+            result = new_result
+        claim_overlap.start_claim()
+        try:
+            embedding_map, kernel_library, symbolizer, demangler, subkernel_arg_types = \
+                self.compile(function, args, kwargs, set_result)
+            claim_overlap.finish()
+        except BaseException:
+            claim_overlap.cancel_and_wait()
+            raise
         self.compile_and_upload_subkernels(embedding_map, args, subkernel_arg_types)
         self._run_compiled(kernel_library, embedding_map, symbolizer, demangler)
         return result

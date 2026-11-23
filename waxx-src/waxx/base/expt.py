@@ -354,18 +354,23 @@ class Expt(Scanner, Dealer, Scribe):
                 "Start the liveOD GUI before running experiments."
             )
 
-        from waxx.util.device_state import queue_gate
-        if not queue_gate.is_warm():
-            # cold: the same moment INIT_RUN always had
-            self.claim()
-        else:
-            # warm: nothing that touches the machine; liveOD only checks the
-            # run could start (RESERVE_RUN creates nothing). The ARTIQ Core
-            # hook runs claim() after the compile and the queue's GO.
-            self._reserve_warm_run()
-            queue_gate.register_claim(self.claim)
+        self._arrange_claim()
 
     # ---- the claim -----------------------------------------------------------
+
+    def _arrange_claim(self):
+        """Cold: claim now, or on a thread beside the kernel compile
+        (claim_overlap: a cold queue launch with WAXX_CLAIM_OVERLAP on and a
+        kernel run()). Warm: touch nothing, have liveOD check the run could
+        start; the ARTIQ Core hook claims after the compile and GO."""
+        from waxx.util.device_state import queue_gate, claim_overlap
+        if queue_gate.is_warm():
+            self._reserve_warm_run()
+            queue_gate.register_claim(self.claim)
+        elif claim_overlap.applies_to(self):
+            claim_overlap.defer_claim(self.claim)
+        else:
+            self.claim()
 
     def claim(self):
         """Take the machine for this run, once (later calls do nothing).
@@ -392,6 +397,10 @@ class Expt(Scanner, Dealer, Scribe):
         self.claim_hardware()
         # overloaded per machine; the last moment before the run id
         self.pre_init_run()
+
+        # an overlapped claim stops here, before any run id, if its compile failed
+        from waxx.util.device_state import claim_overlap
+        claim_overlap.check_not_cancelled()
 
         self._start_liveod_run()
         self._run_started = True
@@ -1033,11 +1042,23 @@ class Expt(Scanner, Dealer, Scribe):
                                                       like=getattr(self.params, key, None)))
                 applied.discard(key)
 
+    def _settle_overlapped_claim(self):
+        """claim_overlap at end: a deferred claim no kernel started runs now,
+        as a cold finish_prepare would have; an overlapped claim's timings go
+        in the run file ('claim_overlap'). No-op otherwise."""
+        from waxx.util.device_state import claim_overlap
+        if not getattr(self, "_claimed", True):
+            claim_overlap.run_claim_now()
+        report = claim_overlap.report()
+        if report:
+            self._extra_file_texts["claim_overlap"] = json.dumps(report)
+
     def end_wax(self, expt_filepath,
                 notify=True,
                 restart_monitor=True):
 
         restart_monitor = _queue_restart_monitor(restart_monitor)
+        self._settle_overlapped_claim()
         # A warm-launched run claims at its first kernel (the ARTIQ Core
         # hook). One whose run() never reached a kernel never claimed: no
         # liveOD run, no fence -- nothing to end, and nothing must pretend.
